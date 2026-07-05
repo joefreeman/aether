@@ -1627,6 +1627,7 @@ impl Shell {
         p.generation = core.generation;
         p.offset = core.offset;
         p.items = core.items.clone();
+        p.groups = core.groups.clone();
         p.total_matches = core.total_matches;
         p.total_candidates = core.total_candidates;
         p.ticking = core.ticking;
@@ -1679,15 +1680,18 @@ impl Shell {
         p.completion = core.explorer_completion();
         p.explorer_parent = core.directory_parent.clone();
         // Keep the highlight on-screen within the fetched slice (the shell half of
-        // RevealPickerSelection). Grep groups each file under a header row, so the visible
+        // RevealPickerSelection). The grouped kinds spend a row per group header, so the visible
         // window holds fewer items than `pane_rows` — `picker_scroll_for_selected` walks the
-        // real layout instead of assuming one row per item.
+        // real layout (the server-pushed spans) instead of assuming one row per item.
         self.picker_scroll = crate::ui::picker_scroll_for_selected(
             &p.items,
             p.selected,
             self.picker_scroll,
             p.pane_rows.max(1) as usize,
-            p.kind,
+            &p.groups,
+            // The over-scroll clamp applies only when the cache reaches the true list end —
+            // mid-cache, rows below just haven't been fetched yet.
+            core.offset as usize + core.items.len() >= core.total_matches as usize,
         );
         p.visible_start = self.picker_scroll;
     }

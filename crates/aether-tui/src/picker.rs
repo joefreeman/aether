@@ -5,7 +5,9 @@
 use crate::scroll::ScrollState;
 use aether_protocol::directory::DirectoryEntry;
 use aether_protocol::lsp::{LspProgress, LspStatus};
-use aether_protocol::picker::{CaseMode, PickerFilters, PickerItem, PickerKind, ScopedPath};
+use aether_protocol::picker::{
+    CaseMode, GroupSpan, PickerFilters, PickerItem, PickerKind, ScopedPath,
+};
 use aether_protocol::BufferId;
 use std::collections::HashMap;
 
@@ -49,6 +51,12 @@ pub struct PickerState {
     pub pane_rows: u32,
     /// Latest pushed slice. `items.len() <= limit`.
     pub items: Vec<PickerItem>,
+    /// The window's group runs, server-pushed alongside `items` (starts index into `items`).
+    /// Non-empty exactly for the grouped kinds' non-empty windows — the renderer and the
+    /// header-aware row math key off this instead of re-deriving groups from item fields. The
+    /// first span of a non-empty window always has `start == 0` (a window beginning mid-group
+    /// repeats the split group's header).
+    pub groups: Vec<GroupSpan>,
     /// First index in `items` rendered by the picker pane. Slides forward / backward in response
     /// to selection moves to keep `selected` on-screen, all without an RPC. Refetch happens only
     /// when this approaches the edge of `items`.
@@ -61,7 +69,7 @@ pub struct PickerState {
     pub spinner: Option<&'static str>,
     /// Total display rows the whole result set occupies, when that differs from `total_matches`.
     /// Server-reported; in practice grep-only (hits + one header per file group — the wire field
-    /// is `grep_total_display_rows`), `None` for the other kinds. Sizes the collapsed picker box.
+    /// is `total_display_rows`), `None` for the other kinds. Sizes the collapsed picker box.
     pub total_display_rows: Option<u32>,
     /// The settled empty-state line (core-owned wording, e.g. "No diagnostics"), or `None` while
     /// searching / when rows exist. Synced from the core's [`PickerState::empty_note`]; the async

@@ -190,6 +190,7 @@ async fn run_search(
                     u.ticking = true;
                     if !window_changed {
                         u.items = None; // count-only tick: keep the client's (stable) window
+                        u.groups.clear(); // spans describe `items`; meaningless without them
                     }
                 }
                 drop(s);

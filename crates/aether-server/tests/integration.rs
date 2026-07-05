@@ -39,8 +39,9 @@ use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavSt
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
     PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem,
-    PickerKind, PickerQuery, PickerQueryParams, PickerSelect, PickerSelectParams,
-    PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
+    PickerKind, PickerQuery, PickerQueryParams, PickerSectionJump, PickerSectionJumpParams,
+    PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
+    PickerView, PickerViewParams, ScopedPath,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -10397,8 +10398,20 @@ async fn keybindings_picker_matches_across_the_composed_row() {
         })
         .collect();
     assert_eq!(descs, ["Delete word back", "Newline and indent", "Find file"]);
-    assert_eq!(update.grep_total_display_rows, Some(5));
-    assert_eq!(update.grep_display_offset, Some(1));
+    assert_eq!(update.total_display_rows, Some(5));
+    assert_eq!(update.display_offset, Some(1));
+    // The group boundaries ride the push explicitly (window-relative starts) — clients render
+    // these spans verbatim instead of re-deriving keys from item fields.
+    use aether_protocol::picker::GroupHeader;
+    let spans: Vec<(u32, &str)> = update
+        .groups
+        .iter()
+        .map(|s| match &s.header {
+            GroupHeader::Label { label } => (s.start, label.as_str()),
+            GroupHeader::File { relative_path, .. } => (s.start, relative_path.as_str()),
+        })
+        .collect();
+    assert_eq!(spans, [(0, "Editing"), (2, "Pickers")]);
 
     // A chord query: "ctrl" only matches the Ctrl-w row, and the match indices land in the
     // keys segment of the composed haystack ("Delete word back Ctrl-w").
@@ -10445,6 +10458,67 @@ async fn keybindings_picker_matches_across_the_composed_row() {
         panic!("expected Keybinding item")
     };
     assert_eq!(desc, "Newline and indent");
+
+    drop(server);
+}
+
+/// `Alt-l` / `Alt-h` jump by group in every header-grouped kind: `picker/section_jump` resolves
+/// the boundary via the same grouping that produces the pushed spans.
+#[tokio::test]
+async fn keybindings_picker_section_jump_moves_by_group() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &keybindings_view_params(true, Some(keybinding_rows())),
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Forward from inside the Editing run (rows 0-1) → the Pickers group's first row.
+    let target = send_request::<PickerSectionJump>(
+        &mut ws,
+        11,
+        &PickerSectionJumpParams {
+            kind: PickerKind::Keybindings,
+            from_index: 0,
+            direction: Direction::Forward,
+        },
+    )
+    .await;
+    let Some(PickerItem::Keybinding { desc, .. }) = &target else {
+        panic!("expected a keybinding target, got {target:?}")
+    };
+    assert_eq!(desc, "Find file");
+
+    // Backward from the second Editing row → the Editing group's first row.
+    let target = send_request::<PickerSectionJump>(
+        &mut ws,
+        12,
+        &PickerSectionJumpParams {
+            kind: PickerKind::Keybindings,
+            from_index: 1,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let Some(PickerItem::Keybinding { desc, .. }) = &target else {
+        panic!("expected a keybinding target, got {target:?}")
+    };
+    assert_eq!(desc, "Delete word back");
+
+    // The very first row has nothing further back.
+    let target = send_request::<PickerSectionJump>(
+        &mut ws,
+        13,
+        &PickerSectionJumpParams {
+            kind: PickerKind::Keybindings,
+            from_index: 0,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    assert!(target.is_none());
 
     drop(server);
 }
@@ -10566,7 +10640,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     assert_eq!(preview, "hello");
 
     // Grouped display rows: 2 hunks + one header per file = 4.
-    assert_eq!(update.grep_total_display_rows, Some(4));
+    assert_eq!(update.total_display_rows, Some(4));
 
     drop(server);
 }

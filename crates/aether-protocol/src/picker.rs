@@ -1078,6 +1078,36 @@ pub struct PickerSectionJumpParams {
     pub direction: Direction,
 }
 
+// ---- group spans ----------------------------------------------------------------------------
+
+/// What a group's header row shows. Presentation-neutral, like the items: `File` carries the
+/// workspace-relative location and the client formats it (root labels are client-derived);
+/// `Label` is rendered verbatim (References' `Definition` / `References` sections, a
+/// keybinding group's name).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupHeader {
+    /// The group is a file (grep hits, git changes, workspace diagnostics).
+    File { path_index: u32, relative_path: String },
+    /// The group is a named section (references, keybindings).
+    Label { label: String },
+}
+
+/// One group run within a pushed window: the items from `start` (0-based index into the
+/// window's `items`, NOT the absolute ranked index) up to the next span (or the window's end)
+/// render under `header`. The server is the single source of group boundaries — clients render
+/// spans verbatim instead of re-deriving keys from item fields.
+///
+/// Invariant for the grouped kinds: a non-empty window's first span always has `start == 0`,
+/// *including* when the window begins mid-group — the split group's header is repeated so the
+/// window is self-describing (this replaces the clients' old "synthesize a header above the
+/// first row" convention). Ungrouped kinds send no spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSpan {
+    pub start: u32,
+    pub header: GroupHeader,
+}
+
 // ---- picker/update (notification) ---------------------------------------------------------------
 
 /// Server-pushed window contents. Sent whenever the subscribed window's items change (matcher
@@ -1109,16 +1139,23 @@ pub struct PickerUpdateParams {
     /// True while the matcher is still consuming candidates (walk in progress, or matcher hasn't
     /// quiesced after a query change). The client may use this to show a spinner.
     pub ticking: bool,
-    /// Grep only: the display-row index (hits interleaved with one section header per file group) of
-    /// this window's first item, accounting for the headers above it. Lets a client virtual-scroll a
-    /// list that renders per-file headers without its spacer under-counting those header rows.
+    /// The window's group runs (see [`GroupSpan`]), in order. Present (non-empty) for the
+    /// grouped kinds whenever `items` is; meaningless on a count-only tick (`items: None`),
+    /// where the client keeps its current window's spans. Empty for the flat kinds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupSpan>,
+    /// Grouped kinds only: the display-row index (items interleaved with one header row per
+    /// group) of this window's first item, accounting for the header rows above it. Lets a
+    /// client virtual-scroll a list that renders group headers without its spacer
+    /// under-counting those rows. Display rows are an abstract uniform unit — each client maps
+    /// them to its own measure (terminal lines, `ROW_H`, a measured pixel height).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grep_display_offset: Option<u32>,
-    /// Grep only: total display rows in the whole result set (`total_matches` + number of file
-    /// groups). Sizes the client's virtual-scroll spacer so every hit (incl. the last file's) is
-    /// reachable. `None` for non-grep kinds.
+    pub display_offset: Option<u32>,
+    /// Grouped kinds only: total display rows in the whole result set (`total_matches` + the
+    /// number of groups). Sizes the client's virtual-scroll spacer so every item (incl. the
+    /// last group's) is reachable. `None` for the flat kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grep_total_display_rows: Option<u32>,
+    pub total_display_rows: Option<u32>,
     /// A server-resolved highlight to adopt when this push lands — currently the DocumentSymbols
     /// picker's cursor-enclosing symbol, computed on the async fill (the picker opens before the
     /// `textDocument/documentSymbol` round-trip returns, so this can't ride the `picker/view`

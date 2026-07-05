@@ -4179,7 +4179,10 @@ fn reveal_picker_selection(p: &PickerState, scroll_y: &mut f32, reveal: Reveal) 
 /// a hit revealed flush to the top edge would sit hidden underneath it.
 fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> {
     let sd = p.selected_display_row()?;
-    let top = sd as f32 * crate::picker::ROW_H;
+    // Row-index × ROW_H, plus the inter-group gap pixels above the row (gaps sit outside the
+    // display-row unit — same compensation as the overlay's spacers).
+    let gaps = p.gaps_above_window() + p.gaps_before_display_rel(sd.saturating_sub(p.window_base()));
+    let top = sd as f32 * crate::picker::ROW_H + gaps as f32 * crate::picker::GROUP_GAP;
     let bottom = top + crate::picker::ROW_H;
     // Kinds that pin a sticky group header over the top row (grep's file path, Keybindings'
     // group label) need a revealed row to clear one row's height or it slides under the header
@@ -4469,7 +4472,7 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::ROW_H;
+    use crate::picker::{GROUP_GAP, ROW_H};
 
     /// A grep window: rows [0]=hdr a.rs, [1..=3]=hits, [4]=hdr b.rs, [5..=24]=hits.
     fn grep_state() -> PickerState {
@@ -4484,6 +4487,13 @@ mod tests {
         let mut s = PickerState::new(PickerKind::Grep);
         let mut items: Vec<_> = (1..=3).map(|l| hit("a.rs", l)).collect();
         items.extend((1..=20).map(|l| hit("b.rs", l)));
+        let file_span = |start: u32, rel: &str| aether_protocol::picker::GroupSpan {
+            start,
+            header: aether_protocol::picker::GroupHeader::File {
+                path_index: 0,
+                relative_path: rel.into(),
+            },
+        };
         assert!(s.apply_update(PickerUpdateParams {
             kind: PickerKind::Grep,
             generation: 0,
@@ -4492,8 +4502,9 @@ mod tests {
             total_matches: 23,
             total_candidates: 23,
             ticking: false,
-            grep_display_offset: Some(0),
-            grep_total_display_rows: Some(25),
+            groups: vec![file_span(0, "a.rs"), file_span(3, "b.rs")],
+            display_offset: Some(0),
+            total_display_rows: Some(25),
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -4510,8 +4521,8 @@ mod tests {
         s.selected = 4; // display row 6 — the first visible row, pinned header over it
         assert_eq!(
             reveal_target(&s, scroll, Reveal::Minimal),
-            Some(5.0 * ROW_H),
-            "selection on the pinned-over first row needs a one-row scroll"
+            Some(5.0 * ROW_H + GROUP_GAP),
+            "selection on the pinned-over first row needs a one-row scroll (plus the group gap above it)"
         );
         // One row below the top edge is genuinely visible — no scroll.
         s.selected = 5; // display row 7
@@ -4520,7 +4531,7 @@ mod tests {
         s.selected = 22; // display row 24 — below the 18-row viewport (rows 6..24)
         assert_eq!(
             reveal_target(&s, scroll, Reveal::Top),
-            Some(23.0 * ROW_H),
+            Some(23.0 * ROW_H + GROUP_GAP),
             "the row aligns with its clearance row at the top"
         );
         // The first hit of the list reveals to 0 — its real header row is above it.
@@ -4545,6 +4556,12 @@ mod tests {
         // shape with group labels instead of file paths.
         let mut items: Vec<_> = (1..=3).map(|n| kb("Motion", n)).collect();
         items.extend((1..=20).map(|n| kb("Edit", n)));
+        let label_span = |start: u32, label: &str| aether_protocol::picker::GroupSpan {
+            start,
+            header: aether_protocol::picker::GroupHeader::Label {
+                label: label.into(),
+            },
+        };
         assert!(s.apply_update(PickerUpdateParams {
             kind: PickerKind::Keybindings,
             generation: 0,
@@ -4553,8 +4570,9 @@ mod tests {
             total_matches: 23,
             total_candidates: 23,
             ticking: false,
-            grep_display_offset: Some(0),
-            grep_total_display_rows: Some(25),
+            groups: vec![label_span(0, "Motion"), label_span(3, "Edit")],
+            display_offset: Some(0),
+            total_display_rows: Some(25),
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -4563,8 +4581,8 @@ mod tests {
         s.selected = 4; // display row 6 — the first visible row, pinned header over it
         assert_eq!(
             reveal_target(&s, scroll, Reveal::Minimal),
-            Some(5.0 * ROW_H),
-            "selection on the pinned-over first row needs a one-row scroll"
+            Some(5.0 * ROW_H + GROUP_GAP),
+            "selection on the pinned-over first row needs a one-row scroll (plus the group gap above it)"
         );
         // One row below the top edge is genuinely visible — no scroll.
         s.selected = 5; // display row 7
@@ -4594,8 +4612,9 @@ mod tests {
             total_matches: 30,
             total_candidates: 30,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         }));

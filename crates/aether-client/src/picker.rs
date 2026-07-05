@@ -3,7 +3,9 @@
 //! rendering half lives in the shell (`src/picker.rs`).
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipValue, DirListingState};
-use aether_protocol::picker::{PickerFilters, PickerItem, PickerKind, PickerUpdateParams};
+use aether_protocol::picker::{
+    GroupHeader, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
+};
 
 /// Rows the panel shows at once.
 pub const VISIBLE_ROWS: usize = 18;
@@ -29,6 +31,9 @@ pub struct PickerState {
     pub generation: u64,
     /// The fetched window starting at `offset` (absolute index into the match list).
     pub items: Vec<PickerItem>,
+    /// The window's group runs (window-relative starts, server-pushed alongside `items` — the
+    /// single source of group boundaries; see `GroupSpan`). Empty for the flat kinds.
+    pub groups: Vec<GroupSpan>,
     pub offset: u32,
     /// Absolute index of the highlighted row.
     pub selected: u32,
@@ -36,7 +41,7 @@ pub struct PickerState {
     pub total_candidates: u32,
     pub ticking: bool,
     /// Display-row index of the fetched window's first row (grep: headers above included,
-    /// from `grep_display_offset`; other kinds: equals `offset`). Sizes the top spacer.
+    /// from `display_offset`; other kinds: equals `offset`). Sizes the top spacer.
     pub display_offset: u32,
     /// Total display rows in the whole result set (grep: hits + group headers). Sizes the
     /// virtual-scroll spacers.
@@ -92,6 +97,7 @@ impl PickerState {
             query: String::new(),
             generation: 0,
             items: Vec::new(),
+            groups: Vec::new(),
             offset: 0,
             selected: 0,
             total_matches: 0,
@@ -399,10 +405,12 @@ impl PickerState {
             return false;
         }
         // `None` is a throttled count-only tick (streaming grep): keep the current window, update
-        // the counts. `Some` replaces it (an empty vec is a genuinely empty result set).
+        // the counts. `Some` replaces it (an empty vec is a genuinely empty result set). The
+        // group spans describe `items`, so they're adopted and kept in lockstep with it.
         let has_items = u.items.is_some();
         if let Some(items) = u.items {
             self.items = items;
+            self.groups = u.groups;
         }
         // Adopt the push's counts + display geometry from a real window (`Some`) or a count tick
         // that's reporting actual progress (`total_matches > 0`). A count-only tick reporting
@@ -414,8 +422,8 @@ impl PickerState {
         if has_items || u.total_matches > 0 {
             self.total_matches = u.total_matches;
             self.total_candidates = u.total_candidates;
-            self.display_offset = u.grep_display_offset.unwrap_or(u.offset);
-            self.total_display_rows = u.grep_total_display_rows.unwrap_or(u.total_matches);
+            self.display_offset = u.display_offset.unwrap_or(u.offset);
+            self.total_display_rows = u.total_display_rows.unwrap_or(u.total_matches);
         }
         self.ticking = u.ticking;
         self.explorer_peek_missing = u.explorer_peek_missing;
@@ -474,51 +482,26 @@ impl PickerState {
         Some(self.selected.saturating_sub(FETCH_LIMIT / 2))
     }
 
-    /// The fetched window as uniform display rows: group headers interleaved before each
-    /// file's first hit (grep), every display row the same height (the shell's `ROW_H`).
+    /// The fetched window as uniform display rows: one group-header row before each group run,
+    /// straight from the server-pushed spans (the single source of group boundaries — no
+    /// client-side key derivation), every display row the same height (the shell's `ROW_H`).
+    /// A window that begins mid-group still leads with its group's header: the server repeats
+    /// the split group's header at `start: 0`.
     pub fn display_rows(&self) -> Vec<DisplayRow<'_>> {
-        let mut rows = Vec::with_capacity(self.items.len() + 8);
-        let mut last_file: Option<(u32, &str)> = None;
-        let mut last_section: Option<bool> = None;
-        let mut last_keybinding_group: Option<&str> = None;
-        // The grouped kinds (Grep, workspace GitChanges, workspace Diagnostics) emit one file header
-        // before each file's first row. The buffer-locked GitChangesFile / Diagnostics are a single
-        // file (or flat) with no header — gated by `groups_by_file`.
-        let group_by_file = self.kind.groups_by_file();
+        let mut rows = Vec::with_capacity(self.items.len() + self.groups.len() + 1);
+        let mut spans = self.groups.iter().peekable();
         for (i, item) in self.items.iter().enumerate() {
-            if let Some((path_index, relative_path)) = file_group_key(item) {
-                let f = (path_index, relative_path);
-                if group_by_file && last_file != Some(f) {
-                    last_file = Some(f);
-                    rows.push(DisplayRow::Header {
+            while let Some(span) = spans.next_if(|s| s.start as usize <= i) {
+                rows.push(match &span.header {
+                    GroupHeader::File {
                         path_index,
                         relative_path,
-                    });
-                }
-            }
-            // References split into a Definition section and a References section: a label row at
-            // each `is_definition` transition. Candidates arrive definition-first, so this is at
-            // most two headers. The transition rule matches the server's display-row accounting.
-            if let PickerItem::Reference { is_definition, .. } = item {
-                if last_section != Some(*is_definition) {
-                    last_section = Some(*is_definition);
-                    rows.push(DisplayRow::Section {
-                        label: if *is_definition {
-                            "Definition"
-                        } else {
-                            "References"
-                        },
-                    });
-                }
-            }
-            // Keybindings group under one section per binding group. Candidates arrive bucketed
-            // (see `keymap::keybinding_entries`) and matches keep candidate order, so each group
-            // is a contiguous run — a label row at each group transition, like References.
-            if let PickerItem::Keybinding { group, .. } = item {
-                if last_keybinding_group != Some(group.as_str()) {
-                    last_keybinding_group = Some(group);
-                    rows.push(DisplayRow::Section { label: group });
-                }
+                    } => DisplayRow::Header {
+                        path_index: *path_index,
+                        relative_path,
+                    },
+                    GroupHeader::Label { label } => DisplayRow::Section { label },
+                });
             }
             rows.push(DisplayRow::Item {
                 abs: self.offset + i as u32,
@@ -575,6 +558,50 @@ impl PickerState {
                 DisplayRow::Header { .. } | DisplayRow::Section { .. } => false,
             })
             .map(|i| base + i as u32)
+    }
+
+    /// Inter-group gap accounting, for the pixel-based shells (iced / web). The grouped pickers
+    /// render a small gap after each group except the last; the gap is *pixels outside the
+    /// display-row unit* (display rows stay uniform — the virtual-scroll invariant), so the
+    /// shells add `gap_px × count` to their spacer sizes and row positions. The TUI instead
+    /// renders the gap as a real blank line, purely locally. One gap sits *before* every group
+    /// header except the list's very first — equivalently, after each group but the last.
+    ///
+    /// Total gaps across the whole result set: `total groups − 1`. Total groups falls out of
+    /// the display metrics (`total_display_rows − total_matches`), so this needs no extra wire
+    /// data. Zero for flat kinds and empty results.
+    pub fn total_gap_count(&self) -> u32 {
+        if self.groups.is_empty() {
+            return 0;
+        }
+        self.total_display_rows
+            .saturating_sub(self.total_matches)
+            .saturating_sub(1)
+    }
+
+    /// Gaps fully above the fetched window — the groups that *ended* above it. Falls out of the
+    /// window metrics: `window_base − offset` counts the headers strictly above the window
+    /// (every grouped window leads with its own header), and each of those groups ended above
+    /// (a group ending inside the window would BE the window's leading group). Zero for flat
+    /// kinds.
+    pub fn gaps_above_window(&self) -> u32 {
+        if self.groups.is_empty() {
+            return 0;
+        }
+        self.window_base().saturating_sub(self.offset)
+    }
+
+    /// Gaps inside the window at or before window-relative display row `rel` (an index into
+    /// [`Self::display_rows`]): one before each header row except the window's first display
+    /// row. A header row's own gap counts toward its position (the gap sits above it).
+    pub fn gaps_before_display_rel(&self, rel: u32) -> u32 {
+        self.display_rows()
+            .iter()
+            .enumerate()
+            .take(rel as usize + 1)
+            .skip(1)
+            .filter(|(_, r)| matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }))
+            .count() as u32
     }
 
     /// After a scroll that puts display row `first_visible` at the top of the list view:
@@ -775,33 +802,6 @@ pub enum DisplayRow<'a> {
     },
 }
 
-/// The file-group key `(path_index, relative_path)` of an item in a file-grouped picker, or `None`
-/// for items that don't group by file. **Single source of truth** for which item kinds sit under a
-/// file header — used by both [`PickerState::display_rows`] (to emit a header at each key change)
-/// and, transitively, [`PickerState::window_base`]. A new file-grouped picker item is wired here
-/// once; the server mirror is `PickerState::grouped_display_metrics`'s `key_at` in
-/// `aether-server/src/picker.rs` (same list, keyed by `PickerCandidates`).
-fn file_group_key(item: &PickerItem) -> Option<(u32, &str)> {
-    match item {
-        PickerItem::GrepHit {
-            path_index,
-            relative_path,
-            ..
-        }
-        | PickerItem::GitChange {
-            path_index,
-            relative_path,
-            ..
-        }
-        | PickerItem::Diagnostic {
-            path_index,
-            relative_path,
-            ..
-        } => Some((*path_index, relative_path.as_str())),
-        _ => None,
-    }
-}
-
 /// The Explorer's pending create affordance — the name a "+ Create …" row would create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCreate {
@@ -857,6 +857,50 @@ mod tests {
     }
 
     #[test]
+    fn gap_accounting_counts_between_group_gaps() {
+        // The grep window fixture from `grep_display_rows_align_with_server_offsets`: the END
+        // window of an 18-display-row list (13 items + 5 groups), holding its last two groups.
+        let hit = |path: &str, line: u32| PickerItem::GrepHit {
+            path_index: 0,
+            relative_path: path.into(),
+            line,
+            col: 0,
+            preview: "x".into(),
+            match_indices: vec![],
+        };
+        let mut s = PickerState::new(PickerKind::Grep);
+        s.offset = 10;
+        assert!(s.apply_update(PickerUpdateParams {
+            kind: PickerKind::Grep,
+            generation: 0,
+            offset: 10,
+            items: Some(vec![hit("a.rs", 1), hit("a.rs", 2), hit("b.rs", 1)]),
+            total_matches: 13,
+            total_candidates: 13,
+            ticking: false,
+            groups: file_spans(&[(0, 0, "a.rs"), (2, 0, "b.rs")]),
+            display_offset: Some(14),
+            total_display_rows: Some(18),
+            center_on: None,
+            explorer_peek_missing: false,
+        }));
+        // 18 display rows − 13 items = 5 groups → 4 between-group gaps overall.
+        assert_eq!(s.total_gap_count(), 4);
+        // window_base = 13, offset = 10 → 3 headers strictly above = 3 groups ended above.
+        assert_eq!(s.gaps_above_window(), 3);
+        // Window rows: [0]=hdr a.rs, [1..2]=items, [3]=hdr b.rs, [4]=item. The leading header
+        // gets no gap; b.rs's header (and everything after it) shifts by one.
+        assert_eq!(s.gaps_before_display_rel(0), 0);
+        assert_eq!(s.gaps_before_display_rel(2), 0);
+        assert_eq!(s.gaps_before_display_rel(3), 1);
+        assert_eq!(s.gaps_before_display_rel(4), 1);
+        // Flat kinds have no gaps anywhere.
+        let flat = PickerState::new(PickerKind::Files);
+        assert_eq!(flat.total_gap_count(), 0);
+        assert_eq!(flat.gaps_above_window(), 0);
+    }
+
+    #[test]
     fn keybinding_display_rows_emit_one_section_per_group_run() {
         let kb = |group: &str, desc: &str| PickerItem::Keybinding {
             group: group.into(),
@@ -870,6 +914,20 @@ mod tests {
             kb("Motion", "Character left"),
             kb("Motion", "Character right"),
             kb("Edit", "Undo"),
+        ];
+        s.groups = vec![
+            GroupSpan {
+                start: 0,
+                header: GroupHeader::Label {
+                    label: "Motion".into(),
+                },
+            },
+            GroupSpan {
+                start: 2,
+                header: GroupHeader::Label {
+                    label: "Edit".into(),
+                },
+            },
         ];
         s.total_matches = 3;
         let rows = s.display_rows();
@@ -910,11 +968,26 @@ mod tests {
             total_matches: total,
             total_candidates: total,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         }
+    }
+
+    /// Shorthand `File` group spans for the grouped-display fixtures.
+    fn file_spans(spans: &[(u32, u32, &str)]) -> Vec<GroupSpan> {
+        spans
+            .iter()
+            .map(|&(start, path_index, rel)| GroupSpan {
+                start,
+                header: GroupHeader::File {
+                    path_index,
+                    relative_path: rel.into(),
+                },
+            })
+            .collect()
     }
 
     #[test]
@@ -991,9 +1064,10 @@ mod tests {
             total_matches: 13,
             total_candidates: 13,
             ticking: false,
+            groups: file_spans(&[(0, 0, "a.rs"), (2, 0, "b.rs")]),
             // The first item sits at display row 14; its group header occupies 13.
-            grep_display_offset: Some(14),
-            grep_total_display_rows: Some(18),
+            display_offset: Some(14),
+            total_display_rows: Some(18),
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1013,7 +1087,7 @@ mod tests {
         // Regression: `display_rows` grouped workspace Diagnostics by file, but `window_base` (and so
         // `selected_display_row`) used a hardcoded variant list that omitted `Diagnostic`, so the
         // window sat one row off and the geometry undercounted the headers. Both now derive from the
-        // same `file_group_key`, so a Diagnostic-bearing window is accounted for like Grep.
+        // server-pushed spans, so a Diagnostic-bearing window is accounted for like Grep.
         let diag = |path: &str, line: u32| PickerItem::Diagnostic {
             path_index: 0,
             relative_path: path.into(),
@@ -1039,8 +1113,9 @@ mod tests {
             total_matches: 3,
             total_candidates: 3,
             ticking: false,
-            grep_display_offset: Some(1), // a.rs's header occupies display row 0
-            grep_total_display_rows: Some(5), // 3 diagnostics + 2 file headers
+            groups: file_spans(&[(0, 0, "src/a.rs"), (2, 0, "src/b.rs")]),
+            display_offset: Some(1), // a.rs's header occupies display row 0
+            total_display_rows: Some(5), // 3 diagnostics + 2 file headers
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1142,14 +1217,16 @@ mod tests {
             match_indices: vec![],
         };
         let items = vec![hunk(1), hunk(5)];
-        // Workspace GitChanges leads each file with a header row...
+        // Workspace GitChanges leads each file with a header row (the server sends spans)...
         let mut workspace = PickerState::new(PickerKind::GitChanges);
         workspace.items = items.clone();
+        workspace.groups = file_spans(&[(0, 0, "src/main.rs")]);
         assert!(workspace
             .display_rows()
             .iter()
             .any(|r| matches!(r, DisplayRow::Header { .. })));
-        // ...but the buffer-locked GitChangesFile is a single file with no header.
+        // ...but the buffer-locked GitChangesFile is a single file with no header — the server
+        // sends no spans for it, so the same items render flat.
         let mut file = PickerState::new(PickerKind::GitChangesFile);
         file.items = items;
         assert!(file
@@ -1185,8 +1262,22 @@ mod tests {
             total_matches: 3,
             total_candidates: 3,
             ticking: false,
-            grep_display_offset: Some(1),
-            grep_total_display_rows: Some(5),
+            groups: vec![
+                GroupSpan {
+                    start: 0,
+                    header: GroupHeader::Label {
+                        label: "Definition".into(),
+                    },
+                },
+                GroupSpan {
+                    start: 1,
+                    header: GroupHeader::Label {
+                        label: "References".into(),
+                    },
+                },
+            ],
+            display_offset: Some(1),
+            total_display_rows: Some(5),
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1260,8 +1351,9 @@ mod tests {
             total_matches: 2,
             total_candidates: 2,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1339,8 +1431,9 @@ mod tests {
             total_matches: names.len() as u32,
             total_candidates: names.len() as u32,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         });

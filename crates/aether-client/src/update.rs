@@ -2897,29 +2897,25 @@ impl Session {
             KeyCode::Char('f') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
                 return self.switch_explorer_picker(PickerKind::Files);
             }
-            // Alt-l/h are per-kind: Explorer descends / ascends; Grep / Git-changes jump the
-            // selection to the next / previous file's first row; DocumentSymbols jumps to the next /
-            // previous top-level unit; elsewhere Alt-h clears (via picker_back).
+            // Alt-l/h are per-kind: Explorer descends / ascends; every header-grouped kind
+            // (grep / git-changes files, keybinding groups, reference sections, workspace
+            // diagnostics) jumps the selection to the next / previous group's first row;
+            // DocumentSymbols jumps to the next / previous top-level unit; elsewhere Alt-h
+            // clears (via picker_back).
             KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_enter_selected();
             }
             KeyCode::Char('l')
                 if mods.alt
                     && !mods.ctrl
-                    && matches!(
-                        p.kind,
-                        PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
-                    ) =>
+                    && (p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols) =>
             {
                 return self.picker_section_jump(Direction::Forward);
             }
             KeyCode::Char('h')
                 if mods.alt
                     && !mods.ctrl
-                    && matches!(
-                        p.kind,
-                        PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
-                    ) =>
+                    && (p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols) =>
             {
                 return self.picker_section_jump(Direction::Backward);
             }
@@ -3336,17 +3332,15 @@ impl Session {
     }
 
     /// Jump the open picker's selection to the next / previous section boundary — the next/prev
-    /// file's first hit (Grep) or top-level symbol (DocumentSymbols). The server finds the boundary
-    /// across the *whole* result list (so it works past the over-fetch window); the result lands as
-    /// [`Event::SectionJumped`].
+    /// group's first row for the header-grouped kinds, the next/prev top-level symbol for
+    /// DocumentSymbols. The server finds the boundary across the *whole* result list (so it
+    /// works past the over-fetch window); the result lands as [`Event::SectionJumped`].
     fn picker_section_jump(&mut self, direction: Direction) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if !matches!(
-            p.kind,
-            PickerKind::Grep | PickerKind::DocumentSymbols | PickerKind::GitChanges
-        ) || p.items.is_empty()
+        if !(p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols)
+            || p.items.is_empty()
         {
             return Effects::none();
         }

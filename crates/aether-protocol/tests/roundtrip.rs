@@ -2116,6 +2116,64 @@ fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
 }
 
 #[test]
+fn group_spans_are_tagged_and_skipped_when_empty() {
+    use aether_protocol::picker::{GroupHeader, GroupSpan, PickerKind, PickerUpdateParams};
+    let u = PickerUpdateParams {
+        kind: PickerKind::Grep,
+        generation: 3,
+        offset: 10,
+        items: Some(vec![]),
+        total_matches: 0,
+        total_candidates: 0,
+        ticking: false,
+        groups: vec![
+            GroupSpan {
+                start: 0,
+                header: GroupHeader::File {
+                    path_index: 1,
+                    relative_path: "src/a.rs".into(),
+                },
+            },
+            GroupSpan {
+                start: 4,
+                header: GroupHeader::Label {
+                    label: "Definition".into(),
+                },
+            },
+        ],
+        display_offset: Some(11),
+        total_display_rows: Some(20),
+        center_on: None,
+        explorer_peek_missing: false,
+    };
+    let v = to_value(&u).unwrap();
+    // Headers are internally tagged, like the items; the display metrics ride unprefixed.
+    assert_eq!(v["groups"][0]["start"], 0);
+    assert_eq!(v["groups"][0]["header"]["kind"], "file");
+    assert_eq!(v["groups"][0]["header"]["relative_path"], "src/a.rs");
+    assert_eq!(v["groups"][1]["header"]["kind"], "label");
+    assert_eq!(v["groups"][1]["header"]["label"], "Definition");
+    assert_eq!(v["display_offset"], 11);
+    assert_eq!(v["total_display_rows"], 20);
+    let back: PickerUpdateParams = from_value(v).unwrap();
+    assert_eq!(back.groups, u.groups);
+
+    // Flat kinds send no spans at all.
+    let u = PickerUpdateParams {
+        groups: vec![],
+        items: None,
+        ..u
+    };
+    let v = to_value(&u).unwrap();
+    assert!(
+        v.get("groups").is_none(),
+        "empty groups skipped on the wire"
+    );
+    let back: PickerUpdateParams = from_value(v).unwrap();
+    assert!(back.groups.is_empty());
+}
+
+#[test]
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
@@ -2215,8 +2273,9 @@ fn picker_update_round_trips_through_notification() {
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2246,8 +2305,9 @@ fn picker_update_carries_center_on_symbol() {
         total_matches: 0,
         total_candidates: 0,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: Some(Box::new(PickerItem::Symbol {
             path: "/p/a.rs".into(),
             line: 3,

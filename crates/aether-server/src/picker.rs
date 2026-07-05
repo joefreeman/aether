@@ -8,10 +8,11 @@
 //! walk, switch to `nucleo::Nucleo` and a per-picker tick task.
 
 use crate::workspace_index::CachedFile;
+use aether_protocol::cursor::Direction;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, KeybindingEntry, MatchOptions, PickerFilters, PickerItem,
-    PickerKind, PickerSelectResult, PickerUpdateParams,
+    BufferDirtyState, CaseMode, GroupHeader, GroupSpan, KeybindingEntry, MatchOptions,
+    PickerFilters, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
@@ -1378,45 +1379,141 @@ impl PickerState {
         self.candidates.len() as u32
     }
 
+    /// The group key of ranked row `ci`, for the header-grouped kinds — `(path_index,
+    /// relative_path)` for the file-grouped kinds, a synthetic `(is_definition, "")` section
+    /// key for References, and the binding group for Keybindings. Only equality matters. The
+    /// borrowing, allocation-free sibling of [`Self::group_header_at`] (which builds the
+    /// wire-shaped header the key summarizes) — `grouped_display_metrics` walks the *whole*
+    /// ranked list with this; the window-sized span payload uses the owned form. The two MUST
+    /// group identically.
+    fn group_key_at(&self, ci: usize) -> Option<(u32, &str)> {
+        match &self.candidates {
+            PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
+            PickerCandidates::GitChanges(v) => {
+                Some((v[ci].path_index, v[ci].relative_path.as_str()))
+            }
+            PickerCandidates::Diagnostics(v) => {
+                Some((v[ci].path_index, v[ci].relative_path.as_str()))
+            }
+            PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+            PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The wire-shaped group header of ranked row `ci` (see [`Self::group_key_at`]).
+    fn group_header_at(&self, ci: usize) -> Option<GroupHeader> {
+        match &self.candidates {
+            PickerCandidates::Grep(v) => Some(GroupHeader::File {
+                path_index: v[ci].path_index,
+                relative_path: v[ci].relative_path.clone(),
+            }),
+            PickerCandidates::GitChanges(v) => Some(GroupHeader::File {
+                path_index: v[ci].path_index,
+                relative_path: v[ci].relative_path.clone(),
+            }),
+            PickerCandidates::Diagnostics(v) => Some(GroupHeader::File {
+                path_index: v[ci].path_index,
+                relative_path: v[ci].relative_path.clone(),
+            }),
+            PickerCandidates::References(v) => Some(GroupHeader::Label {
+                label: if v[ci].is_definition {
+                    "Definition".into()
+                } else {
+                    "References".into()
+                },
+            }),
+            PickerCandidates::Keybindings(v) => Some(GroupHeader::Label {
+                label: v[ci].entry.group.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The group runs of the window `[offset, offset + len)`, with window-relative starts: one
+    /// span per group transition and — the invariant clients rely on — always one at
+    /// `start: 0` for a non-empty window, so a window beginning mid-group repeats the split
+    /// group's header and is self-describing (this replaces the clients' old "synthesize a
+    /// header above the first row" convention). Empty for the kinds that don't render group
+    /// headers — gated on the *kind*: the buffer-locked GitChangesFile shares GitChanges'
+    /// candidate shape but renders headerless.
+    pub fn build_window_spans(&self, offset: u32, len: usize) -> Vec<GroupSpan> {
+        if !self.kind.renders_group_headers() {
+            return Vec::new();
+        }
+        let mut spans: Vec<GroupSpan> = Vec::new();
+        let mut last_key: Option<(u32, &str)> = None;
+        for rel in 0..len {
+            let ci = self.ranked[offset as usize + rel] as usize;
+            let Some(key) = self.group_key_at(ci) else {
+                continue;
+            };
+            if last_key != Some(key) {
+                last_key = Some(key);
+                let header = self
+                    .group_header_at(ci)
+                    .expect("group_key_at and group_header_at cover the same kinds");
+                spans.push(GroupSpan {
+                    start: rel as u32,
+                    header,
+                });
+            }
+        }
+        spans
+    }
+
+    /// The ranked-space position `picker/section_jump` lands on from `from`, for any
+    /// header-grouped kind: `Forward` → the first row of the next group; `Backward` → the
+    /// current group's first row, or the previous group's first row when already there
+    /// (vim-`{` feel). `None` when there's no further boundary that way, or the kind doesn't
+    /// group. Grouping comes from [`Self::group_key_at`] — the same source as the pushed spans,
+    /// so the jump always lands where a client renders a header.
+    pub fn group_boundary(&self, from: usize, direction: Direction) -> Option<usize> {
+        if !self.kind.renders_group_headers() || self.ranked.is_empty() {
+            return None;
+        }
+        let from = from.min(self.ranked.len() - 1);
+        let key = |pos: usize| self.group_key_at(self.ranked[pos] as usize);
+        let cur = key(from)?;
+        match direction {
+            Direction::Forward => (from + 1..self.ranked.len()).find(|&j| key(j) != Some(cur)),
+            Direction::Backward => {
+                let mut run_start = from;
+                while run_start > 0 && key(run_start - 1) == Some(cur) {
+                    run_start -= 1;
+                }
+                if run_start < from {
+                    return Some(run_start);
+                }
+                // Already at the group's first row: step to the previous group's first row.
+                let prev = key(run_start.checked_sub(1)?)?;
+                let mut j = run_start - 1;
+                while j > 0 && key(j - 1) == Some(prev) {
+                    j -= 1;
+                }
+                Some(j)
+            }
+        }
+    }
+
     /// Grouped display-row metrics for a window starting at ranked index `offset`: the display-row
-    /// index of that item (one section header per file group is interleaved above the rows) and the
-    /// total display rows (`ranked.len()` rows + the number of file groups). `None` for pickers
-    /// that don't group by file (everything but Grep and GitChanges). Mirrors the client's
-    /// header-per-file rendering so its virtual-scroll spacer + positioning are exact.
+    /// index of that item (one header row per group is interleaved above the rows) and the
+    /// total display rows (`ranked.len()` rows + the number of groups). `None` for the kinds
+    /// that don't render group headers. Mirrors the clients' header-per-group rendering so their
+    /// virtual-scroll spacer + positioning are exact. Display rows are an abstract uniform
+    /// unit — clients map them to terminal lines / `ROW_H` / measured pixel heights.
     fn grouped_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
-        // The buffer-locked GitChangesFile shares GitChanges' candidate type but renders headerless,
-        // so gate on the kind (References groups into sections, so use the header predicate, not the
-        // file-grouping one) to keep the row math flat there.
         if !self.kind.renders_group_headers() {
             return None;
         }
-        // The group key of ranked row `ci`, for the grouped kinds — `(path_index, relative_path)`
-        // for the file-grouped kinds, a synthetic `(is_definition, "")` section key for
-        // References (the Definition section vs the References section), and the binding group
-        // for Keybindings. Only equality matters here; the count is the number of group
-        // transitions in ranked order.
-        let key_at = |ci: usize| -> Option<(u32, &str)> {
-            match &self.candidates {
-                PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
-                PickerCandidates::GitChanges(v) => {
-                    Some((v[ci].path_index, v[ci].relative_path.as_str()))
-                }
-                PickerCandidates::Diagnostics(v) => {
-                    Some((v[ci].path_index, v[ci].relative_path.as_str()))
-                }
-                PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
-                PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
-                _ => None,
-            }
-        };
-        key_at(*self.ranked.first()? as usize)?; // bail for non-grouped kinds (and empty sets)
-        let mut total_files = 0u32;
+        self.group_key_at(*self.ranked.first()? as usize)?; // bail for non-grouped kinds (and empty sets)
+        let mut total_groups = 0u32;
         let mut headers_at_or_before = 0u32;
         let mut prev: Option<(u32, &str)> = None;
         for (rank, &ci) in self.ranked.iter().enumerate() {
-            let key = key_at(ci as usize);
+            let key = self.group_key_at(ci as usize);
             if prev != key {
-                total_files += 1;
+                total_groups += 1;
                 prev = key;
                 if (rank as u32) <= offset {
                     headers_at_or_before += 1;
@@ -1425,7 +1522,7 @@ impl PickerState {
         }
         Some((
             offset + headers_at_or_before,
-            self.ranked.len() as u32 + total_files,
+            self.ranked.len() as u32 + total_groups,
         ))
     }
 }
@@ -1435,11 +1532,12 @@ impl PickerState {
 pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<PickerUpdateParams> {
     let window = state.subscribed?;
     let (offset, items) = state.build_window_items(window.offset, window.limit, matcher);
-    let (grep_display_offset, grep_total_display_rows) = match state.grouped_display_metrics(offset)
+    let (display_offset, total_display_rows) = match state.grouped_display_metrics(offset)
     {
         Some((d, t)) => (Some(d), Some(t)),
         None => (None, None),
     };
+    let groups = state.build_window_spans(offset, items.len());
     Some(PickerUpdateParams {
         kind: state.kind,
         generation: state.generation,
@@ -1448,8 +1546,9 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         total_matches: state.ranked.len() as u32,
         total_candidates: state.total_candidates(),
         ticking: false,
-        grep_display_offset,
-        grep_total_display_rows,
+        groups,
+        display_offset,
+        total_display_rows,
         // Set by callers that resolve a cursor-based highlight (DocumentSymbols' async fill).
         center_on: None,
         // Explorer-only; false (skipped on the wire) for every other kind.
@@ -1663,6 +1762,91 @@ mod tests {
         s.query = "d".into();
         s.rerank(&mut m);
         assert_eq!(s.ranked, vec![0, 1, 2], "document order, not score order");
+    }
+
+    #[test]
+    fn window_spans_repeat_the_split_groups_header() {
+        let kb = |group: &str, desc: &str| {
+            KeybindingCandidate::from(KeybindingEntry {
+                group: group.into(),
+                desc: desc.into(),
+                mode: "Any".into(),
+                keys: "x".into(),
+            })
+        };
+        let cands = PickerCandidates::Keybindings(vec![
+            kb("Editing", "Delete selection"),
+            kb("Editing", "Undo"),
+            kb("Motion", "Word forward"),
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+
+        // Full window: one span per group, in window-relative starts.
+        let label = |h: &GroupHeader| match h {
+            GroupHeader::Label { label } => label.clone(),
+            GroupHeader::File { relative_path, .. } => relative_path.clone(),
+        };
+        let spans = s.build_window_spans(0, 3);
+        assert_eq!(
+            spans.iter().map(|sp| (sp.start, label(&sp.header))).collect::<Vec<_>>(),
+            [(0, "Editing".to_string()), (2, "Motion".to_string())]
+        );
+        // A window starting mid-group repeats the split group's header at start 0, so the
+        // window is self-describing (no client-side "synthesize a header" convention).
+        let spans = s.build_window_spans(1, 2);
+        assert_eq!(
+            spans.iter().map(|sp| (sp.start, label(&sp.header))).collect::<Vec<_>>(),
+            [(0, "Editing".to_string()), (1, "Motion".to_string())]
+        );
+        // Header-less kinds send no spans, even when the candidate shape could group: the
+        // buffer-locked GitChangesFile gate is the kind, not the data.
+        s.kind = PickerKind::GitChangesFile;
+        assert!(s.build_window_spans(0, 3).is_empty());
+    }
+
+    #[test]
+    fn group_boundary_jumps_by_group_run() {
+        // Three files in walker order: a.rs (3 hits), b.rs (1 hit), c.rs (2 hits) — the exact
+        // semantics `picker/section_jump` (Alt-l / Alt-h) relies on, for every grouped kind.
+        let hit = |rel: &str, line: u32| GrepHitCandidate {
+            path_index: 0,
+            relative_path: rel.to_string(),
+            abs_path: format!("/ws/{rel}"),
+            line,
+            col: 0,
+            match_byte_len: 1,
+            preview: String::new(),
+            match_indices: Vec::new(),
+        };
+        let cands = PickerCandidates::Grep(vec![
+            hit("a.rs", 1),
+            hit("a.rs", 5),
+            hit("a.rs", 9), // indices 0,1,2
+            hit("b.rs", 2), // index 3
+            hit("c.rs", 1),
+            hit("c.rs", 4), // indices 4,5
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+
+        // Forward: the next group's first row; nothing past the last group.
+        assert_eq!(s.group_boundary(0, Direction::Forward), Some(3));
+        assert_eq!(s.group_boundary(2, Direction::Forward), Some(3));
+        assert_eq!(s.group_boundary(3, Direction::Forward), Some(4));
+        assert_eq!(s.group_boundary(4, Direction::Forward), None);
+        assert_eq!(s.group_boundary(5, Direction::Forward), None);
+        // Backward: this group's first row, else the previous group's (vim-`{` feel).
+        assert_eq!(s.group_boundary(2, Direction::Backward), Some(0));
+        assert_eq!(s.group_boundary(1, Direction::Backward), Some(0));
+        assert_eq!(s.group_boundary(4, Direction::Backward), Some(3));
+        assert_eq!(s.group_boundary(3, Direction::Backward), Some(0));
+        assert_eq!(s.group_boundary(0, Direction::Backward), None);
+        // Headerless kinds never jump.
+        s.kind = PickerKind::GitChangesFile;
+        assert_eq!(s.group_boundary(0, Direction::Forward), None);
     }
 
     #[test]

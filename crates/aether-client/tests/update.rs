@@ -747,8 +747,9 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         total_matches: matches,
         total_candidates: matches,
         ticking: true,
-        grep_display_offset: Some(0),
-        grep_total_display_rows: Some(matches + 1),
+        groups: Vec::new(),
+        display_offset: Some(0),
+        total_display_rows: Some(matches + 1),
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -809,8 +810,9 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
         total_matches: matches,
         total_candidates: matches,
         ticking: true,
-        grep_display_offset: Some(0),
-        grep_total_display_rows: Some(matches),
+        groups: Vec::new(),
+        display_offset: Some(0),
+        total_display_rows: Some(matches),
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -880,8 +882,9 @@ fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
         total_matches: total,
         total_candidates: 3,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1055,6 +1058,35 @@ fn space_question_opens_the_keybindings_picker_with_its_rows() {
 }
 
 #[test]
+fn alt_l_and_alt_h_jump_keybinding_groups_via_section_jump() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Keybindings, None, None, false);
+    let p = s.picker.as_mut().unwrap();
+    p.items = (0..6)
+        .map(|n| PickerItem::Keybinding {
+            group: if n < 3 { "Motion" } else { "Edit" }.into(),
+            desc: format!("binding {n}"),
+            mode: "Normal".into(),
+            keys: "x".into(),
+            match_indices: vec![],
+        })
+        .collect();
+    p.total_matches = 6;
+    p.selected = 4;
+    // Alt-l / Alt-h jump by group in every header-grouped kind — the same server-side grouping
+    // that produces the section headers.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/section_jump").expect("Alt-l jumps sections");
+    assert_eq!(params["kind"], "keybindings");
+    assert_eq!(params["from_index"], 4);
+    assert_eq!(params["direction"], "forward");
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/section_jump").expect("Alt-h jumps back");
+    assert_eq!(params["direction"], "backward");
+}
+
+#[test]
 fn enter_on_a_keybinding_row_closes_without_selecting() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     let mut s = session();
@@ -1155,8 +1187,9 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1912,8 +1945,9 @@ fn picker_view_response_renders_items_without_the_push() {
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2535,8 +2569,9 @@ fn selecting_the_create_row_creates_the_file() {
             total_matches: 1,
             total_candidates: 1,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -3016,8 +3051,9 @@ fn workspace_create_row_appears_for_a_novel_name_in_the_workspaces_picker() {
         total_matches: 1,
         total_candidates: 1,
         ticking: false,
-        grep_display_offset: None,
-        grep_total_display_rows: None,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
         center_on: None,
         explorer_peek_missing: false,
     });
@@ -3054,8 +3090,9 @@ fn accepting_the_workspaces_create_row_emits_workspace_create() {
             total_matches: 1,
             total_candidates: 1,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -3354,8 +3391,9 @@ fn symbol_push_center_on_lands_the_highlight() {
             total_matches: 3,
             total_candidates: 3,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: Some(Box::new(sym(5, "b"))),
             explorer_peek_missing: false,
         })
@@ -3414,8 +3452,9 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
             total_matches: 63,
             total_candidates: 63,
             ticking: false,
-            grep_display_offset: None,
-            grep_total_display_rows: None,
+            groups: Vec::new(),
+            display_offset: None,
+            total_display_rows: None,
             center_on: Some(Box::new(sym(81, "externally_modified"))),
             explorer_peek_missing: false,
         })

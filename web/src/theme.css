@@ -914,10 +914,11 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-dirty-externally_modified { color: var(--nord12); }
 .picker-dirty-externally_deleted { color: var(--nord11); }
 .picker-row.create .picker-main { color: var(--nord14); } /* "+ create …" row in green */
-/* Grep file-group header — non-selectable, bold; the path in frost blue (matches the terminal). */
+/* Picker group header (grep/git-changes files, reference sections, keybinding groups) —
+   non-selectable, bold; the path in frost blue (matches the terminal). */
 /* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).
-   Sticky within its .grep-section so the filename stays pinned while scrolling that file's hits. */
-.picker-row.grep-header {
+   Sticky within its .picker-section so the header stays pinned while scrolling that group's rows. */
+.picker-row.picker-group-header {
   color: var(--nord8);
   font-weight: bold;
   cursor: default;
@@ -930,9 +931,14 @@ a.picker-row:not(.selected):hover .picker-main {
   z-index: 1;
   background: var(--nord1);
 }
-/* Keep a hit from hiding under the sticky file header when revealed (e.g. Alt-k up): clear it by one
+/* Keep a row from hiding under the sticky group header when revealed (e.g. Alt-k up): clear it by one
    header row. `--picker-row-h` is the measured display-row height the shell sets on the list. */
-.grep-section .picker-row:not(.grep-header) { scroll-margin-top: var(--picker-row-h, 24px); }
+.picker-section .picker-row:not(.picker-group-header) { scroll-margin-top: var(--picker-row-h, 24px); }
+/* Breathing room between group runs — after each section except the window's last (a section cut
+   off by the window edge continues in the next fetch, so its gap belongs to the virtual space
+   below). Must stay equal to shell.ts's GROUP_GAP_PX: the shell adds the same pixels to the
+   spacer height and window offset so the virtual scroll stays honest. */
+.picker-section:not(:last-child) { margin-bottom: 6px; }
 /* Grep hits are code lines — the editor's mono font. Scoped to the preview text only; the line
    number keeps the picker's sans-serif. */
 .picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
@@ -944,7 +950,7 @@ a.picker-row:not(.selected):hover .picker-main {
    a tight header there under-fills the row the spacer budgeted, and the error compounds per
    header into a scroll-dependent gap at the list's end. */
 .picker-row.grep-hit,
-.picker-row.grep-header.tight {
+.picker-row.picker-group-header.tight {
   padding-top: 1px;
   padding-bottom: 1px;
 }

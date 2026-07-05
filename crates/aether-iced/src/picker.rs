@@ -8,7 +8,7 @@ pub use crate::core::picker::*;
 use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
 use aether_protocol::git::GitStatus;
-use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
+use aether_protocol::picker::{BufferDirtyState, GroupHeader, PickerItem, PickerKind};
 use aether_protocol::viewport::DiffStage;
 use iced::advanced::widget::Tree;
 use iced::advanced::{layout, mouse, renderer, Layout, Widget};
@@ -110,6 +110,11 @@ const CARET_SLACK: f32 = 8.0;
 /// virtual-scroll spacer math exact. Shell geometry: the core speaks display *rows*;
 /// this is where rows become pixels.
 pub const ROW_H: f32 = 24.0;
+/// Vertical breathing room between group runs (before each interior header) — matches the web's
+/// `GROUP_GAP_PX`/`--picker-group-gap`. Pixels outside the display-row unit: every consumer of
+/// row-index × `ROW_H` positions must add the corresponding gap counts (the spacers here, and
+/// `app::reveal_target`'s selected-row position).
+pub const GROUP_GAP: f32 = 6.0;
 
 /// The list viewport's height in px (shrinks below [`VISIBLE_ROWS`] for short lists, and
 /// collapses entirely when there's nothing to list — a reserved blank row would read as a
@@ -118,13 +123,44 @@ pub fn list_height(state: &PickerState) -> f32 {
     // The synthetic "+ Create …" row is appended client-side (not in `total_display_rows`), so add a
     // row for it — otherwise the viewport is one row short and clips it.
     let rows = state.total_display_rows + state.pending_create().is_some() as u32;
-    (rows.min(VISIBLE_ROWS as u32) as f32) * ROW_H
+    // A list short enough to show whole also shows every inter-group gap — include those pixels
+    // or the last row clips by the gap total.
+    let gap_px = if rows <= VISIBLE_ROWS as u32 {
+        state.total_gap_count() as f32 * GROUP_GAP
+    } else {
+        0.0
+    };
+    (rows.min(VISIBLE_ROWS as u32) as f32) * ROW_H + gap_px
 }
 
 /// The display row a scroll offset of `y` px puts at the top of the list view — the px→row
-/// conversion done at the shell edge before asking the core's `scrolled_refetch`.
+/// conversion done at the shell edge before asking the core's `scrolled_refetch`. Ignores the
+/// inter-group gap pixels (a refetch *estimate*; the server clamps and the over-fetch margin
+/// absorbs the drift) — the sticky pin, which must be exact, uses [`window_row_at`] instead.
 pub fn first_visible_row(y: f32) -> u32 {
     (y / ROW_H).floor().max(0.0) as u32
+}
+
+/// The window-relative display row whose box contains list-pixel `y`, accounting for the top
+/// spacer *and* the inter-group gap pixels — the exact px→row mapping the sticky pin needs
+/// (the row-division estimate drifts by up to the accumulated gap pixels). `None` when `y`
+/// falls above the fetched window (a refetch is in flight) or past its end.
+pub fn window_row_at(state: &PickerState, y: f32) -> Option<usize> {
+    let mut top =
+        state.window_base() as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP;
+    if y < top {
+        return None;
+    }
+    for (i, r) in state.display_rows().iter().enumerate() {
+        if i > 0 && matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }) {
+            top += GROUP_GAP;
+        }
+        if y < top + ROW_H {
+            return Some(i);
+        }
+        top += ROW_H;
+    }
+    None
 }
 
 /// Messages from the rendered panel (buttons/rows need `Clone`; the app maps these). Not `Copy`:
@@ -431,12 +467,24 @@ pub fn overlay<'a>(
     // Results: the fetched window rendered as uniform-height rows inside a native scrollable,
     // with spacers sized to the whole virtual result set (the web's virtual-scroll model —
     // grep's spacer math uses the server's display-row counts so group headers are exact).
+    // Grouped kinds add a small GROUP_GAP before each interior header (breathing room between
+    // group runs); those pixels live *outside* the display-row unit, so the spacers add the
+    // same counts (`gaps_above_window` / `total_gap_count`) to stay honest — the same
+    // compensation the web's `applyGeometry` does for its section margins.
     let rows = state.display_rows();
     let window_rows = rows.len() as u32;
     let window_base = state.window_base();
+    let in_window_gaps = state.groups.len().saturating_sub(1) as u32;
     let mut list = column![];
-    list = list.push(iced::widget::Space::new().height(window_base as f32 * ROW_H));
-    for r in rows {
+    list = list.push(iced::widget::Space::new().height(
+        window_base as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP,
+    ));
+    for (i, r) in rows.into_iter().enumerate() {
+        // The gap precedes every header except the window's leading row (the governing header
+        // of a mid-group window sits flush at the top).
+        if i > 0 && matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }) {
+            list = list.push(iced::widget::Space::new().height(GROUP_GAP));
+        }
         match r {
             DisplayRow::Header {
                 path_index,
@@ -506,7 +554,12 @@ pub fn overlay<'a>(
     let below = state
         .total_display_rows
         .saturating_sub(window_base + window_rows);
-    list = list.push(iced::widget::Space::new().height(below as f32 * ROW_H));
+    let gaps_below = state
+        .total_gap_count()
+        .saturating_sub(state.gaps_above_window() + in_window_gaps);
+    list = list.push(
+        iced::widget::Space::new().height(below as f32 * ROW_H + gaps_below as f32 * GROUP_GAP),
+    );
 
     let scroll = iced::widget::scrollable(list)
         .id(list_id())
@@ -520,66 +573,60 @@ pub fn overlay<'a>(
         ))
         .on_scroll(|vp| PickerMsg::Scrolled(vp.absolute_offset().y));
 
-    // Sticky group header: pin the top visible row's group header over the list (web's
-    // `position: sticky`) — the file path for the file-grouped kinds, the binding group for
-    // Keybindings. The stack is ALWAYS present with a pin slot — conditionally changing the
+    // Sticky group header: pin the top visible row's *governing* group header over the list
+    // (web's `position: sticky`) — resolved from the server-pushed spans, no item-field
+    // matching. The stack is ALWAYS present with a pin slot — conditionally changing the
     // tree shape would reset the scrollable's state (iced keys widget state by tree position),
     // which is a scroll-to-top.
-    enum Pin {
-        File(u32, String),
-        Label(String),
-    }
-    // Headerless kinds (e.g. the single-file GitChangesFile) have nothing to pin — without the
-    // gate the top item's own file would pin a stray header over the row. References sections
-    // deliberately don't pin either (at most two short sections).
-    let pinned: Option<Pin> = if !pins_group_header(state.kind) {
+    //
+    // Headerless kinds (e.g. the single-file GitChangesFile) send no spans; the kind gate also
+    // keeps References — which does send spans — deliberately unpinned (at most two short
+    // sections).
+    let pinned: Option<&GroupHeader> = if !pins_group_header(state.kind) {
         None
     } else {
-        let first_visible = first_visible_row(scroll_y);
-        first_visible.checked_sub(window_base).and_then(|rel| {
-            state
-                .display_rows()
-                .into_iter()
-                .nth(rel as usize)
-                .and_then(|r| match r {
-                    DisplayRow::Item { item, .. } => match item {
-                        // The file-grouped kinds (grep hits, Git changes, workspace diagnostics) carry
-                        // the group key.
-                        PickerItem::GrepHit {
-                            path_index,
-                            relative_path,
-                            ..
-                        }
-                        | PickerItem::GitChange {
-                            path_index,
-                            relative_path,
-                            ..
-                        }
-                        | PickerItem::Diagnostic {
-                            path_index,
-                            relative_path,
-                            ..
-                        } => Some(Pin::File(*path_index, relative_path.clone())),
-                        PickerItem::Keybinding { group, .. } => Some(Pin::Label(group.clone())),
-                        _ => None,
-                    },
-                    // A header at the top pins itself (identical overlay, no flicker).
-                    DisplayRow::Header {
-                        path_index,
-                        relative_path,
-                    } => Some(Pin::File(path_index, relative_path.to_string())),
-                    DisplayRow::Section { label } => Some(Pin::Label(label.to_string())),
-                    DisplayRow::Create { .. } => None,
-                })
+        window_row_at(state, scroll_y).and_then(|rel| {
+            match state.display_rows().get(rel)? {
+                // The governing group of an item row is the last span at-or-before it.
+                DisplayRow::Item { abs, .. } => {
+                    let win_idx = abs.checked_sub(state.offset)?;
+                    state
+                        .groups
+                        .iter()
+                        .rev()
+                        .find(|s| s.start <= win_idx)
+                        .map(|s| &s.header)
+                }
+                // A header row at the top pins itself (identical overlay, no flicker). The
+                // display row borrows its content from the span, so hand back that span's header.
+                DisplayRow::Header {
+                    path_index,
+                    relative_path,
+                } => state
+                    .groups
+                    .iter()
+                    .find(|s| {
+                        matches!(&s.header, GroupHeader::File { path_index: p, relative_path: r }
+                            if p == path_index && r == relative_path)
+                    })
+                    .map(|s| &s.header),
+                DisplayRow::Section { label } => state
+                    .groups
+                    .iter()
+                    .find(|s| matches!(&s.header, GroupHeader::Label { label: l } if l == label))
+                    .map(|s| &s.header),
+                DisplayRow::Create { .. } => None,
+            }
         })
     };
     let pin_layer: Element<'_, PickerMsg> = match pinned {
         Some(pin) => {
             let header = match pin {
-                Pin::File(path_index, relative_path) => {
-                    grep_header(roots, path_index, &relative_path)
-                }
-                Pin::Label(label) => section_header(label),
+                GroupHeader::File {
+                    path_index,
+                    relative_path,
+                } => grep_header(roots, *path_index, relative_path),
+                GroupHeader::Label { label } => section_header(label.clone()),
             };
             container(header)
                 .width(Length::Fill)

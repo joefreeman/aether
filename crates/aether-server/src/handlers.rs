@@ -12191,6 +12191,7 @@ pub async fn picker_view(
             u.ticking = true;
             if grep_search_to_spawn.is_some() {
                 u.items = None;
+                u.groups.clear(); // spans describe `items`; meaningless without them
             }
         }
     }
@@ -12373,6 +12374,7 @@ pub async fn picker_query(
         if let Some(ref mut u) = update {
             u.ticking = true;
             u.items = None;
+            u.groups.clear(); // spans describe `items`; meaningless without them
         }
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
@@ -12553,47 +12555,10 @@ pub async fn picker_grep_navigate(
 /// contiguous per-file runs). `from` is the selection's current index.
 ///
 /// - Forward → the first hit whose `(path_index, relative_path)` differs from `from`'s, scanning
-///   forward (i.e. the first hit of the next file).
-/// - Backward → the start of `from`'s own file run; or, if `from` is already that start, the start
-///   of the previous file's run (vim-`{`).
-///
-/// Returns `None` at the ends (no next file going forward; already on the very first hit going
-/// backward). Pure + index-only so it's straightforward to unit-test.
-fn grep_file_boundary(
-    hits: &[picker_state::GrepHitCandidate],
-    from: usize,
-    direction: Direction,
-) -> Option<usize> {
-    let key = |i: usize| (hits[i].path_index, hits[i].relative_path.as_str());
-    let cur = key(from);
-    match direction {
-        Direction::Forward => (from + 1..hits.len()).find(|&j| key(j) != cur),
-        Direction::Backward => {
-            // Walk back to the first hit of the current file.
-            let mut run_start = from;
-            while run_start > 0 && key(run_start - 1) == cur {
-                run_start -= 1;
-            }
-            if from != run_start {
-                return Some(run_start); // not at the top of this file → go there
-            }
-            if run_start == 0 {
-                return None; // already on the very first hit
-            }
-            // At the top of this file → walk to the top of the previous file.
-            let prev = key(run_start - 1);
-            let mut p = run_start - 1;
-            while p > 0 && key(p - 1) == prev {
-                p -= 1;
-            }
-            Some(p)
-        }
-    }
-}
-
-/// Move a picker's selection to the next / previous *section* — per-kind grouping (Grep: by file;
-/// DocumentSymbols: by top-level unit). Computed against the full cached result list so it works
-/// past the client's over-fetch window; the client frames the returned item via
+/// Move a picker's selection to the next / previous *section* — the header-grouped kinds jump
+/// by group run (`PickerState::group_boundary`, the same grouping as the pushed spans);
+/// DocumentSymbols jumps by top-level unit. Computed against the full cached result list so it
+/// works past the client's over-fetch window; the client frames the returned item via
 /// `picker/view { center_on }`. `None` when there's no further section that way.
 pub async fn picker_section_jump(
     state: &SharedState,
@@ -12606,24 +12571,6 @@ pub async fn picker_section_jump(
         return Ok(None);
     };
     match &picker.candidates {
-        picker_state::PickerCandidates::Grep(hits) => {
-            if hits.is_empty() {
-                return Ok(None);
-            }
-            let from = (params.from_index as usize).min(hits.len() - 1);
-            let Some(target) = grep_file_boundary(hits, from, params.direction) else {
-                return Ok(None);
-            };
-            let h = &hits[target];
-            Ok(Some(PickerItem::GrepHit {
-                path_index: h.path_index,
-                relative_path: h.relative_path.clone(),
-                line: h.line,
-                col: h.col,
-                preview: h.preview.clone(),
-                match_indices: h.match_indices.clone(),
-            }))
-        }
         // Top-level units are the depth-0 rows of the (ranked, display-order) outline. Work in
         // ranked-position space so a query filter is respected; map back to a candidate index for
         // the returned item.
@@ -12642,69 +12589,24 @@ pub async fn picker_section_jump(
                     .make_item(ranked[pos] as usize, Vec::new()),
             ))
         }
-        // Git changes group by file like grep, but the ranked list is a fuzzy-filtered subset (in
-        // document order), so work in ranked space and map back — like the symbols arm above.
-        picker_state::PickerCandidates::GitChanges(cands) => {
-            let ranked = &picker.ranked;
-            if ranked.is_empty() {
-                return Ok(None);
-            }
-            let from = (params.from_index as usize).min(ranked.len() - 1);
-            let key = |pos: usize| {
-                let c = &cands[ranked[pos] as usize];
-                (c.path_index, c.relative_path.as_str())
-            };
-            let Some(pos) = file_group_boundary(ranked.len(), from, params.direction, key) else {
-                return Ok(None);
-            };
-            Ok(Some(
+        // Every header-grouped kind (grep and git-changes file runs, keybinding groups,
+        // reference sections, workspace-diagnostic files): one generic ranked-space boundary
+        // walk off the same grouping that produces the pushed spans, so the jump always lands
+        // on a row a client renders a header above.
+        _ => Ok(picker
+            .group_boundary(params.from_index as usize, params.direction)
+            .map(|pos| {
                 picker
                     .candidates
-                    .make_item(ranked[pos] as usize, Vec::new()),
-            ))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Position of the next / previous file-group boundary in a list whose rows carry the group key
-/// `key(pos)`, mirroring [`grep_file_boundary`]'s feel but generic over the key source (so it
-/// serves the ranked-space Git-changes list). `Forward` → the first row of the next file;
-/// `Backward` → this file's first row, or the previous file's first row when already there.
-fn file_group_boundary<'a>(
-    len: usize,
-    from: usize,
-    direction: Direction,
-    key: impl Fn(usize) -> (u32, &'a str),
-) -> Option<usize> {
-    let cur = key(from);
-    match direction {
-        Direction::Forward => (from + 1..len).find(|&j| key(j) != cur),
-        Direction::Backward => {
-            let mut run_start = from;
-            while run_start > 0 && key(run_start - 1) == cur {
-                run_start -= 1;
-            }
-            if from != run_start {
-                return Some(run_start);
-            }
-            if run_start == 0 {
-                return None;
-            }
-            let prev = key(run_start - 1);
-            let mut p = run_start - 1;
-            while p > 0 && key(p - 1) == prev {
-                p -= 1;
-            }
-            Some(p)
-        }
+                    .make_item(picker.ranked[pos] as usize, Vec::new())
+            })),
     }
 }
 
 /// Ranked position of the next / previous top-level (depth-0) symbol, mirroring
-/// [`grep_file_boundary`]'s feel. `Forward` → the next depth-0 row. `Backward` → this unit's own
-/// header (the nearest depth-0 row at or before `from`) when the selection sits below it, else the
-/// previous unit's header. `None` when there's no further unit that way.
+/// `PickerState::group_boundary`'s feel. `Forward` → the next depth-0 row. `Backward` → this
+/// unit's own header (the nearest depth-0 row at or before `from`) when the selection sits below
+/// it, else the previous unit's header. `None` when there's no further unit that way.
 fn symbol_unit_boundary(
     syms: &[picker_state::SymbolCandidate],
     ranked: &[u32],
@@ -13591,62 +13493,6 @@ mod subscribe_snapshot_tests {
     }
 }
 
-#[cfg(test)]
-mod grep_boundary_tests {
-    use super::*;
-
-    fn hit(rel: &str, line: u32) -> picker_state::GrepHitCandidate {
-        picker_state::GrepHitCandidate {
-            path_index: 0,
-            relative_path: rel.to_string(),
-            abs_path: format!("/ws/{rel}"),
-            line,
-            col: 0,
-            match_byte_len: 1,
-            preview: String::new(),
-            match_indices: Vec::new(),
-        }
-    }
-
-    // Three files in walker order: a.rs (3 hits), b.rs (1 hit), c.rs (2 hits).
-    fn sample() -> Vec<picker_state::GrepHitCandidate> {
-        vec![
-            hit("a.rs", 1),
-            hit("a.rs", 5),
-            hit("a.rs", 9), // indices 0,1,2
-            hit("b.rs", 2), // index 3
-            hit("c.rs", 1),
-            hit("c.rs", 4), // indices 4,5
-        ]
-    }
-
-    #[test]
-    fn forward_jumps_to_next_files_first_hit() {
-        let h = sample();
-        // From anywhere within a.rs → the first hit of b.rs (index 3).
-        assert_eq!(grep_file_boundary(&h, 0, Direction::Forward), Some(3));
-        assert_eq!(grep_file_boundary(&h, 2, Direction::Forward), Some(3));
-        // From b.rs → the first hit of c.rs (index 4).
-        assert_eq!(grep_file_boundary(&h, 3, Direction::Forward), Some(4));
-        // Within the last file → nothing further forward.
-        assert_eq!(grep_file_boundary(&h, 4, Direction::Forward), None);
-        assert_eq!(grep_file_boundary(&h, 5, Direction::Forward), None);
-    }
-
-    #[test]
-    fn backward_goes_to_current_file_top_then_previous_file() {
-        let h = sample();
-        // Mid-file (a.rs, index 2) → top of a.rs (index 0).
-        assert_eq!(grep_file_boundary(&h, 2, Direction::Backward), Some(0));
-        assert_eq!(grep_file_boundary(&h, 1, Direction::Backward), Some(0));
-        // Already on the top of c.rs (index 4) → top of the previous file b.rs (index 3).
-        assert_eq!(grep_file_boundary(&h, 4, Direction::Backward), Some(3));
-        // Top of b.rs (index 3) → top of a.rs (index 0).
-        assert_eq!(grep_file_boundary(&h, 3, Direction::Backward), Some(0));
-        // The very first hit → nothing further back.
-        assert_eq!(grep_file_boundary(&h, 0, Direction::Backward), None);
-    }
-}
 
 #[cfg(test)]
 mod diagnostic_span_tests {

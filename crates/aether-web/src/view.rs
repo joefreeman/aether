@@ -131,6 +131,10 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 "offset": p.offset,
                 "selected": p.selected,
                 "items": p.items.iter().map(jv).collect::<Vec<_>>(),
+                // The window's group runs (server-pushed `GroupSpan`s, window-relative starts) —
+                // the shell renders one header row per span instead of re-deriving boundaries
+                // from item fields.
+                "groups": p.groups.iter().map(jv).collect::<Vec<_>>(),
                 "total_matches": p.total_matches,
                 "total_candidates": p.total_candidates,
                 // The web throbber is CSS-animated off `ticking` (the braille `spinner_glyph` is for

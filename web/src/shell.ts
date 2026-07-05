@@ -30,6 +30,7 @@ import type {
   CursorState,
   DiagnosticCounts,
   GitBlameLineResult,
+  GroupSpan,
   LogicalPosition,
   LspServerStatus,
   PickerItem,
@@ -51,6 +52,10 @@ const CONTINUATION_MARKER_WIDTH = 2;
 // path) are segment-elided to this cap, consistently with the native clients.
 const TITLE_LABEL_MAX = 60;
 const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
+// Vertical breathing room between picker group runs (after each group except the last). Must
+// match `--picker-group-gap` in theme.css — the CSS renders it (section margins), this constant
+// keeps the virtual-scroll geometry honest about it (see `applyGeometry`).
+const GROUP_GAP_PX = 6;
 // Fraction of the viewport above a jumped-to / `;`-placed cursor. Mirrors the core's
 // `CURSOR_REST_FRACTION` (the web jump-reveal + subscribe framing don't cross the wasm boundary).
 const CURSOR_REST_FRACTION = 0.2;
@@ -278,6 +283,10 @@ interface PickerView {
   offset: number;
   selected: number;
   items: PickerItem[];
+  /** Server-pushed group runs over `items` (window-relative starts, in order); empty for
+   *  ungrouped kinds. The shell opens one section + header row per span instead of re-deriving
+   *  boundaries from item fields. */
+  groups: GroupSpan[];
   total_matches: number;
   total_candidates: number;
   ticking: boolean;
@@ -3440,82 +3449,49 @@ export class Shell {
     // Virtual scroll (matching the native client): a full-height spacer sized to the whole result set
     // (in display rows) holds the loaded window, absolutely positioned `window_base` rows down — so
     // the scrollbar spans every result and scrolling into an unloaded range refetches it
-    // (onPickerListScroll). Grep rows are grouped per file in a `.grep-section` so the file header can
-    // stick while its hits scroll; a hit's `scroll-margin-top` keeps it clear of that sticky header.
+    // (onPickerListScroll). Grouped rows live in a `.picker-section` per server-pushed group span so
+    // the section header can stick while its rows scroll; a row's `scroll-margin-top` keeps it clear
+    // of that sticky header.
     const win = document.createElement("div");
     win.className = "picker-window";
     const localSel = p.selected - p.offset;
     let selectedRow: HTMLElement | null = null;
-    let prevGrepKey: string | null = null;
     let section: HTMLElement | null = null;
-    // Grep, workspace git-changes, and workspace diagnostics group per file with a sticky header; the
-    // buffer-locked git_changes_file / diagnostics are flat/single-file (the core emits matching
-    // flat display-row offsets/counts).
-    const groupByFile =
-      p.kind === "grep" || p.kind === "git_changes" || p.kind === "diagnostics_workspace";
     // Headers must be the same height as their kind's item rows (the virtual scroll assumes
     // uniform display rows): tight 1px padding only where the rows are tight `.grep-hit` code
     // lines; the standard-height kinds keep the default row padding.
     const headerClass =
       p.kind === "grep" || p.kind === "git_changes"
-        ? "picker-row grep-header tight"
-        : "picker-row grep-header";
+        ? "picker-row picker-group-header tight"
+        : "picker-row picker-group-header";
+    let spanIdx = 0;
     p.items.forEach((item, i) => {
-      if (
-        groupByFile &&
-        (item.kind === "grep_hit" || item.kind === "git_change" || item.kind === "diagnostic")
-      ) {
-        // Diagnostic items carry the path optionally (the buffer picker omits it); in the grouped
-        // workspace picker it's always present.
-        const pathIndex = item.path_index ?? 0;
-        const relPath = item.relative_path ?? "";
-        const key = `${pathIndex}\0${relPath}`;
-        if (key !== prevGrepKey) {
-          prevGrepKey = key;
-          section = document.createElement("div");
-          section.className = "grep-section";
-          const h = document.createElement("div");
-          h.className = headerClass;
+      // Group boundaries are server-pushed spans (window-relative, in order) — open a new section
+      // with its header row wherever a span starts. A window starting mid-group repeats the split
+      // group's header as its first span (start === 0), so the window is self-describing.
+      while (spanIdx < p.groups.length && p.groups[spanIdx].start === i) {
+        const header = p.groups[spanIdx].header;
+        spanIdx++;
+        section = document.createElement("div");
+        section.className = "picker-section";
+        const h = document.createElement("div");
+        h.className = headerClass;
+        if (header.kind === "file") {
+          // File header: the path with root-label disambiguation + budget truncation, matching
+          // file rows elsewhere.
           if (labels.length > 1) {
-            const label = labels[pathIndex] ?? `root ${pathIndex}`;
+            const label = labels[header.path_index] ?? `root ${header.path_index}`;
             const pb = Math.max(8, budget - [...label].length - 2);
-            h.textContent = `${label}: ${truncatePath(relPath, undefined, pb).display}`;
+            h.textContent = `${label}: ${truncatePath(header.relative_path, undefined, pb).display}`;
           } else {
-            h.textContent = truncatePath(relPath, undefined, budget).display;
+            h.textContent = truncatePath(header.relative_path, undefined, budget).display;
           }
-          section.append(h);
-          win.append(section);
+        } else {
+          // Label header: rendered verbatim (Definition/References sections, keybinding groups).
+          h.textContent = header.label;
         }
-      }
-      // References split into a Definition section and a References section: a non-selectable label
-      // row at each is_definition transition (references arrive definition-first). The same
-      // section-header chrome as grep, keyed on the boolean rather than a file path.
-      if (item.kind === "reference") {
-        const key = item.is_definition ? "def" : "use";
-        if (key !== prevGrepKey) {
-          prevGrepKey = key;
-          section = document.createElement("div");
-          section.className = "grep-section";
-          const h = document.createElement("div");
-          h.className = headerClass;
-          h.textContent = item.is_definition ? "Definition" : "References";
-          section.append(h);
-          win.append(section);
-        }
-      }
-      // Keybindings group under one section per binding group (rows arrive bucketed, and matches
-      // keep that order, so each group is a contiguous run) — same chrome, keyed on the group.
-      if (item.kind === "keybinding") {
-        if (item.group !== prevGrepKey) {
-          prevGrepKey = item.group;
-          section = document.createElement("div");
-          section.className = "grep-section";
-          const h = document.createElement("div");
-          h.className = headerClass;
-          h.textContent = item.group;
-          section.append(h);
-          win.append(section);
-        }
+        section.append(h);
+        win.append(section);
       }
       // File-backed rows are <a> so Ctrl/Cmd/middle-click opens in a new browser tab (the boot URL
       // reader lands the tab on the file); other rows stay plain <div>s. CSS makes them look alike.
@@ -3618,8 +3594,18 @@ export class Shell {
     // never carries the create row, so add a row for it). Applied before insertion — the window/create
     // are absolute, so without an explicit spacer height the list would collapse and clamp scrollTop.
     const applyGeometry = () => {
-      win.style.top = `${p.window_base * this.pickerRowH}px`;
-      spacer.style.height = `${(p.total_display_rows + (createRow ? 1 : 0)) * this.pickerRowH}px`;
+      // Inter-group gaps (grouped kinds): each `.picker-section` except the window's last
+      // carries a CSS margin below it, so the same pixels must enter the virtual geometry or
+      // the spacer under-counts and the window drifts (the row-height-mismatch bug's cousin).
+      // Total gaps = total groups − 1, and groups fall out of the display metrics
+      // (`total_display_rows − total_matches`); gaps above the window = groups that ended
+      // above it = `window_base − offset` (the headers strictly above — every grouped window
+      // leads with its own header). Both zero for the flat kinds.
+      const grouped = p.groups.length > 0;
+      const totalGaps = grouped ? Math.max(0, p.total_display_rows - p.total_matches - 1) : 0;
+      const gapsAbove = grouped ? Math.max(0, p.window_base - p.offset) : 0;
+      win.style.top = `${p.window_base * this.pickerRowH + gapsAbove * GROUP_GAP_PX}px`;
+      spacer.style.height = `${(p.total_display_rows + (createRow ? 1 : 0)) * this.pickerRowH + totalGaps * GROUP_GAP_PX}px`;
       if (createRow) createRow.style.top = `${p.total_matches * this.pickerRowH}px`;
       list.style.setProperty("--picker-row-h", `${this.pickerRowH}px`);
     };
@@ -3627,7 +3613,7 @@ export class Shell {
     list.replaceChildren(spacer);
     // Re-measure the row height once in the DOM (fractional, so it doesn't drift over a long list) and
     // re-apply if it changed.
-    const probe = win.querySelector(".picker-row:not(.grep-header)") as HTMLElement | null;
+    const probe = win.querySelector(".picker-row:not(.picker-group-header)") as HTMLElement | null;
     const measured = probe?.getBoundingClientRect().height ?? 0;
     if (measured > 0 && Math.abs(measured - this.pickerRowH) > 0.5) {
       this.pickerRowH = measured;
@@ -3636,8 +3622,8 @@ export class Shell {
 
     // Only move the scroll on an explicit signal: jump to the top on a query change, or reveal the
     // highlighted row after keyboard nav / a refetch. A free wheel-scroll sets neither, so it stays
-    // where the user left it. (`scroll-margin-top` on grep hits keeps a revealed hit below the sticky
-    // file header.) Reset wins — the selection is row 0.
+    // where the user left it. (`scroll-margin-top` on grouped rows keeps a revealed row below the
+    // sticky group header.) Reset wins — the selection is row 0.
     if (this.pickerScrollReset) {
       list.scrollTop = 0;
       this.pickerScrollReset = false;

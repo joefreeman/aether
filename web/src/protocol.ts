@@ -381,3 +381,22 @@ export type PickerItem =
        *  rebased per segment by the shell (mirrors aether-client `keybinding_match_segments`). */
       match_indices?: number[];
     };
+
+/** Mirrors aether-protocol::picker::GroupHeader (serde tag = "kind", snake_case). What a group's
+ *  header row shows: `file` carries the workspace-relative location and the client formats it
+ *  (root labels are client-derived); `label` is rendered verbatim (References' Definition /
+ *  References sections, a keybinding group's name). */
+export type GroupHeader =
+  | { kind: "file"; path_index: number; relative_path: string }
+  | { kind: "label"; label: string };
+
+/** Mirrors aether-protocol::picker::GroupSpan. One group run within a pushed window: the items
+ *  from `start` (0-based index into the *window's* items, NOT the absolute ranked index) up to
+ *  the next span (or the window's end) render under `header`. The server is the single source of
+ *  group boundaries. Invariant for grouped kinds: a non-empty window's first span always has
+ *  `start === 0` — a window starting mid-group repeats the split group's header. Ungrouped kinds
+ *  send no spans. */
+export interface GroupSpan {
+  start: number;
+  header: GroupHeader;
+}
