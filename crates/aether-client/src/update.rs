@@ -9,7 +9,7 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
-    buffer_info, label_for_path, min_pos, severity_label, step_font_size, strip_longest_root,
+    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
     HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry,
     SearchSnapshot, SearchState, Session, SneakState, TextField, WorkspaceSettings,
@@ -1557,7 +1557,12 @@ impl Session {
         let text = if absolute {
             path.to_string()
         } else {
-            label_for_path(path, &self.workspace_paths)
+            // Bare root-relative path — unlike the display label, no `root:` prefix in
+            // multi-root workspaces. Falls back to the absolute path outside every root.
+            match strip_longest_root(path, &self.workspace_paths) {
+                Some((_, rel)) => rel,
+                None => path.to_string(),
+            }
         };
         // Grouped: copying again (absolute vs relative) updates one toast rather than stacking.
         let mut fx = Effects::toast_grouped(

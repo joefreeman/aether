@@ -2736,6 +2736,18 @@ fn space_p_copies_relative_and_absolute_paths() {
 }
 
 #[test]
+fn space_p_multi_root_copies_bare_relative_path() {
+    let mut s = session();
+    s.workspace_paths = vec!["/proj/alpha".into(), "/proj/beta".into()];
+    s.buffer.path = Some("/proj/beta/src/main.rs".into());
+
+    // Unlike the status-bar label, the copied path carries no `root:` prefix.
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
+    assert_eq!(written_clipboard(&fx).as_deref(), Some("src/main.rs"));
+}
+
+#[test]
 fn copy_path_warns_for_scratch_buffer() {
     let mut s = session();
     s.buffer.path = None; // a scratch buffer
