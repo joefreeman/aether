@@ -3010,23 +3010,35 @@ impl App {
         // whole body is built in `Message` space: the Clone-only buttons map their `PromptMsg`
         // immediately rather than the whole tree being mapped at the end.
         // The modal button roles, mirroring the web client's `.modal-btn` classes: `Default` is the
-        // safe, Enter-target option (Cancel/No) — a plain, subtly bordered button; `Danger` is a
-        // destructive confirm (Yes) in red; `Primary` is a non-destructive affirmative (Save) in
-        // frost blue.
+        // safe option (Cancel/No) — a plain, subtly bordered button; `Danger` is a destructive
+        // confirm (Yes) in red; `Primary` is a non-destructive affirmative (Save) in frost blue.
+        // Whichever button Enter triggers sits right-most, macOS-alert style: Primary for Save/Open,
+        // but Default for the destructive confirms (Enter declines those — see `on_prompt_key`).
         #[derive(Clone, Copy)]
         enum BtnRole {
             Default,
             Danger,
             Primary,
         }
-        let btn = |label: &str, role: BtnRole, msg: PromptMsg| -> Element<'_, Message> {
-            Element::from(
-                iced::widget::button(
-                    text(label.to_string())
-                        .size(13)
+        // `key` is the shortcut hint rendered dimly after the label (the confirm buttons advertise
+        // `y`/`n`); the save/open dialogs pass `None` — their Enter/Esc mapping is conventional.
+        let btn = |label: &str, key: Option<&str>, role: BtnRole, msg: PromptMsg| -> Element<'_, Message> {
+            let mut content = row![text(label.to_string()).size(13).font(SANS).color(theme::NORD6)]
+                .spacing(7)
+                .align_y(iced::Alignment::Center);
+            if let Some(key) = key {
+                content = content.push(
+                    text(format!("({key})"))
+                        .size(11)
                         .font(SANS)
-                        .color(theme::NORD6),
-                )
+                        .color(iced::Color {
+                            a: 0.55,
+                            ..theme::NORD6
+                        }),
+                );
+            }
+            Element::from(
+                iced::widget::button(content)
                 .padding([5, 14])
                 .style(move |_, _| {
                     let (bg, border_width, border_color) = match role {
@@ -3118,8 +3130,8 @@ impl App {
                     .color(theme::NORD6),
                 row![
                     iced::widget::Space::new().width(Length::Fill),
-                    btn("No", BtnRole::Default, PromptMsg::Cancel),
-                    btn("Yes", BtnRole::Danger, PromptMsg::Accept),
+                    btn("Yes", Some("y"), BtnRole::Danger, PromptMsg::Accept),
+                    btn("No", Some("n"), BtnRole::Default, PromptMsg::Cancel),
                 ]
                 .spacing(8),
             ]
@@ -3218,8 +3230,8 @@ impl App {
                         }),
                     row![
                         iced::widget::Space::new().width(Length::Fill),
-                        btn("Cancel", BtnRole::Default, PromptMsg::Cancel),
-                        btn("Save", BtnRole::Primary, PromptMsg::Accept),
+                        btn("Cancel", None, BtnRole::Default, PromptMsg::Cancel),
+                        btn("Save", None, BtnRole::Primary, PromptMsg::Accept),
                     ]
                     .spacing(8),
                 ]
@@ -3268,8 +3280,8 @@ impl App {
                         }),
                     row![
                         iced::widget::Space::new().width(Length::Fill),
-                        btn("Cancel", BtnRole::Default, PromptMsg::Cancel),
-                        btn("Open", BtnRole::Primary, PromptMsg::Accept),
+                        btn("Cancel", None, BtnRole::Default, PromptMsg::Cancel),
+                        btn("Open", None, BtnRole::Primary, PromptMsg::Accept),
                     ]
                     .spacing(8),
                 ]

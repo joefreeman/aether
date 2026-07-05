@@ -1452,6 +1452,11 @@ export class Shell {
    *  Confirm/lsp-info prompts have no input and stay on the window handler. */
   private overlayOwnsKeyboard(): boolean {
     const v = this.snapshot;
+    // A modal prompt (confirm / lsp-info) can layer *over* an input overlay (delete-confirm over the
+    // Files picker, lsp-info over the LSP picker). The prompt owns the keyboard then: focus parks on
+    // the capture field (see `focusTarget`) and keys route through the window handler to the core's
+    // prompt handling — the picker beneath must not reclaim them.
+    if (v?.prompt && v.prompt.kind !== "saveas" && v.prompt.kind !== "openpath") return false;
     return !!(
       v &&
       (v.picker ||
@@ -2282,6 +2287,11 @@ export class Shell {
     this.renderPicker(v);
     this.renderWorkspaceSettings(v);
     this.renderAppSettings(v);
+    // Re-park focus for the new state (no-op when already right). The focusout self-heal only
+    // catches focus *drifting*; this catches the state moving under a still-focused input — e.g. a
+    // delete-confirm opening over the Files picker, where the query input would otherwise keep
+    // focus and swallow `y`/`n` as native typing.
+    this.ensureFocus();
     // No workspace yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
     // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
     if (v.buffer.buffer_id === 0) {
@@ -2526,17 +2536,28 @@ export class Shell {
           this.session.on_key(key, false, false, false, this.visibleRows()) as CoreEffect[],
         );
       };
-      const cancel = document.createElement("span");
+      // Each button carries a dim `modal-key` hint advertising its keyboard shortcut (`y`/`n` —
+      // any non-`y` key declines, `n` is just the advertised one).
+      const confirmBtn = (label: string, key: string) => {
+        const btn = document.createElement("span");
+        btn.textContent = label;
+        const hint = document.createElement("span");
+        hint.className = "modal-key";
+        hint.textContent = `(${key})`;
+        btn.append(hint);
+        return btn;
+      };
       // "No" is the safe default (Enter declines via the core's on_prompt_key) — a plain, subtly
-      // bordered button; the destructive "Yes" carries the red `danger` accent.
+      // bordered button in the right-most default slot; the destructive "Yes" carries the red
+      // `danger` accent and sits on the left, macOS-alert style, so Enter's target is where GUI
+      // muscle memory expects it.
+      const cancel = confirmBtn("No", "n");
       cancel.className = "modal-btn";
-      cancel.textContent = "No";
       cancel.addEventListener("click", () => sendKey("Escape"));
-      const ok = document.createElement("span");
+      const ok = confirmBtn("Yes", "y");
       ok.className = "modal-btn danger";
-      ok.textContent = "Yes";
       ok.addEventListener("click", () => sendKey("y"));
-      buttons.append(cancel, ok);
+      buttons.append(ok, cancel);
       modal.append(msg, buttons);
     } else {
       // lsp-info: full server detail (the status is already projected in the view). Ctrl-r restarts

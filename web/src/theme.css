@@ -532,6 +532,9 @@ html, body, #app {
 .modal-btn.primary:hover { background: var(--nord8); border-color: var(--nord8); }
 .modal-btn.danger { background: var(--nord11); border-color: var(--nord11); }
 .modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
+/* Dim per-button shortcut hint (the confirm buttons advertise `y`/`n`). Inherits the button's
+   text colour so it stays legible on both the plain and red fills. */
+.modal-btn .modal-key { margin-left: 7px; font-size: 11px; opacity: 0.55; }
 
 /* Pickers + dialogs (save-as, workspace settings) share the picker offset (8vh from .overlay).
    Only confirmations sit lower, so a confirm over a picker doesn't align with it; and they layer
