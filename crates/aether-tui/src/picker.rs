@@ -823,6 +823,13 @@ pub enum ItemKey<'a> {
         language: &'a str,
         workspace_root: &'a str,
     },
+    /// A keyboard shortcut, identified by `(mode, keys, desc)` — a chord can be bound in several
+    /// modes, and an Alt-pair fold can reuse a description, so all three disambiguate.
+    Keybinding {
+        mode: &'a str,
+        keys: &'a str,
+        desc: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -888,6 +895,13 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         } => ItemKey::LspServer {
             language: language.as_str(),
             workspace_root: workspace_root.as_str(),
+        },
+        PickerItem::Keybinding {
+            mode, keys, desc, ..
+        } => ItemKey::Keybinding {
+            mode: mode.as_str(),
+            keys: keys.as_str(),
+            desc: desc.as_str(),
         },
     }
 }

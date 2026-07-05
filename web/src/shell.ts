@@ -84,6 +84,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   lsp_servers: "List LSPs…",
   references: "List references…",
   document_symbols: "Go to symbol…",
+  keybindings: "Search keybindings…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -131,7 +132,7 @@ function measureCell(buffer: HTMLElement): Cell {
 type ToastLevel = "info" | "error" | "warning" | "success";
 
 interface ShellActionDesc {
-  name: "scroll" | "place_cursor" | "toggle_wrap" | "open_help" | "new_window";
+  name: "scroll" | "place_cursor" | "toggle_wrap" | "new_window";
   dir?: string;
   unit?: string;
   fraction?: number;
@@ -326,11 +327,17 @@ interface RowDesc {
   primary: string;
   matches?: number[];
   meta?: string;
+  /** Fuzzy-match offsets into `meta` (code points), bolded like `matches` (keybinding chords). */
+  metaMatches?: number[];
   /** Coloured right-aligned meta (e.g. a git change's `+A -R` summary), rendered as separate spans
    *  in place of the plain `meta` text. Mutually exclusive with `meta`. */
   metaParts?: { text: string; cls: string }[];
   prefix?: string;
   prefixClass?: string;
+  /** Fuzzy-match offsets into `prefix` (code points), bolded like `matches`. */
+  prefixMatches?: number[];
+  /** Fuzzy-match offsets into `suffix` (code points), bolded like `matches`. */
+  suffixMatches?: number[];
   dir?: boolean;
   italic?: boolean;
   suffix?: string;
@@ -542,6 +549,39 @@ function matched(text: string, indices?: number[]): DocumentFragment {
   return frag;
 }
 
+/** Whether a keybinding row spells its mode out: only Insert/Search — the default modes read
+ *  as noise on every row. Mirrors the Rust protocol's `KeybindingEntry::shows_mode`. */
+function keybindingShowsMode(mode: string): boolean {
+  return mode === "Insert" || mode === "Search";
+}
+
+/** Split a keybinding row's `match_indices` — code-point offsets into the composed haystack
+ *  `"{desc} [({mode}) ]{keys}"` (the mode present only when `keybindingShowsMode`; the group is
+ *  a section header, not row text) — into per-segment offsets, rebased to each segment's start;
+ *  hits on the literal separators are dropped. Mirrors the Rust core's
+ *  `keybinding_match_segments` (aether-client/src/picker.rs), which the wasm boundary can't call. */
+function keybindingMatchSegments(
+  desc: string,
+  mode: string,
+  keys: string,
+  matchIndices?: number[],
+): { desc: number[]; mode: number[]; keys: number[] } {
+  const d = [...desc].length;
+  const m = keybindingShowsMode(mode) ? [...mode].length : 0;
+  const k = [...keys].length;
+  // Segment start offsets within the haystack: `{desc} ({mode}) {keys}` / `{desc} {keys}`.
+  const modeAt = d + 2; // only meaningful when `m > 0`
+  const keysAt = m > 0 ? d + 2 + m + 2 : d + 1;
+  const out: { desc: number[]; mode: number[]; keys: number[] } =
+    { desc: [], mode: [], keys: [] };
+  for (const i of matchIndices ?? []) {
+    if (i < d) out.desc.push(i);
+    else if (m > 0 && i >= modeAt && i < modeAt + m) out.mode.push(i - modeAt);
+    else if (i >= keysAt && i < keysAt + k) out.keys.push(i - keysAt);
+  }
+  return out;
+}
+
 /** Distil a `PickerItem` to its row display. `labels` is the disambiguated per-root label set
  *  (`rootLabels`, "" for single-root); `budget` is the char allowance for paths (segment-elided). */
 function describePickerItem(
@@ -698,6 +738,24 @@ function describePickerItem(
         dim: item.context || undefined,
       };
     }
+    case "keybinding": {
+      // The description in base style (the group is the section header above the run, not row
+      // text), a dim `(mode)` for Insert/Search rows — matching the haystack — and the chord
+      // right-aligned as the meta (the row's flex gap renders the separator space). Fuzzy
+      // matches land in any segment; rebase the haystack offsets per segment (the mode's shift
+      // by 1 for the suffix's leading `(`).
+      const seg = keybindingMatchSegments(item.desc, item.mode, item.keys, item.match_indices);
+      const showsMode = keybindingShowsMode(item.mode);
+      return {
+        primary: item.desc,
+        matches: seg.desc,
+        ...(showsMode
+          ? { suffix: `(${item.mode})`, suffixMatches: seg.mode.map((i) => i + 1) }
+          : {}),
+        meta: item.keys,
+        metaMatches: seg.keys,
+      };
+    }
   }
 }
 
@@ -809,16 +867,6 @@ export class Shell {
   /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
    *  (this runs on every status render). */
   private faviconKey = "";
-  /** The keyboard-shortcut help overlay (Space ?). A shell-local overlay — the core only triggers it
-   *  (Effect::ShellAction OpenHelp); its content is sourced from the core's keymap (help_entries) and
-   *  its tab/scroll/close keys are handled here, not the core. Built once, cached. */
-  private readonly helpEl: HTMLElement;
-  private readonly helpTabsEl: HTMLElement;
-  private readonly helpGridEl: HTMLElement;
-  private helpOpen = false;
-  private helpTab = 0;
-  private helpData: { label: string; sections: { title: string; rows: [string, string][] }[] }[] | null = null;
-  private helpTabEls: HTMLElement[] = [];
   /** The workspace-settings overlay (Space ,). Core-owned state (`session.workspace_settings`); the
    *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
    *  text editing and sync to the core (`workspace_settings_set_name` / `_set_add`); nav/commit/cancel
@@ -1176,22 +1224,6 @@ export class Shell {
     this.faviconEl.rel = "icon";
     document.head.appendChild(this.faviconEl);
     this.faviconDark.addEventListener("change", () => this.updateFavicon());
-    // The help overlay (Space ?): a backdrop + a tabbed, scrollable modal. Content is filled lazily
-    // from the core's keymap on first open; clicking the backdrop closes it.
-    this.helpEl = document.createElement("div");
-    this.helpEl.className = "overlay";
-    this.helpEl.style.display = "none";
-    const helpBox = document.createElement("div");
-    helpBox.className = "modal help";
-    this.helpTabsEl = document.createElement("div");
-    this.helpTabsEl.className = "help-tabs";
-    this.helpGridEl = document.createElement("div");
-    this.helpGridEl.className = "help-grid";
-    helpBox.append(this.helpTabsEl, this.helpGridEl);
-    this.helpEl.append(helpBox);
-    this.helpEl.addEventListener("mousedown", (e) => {
-      if (e.target === this.helpEl) this.closeHelp();
-    });
     // The workspace-settings overlay (Space ,): a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
@@ -1282,7 +1314,6 @@ export class Shell {
       this.pickerEl,
       // `hoverEl` is not appended here — it's parented into the buffer's spacer while shown (so it
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
-      this.helpEl,
       this.workspaceSettingsEl,
       this.appSettingsEl,
       this.connBanner,
@@ -1484,12 +1515,6 @@ export class Shell {
       t === this.psNameInput ||
       t === this.psAddInput
     ) {
-      return;
-    }
-    // The help overlay owns the keyboard while open (tab switching, scrolling, close).
-    if (this.helpOpen) {
-      e.preventDefault();
-      this.handleHelpKey(e);
       return;
     }
     // While a hover popover is open, it reuses the editor's own Copy / Scroll bindings — resolved
@@ -1856,9 +1881,6 @@ export class Shell {
       case "toggle_wrap":
         this.session.toggle_wrap(); // flip core wrap state (no effects); then re-render the viewport
         void this.setWrap();
-        break;
-      case "open_help":
-        this.openHelp();
         break;
       case "new_window":
         // Open another tab/window onto the same server URL (which carries the workspace): it
@@ -3326,110 +3348,6 @@ export class Shell {
     this.hoverEl.replaceChildren();
   }
 
-  // ---- help overlay (Space ?) -----------------------------------------------------------------
-
-  /** Show the keyboard-shortcut help overlay (Effect::ShellAction OpenHelp). Lazily sources the table
-   *  from the core's keymap (help_entries) and builds the tab bar once, then reveals it. */
-  private openHelp(): void {
-    if (!this.helpData) {
-      const entries = this.session.help_entries() as { tab: string; group: string; keys: string; desc: string }[];
-      const order = ["Normal", "Insert", "Search", "Application"];
-      this.helpData = order.map((label) => {
-        const sections: { title: string; rows: [string, string][] }[] = [];
-        for (const e of entries.filter((x) => x.tab === label)) {
-          let sec = sections.find((s) => s.title === e.group);
-          if (!sec) {
-            sec = { title: e.group, rows: [] };
-            sections.push(sec);
-          }
-          sec.rows.push([e.keys, e.desc]);
-        }
-        return { label, sections };
-      });
-      this.helpTabEls = this.helpData.map((tab, i) => {
-        const t = document.createElement("button");
-        t.className = "help-tab";
-        t.textContent = tab.label;
-        t.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          this.selectHelpTab(i);
-        });
-        return t;
-      });
-      this.helpTabsEl.replaceChildren(...this.helpTabEls);
-    }
-    this.helpOpen = true;
-    this.helpEl.style.display = "";
-    this.selectHelpTab(this.helpTab);
-  }
-
-  /** Switch the active help tab (← / → / Tab / 1-4 / click) and re-render its sections. */
-  private selectHelpTab(i: number): void {
-    if (!this.helpData) return;
-    this.helpTab = (i + this.helpData.length) % this.helpData.length;
-    this.helpTabEls.forEach((t, j) => t.classList.toggle("active", j === this.helpTab));
-    const sections = this.helpData[this.helpTab].sections.map((section) => {
-      const sec = document.createElement("div");
-      sec.className = "help-section";
-      const h = document.createElement("div");
-      h.className = "help-section-title";
-      h.textContent = section.title;
-      sec.append(h);
-      for (const [keys, desc] of section.rows) {
-        const row = document.createElement("div");
-        row.className = "help-row";
-        const k = document.createElement("span");
-        k.className = "help-key";
-        k.textContent = keys;
-        const d = document.createElement("span");
-        d.className = "help-desc";
-        d.textContent = desc;
-        row.append(k, d);
-        sec.append(row);
-      }
-      return sec;
-    });
-    this.helpGridEl.replaceChildren(...sections);
-    this.helpGridEl.scrollTop = 0;
-  }
-
-  private closeHelp(): void {
-    if (!this.helpOpen) return;
-    this.helpOpen = false;
-    this.helpEl.style.display = "none";
-    this.ensureFocus();
-  }
-
-  /** The help overlay owns the keyboard while open: tab switching, scrolling, and close. Returns true
-   *  when it consumed the key (so the window handler stops). */
-  private handleHelpKey(e: KeyboardEvent): boolean {
-    const k = e.key;
-    if (k === "Escape" || k === "?" || k === "q") {
-      this.closeHelp();
-    } else if (k === "ArrowRight" || (k === "Tab" && !e.shiftKey) || k === "l") {
-      this.selectHelpTab(this.helpTab + 1);
-    } else if (k === "ArrowLeft" || (k === "Tab" && e.shiftKey) || k === "h") {
-      this.selectHelpTab(this.helpTab - 1);
-    } else if (k >= "1" && k <= String(this.helpData?.length ?? 4)) {
-      this.selectHelpTab(Number(k) - 1);
-    } else if (k === "ArrowDown" || k === "j" || k === " ") {
-      this.helpGridEl.scrollBy({ top: k === " " ? this.helpGridEl.clientHeight - 40 : 40 });
-    } else if (k === "ArrowUp" || k === "k") {
-      this.helpGridEl.scrollBy({ top: -40 });
-    } else if (k === "PageDown") {
-      this.helpGridEl.scrollBy({ top: this.helpGridEl.clientHeight - 40 });
-    } else if (k === "PageUp") {
-      this.helpGridEl.scrollBy({ top: -(this.helpGridEl.clientHeight - 40) });
-    } else if (k === "g" || k === "Home") {
-      this.helpGridEl.scrollTop = 0;
-    } else if (k === "G" || k === "End") {
-      this.helpGridEl.scrollTop = this.helpGridEl.scrollHeight;
-    } else if (k === "Shift" || k === "Control" || k === "Alt" || k === "Meta") {
-      return true; // swallow lone modifiers; wait for the real key
-    }
-    return true; // the help overlay consumes every key while open
-  }
-
   /** The Explorer's synthetic "+ Create …" row — italic, like the TUI/iced. Selecting it (click or
    *  Enter on the highlight) routes through `picker_click(abs)` → the core's create action. */
   private makePickerCreateRow(p: PickerView): HTMLElement {
@@ -3535,6 +3453,13 @@ export class Shell {
     // flat display-row offsets/counts).
     const groupByFile =
       p.kind === "grep" || p.kind === "git_changes" || p.kind === "diagnostics_workspace";
+    // Headers must be the same height as their kind's item rows (the virtual scroll assumes
+    // uniform display rows): tight 1px padding only where the rows are tight `.grep-hit` code
+    // lines; the standard-height kinds keep the default row padding.
+    const headerClass =
+      p.kind === "grep" || p.kind === "git_changes"
+        ? "picker-row grep-header tight"
+        : "picker-row grep-header";
     p.items.forEach((item, i) => {
       if (
         groupByFile &&
@@ -3550,7 +3475,7 @@ export class Shell {
           section = document.createElement("div");
           section.className = "grep-section";
           const h = document.createElement("div");
-          h.className = "picker-row grep-header";
+          h.className = headerClass;
           if (labels.length > 1) {
             const label = labels[pathIndex] ?? `root ${pathIndex}`;
             const pb = Math.max(8, budget - [...label].length - 2);
@@ -3572,8 +3497,22 @@ export class Shell {
           section = document.createElement("div");
           section.className = "grep-section";
           const h = document.createElement("div");
-          h.className = "picker-row grep-header";
+          h.className = headerClass;
           h.textContent = item.is_definition ? "Definition" : "References";
+          section.append(h);
+          win.append(section);
+        }
+      }
+      // Keybindings group under one section per binding group (rows arrive bucketed, and matches
+      // keep that order, so each group is a contiguous run) — same chrome, keyed on the group.
+      if (item.kind === "keybinding") {
+        if (item.group !== prevGrepKey) {
+          prevGrepKey = item.group;
+          section = document.createElement("div");
+          section.className = "grep-section";
+          const h = document.createElement("div");
+          h.className = headerClass;
+          h.textContent = item.group;
           section.append(h);
           win.append(section);
         }
@@ -3585,6 +3524,7 @@ export class Shell {
       if (href) (row as HTMLAnchorElement).href = href;
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (item.kind === "grep_hit" || item.kind === "git_change") row.classList.add("grep-hit");
+      if (item.kind === "keybinding") row.classList.add("keybinding");
       if (i === localSel) selectedRow = row;
       row.addEventListener("mousedown", (e: MouseEvent) => {
         // New-tab gesture on an anchor row: let the browser open the <a> itself.
@@ -3617,7 +3557,7 @@ export class Shell {
       if (d.prefix) {
         const pre = document.createElement("span");
         pre.className = d.prefixClass ? `picker-prefix ${d.prefixClass}` : "picker-prefix";
-        pre.textContent = d.prefix;
+        pre.append(matched(d.prefix, d.prefixMatches));
         row.append(pre);
       }
       const main = document.createElement("span");
@@ -3630,7 +3570,7 @@ export class Shell {
       if (d.suffix) {
         const s = document.createElement("span");
         s.className = "picker-suffix";
-        s.textContent = d.suffix;
+        s.append(matched(d.suffix, d.suffixMatches));
         row.append(s);
       }
       if (d.metaParts) {
@@ -3646,7 +3586,7 @@ export class Shell {
       } else if (d.meta) {
         const m = document.createElement("span");
         m.className = "picker-meta";
-        m.textContent = d.meta;
+        m.append(matched(d.meta, d.metaMatches));
         row.append(m);
       }
       if (d.dirty) {

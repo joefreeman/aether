@@ -92,6 +92,16 @@ pub enum PickerKind {
     /// slot, independent of the workspace-wide [`GitChanges`]. Rows are the buffer's hunks, under the
     /// file's header.
     GitChangesFile,
+    /// The keyboard-shortcut reference (`Space ?`), fuzzy-matched on description, mode, and
+    /// chord, with rows grouped under one section header per binding group (the grep-style
+    /// grouping — matches keep candidate order so each group stays a contiguous run; the client
+    /// ships the rows already bucketed by group). Unique among the kinds in that the *client*
+    /// ships the candidate rows on open ([`PickerViewParams::keybindings`]) — the binding tables
+    /// live in the client core, not on the server; the server only matches and windows them.
+    /// Informational: rows aren't a jump target and there is no `PickerSelectResult` for them
+    /// (Enter just closes the picker). Like [`Workspaces`](Self::Workspaces) it's usable before
+    /// a workspace is active.
+    Keybindings,
 }
 
 impl PickerKind {
@@ -131,10 +141,11 @@ impl PickerKind {
     }
 
     /// Whether this picker interleaves non-selectable header rows above grouped runs of items.
-    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds plus References, which groups
-    /// into a `Definition` section and a `References` section. The header *content* differs per kind
-    /// — file path vs section label — but the header *row* accounting is identical, so clients gate
-    /// header-clearance and virtual-scroll row math on this single predicate.
+    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds plus the section-labelled
+    /// ones — References (a `Definition` section and a `References` section) and Keybindings (one
+    /// section per binding group). The header *content* differs per kind — file path vs section
+    /// label — but the header *row* accounting is identical, so clients gate header-clearance and
+    /// virtual-scroll row math on this single predicate.
     pub fn renders_group_headers(self) -> bool {
         matches!(
             self,
@@ -142,6 +153,7 @@ impl PickerKind {
                 | PickerKind::GitChanges
                 | PickerKind::References
                 | PickerKind::DiagnosticsWorkspace
+                | PickerKind::Keybindings
         )
     }
 
@@ -540,6 +552,66 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// One keyboard shortcut in the Keybindings picker — the [`KeybindingEntry`] the client
+    /// shipped on open, echoed back with match highlighting. Identity is `(mode, keys, desc)`
+    /// (a chord can be bound in several modes, and an Alt-pair fold can reuse a description).
+    /// The matcher haystack is [`KeybindingEntry::haystack`] — the row segments composed in
+    /// display order — and `match_indices` are char offsets into *that* string; the client
+    /// rebuilds the same composition to map them back onto the segments it renders. Not a jump
+    /// target: informational only, no `PickerSelectResult` variant.
+    Keybinding {
+        /// The row's group — rendered as the section header above the group's run, not on the
+        /// row itself (and so not part of the match haystack).
+        group: String,
+        /// One-line description, e.g. `Delete word back`.
+        desc: String,
+        /// The mode the binding applies in: `Normal` / `Insert` / `Search` / `Application` /
+        /// `Any` (the shared Ctrl-editing keys live in both Normal and Insert).
+        mode: String,
+        /// Display chord, e.g. `Ctrl-w`, `Space f ␣`.
+        keys: String,
+        /// Char offsets into [`KeybindingEntry::haystack`] covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+}
+
+/// One keyboard-shortcut row for the Keybindings picker, shipped *by the client* on open
+/// ([`PickerViewParams::keybindings`]) — the binding tables live in the client core, so each
+/// client's picker reflects exactly its own keymap; the server only fuzzy-matches and windows
+/// the rows it was given. Field meanings mirror [`PickerItem::Keybinding`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeybindingEntry {
+    pub group: String,
+    pub desc: String,
+    pub mode: String,
+    pub keys: String,
+}
+
+impl KeybindingEntry {
+    /// Whether `mode` is part of the rendered row (and therefore the haystack). Only Insert and
+    /// Search qualify — Normal, the shared `Any` keys, and the Space-leader Application chords
+    /// read as the default, so spelling their mode out on every row would be noise. The mode
+    /// still always rides the wire: it's the row's identity half and what a future
+    /// palette-execution layer would gate on.
+    pub fn shows_mode(mode: &str) -> bool {
+        matches!(mode, "Insert" | "Search")
+    }
+
+    /// The canonical string the server matches against and `match_indices` index into (char
+    /// offsets): the row's segments in display order — `{desc} ({mode}) {keys}` when
+    /// [`Self::shows_mode`], else `{desc} {keys}`. The group is *not* part of the haystack: rows
+    /// render under a per-group section header (the grep-style grouping), not with an inline
+    /// group label, so a group match would highlight nothing visible. Defined here — in the
+    /// shared protocol crate — so the server's haystack and the client's index-to-segment
+    /// mapping can never drift.
+    pub fn haystack(&self) -> String {
+        if Self::shows_mode(&self.mode) {
+            format!("{} ({}) {}", self.desc, self.mode, self.keys)
+        } else {
+            format!("{} {}", self.desc, self.keys)
+        }
+    }
 }
 
 // ---- picker filters -----------------------------------------------------------------------------
@@ -766,6 +838,11 @@ pub struct PickerViewParams {
     /// `Space Alt-g` seeding the buffer's directory chip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<PickerFilters>,
+    /// Keybindings only: the candidate rows, shipped on a fresh open (the binding tables live
+    /// client-side — see [`KeybindingEntry`]). `None` on scroll/resume re-views: the server keeps
+    /// the previously-shipped set, like the Diagnostics snapshot. Ignored for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybindings: Option<Vec<KeybindingEntry>>,
 }
 
 fn is_false(b: &bool) -> bool {

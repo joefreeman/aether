@@ -2032,6 +2032,90 @@ fn picker_item_lsp_server_is_tagged() {
 }
 
 #[test]
+fn picker_item_keybinding_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(
+        to_value(PickerKind::Keybindings).unwrap(),
+        json!("keybindings")
+    );
+    let item = PickerItem::Keybinding {
+        group: "Editing".into(),
+        desc: "Delete word back".into(),
+        mode: "Any".into(),
+        keys: "Ctrl-w".into(),
+        match_indices: vec![10, 11],
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "keybinding");
+    assert_eq!(v["group"], "Editing");
+    assert_eq!(v["desc"], "Delete word back");
+    assert_eq!(v["mode"], "Any");
+    assert_eq!(v["keys"], "Ctrl-w");
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+}
+
+#[test]
+fn keybinding_entry_haystack_composes_in_display_order() {
+    use aether_protocol::picker::KeybindingEntry;
+    // The composition is a wire contract: match_indices index into this exact string. The
+    // group is a section header, not row text, so it's absent; default modes (Normal / Any /
+    // Application) are elided too.
+    let mut e = KeybindingEntry {
+        group: "Editing".into(),
+        desc: "Delete word back".into(),
+        mode: "Any".into(),
+        keys: "Ctrl-w".into(),
+    };
+    assert_eq!(e.haystack(), "Delete word back Ctrl-w");
+    // Insert/Search-only bindings spell their mode out.
+    e.mode = "Insert".into();
+    assert_eq!(e.haystack(), "Delete word back (Insert) Ctrl-w");
+    e.mode = "Search".into();
+    assert_eq!(e.haystack(), "Delete word back (Search) Ctrl-w");
+}
+
+#[test]
+fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
+    use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerViewParams};
+    let p = PickerViewParams {
+        from_selection: false,
+        kind: PickerKind::Keybindings,
+        reset: true,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id: None,
+        explorer_roots: false,
+        filters: None,
+        keybindings: Some(vec![KeybindingEntry {
+            group: "App".into(),
+            desc: "Show keyboard shortcuts".into(),
+            mode: "Application".into(),
+            keys: "Space ?".into(),
+        }]),
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["kind"], "keybindings");
+    assert_eq!(v["keybindings"][0]["group"], "App");
+    assert_eq!(v["keybindings"][0]["keys"], "Space ?");
+    let back: PickerViewParams = from_value(v).unwrap();
+    assert_eq!(back.keybindings.as_deref().map(|k| k.len()), Some(1));
+
+    // Absent on the wire when None (resume/scroll re-views), and deserializes back to None.
+    let p = PickerViewParams { keybindings: None, ..p };
+    let v = to_value(&p).unwrap();
+    assert!(
+        v.get("keybindings").is_none(),
+        "None keybindings should be skipped"
+    );
+    let back: PickerViewParams = from_value(v).unwrap();
+    assert!(back.keybindings.is_none());
+}
+
+#[test]
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerViewParams};
     let p = PickerViewParams {
@@ -2046,6 +2130,7 @@ fn picker_view_params_omit_center_on_when_none() {
         buffer_id: None,
         explorer_roots: false,
         filters: None,
+        keybindings: None,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -2076,6 +2161,7 @@ fn picker_view_params_from_selection_serialized() {
         buffer_id: Some(4),
         explorer_roots: false,
         filters: None,
+        keybindings: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["from_selection"], true);
@@ -2105,6 +2191,7 @@ fn picker_view_params_center_on_serialized() {
         buffer_id: None,
         explorer_roots: false,
         filters: None,
+        keybindings: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["center_on"]["kind"], "file");
@@ -2495,6 +2582,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
         buffer_id: None,
         explorer_roots: false,
         filters: None,
+        keybindings: None,
     };
     let v = to_value(&p).unwrap();
     assert!(
@@ -2518,6 +2606,7 @@ fn picker_view_params_directory_path_serialized() {
         buffer_id: None,
         explorer_roots: false,
         filters: None,
+        keybindings: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["directory_path"], "/home/x/proj/src");

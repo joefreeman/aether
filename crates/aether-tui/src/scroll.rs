@@ -1,4 +1,4 @@
-//! Vertical scroll state for static, client-rendered lists (e.g. the help overlay).
+//! Vertical scroll state for static, client-rendered lists (e.g. the hover popup).
 //!
 //! The wrinkle this solves: input handling (key / wheel) needs to clamp the offset to the real
 //! maximum — `content_lines - viewport_rows` — but only the *render* path knows the viewport
@@ -58,14 +58,6 @@ impl ScrollState {
         let step = i32::from((self.viewport.get() / 2).max(1));
         self.scroll_by(if down { step } else { -step });
     }
-
-    pub fn scroll_to_top(&mut self) {
-        self.offset = 0;
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.offset = self.max_offset();
-    }
 }
 
 #[cfg(test)]
@@ -102,8 +94,6 @@ mod tests {
         s.record(5, 20); // content shorter than viewport.
         s.scroll_by(10);
         assert_eq!(s.offset(), 0);
-        s.scroll_to_bottom();
-        assert_eq!(s.offset(), 0);
     }
 
     #[test]
@@ -112,7 +102,7 @@ mod tests {
         s.record(100, 10); // page step = 9, max offset 90.
         s.page(true);
         assert_eq!(s.offset(), 9);
-        s.scroll_to_bottom();
+        s.scroll_by(1000); // jump to the bottom
         s.page(true);
         assert_eq!(s.offset(), 90);
         s.page(false);

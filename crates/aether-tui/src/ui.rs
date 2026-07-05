@@ -2,10 +2,8 @@
 
 use crate::app::{
     grep_counter_label, search_counter_label, search_match_count_label, AppState, BufferStatusKind,
-    EditorMode, HelpTab, SearchState, BUFFER_STATUS_DOT,
+    EditorMode, SearchState, BUFFER_STATUS_DOT,
 };
-use aether_client::keymap;
-use aether_client::keymap::KeyCode;
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
 use aether_protocol::cursor::CursorState;
@@ -138,7 +136,6 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let modal_open = state.picker.open
         || state.workspace_settings.is_some()
         || state.app_settings.is_some()
-        || state.help.open
         || state.picker.lsp_detail.is_some();
     // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
     // input and the y/N confirm prompts. Search is deliberately excluded — it live-highlights
@@ -169,11 +166,6 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     }
     if show_status {
         draw_status(f, state, chunks[1]);
-    }
-    // Keyboard-shortcut help (Space ?) is the topmost overlay — drawn last so it covers anything
-    // underneath, and openable with or without an editor.
-    if state.help.open {
-        draw_help_overlay(f, state, chunks[0]);
     }
     // The settings overlay needs a caret on its input row even when no editor exists (e.g. right
     // after `workspace/create`). Fall back to a zero Rect for the status area in that case — the
@@ -333,10 +325,6 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
-/// Keyboard-shortcut help overlay (`Space ?`). A bordered, centered modal — same geometry as the
-/// pickers — listing every binding grouped by context. The content is generated straight from the
-/// `keymap` tables (see [`help_lines`]) so it can never drift from the actual dispatch. Read-only;
-/// `state.help.scroll` pans the (possibly taller-than-the-box) content vertically.
 /// Max body height (rows of text) for the hover box — beyond this it scrolls.
 const HOVER_MAX_BODY: u16 = 16;
 /// Horizontal padding (cols) between the hover box border and its text, each side. When a
@@ -767,82 +755,8 @@ fn hover_display_lines(
     out
 }
 
-fn draw_help_overlay(f: &mut Frame, state: &AppState, area: Rect) {
-    let box_area = picker_box_rect(area);
-    if box_area.width < 4 || box_area.height < 4 {
-        return;
-    }
-    f.render_widget(Clear, box_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(NORD4))
-        .style(Style::default().bg(NORD0).fg(NORD4));
-    f.render_widget(block, box_area);
-    let inner = Rect {
-        x: box_area.x + 1,
-        y: box_area.y + 1,
-        width: box_area.width - 2,
-        height: box_area.height - 2,
-    };
-    let content = pad_horizontal(inner);
-    if content.width == 0 || content.height == 0 {
-        return;
-    }
-    // A fixed tab bar on the top row (it must stay put while the body scrolls), then the per-tab
-    // body below it. When the box is too short for both, the tab bar wins and the body is dropped.
-    let tab_bar = Rect {
-        height: 1,
-        ..content
-    };
-    f.render_widget(
-        Paragraph::new(tab_bar_line(state.help.tab)).style(Style::default().fg(NORD4).bg(NORD0)),
-        tab_bar,
-    );
-    if content.height < 3 {
-        return;
-    }
-    let body = Rect {
-        y: content.y + 2,
-        height: content.height - 2,
-        ..content
-    };
-    // Reserve the rightmost column for a scrollbar (plus a blank gap column before it) when the
-    // tab is taller than the body (same cue as the picker). Decided from a full-width layout; if
-    // the scrollbar is shown we re-wrap to the narrower text area, which can only add lines (so
-    // the bar stays warranted).
-    let full = help_lines(state.help.tab, body.width as usize);
-    let needs_scrollbar = full.len() as u16 > body.height;
-    let (lines, text_width) = if needs_scrollbar {
-        let tw = body.width.saturating_sub(2);
-        (help_lines(state.help.tab, tw as usize), tw)
-    } else {
-        (full, body.width)
-    };
-    // Feed the scroll state the current geometry so key/wheel handling can clamp to the real
-    // bottom; then render from its clamped offset.
-    let total = lines.len() as u16;
-    state.help.scroll.record(total, body.height);
-    let scroll = state.help.scroll.offset();
-    let text_area = Rect {
-        width: text_width,
-        ..body
-    };
-    let para = Paragraph::new(lines)
-        .style(Style::default().fg(NORD4).bg(NORD0))
-        .scroll((scroll, 0));
-    f.render_widget(para, text_area);
-    if needs_scrollbar {
-        let bar = Rect {
-            x: body.x + body.width.saturating_sub(1),
-            width: 1,
-            ..body
-        };
-        draw_vertical_scrollbar(f, bar, scroll, total, body.height);
-    }
-}
-
 /// A 1-column vertical scrollbar over `total` lines with `visible` rows shown from `offset`.
-/// Thin wrapper over [`render_scrollbar`] for static overlays (help, search popover).
+/// Thin wrapper over [`render_scrollbar`] for static overlays (hover, search popover).
 fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, visible: u16) {
     render_scrollbar(
         f,
@@ -894,337 +808,9 @@ fn render_scrollbar(f: &mut Frame, area: Rect, offset: u64, total: u64, visible:
     }
 }
 
-/// The help overlay's tab bar: every [`HelpTab`] in display order, space-separated with no
-/// dividers — the active tab is accented and underlined, the rest dimmed, so the underline (not a
-/// separator glyph) carries the selection.
-fn tab_bar_line(active: HelpTab) -> Line<'static> {
-    let active_style = Style::default()
-        .fg(NORD8)
-        .add_modifier(Modifier::UNDERLINED);
-    let inactive = Style::default().fg(NORD3);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, t) in HelpTab::ALL.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("   "));
-        }
-        let style = if *t == active { active_style } else { inactive };
-        spans.push(Span::styled(t.label(), style));
-    }
-    Line::from(spans)
-}
-
-/// Bindings omitted from the help overlay. The leader *trigger* (`Space` → [`BeginLeader`]) is
-/// hidden: its chords have their own Application tab, so the raw trigger would just be noise (and a
-/// lone "Leader" group) on the Normal tab.
-///
-/// [`BeginLeader`]: keymap::Action::BeginLeader
-fn help_hidden(b: &keymap::Binding) -> bool {
-    matches!(b.action, keymap::Action::BeginLeader)
-}
-
-/// The keymap contexts shown on `tab`, in render order. The Normal and Insert tabs append the
-/// shared `Global` (Ctrl-editing) table so each tab mirrors that mode's full dispatch fallback.
-fn tab_contexts(tab: HelpTab) -> &'static [keymap::KeyContext] {
-    use keymap::KeyContext as C;
-    match tab {
-        HelpTab::Normal => &[C::Normal, C::Global],
-        HelpTab::Insert => &[C::Insert, C::Global],
-        HelpTab::Search => &[C::Search],
-        HelpTab::Application => &[C::Leader],
-    }
-}
-
-/// Build one help *tab*'s lines from the `keymap` tables: each of the tab's contexts (see
-/// [`tab_contexts`]) rendered as accent-coloured `group` headings followed by their rows. The tab
-/// bar already names the mode, so contexts carry no heading of their own — the shared `Global`
-/// block on the Normal/Insert tabs simply flows on as further groups. Within a sub-section, columns
-/// are aligned to that section's own widths, a key's Alt variant occupies an aligned second column,
-/// and descriptions word-wrap (with a hanging indent) to `width`. When a section is too narrow to
-/// fit the Alt column, the Alt variant stacks on its own indented line instead.
-fn help_lines(tab: HelpTab, width: usize) -> Vec<Line<'static>> {
-    let heading = Style::default().fg(NORD8).add_modifier(Modifier::BOLD);
-    let styles = HelpStyles {
-        key: Style::default().fg(NORD9),
-        desc: Style::default().fg(NORD4),
-        // The `/` that joins a merged direction pair (e.g. `h / l`) renders dimmer, as a separator.
-        sep: Style::default().fg(NORD3),
-    };
-    let w = width.max(24);
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Render grouped by `group`, *merging same-named groups across the tab's contexts* — so the
-    // Normal-mode `Delete` and the shared `Ctrl-d` (both "Edit") land in one section. The shared
-    // (extra-context) groups render as a block after the primary context's own groups, keeping the
-    // Ctrl-editing keys together. The table itself is ordered by key proximity to drive lookup, so
-    // a group's rows aren't contiguous there; collecting them here keeps each heading single.
-    let bindings: Vec<&'static keymap::Binding> = keymap::all().collect();
-    let contexts = tab_contexts(tab);
-    let primary = contexts[0];
-    let extra = &contexts[1..];
-    let mut done = vec![false; bindings.len()];
-
-    // Group names from the shared (extra) contexts, in first-appearance order.
-    let mut shared_groups: Vec<&'static str> = Vec::new();
-    for &cx in extra {
-        for b in &bindings {
-            if b.ctx == cx && !help_hidden(b) && !shared_groups.contains(&b.group) {
-                shared_groups.push(b.group);
-            }
-        }
-    }
-    // Primary groups that aren't also shared keep their place; the shared block follows them (a
-    // primary group whose name *is* shared, like Normal's "Edit", merges into that shared section).
-    let mut group_order: Vec<&'static str> = Vec::new();
-    for b in &bindings {
-        if b.ctx == primary
-            && !help_hidden(b)
-            && !shared_groups.contains(&b.group)
-            && !group_order.contains(&b.group)
-        {
-            group_order.push(b.group);
-        }
-    }
-    group_order.extend(shared_groups.iter().copied());
-
-    for (gi, g) in group_order.iter().enumerate() {
-        if gi > 0 {
-            lines.push(Line::from(""));
-        }
-        lines.push(Line::from(Span::styled(g.to_string(), heading)));
-
-        // Gather the group's rows from every context in the tab (in context order), so a merged
-        // group collects both the mode key and the shared Ctrl key. Alt folding (a key's same-key
-        // Alt sibling, always later in the table) and direction-pair merging stay per-context —
-        // they only ever pair within one context. The Leader context never folds Alt: there
-        // `Space Alt-s` is a distinct chord, not a modifier variant of `Space s`.
-        let mut display: Vec<DisplayRow> = Vec::new();
-        for &cx in contexts {
-            let fold_alt = cx != keymap::KeyContext::Leader;
-            let mut rows: Vec<(&'static keymap::Binding, Option<&'static keymap::Binding>)> =
-                Vec::new();
-            for i in 0..bindings.len() {
-                let b = bindings[i];
-                if done[i] || b.ctx != cx || b.group != *g || help_hidden(b) {
-                    continue;
-                }
-                done[i] = true;
-                let sibling = fold_alt
-                    .then(|| {
-                        bindings.iter().enumerate().skip(i + 1).find(|(j, c)| {
-                            !done[*j]
-                                && c.ctx == cx
-                                && c.group == b.group
-                                && c.is_alt_pair(b)
-                                && !help_hidden(c)
-                        })
-                    })
-                    .flatten();
-                rows.push(match sibling {
-                    Some((j, c)) => {
-                        done[j] = true;
-                        if b.is_alt() {
-                            (*c, Some(b))
-                        } else {
-                            (b, Some(*c))
-                        }
-                    }
-                    None => (b, None),
-                });
-            }
-            // Fold forward/backward direction pairs (h/l, j/k, ↑/↓, …) onto one row, merging their
-            // keys and symmetric descriptions ("Char left"/"Char right" → "Char left/right").
-            display.extend(build_display_rows(cx, &rows));
-        }
-        // Collapse aliases: two plain keys for the *same* command (e.g. `Delete` and `Ctrl-d`, both
-        // "Delete selection") into one `Delete, Ctrl-d` row. Comma — not the direction-pair `/` —
-        // signals "either key", not two opposite directions.
-        merge_alias_rows(&mut display);
-
-        // Column widths, computed per section so each lays out independently.
-        let kw = display
-            .iter()
-            .map(|r| r.base.key.width())
-            .max()
-            .unwrap_or(0);
-        // The base column spans *every* row, whether or not it has an Alt variant, so the Alt
-        // column begins past the longest base description. Sizing it only to Alt-bearing rows
-        // (whose descriptions can be short, e.g. `Search`/`Next match`) lets a long description
-        // on an Alt-less row (`Esc  Clear the active search`) overrun the Alt column. The Alt
-        // cell widths still only consider rows that actually carry an Alt variant.
-        let bdw = display
-            .iter()
-            .map(|r| r.base.desc.width())
-            .max()
-            .unwrap_or(0);
-        let (mut adw, mut akw, mut any_alt) = (0usize, 0usize, false);
-        for r in &display {
-            if let Some(a) = &r.alt {
-                any_alt = true;
-                adw = adw.max(a.desc.width());
-                akw = akw.max(a.key.width());
-            }
-        }
-        // The base and Alt cells share one column width so they read as two even columns. Size
-        // it to content (the wider of the two natural cell widths) rather than stretching to
-        // the box — that keeps the columns close together on wide terminals — but cap it at
-        // half the width so two columns plus a gap always fit. Go side-by-side only when the
-        // base cell fits unwrapped and the Alt cell keeps a usable description width; otherwise
-        // the Alt variant stacks on its own line.
-        const GAP: usize = 3;
-        const MIN_ALT_DESC: usize = 10;
-        let base_cell = kw + 2 + bdw;
-        let alt_cell = akw + 1 + adw;
-        let cap = w.saturating_sub(GAP) / 2;
-        let col_w = base_cell.max(alt_cell).min(cap);
-        let side_by_side = any_alt && cap >= base_cell && col_w >= akw + 1 + MIN_ALT_DESC;
-
-        for r in &display {
-            let bkey = &r.base.key;
-            if let (Some(a), true) = (&r.alt, side_by_side) {
-                // [ base key  base desc ]<gap>[ alt key  alt desc ] — two equal `col_w` columns.
-                let base_field = col_w - kw - 2; // base desc fits unwrapped (col_w ≥ base_cell)
-                let alt_desc_w = col_w - akw - 1;
-                let chunks = wrap_words(&a.desc, alt_desc_w);
-                // Only the key column dims its `/` separator; descriptions keep theirs in the
-                // normal text colour (pass the description style as the separator style).
-                let mut spans = padded_spans(bkey, kw, styles.key, styles.sep);
-                spans.push(Span::raw("  "));
-                spans.extend(padded_spans(
-                    &r.base.desc,
-                    base_field,
-                    styles.desc,
-                    styles.desc,
-                ));
-                spans.push(Span::raw(" ".repeat(GAP)));
-                spans.extend(padded_spans(&a.key, akw, styles.key, styles.sep));
-                spans.push(Span::raw(" "));
-                spans.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
-                lines.push(Line::from(spans));
-                let alt_desc_col = col_w + GAP + akw + 1;
-                for c in &chunks[1..] {
-                    let mut l = vec![Span::raw(" ".repeat(alt_desc_col))];
-                    l.extend(sep_spans(c, styles.desc, styles.desc));
-                    lines.push(Line::from(l));
-                }
-            } else {
-                // Base on its own wrapped line(s); a stacked Alt (too narrow to align) indents
-                // under the base description.
-                push_wrapped(&mut lines, bkey, kw, &r.base.desc, w, styles);
-                if let Some(a) = &r.alt {
-                    let mut indented = vec![Span::raw(" ".repeat(kw + 2))];
-                    let inner = wrapped_spans(&a.key, a.key.width(), &a.desc, w - (kw + 2), styles);
-                    // Splice the first inner line after the indent; push the rest with indent.
-                    let mut iter = inner.into_iter();
-                    if let Some(first) = iter.next() {
-                        indented.extend(first);
-                        lines.push(Line::from(indented));
-                    }
-                    for rest in iter {
-                        let mut l = vec![Span::raw(" ".repeat(kw + 2))];
-                        l.extend(rest);
-                        lines.push(Line::from(l));
-                    }
-                }
-            }
-        }
-    }
-    lines
-}
-
-/// The three text styles a help row is built from: the key column, the description, and the
-/// dimmed separator (`/` between a merged direction pair, alias commas).
-#[derive(Clone, Copy)]
-struct HelpStyles {
-    key: Style,
-    desc: Style,
-    sep: Style,
-}
-
-/// Push a `<key>  <description>` block to `lines`, word-wrapping the description to `width` with a
-/// hanging indent aligned under the description column.
-fn push_wrapped(
-    lines: &mut Vec<Line<'static>>,
-    key: &str,
-    key_w: usize,
-    desc: &str,
-    width: usize,
-    styles: HelpStyles,
-) {
-    let desc_col = key_w + 2;
-    let chunks = wrap_words(desc, width.saturating_sub(desc_col));
-    // Key column dims its `/`; the description keeps its `/` in the normal text colour.
-    let mut first = padded_spans(key, key_w, styles.key, styles.sep);
-    first.push(Span::raw("  "));
-    first.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
-    lines.push(Line::from(first));
-    for c in &chunks[1..] {
-        let mut l = vec![Span::raw(" ".repeat(desc_col))];
-        l.extend(sep_spans(c, styles.desc, styles.desc));
-        lines.push(Line::from(l));
-    }
-}
-
-/// Like [`push_wrapped`] but returns the span rows instead of pushing them (so a caller can add a
-/// leading indent). Each returned `Vec<Span>` is one rendered line.
-fn wrapped_spans(
-    key: &str,
-    key_w: usize,
-    desc: &str,
-    width: usize,
-    styles: HelpStyles,
-) -> Vec<Vec<Span<'static>>> {
-    let desc_col = key_w + 1;
-    let chunks = wrap_words(desc, width.saturating_sub(desc_col));
-    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
-    // Key column dims its `/`; the description keeps its `/` in the normal text colour.
-    let mut first = padded_spans(key, key_w, styles.key, styles.sep);
-    first.push(Span::raw(" "));
-    first.extend(sep_spans(&chunks[0], styles.desc, styles.desc));
-    out.push(first);
-    for c in &chunks[1..] {
-        let mut l = vec![Span::raw(" ".repeat(desc_col))];
-        l.extend(sep_spans(c, styles.desc, styles.desc));
-        out.push(l);
-    }
-    out
-}
-
-/// Render `text` as spans, dimming the row's separators with `sep` and everything else with `main`:
-/// a standalone `/` token (the direction-pair separator) and a *trailing* comma on a token (the
-/// alias separator, `Delete, Ctrl-d`). A lone `,` token is the literal comma *key* (`Space ,`), not
-/// a separator, so it stays `main`. Descriptions pass `sep == main`, so their `/` and prose commas
-/// (e.g. "Go to line (count, default 1)") are never dimmed.
-fn sep_spans(text: &str, main: Style, sep: Style) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, tok) in text.split(' ').enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        if tok == "/" {
-            spans.push(Span::styled("/", sep));
-        } else if let Some(word) = tok.strip_suffix(',').filter(|w| !w.is_empty()) {
-            spans.push(Span::styled(word.to_string(), main));
-            spans.push(Span::styled(",", sep));
-        } else if !tok.is_empty() {
-            spans.push(Span::styled(tok.to_string(), main));
-        }
-    }
-    spans
-}
-
-/// [`sep_spans`] then right-pad with spaces to a display width of `w`.
-fn padded_spans(text: &str, w: usize, main: Style, sep: Style) -> Vec<Span<'static>> {
-    let mut spans = sep_spans(text, main, sep);
-    let pad = w.saturating_sub(text.width());
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
-    }
-    spans
-}
-
 /// Greedy word-wrap to `width` columns. Always returns at least one (possibly empty) line. Words
-/// longer than `width` overflow rather than being hard-split — fine for the short help strings.
+/// longer than `width` overflow rather than being hard-split — fine for the short overlay strings
+/// (hover text, settings values) this wraps.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -1247,218 +833,6 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     }
     out.push(cur);
     out
-}
-
-/// One key+description cell in the help overlay. Owned because direction-pair rows merge the text
-/// of two bindings.
-struct Cell {
-    key: String,
-    desc: String,
-}
-
-/// A help row ready to render: a base cell and its optional aligned Alt cell.
-struct DisplayRow {
-    base: Cell,
-    alt: Option<Cell>,
-}
-
-/// Forward/backward key pairs (in display order) whose rows are folded onto one line, merging both
-/// the keys (`h`,`l` → `h/l`) and their symmetric descriptions. Keyed by context.
-const DIRECTION_PAIRS: &[(keymap::KeyContext, KeyCode, KeyCode)] = &[
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::Char('h'),
-        KeyCode::Char('l'),
-    ),
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::Char('j'),
-        KeyCode::Char('k'),
-    ),
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::Char('['),
-        KeyCode::Char(']'),
-    ),
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::Char('{'),
-        KeyCode::Char('}'),
-    ),
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::Char('<'),
-        KeyCode::Char('>'),
-    ),
-    (keymap::KeyContext::Normal, KeyCode::Up, KeyCode::Down),
-    (keymap::KeyContext::Normal, KeyCode::Left, KeyCode::Right),
-    (
-        keymap::KeyContext::Normal,
-        KeyCode::PageUp,
-        KeyCode::PageDown,
-    ),
-    (keymap::KeyContext::Insert, KeyCode::Up, KeyCode::Down),
-    (keymap::KeyContext::Insert, KeyCode::Left, KeyCode::Right),
-    (keymap::KeyContext::Search, KeyCode::Up, KeyCode::Down),
-    (keymap::KeyContext::Search, KeyCode::Left, KeyCode::Right),
-];
-
-/// The display-ordered pair `code` belongs to in `cx`, if any.
-fn direction_pair(cx: keymap::KeyContext, code: KeyCode) -> Option<(KeyCode, KeyCode)> {
-    DIRECTION_PAIRS
-        .iter()
-        .find(|(c, a, b)| *c == cx && (*a == code || *b == code))
-        .map(|(_, a, b)| (*a, *b))
-}
-
-/// Turn a sub-section's paired `(base, Alt)` bindings into display rows, folding direction pairs
-/// (h/l, j/k, …) onto a single merged row.
-fn build_display_rows(
-    cx: keymap::KeyContext,
-    rows: &[(&'static keymap::Binding, Option<&'static keymap::Binding>)],
-) -> Vec<DisplayRow> {
-    let mut out: Vec<DisplayRow> = Vec::new();
-    let mut used = vec![false; rows.len()];
-    for i in 0..rows.len() {
-        if used[i] {
-            continue;
-        }
-        let (base, alt) = rows[i];
-        // Fold a direction pair only when its partner is in this section and both sides agree on
-        // having an Alt variant (so the merged columns stay symmetric).
-        if let Some((first, second)) = direction_pair(cx, base.code) {
-            let partner = if base.code == first { second } else { first };
-            if let Some(j) = rows.iter().position(|(b, _)| b.code == partner) {
-                let (pbase, palt) = rows[j];
-                if j != i && !used[j] && alt.is_some() == palt.is_some() {
-                    used[i] = true;
-                    used[j] = true;
-                    // Put the two sides in the pair's display order.
-                    let (fb, fa, sb, sa) = if base.code == first {
-                        (base, alt, pbase, palt)
-                    } else {
-                        (pbase, palt, base, alt)
-                    };
-                    out.push(DisplayRow {
-                        base: Cell {
-                            key: merge_keys(&fb.key_label(), &sb.key_label()),
-                            desc: merge_descs(fb.desc, sb.desc),
-                        },
-                        alt: match (fa, sa) {
-                            (Some(fa), Some(sa)) => Some(Cell {
-                                key: merge_keys(&fa.key_label(), &sa.key_label()),
-                                desc: merge_descs(fa.desc, sa.desc),
-                            }),
-                            _ => None,
-                        },
-                    });
-                    continue;
-                }
-            }
-        }
-        used[i] = true;
-        out.push(DisplayRow {
-            base: Cell {
-                key: base.key_label(),
-                desc: base.desc.to_string(),
-            },
-            alt: alt.map(|a| Cell {
-                key: a.key_label(),
-                desc: a.desc.to_string(),
-            }),
-        });
-    }
-    out
-}
-
-/// Collapse rows that are *aliases* — different keys bound to the same command, identified by an
-/// identical description — into a single row whose keys are joined with `, ` (e.g. `Delete` and
-/// `Ctrl-d`, both "Delete selection", → `Delete, Ctrl-d`). Only plain rows merge: a row carrying an
-/// Alt variant keeps its two-column shape. Keys join in first-appearance order, and three-plus
-/// aliases chain (`A, B, C`). Comma rather than the direction-pair `/` keeps "either key" distinct
-/// from "two opposite directions".
-fn merge_alias_rows(display: &mut Vec<DisplayRow>) {
-    let mut i = 0;
-    while i < display.len() {
-        if display[i].alt.is_none() {
-            let mut j = i + 1;
-            while j < display.len() {
-                if display[j].alt.is_none() && display[j].base.desc == display[i].base.desc {
-                    let other = display.remove(j).base.key;
-                    display[i].base.key = format!("{}, {}", display[i].base.key, other);
-                } else {
-                    j += 1;
-                }
-            }
-        }
-        i += 1;
-    }
-}
-
-/// Merge two key labels into `a / b` form. When factoring the common prefix/suffix leaves a single
-/// differing char on each side (`Alt-h`/`Alt-l` → `Alt-h / l`, `↑`/`↓` → `↑ / ↓`) we use the
-/// compact factored form; otherwise we show both keys in full (`PageUp` / `PageDown`) since a
-/// factored `PageUp / Down` reads worse. Chars (not bytes) so multi-byte glyphs aren't split.
-fn merge_keys(a: &str, b: &str) -> String {
-    if a == b {
-        return a.to_string();
-    }
-    let av: Vec<char> = a.chars().collect();
-    let bv: Vec<char> = b.chars().collect();
-    let (pre, mid_a, mid_b, suf) = factor_common(&av, &bv);
-    if mid_a.len() <= 1 && mid_b.len() <= 1 {
-        format!(
-            "{}{} / {}{}",
-            pre.iter().collect::<String>(),
-            mid_a.iter().collect::<String>(),
-            mid_b.iter().collect::<String>(),
-            suf.iter().collect::<String>(),
-        )
-    } else {
-        format!("{a} / {b}")
-    }
-}
-
-/// Merge two descriptions word-wise: factor out common leading/trailing *words* and join the
-/// differing middles with ` / ` — e.g. `"Char left"`+`"Char right"` → `"Char left / right"`.
-/// Word-level (not char-level) so a letter shared by two words — the `t` in `left`/`right` — isn't
-/// split off.
-fn merge_descs(a: &str, b: &str) -> String {
-    if a == b {
-        return a.to_string();
-    }
-    let aw: Vec<&str> = a.split(' ').collect();
-    let bw: Vec<&str> = b.split(' ').collect();
-    let (pre, mid_a, mid_b, suf) = factor_common(&aw, &bw);
-    let mut parts: Vec<String> = Vec::new();
-    if !pre.is_empty() {
-        parts.push(pre.join(" "));
-    }
-    parts.push(format!("{} / {}", mid_a.join(" "), mid_b.join(" ")));
-    if !suf.is_empty() {
-        parts.push(suf.join(" "));
-    }
-    parts.join(" ")
-}
-
-/// Split two slices into their common prefix, the two differing middles, and their common suffix.
-/// Shared by the char-wise [`merge_keys`] and word-wise [`merge_descs`].
-fn factor_common<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (&'a [T], &'a [T], &'a [T], &'a [T]) {
-    let max = a.len().min(b.len());
-    let mut p = 0;
-    while p < max && a[p] == b[p] {
-        p += 1;
-    }
-    let mut s = 0;
-    while s < max - p && a[a.len() - 1 - s] == b[b.len() - 1 - s] {
-        s += 1;
-    }
-    (
-        &a[..p],
-        &a[p..a.len() - s],
-        &b[p..b.len() - s],
-        &b[b.len() - s..],
-    )
 }
 
 /// Label above the editable workspace-name field.
@@ -1949,6 +1323,7 @@ fn picker_group_key(item: &PickerItem) -> Option<(u32, &str)> {
             ..
         } => Some((*path_index, relative_path.as_str())),
         PickerItem::Reference { is_definition, .. } => Some((*is_definition as u32, "")),
+        PickerItem::Keybinding { group, .. } => Some((0, group.as_str())),
         _ => None,
     }
 }
@@ -2607,6 +1982,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
         Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
+        Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
         None => "Search…",
     }
 }
@@ -2683,6 +2059,24 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // for them, so what we render here will fit in `pane_height` rows. The headerless kinds (the
     // single-file GitChangesFile) skip this — and must, or the rows wouldn't match that budget.
     let renders_headers = state.picker.kind.is_some_and(|k| k.renders_group_headers());
+    // References and Keybindings render a section label (Definition / References, the binding
+    // group) rather than a file header; the other grouped kinds render the file path.
+    let header_spans = |item: &PickerItem, key: (u32, &str)| -> Vec<Span<'static>> {
+        match item {
+            PickerItem::Reference { is_definition, .. } => section_header_spans(
+                if *is_definition {
+                    "Definition"
+                } else {
+                    "References"
+                },
+                text_width as usize,
+            ),
+            PickerItem::Keybinding { group, .. } => {
+                section_header_spans(group, text_width as usize)
+            }
+            _ => grep_file_header_spans(key.0, key.1, &state.root_labels, text_width as usize),
+        }
+    };
     let mut prev_grep_key: Option<(u32, &str)> = None;
     for (offset_in_slice, item) in state.picker.items[visible_start..visible_end]
         .iter()
@@ -2691,25 +2085,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         let i = visible_start + offset_in_slice;
         if let Some(key) = picker_group_key(item).filter(|_| renders_headers) {
             if prev_grep_key != Some(key) {
-                // References render a section label (Definition / References) rather than a file
-                // header; the other grouped kinds render the file path.
-                let header = match item {
-                    PickerItem::Reference { is_definition, .. } => section_header_spans(
-                        if *is_definition {
-                            "Definition"
-                        } else {
-                            "References"
-                        },
-                        text_width as usize,
-                    ),
-                    _ => grep_file_header_spans(
-                        key.0,
-                        key.1,
-                        &state.root_labels,
-                        text_width as usize,
-                    ),
-                };
-                lines.push(Line::from(header));
+                lines.push(Line::from(header_spans(item, key)));
                 prev_grep_key = Some(key);
             }
         }
@@ -2756,6 +2132,18 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         lines.push(Line::from(spans));
+    }
+    // A pane whose bottom edge lands exactly on a group boundary has one dangling row: the next
+    // item costs two rows (its header + itself) and only one is left, so the item budget stopped
+    // short of it. Fill the row with that next group's header — what a one-row-taller pane would
+    // show — instead of leaving it blank. (Grep's long file groups rarely land there; the
+    // keybindings picker's many small groups made the blank row noticeable.)
+    if renders_headers && lines.len() < pane_height {
+        if let Some(next) = state.picker.items.get(visible_end) {
+            if let Some(key) = picker_group_key(next).filter(|k| prev_grep_key != Some(*k)) {
+                lines.push(Line::from(header_spans(next, key)));
+            }
+        }
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
@@ -2984,6 +2372,21 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::Keybinding {
+        desc,
+        mode,
+        keys,
+        match_indices,
+        ..
+    } = item
+    {
+        return keybinding_item_spans(
+            KeybindingRow { desc, mode, keys },
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
 
     let bg = if highlighted { NORD2 } else { NORD0 };
     let base = Style::default().fg(NORD4).bg(bg);
@@ -3032,7 +2435,8 @@ fn picker_item_spans(
         | PickerItem::Diagnostic { .. }
         | PickerItem::LspServer { .. }
         | PickerItem::Reference { .. }
-        | PickerItem::Symbol { .. } => unreachable!("handled above"),
+        | PickerItem::Symbol { .. }
+        | PickerItem::Keybinding { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
         (
@@ -3135,9 +2539,9 @@ fn grep_file_header_spans(
     vec![Span::styled(display, style)]
 }
 
-/// References-picker section label (`Definition` / `References`) — same bold header chrome as
-/// [`grep_file_header_spans`] but a fixed label rather than a file path.
-fn section_header_spans(label: &'static str, max_width: usize) -> Vec<Span<'static>> {
+/// Picker section label (References' `Definition` / `References`, a Keybindings group) — same
+/// bold header chrome as [`grep_file_header_spans`] but a label rather than a file path.
+fn section_header_spans(label: &str, max_width: usize) -> Vec<Span<'static>> {
     let style = Style::default()
         .fg(NORD8)
         .bg(NORD0)
@@ -3763,6 +3167,55 @@ fn symbol_item_spans(
         base,
     ));
     spans.push(Span::styled(kind.to_string(), dim));
+    spans
+}
+
+/// The display fields of one keyboard shortcut, borrowed from [`PickerItem::Keybinding`].
+/// No `group`: it renders as the section header above the run (`picker_group_key`), not on
+/// the row itself.
+struct KeybindingRow<'a> {
+    desc: &'a str,
+    mode: &'a str,
+    keys: &'a str,
+}
+
+/// One Keybindings picker row: the description on the left (the group is the section header
+/// above the run, not row text), a dim `(mode)` for Insert/Search rows (default modes are
+/// elided, matching the haystack), and the key chord right-aligned at the row's edge in frost
+/// blue (matching the native client). `match_indices` are char offsets into the composed
+/// haystack (`{desc} [({mode}) ]{keys}`); `keybinding_match_segments` rebases them onto each
+/// rendered segment, so highlights land on segment text and never on the separators.
+fn keybinding_item_spans(
+    row: KeybindingRow<'_>,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let KeybindingRow { desc, mode, keys } = row;
+    let bg = if highlighted { NORD2 } else { NORD0 };
+    let base = Style::default().fg(NORD4).bg(bg);
+    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let dim = base.fg(picker_dim_fg(highlighted));
+
+    let seg = aether_client::picker::keybinding_match_segments(desc, mode, keys, match_indices);
+    let shows_mode = aether_protocol::picker::KeybindingEntry::shows_mode(mode);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_styled_with_match_indices(&mut spans, desc, &seg.desc, base, match_style);
+    let mut used = desc.width() + keys.width();
+    if shows_mode {
+        spans.push(Span::styled(" (".to_string(), dim));
+        push_styled_with_match_indices(&mut spans, mode, &seg.mode, dim, match_style);
+        spans.push(Span::styled(")".to_string(), dim));
+        used += 3 + mode.width();
+    }
+
+    // Pad out to right-align the chord. The pad carries the row background, like the text.
+    spans.push(Span::styled(
+        " ".repeat(max_width.saturating_sub(used)),
+        base,
+    ));
+    push_styled_with_match_indices(&mut spans, keys, &seg.keys, base.fg(NORD8), match_style);
     spans
 }
 
@@ -6229,147 +5682,6 @@ mod tests {
         );
     }
 
-    /// Spot-check the rendered overlay: unpaired descriptions appear verbatim, Alt variants are
-    /// folded inline, and forward/backward pairs are merged into one row with merged keys and
-    /// descriptions.
-    #[test]
-    fn help_lines_render_expected_rows() {
-        // Concatenate every tab (wide enough that nothing wraps); the expected rows are spread
-        // across them — `Application settings` on the leader tab, the grep pair on Normal, etc.
-        let rendered: String = HelpTab::ALL
-            .iter()
-            .flat_map(|t| help_lines(*t, 100))
-            .flat_map(|l| l.spans.into_iter())
-            .map(|s| s.content.into_owned())
-            .collect();
-        // Unpaired bindings appear verbatim (key + description).
-        for needle in [
-            "Application settings",
-            "Clear the active search",
-            "Show keyboard shortcuts",
-            "Cursor near top",
-            "Cursor near bottom",
-        ] {
-            assert!(rendered.contains(needle), "missing: {needle:?}");
-        }
-        // Direction pairs are merged (keys and descriptions), with a spaced `/` separator.
-        for needle in [
-            "h / l",
-            "Character left / right",
-            "j / k",
-            "Logical line down / up",
-            "↑ / ↓",
-            "Scroll up / down one line",
-            "← / →",
-            "PageUp / PageDown",
-            "Scroll page up / down",
-        ] {
-            assert!(rendered.contains(needle), "expected merged row: {needle:?}");
-        }
-        // Alt variants fold onto the base line, and merge alongside a direction pair.
-        assert!(
-            rendered.contains("Alt-h / l"),
-            "Alt variant of a pair should merge too"
-        );
-        assert!(rendered.contains("First non-blank / End of line"));
-        // The un-merged "lef / right" bug (char-level merge splitting a shared letter) must not recur.
-        assert!(
-            !rendered.contains("lef / right"),
-            "descriptions must merge word-wise"
-        );
-    }
-
-    /// The mode-divergent Ctrl keys read with the right scope on each tab — selection-scoped on
-    /// Normal, line-scoped on Insert — and the Selection group's bare `c`/`r` no longer mis-fold
-    /// the unrelated `Ctrl-c`/`Ctrl-r` onto their rows.
-    #[test]
-    fn help_lines_describe_ctrl_keys_per_mode() {
-        let render = |tab| -> Vec<String> {
-            help_lines(tab, 120)
-                .into_iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect()
-        };
-        let normal = render(HelpTab::Normal);
-        let insert = render(HelpTab::Insert);
-        // A line holding both the key and its description (spacing-agnostic — the gutter width
-        // shifts as keys merge).
-        let row = |ls: &[String], key: &str, desc: &str| {
-            ls.iter().any(|l| l.contains(key) && l.contains(desc))
-        };
-
-        // Normal: selection-scoped wording; Insert: line-scoped wording, on the matching keys.
-        assert!(row(&normal, "Ctrl-a", "Change selection"));
-        assert!(row(&insert, "Ctrl-a", "Change line"));
-        assert!(row(&insert, "Ctrl-d", "Delete line"));
-        assert!(row(&insert, "Ctrl-c", "Copy line"));
-        // The comment toggles are bound per mode (line style on Ctrl-y, block on Ctrl-Alt-y)
-        // and show on both tabs.
-        assert!(row(&normal, "Ctrl-y", "Toggle line comment"));
-        assert!(row(&normal, "Ctrl-Alt-y", "Toggle block comment"));
-        assert!(row(&insert, "Ctrl-y", "Toggle line comment"));
-        // Mode-agnostic Ctrl keys (from GLOBAL) appear on the Insert tab too.
-        assert!(row(&insert, "Ctrl-f", "Format document"));
-
-        // Normal collapses the two keys for "delete selection" (the Delete key and Ctrl-d) into one
-        // aliased row, comma-separated; Insert keeps them apart (different commands there).
-        assert!(row(&normal, "Delete, Ctrl-d", "Delete selection"));
-        assert!(!insert.iter().any(|l| l.contains("Delete, Ctrl-d")));
-
-        // The fold bug: a Ctrl- chord must not be glued onto the bare-key Collapse row (now `,`).
-        let collapse = normal
-            .iter()
-            .find(|l| l.contains("Collapse selection"))
-            .expect("Collapse row present");
-        assert!(
-            !collapse.contains("Ctrl-"),
-            "no Ctrl- chord should fold onto the Collapse row: {collapse:?}"
-        );
-    }
-
-    /// The comma joining aliased keys (`Delete, Ctrl-d`) renders in the dim separator colour, like
-    /// the direction-pair `/`. The literal comma *key* (`Space ,`) stays key-coloured, and prose
-    /// commas in descriptions are untouched (covered by `sep == main` for descriptions).
-    #[test]
-    fn alias_separator_comma_is_dimmed() {
-        let comma_fg = |lines: &[Line<'static>], row: &str| -> Option<Color> {
-            lines
-                .iter()
-                .find(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                        .contains(row)
-                })
-                .and_then(|l| {
-                    l.spans
-                        .iter()
-                        .find(|s| s.content.as_ref() == ",")
-                        .map(|s| s.style.fg)
-                })
-                .flatten()
-        };
-        let normal = help_lines(HelpTab::Normal, 120);
-        let app = help_lines(HelpTab::Application, 120);
-        // NORD3 = the dim separator colour; NORD9 = the key colour.
-        assert_eq!(
-            comma_fg(&normal, "Delete, Ctrl-d"),
-            Some(NORD3),
-            "alias separator comma should be dimmed"
-        );
-        assert_eq!(
-            comma_fg(&app, "Space ,"),
-            Some(NORD9),
-            "the literal comma key must stay key-coloured"
-        );
-    }
-
     /// The modal backdrop mutes a cell's colour and emphasis to the base palette but keeps its glyph
     /// (so the content stays faintly visible behind a dialog).
     #[test]
@@ -6398,54 +5710,6 @@ mod tests {
         assert!(
             cell.modifier.contains(Modifier::ITALIC),
             "italic emphasis preserved"
-        );
-    }
-
-    /// The tab bar marks the active tab with accent colour + underline (no divider glyphs); inactive
-    /// tabs are dim and unadorned.
-    #[test]
-    fn tab_bar_underlines_active() {
-        let line = tab_bar_line(HelpTab::Insert);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.contains('│'), "no divider glyphs");
-        let span = |label: &str| {
-            line.spans
-                .iter()
-                .find(|s| s.content.as_ref() == label)
-                .unwrap_or_else(|| panic!("tab {label:?} present"))
-        };
-        let active = span("Insert");
-        assert_eq!(active.style.fg, Some(NORD8), "active tab is accented");
-        assert!(
-            active.style.add_modifier.contains(Modifier::UNDERLINED),
-            "active tab is underlined"
-        );
-        let other = span("Normal");
-        assert_eq!(other.style.fg, Some(NORD3), "inactive tab is dim");
-        assert!(!other.style.add_modifier.contains(Modifier::UNDERLINED));
-    }
-
-    #[test]
-    fn merge_keys_factors_single_chars_else_shows_both() {
-        assert_eq!(merge_keys("Alt-h", "Alt-l"), "Alt-h / l");
-        assert_eq!(merge_keys("↑", "↓"), "↑ / ↓");
-        assert_eq!(merge_keys("[", "]"), "[ / ]");
-        assert_eq!(merge_keys("x", "x"), "x");
-        // Multi-char differing middles aren't factored (avoids "PageUp / Down").
-        assert_eq!(merge_keys("PageUp", "PageDown"), "PageUp / PageDown");
-    }
-
-    #[test]
-    fn merge_descs_is_word_wise() {
-        // The shared trailing letter of "left"/"right" stays attached (word-level merge).
-        assert_eq!(merge_descs("Char left", "Char right"), "Char left / right");
-        assert_eq!(
-            merge_descs("Scroll up one line", "Scroll down one line"),
-            "Scroll up / down one line"
-        );
-        assert_eq!(
-            merge_descs("First non-blank of line", "End of line"),
-            "First non-blank / End of line"
         );
     }
 
@@ -6619,28 +5883,6 @@ mod tests {
             ))])),
             diag_color(DiagnosticSeverity::Warning)
         );
-    }
-
-    #[test]
-    fn padded_spans_pads_to_display_width() {
-        let st = Style::default();
-        let total: usize = padded_spans("ab", 5, st, st)
-            .iter()
-            .map(|s| s.content.width())
-            .sum();
-        assert_eq!(total, 5, "short text is padded to the column width");
-        let total: usize = padded_spans("abcde", 3, st, st)
-            .iter()
-            .map(|s| s.content.width())
-            .sum();
-        assert_eq!(total, 5, "already-wider text is not truncated");
-    }
-
-    #[test]
-    fn narrow_help_wraps_to_more_lines() {
-        // Squeezing the width forces descriptions to wrap / Alt variants to stack, so the overlay
-        // grows taller. (The scroll machinery then makes the extra lines reachable.)
-        assert!(help_lines(HelpTab::Normal, 100).len() > help_lines(HelpTab::Normal, 200).len());
     }
 
     // ---- truncate_to_width ----
@@ -7069,6 +6311,79 @@ mod tests {
         let spans = grep_hit_spans(0, "    x", &[1, 2], false, 40);
         assert!(spans.iter().all(|s| s.style.fg != Some(NORD13)));
         assert!(spans_text(&spans).starts_with("x "));
+    }
+
+    // ---- keybinding_item_spans ----
+
+    #[test]
+    fn keybinding_row_reads_left_to_right_with_right_aligned_chord() {
+        // A default mode (Normal) is elided, and the group renders as the section header, not
+        // row text. Index 17 in the composed haystack `Delete word Ctrl-w` is the `w` of the
+        // chord — the highlight must land on that char after the per-segment rebase.
+        let spans = keybinding_item_spans(
+            KeybindingRow {
+                desc: "Delete word",
+                mode: "Normal",
+                keys: "Ctrl-w",
+            },
+            &[17],
+            false,
+            50,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("Delete word "),
+            "description leads, mode elided: {text:?}"
+        );
+        assert!(text.ends_with("Ctrl-w"), "chord right-aligned: {text:?}");
+        assert_eq!(spans_total_width(&spans), 50);
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(NORD13))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "w", "keys-segment match styles the right char");
+        let desc = spans.first().expect("desc span");
+        assert_eq!(desc.style.fg, Some(NORD4));
+        // The chord's unmatched chars are frost blue, matching the native client.
+        let chord = spans
+            .iter()
+            .find(|s| s.content.contains("Ctrl-"))
+            .expect("chord span");
+        assert_eq!(chord.style.fg, Some(NORD8));
+    }
+
+    #[test]
+    fn keybinding_row_spells_out_insert_and_search_modes() {
+        // Insert/Search rows keep their dim mode tag; haystack
+        // `Delete word (Insert) Ctrl-w` puts the chord's `w` at 26.
+        let spans = keybinding_item_spans(
+            KeybindingRow {
+                desc: "Delete word",
+                mode: "Insert",
+                keys: "Ctrl-w",
+            },
+            &[26],
+            false,
+            50,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("Delete word (Insert)"),
+            "mode shown for Insert: {text:?}"
+        );
+        assert_eq!(spans_total_width(&spans), 50);
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(NORD13))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "w", "keys-segment match survives the mode prefix");
+        let mode = spans
+            .iter()
+            .find(|s| s.content.contains("Insert"))
+            .expect("mode span");
+        assert_eq!(mode.style.fg, Some(picker_dim_fg(false)));
     }
 
     // ---- build_editor_status_spans ----

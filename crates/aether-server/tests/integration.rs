@@ -10222,6 +10222,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10291,6 +10292,7 @@ async fn picker_query_restarts_the_window_at_the_top() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10313,6 +10315,159 @@ async fn picker_query_restarts_the_window_at_the_top() {
         update.offset, 0,
         "a query change windows from the top, not the prior scroll offset"
     );
+
+    drop(server);
+}
+
+fn keybinding_rows() -> Vec<aether_protocol::picker::KeybindingEntry> {
+    // A tiny stand-in keymap — the real client ships ~150 rows built from its tables, bucketed
+    // by group (each group must be a contiguous run: one section header per run).
+    [
+        ("Editing", "Delete word back", "Any", "Ctrl-w"),
+        ("Editing", "Newline and indent", "Insert", "Enter"),
+        ("Pickers", "Find file", "Application", "Space f"),
+    ]
+    .into_iter()
+    .map(
+        |(group, desc, mode, keys)| aether_protocol::picker::KeybindingEntry {
+            group: group.into(),
+            desc: desc.into(),
+            mode: mode.into(),
+            keys: keys.into(),
+        },
+    )
+    .collect()
+}
+
+fn keybindings_view_params(
+    reset: bool,
+    rows: Option<Vec<aether_protocol::picker::KeybindingEntry>>,
+) -> PickerViewParams {
+    PickerViewParams {
+        from_selection: false,
+        filters: None,
+        kind: PickerKind::Keybindings,
+        reset,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id: None,
+        explorer_roots: false,
+        keybindings: rows,
+    }
+}
+
+/// The Keybindings picker matches over the whole composed row — group, description, mode, and
+/// chord — and works *without* an active workspace (its rows are shipped by the client, and help
+/// must be reachable from the pre-activation chooser, like the Workspaces picker).
+#[tokio::test]
+async fn keybindings_picker_matches_across_the_composed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("kb-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    // Deliberately no `workspace/activate` before opening.
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &keybindings_view_params(true, Some(keybinding_rows())),
+    )
+    .await;
+    assert_eq!(view.total_candidates, 3);
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.kind, PickerKind::Keybindings);
+    assert_eq!(update.total_matches, 3, "empty query lists every binding");
+    // Empty query preserves the shipped (bucketed) order, and the display-row metrics count
+    // one section header per group run: 3 items + 2 groups = 5 rows, the window's first item
+    // sitting below the first header.
+    let descs: Vec<&str> = update
+        .items()
+        .iter()
+        .map(|i| {
+            let PickerItem::Keybinding { desc, .. } = i else {
+                panic!("expected Keybinding item, got {i:?}")
+            };
+            desc.as_str()
+        })
+        .collect();
+    assert_eq!(descs, ["Delete word back", "Newline and indent", "Find file"]);
+    assert_eq!(update.grep_total_display_rows, Some(5));
+    assert_eq!(update.grep_display_offset, Some(1));
+
+    // A chord query: "ctrl" only matches the Ctrl-w row, and the match indices land in the
+    // keys segment of the composed haystack ("Delete word back Ctrl-w").
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Keybindings,
+            query: "ctrl".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1);
+    let PickerItem::Keybinding {
+        keys,
+        match_indices,
+        ..
+    } = &update.items()[0]
+    else {
+        panic!("expected Keybinding item")
+    };
+    assert_eq!(keys, "Ctrl-w");
+    assert_eq!(match_indices, &[17, 18, 19, 20], "highlights 'Ctrl' in the chord");
+
+    // A mode query: Insert/Search rows carry their mode in the haystack ("Newline and indent
+    // (Insert) Enter"), so "insert" narrows to them; default-mode rows elide theirs.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        12,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Keybindings,
+            query: "insert".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1);
+    let PickerItem::Keybinding { desc, .. } = &update.items()[0] else {
+        panic!("expected Keybinding item")
+    };
+    assert_eq!(desc, "Newline and indent");
+
+    drop(server);
+}
+
+/// A scroll/resume re-view ships no rows (`keybindings: None`) — the server keeps the set from
+/// the fresh open, like the Diagnostics snapshot; a `reset` open with fresh rows rebuilds.
+#[tokio::test]
+async fn keybindings_picker_reviews_preserve_the_shipped_rows() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &keybindings_view_params(true, Some(keybinding_rows())),
+    )
+    .await;
+    assert_eq!(view.total_candidates, 3);
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    // Re-view without rows (what a scroll refetch sends): the candidate set survives.
+    let view = send_request::<PickerView>(&mut ws, 11, &keybindings_view_params(false, None)).await;
+    assert_eq!(view.total_candidates, 3, "re-view keeps the shipped rows");
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 3);
 
     drop(server);
 }
@@ -10361,6 +10516,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10461,6 +10617,7 @@ async fn git_changes_picker_collapses_untracked_directories() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10534,6 +10691,7 @@ async fn git_changes_picker_hide_untracked() {
                 directory_path: None,
                 buffer_id: None,
                 explorer_roots: false,
+                keybindings: None,
             },
         )
         .await;
@@ -10621,6 +10779,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10706,6 +10865,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
         directory_path: None,
         buffer_id,
         explorer_roots: false,
+        keybindings: None,
     };
     let paths = |view: &aether_protocol::picker::PickerViewResult| -> Vec<String> {
         view.update
@@ -10783,6 +10943,7 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10836,6 +10997,7 @@ async fn git_changes_picker_query_greps_diff_content() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -10925,6 +11087,7 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11004,6 +11167,7 @@ async fn git_changes_picker_persists_query_across_reopen() {
         directory_path: None,
         buffer_id: None,
         explorer_roots: false,
+        keybindings: None,
     };
     let _ = send_request::<PickerView>(&mut ws, 2, &open(0)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
@@ -11092,6 +11256,7 @@ async fn git_changes_picker_query_is_a_regex() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11186,6 +11351,7 @@ async fn git_changes_picker_filters_by_directory() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11272,6 +11438,7 @@ async fn git_changes_picker_filters_by_exact_file() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11313,6 +11480,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11371,6 +11539,7 @@ async fn picker_select_returns_absolute_path() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11439,6 +11608,7 @@ async fn picker_resume_centers_on_remembered_item() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11486,6 +11656,7 @@ async fn picker_resume_centers_on_remembered_item() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11519,6 +11690,7 @@ async fn picker_reset_wipes_persisted_query() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11560,6 +11732,7 @@ async fn picker_reset_wipes_persisted_query() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11666,6 +11839,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11746,6 +11920,7 @@ async fn buffers_picker_select_returns_buffer_id() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11865,6 +12040,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -11989,6 +12165,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -12088,6 +12265,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -12205,6 +12383,7 @@ async fn buffers_picker_pushes_on_save() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -12287,6 +12466,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -12382,6 +12562,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -13895,6 +14076,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14003,6 +14185,7 @@ async fn picker_grep_from_selection_seeds_query_and_searches() {
             directory_path: None,
             buffer_id: Some(buffer_id),
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14069,6 +14252,7 @@ async fn picker_grep_from_selection_empty_is_unseeded() {
             directory_path: None,
             buffer_id: Some(buffer_id),
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14102,6 +14286,7 @@ async fn picker_grep_query_initial_push_keeps_the_window() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14165,6 +14350,7 @@ async fn picker_grep_short_query_yields_empty_result() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14212,6 +14398,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14257,6 +14444,7 @@ async fn picker_grep_persists_hits_across_hide_and_resume() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14290,6 +14478,7 @@ async fn picker_grep_treats_query_as_regex() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14340,6 +14529,7 @@ async fn picker_grep_caches_completed_query() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14433,6 +14623,7 @@ async fn setup_grep_with_needle_query() -> (
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14766,6 +14957,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14796,6 +14988,7 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -14992,6 +15185,7 @@ async fn picker_explorer_default_lists_workspace_root() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15043,6 +15237,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15088,6 +15283,7 @@ async fn picker_explorer_query_filters_by_prefix() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15151,6 +15347,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15221,6 +15418,7 @@ async fn setup_peek_workspace() -> (
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15437,6 +15635,7 @@ async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15480,6 +15679,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15545,6 +15745,7 @@ async fn picker_explorer_query_is_smartcase() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15611,6 +15812,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15662,6 +15864,7 @@ async fn picker_explorer_select_directory_errors() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15708,6 +15911,7 @@ async fn picker_explorer_rejects_path_outside_workspace() {
             directory_path: Some("/etc".into()),
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15922,6 +16126,7 @@ async fn picker_explorer_resumes_last_directory() {
             directory_path: Some(target.display().to_string()),
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -15951,6 +16156,7 @@ async fn picker_explorer_resumes_last_directory() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -16039,6 +16245,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -16095,6 +16302,7 @@ async fn picker_files_tags_entries_with_git_status() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -16159,6 +16367,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -19696,6 +19905,7 @@ async fn references_picker_lists_all_uses() {
                     directory_path: None,
                     buffer_id: Some(buffer_id),
                     explorer_roots: false,
+                    keybindings: None,
                 },
             )
             .await;
@@ -19984,6 +20194,7 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
             directory_path: None,
             buffer_id: Some(buffer_id),
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -20642,6 +20853,7 @@ async fn setup_grep_filter_workspace() -> (
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -20879,6 +21091,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -20960,6 +21173,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21143,6 +21357,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21166,6 +21381,7 @@ async fn grep_filters_persist_across_hide_and_reset_wipes() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21205,6 +21421,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21262,6 +21479,7 @@ async fn grep_filter_root_scope() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21364,6 +21582,7 @@ async fn files_picker_filters_narrow_candidates() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -21515,6 +21734,7 @@ async fn explorer_filters_hide_and_changed_only() {
                 directory_path: None,
                 buffer_id: None,
                 explorer_roots: false,
+                keybindings: None,
             },
         )
         .await;
@@ -21589,6 +21809,7 @@ async fn explorer_filters_hide_and_changed_only() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -22129,6 +22350,7 @@ async fn buffers_picker_reports_transient_flag() {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
@@ -22203,6 +22425,7 @@ async fn workspace_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
             directory_path: None,
             buffer_id: None,
             explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;

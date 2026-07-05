@@ -11704,11 +11704,15 @@ pub async fn picker_view(
     // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
     // on demand by `picker/query`'s spawned search. Explorer re-lists the requested directory
     // (or the previously-listed one on resume) every call, like Buffers — directories change.
-    // Per-kind active-workspace gating. Workspaces is the *only* kind that's allowed before
-    // activation — it's how the user gets a workspace active in the first place. Files / Buffers /
+    // Per-kind active-workspace gating. Workspaces is allowed before activation — it's how the
+    // user gets a workspace active in the first place — and Keybindings has no workspace-scoped
+    // data at all (the client ships its rows), so help works pre-activation too. Files / Buffers /
     // Grep / Explorer require an active workspace; their candidate builders all hit workspace-scoped
     // data and would error or return nothing without one.
-    if !matches!(params.kind, PickerKind::Workspaces) {
+    if !matches!(
+        params.kind,
+        PickerKind::Workspaces | PickerKind::Keybindings
+    ) {
         let s = state.lock().await;
         s.active_workspace_or_err(client_id)?;
     }
@@ -11913,6 +11917,18 @@ pub async fn picker_view(
             // Empty `roots` ⇒ no disk walk; only the single open buffer's hunks are built.
             picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&[], open))
         }
+        // The client ships the rows (its keymap tables aren't server knowledge). A fresh open
+        // carries them; a scroll/resume re-view sends none and `preserve_existing` keeps the
+        // previously-shipped set.
+        PickerKind::Keybindings => picker_state::PickerCandidates::Keybindings(
+            params
+                .keybindings
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        ),
     };
 
     let mut s = state.lock().await;
@@ -12032,6 +12048,12 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::GitChanges(_),
                     picker_state::PickerCandidates::GitChanges(new),
                 ) if params.kind == PickerKind::GitChangesFile => new.is_empty(),
+                // Keybindings: a fresh open ships the rows and rebuilds; a scroll/resume re-view
+                // ships none — keep the previously-shipped set, like GitChangesFile.
+                (
+                    picker_state::PickerCandidates::Keybindings(_),
+                    picker_state::PickerCandidates::Keybindings(new),
+                ) => new.is_empty(),
                 _ => false,
             };
             if !preserve_existing {

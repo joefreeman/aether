@@ -985,6 +985,7 @@ impl Session {
                         buffer_id: None,
                         from_selection: false,
                         filters: None,
+                        keybindings: None,
                     },
                     move |__r| Event::PickerViewed {
                         initial: false,
@@ -1897,6 +1898,10 @@ impl Session {
                 .then_some(buffer_id),
                 from_selection,
                 filters: seed_filters,
+                // The binding tables live here in the client core, so a fresh Keybindings open
+                // ships its rows for the server to match against.
+                keybindings: (kind == PickerKind::Keybindings)
+                    .then(crate::keymap::keybinding_entries),
             },
             move |__r| Event::PickerViewed {
                 initial: true,
@@ -2039,6 +2044,7 @@ impl Session {
                 buffer_id: None,
                 from_selection: false,
                 filters: Some(filters),
+                keybindings: None,
             },
             move |__r| Event::PickerViewed {
                 initial: false,
@@ -2105,6 +2111,7 @@ impl Session {
                 buffer_id: None,
                 from_selection: false,
                 filters: None,
+                keybindings: None,
             },
             move |__r| Event::PickerViewed {
                 initial: false,
@@ -2427,6 +2434,7 @@ impl Session {
                         buffer_id: None,
                         from_selection: false,
                         filters: Some(filters),
+                        keybindings: None,
                     },
                     move |__r| Event::PickerViewed {
                         initial: false,
@@ -2740,6 +2748,11 @@ impl Session {
                 let _ = root_label;
                 self.prompt = Some(Prompt::LspInfo(Box::new(info)));
                 return Effects::none();
+            }
+            PickerItem::Keybinding { .. } => {
+                // Informational — a shortcut row isn't a jump target, so Enter just dismisses
+                // the panel (no `picker/select` round-trip; the server has no result for it).
+                return self.close_picker();
             }
             _ => {}
         }
@@ -5170,9 +5183,10 @@ impl Session {
                 fx
             }
             A::OpenHelp => {
-                // The help cheatsheet is still a shell-local overlay (it renders from the keymap
-                // tables); a shell without it ignores the action.
-                Effects::one(Effect::ShellAction(ShellAction::OpenHelp))
+                // The keyboard-shortcut reference is the Keybindings picker: the rows are built
+                // from the keymap tables here in the core and shipped on the `picker/view`, so
+                // every shell gets the same searchable list through the ordinary picker pipeline.
+                self.open_picker(PickerKind::Keybindings, None, None, false)
             }
             A::OpenWorkspaceSettings => {
                 // The workspace-settings overlay now lives in the core (state + key handling); every

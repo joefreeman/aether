@@ -217,27 +217,6 @@ impl WasmSession {
         )))
     }
 
-    /// The keyboard-shortcut help table, sourced from the shared core's keymap (so it can never drift
-    /// from the actual dispatch — unlike the old hand-maintained web help.ts). A flat list of
-    /// `{ tab, group, keys, desc }` tagged by help tab (Normal / Insert / Search / Application, with
-    /// Global bindings folded into Normal + Insert, mirroring the tui's tab contexts); the shell
-    /// groups it into tabs → sections. Hidden bindings (the leader trigger, empty-group internals)
-    /// are filtered out. Returns the array.
-    pub fn help_entries(&self) -> Result<JsValue, JsValue> {
-        let entries: Vec<Value> = aether_client::keymap::help_entries()
-            .into_iter()
-            .map(|e| {
-                json!({
-                    "tab": e.tab,
-                    "group": e.group,
-                    "keys": e.keys,
-                    "desc": e.desc,
-                })
-            })
-            .collect();
-        to_js(&Value::Array(entries))
-    }
-
     /// Select the rightmost filter chip (Left/Backspace at the query start). Returns `Effect[]`.
     pub fn picker_select_last_chip(&mut self) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.picker_select_last_chip()))
@@ -624,7 +603,7 @@ fn reveal_value(r: aether_client::picker::Reveal) -> Value {
 }
 
 /// Lower a [`ShellAction`] to the JSON the web shell's `runShellAction` consumes
-/// (`{ name, dir?, unit?, fraction? }`): scrolling, cursor placement, wrap, help.
+/// (`{ name, dir?, unit?, fraction? }`): scrolling, cursor placement, wrap.
 fn action_value(a: &ShellAction) -> Value {
     let dbg = |x: &dyn std::fmt::Debug| format!("{x:?}").to_lowercase();
     match a {
@@ -635,7 +614,6 @@ fn action_value(a: &ShellAction) -> Value {
             json!({ "name": "place_cursor", "fraction": place.fraction() })
         }
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
-        ShellAction::OpenHelp => json!({ "name": "open_help" }),
         // GUI-only (spawns a native OS window); the web shell has no handler and ignores it.
         ShellAction::NewWindow => json!({ "name": "new_window" }),
     }

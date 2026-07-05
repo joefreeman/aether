@@ -10,8 +10,8 @@
 use crate::workspace_index::CachedFile;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerItem, PickerKind,
-    PickerSelectResult, PickerUpdateParams,
+    BufferDirtyState, CaseMode, KeybindingEntry, MatchOptions, PickerFilters, PickerItem,
+    PickerKind, PickerSelectResult, PickerUpdateParams,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
@@ -396,6 +396,23 @@ pub struct LspServerCandidate {
     pub progress: Vec<LspProgress>,
 }
 
+/// One Keybindings-picker candidate — a [`KeybindingEntry`] the client shipped on `picker/view`
+/// (the binding tables live client-side; the server only matches and windows). `haystack` is the
+/// entry's canonical composition ([`KeybindingEntry::haystack`]), precomputed once at build so
+/// rerank doesn't re-format ~150 rows per keystroke.
+#[derive(Debug, Clone)]
+pub struct KeybindingCandidate {
+    pub entry: KeybindingEntry,
+    pub haystack: String,
+}
+
+impl From<KeybindingEntry> for KeybindingCandidate {
+    fn from(entry: KeybindingEntry) -> Self {
+        let haystack = entry.haystack();
+        KeybindingCandidate { entry, haystack }
+    }
+}
+
 /// How a candidate set turns a non-empty query into a ranked subset. Each `PickerCandidates`
 /// variant picks one; `rerank` and `build_window_items` dispatch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +479,10 @@ pub enum PickerCandidates {
     /// (a snapshot of the repo state at open); the query fuzzy-filters the file path while keeping
     /// the file grouping (document order, like the symbols outline).
     GitChanges(Vec<GitChangeCandidate>),
+    /// The client's keyboard shortcuts, shipped on open (`PickerViewParams::keybindings`) and
+    /// preserved across scroll/resume re-views (the re-view sends no rows), like Diagnostics.
+    /// Static for the picker's lifetime — bindings can't change under a running client.
+    Keybindings(Vec<KeybindingCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -488,6 +509,7 @@ impl PickerCandidates {
             PickerCandidates::References(v) => v.len(),
             PickerCandidates::Symbols(v) => v.len(),
             PickerCandidates::GitChanges(v) => v.len(),
+            PickerCandidates::Keybindings(v) => v.len(),
         }
     }
 
@@ -504,6 +526,7 @@ impl PickerCandidates {
             PickerCandidates::References(_) => PickerKind::References,
             PickerCandidates::Symbols(_) => PickerKind::DocumentSymbols,
             PickerCandidates::GitChanges(_) => PickerKind::GitChanges,
+            PickerCandidates::Keybindings(_) => PickerKind::Keybindings,
         }
     }
 
@@ -526,6 +549,7 @@ impl PickerCandidates {
             // Not used as a match haystack (GitChanges greps content via SubstringContent, not
             // `display_at`); kept defined for completeness.
             PickerCandidates::GitChanges(v) => &v[idx].relative_path,
+            PickerCandidates::Keybindings(v) => &v[idx].haystack,
         }
     }
 
@@ -655,6 +679,16 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Keybindings(v) => {
+                let e = &v[idx].entry;
+                PickerItem::Keybinding {
+                    group: e.group.clone(),
+                    desc: e.desc.clone(),
+                    mode: e.mode.clone(),
+                    keys: e.keys.clone(),
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -746,6 +780,14 @@ impl PickerCandidates {
                     && c.relative_path == *relative_path
                     && c.hunk_index == *hunk_index
             }),
+            (
+                PickerCandidates::Keybindings(v),
+                PickerItem::Keybinding {
+                    mode, keys, desc, ..
+                },
+            ) => v.iter().position(|c| {
+                c.entry.mode == *mode && c.entry.keys == *keys && c.entry.desc == *desc
+            }),
             _ => None,
         }
     }
@@ -761,7 +803,8 @@ impl PickerCandidates {
             | PickerCandidates::Diagnostics(_)
             | PickerCandidates::LspServers(_)
             | PickerCandidates::References(_)
-            | PickerCandidates::Symbols(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::Symbols(_)
+            | PickerCandidates::Keybindings(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -859,6 +902,9 @@ impl PickerCandidates {
             // Query-less default (anchor line). The query-aware variant — landing on the matched
             // line — is applied by `resolve_select`, which has the picker's query.
             PickerCandidates::GitChanges(v) => Some(git_change_select(&v[idx], None)),
+            // Informational — a shortcut row isn't a jump target and `select` never fires for
+            // this kind (the client's Enter just closes the picker), like LspServers.
+            PickerCandidates::Keybindings(_) => None,
         }
     }
 }
@@ -1144,10 +1190,14 @@ impl PickerState {
                         }
                     }
                     self.ranked = keep.into_iter().collect();
-                } else if matches!(&self.candidates, PickerCandidates::GitChanges(_)) {
-                    // Git changes group by file: keep matches in document (candidate) order, not
-                    // score order, so each file's hunks stay a contiguous run the client can put a
-                    // single header above. The fuzzy score only decides which rows survive.
+                } else if matches!(
+                    &self.candidates,
+                    PickerCandidates::GitChanges(_) | PickerCandidates::Keybindings(_)
+                ) {
+                    // Grouped kinds: keep matches in document (candidate) order, not score order,
+                    // so each group's rows stay a contiguous run the client can put a single
+                    // header above — GitChanges' per-file hunks, Keybindings' per-group bindings
+                    // (shipped pre-bucketed). The fuzzy score only decides which rows survive.
                     let mut keep: Vec<u32> = scored.into_iter().map(|(_, i)| i).collect();
                     keep.sort_unstable();
                     self.ranked = keep;
@@ -1341,9 +1391,10 @@ impl PickerState {
             return None;
         }
         // The group key of ranked row `ci`, for the grouped kinds — `(path_index, relative_path)`
-        // for the file-grouped kinds, and a synthetic `(is_definition, "")` section key for
-        // References (the Definition section vs the References section). Only equality matters here;
-        // the count is the number of group transitions in ranked order.
+        // for the file-grouped kinds, a synthetic `(is_definition, "")` section key for
+        // References (the Definition section vs the References section), and the binding group
+        // for Keybindings. Only equality matters here; the count is the number of group
+        // transitions in ranked order.
         let key_at = |ci: usize| -> Option<(u32, &str)> {
             match &self.candidates {
                 PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
@@ -1354,6 +1405,7 @@ impl PickerState {
                     Some((v[ci].path_index, v[ci].relative_path.as_str()))
                 }
                 PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+                PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
                 _ => None,
             }
         };
@@ -1523,6 +1575,109 @@ mod tests {
             match_indices: vec![],
         };
         assert_eq!(c.position_of(&elsewhere), None);
+    }
+
+    fn keybinding_candidates() -> PickerCandidates {
+        let entries = [
+            ("Editing", "Delete word back", "Any", "Ctrl-w"),
+            ("Pickers", "Find file", "Application", "Space f"),
+            ("Movement", "Word forward", "Normal", "w"),
+        ];
+        PickerCandidates::Keybindings(
+            entries
+                .into_iter()
+                .map(|(group, desc, mode, keys)| {
+                    KeybindingEntry {
+                        group: group.into(),
+                        desc: desc.into(),
+                        mode: mode.into(),
+                        keys: keys.into(),
+                    }
+                    .into()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn keybinding_candidates_round_trip_to_items() {
+        let c = keybinding_candidates();
+        assert_eq!(c.kind(), PickerKind::Keybindings);
+        assert_eq!(c.len(), 3);
+        // The haystack is the composed row — description + chord (and the mode, on the
+        // Insert/Search rows that show one). The group is a section header, not row text,
+        // so it isn't matched.
+        assert_eq!(c.display_at(0), "Delete word back Ctrl-w");
+        assert_eq!(c.match_strategy(), MatchStrategy::Fuzzy);
+        match c.make_item(1, vec![0, 1]) {
+            PickerItem::Keybinding {
+                group,
+                desc,
+                mode,
+                keys,
+                match_indices,
+            } => {
+                assert_eq!(group, "Pickers");
+                assert_eq!(desc, "Find file");
+                assert_eq!(mode, "Application");
+                assert_eq!(keys, "Space f");
+                assert_eq!(match_indices, vec![0, 1]);
+            }
+            other => panic!("expected Keybinding, got {other:?}"),
+        }
+        // Informational rows aren't selectable — Enter closes client-side, `select` never fires.
+        assert!(c.select_result(0).is_none());
+    }
+
+    #[test]
+    fn keybindings_group_metrics_and_query_keep_candidate_order() {
+        // Two Editing rows then a Motion row — one section header per group run, mirroring the
+        // client's `display_rows`, so the virtual-scroll row math lines up.
+        let kb = |group: &str, desc: &str, keys: &str| KeybindingCandidate::from(KeybindingEntry {
+            group: group.into(),
+            desc: desc.into(),
+            mode: "Any".into(),
+            keys: keys.into(),
+        });
+        let cands = PickerCandidates::Keybindings(vec![
+            kb("Editing", "Delete selection", "Ctrl-d"),
+            kb("Editing", "Undo", "Ctrl-z"),
+            kb("Motion", "Word forward", "w"),
+        ]);
+        let mut s = PickerState::new(cands);
+        let mut m = make_matcher();
+        s.rerank(&mut m);
+
+        // 3 items + 2 group headers = 5 display rows; a window at ranked row 0 sits below the
+        // first header, one at ranked row 2 sits below both.
+        let (display_offset, total) = s
+            .grouped_display_metrics(0)
+            .expect("keybindings are header-grouped");
+        assert_eq!(total, 5, "3 items + 2 group headers");
+        assert_eq!(display_offset, 1);
+        let (display_offset, _) = s.grouped_display_metrics(2).unwrap();
+        assert_eq!(display_offset, 4);
+
+        // A query keeps candidate (bucketed) order — the score only picks survivors — so each
+        // group stays a contiguous run under its single header.
+        s.query = "d".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1, 2], "document order, not score order");
+    }
+
+    #[test]
+    fn keybinding_identity_is_mode_keys_desc() {
+        let c = keybinding_candidates();
+        assert_eq!(c.position_of(&c.make_item(2, vec![])), Some(2));
+        // Same chord in a different mode is a different row.
+        let other_mode = PickerItem::Keybinding {
+            group: "Movement".into(),
+            desc: "Word forward".into(),
+            mode: "Insert".into(),
+            keys: "w".into(),
+            match_indices: vec![],
+        };
+        assert_eq!(c.position_of(&other_mode), None);
     }
 
     fn reference_candidates() -> PickerCandidates {

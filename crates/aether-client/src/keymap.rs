@@ -514,46 +514,41 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
     table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
-/// One row of the keyboard-shortcuts help: a formatted chord + its description, filed under a tab
-/// and a section group. Built straight from the binding tables so every client renders identical
-/// content.
-pub struct HelpEntry {
-    /// `Normal` / `Insert` / `Search` / `Application`.
-    pub tab: &'static str,
-    /// Section heading within the tab (the binding's `group`).
-    pub group: &'static str,
-    /// Display chord, e.g. `Ctrl-w`, `Space f ␣`, `↑`.
-    pub keys: String,
-    pub desc: &'static str,
-}
-
-/// Every user-facing binding, grouped for the help dialog: the four tabs in display order, the
-/// `Global` (shared Ctrl-editing) keys folded into both Normal and Insert, leader chords as the
-/// Application tab. Bindings with no `group` (internal aliases) and the leader-trigger itself are
-/// omitted. The single source the web and native help dialogs both render.
-pub fn help_entries() -> Vec<HelpEntry> {
-    const TABS: [(&str, &[KeyContext]); 4] = [
-        ("Normal", &[KeyContext::Normal, KeyContext::Global]),
-        ("Insert", &[KeyContext::Insert, KeyContext::Global]),
-        ("Search", &[KeyContext::Search]),
-        ("Application", &[KeyContext::Leader]),
+/// Every user-facing binding as a Keybindings-picker row: one entry per binding, bucketed by
+/// group — the picker renders one section header per group (grep-style), so a group's rows must
+/// be a contiguous run. Groups keep first-appearance order; within a group, rows keep mode-major
+/// order (Normal, the shared `Any` keys, Insert, Search, Application — so unlike the old tabbed
+/// help dialog the `Global` keys appear *once*, as mode `Any`, rather than folded into both
+/// Normal and Insert). Bindings with no `group` (internal aliases) and the leader-trigger itself
+/// are omitted. Built straight from the binding tables and shipped on `picker/view`, so every
+/// client's picker shows exactly its own keymap.
+pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
+    const MODES: [(&str, KeyContext); 5] = [
+        ("Normal", KeyContext::Normal),
+        ("Any", KeyContext::Global),
+        ("Insert", KeyContext::Insert),
+        ("Search", KeyContext::Search),
+        ("Application", KeyContext::Leader),
     ];
-    let mut entries = Vec::new();
-    for (tab, contexts) in TABS {
-        for &cx in contexts {
-            for b in table(cx) {
-                if !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
-                    entries.push(HelpEntry {
-                        tab,
-                        group: b.group,
-                        keys: b.key_label(),
-                        desc: b.desc,
-                    });
+    // Buckets in first-appearance order. A Vec scan beats a map: ~15 groups, built once per open.
+    let mut groups: Vec<(&str, Vec<aether_protocol::picker::KeybindingEntry>)> = Vec::new();
+    for (mode, cx) in MODES {
+        for b in table(cx) {
+            if !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
+                let entry = aether_protocol::picker::KeybindingEntry {
+                    group: b.group.to_string(),
+                    desc: b.desc.to_string(),
+                    mode: mode.to_string(),
+                    keys: b.key_label(),
+                };
+                match groups.iter_mut().find(|(g, _)| *g == b.group) {
+                    Some((_, rows)) => rows.push(entry),
+                    None => groups.push((b.group, vec![entry])),
                 }
             }
         }
     }
-    entries
+    groups.into_iter().flat_map(|(_, rows)| rows).collect()
 }
 
 /// What a key does to an *open hover popover*.
@@ -833,38 +828,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_entries_group_into_the_four_tabs() {
-        let entries = help_entries();
-        for tab in ["Normal", "Insert", "Search", "Application"] {
-            assert!(entries.iter().any(|e| e.tab == tab), "tab {tab} present");
+    fn keybinding_entries_cover_the_five_modes_once_each() {
+        let entries = keybinding_entries();
+        for mode in ["Normal", "Any", "Insert", "Search", "Application"] {
+            assert!(entries.iter().any(|e| e.mode == mode), "mode {mode} present");
         }
         // Internal bindings are hidden: never an empty group, and the leader-trigger (bare
         // "Space", action BeginLeader) is filtered out.
         assert!(entries.iter().all(|e| !e.group.is_empty()));
         assert!(entries.iter().all(|e| e.keys != "Space"));
-        // The Application tab carries the Space leader: every chord is a `Space …` label.
+        // Application rows carry the Space leader: every chord is a `Space …` label.
         assert!(entries
             .iter()
-            .filter(|e| e.tab == "Application")
+            .filter(|e| e.mode == "Application")
             .all(|e| e.keys.starts_with("Space ")));
-        // Hover is now a direct `Tab` on the Normal tab.
+        // Hover is a direct `Tab` in Normal mode.
         assert!(entries
             .iter()
-            .any(|e| e.tab == "Normal" && e.keys == "Tab" && e.desc == "Hover (type & docs)"));
-        // Global (shared Ctrl-editing) keys fold into both Normal and Insert: at least one
-        // description shows up under both tabs.
-        let in_tab = |t: &str| {
-            entries
-                .iter()
-                .filter(move |e| e.tab == t)
-                .map(|e| e.desc)
-                .collect::<Vec<_>>()
-        };
-        let (normal, insert) = (in_tab("Normal"), in_tab("Insert"));
-        assert!(
-            normal.iter().any(|d| insert.contains(d)),
-            "Global bindings appear in both Normal and Insert"
-        );
+            .any(|e| e.mode == "Normal" && e.keys == "Tab" && e.desc == "Hover (type & docs)"));
+        // The flat list dedupes the shared Ctrl-editing keys: each (mode, keys, desc) row —
+        // the picker item identity — appears exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for e in &entries {
+            assert!(
+                seen.insert((e.mode.clone(), e.keys.clone(), e.desc.clone())),
+                "duplicate row: {} {} ({})",
+                e.keys,
+                e.desc,
+                e.mode
+            );
+        }
+        // Groups are contiguous runs — the picker emits one section header per run, so a group
+        // reappearing later would split into duplicate headers.
+        let mut seen_groups: Vec<&str> = Vec::new();
+        for e in &entries {
+            match seen_groups.last() {
+                Some(g) if *g == e.group => {}
+                _ => {
+                    assert!(
+                        !seen_groups.contains(&e.group.as_str()),
+                        "group {:?} appears in two separate runs",
+                        e.group
+                    );
+                    seen_groups.push(&e.group);
+                }
+            }
+        }
     }
 
     #[test]

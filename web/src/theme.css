@@ -533,7 +533,7 @@ html, body, #app {
 .modal-btn.danger { background: var(--nord11); border-color: var(--nord11); }
 .modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
 
-/* Pickers + dialogs (save-as, workspace settings, help) share the picker offset (8vh from .overlay).
+/* Pickers + dialogs (save-as, workspace settings) share the picker offset (8vh from .overlay).
    Only confirmations sit lower, so a confirm over a picker doesn't align with it; and they layer
    above the workspace-settings dialog (same .overlay z-index, but that overlay sits later in the DOM). */
 .overlay.confirm-overlay { padding-top: 11vh; z-index: 11; }
@@ -658,56 +658,6 @@ html, body, #app {
 .as-setting.selected .as-check,
 .as-setting.selected .as-value { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
 .as-desc { color: var(--nord3-brighter); font-size: 12px; margin-top: 2px; }
-
-/* Help overlay. */
-.modal.help { width: min(760px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
-/* Tab bar across the top; the content below scrolls so switching tabs keeps the bar in place. */
-.help-tabs {
-  display: flex;
-  gap: 4px;
-  border-bottom: 1px solid var(--nord3);
-  margin-bottom: 12px;
-  flex: 0 0 auto;
-}
-.help-tab {
-  font: inherit;
-  background: transparent;
-  color: var(--nord3);
-  border: none;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  padding: 6px 12px;
-  cursor: pointer;
-}
-.help-tab:hover { color: var(--nord4); }
-.help-tab.active { color: var(--nord8); border-bottom-color: var(--nord8); }
-.help-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 28px;
-  align-content: start;
-  overflow-y: auto;
-  overflow-x: hidden;
-  flex: 1 1 auto;
-}
-.help-section { break-inside: avoid; margin-bottom: 14px; }
-.help-section-title {
-  color: var(--nord13);
-  margin-bottom: 4px;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.help-row { display: flex; gap: 10px; padding: 1px 0; }
-.help-key {
-  flex: 0 0 44%;
-  color: var(--nord8);
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.help-desc { flex: 1 1 auto; color: var(--nord4); }
 
 /* ---- Picker overlay (command-palette style) ---- */
 .overlay {
@@ -987,10 +937,14 @@ a.picker-row:not(.selected):hover .picker-main {
    number keeps the picker's sans-serif. */
 .picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
 /* Tighter vertical rhythm than the standard 3px row padding, so grep's code lines read closer to
-   the editor's line density. Headers must match: the virtual scroll assumes every grep display
-   row (hit or header) has the same measured height. */
+   the editor's line density. The virtual scroll assumes every display row (item or header) has
+   the same measured height, so a header must match its OWN kind's rows: `.tight` rides only on
+   headers whose item rows are `.grep-hit` (grep, git-changes); the standard-height kinds
+   (keybindings groups, reference sections, workspace-diagnostics files) keep the 3px default —
+   a tight header there under-fills the row the spacer budgeted, and the error compounds per
+   header into a scroll-dependent gap at the list's end. */
 .picker-row.grep-hit,
-.picker-row.grep-header {
+.picker-row.grep-header.tight {
   padding-top: 1px;
   padding-bottom: 1px;
 }
@@ -999,6 +953,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-row.grep-hit .picker-meta { flex: 0 0 auto; margin-left: auto; }
 .picker-meta { color: var(--nord3-brighter); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
 .picker-row.selected .picker-meta { color: var(--nord4); }
+/* Keybinding chords read as the row's value, in the frost blue the native client uses (and the
+   old help dialog's key column used). After the `.selected` rule so it wins on selected rows too
+   (same specificity, later order) — the native client doesn't dim the chord on selection either. */
+.picker-row.keybinding .picker-meta { color: var(--nord8); }
 .picker .match { color: var(--nord13); font-weight: bold; }
 .picker-row.selected .match { color: var(--nord13); }
 /* Match summary ("X/Y") to the right of the input, like the terminal UI. */

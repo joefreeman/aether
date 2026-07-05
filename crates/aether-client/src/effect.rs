@@ -19,8 +19,6 @@ pub enum ShellAction {
     PlaceCursor(ViewportPlace),
     /// Flip soft-wrap and re-render the viewport (paired with [`Effect::SaveContentAnchor`]).
     ToggleWrap,
-    /// Open the shell-local help cheatsheet (rendered from the keymap tables).
-    OpenHelp,
     /// Open another native window onto the same workspace (`Space Alt-x`) — the GUI shell spawns a
     /// fresh detached `ae --gui` process; the TUI and web shells ignore it (a new OS window is
     /// GUI-only). Carries no payload: the spawning shell reads the workspace/path from its own

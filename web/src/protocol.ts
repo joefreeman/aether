@@ -278,7 +278,8 @@ export type PickerKind =
   | "diagnostics_workspace"
   | "lsp_servers"
   | "references"
-  | "document_symbols";
+  | "document_symbols"
+  | "keybindings";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -364,5 +365,19 @@ export type PickerItem =
       /** True when this row is only an ancestor of a match, shown dim for tree context while
        *  filtering — non-selectable (the core's navigation skips it). Absent when false. */
       context?: boolean;
+      match_indices?: number[];
+    }
+  | {
+      kind: "keybinding";
+      /** Section the binding belongs to (e.g. "Editing"). */
+      group: string;
+      /** What the binding does — the row's main label. */
+      desc: string;
+      /** Mode the binding applies in (e.g. "Normal", "Any"). */
+      mode: string;
+      /** The chord itself (e.g. "Ctrl-w"). */
+      keys: string;
+      /** Code-point offsets into the composed haystack `"{group} > {desc} ({mode}) {keys}"` —
+       *  rebased per segment by the shell (mirrors aether-client `keybinding_match_segments`). */
       match_indices?: number[];
     };

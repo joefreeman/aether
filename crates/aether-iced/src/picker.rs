@@ -165,6 +165,16 @@ pub(crate) enum Boundary {
     PathToRoot,
 }
 
+/// Whether this kind pins a sticky group header over the list's top row (the web's
+/// `position: sticky`): the file-grouped kinds pin their file header, Keybindings pins its
+/// group label. References renders section labels but deliberately does *not* pin (at most two
+/// short sections). The single source for the pin itself (`overlay`) AND the one-row reveal
+/// clearance (`app::reveal_target`) — a revealed row must clear the pinned header or it slides
+/// underneath it, so the two must never disagree about which kinds pin.
+pub fn pins_group_header(kind: PickerKind) -> bool {
+    kind.groups_by_file() || kind == PickerKind::Keybindings
+}
+
 /// Query-input placeholder per picker — kept in sync with the web client's `PLACEHOLDER` map
 /// and the TUI's `picker_placeholder`.
 fn placeholder(kind: PickerKind) -> &'static str {
@@ -181,6 +191,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::DocumentSymbols => "Go to symbol…",
         PickerKind::GitChangesFile => "Changes in current file…",
         PickerKind::GitChanges => "Changes in workspace…",
+        PickerKind::Keybindings => "Search keybindings…",
     }
 }
 
@@ -509,13 +520,19 @@ pub fn overlay<'a>(
         ))
         .on_scroll(|vp| PickerMsg::Scrolled(vp.absolute_offset().y));
 
-    // Sticky group header: pin the top visible row's file header over the list (web's
-    // `position: sticky`). The stack is ALWAYS present with a pin slot — conditionally
-    // changing the tree shape would reset the scrollable's state (iced keys widget state by
-    // tree position), which is a scroll-to-top.
-    let pinned: Option<(u32, String)> = if !state.kind.groups_by_file() {
-        // Headerless kinds (e.g. the single-file GitChangesFile) have nothing to pin — without this
-        // the top item's own file would pin a stray header over the row.
+    // Sticky group header: pin the top visible row's group header over the list (web's
+    // `position: sticky`) — the file path for the file-grouped kinds, the binding group for
+    // Keybindings. The stack is ALWAYS present with a pin slot — conditionally changing the
+    // tree shape would reset the scrollable's state (iced keys widget state by tree position),
+    // which is a scroll-to-top.
+    enum Pin {
+        File(u32, String),
+        Label(String),
+    }
+    // Headerless kinds (e.g. the single-file GitChangesFile) have nothing to pin — without the
+    // gate the top item's own file would pin a stray header over the row. References sections
+    // deliberately don't pin either (at most two short sections).
+    let pinned: Option<Pin> = if !pins_group_header(state.kind) {
         None
     } else {
         let first_visible = first_visible_row(scroll_y);
@@ -542,23 +559,29 @@ pub fn overlay<'a>(
                             path_index,
                             relative_path,
                             ..
-                        } => Some((*path_index, relative_path.clone())),
+                        } => Some(Pin::File(*path_index, relative_path.clone())),
+                        PickerItem::Keybinding { group, .. } => Some(Pin::Label(group.clone())),
                         _ => None,
                     },
                     // A header at the top pins itself (identical overlay, no flicker).
                     DisplayRow::Header {
                         path_index,
                         relative_path,
-                    } => Some((path_index, relative_path.to_string())),
-                    // References section labels don't sticky-pin (the sections are short — at most
-                    // one definition row), and the create row is Explorer-only.
-                    DisplayRow::Section { .. } | DisplayRow::Create { .. } => None,
+                    } => Some(Pin::File(path_index, relative_path.to_string())),
+                    DisplayRow::Section { label } => Some(Pin::Label(label.to_string())),
+                    DisplayRow::Create { .. } => None,
                 })
         })
     };
     let pin_layer: Element<'_, PickerMsg> = match pinned {
-        Some((path_index, relative_path)) => {
-            container(grep_header(roots, path_index, &relative_path))
+        Some(pin) => {
+            let header = match pin {
+                Pin::File(path_index, relative_path) => {
+                    grep_header(roots, path_index, &relative_path)
+                }
+                Pin::Label(label) => section_header(label),
+            };
+            container(header)
                 .width(Length::Fill)
                 .align_y(iced::alignment::Vertical::Top)
                 // Stop short of the scrollbar lane rather than covering it.
@@ -924,11 +947,12 @@ fn grep_header<'a>(
     .into()
 }
 
-/// A References-picker section label (`Definition` / `References`). Same footprint and chrome as
-/// [`grep_header`] but a fixed label rather than a file path.
-fn section_header<'a>(label: &'static str) -> Element<'a, PickerMsg> {
+/// A section label (References' `Definition` / `References`, the Keybindings picker's group
+/// headings). Same footprint and chrome as [`grep_header`] but a label rather than a file path.
+/// Takes ownership (`Into<String>`) so the sticky pin can hand it a String built in a match arm.
+fn section_header<'a>(label: impl Into<String>) -> Element<'a, PickerMsg> {
     container(
-        text(label)
+        text(label.into())
             .size(13)
             .font(SANS_BOLD)
             .color(theme::NORD8)
@@ -1365,6 +1389,51 @@ fn render_item<'a>(
             }
             r = r.push(iced::widget::Space::new().width(Length::Fill));
             r = r.push(meta(symbol_kind.label().to_string()));
+            r.into()
+        }
+        PickerItem::Keybinding {
+            desc,
+            mode,
+            keys,
+            match_indices,
+            ..
+        } => {
+            // The description leads (the group is the section header above the run, not row
+            // text), a dim `(Mode)` follows for Insert/Search rows (default modes are elided,
+            // matching the haystack), and the chord sits right-aligned in frost blue. The wire
+            // indices are haystack-relative; the core splits them per segment (mode shifts by 1
+            // for the opening paren added here).
+            let seg =
+                aether_client::picker::keybinding_match_segments(desc, mode, keys, match_indices);
+            // Hover underlines the description alone — the row's "name"; underlining the dim
+            // mode tag and the chord too reads as noise.
+            let mut r = iced::widget::Row::new()
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+            r = r.push(highlighted_owned(
+                desc.clone(),
+                seg.desc,
+                theme::NORD6,
+                SANS,
+                hovered,
+            ));
+            if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
+                r = r.push(highlighted_owned(
+                    format!("({mode})"),
+                    seg.mode.iter().map(|i| i + 1).collect(),
+                    theme::NORD3_BRIGHT,
+                    SANS,
+                    false,
+                ));
+            }
+            r = r.push(iced::widget::Space::new().width(Length::Fill));
+            r = r.push(highlighted_owned(
+                keys.clone(),
+                seg.keys,
+                theme::NORD8,
+                SANS,
+                false,
+            ));
             r.into()
         }
     }

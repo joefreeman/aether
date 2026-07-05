@@ -11,7 +11,6 @@ use aether_protocol::viewport::{DiagnosticSeverity, LogicalLineRender, WrapMode}
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use std::io::stdout;
 use std::time::Instant;
@@ -216,9 +215,6 @@ pub struct AppState {
     /// Active application-settings overlay (`Space .`). When `Some`, draws a centered modal
     /// listing the global settings (e.g. soft wrap). Closed by Esc.
     pub app_settings: Option<AppSettingsState>,
-    /// Keyboard-shortcut help overlay (`Space ?`). A read-only, client-local cheatsheet generated
-    /// from the `keymap` tables — no server round-trip. Closed by Esc.
-    pub help: HelpState,
     /// Latest language-server status per server, keyed by `(language, workspace_root)`, from
     /// `lsp/status_changed`. Drives the status-bar health indicator for the current buffer's
     /// server (keyed this way so several same-language servers don't collide). Persists for the
@@ -273,65 +269,6 @@ impl HoverPopup {
             body,
             scroll: crate::scroll::ScrollState::default(),
         }
-    }
-}
-
-/// State for the keyboard-shortcut help overlay. Open/closed, the selected tab, and a scroll
-/// position; the content is generated on the fly from the `keymap` binding tables, so there's
-/// nothing to cache here.
-#[derive(Debug, Default)]
-pub struct HelpState {
-    pub open: bool,
-    pub tab: HelpTab,
-    pub scroll: crate::scroll::ScrollState,
-}
-
-/// Which tab the help overlay is showing. The tabs mirror the key-dispatch layers: one per editor
-/// mode (`Normal`/`Insert`/`Search`), plus `Application` for the `Space`-leader chords. The shared
-/// `Ctrl-` editing keys (the `Global` table) are surfaced on both the Normal and Insert tabs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HelpTab {
-    #[default]
-    Normal,
-    Insert,
-    Search,
-    Application,
-}
-
-impl HelpTab {
-    /// Tabs in left-to-right display order — the order `h`/`l` cycles through.
-    pub const ALL: [HelpTab; 4] = [
-        HelpTab::Normal,
-        HelpTab::Insert,
-        HelpTab::Search,
-        HelpTab::Application,
-    ];
-
-    /// Label shown in the overlay's tab bar.
-    pub fn label(self) -> &'static str {
-        match self {
-            HelpTab::Normal => "Normal",
-            HelpTab::Insert => "Insert",
-            HelpTab::Search => "Search",
-            HelpTab::Application => "Application",
-        }
-    }
-
-    /// Step `delta` tabs along [`HelpTab::ALL`], wrapping at both ends.
-    fn step(self, delta: isize) -> HelpTab {
-        let n = HelpTab::ALL.len() as isize;
-        let i = HelpTab::ALL.iter().position(|t| *t == self).unwrap_or(0) as isize;
-        HelpTab::ALL[(((i + delta) % n + n) % n) as usize]
-    }
-
-    /// The next tab to the right (wraps around to the first).
-    pub fn next(self) -> HelpTab {
-        self.step(1)
-    }
-
-    /// The previous tab to the left (wraps around to the last).
-    pub fn prev(self) -> HelpTab {
-        self.step(-1)
     }
 }
 
@@ -743,44 +680,6 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
 // action (`Copy`/`DeleteSelection`/… in Normal, `CopyLine`/`DeleteLine`/… in Insert), so
 // `run_action` dispatches straight to `copy_to_clipboard(Selection)` / `delete_line` / etc.
 
-/// Key handling for the keyboard-shortcut help overlay (`Space ?`). Read-only: Esc / `?` / `q`
-/// close it; the arrows and PageUp/Down scroll. The render clamps `scroll` to the content height,
-/// so over-scrolling here is harmless.
-pub fn handle_help_key(state: &mut AppState, k: KeyEvent) -> Result<()> {
-    // Scroll math (and clamping to the real bottom) lives in `ScrollState`, which the renderer
-    // feeds the box geometry. Here we just translate keys to intents. `h`/`l` (and the arrows /
-    // Tab) move *between* tabs; `j`/`k` (and ↑/↓) scroll *within* one. Switching tabs resets the
-    // scroll to the top, since each tab is its own (usually short) page.
-    match k.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => state.help.open = false,
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-            state.help.tab = state.help.tab.prev();
-            state.help.scroll.scroll_to_top();
-        }
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-            state.help.tab = state.help.tab.next();
-            state.help.scroll.scroll_to_top();
-        }
-        KeyCode::Up | KeyCode::Char('k') => state.help.scroll.scroll_by(-1),
-        KeyCode::Down | KeyCode::Char('j') => state.help.scroll.scroll_by(1),
-        KeyCode::PageUp => state.help.scroll.page(false),
-        KeyCode::PageDown | KeyCode::Char(' ') => state.help.scroll.page(true),
-        KeyCode::Home | KeyCode::Char('g') => state.help.scroll.scroll_to_top(),
-        KeyCode::End | KeyCode::Char('G') => state.help.scroll.scroll_to_bottom(),
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Mouse handling for the help overlay — the wheel scrolls, everything else is ignored.
-pub fn handle_help_mouse(state: &mut AppState, m: MouseEvent) {
-    match m.kind {
-        MouseEventKind::ScrollUp => state.help.scroll.scroll_by(-3),
-        MouseEventKind::ScrollDown => state.help.scroll.scroll_by(3),
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,7 +783,6 @@ mod tests {
             editor: None,
             workspace_settings: None,
             app_settings: None,
-            help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
@@ -914,7 +812,6 @@ mod tests {
             editor: None,
             workspace_settings: None,
             app_settings: None,
-            help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
@@ -947,7 +844,6 @@ mod tests {
             editor: Some(stub_editor_state("src/main.rs")),
             workspace_settings: None,
             app_settings: None,
-            help: HelpState::default(),
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),

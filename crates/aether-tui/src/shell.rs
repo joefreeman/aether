@@ -634,11 +634,6 @@ impl Shell {
             self.state.hover = None;
             return;
         }
-        // Shell-local overlays own the keyboard while open.
-        if self.state.help.open {
-            let _ = crate::app::handle_help_key(&mut self.state, k);
-            return;
-        }
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
@@ -838,10 +833,6 @@ impl Shell {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        if self.state.help.open {
-            crate::app::handle_help_mouse(&mut self.state, m);
-            return;
-        }
         // While a picker is open its overlay owns the screen: the wheel moves the highlight,
         // and clicks fall through to the picker rather than the buffer underneath.
         if self.session.picker.is_some() {
@@ -996,10 +987,6 @@ impl Shell {
                 };
                 self.sent_grid = Some(self.grid());
                 self.subscribe();
-            }
-            ShellAction::OpenHelp => {
-                self.state.help.open = true;
-                self.state.help.scroll = Default::default();
             }
             // "Open another window" is GUI-only — a new OS window makes no sense for the terminal
             // client, which owns the one terminal it was launched in. Ignore it here.
@@ -2276,7 +2263,6 @@ fn make_state(
         editor: None,
         workspace_settings: None,
         app_settings: None,
-        help: Default::default(),
         lsp_status: Default::default(),
         hover: None,
         diagnostic_counts: Default::default(),

@@ -480,6 +480,7 @@ impl PickerState {
         let mut rows = Vec::with_capacity(self.items.len() + 8);
         let mut last_file: Option<(u32, &str)> = None;
         let mut last_section: Option<bool> = None;
+        let mut last_keybinding_group: Option<&str> = None;
         // The grouped kinds (Grep, workspace GitChanges, workspace Diagnostics) emit one file header
         // before each file's first row. The buffer-locked GitChangesFile / Diagnostics are a single
         // file (or flat) with no header — gated by `groups_by_file`.
@@ -508,6 +509,15 @@ impl PickerState {
                             "References"
                         },
                     });
+                }
+            }
+            // Keybindings group under one section per binding group. Candidates arrive bucketed
+            // (see `keymap::keybinding_entries`) and matches keep candidate order, so each group
+            // is a contiguous run — a label row at each group transition, like References.
+            if let PickerItem::Keybinding { group, .. } = item {
+                if last_keybinding_group != Some(group.as_str()) {
+                    last_keybinding_group = Some(group);
+                    rows.push(DisplayRow::Section { label: group });
                 }
             }
             rows.push(DisplayRow::Item {
@@ -612,6 +622,7 @@ impl PickerState {
             _ if !self.query.is_empty() => "No matches",
             PickerKind::Diagnostics | PickerKind::DiagnosticsWorkspace => "No diagnostics",
             PickerKind::GitChanges | PickerKind::GitChangesFile => "No changes",
+            PickerKind::Keybindings => "No keybindings",
             _ => "No results",
         })
     }
@@ -633,6 +644,58 @@ pub enum ItemKey<'a> {
     LspServer(&'a str, &'a str),
     Reference(&'a str, u32, u32),
     Symbol(&'a str, u32, u32),
+    /// `(mode, keys, desc)` — a chord can be bound in several modes, and an Alt-variant can
+    /// share a description, so all three disambiguate.
+    Keybinding(&'a str, &'a str, &'a str),
+}
+
+/// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
+/// offsets into the row's composed haystack (`KeybindingEntry::haystack`, `{desc} [({mode}) ]
+/// {keys}` — the mode is present only for Insert/Search rows, see
+/// `KeybindingEntry::shows_mode`; the group is a section header, not row text); each field here
+/// is the subset that falls inside that segment, rebased to the segment's own chars — ready to
+/// feed a shell's per-span highlighter. Indices landing on the literal separators are dropped:
+/// the shells style separators dim and unhighlighted. `mode` stays empty for rows whose mode is
+/// elided.
+#[derive(Debug, Default, PartialEq)]
+pub struct KeybindingSegments {
+    pub desc: Vec<u32>,
+    pub mode: Vec<u32>,
+    pub keys: Vec<u32>,
+}
+
+/// Split a [`PickerItem::Keybinding`]'s haystack-relative `match_indices` into per-segment
+/// lists (see [`KeybindingSegments`]). The single source of the segment offsets — keep in
+/// lockstep with `KeybindingEntry::haystack` (the web shell mirrors this in TypeScript).
+pub fn keybinding_match_segments(
+    desc: &str,
+    mode: &str,
+    keys: &str,
+    match_indices: &[u32],
+) -> KeybindingSegments {
+    let (d, k) = (
+        desc.chars().count() as u32,
+        keys.chars().count() as u32,
+    );
+    // Segment start offsets within the haystack: `{desc} ({mode}) {keys}` / `{desc} {keys}`.
+    let m = if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
+        mode.chars().count() as u32
+    } else {
+        0
+    };
+    let mode_at = d + 2; // only meaningful when `m > 0`
+    let keys_at = if m > 0 { d + 2 + m + 2 } else { d + 1 };
+    let mut out = KeybindingSegments::default();
+    for &i in match_indices {
+        if i < d {
+            out.desc.push(i);
+        } else if m > 0 && (mode_at..mode_at + m).contains(&i) {
+            out.mode.push(i - mode_at);
+        } else if (keys_at..keys_at + k).contains(&i) {
+            out.keys.push(i - keys_at);
+        }
+    }
+    out
 }
 
 /// Split an Explorer path-query into `(path_part, filter_part)` at the last `/`, mirroring the
@@ -681,6 +744,9 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Symbol {
             path, line, col, ..
         } => ItemKey::Symbol(path, *line, *col),
+        PickerItem::Keybinding {
+            mode, keys, desc, ..
+        } => ItemKey::Keybinding(mode, keys, desc),
     }
 }
 
@@ -690,11 +756,11 @@ pub enum DisplayRow<'a> {
         path_index: u32,
         relative_path: &'a str,
     },
-    /// A non-selectable section label (References picker): `Definition` above the definition row,
-    /// `References` above the uses. Like [`DisplayRow::Header`] but the content is a fixed label,
-    /// not a file path.
+    /// A non-selectable section label: References' `Definition` / `References` split, and the
+    /// Keybindings picker's per-group headings. Like [`DisplayRow::Header`] but the content is a
+    /// label, not a file path.
     Section {
-        label: &'static str,
+        label: &'a str,
     },
     Item {
         abs: u32,
@@ -749,6 +815,77 @@ pub struct PendingCreate {
 mod tests {
     use super::*;
     use aether_protocol::git::GitStatus;
+
+    #[test]
+    fn keybinding_match_segments_rebase_and_drop_separators() {
+        // Elided mode (Any). Haystack: "Delete word back Ctrl-w"
+        //                               0..............15  17..22
+        let seg =
+            keybinding_match_segments("Delete word back", "Any", "Ctrl-w", &[0, 16, 17, 22]);
+        assert_eq!(seg.desc, vec![0]); // 'D' (16 lands on the separator space → dropped)
+        assert_eq!(seg.mode, Vec::<u32>::new()); // elided — nothing can land in it
+        assert_eq!(seg.keys, vec![0, 5]); // 'C', 'w'
+
+        // Shown mode (Insert). Haystack: "Delete word back (Insert) Ctrl-w"
+        //                                 0..............15  18...23  26..31
+        let seg = keybinding_match_segments(
+            "Delete word back",
+            "Insert",
+            "Ctrl-w",
+            &[17, 18, 23, 26, 31],
+        );
+        assert_eq!(seg.mode, vec![0, 5]); // 'I', 't' (17 lands on the '(' → dropped)
+        assert_eq!(seg.keys, vec![0, 5]); // 'C', 'w'
+
+        // Round-trip sanity: the haystacks really are composed the way the offsets assume.
+        let mut e = aether_protocol::picker::KeybindingEntry {
+            group: "Editing".into(),
+            desc: "Delete word back".into(),
+            mode: "Any".into(),
+            keys: "Ctrl-w".into(),
+        };
+        let hay: Vec<char> = e.haystack().chars().collect();
+        assert_eq!(hay[0], 'D');
+        assert_eq!(hay[17], 'C');
+        assert_eq!(hay[22], 'w');
+        e.mode = "Insert".into();
+        let hay: Vec<char> = e.haystack().chars().collect();
+        assert_eq!(hay[18], 'I');
+        assert_eq!(hay[23], 't');
+        assert_eq!(hay[26], 'C');
+        assert_eq!(hay[31], 'w');
+    }
+
+    #[test]
+    fn keybinding_display_rows_emit_one_section_per_group_run() {
+        let kb = |group: &str, desc: &str| PickerItem::Keybinding {
+            group: group.into(),
+            desc: desc.into(),
+            mode: "Normal".into(),
+            keys: "x".into(),
+            match_indices: vec![],
+        };
+        let mut s = PickerState::new(PickerKind::Keybindings);
+        s.items = vec![
+            kb("Motion", "Character left"),
+            kb("Motion", "Character right"),
+            kb("Edit", "Undo"),
+        ];
+        s.total_matches = 3;
+        let rows = s.display_rows();
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Section { label } => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Motion", "Edit"]);
+        // Section + 2 items + section + item.
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], DisplayRow::Section { .. }));
+        assert!(matches!(rows[3], DisplayRow::Section { .. }));
+    }
 
     fn update(
         kind: PickerKind,
