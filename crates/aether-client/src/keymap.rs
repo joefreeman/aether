@@ -359,7 +359,7 @@ pub enum Action {
 
     // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
     // overlay ignores them) ----
-    /// `Space ?` — the keyboard-shortcut help overlay, generated from these tables.
+    /// `Space /` — the keyboard-shortcut help overlay, generated from these tables.
     OpenHelp,
     /// `Space ,` — the workspace-settings overlay (roots + rename). TUI-only today.
     OpenWorkspaceSettings,
@@ -811,7 +811,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
-    bind!(L, ch('?'), Any, A::OpenHelp, "App", "Show keyboard shortcuts"),
+    bind!(L, ch('/'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),

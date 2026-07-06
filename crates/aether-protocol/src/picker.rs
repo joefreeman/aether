@@ -92,7 +92,7 @@ pub enum PickerKind {
     /// slot, independent of the workspace-wide [`GitChanges`]. Rows are the buffer's hunks, under the
     /// file's header.
     GitChangesFile,
-    /// The keyboard-shortcut reference (`Space ?`), fuzzy-matched on description, mode, and
+    /// The keyboard-shortcut reference (`Space /`), fuzzy-matched on description, mode, and
     /// chord, with rows grouped under one section header per binding group (the grep-style
     /// grouping — matches keep candidate order so each group stays a contiguous run; the client
     /// ships the rows already bucketed by group). Unique among the kinds in that the *client*

@@ -1033,12 +1033,12 @@ fn workspaces_picker_centers_on_the_active_workspace() {
 }
 
 #[test]
-fn space_question_opens_the_keybindings_picker_with_its_rows() {
+fn space_slash_opens_the_keybindings_picker_with_its_rows() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, '?');
-    let params = find_request(&fx, "picker/view").expect("Space ? opens via picker/view");
+    let fx = key(&mut s, '/');
+    let params = find_request(&fx, "picker/view").expect("Space / opens via picker/view");
     assert_eq!(params["kind"], "keybindings");
     assert_eq!(params["reset"], true);
     // The rows ride the open: the keymap tables live client-side, the server only matches.
@@ -1048,7 +1048,7 @@ fn space_question_opens_the_keybindings_picker_with_its_rows() {
         "the whole keymap ships ({} rows)",
         rows.len()
     );
-    assert!(rows.iter().any(|r| r["keys"] == "Space ?"
+    assert!(rows.iter().any(|r| r["keys"] == "Space /"
         && r["desc"] == "Show keyboard shortcuts"
         && r["mode"] == "Application"));
     assert_eq!(
@@ -1096,7 +1096,7 @@ fn enter_on_a_keybinding_row_closes_without_selecting() {
         group: "App".into(),
         desc: "Show keyboard shortcuts".into(),
         mode: "Application".into(),
-        keys: "Space ?".into(),
+        keys: "Space /".into(),
         match_indices: vec![],
     }];
     p.total_matches = 1;
