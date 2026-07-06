@@ -717,7 +717,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
     bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
-    bind!(N, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform case (u/l/i/c/p/s/k/w/t/n/d/x)"),
+    bind!(N, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform selection (u/l/i/r/c/p/s/k/w/t/n/d/x)"),
     bind!(N, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Selection), "Edit", "Toggle line comment"),
     bind!(N, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Selection), "Edit", "Toggle block comment"),
 
@@ -768,7 +768,7 @@ static INSERT: &[Binding] = &[
     bind!(I, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceLineClipboard, "Clipboard", "Replace line with clipboard"),
     bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
     bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
-    bind!(I, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier case (u/l/i/c/p/s/k/w/t/n/d/x)"),
+    bind!(I, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier (u/l/i/r/c/p/s/k/w/t/n/d/x)"),
     bind!(I, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Line), "Edit", "Toggle line comment"),
     bind!(I, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Line), "Edit", "Toggle block comment on line"),
 ];

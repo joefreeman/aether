@@ -1,7 +1,8 @@
 //! Pure case/word-shape transforms for `input/transform_case`. No buffer or position awareness —
 //! just `&str` in, `String` out — so it's trivially unit-testable.
 //!
-//! The three character transforms (`Upper`/`Lower`/`Invert`) recase letters verbatim. The
+//! The character transforms (`Upper`/`Lower`/`Invert`/`Reverse`) act per char, verbatim —
+//! recasing letters, or reversing their order (`Reverse`). The
 //! convention transforms split the operand into words and re-render them: split on whitespace,
 //! any non-alphanumeric punctuation (`_`, `-`, `.`, …), and case boundaries — a lower/digit→upper
 //! transition (`fooBar` → `foo`,`bar`) and an acronym tail (`HTTPServer` → `HTTP`,`Server`).
@@ -13,6 +14,7 @@ pub fn transform(kind: CaseKind, input: &str) -> String {
         CaseKind::Upper => input.to_uppercase(),
         CaseKind::Lower => input.to_lowercase(),
         CaseKind::Invert => input.chars().map(invert_char).collect(),
+        CaseKind::Reverse => input.chars().rev().collect(),
         // Convention transforms share the tokenizer; they differ only in the per-word casing and
         // the joining separator.
         CaseKind::Camel => join_words(input, WordCase::CamelLead, ""),
@@ -158,6 +160,23 @@ mod tests {
         assert_eq!(t(CaseKind::Invert, "aBc1-D"), "AbC1-d");
         // Character transforms are non-destructive on arbitrary text (spaces/punctuation kept).
         assert_eq!(t(CaseKind::Upper, "let foo = 1;"), "LET FOO = 1;");
+    }
+
+    #[test]
+    fn reverse_reverses_char_order() {
+        assert_eq!(t(CaseKind::Reverse, "abc"), "cba");
+        // Letterless text still reverses (the handler's no-op check is content-based, not
+        // letter-based).
+        assert_eq!(t(CaseKind::Reverse, "123"), "321");
+        // A palindrome comes back unchanged — the handler prechecks and no-ops it.
+        assert_eq!(t(CaseKind::Reverse, "aba"), "aba");
+        // Multi-line operand: full char reversal, newlines included.
+        assert_eq!(t(CaseKind::Reverse, "ab\ncd"), "dc\nba");
+        // Self-inverse.
+        assert_eq!(
+            t(CaseKind::Reverse, &t(CaseKind::Reverse, "aBc1-D")),
+            "aBc1-D"
+        );
     }
 
     #[test]

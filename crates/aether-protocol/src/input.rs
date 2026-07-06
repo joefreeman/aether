@@ -347,11 +347,12 @@ pub struct InputUnsurroundParams {
 
 // ---- input/transform_case -----------------------------------------------------------------------
 
-/// A case/word-shape transform applied to the operand text. The first three are *character*
-/// transforms (they recase every letter verbatim); the rest are *convention* transforms that
-/// split the operand into words — on whitespace, punctuation, `_`/`-`/`.`, and case boundaries
-/// (`fooBar` → `foo`,`bar`; `HTTPServer` → `HTTP`,`Server`) — then re-render them in the target
-/// convention. Round-tripping is lossy only for acronyms (the all-caps run isn't recovered).
+/// A case/word-shape transform applied to the operand text. The first four are *character*
+/// transforms (per-char, verbatim: `Upper`/`Lower`/`Invert` recase letters, `Reverse` reorders
+/// them); the rest are *convention* transforms that split the operand into words — on
+/// whitespace, punctuation, `_`/`-`/`.`, and case boundaries (`fooBar` → `foo`,`bar`;
+/// `HTTPServer` → `HTTP`,`Server`) — then re-render them in the target convention.
+/// Round-tripping is lossy only for acronyms (the all-caps run isn't recovered).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseKind {
@@ -361,6 +362,8 @@ pub enum CaseKind {
     Lower,
     /// Swap each letter's case: `aBc` → `AbC`.
     Invert,
+    /// Reverse the character order: `abc` → `cba` (self-inverse, so a repeat undoes it).
+    Reverse,
     /// `foo bar`/`foo_bar`/`FooBar` → `fooBar`.
     Camel,
     /// `foo bar`/`foo_bar`/`fooBar` → `FooBar`.
@@ -389,6 +392,7 @@ impl CaseKind {
             'u' => CaseKind::Upper,
             'l' => CaseKind::Lower,
             'i' => CaseKind::Invert,
+            'r' => CaseKind::Reverse,
             'c' => CaseKind::Camel,
             'p' => CaseKind::Pascal,
             's' => CaseKind::Snake,

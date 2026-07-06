@@ -2293,6 +2293,55 @@ async fn transform_case_recases_selection_and_keeps_it_selected() {
 }
 
 #[tokio::test]
+async fn transform_case_reverse_reverses_the_selection_and_chains_back() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("abc def\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Select "abc" (inclusive cols 0..=2).
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 2),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    // `Ctrl-r r`: the selected chars reverse in place and stay selected.
+    let st: EditResult = send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Reverse,
+            scan_at_cursor: false,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "cba def\n");
+    assert_eq!(st.cursor.anchor, p(0, 0));
+    assert_eq!(st.cursor.position, p(0, 2));
+
+    // Self-inverse: the persisted selection means a repeat press restores the original.
+    send_request::<InputTransformCase>(
+        &mut ws,
+        13,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Reverse,
+            scan_at_cursor: false,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 14, buffer_id).await, "abc def\n");
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn transform_case_scan_at_cursor_targets_the_identifier_under_the_caret() {
     let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };
