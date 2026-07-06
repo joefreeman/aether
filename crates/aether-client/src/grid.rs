@@ -318,8 +318,11 @@ pub fn byte_range_span(cells: &[Cell<'_>], start: u32, end: u32) -> Option<(u32,
 
 /// The selection's display-col span on one visual row, or `None` when the selection doesn't
 /// touch it. `min`/`max` are the selection's inclusive endpoints in normal form (`min ≤ max`).
-/// On lines that end *inside* the selection, the span extends one col past the last char so the
-/// consumed newline is visible.
+///
+/// The line's implicit `\n` lives at byte `row_end` of its last visual row and gets one display
+/// cell whenever the inclusive selection covers that byte — uniformly: a range continuing past
+/// the line, one ending on the newline, or a 1-char point selection parked there. Callers decide
+/// whether a point renders at all (block-cursor modes treat it as the 1-char selection it is).
 pub fn row_selection_span(
     line_no: u32,
     row: &VisualRow,
@@ -332,11 +335,6 @@ pub fn row_selection_span(
         return None;
     }
     let cells = row_cells(row, tab_width);
-    let Some(last) = cells.last() else {
-        // Empty line strictly inside the selection: show its consumed newline as one cell.
-        let p = row_prefix_cols(row);
-        return Some((p, p + 1));
-    };
     let row_start = row.byte_offset;
     let row_end = row_end_byte(row);
     // The selection's inclusive byte range on this line; u32::MAX = "through the newline".
@@ -346,31 +344,39 @@ pub fn row_selection_span(
     } else {
         u32::MAX
     };
-    if sel_end < row_start {
-        return None;
+    let newline_cell = is_last_row_of_line && sel_start <= row_end && sel_end >= row_end;
+    // The span over the row's text cells (the newline cell rides on after it).
+    let text_span = cells.last().and_then(|last| {
+        if sel_end < row_start || sel_start >= row_end {
+            return None;
+        }
+        let start = cells
+            .iter()
+            .find(|c| c.byte >= sel_start)
+            .map(|c| c.dcol)
+            .unwrap_or(last.dcol);
+        let end = cells
+            .iter()
+            .rev()
+            .find(|c| c.byte <= sel_end)
+            .map(|c| c.dcol + c.width)?;
+        (end > start).then_some((start, end))
+    });
+    match (text_span, newline_cell) {
+        // A covered newline always adjoins the text span's end (`sel_end ≥ row_end` means the
+        // span already runs through the last char).
+        (Some((start, end)), true) => Some((start, end + 1)),
+        (span, false) => span,
+        (None, true) => {
+            // Only the newline is covered (a selection edge or point on the `\n`, or an empty
+            // line): its cell sits just past the last char, or at the prefix on an empty row.
+            let p = cells
+                .last()
+                .map(|c| c.dcol + c.width)
+                .unwrap_or_else(|| row_prefix_cols(row));
+            Some((p, p + 1))
+        }
     }
-    if sel_start >= row_end {
-        // Starts past this row's text. The one visible case: the selection begins exactly on
-        // this line's newline and continues to a later line — show the newline cell.
-        return (line_no < max.line && is_last_row_of_line && sel_start == row_end)
-            .then(|| (last.dcol + last.width, last.dcol + last.width + 1));
-    }
-    let start_dcol = cells
-        .iter()
-        .find(|c| c.byte >= sel_start)
-        .map(|c| c.dcol)
-        .unwrap_or(last.dcol);
-    let mut end_dcol = cells
-        .iter()
-        .rev()
-        .find(|c| c.byte <= sel_end)
-        .map(|c| c.dcol + c.width)?;
-    // The newline consumed by a selection continuing past this line: one extra col, drawn on
-    // the line's last visual row.
-    if line_no < max.line && is_last_row_of_line {
-        end_dcol += 1;
-    }
-    (end_dcol > start_dcol).then_some((start_dcol, end_dcol))
 }
 
 #[cfg(test)]
@@ -613,6 +619,34 @@ mod tests {
             row_selection_span(10, &empty, true, min, max, 4),
             Some((0, 1))
         );
+    }
+
+    #[test]
+    fn selection_ending_on_newline_includes_its_cell() {
+        // `max` sits *on* the newline byte (col == text len): the cell past the last char joins
+        // the span — the same rule as a range continuing past the line.
+        let r = row(0, 0, "abc");
+        let min = LogicalPosition { line: 10, col: 1 };
+        let max = LogicalPosition { line: 10, col: 3 };
+        assert_eq!(row_selection_span(10, &r, true, min, max, 4), Some((1, 4)));
+        // Ending on the last *char* doesn't reach the newline.
+        let max = LogicalPosition { line: 10, col: 2 };
+        assert_eq!(row_selection_span(10, &r, true, min, max, 4), Some((1, 3)));
+    }
+
+    #[test]
+    fn point_selection_spans_one_cell() {
+        // A point (min == max) is the 1-char selection of the char under it.
+        let r = row(0, 0, "abc");
+        let p = LogicalPosition { line: 10, col: 1 };
+        assert_eq!(row_selection_span(10, &r, true, p, p, 4), Some((1, 2)));
+        // Parked on the newline: just the newline cell.
+        let p = LogicalPosition { line: 10, col: 3 };
+        assert_eq!(row_selection_span(10, &r, true, p, p, 4), Some((3, 4)));
+        // Parked on an empty line: its newline cell at col 0.
+        let empty = row(0, 0, "");
+        let p = LogicalPosition { line: 10, col: 0 };
+        assert_eq!(row_selection_span(10, &empty, true, p, p, 4), Some((0, 1)));
     }
 
     #[test]

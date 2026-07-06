@@ -372,7 +372,11 @@ where
         let scroll = self.content.scroll_px;
         let cursor_pos = self.content.cursor.position;
         let (sel_min, sel_max) = selection_endpoints(&self.content.cursor);
-        let draw_selection = !self.content.cursor.is_point();
+        // A point cursor is the 1-char selection of the char under it (Helix-style): under a
+        // block cursor it renders with the same selection styling — fill + whitespace/newline
+        // glyphs — as inside a multi-char range (terminal parity). Insert's bar cursor is a gap
+        // between chars, not a selection, so a point draws nothing there.
+        let draw_selection = !self.content.cursor.is_point() || !self.content.insert_mode;
         let scroll_x = self.content.scroll_x_px;
         // Code text shapes with ligatures on (`Advanced`) or off (`Basic`); markers/glyphs always
         // use `draw_run` (Advanced). Same JetBrains Mono metrics either way, so the grid is unaffected.
@@ -793,30 +797,21 @@ where
                 }
 
                 // Selected newline: a muted `↵` at the line's end on its last visual row, when the
-                // consumed `\n` falls in the selection (terminal parity). The fill ensures the
-                // selection blue sits under the glyph even when the selection ends exactly on it
-                // (where `row_selection_span` stops at the last char).
+                // consumed `\n` falls in the selection (terminal parity). `row_selection_span`
+                // already painted the cell's fill; only the glyph is drawn here.
                 let nl_selected = draw_selection
                     && row_idx + 1 == n_rows
-                    && line.logical_line >= sel_min.line
-                    && (line.logical_line < sel_max.line
-                        || (line.logical_line == sel_max.line
-                            && sel_max.col >= grid::row_end_byte(row)));
+                    && pos_in_selection(
+                        line.logical_line,
+                        grid::row_end_byte(row),
+                        sel_min,
+                        sel_max,
+                    );
                 if nl_selected {
                     let end_dcol = cells
                         .last()
                         .map(|c| c.dcol + c.width)
                         .unwrap_or_else(|| grid::row_prefix_cols(row));
-                    fill_content(
-                        renderer,
-                        Rectangle {
-                            x: text_x(end_dcol),
-                            y,
-                            width: cell.width,
-                            height: cell.height,
-                        },
-                        theme::NORD10,
-                    );
                     draw_run(
                         renderer,
                         "↵".to_string(),

@@ -486,8 +486,12 @@ export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
       ? bracketPair.filter((p) => p.line === L).map((p) => p.col)
       : [];
 
+    // A point cursor is the 1-char selection of the char under it (Helix-style): under a block
+    // (or pending-underscore) cursor it renders with the same selection styling — fill +
+    // whitespace/newline glyphs — as inside a multi-char range (terminal parity). Insert's bar
+    // cursor is a gap between chars, not a selection, so a point draws nothing there.
     let sel: LineSelection | null = null;
-    if (!isPoint && L >= min.line && L <= max.line) {
+    if ((!isPoint || !insertMode) && L >= min.line && L <= max.line) {
       sel = {
         start: L === min.line ? min.col : 0,
         end: L === max.line ? max.col : 0,
