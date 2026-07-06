@@ -1,8 +1,10 @@
 //! Pure case/word-shape transforms for `input/transform_case`. No buffer or position awareness —
 //! just `&str` in, `String` out — so it's trivially unit-testable.
 //!
-//! The character transforms (`Upper`/`Lower`/`Invert`/`Reverse`) act per char, verbatim —
-//! recasing letters, or reversing their order (`Reverse`). The
+//! The character transforms (`Upper`/`Lower`/`Invert`/`Reverse`/`Randomize`) act per char —
+//! recasing letters, reversing their order (`Reverse`), or re-rolling alphanumerics in place
+//! (`Randomize`, the one non-deterministic transform: OS entropy, so it's fit for the throwaway
+//! passwords it exists to generate). The
 //! convention transforms split the operand into words and re-render them: split on whitespace,
 //! any non-alphanumeric punctuation (`_`, `-`, `.`, …), and case boundaries — a lower/digit→upper
 //! transition (`fooBar` → `foo`,`bar`) and an acronym tail (`HTTPServer` → `HTTP`,`Server`).
@@ -15,6 +17,7 @@ pub fn transform(kind: CaseKind, input: &str) -> String {
         CaseKind::Lower => input.to_lowercase(),
         CaseKind::Invert => input.chars().map(invert_char).collect(),
         CaseKind::Reverse => input.chars().rev().collect(),
+        CaseKind::Randomize => randomize(input),
         // Convention transforms share the tokenizer; they differ only in the per-word casing and
         // the joining separator.
         CaseKind::Camel => join_words(input, WordCase::CamelLead, ""),
@@ -46,6 +49,75 @@ fn invert_char(c: char) -> char {
         }
     } else {
         c
+    }
+}
+
+/// Shape-preserving randomization: each ASCII letter becomes a random letter of the same case,
+/// each ASCII digit a random digit; everything else (punctuation, whitespace, non-ASCII) is kept
+/// verbatim. The operand acts as a template — its length and character-class layout survive —
+/// which is what makes it double as a password generator and a sample-data scrambler.
+///
+/// Entropy comes from the OS (`getrandom`), rejection-sampled so there's no modulo bias — this
+/// explicitly feeds password generation. If the entropy source fails (effectively impossible on
+/// a booted system), the input is returned unchanged and the edit no-ops upstream.
+fn randomize(input: &str) -> String {
+    let mut entropy = EntropyBytes::new();
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        let mapped = if c.is_ascii_lowercase() {
+            entropy.uniform(26).map(|i| (b'a' + i) as char)
+        } else if c.is_ascii_uppercase() {
+            entropy.uniform(26).map(|i| (b'A' + i) as char)
+        } else if c.is_ascii_digit() {
+            entropy.uniform(10).map(|i| (b'0' + i) as char)
+        } else {
+            Some(c)
+        };
+        match mapped {
+            Some(m) => out.push(m),
+            None => return input.to_string(),
+        }
+    }
+    out
+}
+
+/// A small OS-entropy cursor: pulls 64 bytes at a time and hands them out one by one, refilling
+/// on demand. `uniform` rejection-samples so every value in `[0, n)` is equally likely.
+struct EntropyBytes {
+    buf: [u8; 64],
+    next: usize,
+}
+
+impl EntropyBytes {
+    fn new() -> Self {
+        // `next` starts at the end so the first draw forces a fill — the zeroed buffer is never
+        // handed out as entropy.
+        Self {
+            buf: [0; 64],
+            next: 64,
+        }
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        if self.next == self.buf.len() {
+            getrandom::fill(&mut self.buf).ok()?;
+            self.next = 0;
+        }
+        let b = self.buf[self.next];
+        self.next += 1;
+        Some(b)
+    }
+
+    /// A uniform value in `[0, n)`. Rejects bytes at/above the largest multiple of `n` that fits
+    /// in a byte (256 isn't a multiple of 26 or 10, so plain `% n` would bias low values).
+    fn uniform(&mut self, n: u8) -> Option<u8> {
+        let limit = (256u16 - (256u16 % n as u16)) as u16;
+        loop {
+            let b = self.byte()?;
+            if (b as u16) < limit {
+                return Some(b % n);
+            }
+        }
     }
 }
 
@@ -177,6 +249,36 @@ mod tests {
             t(CaseKind::Reverse, &t(CaseKind::Reverse, "aBc1-D")),
             "aBc1-D"
         );
+    }
+
+    #[test]
+    fn randomize_preserves_shape_and_classes() {
+        let template = "foo-BAR_12 baz!\n";
+        let out = t(CaseKind::Randomize, template);
+        assert_eq!(out.chars().count(), template.chars().count());
+        for (o, n) in template.chars().zip(out.chars()) {
+            match o {
+                c if c.is_ascii_lowercase() => assert!(n.is_ascii_lowercase()),
+                c if c.is_ascii_uppercase() => assert!(n.is_ascii_uppercase()),
+                c if c.is_ascii_digit() => assert!(n.is_ascii_digit()),
+                _ => assert_eq!(n, o, "non-alphanumerics are kept verbatim"),
+            }
+        }
+        // Non-ASCII letters are deliberately conservative: kept, never mapped into ASCII.
+        assert_eq!(t(CaseKind::Randomize, "héllo").chars().nth(1), Some('é'));
+    }
+
+    #[test]
+    fn randomize_actually_randomizes() {
+        // 64 lowercase chars: two outputs colliding (or matching the template) by chance is
+        // ~26^-64 — what this catches is a deterministic bug: identity, constant output, or a
+        // repeated entropy stream across calls.
+        let template = "a".repeat(64);
+        let one = t(CaseKind::Randomize, &template);
+        let two = t(CaseKind::Randomize, &template);
+        assert_ne!(one, template);
+        assert_ne!(two, template);
+        assert_ne!(one, two, "independent rolls");
     }
 
     #[test]

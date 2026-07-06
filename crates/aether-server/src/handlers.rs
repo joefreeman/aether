@@ -10177,8 +10177,8 @@ enum EditKind {
     /// `resolve_transform_case`: with `scan` (Insert mode) it recases the identifier under the
     /// caret (post-edit cursor collapses past the result); otherwise it recases exactly the
     /// selection — a point being the single char under the block — which stays selected, so
-    /// transforms can be chained. `input_transform_case` prechecks for a no-op, so this is `Some`
-    /// in practice.
+    /// transforms can be chained. `input_transform_case` prechecks for a no-op, so this resolves
+    /// `Some` in practice; a stale `None` at apply time returns early, untouched.
     TransformCase { kind: CaseKind, scan: bool },
 }
 
@@ -10217,22 +10217,40 @@ async fn apply_edit(
 
     // Resolve the target number once for `AdjustNumber` so the range and the replacement text below
     // agree. `(start_char, end_char, line, new_text)` — absolute char offsets. `input_*_number`
-    // prechecks that a number exists, so this is `Some` in practice; the `None` arms below are a
-    // defensive no-op.
+    // prechecks that a number exists, so this is `Some` in practice; a stale `None` is caught by
+    // the no-op guard below.
     let number_edit = match &edit {
         EditKind::AdjustNumber { delta, scan } => resolve_number_edit(buf, &cursor, *delta, *scan),
         _ => None,
     };
 
     // Likewise resolve the case-transform operand once so the range and replacement agree.
-    // `input_transform_case` prechecks for a no-op, so this is `Some` in practice; the `None`
-    // arms below are a defensive no-op (matching `AdjustNumber`).
+    // `input_transform_case` prechecks for a no-op, so this is `Some` in practice; `None` — a
+    // stale precheck verdict, or `Randomize` re-rolling a tiny operand back to the original on
+    // the fresh entropy it draws here — is caught by the no-op guard below.
     let transform_edit = match &edit {
         EditKind::TransformCase { kind, scan } => {
             resolve_transform_case(buf, &cursor, *kind, *scan)
         }
         _ => None,
     };
+
+    // A resolved no-op stops here, before any buffer mutation. Running it through the splice
+    // below would bump the revision, clear the redo stack, and (outside the undo group window)
+    // push a rope-snapshot undo entry — all for a zero-change edit — and `PostEdit::PointAfter`
+    // would collapse a selection operand. Reached when a handler's precheck verdict went stale
+    // (another client or a watcher reload edited the buffer between the precheck's lock and this
+    // one) or when `Randomize` re-rolls a tiny operand back to the original.
+    let resolved_noop = match &edit {
+        EditKind::AdjustNumber { .. } => number_edit.is_none(),
+        EditKind::TransformCase { .. } => transform_edit.is_none(),
+        _ => false,
+    };
+    if resolved_noop {
+        let revision = buf.revision;
+        let cursor = wrap_for_response(&s, client_id, buffer_id, cursor);
+        return Ok(EditResult { revision, cursor });
+    }
 
     // Compute the char range to replace and the affected line range. The range_is_inclusive
     // flag (selection mode) extends end_char by 1 to cover the cursor's char under the block.
@@ -10423,15 +10441,7 @@ async fn apply_edit(
                 first_line: *line,
                 last_line: *line,
             },
-            None => {
-                let c = motion::pos_to_char(buf, cursor.position);
-                EditRange {
-                    start_char: c,
-                    end_char: c,
-                    first_line: cursor.position.line,
-                    last_line: cursor.position.line,
-                }
-            }
+            None => unreachable!("resolved no-op edits return early"),
         },
         EditKind::TransformCase { .. } => match &transform_edit {
             Some(te) => EditRange {
@@ -10440,15 +10450,7 @@ async fn apply_edit(
                 first_line: te.first_line,
                 last_line: te.last_line,
             },
-            None => {
-                let c = motion::pos_to_char(buf, cursor.position);
-                EditRange {
-                    start_char: c,
-                    end_char: c,
-                    first_line: cursor.position.line,
-                    last_line: cursor.position.line,
-                }
-            }
+            None => unreachable!("resolved no-op edits return early"),
         },
     };
     // `insert_text` is what gets written over `[start_char, end_char)`; `post_edit` decides where
@@ -10524,7 +10526,7 @@ async fn apply_edit(
                 };
                 (Cow::Owned(text.clone()), post)
             }
-            None => (Cow::Borrowed(""), PostEdit::PointAfter),
+            None => unreachable!("resolved no-op edits return early"),
         },
         EditKind::TransformCase { .. } => match &transform_edit {
             // A selection operand stays selected (chain transforms / see what changed); a
@@ -10538,7 +10540,7 @@ async fn apply_edit(
                 };
                 (Cow::Owned(te.new_text.clone()), post)
             }
-            None => (Cow::Borrowed(""), PostEdit::PointAfter),
+            None => unreachable!("resolved no-op edits return early"),
         },
     };
 

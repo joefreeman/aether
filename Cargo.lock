@@ -89,6 +89,7 @@ dependencies = [
  "clap",
  "directories",
  "futures-util",
+ "getrandom 0.3.4",
  "git2",
  "grep-matcher",
  "grep-regex",

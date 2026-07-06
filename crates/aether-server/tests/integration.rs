@@ -2342,6 +2342,110 @@ async fn transform_case_reverse_reverses_the_selection_and_chains_back() {
 }
 
 #[tokio::test]
+async fn transform_case_randomize_preserves_the_template_shape() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo-BAR 12! rest\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    // Select the "foo-BAR 12!" template (inclusive cols 0..=10).
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 10),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    let st: EditResult = send_request::<InputTransformCase>(
+        &mut ws,
+        11,
+        &InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Randomize,
+            scan_at_cursor: false,
+        },
+    )
+    .await;
+    // The template's length and character-class layout survive; the unselected tail is intact.
+    let text = buffer_text(&mut ws, 12, buffer_id).await;
+    assert_eq!(text.len(), "foo-BAR 12! rest\n".len());
+    assert!(text.ends_with(" rest\n"));
+    for (i, (o, n)) in "foo-BAR 12!".chars().zip(text.chars()).enumerate() {
+        match o {
+            c if c.is_ascii_lowercase() => assert!(n.is_ascii_lowercase(), "col {i}"),
+            c if c.is_ascii_uppercase() => assert!(n.is_ascii_uppercase(), "col {i}"),
+            c if c.is_ascii_digit() => assert!(n.is_ascii_digit(), "col {i}"),
+            _ => assert_eq!(n, o, "col {i}: separators are kept"),
+        }
+    }
+    // The result stays selected, so a repeat press re-rolls.
+    assert_eq!(st.cursor.anchor, p(0, 0));
+    assert_eq!(st.cursor.position, p(0, 10));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn transform_case_randomize_single_char_repeats_safely() {
+    // A 1-char operand re-rolls to itself ~1 press in 26, landing in one of the two no-op paths:
+    // the handler's precheck, or — when only the fresh roll inside `apply_edit` matches — the
+    // resolved-no-op guard there. Either way it must be a *true* no-op: same revision (no
+    // splice, no redo-stack clear, no stray undo entry). 80 presses make both paths near-certain
+    // to be exercised.
+    let (server, mut ws, buffer_id) = setup_with_buffer("a rest\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: p(0, 0),
+            anchor: p(0, 0),
+        },
+    )
+    .await;
+
+    let mut seen = Vec::new();
+    for i in 0..80u64 {
+        let st: EditResult = send_request::<InputTransformCase>(
+            &mut ws,
+            11 + i,
+            &InputTransformCaseParams {
+                buffer_id,
+                kind: CaseKind::Randomize,
+                scan_at_cursor: false,
+            },
+        )
+        .await;
+        // The point selection stays on the char regardless of whether the roll applied.
+        assert_eq!(st.cursor.position, p(0, 0));
+        assert_eq!(st.cursor.anchor, p(0, 0));
+        let text = buffer_text(&mut ws, 1000 + i, buffer_id).await;
+        if let Some((prev_text, prev_rev)) = seen.last() {
+            if text == *prev_text {
+                assert_eq!(
+                    st.revision, *prev_rev,
+                    "no-op press must not bump the revision"
+                );
+            } else {
+                assert_ne!(st.revision, *prev_rev);
+            }
+        }
+        seen.push((text, st.revision));
+    }
+    let (text, _) = seen.last().unwrap();
+    assert!(text.chars().next().unwrap().is_ascii_lowercase());
+    assert!(text.ends_with(" rest\n"));
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn transform_case_scan_at_cursor_targets_the_identifier_under_the_caret() {
     let (server, mut ws, buffer_id) = setup_with_buffer("fooBar baz\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };

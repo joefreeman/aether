@@ -347,12 +347,12 @@ pub struct InputUnsurroundParams {
 
 // ---- input/transform_case -----------------------------------------------------------------------
 
-/// A case/word-shape transform applied to the operand text. The first four are *character*
-/// transforms (per-char, verbatim: `Upper`/`Lower`/`Invert` recase letters, `Reverse` reorders
-/// them); the rest are *convention* transforms that split the operand into words — on
-/// whitespace, punctuation, `_`/`-`/`.`, and case boundaries (`fooBar` → `foo`,`bar`;
-/// `HTTPServer` → `HTTP`,`Server`) — then re-render them in the target convention.
-/// Round-tripping is lossy only for acronyms (the all-caps run isn't recovered).
+/// A case/word-shape transform applied to the operand text. The first five are *character*
+/// transforms (per-char: `Upper`/`Lower`/`Invert` recase letters, `Reverse` reorders them,
+/// `Randomize` re-rolls alphanumerics in place); the rest are *convention* transforms that
+/// split the operand into words — on whitespace, punctuation, `_`/`-`/`.`, and case boundaries
+/// (`fooBar` → `foo`,`bar`; `HTTPServer` → `HTTP`,`Server`) — then re-render them in the target
+/// convention. Round-tripping is lossy only for acronyms (the all-caps run isn't recovered).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseKind {
@@ -364,6 +364,13 @@ pub enum CaseKind {
     Invert,
     /// Reverse the character order: `abc` → `cba` (self-inverse, so a repeat undoes it).
     Reverse,
+    /// Replace each ASCII letter with a random letter of the same case and each ASCII digit with
+    /// a random digit; everything else (punctuation, whitespace, non-ASCII) is kept. The operand
+    /// is a template — length and character-class shape are preserved — so it doubles as a
+    /// throwaway-password generator (type the shape you want, e.g. `aaaaaaaaAAAA99!`, and
+    /// transform) and a structure-keeping scrambler for identifiers/sample data. OS-entropy
+    /// backed; the result stays selected, so a repeat press re-rolls.
+    Randomize,
     /// `foo bar`/`foo_bar`/`FooBar` → `fooBar`.
     Camel,
     /// `foo bar`/`foo_bar`/`fooBar` → `FooBar`.
@@ -393,6 +400,7 @@ impl CaseKind {
             'l' => CaseKind::Lower,
             'i' => CaseKind::Invert,
             'r' => CaseKind::Reverse,
+            'm' => CaseKind::Randomize,
             'c' => CaseKind::Camel,
             'p' => CaseKind::Pascal,
             's' => CaseKind::Snake,

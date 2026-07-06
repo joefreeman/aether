@@ -27,6 +27,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde", "js"] }
 
+# OS entropy for the Randomize transform (explicitly password-suitable, so not `fastrand`).
+getrandom = "0.3"
+
 # Markdown (hover popovers) — parsed once in the core into an AST the shells render. Only the
 # parser is needed (no HTML renderer); already present transitively via iced's markdown widget.
 pulldown-cmark = { version = "0.12", default-features = false }

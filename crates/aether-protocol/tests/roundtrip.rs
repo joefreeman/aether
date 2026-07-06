@@ -858,6 +858,7 @@ fn input_transform_case_params() {
     // The mnemonic map is the single source of truth shared with the keymap.
     assert_eq!(CaseKind::from_char('i'), Some(CaseKind::Invert));
     assert_eq!(CaseKind::from_char('r'), Some(CaseKind::Reverse));
+    assert_eq!(CaseKind::from_char('m'), Some(CaseKind::Randomize));
     assert_eq!(CaseKind::from_char('w'), Some(CaseKind::Words));
     assert_eq!(CaseKind::from_char('z'), None);
 }
