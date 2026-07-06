@@ -5117,8 +5117,11 @@ impl Session {
                 CursorSelectAllParams { buffer_id },
                 Event::CursorMsg,
             ),
-            A::SwapAnchor => self.request_str::<CursorSwapAnchor>(
-                CursorSwapAnchorParams { buffer_id },
+            A::SwapAnchor { forward_only } => self.request_str::<CursorSwapAnchor>(
+                CursorSwapAnchorParams {
+                    buffer_id,
+                    forward_only,
+                },
                 Event::CursorMsg,
             ),
             A::CollapseSelection => {

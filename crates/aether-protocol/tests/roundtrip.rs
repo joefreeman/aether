@@ -3041,6 +3041,31 @@ fn cursor_select_all_params_wire_shape() {
 }
 
 #[test]
+fn cursor_swap_anchor_params_wire_shape() {
+    use aether_protocol::cursor::{CursorSwapAnchor, CursorSwapAnchorParams};
+    assert_eq!(CursorSwapAnchor::NAME, "cursor/swap_anchor");
+
+    // `forward_only == false` is the default and stays off the wire, so pre-flag params still
+    // parse and the plain swap's wire shape is unchanged.
+    let p = CursorSwapAnchorParams {
+        buffer_id: 7,
+        forward_only: false,
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({ "buffer_id": 7 }));
+    let back: CursorSwapAnchorParams = from_value(json!({ "buffer_id": 7 })).unwrap();
+    assert!(!back.forward_only);
+
+    let p = CursorSwapAnchorParams {
+        buffer_id: 7,
+        forward_only: true,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "buffer_id": 7, "forward_only": true })
+    );
+}
+
+#[test]
 fn app_settings_wire_shape_and_defaults() {
     use aether_protocol::settings::AppSettings;
     use aether_protocol::viewport::WrapMode;

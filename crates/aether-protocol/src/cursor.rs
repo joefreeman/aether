@@ -385,6 +385,15 @@ impl RpcMethod for CursorSwapAnchor {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CursorSwapAnchorParams {
     pub buffer_id: BufferId,
+    /// Only swap when the selection is backward (cursor before anchor): normalize to the forward
+    /// orientation instead of toggling (`Alt-r` vs `r`). An already-forward selection or a point
+    /// cursor is left untouched.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forward_only: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ---- cursor/select_all --------------------------------------------------------------------------

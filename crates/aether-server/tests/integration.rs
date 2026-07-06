@@ -4889,8 +4889,15 @@ async fn select_line_after_swap_preserves_backward_orientation() {
         },
     )
     .await;
-    let st: CursorState =
-        send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams { buffer_id }).await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        12,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.anchor, LogicalPosition { line: 0, col: 5 });
 
@@ -5136,8 +5143,15 @@ async fn swap_anchor_swaps_position_and_anchor() {
     )
     .await;
 
-    let st: CursorState =
-        send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        11,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
     assert_eq!(st.anchor, LogicalPosition { line: 1, col: 3 });
 
@@ -5159,9 +5173,103 @@ async fn swap_anchor_with_no_selection_is_noop() {
         },
     )
     .await;
-    let st: CursorState =
-        send_request::<CursorSwapAnchor>(&mut ws, 11, &CursorSwapAnchorParams { buffer_id }).await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        11,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: false,
+        },
+    )
+    .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(st.anchor, st.position);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn swap_anchor_forward_only_reorients_backward_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    // Backward selection: cursor before anchor.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 1 },
+            anchor: LogicalPosition { line: 1, col: 3 },
+        },
+    )
+    .await;
+
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        11,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: true,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 3 });
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 1 });
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn swap_anchor_forward_only_keeps_forward_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+
+    // Forward selection (and, below, a point cursor): `forward_only` must not toggle either.
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 3 },
+            anchor: LogicalPosition { line: 0, col: 1 },
+        },
+    )
+    .await;
+
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        11,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: true,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 1, col: 3 });
+    assert_eq!(st.anchor, LogicalPosition { line: 0, col: 1 });
+
+    send_request::<CursorSet>(
+        &mut ws,
+        12,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 2 },
+            anchor: LogicalPosition { line: 0, col: 2 },
+        },
+    )
+    .await;
+    let st: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        13,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: true,
+        },
+    )
+    .await;
+    assert_eq!(st.position, LogicalPosition { line: 0, col: 2 });
     assert_eq!(st.anchor, st.position);
 
     drop(server);
@@ -5429,8 +5537,15 @@ async fn motion_undo_records_select_line_and_swap() {
     )
     .await;
     // s → swap.
-    let after_swap: CursorState =
-        send_request::<CursorSwapAnchor>(&mut ws, 12, &CursorSwapAnchorParams { buffer_id }).await;
+    let after_swap: CursorState = send_request::<CursorSwapAnchor>(
+        &mut ws,
+        12,
+        &CursorSwapAnchorParams {
+            buffer_id,
+            forward_only: false,
+        },
+    )
+    .await;
     assert_eq!(after_swap.position, LogicalPosition { line: 1, col: 0 });
 
     // Undo the swap.
@@ -10397,7 +10512,10 @@ async fn keybindings_picker_matches_across_the_composed_row() {
             desc.as_str()
         })
         .collect();
-    assert_eq!(descs, ["Delete word back", "Newline and indent", "Find file"]);
+    assert_eq!(
+        descs,
+        ["Delete word back", "Newline and indent", "Find file"]
+    );
     assert_eq!(update.total_display_rows, Some(5));
     assert_eq!(update.display_offset, Some(1));
     // The group boundaries ride the push explicitly (window-relative starts) — clients render
@@ -10437,7 +10555,11 @@ async fn keybindings_picker_matches_across_the_composed_row() {
         panic!("expected Keybinding item")
     };
     assert_eq!(keys, "Ctrl-w");
-    assert_eq!(match_indices, &[17, 18, 19, 20], "highlights 'Ctrl' in the chord");
+    assert_eq!(
+        match_indices,
+        &[17, 18, 19, 20],
+        "highlights 'Ctrl' in the chord"
+    );
 
     // A mode query: Insert/Search rows carry their mode in the haystack ("Newline and indent
     // (Insert) Enter"), so "insert" narrows to them; default-mode rows elide theirs.

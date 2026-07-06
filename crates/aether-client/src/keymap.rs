@@ -210,7 +210,11 @@ pub enum Action {
     },
     SelectLine(Direction),
     SelectAll,
-    SwapAnchor,
+    /// Swap cursor and anchor (`r`). With `forward_only` (`Alt-r`), only a backward selection
+    /// swaps — normalize to forward orientation instead of toggling.
+    SwapAnchor {
+        forward_only: bool,
+    },
     CollapseSelection,
     TreeExpand,
     TreeContract,
@@ -608,7 +612,8 @@ static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
     bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
-    bind!(N, ch(','), Exact(Mods::ALT), A::SwapAnchor, "Selection", "Swap cursor and anchor"),
+    bind!(N, ch('r'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Selection", "Reverse selection (swap cursor and anchor)"),
+    bind!(N, ch('r'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Selection", "Orient selection forward (cursor to end)"),
     bind!(N, ch('q'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
     bind!(N, ch('q'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
     bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),

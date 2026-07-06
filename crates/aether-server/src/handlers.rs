@@ -7369,6 +7369,14 @@ pub async fn cursor_swap_anchor(
     }
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
+    // `forward_only` (`Alt-r`) normalizes orientation instead of toggling: only a backward
+    // selection (cursor before anchor) swaps; anything else returns completely untouched — no
+    // motion-history entry, no virtual-col or tree-history reset.
+    let backward =
+        (current.position.line, current.position.col) < (current.anchor.line, current.anchor.col);
+    if params.forward_only && !backward {
+        return Ok(wrap_for_response(&s, client_id, params.buffer_id, current));
+    }
     // Swap anchor and position. For a point cursor (anchor == position) this is a no-op.
     let new_state = CursorState {
         position: current.anchor,
