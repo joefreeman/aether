@@ -111,7 +111,7 @@ impl EntropyBytes {
     /// A uniform value in `[0, n)`. Rejects bytes at/above the largest multiple of `n` that fits
     /// in a byte (256 isn't a multiple of 26 or 10, so plain `% n` would bias low values).
     fn uniform(&mut self, n: u8) -> Option<u8> {
-        let limit = (256u16 - (256u16 % n as u16)) as u16;
+        let limit = 256u16 - (256u16 % n as u16);
         loop {
             let b = self.byte()?;
             if (b as u16) < limit {

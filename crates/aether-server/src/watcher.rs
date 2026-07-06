@@ -544,7 +544,7 @@ mod tests {
         // get a kernel watch, so activation doesn't walk them and builds don't spam events.
         let dir = repo_fixture();
         let root = dir.path().to_path_buf();
-        let targets = watch_targets(&[root.clone()]);
+        let targets = watch_targets(std::slice::from_ref(&root));
         for included in [root.clone(), root.join("src"), root.join("src/nested")] {
             assert!(targets.contains(&included), "missing {included:?}");
         }
@@ -567,7 +567,7 @@ mod tests {
         // need their own targeted watches.
         let dir = repo_fixture();
         let root = dir.path().to_path_buf();
-        let targets = watch_targets(&[root.clone()]);
+        let targets = watch_targets(std::slice::from_ref(&root));
         for included in [
             root.join(".git"),
             root.join(".git/refs"),
@@ -584,7 +584,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("notes.txt");
         std::fs::write(&file, "hi\n").unwrap();
-        assert_eq!(watch_targets(&[file.clone()]), vec![file]);
+        assert_eq!(watch_targets(std::slice::from_ref(&file)), vec![file]);
     }
 
     #[test]
@@ -594,7 +594,7 @@ mod tests {
         let dir = repo_fixture();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("vendor/lib/.git/refs")).unwrap();
-        let targets = watch_targets(&[root.clone()]);
+        let targets = watch_targets(std::slice::from_ref(&root));
         assert!(targets.contains(&root.join("vendor/lib/.git")));
         assert!(targets.contains(&root.join("vendor/lib/.git/refs")));
     }

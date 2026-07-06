@@ -12591,10 +12591,6 @@ pub async fn picker_grep_navigate(
     }))
 }
 
-/// Index of the file-boundary hit to jump to within `hits` (grep candidates, grouped into
-/// contiguous per-file runs). `from` is the selection's current index.
-///
-/// - Forward → the first hit whose `(path_index, relative_path)` differs from `from`'s, scanning
 /// Move a picker's selection to the next / previous *section* — the header-grouped kinds jump
 /// by group run (`PickerState::group_boundary`, the same grouping as the pushed spans);
 /// DocumentSymbols jumps by top-level unit. Computed against the full cached result list so it

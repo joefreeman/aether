@@ -1314,9 +1314,9 @@ pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
 /// fetched `items`, the same index space as `start` here. An item that opens a group mid-pane
 /// (a span starts at its index) costs 3 rows: gap + header + itself. The first visible item
 /// always costs 2 — its governing group's header renders above it even when the window starts
-/// mid-group, but the pane top never spends its first row on a gap. Items inside a group cost
-/// 1. Used by both the scroll math (where it caps the visible window inside the over-fetched
-/// cache) and the renderer (where it bounds the slice it draws).
+/// mid-group, but the pane top never spends its first row on a gap. Items inside a group cost 1.
+/// Used by both the scroll math (where it caps the visible window inside the over-fetched cache)
+/// and the renderer (where it bounds the slice it draws).
 pub fn grep_visible_item_count_from(
     items: &[PickerItem],
     start: usize,
@@ -1405,12 +1405,12 @@ fn picker_dangling_header(groups: &[GroupSpan], visible_end: usize) -> Option<&G
 /// `visible_end`) fills nothing; the degenerate case where nothing rendered above
 /// (`leftover == pane_height`, a 1-row pane starting on a boundary) renders the header alone —
 /// the pane top never opens with a gap.
-fn picker_dangling_fill<'a>(
-    groups: &'a [GroupSpan],
+fn picker_dangling_fill(
+    groups: &[GroupSpan],
     visible_end: usize,
     leftover: usize,
     pane_height: usize,
-) -> (bool, Option<&'a GroupHeader>) {
+) -> (bool, Option<&GroupHeader>) {
     let header = picker_dangling_header(groups, visible_end);
     if leftover == 0 || header.is_none() {
         return (false, None);
