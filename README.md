@@ -24,7 +24,7 @@ buffer, see each other's cursors, and share a single undo stack.
 
 ## Keybindings
 
-Type `Space ?` for the in-app overlay. Holding the Shift key extends the selection (e.g., `Shift-w`); a leading
+Type `Space /` for the in-app searchable list. Holding the Shift key extends the selection (e.g., `Shift-w`); a leading
 **count** repeats a motion (e.g., `3w`). `Space` is the leader for app/file/git/code commands, and `Tab` reveals
 hover info at the cursor.
 
@@ -55,7 +55,8 @@ hover info at the cursor.
 
 | Key | Action |
 | --- | --- |
-| `,`/`Alt-,` | Collapse selection / swap cursor and anchor |
+| `,` | Collapse selection |
+| `r`/`Alt-r` | Reverse selection (swap cursor and anchor) / orient it forward |
 | `%` | Select whole buffer |
 | `q`/`Alt-q` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |
@@ -86,17 +87,18 @@ identical in both.
 | `Ctrl-d` | Delete selection | Delete line |
 | `Ctrl-c` | Copy selection | Copy line |
 | `Ctrl-x` | Cut selection | Cut line |
+| `Ctrl-Alt-x` | Cut selection and insert | — |
 | `Ctrl-v` | Paste before selection | Paste at cursor |
 | `Ctrl-Alt-v` | Replace selection with clipboard | Replace line with clipboard |
 | `Ctrl-s` | Surround selection (next key = delimiter) | Surround line |
 | `Ctrl-Alt-s` | Unsurround selection | Unsurround line |
-| `Ctrl-r` | Transform case (next key = style) | Transform identifier case |
+| `Ctrl-r` | Transform selection (next key = transform: case styles, invert, reverse, randomise) | Transform identifier under cursor |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo/redo | Undo/redo |
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
 | `Ctrl-g` | Join lines | Join lines |
 | `Ctrl-e`/`Ctrl-Alt-e` | Increment/decrement number | Increment/decrement number |
-| `Ctrl-y` | Toggle comment | Toggle comment |
+| `Ctrl-y`/`Ctrl-Alt-y` | Toggle line/block comment | Toggle line/block comment |
 | `Ctrl-f` | Format document | Format document |
 | `Ctrl-o`/`Ctrl-Alt-o` | Open line below/above | Open line below/above |
 
@@ -114,17 +116,17 @@ identical in both.
 | --- | --- |
 | `Space f`/`Space Alt-f` | Find files / in buffer's directory |
 | `Space b`/`Space Alt-b` | Switch buffer / new scratch buffer |
-| `Space g`/`Space Alt-g` | Grep workspace / buffer's directory |
+| `Space g`/`Space Alt-g` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
 | `Space p`/`Space Alt-p` | Copy relative/absolute path |
 | `Space s`/`Space Alt-s` | Save / save as |
 | `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
-| `Space x` | Close buffer |
+| `Space x`/`Space Alt-x` | Close buffer / open another window |
 | `Space ,` | Workspace settings |
 | `Space .` | Application settings (soft wrap, …) |
 | `Space q` | Quit |
-| `Space ?` | Show keyboard shortcuts |
+| `Space /` | Show keyboard shortcuts |
 
 ### Git
 
