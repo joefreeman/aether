@@ -11,7 +11,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned (not -latest): the runner's glibc is the binaries' compatibility floor, and
+          # that matters most for the AppImage, whose whole point is running on older distros.
+          # 22.04 → glibc 2.35. Bump deliberately, not via a runner-image rollover.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -61,6 +64,7 @@ jobs:
       - name: Install GUI build deps (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev libwayland-dev libx11-dev \
             libxcursor-dev libxrandr-dev libxi-dev \
@@ -110,10 +114,50 @@ jobs:
           cargo build --release -p aether-ae --target "$T" --no-default-features
           stage "-no-gui"
 
+      # AppImage (Linux, GUI variant). The binary links nothing beyond glibc/libz — winit/wgpu
+      # dlopen the display/GL stack at runtime — so a bare AppDir is enough; no linuxdeploy-style
+      # library bundling. `continuous` is upstream's only release channel (no versioned tags to
+      # pin); it embeds the static type-2 runtime, so the AppImage doesn't need libfuse2 on users'
+      # machines. --appimage-extract-and-run because CI runners have no FUSE.
+      - name: Build AppImage (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.target }}"; ARCH="${ARCH%%-*}"
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+            AppDir/usr/share/icons/hicolor/scalable/apps AppDir/usr/share/metainfo
+          # "uk.joef.Aether" is the application id: the window's Wayland app_id/X11 WM_CLASS
+          # (set in the iced shell) and the desktop file's basename must be this exact string
+          # for desktop environments to associate the running window with the entry's icon.
+          cp "pkg/aether-${VER}-${{ matrix.target }}/ae" AppDir/usr/bin/
+          cp packaging/uk.joef.Aether.desktop AppDir/usr/share/applications/
+          # The icon is a square variant of logo.svg (icon slots are square; the raw logo is
+          # 256×194 and would be stretched).
+          cp packaging/uk.joef.Aether.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          # The metainfo is a template: render the release entry from the tag-verified version.
+          # Written under the legacy `.appdata.xml` name because that's the only suffix
+          # appimagetool recognizes (both are valid AppStream; the repo file keeps the modern
+          # `.metainfo.xml` name, which is what e.g. Flathub would want).
+          sed "s/@VERSION@/${VER}/; s/@DATE@/$(date -u +%F)/" \
+            packaging/uk.joef.Aether.metainfo.xml \
+            > AppDir/usr/share/metainfo/uk.joef.Aether.appdata.xml
+          ln -s usr/bin/ae AppDir/AppRun
+          ln -s usr/share/applications/uk.joef.Aether.desktop AppDir/uk.joef.Aether.desktop
+          ln -s usr/share/icons/hicolor/scalable/apps/uk.joef.Aether.svg AppDir/uk.joef.Aether.svg
+          ln -s uk.joef.Aether.svg AppDir/.DirIcon
+          curl -fsSL -o /tmp/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x /tmp/appimagetool
+          ARCH="$ARCH" /tmp/appimagetool --appimage-extract-and-run \
+            AppDir "dist/aether-${VER}-${ARCH}.AppImage"
+
       - uses: actions/upload-artifact@v4
         with:
           name: aether-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.AppImage
           if-no-files-found: error
 
   release:
@@ -127,7 +171,11 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          # Both patterns must match (fail_on_unmatched_files) — a missing AppImage is a broken
+          # release, not a partial one.
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.AppImage
           generate_release_notes: true
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}

@@ -207,7 +207,11 @@ fn server_is_up(port: u16) -> bool {
 /// logs runs `ae server` by hand.
 fn spawn_detached_server(idle_timeout_secs: u64) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
-    let exe = std::env::current_exe()?;
+    let exe = server_spawn_exe(
+        std::env::current_exe()?,
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    );
     let mut cmd = Command::new(exe);
     // `ae server --profile X --idle-timeout N` — the spawned server resolves its port from the same
     // profile.toml we just read (the port is never passed on the CLI).
@@ -222,6 +226,25 @@ fn spawn_detached_server(idle_timeout_secs: u64) -> std::io::Result<()> {
     detach(&mut cmd);
     cmd.spawn()?;
     Ok(())
+}
+
+/// Which executable to spawn the detached server from. Normally our own binary — but inside an
+/// AppImage, `current_exe()` resolves into the transient FUSE mount (`/tmp/.mount_XXXX/usr/bin/ae`)
+/// that belongs to *this* launch, so a server spawned from there would outlive its own binary and
+/// keep the mount pinned. The AppImage runtime exports `APPIMAGE` (the image's on-disk path) and
+/// `APPDIR` (the mount point); when we're genuinely running from that mount, spawn the AppImage
+/// itself so the server is an independent launch with its own lifetime. The `starts_with` guard
+/// keeps an APPIMAGE var merely *inherited* from some other AppImage'd parent (say, a terminal
+/// emulator) from hijacking the spawn when this `ae` is a plain binary.
+fn server_spawn_exe(
+    current: std::path::PathBuf,
+    appimage: Option<std::ffi::OsString>,
+    appdir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    match (appimage, appdir) {
+        (Some(image), Some(dir)) if current.starts_with(&dir) => image.into(),
+        _ => current,
+    }
 }
 
 /// Put the spawned server in its own session so the controlling terminal's signals never reach it.
@@ -422,5 +445,41 @@ mod tests {
             resolve_workspace(&edit).unwrap(),
             Some("myproj".to_string())
         );
+    }
+
+    #[test]
+    fn server_spawns_from_the_appimage_when_running_inside_its_mount() {
+        let exe = server_spawn_exe(
+            "/tmp/.mount_aeXYZ/usr/bin/ae".into(),
+            Some("/home/joe/apps/aether.AppImage".into()),
+            Some("/tmp/.mount_aeXYZ".into()),
+        );
+        assert_eq!(exe, std::path::Path::new("/home/joe/apps/aether.AppImage"));
+    }
+
+    #[test]
+    fn inherited_appimage_vars_do_not_hijack_a_plain_binary_spawn() {
+        // `ae` launched from inside some *other* AppImage'd app (a terminal emulator, say)
+        // inherits its APPIMAGE/APPDIR — but our exe isn't under that mount, so spawn ourselves.
+        let exe = server_spawn_exe(
+            "/usr/local/bin/ae".into(),
+            Some("/home/joe/apps/kitty.AppImage".into()),
+            Some("/tmp/.mount_kitty1".into()),
+        );
+        assert_eq!(exe, std::path::Path::new("/usr/local/bin/ae"));
+    }
+
+    #[test]
+    fn no_appimage_vars_means_spawn_current_exe() {
+        let exe = server_spawn_exe("/usr/local/bin/ae".into(), None, None);
+        assert_eq!(exe, std::path::Path::new("/usr/local/bin/ae"));
+
+        // APPIMAGE without APPDIR (or vice versa) is not a trustworthy AppImage context either.
+        let exe = server_spawn_exe(
+            "/usr/local/bin/ae".into(),
+            Some("/home/joe/apps/aether.AppImage".into()),
+            None,
+        );
+        assert_eq!(exe, std::path::Path::new("/usr/local/bin/ae"));
     }
 }

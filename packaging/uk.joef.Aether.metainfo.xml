@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream upstream metadata: what software centers show for the app. Shipped in the AppImage
+     at usr/share/metainfo/ (renamed to the legacy `.appdata.xml` suffix there — the only one
+     appimagetool recognizes). This file is a template — @VERSION@ and @DATE@ are rendered by the
+     release workflow from the tag-verified Cargo.toml version, so the release entry can never
+     drift from the published binary. Screenshots are deliberately omitted (validator warning,
+     not an error); add them if this ever goes to a software-center catalogue like Flathub. -->
+<component type="desktop-application">
+  <id>uk.joef.Aether</id>
+  <name>Aether</name>
+  <summary>Modal text editor</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>
+      Aether is an experimental modal text editor with a client–server architecture and
+      tree-sitter integration. A long-lived local server holds all text state — buffer contents,
+      cursors, selections, the undo stack — while thin clients render what the server sends and
+      forward keystrokes. Multiple clients can share a buffer, see each other's cursors, and
+      share a single undo stack.
+    </p>
+    <ul>
+      <li>Modal editing with tree-sitter highlighting, indentation, and navigation</li>
+      <li>Fuzzy pickers for files, buffers, and workspaces; file explorer; workspace-wide grep</li>
+      <li>Git integration: gutter, inline diff, blame, hunk staging</li>
+      <li>LSP support: diagnostics, hover, go-to-definition, formatting</li>
+      <li>Terminal, desktop, and web clients</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">uk.joef.Aether.desktop</launchable>
+  <provides>
+    <binary>ae</binary>
+  </provides>
+  <url type="homepage">https://github.com/joefreeman/aether</url>
+  <url type="vcs-browser">https://github.com/joefreeman/aether</url>
+  <developer id="uk.joef">
+    <name>Joe Freeman</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

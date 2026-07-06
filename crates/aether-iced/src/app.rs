@@ -4488,8 +4488,26 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
             antialiasing: true,
             ..iced::Settings::default()
         })
-        .window_size(Size::new(1100.0, 750.0))
+        .window(window_settings())
         .run()
+}
+
+/// Initial window settings: size, and on Linux the application id ("uk.joef.Aether") that becomes
+/// the Wayland `app_id` / X11 `WM_CLASS`. Desktop environments match a running window to its
+/// installed `uk.joef.Aether.desktop` entry (and thus its icon) by this exact string; iced's
+/// default is an empty id, which matches nothing. Reverse-DNS per the freedesktop convention —
+/// the same id names the desktop file and icon shipped in the AppImage, and is what a future
+/// Flatpak would have to be called.
+fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        size: Size::new(1100.0, 750.0),
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: "uk.joef.Aether".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Aether
+Comment=Modal text editor
+Exec=ae %f
+Icon=uk.joef.Aether
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;
