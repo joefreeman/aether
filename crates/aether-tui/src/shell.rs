@@ -22,8 +22,8 @@ use aether_client::keymap::{
     CURSOR_REST_FRACTION,
 };
 use aether_client::session::{
-    buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending, Prompt,
-    Session,
+    boot_backoff, buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode,
+    Pending, Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::envelope::Notification;
@@ -1961,7 +1961,9 @@ async fn boot_dial(
     server_url: String,
 ) -> Result<Booted, ReconnectError> {
     if attempt > 0 {
-        tokio::time::sleep(reconnect_backoff(attempt)).await;
+        // Boot pacing, not the reconnect curve: we're usually racing the daemon this very
+        // process just spawned, so poll fast at first (see `boot_backoff`).
+        tokio::time::sleep(boot_backoff(attempt)).await;
     }
     let (handle, notifications) = crate::connection::connect(&server_url, &spec.version)
         .await

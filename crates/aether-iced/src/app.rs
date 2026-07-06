@@ -334,6 +334,9 @@ pub struct App {
     /// connection lands and the real session/chooser is installed. While `Some`, input is parked
     /// and the immersive "Connecting…" backdrop shows.
     boot_args: Option<ConnectingBootstrap>,
+    /// How many boot dials have failed so far — paces the retry delay (`boot_backoff`). Reset
+    /// when a connection lands.
+    boot_attempt: u32,
     /// The window's one editing context (one connection — the server's client).
     session: Session,
     /// The session's transport — shell-owned (native sockets don't exist on every shell;
@@ -409,6 +412,7 @@ impl App {
                      server_started_at: u64| App {
             boot,
             boot_args: None,
+            boot_attempt: 0,
             session,
             handle,
             notifications,
@@ -1200,6 +1204,7 @@ impl App {
         match message {
             Message::Booted(Ok(Bootstrap::Session(b))) => {
                 self.boot_args = None;
+                self.boot_attempt = 0;
                 self.server_started_at = b.server_started_at;
                 self.handle = b.handle;
                 self.notifications = b.notifications.clone();
@@ -1228,6 +1233,7 @@ impl App {
             }
             Message::Booted(Ok(Bootstrap::Choose(b))) => {
                 self.boot_args = None;
+                self.boot_attempt = 0;
                 self.server_started_at = b.server_started_at;
                 self.handle = b.handle.clone();
                 self.notifications = b.notifications.clone();
@@ -1238,7 +1244,10 @@ impl App {
             Message::Booted(Err(e)) => {
                 tracing::debug!(error = %e, "boot connect failed; retrying");
                 match &self.boot_args {
-                    Some(args) => spawn_connect_delayed(args.clone()),
+                    Some(args) => {
+                        self.boot_attempt += 1;
+                        spawn_connect_delayed(args.clone(), self.boot_attempt)
+                    }
                     None => Task::none(),
                 }
             }
@@ -4287,10 +4296,12 @@ fn spawn_connect(args: ConnectingBootstrap) -> Task<Message> {
 /// Like [`spawn_connect`] but after a short delay — the retry between failed boot dials (the
 /// daemon may still be coming up). Localhost dials are cheap, so a flat 500ms keeps it responsive
 /// without busy-looping.
-fn spawn_connect_delayed(args: ConnectingBootstrap) -> Task<Message> {
+fn spawn_connect_delayed(args: ConnectingBootstrap, attempt: u32) -> Task<Message> {
     Task::perform(
         async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Boot pacing, not the reconnect curve: we're usually racing the daemon this very
+            // process just spawned, so poll fast at first (see `boot_backoff`).
+            tokio::time::sleep(boot_backoff(attempt)).await;
             connect_and_bootstrap(args).await
         },
         Message::Booted,

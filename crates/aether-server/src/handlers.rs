@@ -173,6 +173,7 @@ pub async fn workspace_activate(
     ctx: &mut ConnectionCtx,
     params: WorkspaceActivateParams,
 ) -> Result<WorkspaceActivateResult, RpcError> {
+    let started = std::time::Instant::now();
     let client_id = ctx.client_id;
 
     // Cheap path: if the workspace is already loaded (some other client activated it earlier, or
@@ -218,6 +219,10 @@ pub async fn workspace_activate(
     // eagerly after the lock is released — see the restore block below and the loop after it.
     let mut eager_restore_ids: Vec<BufferId> = Vec::new();
 
+    // Watch registration deferred until after the lock is released — see below.
+    let mut watch_after: Option<(Arc<crate::watcher::WatcherHandle>, Vec<std::path::PathBuf>)> =
+        None;
+
     // Install the workspace entry on the cold path. Reuse the existing entry (and its shared
     // `WorkspaceIndex`) on the hot path.
     if let Some((name, canonical_paths)) = cold_load {
@@ -235,13 +240,14 @@ pub async fn workspace_activate(
                 dormant_buffers: Vec::new(),
             },
         );
-        // Hand the new roots to the watcher so its events flow for this workspace too. Best-effort
-        // — a watcher failure shouldn't refuse activation. `watcher` is `None` only when the
-        // server skipped initializing it (failed at startup); we just skip registration in that
-        // case.
-        if let Some(w) = s.watcher.clone() {
-            crate::watcher::watch_workspace_paths(&w, &canonical_paths);
-        }
+        // Hand the new roots to the watcher so its events flow for this workspace too — but only
+        // after the lock is released, on a blocking task: registration walks the roots (ignore-
+        // filtered, but still disk I/O — slow on a cold cache), and activation shouldn't wait for
+        // it. The gap is benign: an external change in the first moments simply goes unnoticed,
+        // exactly as one landing just before registration always did. Best-effort — a watcher
+        // failure shouldn't refuse activation. `watcher` is `None` only when the server skipped
+        // initializing it (failed at startup); we just skip registration in that case.
+        watch_after = s.watcher.clone().map(|w| (w, canonical_paths.clone()));
 
         // First activation this session: restore the workspace's previously-open buffers from the
         // persisted session. Clean files become *dormant* (listed in the picker, loaded lazily — a
@@ -328,8 +334,17 @@ pub async fn workspace_activate(
         })
         .or_else(|| s.first_dormant_id(&params.name));
 
-    tracing::info!(%client_id, workspace = %params.name, "client activated workspace");
+    tracing::info!(
+        %client_id,
+        workspace = %params.name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "client activated workspace"
+    );
     drop(s);
+
+    if let Some((w, roots)) = watch_after {
+        tokio::task::spawn_blocking(move || crate::watcher::watch_workspace_paths(&w, &roots));
+    }
 
     // Composite post-step (docs/protocol-composites.md, C): open the landing buffer — the
     // workspace's MRU buffer, or a fresh transient scratch on a first visit — in the same
@@ -825,11 +840,14 @@ pub async fn workspace_add_root(
     let watcher = s.watcher.clone();
     drop(s);
 
-    // TOML write + watcher registration happen outside the lock.
+    // TOML write + watcher registration happen outside the lock; registration also moves to a
+    // blocking task so the response doesn't wait on the new root's (ignore-filtered) walk.
     crate::config::write_workspace_config(&updated)
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
-        crate::watcher::watch_workspace_paths(&w, &[canonical]);
+        tokio::task::spawn_blocking(move || {
+            crate::watcher::watch_workspace_paths(&w, &[canonical])
+        });
     }
     Ok(WorkspaceInfo {
         name: params.workspace,
@@ -951,6 +969,10 @@ pub async fn workspace_remove_root(
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
         crate::watcher::unwatch_workspace_paths(&w, &[canonical]);
+        // The unwatch drops every registered directory under the removed root — including any a
+        // *different* loaded workspace with an overlapping root still needs. Self-heal by
+        // re-walking all loaded roots (idempotent, ignore-filtered, debounced).
+        crate::watcher::schedule_rescan(state.clone(), w);
     }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -1898,7 +1920,15 @@ async fn buffer_open_inner(
     {
         pushes.extend(collect_buffer_state_pushes(&s, id));
     }
+    let watcher = s.watcher.clone();
     drop(s);
+    // Make sure this buffer's directory carries a watch: the workspace-root registration is
+    // ignore-aware, so a file opened from inside a gitignored tree (or outside the roots
+    // entirely) wouldn't otherwise get external-change events. Idempotent — the common
+    // in-workspace open finds its parent already watched.
+    if let Some(w) = watcher {
+        crate::watcher::watch_buffer_parent(&w, &canonical);
+    }
     if let Some((key, spec, generation)) = lsp_launch {
         tokio::spawn(crate::lsp::manager::launch(
             state.clone(),

@@ -31,7 +31,7 @@ pub struct ServerState {
     /// happens during `run_with_listener`. `workspace/activate` reaches in to add new workspace roots
     /// once a workspace gets loaded. Per-server (not a global) so tests can spin up multiple servers
     /// in the same process without sharing watcher state.
-    pub watcher: Option<Arc<std::sync::Mutex<notify::RecommendedWatcher>>>,
+    pub watcher: Option<Arc<crate::watcher::WatcherHandle>>,
     pub buffers: HashMap<BufferId, Buffer>,
     /// Which workspace each open buffer belongs to. Populated when a buffer is created
     /// (`buffer/open`) and looked up when scoping per-buffer state to a workspace (e.g. on

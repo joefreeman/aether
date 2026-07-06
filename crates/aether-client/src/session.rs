@@ -54,6 +54,21 @@ pub fn reconnect_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis((250u64 << attempt.min(5)).min(5000))
 }
 
+/// Backoff before *boot* dial attempt `attempt`. Boot is the one place the client is usually
+/// racing a server it just spawned itself (`ensure_server_running`): the first dial fires before
+/// the daemon binds, and the reconnect curve would then quantize a ~50ms server start into a
+/// 500ms+ wait. So poll fast — a refused localhost connect is instant and free — for a ~1s
+/// window that comfortably covers a normal daemon start, then fall back to the reconnect curve
+/// for the abnormal case (spawn failed, no server coming).
+pub fn boot_backoff(attempt: u32) -> std::time::Duration {
+    const FAST_TRIES: u32 = 20; // 20 × 50ms — the fast window
+    if attempt <= FAST_TRIES {
+        std::time::Duration::from_millis(50)
+    } else {
+        reconnect_backoff(attempt - FAST_TRIES)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BufferInfo {
     pub buffer_id: BufferId,
@@ -823,5 +838,29 @@ mod tests {
     fn label_for_path_outside_all_roots_falls_back_to_absolute() {
         let r = roots(&["/home/joe/work/api", "/home/joe/personal/api"]);
         assert_eq!(label_for_path("/etc/hosts", &r), "/etc/hosts");
+    }
+
+    #[test]
+    fn boot_backoff_polls_fast_then_falls_back_to_reconnect_curve() {
+        use std::time::Duration;
+        // Fast window: a just-spawned daemon binds in tens of ms; each retry stays at 50ms so
+        // connecting tracks actual readiness instead of quantizing to the reconnect curve.
+        assert_eq!(boot_backoff(1), Duration::from_millis(50));
+        assert_eq!(boot_backoff(20), Duration::from_millis(50));
+        // Past the window (~1s of polling), no server is coming imminently — hand over to the
+        // reconnect curve rather than hammering forever.
+        assert_eq!(boot_backoff(21), reconnect_backoff(1));
+        assert_eq!(boot_backoff(30), reconnect_backoff(10));
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_to_a_ceiling() {
+        use std::time::Duration;
+        assert_eq!(reconnect_backoff(0), Duration::from_millis(250));
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(4), Duration::from_millis(4000));
+        // Capped: attempts 5+ all wait 5s.
+        assert_eq!(reconnect_backoff(5), Duration::from_millis(5000));
+        assert_eq!(reconnect_backoff(50), Duration::from_millis(5000));
     }
 }

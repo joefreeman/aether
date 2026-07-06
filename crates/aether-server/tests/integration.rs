@@ -16686,6 +16686,80 @@ async fn watcher_flags_deleted_file() {
     drop(server);
 }
 
+#[tokio::test]
+async fn watcher_covers_open_buffer_inside_gitignored_dir() {
+    // Workspace-root watch registration is gitignore-aware (it skips e.g. `target/`), but a
+    // buffer the user opens *inside* an ignored tree still gets external-change events via the
+    // targeted parent-dir watch `buffer/open` adds. Regression guard for the per-directory
+    // watcher scheme — under the old recursive watch this coverage was implicit.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap(); // marks the repo so .gitignore applies
+    std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+    std::fs::create_dir_all(root.join("generated")).unwrap();
+    let path = root.join("generated/out.txt");
+    std::fs::write(&path, "v1\n").unwrap();
+    // Strictly-greater mtime for the external write (see `setup_watched_buffer`).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let root_path = root.to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![root_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("generated/out.txt".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // External edit. Clean buffer → silent reload + buffer/state push, same as an un-ignored file.
+    std::fs::write(&path, "v2\n").unwrap();
+    let state_push =
+        expect_notification_within::<BufferState>(&mut ws, std::time::Duration::from_secs(5)).await;
+    assert_eq!(state_push.buffer_id, open.buffer_id);
+    assert!(
+        !state_push.externally_modified,
+        "clean buffer should reload silently, not be flagged"
+    );
+
+    drop(server);
+}
+
 /// Connect a client, activate the named workspace, open `watched.txt` under root 0, and subscribe
 /// a viewport (so the watcher's `buffer/state` pushes reach it). Returns the socket + buffer id.
 async fn connect_and_open_watched(
