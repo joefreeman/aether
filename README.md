@@ -22,6 +22,27 @@ buffer, see each other's cursors, and share a single undo stack.
 - LSP (diagnostics, hover, go-to-definition, format)
 - Terminal and web clients
 
+## Install
+
+Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to each
+[release](https://github.com/joefreeman/aether/releases):
+
+- `aether-<version>-<target>.tar.gz` — the **GUI** build (native window + server + terminal/web
+  clients); needs a graphical environment at runtime.
+- `aether-<version>-<target>-no-gui.tar.gz` — same editor minus the desktop window: server,
+  terminal client, and embedded web client, with no graphics libraries required (headless boxes,
+  SSH).
+- `aether-<version>-x86_64.AppImage` (**Linux**) — the GUI build as one self-contained executable:
+  `chmod +x` and run, nothing to unpack. An AppImage integration tool can add an app-menu entry
+  and icon; for the command line, symlink it onto your `PATH`
+  (`ln -s /path/to/aether-<version>-x86_64.AppImage ~/.local/bin/ae`) — all `ae` commands work
+  through it.
+
+Each archive holds the single `ae` binary; unpack it and put `ae` on your `PATH`.
+
+> **macOS:** binaries are unsigned, so clear the quarantine flag once after unpacking:
+> `xattr -d com.apple.quarantine ./ae`.
+
 ## Keybindings
 
 Type `Space /` for the in-app searchable list. Holding the Shift key extends the selection (e.g., `Shift-w`); a leading
@@ -151,22 +172,6 @@ identical in both.
 | `Space o` | Document symbols |
 | `Space l` | LSP servers (status, restart) |
 | `Ctrl-f` | Format document |
-
-## Install
-
-Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to each
-[release](https://github.com/joefreeman/aether/releases), in two variants per platform:
-
-- `aether-<version>-<target>.tar.gz` — the **GUI** build (native window + server + terminal/web
-  clients); needs a graphical environment at runtime.
-- `aether-<version>-<target>-no-gui.tar.gz` — same editor minus the desktop window: server,
-  terminal client, and embedded web client, with no graphics libraries required (headless boxes,
-  SSH).
-
-Each archive holds the single `ae` binary; unpack it and put `ae` on your `PATH`.
-
-> **macOS:** binaries are unsigned, so clear the quarantine flag once after unpacking:
-> `xattr -d com.apple.quarantine ./ae`.
 
 ## Building
 
