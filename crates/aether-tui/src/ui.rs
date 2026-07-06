@@ -1258,9 +1258,7 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
         if picker.groups.is_empty() {
             return rows;
         }
-        let gaps = rows
-            .saturating_sub(picker.total_matches)
-            .saturating_sub(1);
+        let gaps = rows.saturating_sub(picker.total_matches).saturating_sub(1);
         return rows + gaps;
     }
     picker.total_matches + picker.synthetic_create_idx.is_some() as u32
@@ -1454,9 +1452,8 @@ pub fn picker_scroll_for_selected(
         }
         // Walk back while everything from one item earlier still fits whole — stop at the
         // smallest start whose tail fills the pane as far as the layout's row chunks allow.
-        let tail_fits = |s: usize| {
-            s + picker_visible_item_count_from(items, s, pane, groups) >= items.len()
-        };
+        let tail_fits =
+            |s: usize| s + picker_visible_item_count_from(items, s, pane, groups) >= items.len();
         let mut s = start;
         while s > 0 && tail_fits(s - 1) {
             s -= 1;
@@ -5714,9 +5711,15 @@ mod tests {
         let (items, spans) = grep_items(&[("a.rs", 3), ("b.rs", 3)]);
         let pane = 8usize;
         // Item 0 from offset 0 is visible → no change.
-        assert_eq!(picker_scroll_for_selected(&items, 0, 0, pane, &spans, false), 0);
+        assert_eq!(
+            picker_scroll_for_selected(&items, 0, 0, pane, &spans, false),
+            0
+        );
         // Selecting an item above the current scroll pins it to the top.
-        assert_eq!(picker_scroll_for_selected(&items, 2, 4, pane, &spans, false), 2);
+        assert_eq!(
+            picker_scroll_for_selected(&items, 2, 4, pane, &spans, false),
+            2
+        );
     }
 
     /// A view parked past the point where content fills the pane (a jump pinned the selection
@@ -5729,15 +5732,24 @@ mod tests {
         // 9 items in 3 groups → 14 display rows (3 headers + 9 items + 2 gaps).
         let (items, spans) = grep_items(&[("a.rs", 3), ("b.rs", 3), ("c.rs", 3)]);
         // A pane taller than the whole list: any scroll clamps to the top.
-        assert_eq!(picker_scroll_for_selected(&items, 8, 8, 20, &spans, true), 0);
+        assert_eq!(
+            picker_scroll_for_selected(&items, 8, 8, 20, &spans, true),
+            0
+        );
         // A 10-row pane with the view parked on the last item: from start 3 the tail is
         // 9 rows (governing header + 3 b-hits + gap + header + 3 c-hits); from start 2 it
         // would be 12 — so the clamp walks back to 3, filling the pane instead of showing
         // 2 rows + 8 blanks.
-        assert_eq!(picker_scroll_for_selected(&items, 8, 8, 10, &spans, true), 3);
+        assert_eq!(
+            picker_scroll_for_selected(&items, 8, 8, 10, &spans, true),
+            3
+        );
         // Mid-cache (more results below, not yet fetched): no clamp — the same call leaves
         // the view where the selection put it.
-        assert_eq!(picker_scroll_for_selected(&items, 8, 8, 10, &spans, false), 8);
+        assert_eq!(
+            picker_scroll_for_selected(&items, 8, 8, 10, &spans, false),
+            8
+        );
     }
 
     /// A window that begins mid-group carries a single span at `start == 0` repeating the split

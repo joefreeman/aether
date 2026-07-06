@@ -545,11 +545,7 @@ mod tests {
         let dir = repo_fixture();
         let root = dir.path().to_path_buf();
         let targets = watch_targets(&[root.clone()]);
-        for included in [
-            root.clone(),
-            root.join("src"),
-            root.join("src/nested"),
-        ] {
+        for included in [root.clone(), root.join("src"), root.join("src/nested")] {
             assert!(targets.contains(&included), "missing {included:?}");
         }
         for excluded in [
@@ -557,7 +553,10 @@ mod tests {
             root.join("target/debug"),
             root.join(".hidden"),
         ] {
-            assert!(!targets.contains(&excluded), "should not watch {excluded:?}");
+            assert!(
+                !targets.contains(&excluded),
+                "should not watch {excluded:?}"
+            );
         }
     }
 

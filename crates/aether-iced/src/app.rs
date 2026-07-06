@@ -3031,42 +3031,46 @@ impl App {
         }
         // `key` is the shortcut hint rendered dimly after the label (the confirm buttons advertise
         // `y`/`n`); the save/open dialogs pass `None` — their Enter/Esc mapping is conventional.
-        let btn = |label: &str, key: Option<&str>, role: BtnRole, msg: PromptMsg| -> Element<'_, Message> {
-            let mut content = row![text(label.to_string()).size(13).font(SANS).color(theme::NORD6)]
-                .spacing(7)
-                .align_y(iced::Alignment::Center);
+        let btn = |label: &str,
+                   key: Option<&str>,
+                   role: BtnRole,
+                   msg: PromptMsg|
+         -> Element<'_, Message> {
+            let mut content = row![text(label.to_string())
+                .size(13)
+                .font(SANS)
+                .color(theme::NORD6)]
+            .spacing(7)
+            .align_y(iced::Alignment::Center);
             if let Some(key) = key {
-                content = content.push(
-                    text(format!("({key})"))
-                        .size(11)
-                        .font(SANS)
-                        .color(iced::Color {
-                            a: 0.55,
-                            ..theme::NORD6
-                        }),
-                );
+                content = content.push(text(format!("({key})")).size(11).font(SANS).color(
+                    iced::Color {
+                        a: 0.55,
+                        ..theme::NORD6
+                    },
+                ));
             }
             Element::from(
                 iced::widget::button(content)
-                .padding([5, 14])
-                .style(move |_, _| {
-                    let (bg, border_width, border_color) = match role {
-                        BtnRole::Default => (theme::NORD2, 1.0, theme::NORD3),
-                        BtnRole::Danger => (theme::NORD11, 0.0, iced::Color::TRANSPARENT),
-                        BtnRole::Primary => (theme::NORD10, 0.0, iced::Color::TRANSPARENT),
-                    };
-                    iced::widget::button::Style {
-                        background: Some(bg.into()),
-                        text_color: theme::NORD6,
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: border_width,
-                            color: border_color,
-                        },
-                        ..iced::widget::button::Style::default()
-                    }
-                })
-                .on_press(msg),
+                    .padding([5, 14])
+                    .style(move |_, _| {
+                        let (bg, border_width, border_color) = match role {
+                            BtnRole::Default => (theme::NORD2, 1.0, theme::NORD3),
+                            BtnRole::Danger => (theme::NORD11, 0.0, iced::Color::TRANSPARENT),
+                            BtnRole::Primary => (theme::NORD10, 0.0, iced::Color::TRANSPARENT),
+                        };
+                        iced::widget::button::Style {
+                            background: Some(bg.into()),
+                            text_color: theme::NORD6,
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                width: border_width,
+                                color: border_color,
+                            },
+                            ..iced::widget::button::Style::default()
+                        }
+                    })
+                    .on_press(msg),
             )
             .map(|m| match m {
                 PromptMsg::Accept => Message::Core(CoreEvent::PromptAccept),
@@ -4202,7 +4206,8 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> 
     let sd = p.selected_display_row()?;
     // Row-index × ROW_H, plus the inter-group gap pixels above the row (gaps sit outside the
     // display-row unit — same compensation as the overlay's spacers).
-    let gaps = p.gaps_above_window() + p.gaps_before_display_rel(sd.saturating_sub(p.window_base()));
+    let gaps =
+        p.gaps_above_window() + p.gaps_before_display_rel(sd.saturating_sub(p.window_base()));
     let top = sd as f32 * crate::picker::ROW_H + gaps as f32 * crate::picker::GROUP_GAP;
     let bottom = top + crate::picker::ROW_H;
     // Kinds that pin a sticky group header over the top row (grep's file path, Keybindings'

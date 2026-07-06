@@ -2107,7 +2107,10 @@ fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
     assert_eq!(back.keybindings.as_deref().map(|k| k.len()), Some(1));
 
     // Absent on the wire when None (resume/scroll re-views), and deserializes back to None.
-    let p = PickerViewParams { keybindings: None, ..p };
+    let p = PickerViewParams {
+        keybindings: None,
+        ..p
+    };
     let v = to_value(&p).unwrap();
     assert!(
         v.get("keybindings").is_none(),

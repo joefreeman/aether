@@ -1532,8 +1532,7 @@ impl PickerState {
 pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<PickerUpdateParams> {
     let window = state.subscribed?;
     let (offset, items) = state.build_window_items(window.offset, window.limit, matcher);
-    let (display_offset, total_display_rows) = match state.grouped_display_metrics(offset)
-    {
+    let (display_offset, total_display_rows) = match state.grouped_display_metrics(offset) {
         Some((d, t)) => (Some(d), Some(t)),
         None => (None, None),
     };
@@ -1732,12 +1731,14 @@ mod tests {
     fn keybindings_group_metrics_and_query_keep_candidate_order() {
         // Two Editing rows then a Motion row — one section header per group run, mirroring the
         // client's `display_rows`, so the virtual-scroll row math lines up.
-        let kb = |group: &str, desc: &str, keys: &str| KeybindingCandidate::from(KeybindingEntry {
-            group: group.into(),
-            desc: desc.into(),
-            mode: "Any".into(),
-            keys: keys.into(),
-        });
+        let kb = |group: &str, desc: &str, keys: &str| {
+            KeybindingCandidate::from(KeybindingEntry {
+                group: group.into(),
+                desc: desc.into(),
+                mode: "Any".into(),
+                keys: keys.into(),
+            })
+        };
         let cands = PickerCandidates::Keybindings(vec![
             kb("Editing", "Delete selection", "Ctrl-d"),
             kb("Editing", "Undo", "Ctrl-z"),
@@ -1790,14 +1791,20 @@ mod tests {
         };
         let spans = s.build_window_spans(0, 3);
         assert_eq!(
-            spans.iter().map(|sp| (sp.start, label(&sp.header))).collect::<Vec<_>>(),
+            spans
+                .iter()
+                .map(|sp| (sp.start, label(&sp.header)))
+                .collect::<Vec<_>>(),
             [(0, "Editing".to_string()), (2, "Motion".to_string())]
         );
         // A window starting mid-group repeats the split group's header at start 0, so the
         // window is self-describing (no client-side "synthesize a header" convention).
         let spans = s.build_window_spans(1, 2);
         assert_eq!(
-            spans.iter().map(|sp| (sp.start, label(&sp.header))).collect::<Vec<_>>(),
+            spans
+                .iter()
+                .map(|sp| (sp.start, label(&sp.header)))
+                .collect::<Vec<_>>(),
             [(0, "Editing".to_string()), (1, "Motion".to_string())]
         );
         // Header-less kinds send no spans, even when the candidate shape could group: the

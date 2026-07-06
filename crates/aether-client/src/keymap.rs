@@ -836,7 +836,10 @@ mod tests {
     fn keybinding_entries_cover_the_five_modes_once_each() {
         let entries = keybinding_entries();
         for mode in ["Normal", "Any", "Insert", "Search", "Application"] {
-            assert!(entries.iter().any(|e| e.mode == mode), "mode {mode} present");
+            assert!(
+                entries.iter().any(|e| e.mode == mode),
+                "mode {mode} present"
+            );
         }
         // Internal bindings are hidden: never an empty group, and the leader-trigger (bare
         // "Space", action BeginLeader) is filtered out.

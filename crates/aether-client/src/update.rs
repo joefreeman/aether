@@ -9,10 +9,10 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
 use super::session::{
-    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root,
-    AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
-    HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry,
-    SearchSnapshot, SearchState, Session, SneakState, TextField, WorkspaceSettings,
+    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AppSettingId,
+    AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
+    HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
+    SearchState, Session, SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::buffer::{
@@ -2908,14 +2908,16 @@ impl Session {
             KeyCode::Char('l')
                 if mods.alt
                     && !mods.ctrl
-                    && (p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols) =>
+                    && (p.kind.renders_group_headers()
+                        || p.kind == PickerKind::DocumentSymbols) =>
             {
                 return self.picker_section_jump(Direction::Forward);
             }
             KeyCode::Char('h')
                 if mods.alt
                     && !mods.ctrl
-                    && (p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols) =>
+                    && (p.kind.renders_group_headers()
+                        || p.kind == PickerKind::DocumentSymbols) =>
             {
                 return self.picker_section_jump(Direction::Backward);
             }

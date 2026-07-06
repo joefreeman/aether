@@ -700,10 +700,7 @@ pub fn keybinding_match_segments(
     keys: &str,
     match_indices: &[u32],
 ) -> KeybindingSegments {
-    let (d, k) = (
-        desc.chars().count() as u32,
-        keys.chars().count() as u32,
-    );
+    let (d, k) = (desc.chars().count() as u32, keys.chars().count() as u32);
     // Segment start offsets within the haystack: `{desc} ({mode}) {keys}` / `{desc} {keys}`.
     let m = if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
         mode.chars().count() as u32
@@ -820,8 +817,7 @@ mod tests {
     fn keybinding_match_segments_rebase_and_drop_separators() {
         // Elided mode (Any). Haystack: "Delete word back Ctrl-w"
         //                               0..............15  17..22
-        let seg =
-            keybinding_match_segments("Delete word back", "Any", "Ctrl-w", &[0, 16, 17, 22]);
+        let seg = keybinding_match_segments("Delete word back", "Any", "Ctrl-w", &[0, 16, 17, 22]);
         assert_eq!(seg.desc, vec![0]); // 'D' (16 lands on the separator space → dropped)
         assert_eq!(seg.mode, Vec::<u32>::new()); // elided — nothing can land in it
         assert_eq!(seg.keys, vec![0, 5]); // 'C', 'w'

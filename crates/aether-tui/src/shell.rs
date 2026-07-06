@@ -22,8 +22,8 @@ use aether_client::keymap::{
     CURSOR_REST_FRACTION,
 };
 use aether_client::session::{
-    boot_backoff, buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode,
-    Pending, Prompt, Session,
+    boot_backoff, buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending,
+    Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::envelope::Notification;

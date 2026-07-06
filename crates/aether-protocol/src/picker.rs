@@ -1088,7 +1088,10 @@ pub struct PickerSectionJumpParams {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GroupHeader {
     /// The group is a file (grep hits, git changes, workspace diagnostics).
-    File { path_index: u32, relative_path: String },
+    File {
+        path_index: u32,
+        relative_path: String,
+    },
     /// The group is a named section (references, keybindings).
     Label { label: String },
 }

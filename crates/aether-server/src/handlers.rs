@@ -13533,7 +13533,6 @@ mod subscribe_snapshot_tests {
     }
 }
 
-
 #[cfg(test)]
 mod diagnostic_span_tests {
     use super::{diagnostic_counts, diagnostic_spans_on_line, navigate_diagnostic_target};

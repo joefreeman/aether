@@ -146,8 +146,7 @@ pub fn first_visible_row(y: f32) -> u32 {
 /// (the row-division estimate drifts by up to the accumulated gap pixels). `None` when `y`
 /// falls above the fetched window (a refetch is in flight) or past its end.
 pub fn window_row_at(state: &PickerState, y: f32) -> Option<usize> {
-    let mut top =
-        state.window_base() as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP;
+    let mut top = state.window_base() as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP;
     if y < top {
         return None;
     }
@@ -476,9 +475,10 @@ pub fn overlay<'a>(
     let window_base = state.window_base();
     let in_window_gaps = state.groups.len().saturating_sub(1) as u32;
     let mut list = column![];
-    list = list.push(iced::widget::Space::new().height(
-        window_base as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP,
-    ));
+    list = list.push(
+        iced::widget::Space::new()
+            .height(window_base as f32 * ROW_H + state.gaps_above_window() as f32 * GROUP_GAP),
+    );
     for (i, r) in rows.into_iter().enumerate() {
         // The gap precedes every header except the window's leading row (the governing header
         // of a mid-group window sits flush at the top).
