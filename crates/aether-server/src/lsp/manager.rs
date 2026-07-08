@@ -283,7 +283,7 @@ fn file_has_line(path: &Path, needle: &str) -> bool {
 /// Background task: spawn the subprocess, hand off to [`bring_up`]. Marks the handle `Crashed` if
 /// the process can't be spawned.
 pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, generation: u64) {
-    let proc = match process::spawn(spec.command, spec.args) {
+    let proc = match process::spawn(spec.command, spec.args, &key.root) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "failed to spawn language server");

@@ -4,6 +4,7 @@
 //! in-memory pipes (see `client`/`transport` tests), so this only has to wire a child's pipes in
 //! and drain its stderr to the log.
 
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -19,10 +20,18 @@ pub struct LspProcess {
     pub child: Child,
 }
 
-/// Spawn `command args...` and connect to it. The child is killed if its [`Child`] is dropped.
-pub fn spawn(command: &str, args: &[&str]) -> std::io::Result<LspProcess> {
+/// Spawn `command args...` in `cwd` and connect to it. The child is killed if its [`Child`] is
+/// dropped.
+///
+/// `cwd` is the discovered LSP root (see [`super::manager`]). Beyond the servers' own use of it, it
+/// is what makes version-manager shims resolve a per-project toolchain: shims (asdf, rbenv/pyenv,
+/// rustup's cargo proxies, mise-with-shims, …) read the tool-version files from their process's cwd
+/// *upward*, so launching here honors a pin at the root or any ancestor. `command` itself is still
+/// resolved on `PATH` — we only steer the cwd, staying agnostic to which manager (if any) is in use.
+pub fn spawn(command: &str, args: &[&str], cwd: &Path) -> std::io::Result<LspProcess> {
     let mut cmd = Command::new(command);
     cmd.args(args)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -68,7 +77,7 @@ mod tests {
             client,
             mut inbound,
             mut child,
-        } = match spawn("cat", &[]) {
+        } = match spawn("cat", &[], Path::new(".")) {
             Ok(p) => p,
             Err(_) => return, // no `cat` on this host; nothing to test
         };
@@ -87,5 +96,27 @@ mod tests {
             other => panic!("unexpected inbound: {other:?}"),
         }
         let _ = child.wait().await;
+    }
+
+    /// The child must run in the `cwd` we pass — this is what lets version-manager shims resolve a
+    /// per-project toolchain. The child writes its own working directory to a marker file opened
+    /// *relative to that cwd*; if `current_dir` is honored the marker lands inside `dir` and holds
+    /// `dir`'s path. Canonicalize both sides so a symlinked temp root (e.g. `/tmp`) doesn't fool us.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_runs_child_in_the_given_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LspProcess { mut child, .. } = match spawn("sh", &["-c", "pwd -P > cwd_marker"], dir.path())
+        {
+            Ok(p) => p,
+            Err(_) => return, // no `sh` on this host; nothing to test
+        };
+        let _ = child.wait().await;
+
+        let marker = std::fs::read_to_string(dir.path().join("cwd_marker"))
+            .expect("marker written in the child's cwd");
+        let reported = std::fs::canonicalize(marker.trim()).expect("canonicalize reported cwd");
+        let expected = std::fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        assert_eq!(reported, expected);
     }
 }
