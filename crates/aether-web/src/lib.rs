@@ -616,8 +616,11 @@ fn action_value(a: &ShellAction) -> Value {
             json!({ "name": "place_cursor", "fraction": place.fraction() })
         }
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
-        // GUI-only (spawns a native OS window); the web shell has no handler and ignores it.
-        ShellAction::NewWindow => json!({ "name": "new_window" }),
+        // The web shell opens a new browser tab on the same URL (`window.open`). The target payload
+        // is ignored: `Space Alt-x` duplicates the current tab, and the picker's Ctrl-Enter is
+        // handled shell-side on the web (rows are `<a>` links, `onPickerInputKey` intercepts it), so
+        // the picker path never reaches here.
+        ShellAction::NewWindow(_) => json!({ "name": "new_window" }),
     }
 }
 

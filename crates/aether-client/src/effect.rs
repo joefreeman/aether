@@ -6,12 +6,13 @@
 
 use super::keymap::{ScrollDir, ScrollUnit, ViewportPlace};
 use super::session::{HoverText, PasteKind};
+use aether_protocol::BufferId;
 
 /// An action whose execution is irreducibly shell-side — geometry (pixel scroll, cell metrics,
 /// cursor placement), viewport wrap plumbing, or the help overlay. The keymap and dispatch stay in
 /// the core; only the body is the shell's. Deliberately a small, closed set (not the whole `Action`
 /// enum) so every shell matches it exhaustively — a new shell-action can't be silently dropped.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ShellAction {
     /// Pixel/row scroll by direction and unit.
     Scroll { dir: ScrollDir, unit: ScrollUnit },
@@ -19,11 +20,44 @@ pub enum ShellAction {
     PlaceCursor(ViewportPlace),
     /// Flip soft-wrap and re-render the viewport (paired with [`Effect::SaveContentAnchor`]).
     ToggleWrap,
-    /// Open another native window onto the same workspace (`Space Alt-x`) — the GUI shell spawns a
-    /// fresh detached `ae --gui` process; the TUI and web shells ignore it (a new OS window is
-    /// GUI-only). Carries no payload: the spawning shell reads the workspace/path from its own
-    /// session. See [`crate::keymap::Action::NewWindow`].
-    NewWindow,
+    /// Open a [`WindowTarget`] in a *new* window. Two entry points build the target in the core:
+    /// `Space Alt-x` ([`crate::keymap::Action::NewWindow`]) duplicates the current view, and
+    /// `Ctrl-Enter` in a picker opens the highlighted item (the native sibling of the web client's
+    /// Ctrl/Cmd-Enter "open in a new tab"). The GUI shell spawns a fresh detached `ae --gui` seeded
+    /// from the target; the TUI ignores it (no window to spawn); the web shell opens a new browser
+    /// tab on the same URL (`window.open`) — its Ctrl-Enter is handled shell-side, so the picker
+    /// path never reaches here on the web.
+    NewWindow(WindowTarget),
+}
+
+/// A resolved target for opening a *new* window ([`ShellAction::NewWindow`]). The core resolves
+/// everything the spawning shell needs into plain strings/ids — the shell only turns it into a fresh
+/// `ae` invocation. Built by [`crate::update`]'s `current_view_target` (`Space Alt-x`) or
+/// `picker_item_target` (`Ctrl-Enter`), the latter's item set mirroring the web client's `pickerItemUrl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowTarget {
+    /// `--workspace NAME` for the new window, or `None` to open by path alone — an ephemeral,
+    /// no-workspace open, used for a file outside every workspace (an ephemeral workspace id isn't
+    /// CLI-addressable).
+    pub workspace: Option<String>,
+    /// What the new window lands on.
+    pub open: WindowOpen,
+}
+
+/// The thing a [`WindowTarget`] opens: a file (optionally jumped to a location), an existing buffer
+/// by id (a scratch, re-openable because the new window dials the same daemon), or just the
+/// workspace's MRU buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowOpen {
+    /// Open a file by absolute path, optionally jumping to a 0-based `(line, col)` (a grep hit).
+    Path { path: String, at: Option<(u32, u32)> },
+    /// Re-open an existing buffer by id — a scratch buffer with no path, addressable across clients
+    /// because buffers are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if
+    /// the id is gone (the daemon restarted).
+    Buffer(BufferId),
+    /// No specific file: activate the workspace and land on its MRU buffer (the `Space Alt-x`
+    /// duplicate, and the Workspaces picker's "open this workspace in a new window").
+    Workspace,
 }
 
 /// Web-client toast kinds; the colour of the toast's accent bar.

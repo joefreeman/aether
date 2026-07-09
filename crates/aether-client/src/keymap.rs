@@ -320,11 +320,12 @@ pub enum Action {
     CopyAbsolutePath,
     NewScratch,
     CloseBuffer,
-    /// `Space Alt-x` — open another native window onto the same workspace: a fresh detached
-    /// `ae --gui` process dialling the same daemon. A new client lands on the workspace's MRU
-    /// buffer (the one you're on), so it "duplicates" the current view; the two windows are
-    /// independent thereafter (own cursor/selection/viewport, shared buffers server-side).
-    /// GUI-only — the TUI and web shells ignore the [`ShellAction::NewWindow`] it emits.
+    /// `Space Alt-x` — open another window onto the same workspace: the GUI spawns a fresh detached
+    /// `ae --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
+    /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it "duplicates"
+    /// the current view; the two windows are independent thereafter (own cursor/selection/viewport,
+    /// shared buffers server-side). The TUI has no window to spawn, so it ignores the
+    /// [`ShellAction::NewWindow`] it emits.
     NewWindow,
 
     // ---- git ----

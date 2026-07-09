@@ -106,11 +106,19 @@ struct EditArgs {
     #[arg(short = 'w', long)]
     workspace: Option<String>,
 
-    /// File or directory to open. Omit for a scratch buffer.
+    /// File or directory to open, optionally with a `:LINE` or `:LINE:COL` suffix to jump to a
+    /// position (`ae src/main.rs:42:10`; 1-based, editor-conventional). Omit for a scratch buffer.
     ///
     /// Resolved against the working directory; infers the workspace when `--workspace` is absent. A
-    /// directory opens the file browser there.
+    /// directory opens the file browser there. A path that literally exists (colon and all) wins over
+    /// the `:LINE:COL` interpretation.
     path: Option<String>,
+
+    /// Re-attach to an already-open buffer by id (a scratch with no path), overriding PATH. Hidden:
+    /// buffer ids are daemon-session internals, set by the GUI when it opens a Buffers-picker item in
+    /// a new window (`Ctrl-Enter`), not something to type by hand.
+    #[arg(long, hide = true)]
+    buffer: Option<u64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -135,7 +143,17 @@ fn main() -> anyhow::Result<()> {
 /// Run the default `edit` command: resolve the workspace (explicit, inferred, or picker), resolve the
 /// active profile's port (creating the profile on first use), make sure a server is up on it, then
 /// launch the terminal or GUI client pointed at it.
-fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
+fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
+    // Peel a `:LINE[:COL]` jump suffix off the path before anything resolves it (workspace inference
+    // and the boot open both want the bare path). `None` jump for a plain path.
+    let jump = match edit.path.take() {
+        Some(arg) => {
+            let (path, jump) = split_path_and_jump(&arg);
+            edit.path = Some(path);
+            jump
+        }
+        None => None,
+    };
     let workspace = resolve_workspace(&edit)?;
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
@@ -145,12 +163,15 @@ fn run_edit(edit: EditArgs, version: String) -> anyhow::Result<()> {
         run_gui(
             workspace,
             edit.path,
+            jump,
+            edit.buffer,
             version,
             server_url,
             aether_server::active_profile().to_string(),
         )
     } else {
-        run_tui(workspace, edit.path, version, server_url)
+        // `--buffer` is a GUI-spawn internal; the terminal client has no window to seed with it.
+        run_tui(workspace, edit.path, jump, version, server_url)
     }
 }
 
@@ -274,6 +295,34 @@ fn detach(_cmd: &mut std::process::Command) {}
 /// and the client opens the file directly in an ephemeral "(no workspace)" context (`ae /etc/hosts`).
 /// With no PATH at all, we return `None` so a bare `ae` opens the workspace picker — the working
 /// directory is deliberately *not* used to guess a workspace (it only resolves relative file paths).
+/// Split a positional path of the form `PATH[:LINE[:COL]]` into the bare path and an optional 0-based
+/// `(line, col)` jump. The editor convention (`ae src/main.rs:42:10`): `LINE`/`COL` are 1-based as
+/// typed and returned 0-based (what the protocol uses). Because a filename may legitimately contain a
+/// colon, a path that literally exists on disk is taken as-is; only when it doesn't do we peel a
+/// trailing `:LINE` / `:LINE:COL`. A zero or non-numeric field is left as part of the path (no jump).
+fn split_path_and_jump(arg: &str) -> (String, Option<(u32, u32)>) {
+    // A literal existing path wins — this is how a name that genuinely contains a colon still opens.
+    if std::path::Path::new(arg).exists() {
+        return (arg.to_string(), None);
+    }
+    // Peel one trailing `:<positive-int>` group: `head` is what's left, `n` the parsed number. A
+    // nested `fn` (not a closure) so the returned `&str` is tied to the input's lifetime.
+    fn peel(s: &str) -> Option<(&str, u32)> {
+        let (head, tail) = s.rsplit_once(':')?;
+        let n: u32 = tail.parse().ok()?;
+        (!head.is_empty() && n > 0).then_some((head, n))
+    }
+    match peel(arg) {
+        // Two numeric suffixes → `PATH:LINE:COL` (the first peel is COL, the second LINE).
+        Some((rest, col)) => match peel(rest) {
+            Some((path, line)) => (path.to_string(), Some((line - 1, col - 1))),
+            // One numeric suffix → `PATH:LINE` (column defaults to the line start).
+            None => (rest.to_string(), Some((col - 1, 0))),
+        },
+        None => (arg.to_string(), None),
+    }
+}
+
 fn resolve_workspace(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     use aether_server::WorkspaceMatch;
 
@@ -383,29 +432,36 @@ fn terminate(_pid: u32) -> anyhow::Result<()> {
 fn run_tui(
     workspace: Option<String>,
     path: Option<String>,
+    jump: Option<(u32, u32)>,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
-    runtime()?.block_on(aether_tui::run(workspace, path, version, server_url))
+    runtime()?.block_on(aether_tui::run(workspace, path, jump, version, server_url))
 }
 
 #[cfg(feature = "gui")]
+#[allow(clippy::too_many_arguments)]
 fn run_gui(
     workspace: Option<String>,
     path: Option<String>,
+    jump: Option<(u32, u32)>,
+    buffer: Option<u64>,
     version: String,
     server_url: String,
     profile: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(workspace, path, version, server_url, profile)
+    aether_iced::run(workspace, path, jump, buffer, version, server_url, profile)
 }
 
 #[cfg(not(feature = "gui"))]
+#[allow(clippy::too_many_arguments)]
 fn run_gui(
     _workspace: Option<String>,
     _path: Option<String>,
+    _jump: Option<(u32, u32)>,
+    _buffer: Option<u64>,
     _version: String,
     _server_url: String,
     _profile: String,
@@ -427,6 +483,49 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_path_and_jump_parses_line_and_col() {
+        // Non-existent paths, so the `:LINE:COL` peel runs. 1-based in, 0-based out.
+        assert_eq!(
+            split_path_and_jump("nonexistent/main.rs:42:10"),
+            ("nonexistent/main.rs".to_string(), Some((41, 9)))
+        );
+        assert_eq!(
+            split_path_and_jump("nonexistent/main.rs:42"),
+            ("nonexistent/main.rs".to_string(), Some((41, 0)))
+        );
+        assert_eq!(
+            split_path_and_jump("nonexistent/main.rs"),
+            ("nonexistent/main.rs".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn split_path_and_jump_ignores_non_numeric_and_zero_suffixes() {
+        // A colon that isn't a positive line number stays part of the path.
+        assert_eq!(
+            split_path_and_jump("weird:name.rs"),
+            ("weird:name.rs".to_string(), None)
+        );
+        assert_eq!(
+            split_path_and_jump("nonexistent/file.rs:0"),
+            ("nonexistent/file.rs:0".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn split_path_and_jump_prefers_a_literal_existing_path() {
+        // A path that exists on disk wins over the `:LINE` reading, even with a `:digits` suffix —
+        // otherwise a real file named like `notes:1` could never be opened.
+        let dir = std::env::temp_dir().join(format!("aether-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let weird = dir.join("notes:1");
+        std::fs::write(&weird, b"x").unwrap();
+        let s = weird.display().to_string();
+        assert_eq!(split_path_and_jump(&s), (s.clone(), None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn bare_invocation_opens_the_picker_not_a_cwd_inferred_workspace() {

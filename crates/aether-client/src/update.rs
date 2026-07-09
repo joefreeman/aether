@@ -4,7 +4,7 @@
 //! bridges with a single `Message::Core(Event)` variant and an effect executor.
 
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
-use super::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
+use super::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
@@ -2741,6 +2741,111 @@ impl Session {
 
     /// Enter / row click: act on the highlighted item. Directories and roots navigate within
     /// the open explorer; everything else closes the panel and runs `picker/select`.
+    /// The [`WindowTarget`] that duplicates the current view (`Space Alt-x`): a real workspace lands
+    /// the sibling on its MRU buffer (`WindowOpen::Workspace`); an ephemeral file context passes the
+    /// buffer's path (the ephemeral id isn't CLI-addressable); a pathless ephemeral scratch can't be
+    /// reproduced, so the sibling opens the chooser.
+    fn current_view_target(&self) -> WindowTarget {
+        let workspace = (!aether_protocol::is_ephemeral_workspace_id(&self.workspace))
+            .then(|| self.workspace.clone());
+        let open = match (&workspace, self.buffer.path.as_deref()) {
+            (Some(_), _) | (None, None) => WindowOpen::Workspace,
+            (None, Some(path)) => WindowOpen::Path {
+                path: path.to_string(),
+                at: None,
+            },
+        };
+        WindowTarget { workspace, open }
+    }
+
+    /// The spawn descriptor for opening the highlighted picker item in a *new* window (`Ctrl-Enter`),
+    /// or `None` when the row isn't a new-window target. The native counterpart of the web client's
+    /// `pickerItemUrl`: it supports the same set — files, grep hits, file-backed and scratch buffers,
+    /// explorer files, and workspaces — and declines directories, roots, LSP servers, keybindings,
+    /// and the diagnostic/reference/symbol jump lists (all of which the web client also omits).
+    fn picker_item_target(&self) -> Option<WindowTarget> {
+        let p = self.picker.as_ref()?;
+        // The synthetic "+ Create …" row has nothing to open in another window.
+        if p.selected_is_create() {
+            return None;
+        }
+        // Files/grep/buffers live in the *current* workspace; a Workspace row names its own. A path
+        // is only CLI-addressable when the workspace is real — an ephemeral id can't seed a fresh
+        // `ae`, so we open by path alone there (mirrors `current_view_target`).
+        let here = (!aether_protocol::is_ephemeral_workspace_id(&self.workspace))
+            .then(|| self.workspace.clone());
+        let abs = |path_index: u32, relative: &str| -> Option<String> {
+            let root = self.workspace_paths.get(path_index as usize)?;
+            Some(format!("{}/{}", root.trim_end_matches('/'), relative))
+        };
+        match p.selected_item()? {
+            PickerItem::File {
+                path_index,
+                relative_path,
+                ..
+            } => Some(WindowTarget {
+                workspace: here,
+                open: WindowOpen::Path {
+                    path: abs(*path_index, relative_path)?,
+                    at: None,
+                },
+            }),
+            PickerItem::GrepHit {
+                path_index,
+                relative_path,
+                line,
+                col,
+                ..
+            } => Some(WindowTarget {
+                workspace: here,
+                open: WindowOpen::Path {
+                    path: abs(*path_index, relative_path)?,
+                    at: Some((*line, *col)),
+                },
+            }),
+            // A file-backed buffer opens by path, like a Files row.
+            PickerItem::Buffer {
+                path_index: Some(pi),
+                relative_path: Some(rel),
+                ..
+            } => Some(WindowTarget {
+                workspace: here,
+                open: WindowOpen::Path {
+                    path: abs(*pi, rel)?,
+                    at: None,
+                },
+            }),
+            // A scratch buffer (no path) re-opens by id against the shared daemon — but only when the
+            // workspace is CLI-addressable (the new `ae` must activate it before `buffer/open`-by-id).
+            PickerItem::Buffer { buffer_id, .. } => here.map(|ws| WindowTarget {
+                workspace: Some(ws),
+                open: WindowOpen::Buffer(*buffer_id),
+            }),
+            // An explorer *file* (a directory navigates within the picker instead). The listing dir
+            // is absolute, so join the leaf name for the absolute path.
+            PickerItem::DirEntry {
+                name,
+                is_dir: false,
+                ..
+            } => {
+                let dir = p.explorer_listing_dir()?;
+                Some(WindowTarget {
+                    workspace: here,
+                    open: WindowOpen::Path {
+                        path: format!("{}/{name}", dir.trim_end_matches('/')),
+                        at: None,
+                    },
+                })
+            }
+            // Open a *different* workspace in a new window — lands on its MRU buffer.
+            PickerItem::Workspace { name, .. } => Some(WindowTarget {
+                workspace: Some(name.clone()),
+                open: WindowOpen::Workspace,
+            }),
+            _ => None,
+        }
+    }
+
     fn picker_accept(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
@@ -2910,6 +3015,18 @@ impl Session {
         };
         match code {
             KeyCode::Esc => return self.close_picker(),
+            // Ctrl-Enter opens the highlighted item in a *new* window (GUI-only; a no-op in the TUI),
+            // mirroring the web client's Ctrl/Cmd-Enter "open in a new tab". Rows that aren't a
+            // new-window target (directories, LSP servers, keybindings, …) fall through to an
+            // ordinary accept — the same fall-through the web shell does when the row has no URL.
+            KeyCode::Enter if mods.ctrl => {
+                if let Some(target) = self.picker_item_target() {
+                    return self
+                        .close_picker()
+                        .and(Effects::one(Effect::ShellAction(ShellAction::NewWindow(target))));
+                }
+                return self.picker_accept();
+            }
             KeyCode::Enter => return self.picker_accept(),
             // Ctrl-d: trash the highlighted entry (Files + Explorer) or delete the highlighted
             // workspace (Workspaces), behind a confirm. (Not plain `Delete` — that's a forward-delete
@@ -5473,7 +5590,9 @@ impl Session {
             // Spawning the new process is irreducibly shell-side (and GUI-only) — the shell reads
             // the workspace/path from its session and detaches a sibling `ae --gui`. The core just
             // asks for it; non-GUI shells ignore the action.
-            A::NewWindow => Effects::one(Effect::ShellAction(ShellAction::NewWindow)),
+            A::NewWindow => Effects::one(Effect::ShellAction(ShellAction::NewWindow(
+                self.current_view_target(),
+            ))),
 
             // ---- git ----
             A::ToggleDiffView => {
@@ -5851,5 +5970,130 @@ mod tests {
         // Roots mode: no dir scope — the target covers the whole workspace.
         let seeded = seeded_filters_for_switch(&defaults, None, PickerKind::Grep);
         assert!(seeded.directories.is_empty());
+    }
+
+    /// `picker_item_target` — the "open in a new window" descriptor — supports the same item set as
+    /// the web client's `pickerItemUrl`: files, grep hits (with location), file-backed and scratch
+    /// buffers, explorer files, and workspaces; it declines everything else.
+    fn target_of(kind: PickerKind, item: PickerItem, selected: u32) -> Option<WindowTarget> {
+        use crate::picker::PickerState;
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        let mut p = PickerState::new(kind);
+        if kind == PickerKind::Explorer {
+            p.directory = Some("/proj/src".into());
+        }
+        p.items = vec![item];
+        p.offset = 0;
+        p.selected = selected;
+        s.picker = Some(p);
+        s.picker_item_target()
+    }
+
+    #[test]
+    fn picker_item_target_resolves_files_and_grep_hits_to_absolute_paths() {
+        assert_eq!(
+            target_of(
+                PickerKind::Files,
+                PickerItem::File {
+                    path_index: 0,
+                    relative_path: "src/main.rs".into(),
+                    match_indices: vec![],
+                    git_status: None,
+                },
+                0,
+            ),
+            Some(WindowTarget {
+                workspace: Some("proj".into()),
+                open: WindowOpen::Path {
+                    path: "/proj/src/main.rs".into(),
+                    at: None,
+                },
+            })
+        );
+        // A grep hit carries its 0-based location so the new window jumps to the match.
+        assert_eq!(
+            target_of(
+                PickerKind::Grep,
+                PickerItem::GrepHit {
+                    path_index: 0,
+                    relative_path: "src/main.rs".into(),
+                    line: 41,
+                    col: 9,
+                    preview: "let x = 1;".into(),
+                    match_indices: vec![],
+                },
+                0,
+            ),
+            Some(WindowTarget {
+                workspace: Some("proj".into()),
+                open: WindowOpen::Path {
+                    path: "/proj/src/main.rs".into(),
+                    at: Some((41, 9)),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn picker_item_target_reopens_a_scratch_buffer_by_id() {
+        assert_eq!(
+            target_of(
+                PickerKind::Buffers,
+                PickerItem::Buffer {
+                    buffer_id: 7,
+                    display: "(scratch 1)".into(),
+                    status: aether_protocol::picker::BufferDirtyState::default(),
+                    path_index: None,
+                    relative_path: None,
+                    match_indices: vec![],
+                    transient: false,
+                    dormant: false,
+                },
+                0,
+            ),
+            Some(WindowTarget {
+                workspace: Some("proj".into()),
+                open: WindowOpen::Buffer(7),
+            })
+        );
+    }
+
+    #[test]
+    fn picker_item_target_opens_a_workspace_row_in_its_own_window() {
+        assert_eq!(
+            target_of(
+                PickerKind::Workspaces,
+                PickerItem::Workspace {
+                    name: "other".into(),
+                    unsaved_buffers: 0,
+                    match_indices: vec![],
+                },
+                0,
+            ),
+            Some(WindowTarget {
+                workspace: Some("other".into()),
+                open: WindowOpen::Workspace,
+            })
+        );
+    }
+
+    #[test]
+    fn picker_item_target_declines_directories() {
+        // A directory navigates *within* the picker — it isn't a new-window target (nor is it on web).
+        assert_eq!(
+            target_of(
+                PickerKind::Explorer,
+                PickerItem::DirEntry {
+                    name: "sub".into(),
+                    is_dir: true,
+                    match_indices: vec![],
+                    git_status: None,
+                },
+                0,
+            ),
+            None
+        );
     }
 }

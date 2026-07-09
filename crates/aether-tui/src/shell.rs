@@ -120,6 +120,9 @@ struct Booted {
 struct BootSpec {
     workspace: Option<String>,
     file: Option<String>,
+    /// A 0-based `(line, col)` to jump to once `file` opens (`ae src/main.rs:42`). `None` for a bare
+    /// open. Initial-boot only — reconnects restore the live cursor, not this.
+    jump: Option<(u32, u32)>,
     version: String,
 }
 
@@ -196,6 +199,7 @@ pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     workspace: Option<String>,
     file: Option<String>,
+    jump: Option<(u32, u32)>,
     version: String,
     server_url: String,
 ) -> Result<()> {
@@ -246,6 +250,7 @@ pub async fn run(
         boot: Some(BootSpec {
             workspace,
             file,
+            jump,
             version,
         }),
         boot_attempt: 0,
@@ -992,9 +997,10 @@ impl Shell {
                 self.sent_grid = Some(self.grid());
                 self.subscribe();
             }
-            // "Open another window" is GUI-only — a new OS window makes no sense for the terminal
-            // client, which owns the one terminal it was launched in. Ignore it here.
-            ShellAction::NewWindow => {}
+            // "Open another window" (both the `Space Alt-x` duplicate and "open picker item in a
+            // new window") is GUI-only — a new OS window makes no sense for the terminal client,
+            // which owns the one terminal it was launched in. Ignore it here.
+            ShellAction::NewWindow(_) => {}
         }
     }
 
@@ -1978,6 +1984,7 @@ async fn boot_dial(
         &handle,
         spec.workspace.as_deref(),
         spec.file.as_deref(),
+        spec.jump,
         cols,
         rows,
     )
@@ -2096,10 +2103,13 @@ pub async fn bootstrap(
     handle: &Handle,
     workspace: Option<&str>,
     file: Option<&str>,
+    jump: Option<(u32, u32)>,
     cols: u16,
     rows: u16,
 ) -> Result<(Session, AppState, Effects)> {
     use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
+    use aether_protocol::LogicalPosition;
+    let jump_to = jump.map(|(line, col)| LogicalPosition { line, col });
     use aether_protocol::picker::PickerKind;
     use aether_protocol::workspace::{
         WorkspaceActivate, WorkspaceActivateParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
@@ -2184,13 +2194,15 @@ pub async fn bootstrap(
                 Some(abs) => {
                     let abs = abs.display().to_string();
                     match aether_client::session::strip_longest_root(&abs, &workspace_paths) {
-                        // Inside a workspace root: ordinary workspace-relative open.
+                        // Inside a workspace root: ordinary workspace-relative open. A `path:line:col`
+                        // launch jumps to `jump_to` here.
                         Some((path_index, relative_path)) => {
                             handle
                                 .rpc::<BufferOpen>(BufferOpenParams {
                                     path_index: Some(path_index),
                                     relative_path: Some(relative_path),
                                     create_if_missing: true,
+                                    jump_to,
                                     ..Default::default()
                                 })
                                 .await?

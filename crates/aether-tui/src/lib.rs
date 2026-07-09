@@ -34,6 +34,7 @@ use std::io::{stdout, Stdout};
 pub async fn run(
     workspace: Option<String>,
     file: Option<String>,
+    jump: Option<(u32, u32)>,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
@@ -59,7 +60,7 @@ pub async fn run(
     // (status row showing "Connecting…", client-side keys live) and `run` dials `server_url` from
     // within — so the client can start before the daemon and waits for it without leaving the
     // editor. The boot dial installs the session once it lands.
-    let run_result = shell::run(&mut terminal, workspace, file, version, server_url).await;
+    let run_result = shell::run(&mut terminal, workspace, file, jump, version, server_url).await;
     restore_terminal(&mut terminal)?;
     run_result
 }

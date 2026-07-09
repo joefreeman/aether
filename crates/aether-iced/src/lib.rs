@@ -35,9 +35,12 @@ pub(crate) fn active_profile() -> &'static str {
 /// address to dial, and `profile` is the active profile name (recorded for window-spawning). iced
 /// owns the main thread and manages its own tokio runtime, so unlike the terminal client this is a
 /// synchronous call (not awaited on a runtime the caller provides).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     workspace: Option<String>,
     file: Option<String>,
+    jump: Option<(u32, u32)>,
+    buffer_id: Option<u64>,
     version: String,
     server_url: String,
     profile: String,
@@ -57,6 +60,8 @@ pub fn run(
     app::run(app::Bootstrap::Connecting(app::ConnectingBootstrap {
         workspace,
         file,
+        jump_to: jump.map(|(line, col)| aether_protocol::LogicalPosition { line, col }),
+        buffer_id,
         client_version: version,
         server_url,
     }))

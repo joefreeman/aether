@@ -3950,7 +3950,7 @@ fn space_alt_x_asks_the_shell_to_open_a_new_window() {
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
     assert!(
         fx.0.iter()
-            .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow))),
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
         "Space Alt-x should emit ShellAction::NewWindow"
     );
     // It's a pure shell hand-off — no server traffic, and crucially not a buffer/close (that's

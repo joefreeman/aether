@@ -8,7 +8,9 @@
 
 use crate::connection::Handle;
 use crate::connection::NotifRx;
-pub use crate::core::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
+pub use crate::core::effect::{
+    Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget,
+};
 use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
@@ -22,6 +24,7 @@ use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::Granularity;
+use aether_protocol::{BufferId, LogicalPosition};
 use aether_protocol::envelope::{NotificationMethod, RpcMethod};
 use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::lsp::LspStatus;
@@ -76,6 +79,15 @@ impl std::fmt::Debug for Bootstrap {
 pub struct ConnectingBootstrap {
     pub workspace: Option<String>,
     pub file: Option<String>,
+    /// A location (0-based line/col) to jump to once the CLI `file` opens (`ae src/main.rs:42:10`,
+    /// and the grep-hit "open in new window"). Applies only to a file *inside* a workspace root —
+    /// an external open goes through `workspace/open_path`, which carries no jump. `None` for a bare
+    /// file open.
+    pub jump_to: Option<LogicalPosition>,
+    /// Re-open an existing buffer by id instead of a file — the scratch-buffer "open in new window"
+    /// (`--buffer <id>`). Takes precedence over `file`; the id is daemon-session scoped, so a stale
+    /// one falls back to the workspace's MRU/scratch.
+    pub buffer_id: Option<BufferId>,
     pub client_version: String,
     /// The (profile-resolved) WebSocket address every dial and reconnect targets.
     pub server_url: String,
@@ -1898,8 +1910,8 @@ impl App {
                     Message::WindowUpdate,
                 )
             }
-            A::NewWindow => {
-                spawn_window(&self.session);
+            A::NewWindow(target) => {
+                spawn_target(&target);
                 Task::none()
             }
         }
@@ -4122,14 +4134,12 @@ fn open_link(url: &str) {
         .spawn();
 }
 
-/// Open another native window onto the same workspace as `session`: spawn a detached `ae --gui` for
-/// the *same* profile, so the new process dials the same daemon and (via `workspace/activate`) lands
-/// on the workspace's MRU buffer — i.e. the one this window is showing. Pointed by `--workspace` for
-/// a real workspace; for an ephemeral context (a file opened outside any workspace) we pass the
-/// buffer's path instead, since the ephemeral id isn't CLI-addressable — and a pathless ephemeral
-/// scratch can't be reproduced, so the new window just opens the chooser. Best-effort: a spawn
-/// failure is logged, not surfaced (the user simply gets no new window).
-fn spawn_window(session: &Session) {
+/// Spawn a detached `ae --gui` sibling seeded from a [`WindowTarget`] — the body behind
+/// [`ShellAction::NewWindow`] (both the `Space Alt-x` duplicate and "open picker item in a new
+/// window"; the core builds the target either way). The sibling dials the same daemon (`--profile`),
+/// so buffers are shared server-side. Best-effort: a spawn failure is logged, not surfaced (the user
+/// simply gets no new window).
+fn spawn_target(target: &WindowTarget) {
     let Ok(exe) = std::env::current_exe() else {
         tracing::warn!("cannot open a new window: current exe path is unavailable");
         return;
@@ -4139,10 +4149,22 @@ fn spawn_window(session: &Session) {
     cmd.arg("--profile")
         .arg(crate::active_profile())
         .arg("--gui");
-    if !aether_protocol::is_ephemeral_workspace_id(&session.workspace) {
-        cmd.arg("--workspace").arg(&session.workspace);
-    } else if let Some(path) = session.buffer.path.as_deref() {
-        cmd.arg(path);
+    if let Some(ws) = &target.workspace {
+        cmd.arg("--workspace").arg(ws);
+    }
+    match &target.open {
+        // `PATH:LINE:COL` — 1-based on the CLI (the editor convention `ae src/main.rs:42:10`), which
+        // `split_path_and_jump` parses back. No `:L:C` when there's no jump.
+        WindowOpen::Path { path, at } => {
+            cmd.arg(match at {
+                Some((line, col)) => format!("{path}:{}:{}", line + 1, col + 1),
+                None => path.clone(),
+            });
+        }
+        WindowOpen::Buffer(id) => {
+            cmd.arg("--buffer").arg(id.to_string());
+        }
+        WindowOpen::Workspace => {}
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4385,47 +4407,74 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, S
         None => None,
     };
 
-    let open = match &resolved {
-        Some(abs) if abs.is_dir() => handle
+    let open = if let Some(bid) = args.buffer_id {
+        // The scratch-buffer "open in new window": re-attach to the buffer by id (buffers are
+        // daemon-global, so a fresh client can reach it). The id is daemon-session scoped, so a stale
+        // one — the daemon restarted since the picker row was built — falls back to the MRU/scratch.
+        match handle
             .rpc::<BufferOpen>(BufferOpenParams {
-                transient: Some(true),
+                buffer_id: Some(bid),
                 ..Default::default()
             })
             .await
-            .map_err(|e| e.to_string())?,
-        Some(abs) => {
-            let abs_str = abs.display().to_string();
-            match strip_longest_root(&abs_str, &workspace_paths) {
-                // Inside a workspace root: ordinary workspace-relative open.
-                Some((path_index, relative_path)) => handle
-                    .rpc::<BufferOpen>(BufferOpenParams {
-                        path_index: Some(path_index),
-                        relative_path: Some(relative_path),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?,
-                // Outside the named workspace's roots: open as an external (guest) buffer in it.
-                None => handle
-                    .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
-                        path: abs_str,
-                        transient: None,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .opened
-                    .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?,
-            }
+        {
+            Ok(open) => open,
+            Err(_) => handle
+                .rpc::<BufferOpen>(BufferOpenParams {
+                    buffer_id: activated.last_buffer_id,
+                    transient: activated.last_buffer_id.is_none().then_some(true),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?,
         }
-        // No file: attach to the most recent buffer, or a transient scratch placeholder.
-        None => handle
-            .rpc::<BufferOpen>(BufferOpenParams {
-                buffer_id: activated.last_buffer_id,
-                transient: activated.last_buffer_id.is_none().then_some(true),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| e.to_string())?,
+    } else {
+        match &resolved {
+            Some(abs) if abs.is_dir() => handle
+                .rpc::<BufferOpen>(BufferOpenParams {
+                    transient: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?,
+            Some(abs) => {
+                let abs_str = abs.display().to_string();
+                match strip_longest_root(&abs_str, &workspace_paths) {
+                    // Inside a workspace root: ordinary workspace-relative open. A `path:line:col`
+                    // launch (or a grep-hit "open in new window") jumps to `jump_to` here.
+                    Some((path_index, relative_path)) => handle
+                        .rpc::<BufferOpen>(BufferOpenParams {
+                            path_index: Some(path_index),
+                            relative_path: Some(relative_path),
+                            jump_to: args.jump_to,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?,
+                    // Outside the named workspace's roots: open as an external (guest) buffer in it.
+                    // `workspace/open_path` carries no jump, so a `path:line:col` on an external file
+                    // opens at the top.
+                    None => handle
+                        .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
+                            path: abs_str,
+                            transient: None,
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .opened
+                        .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?,
+                }
+            }
+            // No file: attach to the most recent buffer, or a transient scratch placeholder.
+            None => handle
+                .rpc::<BufferOpen>(BufferOpenParams {
+                    buffer_id: activated.last_buffer_id,
+                    transient: activated.last_buffer_id.is_none().then_some(true),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?,
+        }
     };
 
     let explorer_dir = match &resolved {
