@@ -2846,6 +2846,22 @@ impl Session {
         }
     }
 
+    /// A Ctrl-click on a picker row — the mouse sibling of `Ctrl-Enter`: move the selection onto the
+    /// clicked row, then open it in a new window (or fall through to a normal open when the row isn't
+    /// a new-window target). Shell-invoked (the iced GUI reads the modifier at click time, since a
+    /// `mouse_area` press carries none); the TUI never calls it.
+    pub fn picker_click_new_window(&mut self, abs: u32) -> Effects {
+        if let Some(p) = &mut self.picker {
+            p.selected = abs;
+        }
+        if let Some(target) = self.picker_item_target() {
+            return self
+                .close_picker()
+                .and(Effects::one(Effect::ShellAction(ShellAction::NewWindow(target))));
+        }
+        self.picker_accept()
+    }
+
     fn picker_accept(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
@@ -6094,6 +6110,73 @@ mod tests {
                 0,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn picker_click_new_window_selects_the_clicked_row_then_spawns_and_closes() {
+        use crate::picker::PickerState;
+        let file = |name: &str| PickerItem::File {
+            path_index: 0,
+            relative_path: name.into(),
+            match_indices: vec![],
+            git_status: None,
+        };
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        let mut p = PickerState::new(PickerKind::Files);
+        p.items = vec![file("a.rs"), file("b.rs")];
+        p.offset = 0;
+        p.selected = 0;
+        s.picker = Some(p);
+
+        // Ctrl-click the *second* row: the click moves the selection there, then spawns for it.
+        let fx = s.picker_click_new_window(1);
+        let target = fx.0.iter().find_map(|e| match e {
+            Effect::ShellAction(ShellAction::NewWindow(t)) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            target,
+            Some(WindowTarget {
+                workspace: Some("proj".into()),
+                open: WindowOpen::Path {
+                    path: "/proj/b.rs".into(),
+                    at: None,
+                },
+            })
+        );
+        // Like a normal accept / Ctrl-Enter, the panel closes.
+        assert!(s.picker.is_none());
+    }
+
+    #[test]
+    fn picker_click_new_window_falls_through_for_non_targets() {
+        use crate::picker::PickerState;
+        // A directory row isn't a new-window target — a Ctrl-click on it behaves like a normal click
+        // (navigate into the dir), never a window spawn.
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        let mut p = PickerState::new(PickerKind::Explorer);
+        p.directory = Some("/proj/src".into());
+        p.items = vec![PickerItem::DirEntry {
+            name: "sub".into(),
+            is_dir: true,
+            match_indices: vec![],
+            git_status: None,
+        }];
+        p.offset = 0;
+        p.selected = 0;
+        s.picker = Some(p);
+
+        let fx = s.picker_click_new_window(0);
+        assert!(
+            !fx.0
+                .iter()
+                .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
+            "a directory Ctrl-click must not spawn a window"
         );
     }
 }

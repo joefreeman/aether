@@ -324,6 +324,8 @@ pub enum Message {
     /// A core event (docs/client-core.md): forwarded to `Session::on_event`, whose effects
     /// the shell executes. Grows a subsystem at a time as update logic migrates into core.
     Core(CoreEvent),
+    /// Keyboard modifier state changed — stashed in `App::modifiers` for click-time reads (Ctrl-click).
+    ModifiersChanged(keyboard::Modifiers),
     /// The picker's results list scrolled natively (absolute y in px).
     PickerScrolled(f32),
     /// Pointer entered (`Some(abs)`) or left (`None`-if-still-current, see mapping) a row.
@@ -362,6 +364,9 @@ pub struct App {
     server_started_at: u64,
     cell: Option<Size>,
     view_size: Size,
+    /// Live keyboard modifier state, kept current from `ModifiersChanged` in every phase. Read at
+    /// click time for Ctrl-click on picker rows — iced's `mouse_area::on_press` carries no modifiers.
+    modifiers: keyboard::Modifiers,
     // Per-session presentation state (geometry + parsed artifacts) — deliberately NOT on
     // `core` Session (docs/client-core.md: semantics in the core, geometry in the shell).
     scroll_px: f32,
@@ -433,6 +438,7 @@ impl App {
             server_started_at,
             cell: None,
             view_size: Size::ZERO,
+            modifiers: keyboard::Modifiers::default(),
             scroll_px: 0.0,
             scroll_x_px: 0.0,
             scroll_anim: None,
@@ -596,6 +602,9 @@ impl App {
                     text: text.map(|t| t.to_string()),
                 })
             }
+            // Track modifier state for click-time reads (Ctrl-click on picker rows). `ModifiersChanged`
+            // self-heals on focus loss, so the state can't get stuck held.
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::ModifiersChanged(m)),
             _ => None,
         });
         // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them
@@ -618,6 +627,12 @@ impl App {
     // ---- update ---------------------------------------------------------------------------
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        // Keep live modifier state current in every phase (boot/connecting/session) — Ctrl-click on a
+        // picker row reads it, and a `mouse_area` press hands over no modifiers of its own.
+        if let Message::ModifiersChanged(m) = message {
+            self.modifiers = m;
+            return Task::none();
+        }
         // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
         // Then the workspace chooser (if any) owns every message until `SessionReady` hands off.
         let task = if self.boot_args.is_some() {
@@ -1275,6 +1290,8 @@ impl App {
             Message::SessionReady(_) => Task::none(),
             Message::Editor(ev) => self.on_editor_event(ev),
             Message::Key { code, mods, text } => self.on_key(code, mods, text),
+            // Handled upstream in `update` (tracked in every phase); listed here only for exhaustiveness.
+            Message::ModifiersChanged(_) => Task::none(),
 
             Message::Subscribed(Ok(res)) => {
                 tracing::debug!(
@@ -1337,6 +1354,13 @@ impl App {
                 self.error(format!("Viewport update failed: {e}"))
             }
 
+            // Ctrl-click on a picker row opens it in a new window — the mouse sibling of Ctrl-Enter.
+            // `mouse_area::on_press` carries no modifiers, so we consult the tracked `self.modifiers`;
+            // a plain click falls through to the generic arm below (normal open in this window).
+            Message::Core(CoreEvent::PickerClicked(abs)) if self.modifiers.control() => {
+                let fx = self.session.picker_click_new_window(abs);
+                self.run_core(fx)
+            }
             Message::Core(ev) => {
                 let fx = self.session.on_event(ev);
                 self.run_core(fx)
