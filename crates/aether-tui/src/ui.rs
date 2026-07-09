@@ -2165,8 +2165,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // the group, the header covers it — the scroll math keeps the selection clear of this row.
     if let Some(kind) = state.picker.kind {
         if pins_group_header(kind) && !groups.is_empty() {
-            if let (Some(first), Some(gi)) =
-                (lines.first_mut(), picker_governing_group(&rows, top))
+            if let (Some(first), Some(gi)) = (lines.first_mut(), picker_governing_group(&rows, top))
             {
                 *first = Line::from(header_spans(&groups[gi].header));
             }
@@ -5686,7 +5685,10 @@ mod tests {
                 next + pane
             );
             // Moving down never scrolls the view up.
-            assert!(next >= top, "sel {sel}: scrolled up {top} -> {next} (pane {pane})");
+            assert!(
+                next >= top,
+                "sel {sel}: scrolled up {top} -> {next} (pane {pane})"
+            );
             // When a down-move scrolls, the selection lands on the bottom edge — never leaving
             // rows dangling below it — unless clamped at the list end (the last-screenful case).
             if next > top {
@@ -5752,7 +5754,11 @@ mod tests {
 
         // Steady state: flat window [0, 90), the selection walked to the last cached item (89),
         // parked on the bottom row (top 72, pane row 17, offset 0).
-        let steady = PickerScroll { top: 72, sel_pane: 17, offset: 0 };
+        let steady = PickerScroll {
+            top: 72,
+            sel_pane: 17,
+            offset: 0,
+        };
         assert_eq!(
             picker_scroll_step(&picker_window_rows(90, &[]), 89, pane, false, 0, steady),
             steady,
@@ -5766,7 +5772,11 @@ mod tests {
         let mid = picker_scroll_step(&empty, 45, pane, false, 45, steady);
         assert_eq!(
             mid,
-            PickerScroll { top: 0, sel_pane: 17, offset: 0 },
+            PickerScroll {
+                top: 0,
+                sel_pane: 17,
+                offset: 0
+            },
             "empty refetch frame must preserve the continuity anchor, not collapse it"
         );
 
@@ -5775,7 +5785,11 @@ mod tests {
         let rows_b = picker_window_rows(90, &[]);
         let landed = picker_scroll_step(&rows_b, 45, pane, false, 45, mid);
         assert_eq!(landed.top, 28);
-        assert_eq!(45 - landed.top, pane - 1, "selection stays on the bottom edge");
+        assert_eq!(
+            45 - landed.top,
+            pane - 1,
+            "selection stays on the bottom edge"
+        );
     }
 
     /// The empty-frame guard also holds for the grouped (pinned) kinds and when the anchor sits
@@ -5785,7 +5799,11 @@ mod tests {
         let pane = 12usize;
         let (_, spans) = grep_items(&[("a.rs", 90)]);
         // Selection parked mid-pane (pane row 6) in window [0, 90).
-        let steady = PickerScroll { top: 20, sel_pane: 6, offset: 0 };
+        let steady = PickerScroll {
+            top: 20,
+            sel_pane: 6,
+            offset: 0,
+        };
         // Empty refetch frame (0 items → no rows regardless of spans): anchor must survive.
         let mid = picker_scroll_step(&picker_window_rows(0, &[]), 45, pane, true, 45, steady);
         assert_eq!(mid.sel_pane, 6, "anchor preserved through the empty frame");
@@ -5839,7 +5857,7 @@ mod tests {
         assert_eq!(picker_governing_group(&rows, 3), Some(0)); // the gap still belongs to a
         assert_eq!(picker_governing_group(&rows, 4), Some(1)); // on b's header
         assert_eq!(picker_governing_group(&rows, 6), Some(1)); // mid b
-        // Flat windows have no groups to pin.
+                                                               // Flat windows have no groups to pin.
         assert_eq!(picker_governing_group(&picker_window_rows(3, &[]), 1), None);
     }
 
@@ -5932,7 +5950,10 @@ mod tests {
         };
         let rows = render_picker_rows(picker);
 
-        let content: Vec<&String> = rows.iter().filter(|r| r.contains("HIT") || r.contains("a.rs")).collect();
+        let content: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("HIT") || r.contains("a.rs"))
+            .collect();
         let first = content.first().expect("some picker rows rendered");
         assert!(
             first.contains("a.rs") && !first.contains("HIT"),
@@ -5941,8 +5962,14 @@ mod tests {
         // The covered row (HIT2) is gone; the rows just below the pin are the following hits, and
         // the selected HIT4 is on screen.
         let joined = rows.join("\n");
-        assert!(!joined.contains("HIT2"), "the row under the pin (HIT2) should be covered");
-        assert!(joined.contains("HIT4"), "the selected hit should be visible");
+        assert!(
+            !joined.contains("HIT2"),
+            "the row under the pin (HIT2) should be covered"
+        );
+        assert!(
+            joined.contains("HIT4"),
+            "the selected hit should be visible"
+        );
     }
 
     #[test]

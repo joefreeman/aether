@@ -1979,8 +1979,7 @@ fn picker_view_response_renders_items_without_the_push() {
 
 /// How many `picker/view` requests `fx` carries.
 fn count_picker_views(fx: &Effects) -> usize {
-    fx.0
-        .iter()
+    fx.0.iter()
         .filter(|e| matches!(e, Effect::Request { method, .. } if *method == "picker/view"))
         .count()
 }
@@ -2041,7 +2040,11 @@ fn fast_picker_scroll_coalesces_refetches_into_one_in_flight() {
 
     // Cross the window edge: one refetch, slot armed.
     let fx = s.picker_wheel(90); // selected 0 -> 90, leaves [0, 90)
-    assert_eq!(count_picker_views(&fx), 1, "boundary crossing fires one refetch");
+    assert_eq!(
+        count_picker_views(&fx),
+        1,
+        "boundary crossing fires one refetch"
+    );
     assert!(s.picker.as_ref().unwrap().refetch_in_flight);
     let selected = s.picker.as_ref().unwrap().selected;
 
@@ -2071,9 +2074,16 @@ fn refetch_reply_chases_a_selection_that_raced_past_the_window() {
     // The in-flight reply (window [45, 135)) lands; 150 is past it → one trailing refetch at
     // 150 - 45 = 105.
     let fx = feed_files_window(&mut s, false, 45, 90, 500);
-    assert_eq!(count_picker_views(&fx), 1, "trailing chase fires one refetch");
+    assert_eq!(
+        count_picker_views(&fx),
+        1,
+        "trailing chase fires one refetch"
+    );
     assert_eq!(find_request(&fx, "picker/view").unwrap()["offset"], 105);
-    assert!(s.picker.as_ref().unwrap().refetch_in_flight, "chase re-arms the slot");
+    assert!(
+        s.picker.as_ref().unwrap().refetch_in_flight,
+        "chase re-arms the slot"
+    );
 }
 
 /// The chase stops as soon as a delivered window contains the selection: no extra refetch, slot
@@ -2087,7 +2097,11 @@ fn refetch_reply_stops_when_it_catches_the_selection() {
 
     s.picker_wheel(90); // refetch @ 45; selected = 90
     let fx = feed_files_window(&mut s, false, 45, 90, 500); // window [45, 135) contains 90
-    assert_eq!(count_picker_views(&fx), 0, "caught up — no trailing refetch");
+    assert_eq!(
+        count_picker_views(&fx),
+        0,
+        "caught up — no trailing refetch"
+    );
     let p = s.picker.as_ref().unwrap();
     assert!(!p.refetch_in_flight, "slot freed");
     assert_eq!(p.items.len(), 90);
@@ -2126,7 +2140,11 @@ fn free_scroll_refetch_does_not_chase_the_selection() {
     // The scrollbar drags the view far from the selection: a free-scroll refetch (chase = false).
     let fx = s.picker_refetch(200, false);
     assert_eq!(count_picker_views(&fx), 1, "the scroll refetch itself");
-    assert_eq!(s.picker.as_ref().unwrap().selected, 0, "free scroll leaves the selection put");
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        0,
+        "free scroll leaves the selection put"
+    );
 
     // Window [200, 290) lands; the selection (0) is outside it — but this was free scroll, so it
     // must stay where it was scrolled, not chase back to the selection.

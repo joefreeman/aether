@@ -106,11 +106,11 @@ mod tests {
     #[tokio::test]
     async fn spawn_runs_child_in_the_given_cwd() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let LspProcess { mut child, .. } = match spawn("sh", &["-c", "pwd -P > cwd_marker"], dir.path())
-        {
-            Ok(p) => p,
-            Err(_) => return, // no `sh` on this host; nothing to test
-        };
+        let LspProcess { mut child, .. } =
+            match spawn("sh", &["-c", "pwd -P > cwd_marker"], dir.path()) {
+                Ok(p) => p,
+                Err(_) => return, // no `sh` on this host; nothing to test
+            };
         let _ = child.wait().await;
 
         let marker = std::fs::read_to_string(dir.path().join("cwd_marker"))
