@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for the macOS `Aether.app` bundle. A @VERSION@ template: release.yml renders it with
+  the tag-verified version (same sed pattern as the AppStream metainfo). The bundle wraps the single
+  `ae` binary at Contents/MacOS/ae — identical to the tarball's binary. Launching via Finder/Spotlight
+  (`open -a Aether`) starts it with no controlling terminal, which `has_gui_display()`'s macOS branch
+  resolves to the GUI; invoking Contents/MacOS/ae directly from a shell keeps a tty and runs the TUI.
+
+  CFBundleIdentifier must stay `uk.joef.Aether` to match the iced window's app id and the Linux
+  desktop-file basename.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleName</key>
+    <string>Aether</string>
+    <key>CFBundleDisplayName</key>
+    <string>Aether</string>
+    <key>CFBundleIdentifier</key>
+    <string>uk.joef.Aether</string>
+    <key>CFBundleExecutable</key>
+    <string>ae</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© Joe Freeman</string>
+</dict>
+</plist>

@@ -37,11 +37,17 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
   and icon; for the command line, symlink it onto your `PATH`
   (`ln -s /path/to/aether-<version>-x86_64.AppImage ~/.local/bin/ae`) — all `ae` commands work
   through it.
+- `aether-<version>-<target>.dmg` (**macOS**) — the GUI build as a drag-install `Aether.app`. Open
+  the image and drag the app to `Applications`; double-clicking it (or `open -a Aether`) launches the
+  GUI. The bundle wraps the same `ae` binary, so for the command line, symlink it onto your `PATH`
+  (`ln -s /Applications/Aether.app/Contents/MacOS/ae /usr/local/bin/ae`) — running `ae` from a
+  terminal then opens the terminal client.
 
 Each archive holds the single `ae` binary; unpack it and put `ae` on your `PATH`.
 
-> **macOS:** binaries are unsigned, so clear the quarantine flag once after unpacking:
-> `xattr -d com.apple.quarantine ./ae`.
+> **macOS:** downloads are unsigned, so clear the quarantine flag once. For a `.tar.gz` binary:
+> `xattr -d com.apple.quarantine ./ae`. For the `.dmg`'s app:
+> `xattr -dr com.apple.quarantine /Applications/Aether.app` (or right-click → Open on first launch).
 
 ## Keybindings
 

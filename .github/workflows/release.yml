@@ -114,6 +114,47 @@ jobs:
           cargo build --release -p aether-ae --target "$T" --no-default-features
           stage "-no-gui"
 
+      # macOS .app bundle + .dmg (GUI variant). The bundle wraps the same `ae` binary at
+      # Contents/MacOS/ae, so it still runs as a CLI when invoked directly (…/Contents/MacOS/ae keeps
+      # a tty → TUI); the bundle only adds the Finder/Spotlight launch path (`open -a Aether` starts
+      # it with no tty → GUI, via has_gui_display()'s macOS branch). Unsigned/un-notarized for now —
+      # first launch trips Gatekeeper (right-click → Open, or clear the quarantine xattr).
+      - name: Build .app + .dmg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target }}"
+          APP="Aether.app"
+
+          # Render the .icns from the same square SVG the Linux packaging uses (single source of
+          # truth). sips can't rasterize SVG, so use librsvg's rsvg-convert for each iconset slot;
+          # iconutil packs them. The 10 files below are the canonical iconset (1x + @2x per size).
+          brew list librsvg >/dev/null 2>&1 || brew install librsvg
+          mkdir -p AppIcon.iconset
+          for s in 16 32 128 256 512; do
+            rsvg-convert -w "$s"        -h "$s"        packaging/uk.joef.Aether.svg -o "AppIcon.iconset/icon_${s}x${s}.png"
+            rsvg-convert -w "$((s*2))"  -h "$((s*2))"  packaging/uk.joef.Aether.svg -o "AppIcon.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns AppIcon.iconset -o AppIcon.icns
+
+          # Assemble the bundle. Copy the *staged* GUI binary (pkg/…/ae): target/$T/release/ae was
+          # overwritten by the subsequent --no-default-features (no-gui) build above.
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "pkg/aether-${VER}-${T}/ae" "$APP/Contents/MacOS/ae"
+          chmod +x "$APP/Contents/MacOS/ae"
+          cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          # Render Info.plist from its @VERSION@ template (same sed pattern as the AppStream metainfo).
+          sed "s/@VERSION@/${VER}/g" packaging/Info.plist > "$APP/Contents/Info.plist"
+
+          # Ship the .app inside a compressed, read-only .dmg with an /Applications shortcut, so the
+          # install is the conventional drag-across. UDZO = zlib-compressed.
+          mkdir -p dmg
+          cp -R "$APP" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Aether" -srcfolder dmg -ov -format UDZO \
+            "dist/aether-${VER}-${T}.dmg"
+
       # AppImage (Linux, GUI variant). The binary links nothing beyond glibc/libz — winit/wgpu
       # dlopen the display/GL stack at runtime — so a bare AppDir is enough; no linuxdeploy-style
       # library bundling. `continuous` is upstream's only release channel (no versioned tags to
@@ -132,8 +173,8 @@ jobs:
           # for desktop environments to associate the running window with the entry's icon.
           cp "pkg/aether-${VER}-${{ matrix.target }}/ae" AppDir/usr/bin/
           cp packaging/uk.joef.Aether.desktop AppDir/usr/share/applications/
-          # The icon is a square variant of logo.svg (icon slots are square; the raw logo is
-          # 256×194 and would be stretched).
+          # The icon is the square (1024×1024) app mark (also the README badge); the "scalable"
+          # icon slot expects square art.
           cp packaging/uk.joef.Aether.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           # The metainfo is a template: render the release entry from the tag-verified version.
           # Written under the legacy `.appdata.xml` name because that's the only suffix
@@ -158,6 +199,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.AppImage
+            dist/*.dmg
           if-no-files-found: error
 
   release:
@@ -171,11 +213,13 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          # Both patterns must match (fail_on_unmatched_files) — a missing AppImage is a broken
-          # release, not a partial one.
+          # Every pattern must match (fail_on_unmatched_files) — a missing AppImage or .dmg is a
+          # broken release, not a partial one. The download-artifact step above collects every build
+          # job's output into artifacts/, so all three types are present across the matrix.
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.AppImage
+            artifacts/**/*.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}
