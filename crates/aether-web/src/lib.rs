@@ -183,7 +183,9 @@ impl WasmSession {
             .picker
             .as_ref()
             .and_then(|p| p.scrolled_refetch(first_visible_row));
-        let fx = offset.map_or_else(Effects::none, |o| self.inner.picker_refetch(o));
+        // Free pixel scroll — the view moved, not the selection — so the reply must not chase the
+        // highlight back (`chase_selection = false`); that would fight the scroll and blank it.
+        let fx = offset.map_or_else(Effects::none, |o| self.inner.picker_refetch(o, false));
         to_js(&effects_to_json(fx))
     }
 

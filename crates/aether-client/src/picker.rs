@@ -85,6 +85,19 @@ pub struct PickerState {
     /// streaming-grep ticks (~16/s) drive the throbber without any client-side timer. See
     /// [`PickerState::spinner_glyph`].
     pub spinner_frame: u8,
+    /// Single-flight guard for window refetches: true while a `picker/view` fired by
+    /// [`crate::Session::picker_refetch`] is awaiting its reply. A *selection* move that leaves the
+    /// window while this is set is coalesced — `selected` keeps advancing locally and the reply's
+    /// trailing check chases it with one more fetch — so a fast keyboard scroll fires ~one refetch
+    /// per round-trip instead of one per move. Reset when a fresh window supersedes the cycle
+    /// (query change / dir nav) so it can't wedge.
+    pub refetch_in_flight: bool,
+    /// Whether the in-flight refetch should *chase the selection* when it lands (see the trailing
+    /// check in the `PickerViewed` handler). True for selection-driven refetches (keyboard nav);
+    /// **false for free pixel scroll** (iced / web scrollbar), where the view moves independently
+    /// of the selection — chasing there would yank the window back to the selection and fight the
+    /// scroll (a blank, oscillating scrollbar).
+    pub refetch_chases_selection: bool,
 }
 
 /// Braille throbber frames for the "still searching" spinner (left of the picker's count).
@@ -116,6 +129,8 @@ impl PickerState {
             chip_editor: None,
             sent_filters: PickerFilters::default(),
             spinner_frame: 0,
+            refetch_in_flight: false,
+            refetch_chases_selection: false,
         }
     }
 

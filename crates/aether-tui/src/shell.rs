@@ -153,9 +153,13 @@ pub struct Shell {
     /// Like `reveal_after_fetch`, but places the cursor at a fixed fraction down once its
     /// (out-of-window) line lands — for `;` / `Alt-;` when the line was scrolled out of the window.
     place_after_fetch: Option<ViewportPlace>,
-    /// Picker results scroll (first visible item index) — the shell half of picker
-    /// geometry, reset by `Effect::PickerScrollReset`.
-    picker_scroll: usize,
+    /// Picker results scroll continuity — the first-visible *view row* (`top`, an index into
+    /// [`crate::ui::picker_window_rows`]: header / gap / item rows, so grep / keybindings scroll one
+    /// screen row at a time), the selection's on-screen pane row, and the `core.offset` they were
+    /// computed against. Threaded through `crate::ui::picker_scroll_step` each sync so the scroll
+    /// survives a recentering refetch (and its empty-items frames). Reset by
+    /// `Effect::PickerScrollReset`.
+    picker_scroll: crate::ui::PickerScroll,
     /// Monotonic id for the latest `viewport/subscribe`. Stale `Done::Subscribed` responses
     /// (whose epoch != this) are dropped so a superseded subscribe can't reinstate a viewport
     /// the server has already replaced.
@@ -231,7 +235,7 @@ pub async fn run(
         refetch_queued: false,
         reveal_after_fetch: None,
         place_after_fetch: None,
-        picker_scroll: 0,
+        picker_scroll: crate::ui::PickerScroll::default(),
         subscribe_epoch: 0,
         last_click: None,
         click_streak: 0,
@@ -454,7 +458,7 @@ impl Shell {
                     // Selection reveals are handled by the sync (`visible_start` follows
                     // `selected`); a reset just snaps the window to the top.
                     if matches!(effect, Effect::PickerScrollReset) {
-                        self.picker_scroll = 0;
+                        self.picker_scroll = crate::ui::PickerScroll::default();
                     }
                 }
                 Effect::Reconnect { attempt } => self.spawn_reconnect(attempt),
@@ -1680,20 +1684,22 @@ impl Shell {
         p.completion = core.explorer_completion();
         p.explorer_parent = core.directory_parent.clone();
         // Keep the highlight on-screen within the fetched slice (the shell half of
-        // RevealPickerSelection). The grouped kinds spend a row per group header, so the visible
-        // window holds fewer items than `pane_rows` — `picker_scroll_for_selected` walks the
-        // real layout (the server-pushed spans) instead of assuming one row per item.
-        self.picker_scroll = crate::ui::picker_scroll_for_selected(
-            &p.items,
+        // RevealPickerSelection). Scroll is a *view row* over the window's header / gap / item
+        // rows, so grep / keybindings advance one screen row at a time even across a group
+        // boundary — the item-index math jumped a header + gap there. `picker_scroll_step` also
+        // carries the on-screen position across a recentering refetch (and preserves it through
+        // the empty-items frames a fast scroll produces, rather than snapping to the top).
+        let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups);
+        let pin = crate::ui::pins_group_header(core.kind) && !p.groups.is_empty();
+        self.picker_scroll = crate::ui::picker_scroll_step(
+            &rows,
             p.selected,
-            self.picker_scroll,
             p.pane_rows.max(1) as usize,
-            &p.groups,
-            // The over-scroll clamp applies only when the cache reaches the true list end —
-            // mid-cache, rows below just haven't been fetched yet.
-            core.offset as usize + core.items.len() >= core.total_matches as usize,
+            pin,
+            core.offset,
+            self.picker_scroll,
         );
-        p.visible_start = self.picker_scroll;
+        p.visible_start = self.picker_scroll.top;
     }
 
     fn sync_prompts(&mut self) {

@@ -17,10 +17,12 @@ use std::collections::HashMap;
 /// which screen is underneath, so there's no "return mode" bookkeeping to do.
 ///
 /// Cache layout: `items` is over-fetched — we ask the server for several pane-heights' worth so
-/// most scrolls stay client-side. `visible_start` slides through that cache (without RPCs) to
-/// pick the slice the renderer actually draws; `selected` is an index into `items` clamped to
-/// keep the highlight inside the visible slice. We only round-trip when the visible window
-/// approaches the cache edge — see `picker_move_selection` for the refetch trigger.
+/// most scrolls stay client-side. The renderer expands the fetched window into view rows (header /
+/// gap / item — [`crate::ui::picker_window_rows`]); `visible_start` is the first *view row* drawn
+/// and slides through that cache without RPCs, so grouped results scroll one screen row at a time.
+/// `selected` is an index into `items` clamped to keep the highlight on-screen. We only round-trip
+/// when a selection move leaves the cached window — the core's `move_selection` recenters the
+/// fetch, and the shell's `sync_picker` reseeds the scroll so it stays smooth across the shift.
 /// Identity of the client's active entry in a freshly-opened Buffers / Workspaces picker — what
 /// the initial highlight should step over. See `PickerState::default_skip`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +59,11 @@ pub struct PickerState {
     /// first span of a non-empty window always has `start == 0` (a window beginning mid-group
     /// repeats the split group's header).
     pub groups: Vec<GroupSpan>,
-    /// First index in `items` rendered by the picker pane. Slides forward / backward in response
-    /// to selection moves to keep `selected` on-screen, all without an RPC. Refetch happens only
-    /// when this approaches the edge of `items`.
+    /// First *view row* rendered by the picker pane — an index into the window's expanded rows
+    /// ([`crate::ui::picker_window_rows`]: header / gap / item rows), not an item index, so the
+    /// grouped kinds scroll one screen row at a time. Slides forward / backward on selection moves
+    /// to keep `selected` on-screen without an RPC. Refetch happens only when scrolling approaches
+    /// the edge of `items`.
     pub visible_start: usize,
     pub total_matches: u32,
     pub total_candidates: u32,
@@ -96,11 +100,9 @@ pub struct PickerState {
     /// hide/show so reopening a picker can resume both the highlight and the scroll position.
     /// Lives outside `kind`-scoped fields above because it survives reset.
     pub last_selected: HashMap<PickerKind, (PickerItem, usize)>,
-    /// Coalesced refetch target. `picker_move_selection` writes into this when the visible
-    /// window approaches the cache edge; `flush_pending_picker_scroll` (once per draw cycle)
-    /// fires a single `picker/view`. `apply_update` reconciles by accepting either `self.offset`
-    /// or `pending_offset` and shifting `visible_start` / `selected` so the user's spot is
-    /// preserved across the cache swap.
+    /// Reserved view-model slot for a coalesced client-side refetch target — not currently wired
+    /// (the refetch is driven by the core's `move_selection` recenter, with `sync_picker` reseeding
+    /// the scroll). Kept as part of the core-mirroring surface under the struct's `dead_code` allow.
     pub pending_offset: Option<u32>,
     /// Explorer only. The canonical absolute path of the directory the picker is currently
     /// listing. Set by `open_picker(Explorer)` / `picker_navigate_to_dir` from the

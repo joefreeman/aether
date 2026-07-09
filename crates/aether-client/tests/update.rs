@@ -1977,6 +1977,170 @@ fn picker_view_response_renders_items_without_the_push() {
     );
 }
 
+/// How many `picker/view` requests `fx` carries.
+fn count_picker_views(fx: &Effects) -> usize {
+    fx.0
+        .iter()
+        .filter(|e| matches!(e, Effect::Request { method, .. } if *method == "picker/view"))
+        .count()
+}
+
+/// Feed a `picker/view` reply carrying a flat Files window of `n` items starting at `offset`,
+/// out of `total` matches (generation 0, matching a freshly-opened picker).
+fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total: u32) -> Effects {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerUpdateParams, PickerViewResult};
+    let items = (0..n)
+        .map(|i| PickerItem::File {
+            path_index: offset + i,
+            relative_path: format!("f{}.rs", offset + i),
+            match_indices: vec![],
+            git_status: None,
+        })
+        .collect();
+    let update = PickerUpdateParams {
+        kind: PickerKind::Files,
+        generation: 0,
+        offset,
+        items: Some(items),
+        total_matches: total,
+        total_candidates: total,
+        ticking: false,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
+        center_on: None,
+        explorer_peek_missing: false,
+    };
+    let r = PickerViewResult {
+        query: String::new(),
+        generation: 0,
+        total_candidates: total,
+        effective_offset: offset,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: Default::default(),
+        update: Some(update),
+    };
+    s.on_event(Event::PickerViewed {
+        initial,
+        result: Ok(r),
+    })
+}
+
+/// Single-flight: crossing the fetched window fires exactly one refetch and marks it in flight;
+/// further moves while it's pending are coalesced (no new requests) — the selection still advances
+/// locally. This is the fast-scroll pile-up cure.
+#[test]
+fn fast_picker_scroll_coalesces_refetches_into_one_in_flight() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.open_picker(PickerKind::Files, None, None, false);
+    feed_files_window(&mut s, true, 0, 90, 500); // window [0, 90) of 500; FETCH_LIMIT = 90
+
+    // Cross the window edge: one refetch, slot armed.
+    let fx = s.picker_wheel(90); // selected 0 -> 90, leaves [0, 90)
+    assert_eq!(count_picker_views(&fx), 1, "boundary crossing fires one refetch");
+    assert!(s.picker.as_ref().unwrap().refetch_in_flight);
+    let selected = s.picker.as_ref().unwrap().selected;
+
+    // Two more ticks while the fetch is in flight — coalesced, no traffic, selection advances.
+    let fx2 = s.picker_wheel(1);
+    let fx3 = s.picker_wheel(1);
+    assert_eq!(count_picker_views(&fx2), 0, "coalesced — no second refetch");
+    assert_eq!(count_picker_views(&fx3), 0, "coalesced — no third refetch");
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.selected, selected + 2, "selection kept moving locally");
+    assert!(p.refetch_in_flight, "still one fetch in flight");
+}
+
+/// Trailing chase: when the in-flight reply lands and coalesced moves ran the selection past the
+/// window it delivered, exactly one more refetch fires, recomputed from the current selection.
+#[test]
+fn refetch_reply_chases_a_selection_that_raced_past_the_window() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.open_picker(PickerKind::Files, None, None, false);
+    feed_files_window(&mut s, true, 0, 90, 500);
+
+    s.picker_wheel(90); // refetch @ offset 45 fires; selected = 90
+    s.picker_wheel(60); // coalesced; selected races to 150 (no request)
+    assert_eq!(s.picker.as_ref().unwrap().selected, 150);
+
+    // The in-flight reply (window [45, 135)) lands; 150 is past it → one trailing refetch at
+    // 150 - 45 = 105.
+    let fx = feed_files_window(&mut s, false, 45, 90, 500);
+    assert_eq!(count_picker_views(&fx), 1, "trailing chase fires one refetch");
+    assert_eq!(find_request(&fx, "picker/view").unwrap()["offset"], 105);
+    assert!(s.picker.as_ref().unwrap().refetch_in_flight, "chase re-arms the slot");
+}
+
+/// The chase stops as soon as a delivered window contains the selection: no extra refetch, slot
+/// freed.
+#[test]
+fn refetch_reply_stops_when_it_catches_the_selection() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.open_picker(PickerKind::Files, None, None, false);
+    feed_files_window(&mut s, true, 0, 90, 500);
+
+    s.picker_wheel(90); // refetch @ 45; selected = 90
+    let fx = feed_files_window(&mut s, false, 45, 90, 500); // window [45, 135) contains 90
+    assert_eq!(count_picker_views(&fx), 0, "caught up — no trailing refetch");
+    let p = s.picker.as_ref().unwrap();
+    assert!(!p.refetch_in_flight, "slot freed");
+    assert_eq!(p.items.len(), 90);
+}
+
+/// A query change abandons the window cycle, so it must free the single-flight slot — otherwise a
+/// late reply from the old cycle would wedge it and coalesce every later move forever.
+#[test]
+fn query_change_frees_the_refetch_slot() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.open_picker(PickerKind::Files, None, None, false);
+    feed_files_window(&mut s, true, 0, 90, 500);
+
+    s.picker_wheel(90); // refetch in flight
+    assert!(s.picker.as_ref().unwrap().refetch_in_flight);
+    s.picker_set_query("abc".into());
+    assert!(
+        !s.picker.as_ref().unwrap().refetch_in_flight,
+        "query change frees the slot"
+    );
+}
+
+/// Free pixel scroll (iced / web scrollbar) refetches at the *scroll position* without moving the
+/// selection. Its reply must NOT chase the selection back into view — that would yank the window
+/// off the scroll position and, repeated against the scroll handler, oscillate the scrollbar and
+/// blank the list (the native-client regression). The selection-driven chase only applies to
+/// keyboard nav.
+#[test]
+fn free_scroll_refetch_does_not_chase_the_selection() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.open_picker(PickerKind::Files, None, None, false);
+    feed_files_window(&mut s, true, 0, 90, 500); // window [0, 90), selection at 0
+
+    // The scrollbar drags the view far from the selection: a free-scroll refetch (chase = false).
+    let fx = s.picker_refetch(200, false);
+    assert_eq!(count_picker_views(&fx), 1, "the scroll refetch itself");
+    assert_eq!(s.picker.as_ref().unwrap().selected, 0, "free scroll leaves the selection put");
+
+    // Window [200, 290) lands; the selection (0) is outside it — but this was free scroll, so it
+    // must stay where it was scrolled, not chase back to the selection.
+    let fx2 = feed_files_window(&mut s, false, 200, 90, 500);
+    assert_eq!(
+        count_picker_views(&fx2),
+        0,
+        "free scroll must not chase the selection back (no oscillation)"
+    );
+    let p = s.picker.as_ref().unwrap();
+    assert!(!p.refetch_in_flight, "slot freed");
+    assert_eq!(p.offset, 200, "window stayed where it was scrolled");
+}
+
 #[test]
 fn grep_open_does_not_reset_scroll_but_fresh_pickers_do() {
     // A fresh picker (Files) resets the list to the top on open. Grep preserves state and resumes

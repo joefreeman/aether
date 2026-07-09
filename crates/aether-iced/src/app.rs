@@ -1360,7 +1360,9 @@ impl App {
                 self.picker_scroll_y = y;
                 match p.scrolled_refetch(crate::picker::first_visible_row(y)) {
                     Some(offset) => {
-                        let fx = self.session.picker_refetch(offset);
+                        // Free pixel scroll — the view moved, not the selection — so the reply must
+                        // not chase the highlight back (`chase_selection = false`).
+                        let fx = self.session.picker_refetch(offset, false);
                         self.run_core(fx)
                     }
                     None => Task::none(),

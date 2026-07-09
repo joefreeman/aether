@@ -641,7 +641,10 @@ impl Session {
 
             Event::PickerViewed { initial, result } => match result {
                 Ok(r) => {
-                    if let Some(p) = &mut self.picker {
+                    let chase_offset = if let Some(p) = &mut self.picker {
+                        // The single in-flight refetch slot is free again (Rule 2 below may re-arm
+                        // it). Harmless for an initial open, which never set it.
+                        p.refetch_in_flight = false;
                         p.offset = r.effective_offset;
                         if let Some(center) = r.effective_center_on {
                             p.pending_center = Some(center);
@@ -676,6 +679,7 @@ impl Session {
                         // wipe them (the bug: results blank until you edit the query). Only fold the
                         // window in when it actually carries rows, or we have none yet (resume /
                         // non-streaming kinds, where it's the sole source).
+                        let mut reveal = None;
                         if let Some(update) = r.update {
                             let window_has_rows =
                                 update.items.as_ref().is_none_or(|it| !it.is_empty());
@@ -683,13 +687,36 @@ impl Session {
                                 && p.apply_update(update)
                                 && p.pending_center.is_none()
                             {
-                                if let Some(reveal) = p.reveal_on_update.take() {
-                                    return Effects::one(Effect::RevealPickerSelection(reveal));
-                                }
+                                reveal = p.reveal_on_update.take();
                             }
                         }
-                    }
-                    Effects::none()
+                        // Rule 2 (trailing chase): while this window was in flight, coalesced moves
+                        // (single-flight) may have run the highlight past it. If it landed outside
+                        // the window we just loaded, fire ONE more refetch recomputed from the
+                        // *current* selection — the window "chases" the highlight one hop per
+                        // round-trip until it catches up. Only for selection-driven refetches: a
+                        // free pixel scroll (`refetch_chases_selection == false`) deliberately moved
+                        // the view away from the selection, so chasing it would fight the scroll
+                        // (blank, oscillating scrollbar). Skip while a center is pending (that
+                        // repositions the highlight itself) and when the window is empty. Recorded
+                        // here and acted on below, once `p`'s borrow has ended.
+                        let chase = p.refetch_chases_selection
+                            && p.pending_center.is_none()
+                            && !p.items.is_empty()
+                            && (p.selected < p.offset
+                                || p.selected >= p.offset + p.items.len() as u32);
+                        if chase {
+                            p.selected.saturating_sub(FETCH_LIMIT / 2)
+                        } else {
+                            return match reveal {
+                                Some(reveal) => Effects::one(Effect::RevealPickerSelection(reveal)),
+                                None => Effects::none(),
+                            };
+                        }
+                    } else {
+                        return Effects::none();
+                    };
+                    self.picker_refetch(chase_offset, true)
                 }
                 Err(e) => {
                     self.picker = None;
@@ -2007,6 +2034,7 @@ impl Session {
         p.selected = 0;
         p.offset = 0;
         p.items.clear();
+        p.refetch_in_flight = false; // fresh listing supersedes any in-flight scroll refetch
         let generation = p.generation;
         let filters = p.wire_filters();
         let center_on = pre_select.map(|name| PickerItem::DirEntry {
@@ -2083,17 +2111,31 @@ impl Session {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
-        match p.move_selection(delta) {
-            Some(offset) => self.picker_refetch(offset),
-            None => Effects::one(Effect::RevealPickerSelection(Reveal::Minimal)),
+        let Some(offset) = p.move_selection(delta) else {
+            return Effects::one(Effect::RevealPickerSelection(Reveal::Minimal));
+        };
+        // Single-flight: only one window refetch is allowed in flight at a time. If one is already
+        // running, coalesce this move — `selected` has already advanced locally, and the trailing
+        // check when the reply lands (see `PickerViewed`) chases it with one fetch. This turns a
+        // fast scroll from one request per move into ~one per round-trip (no pile-up, no
+        // out-of-order replies). This move follows the selection, so the reply should chase it.
+        if p.refetch_in_flight {
+            return Effects::none();
         }
+        self.picker_refetch(offset, true)
     }
 
-    /// Re-subscribe the picker's window at a new offset (the highlight moved past it).
-    pub fn picker_refetch(&mut self, offset: u32) -> Effects {
+    /// Re-subscribe the picker's window at a new offset. Marks the single in-flight refetch slot
+    /// busy; the matching `PickerViewed` frees it. `chase_selection` records intent: keyboard nav
+    /// passes `true` so the reply chases the highlight if coalesced moves ran it past the window;
+    /// free pixel scroll (iced / web) passes `false` — the view moved, not the selection, so the
+    /// window must stay where it was scrolled, not snap back.
+    pub fn picker_refetch(&mut self, offset: u32, chase_selection: bool) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
+        p.refetch_in_flight = true;
+        p.refetch_chases_selection = chase_selection;
         p.offset = offset;
         p.items.clear();
         let kind = p.kind;
@@ -2130,6 +2172,9 @@ impl Session {
         p.generation += 1;
         p.selected = 0;
         p.offset = 0;
+        // A new query starts a fresh window cycle — abandon any in-flight scroll refetch so its
+        // late reply can't wedge the single-flight slot.
+        p.refetch_in_flight = false;
         // We deliberately keep the *previous* query's window on screen until the fresh one arrives,
         // rather than clearing it now — clearing flashes an empty list on every keystroke (the new
         // window rides `picker/query`'s own `picker/update` push, a round-trip away). For the
@@ -2416,6 +2461,7 @@ impl Session {
                     p.selected = 0;
                     p.offset = 0;
                     p.items.clear();
+                    p.refetch_in_flight = false; // fresh listing supersedes any in-flight refetch
                     let f = p.wire_filters();
                     p.sent_filters = f.clone();
                     f
