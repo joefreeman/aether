@@ -1,4 +1,4 @@
-<img src="logo.svg" alt="Aether" width="100" />
+<img src="packaging/uk.joef.Aether.svg" alt="Aether" width="100" />
 <br />
 
 # Aether
