@@ -10,7 +10,9 @@
 mod view;
 
 use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
-use aether_client::keymap::{hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit};
+use aether_client::keymap::{
+    hover_action, keycode_for_binding, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
+};
 use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
@@ -40,17 +42,20 @@ impl WasmSession {
         }
     }
 
-    /// Feed a key. `key` is the browser `KeyboardEvent.key`; it's normalised to the core's
-    /// [`KeyCode`] exactly as `aether-iced/src/input.rs` normalises iced keys. Returns `Effect[]`.
+    /// Feed a key. `key` is the browser `KeyboardEvent.key` (the layout/Option-composed key) and
+    /// `code` is `KeyboardEvent.code` (the physical, unmodified key); binding resolution picks
+    /// between them exactly as `aether-iced/src/input.rs` does — see [`keycode_for_binding`].
+    /// Returns `Effect[]`.
     pub fn on_key(
         &mut self,
         key: &str,
+        code: &str,
         ctrl: bool,
         alt: bool,
         shift: bool,
         visible_rows: u32,
     ) -> Result<JsValue, JsValue> {
-        let effects = self.dispatch_key(key, ctrl, alt, shift, visible_rows);
+        let effects = self.dispatch_key(key, code, ctrl, alt, shift, visible_rows);
         to_js(&effects)
     }
 
@@ -389,17 +394,21 @@ impl WasmSession {
     fn dispatch_key(
         &mut self,
         key: &str,
+        code: &str,
         ctrl: bool,
         alt: bool,
         shift: bool,
         visible_rows: u32,
     ) -> Vec<Value> {
-        let Some(code) = parse_keycode(key) else {
+        // Resolve the binding against the physical key (`code`) when Alt is held and the modified
+        // key (`key`) otherwise: on macOS `key` is Option-composed (Option-`l` → `¬`) and would
+        // never match an Alt-chord, while `code` stays `KeyL`. Text insertion still uses `key`.
+        let Some(keycode) = keycode_for_binding(parse_code(code), parse_keycode(key), alt) else {
             return Vec::new();
         };
         let mods = Mods { ctrl, alt, shift };
         let text = key_text(key, &mods);
-        let fx = self.inner.on_key(code, mods, text, visible_rows);
+        let fx = self.inner.on_key(keycode, mods, text, visible_rows);
         effects_to_json(fx)
     }
 
@@ -489,6 +498,60 @@ fn parse_keycode(key: &str) -> Option<KeyCode> {
             KeyCode::Char(c.to_ascii_lowercase())
         }
     })
+}
+
+/// Browser `KeyboardEvent.code` → the core's [`KeyCode`]. This is the web's *base* (unmodified)
+/// key: on macOS `KeyboardEvent.key` is Option-composed (Option-`l` → `¬`) while `code` stays
+/// `KeyL`, so Alt-chords resolve against `code` (see [`keycode_for_binding`]). `code` is the
+/// physical QWERTY position — right for the common layouts; an exotic non-QWERTY layout would
+/// resolve a different base letter than winit's layout-aware key would on the native shells.
+/// `None` for keys we don't bind.
+fn parse_code(code: &str) -> Option<KeyCode> {
+    Some(match code {
+        "Escape" => KeyCode::Esc,
+        "Enter" | "NumpadEnter" => KeyCode::Enter,
+        "Tab" => KeyCode::Tab,
+        "Backspace" => KeyCode::Backspace,
+        "Delete" => KeyCode::Delete,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "ArrowLeft" => KeyCode::Left,
+        "ArrowRight" => KeyCode::Right,
+        "ArrowUp" => KeyCode::Up,
+        "ArrowDown" => KeyCode::Down,
+        "Space" => KeyCode::Char(' '),
+        "Semicolon" => KeyCode::Char(';'),
+        "Comma" => KeyCode::Char(','),
+        "Period" => KeyCode::Char('.'),
+        "Slash" => KeyCode::Char('/'),
+        "Backslash" => KeyCode::Char('\\'),
+        "Minus" => KeyCode::Char('-'),
+        "Equal" => KeyCode::Char('='),
+        "Quote" => KeyCode::Char('\''),
+        "Backquote" => KeyCode::Char('`'),
+        "BracketLeft" => KeyCode::Char('['),
+        "BracketRight" => KeyCode::Char(']'),
+        s => {
+            // Physical letter / digit: "KeyA".."KeyZ" → 'a'..'z', "Digit0".."Digit9" → '0'..'9'.
+            if let Some(letter) = s.strip_prefix("Key") {
+                let c = single_char(letter).filter(char::is_ascii_alphabetic)?;
+                KeyCode::Char(c.to_ascii_lowercase())
+            } else if let Some(digit) = s.strip_prefix("Digit") {
+                KeyCode::Char(single_char(digit).filter(char::is_ascii_digit)?)
+            } else {
+                return None;
+            }
+        }
+    })
+}
+
+/// The sole `char` of `s`, or `None` if `s` is empty or longer than one char.
+fn single_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
 }
 
 /// The text a key types, if any: a single printable char with neither Ctrl nor Alt held. Named
@@ -690,12 +753,39 @@ mod tests {
     }
 
     #[test]
+    fn code_parses_physical_letters_named_and_punctuation() {
+        assert_eq!(parse_code("KeyL"), Some(KeyCode::Char('l')));
+        assert_eq!(parse_code("Digit3"), Some(KeyCode::Char('3')));
+        assert_eq!(parse_code("Semicolon"), Some(KeyCode::Char(';')));
+        assert_eq!(parse_code("Space"), Some(KeyCode::Char(' ')));
+        assert_eq!(parse_code("ArrowLeft"), Some(KeyCode::Left));
+        assert_eq!(parse_code("Backspace"), Some(KeyCode::Backspace));
+        assert_eq!(parse_code("F1"), None);
+        assert_eq!(parse_code("MetaLeft"), None);
+    }
+
+    #[test]
     fn entering_insert_mode_dispatches_through_the_core() {
         // `i` enters Insert mode — proves a key crosses into the core and produces a real effect
         // list (the whole point of Phase 1's boundary), without needing a live server.
         let mut s = WasmSession::new();
-        let _effects = s.dispatch_key("i", false, false, false, 40);
+        let _effects = s.dispatch_key("i", "KeyI", false, false, false, 40);
         assert_eq!(s.inner.mode, aether_client::session::Mode::Insert);
+    }
+
+    #[test]
+    fn alt_chord_resolves_on_physical_code_not_macos_composed_key() {
+        // macOS delivers Option-w as key `∑` + code `KeyW`. With Alt held, resolution must pick the
+        // physical `code` — binding on the composed `∑` would match no Alt-chord. Without Alt it
+        // uses the modified key so shifted symbols (Shift-/ → `?`) still compose.
+        assert_eq!(
+            keycode_for_binding(parse_code("KeyW"), parse_keycode("∑"), true),
+            Some(KeyCode::Char('w'))
+        );
+        assert_eq!(
+            keycode_for_binding(parse_code("Slash"), parse_keycode("?"), false),
+            Some(KeyCode::Char('?'))
+        );
     }
 
     #[test]

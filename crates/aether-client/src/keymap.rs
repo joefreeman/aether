@@ -35,6 +35,31 @@ pub enum KeyCode {
     Down,
 }
 
+/// Pick which normalised key a binding lookup should resolve against.
+///
+/// Normally we use the *modified* key, so layout/Shift composition is honoured (Shift-`/` → `?`,
+/// etc.). But macOS applies Option(Alt)-composition to the modified key — Option-`f` arrives as
+/// `ƒ`, Option-`j` as `∆` — which would never match an `Alt-f` binding. When Alt is held, fall back
+/// to the *base* (unmodified) key, which is the raw `f` on every platform. On Linux/Windows the two
+/// keys are equal under Alt, so this is a no-op there and a fix on macOS.
+///
+/// Shells own producing the two `KeyCode`s from their native key events (iced's `key` /
+/// `modified_key`; the web's `e.code` / `e.key`) and pass them here — the rule itself lives in the
+/// core so every shell resolves Alt-chords identically. The "base" key each shell can produce
+/// differs slightly (winit's layout-aware `key_without_modifiers` vs the browser's physical
+/// `e.code`), but that only matters for exotic non-QWERTY layouts.
+pub fn keycode_for_binding(
+    base: Option<KeyCode>,
+    modified: Option<KeyCode>,
+    alt: bool,
+) -> Option<KeyCode> {
+    if alt {
+        base
+    } else {
+        modified
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Mods {
     pub ctrl: bool,
@@ -832,6 +857,21 @@ static LEADER: &[Binding] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keycode_for_binding_prefers_base_under_alt_and_modified_otherwise() {
+        // macOS delivers Option-f as base `f` + modified `ƒ`. With Alt held we must resolve on the
+        // base key, or the Alt-chord never matches.
+        assert_eq!(
+            keycode_for_binding(Some(KeyCode::Char('f')), Some(KeyCode::Char('ƒ')), true),
+            Some(KeyCode::Char('f'))
+        );
+        // No Alt: honour composition so Shift-/ resolves to `?`, not the base `/`.
+        assert_eq!(
+            keycode_for_binding(Some(KeyCode::Char('/')), Some(KeyCode::Char('?')), false),
+            Some(KeyCode::Char('?'))
+        );
+    }
 
     #[test]
     fn keybinding_entries_cover_the_five_modes_once_each() {

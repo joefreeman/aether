@@ -1,7 +1,7 @@
 //! The iced shell's input edge: mapping `iced::keyboard` events onto the core's key types.
 //! This is the only place iced key types and the core keymap meet.
 
-use crate::keymap::{KeyCode, Mods};
+use crate::keymap::{self, KeyCode, Mods};
 
 /// Map iced modifiers onto the core's [`Mods`]. A free function, not `From` — both types
 /// are foreign here now that the keymap lives in `aether-client` (orphan rule).
@@ -15,18 +15,16 @@ pub fn mods(m: iced::keyboard::Modifiers) -> Mods {
 
 /// Pick which logical key to resolve a binding against, then normalise it.
 ///
-/// Normally we use the *modified* key, so layout/Shift composition is honoured (Shift-`/` →
-/// `?`, etc.). But macOS applies Option(Alt)-composition to the modified key — Option-`f` arrives
-/// as `ƒ`, Option-`j` as `∆` — which would never match an `Alt-f` binding. When Alt is held, fall
-/// back to the *unmodified* base key (iced's `key`, sourced from winit's `key_without_modifiers()`),
-/// which is the raw `f` on every platform. On Linux/Windows the two keys are equal under Alt, so
-/// this is a no-op there and a fix on macOS.
+/// The base/modified selection rule (and its macOS Option-composition rationale) lives in the core
+/// so every shell resolves Alt-chords identically — see [`keymap::keycode_for_binding`]. Here we
+/// just normalise iced's base key (`key`, sourced from winit's `key_without_modifiers()`) and its
+/// modified key, then hand both to the shared rule.
 pub fn keycode_for_binding(
     key: &iced::keyboard::Key,
     modified_key: &iced::keyboard::Key,
     alt: bool,
 ) -> Option<KeyCode> {
-    keycode(if alt { key } else { modified_key })
+    keymap::keycode_for_binding(keycode(key), keycode(modified_key), alt)
 }
 
 /// Normalise an iced key to the core's [`KeyCode`]. `None` for keys we don't bind

@@ -1570,7 +1570,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
         );
       }
       return;
@@ -1583,7 +1583,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
         );
       }
       return;
@@ -1595,7 +1595,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
         );
       }
       return;
@@ -1619,8 +1619,11 @@ export class Shell {
     // A lone modifier keydown isn't fed to the core (it would disturb pending captures).
     if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") return;
     if (!this.session) return;
+    // Pass both the composed key (`e.key`) and the physical key (`e.code`): the core resolves
+    // Alt-chords against `code` so macOS Option-composition (Option-l → `¬`) can't hide them.
     const effects = this.session.on_key(
       e.key,
+      e.code,
       e.ctrlKey,
       e.altKey,
       e.shiftKey,
@@ -2375,7 +2378,7 @@ export class Shell {
     e.preventDefault();
     if (this.session) {
       this.runEffects(
-        this.session.on_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+        this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
       );
     }
   }
@@ -2405,7 +2408,8 @@ export class Shell {
    *  logic stays single-sourced (matches the confirm modal's click→synthetic-key handling). */
   private saveAsCommand(key: string): void {
     if (!this.session) return;
-    this.runEffects(this.session.on_key(key, false, false, false, this.visibleRows()) as CoreEffect[]);
+    // Synthetic key from a button click: no Alt, so the physical-code arg is unused — pass `key`.
+    this.runEffects(this.session.on_key(key, key, false, false, false, this.visibleRows()) as CoreEffect[]);
   }
 
   private onSaveAsInputKey(e: KeyboardEvent): void {
@@ -2418,17 +2422,25 @@ export class Shell {
     }
     const inRoot = p.multi_root && p.field === "root";
     const emptyPath = p.multi_root && p.field === "path" && p.input.length === 0;
+    // Gate the Alt-chords on the physical `code` (KeyL/H/J/K), not `k`: on macOS Alt composes `k`
+    // into a glyph (Option-l → `¬`), and the core resolves the chord off `code` too — keep them in
+    // lockstep so the gate and the core agree on what an Alt-chord is.
     const coreKey =
       k === "Enter" ||
       k === "Escape" ||
       k === "Tab" ||
-      (e.altKey && (k === "l" || k === "h" || k === "j" || k === "k" || k === "Backspace")) ||
+      (e.altKey &&
+        (e.code === "KeyL" ||
+          e.code === "KeyH" ||
+          e.code === "KeyJ" ||
+          e.code === "KeyK" ||
+          k === "Backspace")) ||
       (k === ":" && inRoot && !e.altKey && !e.ctrlKey) ||
       (k === "Backspace" && !e.altKey && !e.ctrlKey && emptyPath);
     if (!coreKey) return; // native editing; the `input` event syncs the new text to the core
     e.preventDefault();
     this.runEffects(
-      this.session.on_key(k, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+      this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
     );
   }
 
@@ -2532,8 +2544,9 @@ export class Shell {
       // `y` confirms) — focus stays on the capture field, so no extra routing is needed.
       const sendKey = (key: string) => {
         if (!this.session) return;
+        // Synthetic key from a button click: no Alt, so the physical-code arg is unused — pass `key`.
         this.runEffects(
-          this.session.on_key(key, false, false, false, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(key, key, false, false, false, this.visibleRows()) as CoreEffect[],
         );
       };
       // Each button carries a dim `modal-key` hint advertising its keyboard shortcut (`y`/`n` —
@@ -3161,16 +3174,24 @@ export class Shell {
     }
     const inRoot = ce.is_dir && ce.multi_root && ce.field === "root";
     const emptyPath = ce.is_dir && ce.multi_root && ce.field === "path" && ce.input.text.length === 0;
+    // Gate the Alt-chords on the physical `code` (KeyL/H/J/K), not `k`: on macOS Alt composes `k`
+    // into a glyph (Option-l → `¬`), and the core resolves the chord off `code` too — keep them in
+    // lockstep so the gate and the core agree on what an Alt-chord is.
     const coreKey =
       k === "Enter" ||
       k === "Escape" ||
       k === "Tab" ||
-      (e.altKey && (k === "l" || k === "h" || k === "j" || k === "k" || k === "Backspace")) ||
+      (e.altKey &&
+        (e.code === "KeyL" ||
+          e.code === "KeyH" ||
+          e.code === "KeyJ" ||
+          e.code === "KeyK" ||
+          k === "Backspace")) ||
       (k === ":" && inRoot && !e.altKey && !e.ctrlKey) ||
       (k === "Backspace" && !e.altKey && !e.ctrlKey && emptyPath);
     if (!coreKey) return; // native editing; the `input` event syncs the new text to the core
     e.preventDefault();
-    this.runEffects(this.session.on_key(k, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[]);
+    this.runEffects(this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[]);
   }
 
   /** Rebuild just the results list (the persistent input/panel stay, keeping focus + caret). */
