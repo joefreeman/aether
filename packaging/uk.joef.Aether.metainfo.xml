@@ -10,7 +10,7 @@
   <name>Aether</name>
   <summary>Modal text editor</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT OR Apache-2.0</project_license>
+  <project_license>MIT</project_license>
   <description>
     <p>
       Aether is an experimental modal text editor with a client–server architecture and

@@ -1,26 +1,22 @@
 <img src="packaging/uk.joef.Aether.svg" alt="Aether" width="100" />
-<br />
 
 # Aether
 
-An experimental modal text editor with a client–server architecture and tree-sitter integration.
-
-Aether splits editing across two processes: a long-lived server, running locally, holds all
-text state — buffer contents, cursors, selections, the undo stack, per-viewport soft wrap — while
-thin clients render what the server sends and forward keystrokes. Multiple clients can share a
-buffer, see each other's cursors, and share a single undo stack.
+A modal text editor with a client–server architecture for Linux and maxOS. Native, terminal and
+web clients connect to a shared server process.
 
 ## Features
 
 - Modal editing (normal/insert mode)
 - Tree-sitter integration (highlighting, indentation, navigation)
-- Surround/unsurround, toggle-comment, join and move lines
+- LSP support (diagnostics, hover, go-to-definition, format)
+- Surround/unsurround, toggle-comment, join and move lines, transforms, sneak.
 - Undo and redo stacks for edits and cursor/selection motions
-- Fuzzy pickers for files/buffers/workspaces, file explorer, workspace-wide grep
+- Fuzzy pickers for files/buffers/workspaces
+- File explorer, workspace-wide grep, diagnostics, outline
 - Mouse support, soft wrap, system-clipboard integration
 - Git integration (gutter, inline diff, blame, hunk staging)
-- LSP (diagnostics, hover, go-to-definition, format)
-- Terminal and web clients
+- Native, terminal and web clients
 
 ## Install
 
