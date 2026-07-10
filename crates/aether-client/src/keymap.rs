@@ -330,6 +330,10 @@ pub enum Action {
     Quit,
     Save,
     SaveAs,
+    /// `Space Alt-q` — save the current buffer, then quit if the save succeeds. An overwrite /
+    /// external-change confirm defers the quit until the retry lands; a failed or cancelled save
+    /// doesn't quit. Sequences `Save` then `Quit`.
+    SaveAndQuit,
     /// `Space Alt-w` — open a file by typing its absolute path (a leading `~/` is fine),
     /// regardless of the active workspace. Outside any workspace root the file opens as an external
     /// buffer; with no workspace active it lands in a fresh ephemeral context. Pairs with `Space w`
@@ -837,6 +841,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
+    bind!(L, ch('q'), Exact(Mods::ALT), A::SaveAndQuit, "App", "Save and quit"),
     bind!(L, ch('/'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),

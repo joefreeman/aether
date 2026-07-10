@@ -1183,7 +1183,11 @@ impl Session {
             }
 
             Event::Noop => Effects::none(),
-            Event::SaveTried(Ok(SaveTry::Saved { result, target })) => {
+            Event::SaveTried(Ok(SaveTry::Saved {
+                result,
+                target,
+                quit_after,
+            })) => {
                 self.buffer.revision = result.revision;
                 self.buffer.saved_revision = result.revision;
                 self.buffer.transient = false; // saving promotes a transient buffer
@@ -1206,7 +1210,13 @@ impl Session {
                     }
                     None => format!("Saved (rev {})", result.revision),
                 };
-                Effects::toast(note, ToastKind::Success)
+                let mut fx = Effects::toast(note, ToastKind::Success);
+                if quit_after {
+                    // Save-and-quit (`Space Alt-q`): the save landed, so close the window — the
+                    // server drops per-client state on disconnect, so this is exactly `Space q`.
+                    fx.push(Effect::Exit);
+                }
+                fx
             }
             Event::SaveTried(Ok(SaveTry::NeedsConfirm { kind, action })) => {
                 self.prompt = Some(Prompt::Confirm { kind, action });
@@ -1235,7 +1245,12 @@ impl Session {
 
     /// `buffer/save`, mapping the server's refusal codes to a `[y/N]` confirmation that
     /// retries with `overwrite: true`. `target` is the save-as `(path_index, relative_path)`.
-    pub fn save(&mut self, target: Option<(u32, String)>, overwrite: bool) -> Effects {
+    pub fn save(
+        &mut self,
+        target: Option<(u32, String)>,
+        overwrite: bool,
+        quit_after: bool,
+    ) -> Effects {
         let buffer_id = self.buffer.buffer_id;
         let (path_index, relative_path) = match &target {
             Some((i, p)) => (Some(*i), Some(p.clone())),
@@ -1251,25 +1266,29 @@ impl Session {
             },
             move |__r| {
                 Event::SaveTried(match __r {
-                    Ok(result) => Ok(SaveTry::Saved { result, target }),
+                    Ok(result) => Ok(SaveTry::Saved {
+                        result,
+                        target,
+                        quit_after,
+                    }),
                     Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::Overwrite {
                                 path: target.as_ref().map(|(_, p)| p.clone()),
                             },
-                            action: ConfirmAction::Save { target },
+                            action: ConfirmAction::Save { target, quit_after },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::OverwriteModified,
-                            action: ConfirmAction::Save { target },
+                            action: ConfirmAction::Save { target, quit_after },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::RecreateDeleted,
-                            action: ConfirmAction::Save { target },
+                            action: ConfirmAction::Save { target, quit_after },
                         })
                     }
                     Err(e) => Err(e.to_string()),
@@ -3481,7 +3500,7 @@ impl Session {
             }
         };
         self.prompt = None;
-        self.save(Some(target), false)
+        self.save(Some(target), false, false)
     }
 
     /// Sync the open-from-path field's value from the shell's input (the shell owns text entry).
@@ -4851,7 +4870,7 @@ impl Session {
 
     fn run_confirm(&mut self, action: ConfirmAction) -> Effects {
         match action {
-            ConfirmAction::Save { target } => self.save(target, true),
+            ConfirmAction::Save { target, quit_after } => self.save(target, true, quit_after),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
             ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
@@ -4907,6 +4926,8 @@ impl Session {
     fn decline_confirm(&mut self, action: ConfirmAction) -> Effects {
         if let ConfirmAction::Save {
             target: Some((path_index, input)),
+            // Declining discards any save-and-quit intent — a cancelled save must not quit.
+            quit_after: _,
         } = action
         {
             return self.open_save_as(path_index, input);
@@ -5535,7 +5556,8 @@ impl Session {
             // The server tears down all per-client state on disconnect, so quitting is just
             // closing the window.
             A::Quit => Effects::one(Effect::Exit),
-            A::Save => self.save(None, false),
+            A::Save => self.save(None, false, false),
+            A::SaveAndQuit => self.save(None, false, true),
             A::SaveAs => {
                 // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self

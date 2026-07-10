@@ -37,6 +37,21 @@ fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     req
 }
 
+/// The token of the (single) `buffer/save` request in `fx`.
+fn save_token(fx: &Effects) -> u64 {
+    fx.0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
+            _ => None,
+        })
+        .expect("a buffer/save request was emitted")
+}
+
+fn quits(fx: &Effects) -> bool {
+    fx.0.iter().any(|e| matches!(e, Effect::Exit))
+}
+
 fn has_error_toast(fx: &Effects) -> bool {
     fx.0.iter().any(|e| {
         matches!(
@@ -570,6 +585,92 @@ fn save_as_overwrite_confirms_then_retries_with_the_flag_set() {
     assert_eq!(params["relative_path"], json!("existing.md"));
 }
 
+/// `Space Alt-q` saves the current buffer in place, then quits — but only after the save result
+/// lands successfully. The quit is deferred, not fired alongside the save request.
+#[test]
+fn space_alt_q_saves_then_quits_on_success() {
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    // Saves in place (overwrite:false), and does NOT quit yet.
+    let params = find_request(&fx, "buffer/save").expect("Space Alt-q saves first");
+    assert_eq!(params["overwrite"], json!(false));
+    assert!(!quits(&fx), "quit is deferred until the save succeeds");
+    let token = save_token(&fx);
+
+    // Save lands → now it quits.
+    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 3 })));
+    assert!(quits(&fx), "a successful save quits");
+}
+
+/// A failed save must not quit — `Space Alt-q` is save-*and*-quit, not quit-regardless.
+#[test]
+fn space_alt_q_does_not_quit_when_the_save_fails() {
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    let token = save_token(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "buffer/save",
+            code: 0,
+            message: "disk full".into(),
+        }),
+    );
+    assert!(!quits(&fx), "a failed save must not quit");
+    assert!(has_error_toast(&fx), "the failure is surfaced");
+}
+
+/// The quit intent survives the overwrite/external-change confirm detour: if the save is refused
+/// pending confirmation, accepting retries and — on success — still quits.
+#[test]
+fn space_alt_q_survives_the_external_modify_confirm() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    use aether_protocol::error::ErrorCode;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    let token = save_token(&fx);
+
+    // The file changed on disk → the server refuses; a confirm is raised, still no quit.
+    let _ = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "buffer/save",
+            code: ErrorCode::EXTERNALLY_MODIFIED.code(),
+            message: "changed".into(),
+        }),
+    );
+    assert!(
+        matches!(
+            &s.prompt,
+            Some(Prompt::Confirm {
+                kind: ConfirmKind::OverwriteModified,
+                ..
+            })
+        ),
+        "external-modify confirm, got {:?}",
+        s.prompt
+    );
+
+    // Accept → retry carries overwrite:true; the quit intent is threaded through, so still no
+    // quit until the retry lands.
+    let fx = s.on_event(Event::PromptAccept);
+    let params = find_request(&fx, "buffer/save").expect("the confirmed save retries");
+    assert_eq!(params["overwrite"], json!(true));
+    assert!(!quits(&fx), "no quit until the retry succeeds");
+    let token = save_token(&fx);
+
+    // Retry succeeds → now it quits.
+    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    assert!(quits(&fx), "save-and-quit survives the confirm detour");
+}
+
 /// Declining the overwrite confirm re-opens the save-as prompt pre-filled, so a tweak and re-save
 /// is one gesture (and re-fetches the directory listing for the ghost).
 #[test]
@@ -1090,6 +1191,12 @@ fn space_slash_opens_the_keybindings_picker_with_its_rows() {
     assert!(rows.iter().any(|r| r["keys"] == "Space /"
         && r["desc"] == "Show keyboard shortcuts"
         && r["mode"] == "Application"));
+    assert!(
+        rows.iter().any(|r| r["keys"] == "Space Alt-q"
+            && r["desc"] == "Save and quit"
+            && r["mode"] == "Application"),
+        "the new save-and-quit binding shows in help"
+    );
     assert_eq!(
         s.picker.as_ref().map(|p| p.kind),
         Some(PickerKind::Keybindings)

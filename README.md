@@ -152,7 +152,7 @@ identical in both.
 | `Space x`/`Space Alt-x` | Close buffer / open another window |
 | `Space ,` | Workspace settings |
 | `Space .` | Application settings (soft wrap, …) |
-| `Space q` | Quit |
+| `Space q`/`Space Alt-q` | Quit / save current buffer and quit |
 | `Space /` | Show keyboard shortcuts |
 
 ### Git

@@ -386,8 +386,12 @@ pub enum ConfirmKind {
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     /// Retry `buffer/save` with `overwrite: true`; `target` carries the save-as path (None for
-    /// the in-place save).
-    Save { target: Option<(u32, String)> },
+    /// the in-place save). `quit_after` threads a pending save-and-quit (`Space Alt-q`) through the
+    /// confirm, so the retry still quits on success.
+    Save {
+        target: Option<(u32, String)>,
+        quit_after: bool,
+    },
     /// Retry `buffer/reload` with `force: true`.
     ReloadDiscard,
     /// Close the buffer despite unsaved changes.
@@ -415,6 +419,8 @@ pub enum SaveTry {
     Saved {
         result: BufferSaveResult,
         target: Option<(u32, String)>,
+        /// Quit once the save lands (`Space Alt-q`); threaded through any overwrite confirm.
+        quit_after: bool,
     },
     NeedsConfirm {
         kind: ConfirmKind,
