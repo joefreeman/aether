@@ -24,7 +24,6 @@ use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::Granularity;
-use aether_protocol::{BufferId, LogicalPosition};
 use aether_protocol::envelope::{NotificationMethod, RpcMethod};
 use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::lsp::LspStatus;
@@ -43,6 +42,7 @@ use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceCreate, WorkspaceCreateParams,
     WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
+use aether_protocol::{BufferId, LogicalPosition};
 use iced::widget::{column, container, row, text};
 use iced::{keyboard, Element, Event, Length, Size, Subscription, Task};
 
@@ -604,7 +604,9 @@ impl App {
             }
             // Track modifier state for click-time reads (Ctrl-click on picker rows). `ModifiersChanged`
             // self-heals on focus loss, so the state can't get stuck held.
-            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Message::ModifiersChanged(m)),
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
             _ => None,
         });
         // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them

@@ -50,7 +50,10 @@ pub struct WindowTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowOpen {
     /// Open a file by absolute path, optionally jumping to a 0-based `(line, col)` (a grep hit).
-    Path { path: String, at: Option<(u32, u32)> },
+    Path {
+        path: String,
+        at: Option<(u32, u32)>,
+    },
     /// Re-open an existing buffer by id — a scratch buffer with no path, addressable across clients
     /// because buffers are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if
     /// the id is gone (the daemon restarted).

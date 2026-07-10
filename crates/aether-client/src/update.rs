@@ -4,7 +4,9 @@
 //! bridges with a single `Message::Core(Event)` variant and an effect executor.
 
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
-use super::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget};
+use super::effect::{
+    Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget,
+};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
@@ -2876,9 +2878,9 @@ impl Session {
             p.selected = abs;
         }
         if let Some(target) = self.picker_item_target() {
-            return self
-                .close_picker()
-                .and(Effects::one(Effect::ShellAction(ShellAction::NewWindow(target))));
+            return self.close_picker().and(Effects::one(Effect::ShellAction(
+                ShellAction::NewWindow(target),
+            )));
         }
         self.picker_accept()
     }
@@ -3060,9 +3062,9 @@ impl Session {
             // ordinary accept — the same fall-through the web shell does when the row has no URL.
             KeyCode::Enter if mods.ctrl => {
                 if let Some(target) = self.picker_item_target() {
-                    return self
-                        .close_picker()
-                        .and(Effects::one(Effect::ShellAction(ShellAction::NewWindow(target))));
+                    return self.close_picker().and(Effects::one(Effect::ShellAction(
+                        ShellAction::NewWindow(target),
+                    )));
                 }
                 return self.picker_accept();
             }

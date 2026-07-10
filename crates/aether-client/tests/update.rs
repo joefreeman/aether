@@ -39,8 +39,7 @@ fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
 
 /// The token of the (single) `buffer/save` request in `fx`.
 fn save_token(fx: &Effects) -> u64 {
-    fx.0
-        .iter()
+    fx.0.iter()
         .find_map(|e| match e {
             Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
             _ => None,
@@ -1248,7 +1247,10 @@ fn enter_on_a_keybinding_row_is_a_noop() {
     p.total_matches = 1;
     // Informational rows: Enter does nothing — the panel stays open, no hide, no `picker/select`.
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
-    assert!(s.picker.is_some(), "Enter leaves the keybindings picker open");
+    assert!(
+        s.picker.is_some(),
+        "Enter leaves the keybindings picker open"
+    );
     assert!(
         find_request(&fx, "picker/hide").is_none(),
         "Enter doesn't dismiss the picker"

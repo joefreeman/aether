@@ -555,11 +555,19 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
 /// `keybinding_sections_follow_the_curated_group_order` test enforces both directions (no missing
 /// group, no stale entry).
 const GROUP_ORDER: &[&str] = &[
-    "Motion", "Navigation", "Scroll", // getting around
-    "Selection", "Mode", "Edit", "Clipboard", // changing text
-    "Search", // finding
-    "Files", "Code", "Git", // tools
-    "Workspace", "App", // app-level
+    "Motion",
+    "Navigation",
+    "Scroll", // getting around
+    "Selection",
+    "Mode",
+    "Edit",
+    "Clipboard", // changing text
+    "Search",    // finding
+    "Files",
+    "Code",
+    "Git", // tools
+    "Workspace",
+    "App", // app-level
 ];
 
 /// Every user-facing binding as a Keybindings-picker row: one entry per binding, bucketed by
@@ -599,7 +607,12 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
     }
     // Section order follows GROUP_ORDER, not the tables. A group absent from GROUP_ORDER sorts
     // last; the guard test forbids that, so in practice every group has an explicit position.
-    groups.sort_by_key(|(g, _)| GROUP_ORDER.iter().position(|x| x == g).unwrap_or(usize::MAX));
+    groups.sort_by_key(|(g, _)| {
+        GROUP_ORDER
+            .iter()
+            .position(|x| x == g)
+            .unwrap_or(usize::MAX)
+    });
     groups.into_iter().flat_map(|(_, rows)| rows).collect()
 }
 
@@ -1012,19 +1025,31 @@ mod tests {
         // Bare arrow scrolls one line; Alt-arrow scrolls half a page.
         assert!(matches!(
             scroll(KeyCode::Up, Mods::NONE),
-            Some(Action::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line })
+            Some(Action::Scroll {
+                dir: ScrollDir::Up,
+                unit: ScrollUnit::Line
+            })
         ));
         assert!(matches!(
             scroll(KeyCode::Down, Mods::NONE),
-            Some(Action::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line })
+            Some(Action::Scroll {
+                dir: ScrollDir::Down,
+                unit: ScrollUnit::Line
+            })
         ));
         assert!(matches!(
             scroll(KeyCode::Up, Mods::ALT),
-            Some(Action::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half })
+            Some(Action::Scroll {
+                dir: ScrollDir::Up,
+                unit: ScrollUnit::Half
+            })
         ));
         assert!(matches!(
             scroll(KeyCode::Down, Mods::ALT),
-            Some(Action::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half })
+            Some(Action::Scroll {
+                dir: ScrollDir::Down,
+                unit: ScrollUnit::Half
+            })
         ));
         // Shift/Ctrl (and Ctrl-Alt) arrows do nothing now the `Any` catch-all is gone.
         for mods in [Mods::SHIFT, Mods::CTRL, Mods::CTRL_ALT] {
@@ -1039,15 +1064,24 @@ mod tests {
         // Alt-e is big-word end; bare/Shift-e is small-word end (Shift ignored, like `w`/`b`).
         assert!(matches!(
             e(Mods::ALT),
-            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord })
+            Some(Action::MoveWordEnd {
+                dir: Direction::Forward,
+                boundary: WordBoundary::BigWord
+            })
         ));
         assert!(matches!(
             e(Mods::NONE),
-            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word })
+            Some(Action::MoveWordEnd {
+                dir: Direction::Forward,
+                boundary: WordBoundary::Word
+            })
         ));
         assert!(matches!(
             e(Mods::SHIFT),
-            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word })
+            Some(Action::MoveWordEnd {
+                dir: Direction::Forward,
+                boundary: WordBoundary::Word
+            })
         ));
         // Ctrl-e is not a Normal binding — it's GLOBAL's IncrementNumber. The old `Any` catch-all
         // matched it here too, working only because GLOBAL is looked up first.
