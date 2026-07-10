@@ -98,14 +98,15 @@ pub struct Chip {
 }
 
 /// Whether a filter chip applies to this picker kind (chords are clean no-ops elsewhere):
-/// Grep takes everything; Files the scope chips + changed-only; the Explorer the visibility
-/// chips + changed-only.
+/// Grep takes everything; Files the scope chips + changed-only + the hidden visibility chip
+/// (its index includes hidden files, so `Alt-.` hides them — but not `ignored`, which would need
+/// a re-walk); the Explorer both visibility chips + changed-only.
 pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
         PickerKind::Grep => true,
         PickerKind::Files => matches!(
             id,
-            ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed | ChipId::Untracked
+            ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed | ChipId::Untracked | ChipId::Hidden
         ),
         // The workspace Git-changes picker greps content like Grep, so it offers the regex options
         // (case/word/literal) plus the path-scope chips. Inherently changed-only, but it can still
@@ -241,10 +242,11 @@ pub fn adopt_filters(f: &PickerFilters) -> Vec<ChipValue> {
 
 /// Toggle/cycle the filter a flag chip stands for: booleans flip (appearing appends,
 /// disappearing drops out); `case` cycles smart → sensitive → insensitive → smart *in place*
-/// while the chip stays visible. The ignored/hidden chips record the per-kind direction
-/// (`explorer` hides; everything else includes) in the value at creation time. Returns `false`
-/// for the valued chips (dir, glob — those go through their editors).
-pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, explorer: bool) -> bool {
+/// while the chip stays visible. The ignored/hidden chips record the per-kind direction in the
+/// value at creation time (`hide` for the Explorer and Files, which show those entries by default;
+/// include for Grep). Returns `false` for the valued chips (dir, glob — those go through their
+/// editors).
+pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, hide: bool) -> bool {
     let value = match id {
         ChipId::Case => {
             let pos = values.iter().position(|v| matches!(v, ChipValue::Case(_)));
@@ -263,8 +265,8 @@ pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, explorer: bool
         }
         ChipId::Word => ChipValue::Word,
         ChipId::Regex => ChipValue::Regex,
-        ChipId::Ignored => ChipValue::Ignored { hide: explorer },
-        ChipId::Hidden => ChipValue::Hidden { hide: explorer },
+        ChipId::Ignored => ChipValue::Ignored { hide },
+        ChipId::Hidden => ChipValue::Hidden { hide },
         ChipId::Changed => ChipValue::Changed,
         ChipId::Untracked => ChipValue::Untracked,
         ChipId::Dir(_) | ChipId::Glob(_) => return false,
@@ -986,6 +988,24 @@ mod tests {
         assert_eq!(adopt_filters(&wire), chips);
         assert!(apply_chip_toggle(&mut chips, ChipId::Untracked, false));
         assert!(!wire_filters(&chips).hide_untracked);
+    }
+
+    #[test]
+    fn files_offers_hidden_chip_but_not_ignored() {
+        // The Files index includes hidden files, so `Alt-.` *hides* them; `+ignored` would need a
+        // re-walk, so it stays Grep/Explorer-only.
+        assert!(filter_applies(PickerKind::Files, ChipId::Hidden));
+        assert!(!filter_applies(PickerKind::Files, ChipId::Ignored));
+        // Hide-polarity (as the update loop passes for Files): wires to `hide_hidden`, renders `-.`.
+        let mut chips = Vec::new();
+        assert!(apply_chip_toggle(&mut chips, ChipId::Hidden, true));
+        let wire = wire_filters(&chips);
+        assert!(
+            wire.hide_hidden && !wire.include_hidden,
+            "Files hidden chip is inverted like the Explorer's"
+        );
+        assert!(derive_chips(&chips, &[]).iter().any(|c| c.label == "-."));
+        assert_eq!(adopt_filters(&wire), chips);
     }
 
     #[test]

@@ -2528,8 +2528,10 @@ impl Session {
         if !chips::filter_applies(p.kind, id) {
             return Effects::none();
         }
-        let explorer = p.kind == PickerKind::Explorer;
-        if !chips::apply_chip_toggle(&mut p.chips, id, explorer) {
+        // Explorer and Files both show hidden (and, for the Explorer, ignored) entries by default,
+        // so their visibility chips *hide*; Grep's *include*. Files only offers the hidden chip.
+        let hide = matches!(p.kind, PickerKind::Explorer | PickerKind::Files);
+        if !chips::apply_chip_toggle(&mut p.chips, id, hide) {
             return Effects::none(); // valued chips (dir, glob) go through their editors
         }
         self.apply_picker_filter_change()

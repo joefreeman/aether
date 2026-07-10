@@ -11768,6 +11768,9 @@ pub async fn picker_view(
                 let p = s.active_workspace_or_err(client_id)?;
                 (p.workspace_index.clone(), p.paths.clone())
             };
+            // The index walk is hidden-*inclusive*, so tracked dot-entries (e.g.
+            // `.circleci/workflows.yml`) are reachable by default; the `hide_hidden` chip drops
+            // them again during `rerank`.
             let files = workspace_index.files().await;
             // One Git status pass per workspace root, aligned to the file snapshot by index, computed
             // off the lock (statuses() walks the worktree). Empty for roots that aren't in a repo.

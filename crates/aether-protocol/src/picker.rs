@@ -691,10 +691,10 @@ pub struct ScopedPath {
 /// all-default struct is equivalent to the field being absent on the wire.
 ///
 /// Which fields apply depends on the picker kind: Grep reads everything (including
-/// `hide_untracked`); Files reads `globs`/`directories`/`changed_only`/`hide_untracked`; GitChanges
-/// reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer reads
-/// `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`. Inapplicable fields are ignored,
-/// not errors — clients only offer the chips that apply.
+/// `hide_untracked`); Files reads `globs`/`directories`/`changed_only`/`hide_untracked`/`hide_hidden`;
+/// GitChanges reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer
+/// reads `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`. Inapplicable fields are
+/// ignored, not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.
@@ -713,8 +713,9 @@ pub struct PickerFilters {
     /// ignored entries by default.)
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_ignored: bool,
-    /// Grep: include hidden (dot-) files (ripgrep `--hidden`). Same Files caveat as
-    /// `include_ignored`; the Explorer's equivalent is `hide_hidden`.
+    /// Grep: include hidden (dot-) files (ripgrep `--hidden`). Not offered for Files — the Files
+    /// index *includes* hidden files, so Files uses the inverted `hide_hidden` chip instead (like
+    /// the Explorer). The `include_ignored` re-walk caveat still applies to ignored files there.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_hidden: bool,
     /// Explorer only: drop `.gitignore`d entries from the listing. The explorer shows them by
@@ -722,8 +723,9 @@ pub struct PickerFilters {
     /// rather than includes, keeping every field's default equal to current behavior.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_ignored: bool,
-    /// Explorer only: drop hidden (dot-) entries from the listing. Same default rationale as
-    /// `hide_ignored`.
+    /// Explorer and Files: drop hidden (dot-) entries — any path component starting with `.`. Both
+    /// walk hidden entries in by default, so this chip *hides* rather than includes, keeping the
+    /// default (off) equal to current behavior. (Explorer also colour-tags them; Files just lists.)
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_hidden: bool,
     /// All kinds: restrict to files with uncommitted changes (any non-clean, non-ignored Git

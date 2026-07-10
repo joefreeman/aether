@@ -129,15 +129,13 @@ async fn run_search(
     let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<GrepHitCandidate>>(CHANNEL_DEPTH);
     let files_for_blocking = workspace_files.clone();
     tokio::task::spawn_blocking(move || {
-        // `+ignored` / `+hidden` need files the memoized index never contains — run a one-shot
-        // relaxed walk instead. The plain path keeps using the shared snapshot.
+        // The shared snapshot is hidden-*inclusive* (gitignore + `.git` excluded); `FileFilter`
+        // drops hidden files unless `+hidden`, so `+hidden` needs no re-walk. Only `+ignored` pulls
+        // in files the snapshot never contains, so it alone triggers a one-shot relaxed walk —
+        // carrying `include_hidden` through so the relaxed walk's own `.hidden` flag matches.
         let relaxed: Vec<CachedFile>;
-        let files: &[CachedFile] = if filters.include_ignored || filters.include_hidden {
-            relaxed = crate::workspace_index::walk_with(
-                &roots,
-                filters.include_ignored,
-                filters.include_hidden,
-            );
+        let files: &[CachedFile] = if filters.include_ignored {
+            relaxed = crate::workspace_index::walk_with(&roots, true, filters.include_hidden);
             &relaxed
         } else {
             &files_for_blocking
@@ -273,6 +271,13 @@ struct FileFilter {
     status: Option<Vec<Option<crate::git::RepoStatus>>>,
     changed_only: bool,
     hide_untracked: bool,
+    /// The shared file snapshot now *includes* hidden (dot-) files, so the Files picker can surface
+    /// them. Grep's default excludes them again here; `+hidden` (`include_hidden`) turns this off.
+    /// This also drops whitelisted dotfiles like `.envrc` (a `!`-rule in `.gitignore` that the
+    /// `ignore` crate lets override the hidden filter) from grep's default — intentional: grep
+    /// without `+hidden` means "no dotfiles", matching ripgrep's `--hidden`-off default. A relaxed
+    /// `+ignored` walk sets its own `.hidden` flag, so this stays a no-op there.
+    hide_hidden: bool,
 }
 
 impl FileFilter {
@@ -296,10 +301,14 @@ impl FileFilter {
             }),
             changed_only: filters.changed_only,
             hide_untracked: filters.hide_untracked,
+            hide_hidden: !filters.include_hidden,
         }
     }
 
     fn passes(&self, f: &CachedFile) -> bool {
+        if self.hide_hidden && crate::picker::path_is_hidden(&f.relative_path) {
+            return false;
+        }
         if !self.directories.is_empty()
             && !self.directories.iter().any(|(path_index, rel, is_file)| {
                 crate::picker::under_scope(

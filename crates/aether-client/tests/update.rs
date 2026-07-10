@@ -991,6 +991,45 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
 }
 
 #[test]
+fn files_picker_alt_dot_hides_hidden_with_explorer_polarity() {
+    use aether_client::chips::ChipValue;
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
+    // Files shows hidden files by default; Alt-. *hides* them — the Explorer's inverted polarity,
+    // not Grep's `+hidden`. So the chip records `hide: true` and wires to `hide_hidden`.
+    let fx = s.on_key(KeyCode::Char('.'), Mods::ALT, None, ROWS);
+    assert!(
+        s.picker
+            .as_ref()
+            .unwrap()
+            .chips
+            .iter()
+            .any(|c| matches!(c, ChipValue::Hidden { hide: true })),
+        "Alt-. adds a hide-polarity hidden chip on Files"
+    );
+    let params = find_request(&fx, "picker/query").expect("filter change re-queries");
+    assert_eq!(params["filters"]["hide_hidden"], true);
+    assert!(
+        params["filters"].get("include_hidden").is_none(),
+        "Files never sends include_hidden: {}",
+        params["filters"]
+    );
+    // Alt-. again clears the chip.
+    let _ = s.on_key(KeyCode::Char('.'), Mods::ALT, None, ROWS);
+    assert!(
+        !s.picker
+            .as_ref()
+            .unwrap()
+            .chips
+            .iter()
+            .any(|c| matches!(c, ChipValue::Hidden { .. })),
+        "second Alt-. removes the chip"
+    );
+}
+
+#[test]
 fn lsp_picker_centers_on_the_current_buffers_server() {
     use aether_protocol::lsp::LspServerRef;
     use aether_protocol::picker::PickerKind;

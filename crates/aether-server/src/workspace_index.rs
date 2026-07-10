@@ -4,7 +4,10 @@
 //!
 //! Designed as a single service that consumers (pickers, buffer manager) attach to. The walk is
 //! lazy: the first `files()` call runs it on a blocking task; subsequent calls reuse the cached
-//! `Arc`. The cache survives `hide`, so reopening a picker doesn't re-walk.
+//! `Arc`. The cache survives `hide`, so reopening a picker doesn't re-walk. The walk is
+//! hidden-*inclusive* (gitignore + `.git` excluded) so the Files picker can surface tracked
+//! dot-entries; grep filters hidden files back out in-memory for its default (see
+//! `grep::FileFilter`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +65,9 @@ pub struct CachedFile {
 
 pub struct WorkspaceIndex {
     roots: Vec<PathBuf>,
+    /// The one memoized walk, hidden-*inclusive* (gitignore + `.git` still excluded). The Files
+    /// picker ranks it as-is so tracked dot-entries like `.circleci/workflows.yml` are reachable;
+    /// grep filters hidden files back out in-memory for its default (see `grep::FileFilter`).
     cache: Mutex<Option<Arc<Vec<CachedFile>>>>,
     /// Set by the file-watcher when files are created or removed under a root. Consumed by
     /// the next `files()` call, which drops the cache and re-walks. Cheap to set (atomic),
@@ -78,8 +84,8 @@ impl WorkspaceIndex {
         }
     }
 
-    /// Get the candidate cache, walking on first call or after an invalidation. Concurrent
-    /// callers wait on the mutex — we don't want two simultaneous walks.
+    /// Get the candidate cache (a hidden-*inclusive* walk), walking on first call or after an
+    /// invalidation. Concurrent callers wait on the mutex — we don't want two simultaneous walks.
     pub async fn files(&self) -> Arc<Vec<CachedFile>> {
         let mut guard = self.cache.lock().await;
         if self.invalidated.swap(false, Ordering::AcqRel) {
@@ -106,7 +112,9 @@ impl WorkspaceIndex {
 }
 
 fn walk(roots: &[PathBuf]) -> Vec<CachedFile> {
-    walk_with(roots, false, false)
+    // Hidden-*inclusive* (gitignore + `.git` still excluded) — the single memoized candidate set.
+    // Grep hides dot-files back out in-memory for its default; the Files picker keeps them.
+    walk_with(roots, false, true)
 }
 
 /// The workspace walk with the gitignore / hidden-file exclusions optionally relaxed. The

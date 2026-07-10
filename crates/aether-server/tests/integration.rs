@@ -21724,6 +21724,92 @@ async fn grep_filter_include_ignored_and_hidden() {
     drop(server);
 }
 
+/// Files and grep share one hidden-*inclusive* index; grep filters hidden files out in-memory for
+/// its default. Intentional side effect (see `grep::FileFilter`): a dotfile whitelisted via a
+/// `!`-rule in `.gitignore` — which the `ignore` crate lets override the hidden filter — no longer
+/// appears in grep's default, only under `+hidden`.
+#[tokio::test]
+async fn grep_default_excludes_whitelisted_dotfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let repo = git2::Repository::init(&root).unwrap();
+    std::fs::write(root.join("main.rs"), "needle here\n").unwrap();
+    // `!.envrc` explicitly un-ignores it; the ignore crate treats that as "definitely include",
+    // overriding its hidden-file default — so `.envrc` is in the inclusive walk.
+    std::fs::write(root.join(".gitignore"), "!.envrc\n").unwrap();
+    std::fs::write(root.join(".envrc"), "needle secret\n").unwrap();
+    let mut index = repo.index().unwrap();
+    for rel in ["main.rs", ".gitignore", ".envrc"] {
+        index.add_path(std::path::Path::new(rel)).unwrap();
+    }
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "t@e.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    drop(tree);
+    drop(index);
+    drop(repo);
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("wl-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "wl-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // initial empty push
+
+    // Default: the whitelisted dotfile is NOT searched (grep default = no dotfiles).
+    let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
+    let files = grep_hit_files(&update);
+    assert!(files.contains(&"main.rs".to_string()), "files: {files:?}");
+    assert!(
+        !files.contains(&".envrc".to_string()),
+        "whitelisted dotfile excluded from grep default: {files:?}"
+    );
+
+    // `+hidden` brings it back — no re-walk needed, it's already in the inclusive snapshot.
+    let filters = PickerFilters {
+        include_hidden: true,
+        ..Default::default()
+    };
+    let update = grep_with_filters(&mut ws, 11, "needle", filters, 2).await;
+    let files = grep_hit_files(&update);
+    assert!(
+        files.contains(&".envrc".to_string()),
+        "+hidden surfaces the whitelisted dotfile: {files:?}"
+    );
+
+    drop(server);
+}
+
 /// A filter change with an unchanged query must not be served from the completed-search cache —
 /// the candidates were produced under different filters.
 #[tokio::test]
@@ -21954,9 +22040,10 @@ async fn grep_filter_root_scope() {
     drop(server);
 }
 
-/// Files-picker filters reuse the grep filter workspace: directory scope, globs, and
-/// changed-only are pure predicates over the cached walk (the walk itself still excludes
-/// hidden + ignored files, so those toggles aren't offered for Files).
+/// Files-picker filters reuse the grep filter workspace: directory scope, globs, changed-only,
+/// and hide-hidden are pure predicates over the cached walk. The Files walk *includes* hidden
+/// files (so tracked dot-entries are reachable); only ignored files are excluded at walk time, so
+/// `+ignored` stays Grep-only. Dedicated hidden-dir coverage is `files_picker_shows_hidden_dirs`.
 #[tokio::test]
 async fn files_picker_filters_narrow_candidates() {
     let (server, mut ws) = setup_grep_filter_workspace().await;
@@ -22010,9 +22097,10 @@ async fn files_picker_filters_narrow_candidates() {
     )
     .await;
     let first = expect_notification::<PickerUpdate>(&mut ws).await;
-    // Default walk: src/main.rs, src/lib.rs, README.md, changed.rs, new.rs (hidden + ignored
-    // files excluded at index time).
-    assert_eq!(first.total_matches, 5);
+    // Default walk now includes the tracked hidden files (`.hidden.rs`, `.gitignore`) alongside
+    // src/main.rs, src/lib.rs, README.md, changed.rs, new.rs; only gitignored `debug.log` and
+    // `.git/` stay out.
+    assert_eq!(first.total_matches, 7);
 
     // Directory scope: only src/ files.
     let filters = PickerFilters {
@@ -22080,7 +22168,7 @@ async fn files_picker_filters_narrow_candidates() {
         ..Default::default()
     };
     let update = files_query(&mut ws, 14, "", filters, 4).await;
-    assert_eq!(update.total_matches, 5);
+    assert_eq!(update.total_matches, 7);
 
     // Hide-untracked alone: every tracked file stays, only the untracked new.rs drops — "all
     // tracked" (the orthogonal axis to changed-only).
@@ -22097,7 +22185,8 @@ async fn files_picker_filters_narrow_candidates() {
             _ => None,
         })
         .collect();
-    assert_eq!(update.total_matches, 4, "tracked-only: {names:?}");
+    // Six tracked files (the two hidden ones included), only untracked new.rs drops.
+    assert_eq!(update.total_matches, 6, "tracked-only: {names:?}");
     assert!(!names.contains(&"new.rs"), "untracked dropped: {names:?}");
     assert!(
         names.contains(&"changed.rs"),
@@ -22124,6 +22213,126 @@ async fn files_picker_filters_narrow_candidates() {
         names,
         vec!["changed.rs"],
         "changed + tracked-only: {names:?}"
+    );
+
+    drop(server);
+}
+
+/// The Files picker surfaces tracked files inside *hidden directories* (e.g. `.circleci/`) by
+/// default — the flip from the old ripgrep-style hidden exclusion — while still honouring
+/// `.gitignore`. `Alt-.`'s `hide_hidden` chip filters them back out in-memory (no re-walk).
+#[tokio::test]
+async fn files_picker_shows_hidden_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let repo = git2::Repository::init(&root).unwrap();
+    std::fs::create_dir_all(root.join(".circleci")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".circleci/workflows.yml"), "jobs: {}\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "secret.txt\n").unwrap();
+    let mut index = repo.index().unwrap();
+    for rel in [".circleci/workflows.yml", "src/main.rs", ".gitignore"] {
+        index.add_path(std::path::Path::new(rel)).unwrap();
+    }
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "t@e.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    drop(tree);
+    drop(index);
+    drop(repo);
+    // A gitignored file must never appear, even though hidden files now do.
+    std::fs::write(root.join("secret.txt"), "nope\n").unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("hidden-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "hidden-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let names_of = |u: &PickerUpdateParams| -> Vec<String> {
+        u.items()
+            .iter()
+            .filter_map(|i| match i {
+                PickerItem::File { relative_path, .. } => Some(relative_path.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Default view: the hidden-dir file and the normal file both show; the gitignored file stays out.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Files,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let first = expect_notification::<PickerUpdate>(&mut ws).await;
+    let names = names_of(&first);
+    assert!(
+        names.iter().any(|n| n == ".circleci/workflows.yml"),
+        "tracked file in a hidden dir shows by default: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "src/main.rs"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n == "secret.txt"),
+        "gitignored file stays out even with hidden included: {names:?}"
+    );
+
+    // `hide_hidden` (the Alt-. chip) drops anything with a dot-component; normal files remain.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            kind: PickerKind::Files,
+            query: String::new(),
+            generation: 1,
+            filters: PickerFilters {
+                hide_hidden: true,
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let hidden = loop {
+        let p: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+        if p.generation == 1 && !p.ticking {
+            break p;
+        }
+    };
+    let names = names_of(&hidden);
+    assert!(
+        !names.iter().any(|n| n == ".circleci/workflows.yml"),
+        "hide_hidden drops the hidden-dir file: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "src/main.rs"),
+        "hide_hidden keeps normal files: {names:?}"
     );
 
     drop(server);

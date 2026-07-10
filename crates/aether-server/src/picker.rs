@@ -1008,6 +1008,17 @@ struct FilesFilter {
     directories: Vec<(u32, String, bool)>,
     changed_only: bool,
     hide_untracked: bool,
+    /// Files only: drop entries whose path has a dot-component. The Files walk *includes* hidden
+    /// entries (unlike grep's), so this chip hides them back out — the Explorer-style inverted
+    /// polarity. Never set for Git changes (that picker doesn't offer the chip).
+    hide_hidden: bool,
+}
+
+/// A workspace-relative path is "hidden" when any component starts with a dot — matching ripgrep's
+/// rule and the Explorer's `hide_hidden`, so a file under `.circleci/` counts as hidden, not just
+/// a leaf dotfile.
+pub(crate) fn path_is_hidden(relative_path: &str) -> bool {
+    relative_path.split('/').any(|c| c.starts_with('.'))
 }
 
 /// True when `file` sits under the `(path_index, relative_path)` scope. A directory scope (the
@@ -1047,6 +1058,7 @@ impl FilesFilter {
                 .collect(),
             changed_only: filters.changed_only,
             hide_untracked: filters.hide_untracked,
+            hide_hidden: filters.hide_hidden,
         }
     }
 
@@ -1074,6 +1086,12 @@ impl FilesFilter {
 
     fn passes(&self, file: &CachedFile, status: Option<aether_protocol::git::GitStatus>) -> bool {
         if !self.passes_path(file.path_index, &file.relative_path) {
+            return false;
+        }
+        // The Files walk includes hidden entries by default (so tracked dot-files are reachable);
+        // this chip drops anything with a dot-component back out. Files-only — `passes` isn't
+        // called for Git changes.
+        if self.hide_hidden && path_is_hidden(&file.relative_path) {
             return false;
         }
         // The workspace walk never yields ignored files, so any status here is a real change.
