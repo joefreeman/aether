@@ -2938,9 +2938,11 @@ impl Session {
                 return Effects::none();
             }
             PickerItem::Keybinding { .. } => {
-                // Informational — a shortcut row isn't a jump target, so Enter just dismisses
-                // the panel (no `picker/select` round-trip; the server has no result for it).
-                return self.close_picker();
+                // Informational — a shortcut row isn't a jump target and Enter doesn't fire the
+                // binding, so it does nothing: the picker stays open (no close, no `picker/select`).
+                // This keeps it clear that the list is a reference, not a command palette; Esc
+                // dismisses it like any other picker.
+                return Effects::none();
             }
             _ => {}
         }

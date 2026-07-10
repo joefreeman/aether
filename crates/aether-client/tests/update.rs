@@ -1233,7 +1233,7 @@ fn alt_l_and_alt_h_jump_keybinding_groups_via_section_jump() {
 }
 
 #[test]
-fn enter_on_a_keybinding_row_closes_without_selecting() {
+fn enter_on_a_keybinding_row_is_a_noop() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     let mut s = session();
     let _ = s.open_picker(PickerKind::Keybindings, None, None, false);
@@ -1246,10 +1246,13 @@ fn enter_on_a_keybinding_row_closes_without_selecting() {
         match_indices: vec![],
     }];
     p.total_matches = 1;
-    // Informational rows: Enter dismisses the panel — a hide, never a `picker/select`.
+    // Informational rows: Enter does nothing — the panel stays open, no hide, no `picker/select`.
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
-    assert!(s.picker.is_none(), "Enter closes the keybindings picker");
-    assert!(find_request(&fx, "picker/hide").is_some(), "unsubscribes");
+    assert!(s.picker.is_some(), "Enter leaves the keybindings picker open");
+    assert!(
+        find_request(&fx, "picker/hide").is_none(),
+        "Enter doesn't dismiss the picker"
+    );
     assert!(
         find_request(&fx, "picker/select").is_none(),
         "no select round-trip for an informational row"

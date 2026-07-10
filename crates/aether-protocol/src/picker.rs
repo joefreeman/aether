@@ -99,8 +99,8 @@ pub enum PickerKind {
     /// ships the candidate rows on open ([`PickerViewParams::keybindings`]) — the binding tables
     /// live in the client core, not on the server; the server only matches and windows them.
     /// Informational: rows aren't a jump target and there is no `PickerSelectResult` for them
-    /// (Enter just closes the picker). Like [`Workspaces`](Self::Workspaces) it's usable before
-    /// a workspace is active.
+    /// (Enter is a no-op — the picker stays open; Esc dismisses it). Like
+    /// [`Workspaces`](Self::Workspaces) it's usable before a workspace is active.
     Keybindings,
 }
 

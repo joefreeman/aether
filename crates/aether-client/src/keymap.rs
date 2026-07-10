@@ -548,9 +548,23 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
     table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
+/// Curated section order for the keybindings picker: getting-around → changing-text → finding →
+/// tools → app. This is deliberately independent of the binding tables' declaration order, so
+/// reordering `bind!` lines only shuffles rows *within* a group, never the section order here.
+/// Every group produced by the tables must appear exactly once below — the
+/// `keybinding_sections_follow_the_curated_group_order` test enforces both directions (no missing
+/// group, no stale entry).
+const GROUP_ORDER: &[&str] = &[
+    "Motion", "Navigation", "Scroll", // getting around
+    "Selection", "Mode", "Edit", "Clipboard", // changing text
+    "Search", // finding
+    "Files", "Code", "Git", // tools
+    "Workspace", "App", // app-level
+];
+
 /// Every user-facing binding as a Keybindings-picker row: one entry per binding, bucketed by
 /// group — the picker renders one section header per group (grep-style), so a group's rows must
-/// be a contiguous run. Groups keep first-appearance order; within a group, rows keep mode-major
+/// be a contiguous run. Groups follow [`GROUP_ORDER`]; within a group, rows keep mode-major
 /// order (Normal, the shared `Any` keys, Insert, Search, Application — so unlike the old tabbed
 /// help dialog the `Global` keys appear *once*, as mode `Any`, rather than folded into both
 /// Normal and Insert). Bindings with no `group` (internal aliases) and the leader-trigger itself
@@ -564,7 +578,8 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
         ("Search", KeyContext::Search),
         ("Application", KeyContext::Leader),
     ];
-    // Buckets in first-appearance order. A Vec scan beats a map: ~15 groups, built once per open.
+    // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
+    // A Vec scan beats a map: ~15 groups, built once per open.
     let mut groups: Vec<(&str, Vec<aether_protocol::picker::KeybindingEntry>)> = Vec::new();
     for (mode, cx) in MODES {
         for b in table(cx) {
@@ -582,6 +597,9 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
             }
         }
     }
+    // Section order follows GROUP_ORDER, not the tables. A group absent from GROUP_ORDER sorts
+    // last; the guard test forbids that, so in practice every group has an explicit position.
+    groups.sort_by_key(|(g, _)| GROUP_ORDER.iter().position(|x| x == g).unwrap_or(usize::MAX));
     groups.into_iter().flat_map(|(_, rows)| rows).collect()
 }
 
@@ -675,7 +693,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWordBack { boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
     bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWordBack { boundary: WordBoundary::Word }, "Motion", "Small word backward"),
     bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
-    bind!(N, ch('e'), Any, A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
+    bind!(N, ch('e'), IgnoreShift(Mods::NONE), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 
     // ---- motions: find char ----
     bind!(N, ch('f'), IgnoreShift(Mods::ALT), A::BeginFind { dir: Direction::Backward, till: false }, "Motion", "Find character backward"),
@@ -716,10 +734,12 @@ static NORMAL: &[Binding] = &[
     // ---- viewport scroll ----
     bind!(N, KeyCode::PageDown, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Page }, "Scroll", "Scroll page down"),
     bind!(N, KeyCode::PageUp, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Page }, "Scroll", "Scroll page up"),
-    bind!(N, KeyCode::Up, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half }, "Scroll", "Scroll half page up"),
-    bind!(N, KeyCode::Down, IgnoreShift(Mods::ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }, "Scroll", "Scroll half page down"),
-    bind!(N, KeyCode::Up, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }, "Scroll", "Scroll up one line"),
-    bind!(N, KeyCode::Down, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
+    // Only a bare arrow (one line) and Alt-arrow (half page) scroll; Shift/Ctrl arrows do nothing.
+    // Exact patterns keep these disjoint, so declaration order here doesn't affect dispatch.
+    bind!(N, KeyCode::Up, Exact(Mods::ALT), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half }, "Scroll", "Scroll half page up"),
+    bind!(N, KeyCode::Down, Exact(Mods::ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }, "Scroll", "Scroll half page down"),
+    bind!(N, KeyCode::Up, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }, "Scroll", "Scroll up one line"),
+    bind!(N, KeyCode::Down, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
     bind!(N, KeyCode::Left, Any, A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }, "Scroll", "Scroll left one column"),
     bind!(N, KeyCode::Right, Any, A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }, "Scroll", "Scroll right one column"),
     bind!(N, ch(';'), Exact(Mods::NONE), A::PlaceCursor(ViewportPlace::Upper), "Scroll", "Cursor near top"),
@@ -959,6 +979,79 @@ mod tests {
         // Horizontal scrolls and unrelated keys aren't popover actions (→ dismiss).
         assert_eq!(hover_action(KeyCode::Left, Mods::NONE), None);
         assert_eq!(hover_action(ch('a'), Mods::NONE), None);
+    }
+
+    #[test]
+    fn keybinding_sections_follow_the_curated_group_order() {
+        let entries = keybinding_entries();
+        // Distinct groups in the order their section headers appear (each is one contiguous run).
+        let mut sections: Vec<&str> = Vec::new();
+        for e in &entries {
+            if sections.last().copied() != Some(e.group.as_str()) {
+                sections.push(e.group.as_str());
+            }
+        }
+        // Sections appear in exactly GROUP_ORDER's sequence (filtered to groups that have rows),
+        // which also proves no emitted group is missing from GROUP_ORDER (else it sorts last and
+        // the vectors diverge).
+        let expected: Vec<&str> = GROUP_ORDER
+            .iter()
+            .copied()
+            .filter(|g| sections.contains(g))
+            .collect();
+        assert_eq!(sections, expected, "picker sections must match GROUP_ORDER");
+        // GROUP_ORDER carries no stale / misspelled group that never renders.
+        for g in GROUP_ORDER {
+            assert!(sections.contains(g), "GROUP_ORDER lists unused group {g:?}");
+        }
+    }
+
+    #[test]
+    fn arrow_scroll_binds_only_bare_and_alt() {
+        let scroll = |code, mods| lookup(KeyContext::Normal, code, mods).map(|b| b.action);
+        // Bare arrow scrolls one line; Alt-arrow scrolls half a page.
+        assert!(matches!(
+            scroll(KeyCode::Up, Mods::NONE),
+            Some(Action::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line })
+        ));
+        assert!(matches!(
+            scroll(KeyCode::Down, Mods::NONE),
+            Some(Action::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line })
+        ));
+        assert!(matches!(
+            scroll(KeyCode::Up, Mods::ALT),
+            Some(Action::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half })
+        ));
+        assert!(matches!(
+            scroll(KeyCode::Down, Mods::ALT),
+            Some(Action::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half })
+        ));
+        // Shift/Ctrl (and Ctrl-Alt) arrows do nothing now the `Any` catch-all is gone.
+        for mods in [Mods::SHIFT, Mods::CTRL, Mods::CTRL_ALT] {
+            assert!(scroll(KeyCode::Up, mods).is_none());
+            assert!(scroll(KeyCode::Down, mods).is_none());
+        }
+    }
+
+    #[test]
+    fn word_end_e_mirrors_w_and_b_shape() {
+        let e = |mods| lookup(KeyContext::Normal, ch('e'), mods).map(|b| b.action);
+        // Alt-e is big-word end; bare/Shift-e is small-word end (Shift ignored, like `w`/`b`).
+        assert!(matches!(
+            e(Mods::ALT),
+            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord })
+        ));
+        assert!(matches!(
+            e(Mods::NONE),
+            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word })
+        ));
+        assert!(matches!(
+            e(Mods::SHIFT),
+            Some(Action::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word })
+        ));
+        // Ctrl-e is not a Normal binding — it's GLOBAL's IncrementNumber. The old `Any` catch-all
+        // matched it here too, working only because GLOBAL is looked up first.
+        assert!(e(Mods::CTRL).is_none());
     }
 
     #[test]
