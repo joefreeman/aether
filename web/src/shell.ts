@@ -105,6 +105,10 @@ const SYMBOL_TAG: Record<SymbolKind, string> = {
 
 interface Config {
   wsBase: string;
+  /** HTTP origin of the daemon, derived from `wsBase` (ws→http, wss→https), for the `/status` probe. */
+  httpBase: string;
+  /** The version that served this page, from the `aether-version` meta tag (null under Vite dev). */
+  buildVersion: string | null;
   workspace: string | undefined;
 }
 
@@ -112,7 +116,10 @@ function resolveConfig(): Config {
   // No token: the daemon authorizes by loopback Host/Origin (served same-origin; Vite dev points
   // VITE_AETHER_WS at the daemon, whose origin check accepts localhost).
   const wsBase = import.meta.env.VITE_AETHER_WS ?? `ws://${location.host}`;
-  return { wsBase, workspace: import.meta.env.VITE_AETHER_WORKSPACE };
+  const httpBase = wsBase.replace(/^ws/, "http"); // ws://→http://, wss://→https://
+  const buildVersion =
+    document.querySelector('meta[name="aether-version"]')?.getAttribute("content") ?? null;
+  return { wsBase, httpBase, buildVersion, workspace: import.meta.env.VITE_AETHER_WORKSPACE };
 }
 
 interface Cell {
@@ -1350,14 +1357,17 @@ export class Shell {
   private async boot(cfg: Config): Promise<void> {
     await init(); // instantiate the wasm module
 
-    // No client_version: the server's version gate only rejects a *declared* mismatch, and the
-    // browser is inherently version-locked to its serving daemon (it loads this bundle from the same
-    // build it then connects to), so it can never be skewed. Sending a fixed string would just get
-    // us rejected the moment the release version moves.
+    // The WS URL carries no `?version=`: the browser can't read the handshake's 426, so the version
+    // gate is useless here. Instead the client compares the page's build version (injected into the
+    // `aether-version` meta tag by the serving daemon) against the daemon's live `/status` version on
+    // each reconnect — if the daemon was replaced by a different build, it surfaces "outdated" and
+    // prompts a reload rather than reconnecting onto a possibly-drifted wire format.
     const url = `${cfg.wsBase}/`;
     this.client = new RpcClient(url, (m, p) => this.onNotification(m, p), {
       onConnState: (s) => this.onConnState(s),
       onReconnect: () => void this.reestablish(),
+      httpBase: cfg.httpBase,
+      buildVersion: cfg.buildVersion,
     });
 
     try {
@@ -1674,12 +1684,27 @@ export class Shell {
     }
     // A down state: suspend the core (only meaningful once a session exists) and show the banner.
     if (this.session) this.runEffects(this.session.connection_lost() as CoreEffect[]);
-    this.connBanner.className = s === "failed" ? "failed" : "";
+    // "outdated" and "failed" are both terminal (no auto-retry), so they share the stopped styling.
+    const terminal = s === "failed" || s === "outdated";
+    this.connBanner.className = terminal ? "failed" : "";
     this.connBanner.replaceChildren();
     const label = document.createElement("span");
-    label.textContent = s === "failed" ? "Disconnected" : "Reconnecting…";
+    label.textContent =
+      s === "outdated"
+        ? "Aether was updated — reload to continue"
+        : s === "failed"
+          ? "Disconnected"
+          : "Reconnecting…";
     this.connBanner.append(label);
-    if (s === "failed") {
+    if (s === "outdated") {
+      // A reload fetches the fresh bundle from the new daemon; a plain retry would just hit the same
+      // mismatch again.
+      const reload = document.createElement("button");
+      reload.className = "conn-retry";
+      reload.textContent = "Reload";
+      reload.addEventListener("click", () => location.reload());
+      this.connBanner.append(reload);
+    } else if (s === "failed") {
       const retry = document.createElement("button");
       retry.className = "conn-retry";
       retry.textContent = "Retry";

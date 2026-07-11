@@ -8,13 +8,26 @@
 
 export type NotificationHandler = (method: string, params: unknown) => void;
 
-/** connecting/reconnecting are "down" states; connected is up; failed means we gave up retrying. */
-export type ConnState = "connecting" | "connected" | "reconnecting" | "failed";
+/**
+ * connecting/reconnecting are "down" states; connected is up; failed means we gave up retrying;
+ * outdated means the daemon was replaced by a different build than served this page — terminal, and
+ * only a reload (which fetches the fresh bundle) can recover.
+ */
+export type ConnState = "connecting" | "connected" | "reconnecting" | "failed" | "outdated";
 
 export interface RpcClientOpts {
   onConnState: (state: ConnState) => void;
   /** Fired after a *re*connection opens (not the initial connect) — the app should re-bootstrap. */
   onReconnect: () => void;
+  /** HTTP origin of the daemon (e.g. `http://127.0.0.1:2384`) for the out-of-band `/status` probe. */
+  httpBase: string;
+  /**
+   * The version that served this page (from the `aether-version` meta tag), or `null` when absent
+   * (the Vite dev server doesn't inject it). When set, a reconnect that finds the daemon reporting a
+   * *different* version is treated as "outdated" rather than retried — the browser can't read the
+   * handshake's 426, so we compare versions over `/status` instead.
+   */
+  buildVersion: string | null;
 }
 
 /** A JSON-RPC error response, carrying the numeric code so callers can branch (e.g. WOULD_OVERWRITE). */
@@ -45,6 +58,8 @@ export class RpcClient {
   private readonly onNotification: NotificationHandler;
   private readonly onConnState: (state: ConnState) => void;
   private readonly onReconnect: () => void;
+  private readonly httpBase: string;
+  private readonly buildVersion: string | null;
   private firstConnect = true;
   private attempts = 0;
   private reconnectTimer: number | undefined;
@@ -58,6 +73,8 @@ export class RpcClient {
     this.onNotification = onNotification;
     this.onConnState = opts.onConnState;
     this.onReconnect = opts.onReconnect;
+    this.httpBase = opts.httpBase;
+    this.buildVersion = opts.buildVersion;
     this.ready = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve;
       this.rejectReady = reject;
@@ -98,14 +115,43 @@ export class RpcClient {
     }
     const delay = Math.min(10_000, 500 * 2 ** (this.attempts - 1));
     this.onConnState("reconnecting");
-    this.reconnectTimer = window.setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = window.setTimeout(() => void this.reconnect(), delay);
+  }
+
+  /** A reconnect attempt, gated on a version check. A dropped localhost socket usually means the
+   *  daemon restarted; if it came back as a *different* build than served this page, the wire format
+   *  may have drifted, so retrying can't help and silently reconnecting risks talking a skewed
+   *  protocol. Surface "outdated" (→ reload) instead of looping. Server unreachable or same-version
+   *  falls through to a normal reconnect. */
+  private async reconnect(): Promise<void> {
+    if (await this.serverOutdated()) {
+      this.onConnState("outdated");
+      if (this.firstConnect) this.rejectReady(new Error("server version changed — reload required"));
+      return;
+    }
+    this.connect();
+  }
+
+  /** True only if the daemon is reachable AND reports a version different from the one that served
+   *  this page. Unknown build version (dev), an unreachable server (still restarting), or a matching
+   *  version all return false, so the normal retry loop continues. */
+  private async serverOutdated(): Promise<boolean> {
+    if (!this.buildVersion) return false;
+    try {
+      const resp = await fetch(`${this.httpBase}/status`, { cache: "no-store" });
+      if (!resp.ok) return false;
+      const status = (await resp.json()) as { version?: unknown };
+      return typeof status.version === "string" && status.version !== this.buildVersion;
+    } catch {
+      return false; // unreachable — treat as down, keep retrying
+    }
   }
 
   /** Manual retry after we've given up ("failed"). */
   retry(): void {
     window.clearTimeout(this.reconnectTimer);
     this.attempts = 0;
-    this.connect();
+    void this.reconnect();
   }
 
   private handleMessage(data: unknown): void {

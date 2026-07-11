@@ -43,6 +43,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="aether-version" content="__AETHER_VERSION__" />
   <title>Aether</title>
   <link rel="stylesheet" href="/assets/index.css" />
   <script type="module" src="/assets/index.js"></script>
@@ -52,6 +53,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </body>
 </html>
 "#;
+
+/// The `/` page with this server's build version stamped into the `aether-version` meta tag. The
+/// browser client reads it as the version that served this bundle; on a later reconnect it compares
+/// against the daemon's live `/status` version to detect that the daemon has been replaced by a
+/// different build (and then prompts a reload instead of talking a drifted wire format). See
+/// `web/src/client.ts`.
+fn index_html() -> String {
+    INDEX_HTML.replace("__AETHER_VERSION__", aether_protocol::PROTOCOL_VERSION)
+}
 
 /// Peek the connection and route it: a WebSocket upgrade goes to the JSON-RPC connection handler,
 /// everything else is served as HTTP. Bytes peeked here remain queued for the chosen handler.
@@ -113,7 +123,7 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
     let response = if path == "/status" {
         status_response(&state).await
     } else if path == "/" || path == "/index.html" {
-        http_response("200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes())
+        http_response("200 OK", "text/html; charset=utf-8", index_html().as_bytes())
     } else if let Some((bytes, content_type)) = path.strip_prefix('/').and_then(load_asset) {
         http_response("200 OK", content_type, &bytes)
     } else {
@@ -286,5 +296,17 @@ mod tests {
         let req = "GET / HTTP/1.1\r\nhOsT:  127.0.0.1:2384\r\nConnection: close\r\n\r\n";
         assert_eq!(request_host(req), Some("127.0.0.1:2384"));
         assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn index_html_stamps_the_build_version() {
+        let html = index_html();
+        // The placeholder is fully substituted for the real version, in a readable meta tag the web
+        // client can query — this is the contract `web/src/client.ts` relies on for reload detection.
+        assert!(!html.contains("__AETHER_VERSION__"), "placeholder left unsubstituted");
+        assert!(html.contains(&format!(
+            r#"<meta name="aether-version" content="{}" />"#,
+            aether_protocol::PROTOCOL_VERSION
+        )));
     }
 }
