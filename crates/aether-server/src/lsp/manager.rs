@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use super::client::{LspClient, LspInbound};
 use super::config::{self, LspServerSpec, WorkspaceMarker};
 use super::position::PositionEncoding;
-use super::{lifecycle, process, uri};
+use super::{lifecycle, process, shell_env, uri};
 use crate::state::{ServerState, SharedState};
 
 /// Identifies a server instance: one per **workspace** per workspace root per language.
@@ -283,7 +283,10 @@ fn file_has_line(path: &Path, needle: &str) -> bool {
 /// Background task: spawn the subprocess, hand off to [`bring_up`]. Marks the handle `Crashed` if
 /// the process can't be spawned.
 pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, generation: u64) {
-    let proc = match process::spawn(spec.command, spec.args, &key.root) {
+    // Resolve the toolchain environment for this root (mise/direnv/asdf/… activation), falling back
+    // to the daemon's own environment when there's nothing to add. See [`shell_env`].
+    let env = shell_env::resolve(&key.root).await;
+    let proc = match process::spawn(spec.command, spec.args, &key.root, env.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "failed to spawn language server");

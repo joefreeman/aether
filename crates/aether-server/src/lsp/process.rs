@@ -4,6 +4,7 @@
 //! in-memory pipes (see `client`/`transport` tests), so this only has to wire a child's pipes in
 //! and drain its stderr to the log.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,15 +21,24 @@ pub struct LspProcess {
     pub child: Child,
 }
 
-/// Spawn `command args...` in `cwd` and connect to it. The child is killed if its [`Child`] is
-/// dropped.
+/// Spawn `command args...` in `cwd`, under `env`, and connect to it. The child is killed if its
+/// [`Child`] is dropped.
 ///
-/// `cwd` is the discovered LSP root (see [`super::manager`]). Beyond the servers' own use of it, it
-/// is what makes version-manager shims resolve a per-project toolchain: shims (asdf, rbenv/pyenv,
-/// rustup's cargo proxies, mise-with-shims, …) read the tool-version files from their process's cwd
-/// *upward*, so launching here honors a pin at the root or any ancestor. `command` itself is still
-/// resolved on `PATH` — we only steer the cwd, staying agnostic to which manager (if any) is in use.
-pub fn spawn(command: &str, args: &[&str], cwd: &Path) -> std::io::Result<LspProcess> {
+/// `cwd` is the discovered LSP root (see [`super::manager`]). Servers use it directly, and it lets a
+/// *shim*-based version manager (asdf, rbenv/pyenv, rustup's cargo proxies, mise-with-shims) resolve
+/// a per-project toolchain — a shim reads the tool-version files from its cwd upward. But the more
+/// common *shell-activation* managers (`mise activate`, `direnv`, `nvm`) don't use shims: they
+/// rewrite `PATH` in a shell hook, so cwd alone wouldn't reach them. `env` closes that gap — when
+/// `Some`, it's the environment resolved for this root by [`super::shell_env`], overlaid onto the
+/// inherited one so its `PATH` (and any tool vars) win while daemon-only vars are preserved. When
+/// `None`, the child simply inherits the daemon's environment. `command` is resolved on the
+/// resulting `PATH`.
+pub fn spawn(
+    command: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: Option<&HashMap<String, String>>,
+) -> std::io::Result<LspProcess> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .current_dir(cwd)
@@ -36,6 +46,11 @@ pub fn spawn(command: &str, args: &[&str], cwd: &Path) -> std::io::Result<LspPro
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Overlay, not replace: `.envs` sets/overrides only the resolved keys, leaving the rest of the
+    // inherited environment intact.
+    if let Some(env) = env {
+        cmd.envs(env);
+    }
 
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().expect("stdin piped");
@@ -77,7 +92,7 @@ mod tests {
             client,
             mut inbound,
             mut child,
-        } = match spawn("cat", &[], Path::new(".")) {
+        } = match spawn("cat", &[], Path::new("."), None) {
             Ok(p) => p,
             Err(_) => return, // no `cat` on this host; nothing to test
         };
@@ -107,7 +122,7 @@ mod tests {
     async fn spawn_runs_child_in_the_given_cwd() {
         let dir = tempfile::tempdir().expect("tempdir");
         let LspProcess { mut child, .. } =
-            match spawn("sh", &["-c", "pwd -P > cwd_marker"], dir.path()) {
+            match spawn("sh", &["-c", "pwd -P > cwd_marker"], dir.path(), None) {
                 Ok(p) => p,
                 Err(_) => return, // no `sh` on this host; nothing to test
             };
@@ -118,5 +133,30 @@ mod tests {
         let reported = std::fs::canonicalize(marker.trim()).expect("canonicalize reported cwd");
         let expected = std::fs::canonicalize(dir.path()).expect("canonicalize temp dir");
         assert_eq!(reported, expected);
+    }
+
+    /// The `env` we pass must reach the child — this is what carries a resolved toolchain `PATH`
+    /// (and friends) to a language server. The child writes one variable's value to a marker file;
+    /// if the overlay was applied it holds the value we set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_applies_the_given_env_to_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env: HashMap<String, String> =
+            [("AE_TEST_VAR".to_string(), "sentinel-value".to_string())].into();
+        let LspProcess { mut child, .. } = match spawn(
+            "sh",
+            &["-c", "printf %s \"$AE_TEST_VAR\" > env_marker"],
+            dir.path(),
+            Some(&env),
+        ) {
+            Ok(p) => p,
+            Err(_) => return, // no `sh` on this host; nothing to test
+        };
+        let _ = child.wait().await;
+
+        let marker = std::fs::read_to_string(dir.path().join("env_marker"))
+            .expect("marker written by the child");
+        assert_eq!(marker, "sentinel-value");
     }
 }

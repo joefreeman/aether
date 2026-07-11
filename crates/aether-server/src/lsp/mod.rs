@@ -13,5 +13,6 @@ pub mod lifecycle;
 pub mod manager;
 pub mod position;
 pub mod process;
+pub mod shell_env;
 pub mod transport;
 pub mod uri;
