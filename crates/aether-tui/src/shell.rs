@@ -103,6 +103,18 @@ enum ReconnectError {
     Fatal(String),
 }
 
+impl From<crate::connection::ConnectError> for ReconnectError {
+    /// A version mismatch is terminal — the running daemon is a different build, so retrying can't
+    /// help; surface the message. Any other dial failure is just "not up yet", so retry.
+    fn from(e: crate::connection::ConnectError) -> Self {
+        use crate::connection::ConnectError;
+        match e {
+            ConnectError::VersionMismatch(m) => ReconnectError::Fatal(m),
+            ConnectError::Down(_) => ReconnectError::NotUp,
+        }
+    }
+}
+
 /// A successful initial boot: the live connection plus the bootstrapped session/state and any
 /// startup effects (e.g. the no-args Workspaces chooser's `picker/view`), ready to install in place
 /// of the connecting placeholder.
@@ -583,8 +595,9 @@ impl Shell {
                     self.boot_attempt = self.boot_attempt.saturating_add(1);
                     self.spawn_boot_dial();
                 }
-                // A live server but the bootstrap refused (e.g. unknown CLI workspace) — end the run
-                // with the error once the terminal is restored.
+                // Terminal: either a live server whose bootstrap refused (e.g. unknown CLI
+                // workspace) or a version mismatch (a stale daemon holding the port). Retrying
+                // can't help — end the run, printing the message once the terminal is restored.
                 Err(ReconnectError::Fatal(e)) => {
                     self.fatal = Some(e);
                     self.should_quit = true;
@@ -1979,7 +1992,7 @@ async fn boot_dial(
     }
     let (handle, notifications) = crate::connection::connect(&server_url, &spec.version)
         .await
-        .map_err(|_| ReconnectError::NotUp)?;
+        .map_err(ReconnectError::from)?;
     let (session, state, startup) = bootstrap(
         &handle,
         spec.workspace.as_deref(),
@@ -2017,7 +2030,7 @@ async fn dial(
     tokio::time::sleep(reconnect_backoff(attempt)).await;
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
-        .map_err(|_| ReconnectError::NotUp)?;
+        .map_err(ReconnectError::from)?;
     let activated = match handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
             name: workspace,

@@ -153,6 +153,45 @@ pub enum ReconnectError {
     Fatal(String),
 }
 
+impl From<crate::connection::ConnectError> for ReconnectError {
+    /// A version mismatch is terminal — the running daemon is a different build, so retrying can't
+    /// help; surface the message. Any other dial failure is just "not up yet", so retry.
+    fn from(e: crate::connection::ConnectError) -> Self {
+        use crate::connection::ConnectError;
+        match e {
+            ConnectError::VersionMismatch(m) => ReconnectError::Fatal(m),
+            ConnectError::Down(_) => ReconnectError::NotUp,
+        }
+    }
+}
+
+/// Why a boot dial didn't produce a session. Mirrors [`ReconnectError`] for the initial-boot path,
+/// which merges connect failures with bootstrap failures (`String`) — so `?` on a bootstrap error
+/// folds into [`BootError::Retry`] via `From<String>`, and only a version mismatch is `Fatal`.
+#[derive(Debug)]
+pub enum BootError {
+    /// Daemon not up yet, or a bootstrap RPC hiccuped — keep dialing.
+    Retry(String),
+    /// A version mismatch (a stale daemon holds the port) — surface it and stop retrying.
+    Fatal(String),
+}
+
+impl From<String> for BootError {
+    fn from(s: String) -> Self {
+        BootError::Retry(s)
+    }
+}
+
+impl From<crate::connection::ConnectError> for BootError {
+    fn from(e: crate::connection::ConnectError) -> Self {
+        use crate::connection::ConnectError;
+        match e {
+            ConnectError::VersionMismatch(m) => BootError::Fatal(m),
+            ConnectError::Down(e) => BootError::Retry(e.to_string()),
+        }
+    }
+}
+
 /// Pre-session state: the workspace chooser shown on a no-args start. Owns the connection the
 /// session will be built over; all input routes through `update_boot` while this is set.
 struct Boot {
@@ -297,8 +336,9 @@ pub enum Message {
     /// server instance's start stamp (for restart detection once the session exists).
     SessionReady(Result<Box<(WorkspaceInfo, BufferOpenResult, u64)>, String>),
     /// The boot-connect dial resolved (from the `Connecting` launch state): either a connected
-    /// `Session`/`Choose` bootstrap to install, or a failure to retry.
-    Booted(Result<Bootstrap, String>),
+    /// `Session`/`Choose` bootstrap to install, or a failure to retry (or, for a version mismatch,
+    /// to surface and stop).
+    Booted(Result<Bootstrap, BootError>),
     Editor(EditorEvent),
     Key {
         code: KeyCode,
@@ -335,7 +375,7 @@ pub enum Message {
     /// A reconnect attempt resolved (the backoff sleep rides inside the attempt task).
     Reconnected(Result<Box<Reestablished>, ReconnectError>),
     /// The boot chooser's reconnect attempt resolved.
-    BootReconnected(Result<BootConn, String>),
+    BootReconnected(Result<BootConn, BootError>),
 }
 
 pub struct App {
@@ -843,7 +883,14 @@ impl App {
                 let note = self.toast("Reconnected", ToastKind::Success, Some("connection".into()));
                 Task::batch([pump(c.notifications), view, note])
             }
-            Message::BootReconnected(Err(_)) => self.boot_reconnect(),
+            Message::BootReconnected(Err(BootError::Retry(_))) => self.boot_reconnect(),
+            // Version mismatch while the chooser's connection was down: a stale daemon holds the
+            // port. Stop redialing and leave a persistent error toast; the chooser stays up (marked
+            // down) rather than spinning forever.
+            Message::BootReconnected(Err(BootError::Fatal(e))) => {
+                tracing::warn!(error = %e, "boot chooser reconnect rejected: version mismatch");
+                self.toast(e, ToastKind::Error, Some("connection".into()))
+            }
             Message::SessionReady(Ok(r)) => {
                 // The pick resolved: the boot connection becomes the session's. The running
                 // pump carries on — same notification channel, now read by the main handler.
@@ -1148,7 +1195,7 @@ impl App {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(BootError::from)?;
                 Ok(BootConn {
                     handle,
                     notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1270,7 +1317,7 @@ impl App {
             }
             // The dial only ever yields Session/Choose; Connecting can't come back.
             Message::Booted(Ok(Bootstrap::Connecting(_))) => Task::none(),
-            Message::Booted(Err(e)) => {
+            Message::Booted(Err(BootError::Retry(e))) => {
                 tracing::debug!(error = %e, "boot connect failed; retrying");
                 match &self.boot_args {
                     Some(args) => {
@@ -1279,6 +1326,15 @@ impl App {
                     }
                     None => Task::none(),
                 }
+            }
+            // Version mismatch on the initial dial: a stale daemon holds the port. Retrying can't
+            // help, so stop dialing (drop `boot_args`) and drop the connecting placeholder into the
+            // terminal `Failed` state with a persistent error toast naming the fix.
+            Message::Booted(Err(BootError::Fatal(e))) => {
+                tracing::warn!(error = %e, "boot connect rejected: version mismatch");
+                self.boot_args = None;
+                let fx = self.session.on_event(CoreEvent::ReconnectFatal(e));
+                self.run_core(fx)
             }
             // Client-side input runs against the placeholder session (RPCs dropped while
             // Connecting), giving the reconnect-style "some keys work" feel.
@@ -2022,7 +2078,7 @@ impl App {
                 tokio::time::sleep(reconnect_backoff(attempt)).await;
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
-                    .map_err(|_| ReconnectError::NotUp)?;
+                    .map_err(ReconnectError::from)?;
                 let activated = match handle
                     .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
                         name: workspace,
@@ -4365,12 +4421,14 @@ fn spawn_connect_delayed(args: ConnectingBootstrap, attempt: u32) -> Task<Messag
 
 /// One boot-connect attempt: dial the fixed address, then (with a CLI workspace) activate it and
 /// open the file / MRU buffer, or (without one) hand back a bare connection for the chooser.
-/// Returns the connected [`Bootstrap`] to install, or an error string to retry / surface.
-async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, String> {
+/// Returns the connected [`Bootstrap`] to install, or a [`BootError`] to retry / surface. Bootstrap
+/// RPC failures are `String` and fold into [`BootError::Retry`] via `?`; only a version-mismatch
+/// dial is `Fatal`.
+async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, BootError> {
     let base_url = args.server_url.clone();
     let (handle, rx) = crate::connection::connect(&base_url, &args.client_version)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(BootError::from)?;
     let notifications = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
     // No workspace on the CLI. An existing file outside any configured workspace (`ae /etc/hosts`)

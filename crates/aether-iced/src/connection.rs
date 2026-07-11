@@ -95,14 +95,53 @@ impl Handle {
     }
 }
 
+/// Why a dial failed. A version mismatch (the running daemon is a different build) is terminal —
+/// retrying can't fix it, so the shell surfaces it and stops; any other failure means "server not
+/// up yet" and is retried on the backoff curve.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The server rejected the handshake with `426 Upgrade Required` (its version gate). Carries the
+    /// message to show: the server's response body if it survived the handshake, else a synthesized
+    /// one naming our own version.
+    VersionMismatch(String),
+    /// Dial failed for any other reason (connection refused, reset, timeout, …).
+    Down(anyhow::Error),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::VersionMismatch(m) => f.write_str(m),
+            ConnectError::Down(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Connect to the server and spawn the actor on the *current* tokio runtime. Returns the RPC
 /// handle and the notification stream; the receiver yields `None` when the connection dies.
 pub async fn connect(
     base_url: &str,
     client_version: &str,
-) -> anyhow::Result<(Handle, mpsc::UnboundedReceiver<Notification>)> {
+) -> Result<(Handle, mpsc::UnboundedReceiver<Notification>), ConnectError> {
+    use tokio_tungstenite::tungstenite::{http::StatusCode, Error as WsError};
     let url = format!("{base_url}/?version={client_version}");
-    let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let ws = match tokio_tungstenite::connect_async(&url).await {
+        Ok((ws, _)) => ws,
+        // The server's version gate rejected the upgrade (426): the daemon holding the port is a
+        // different build. Terminal — surface it rather than dialing forever. Prefer the server's
+        // own message; fall back to one naming the client version if the body didn't survive.
+        Err(WsError::Http(resp)) if resp.status() == StatusCode::UPGRADE_REQUIRED => {
+            let detail = resp
+                .body()
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                .filter(|s| !s.is_empty());
+            return Err(ConnectError::VersionMismatch(detail.unwrap_or_else(|| {
+                format!("server is a different version than this client ({client_version}) — restart the server")
+            })));
+        }
+        Err(e) => return Err(ConnectError::Down(e.into())),
+    };
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (notif_tx, notif_rx) = mpsc::unbounded_channel();
     tokio::spawn(actor(ws, req_rx, notif_tx));
@@ -192,5 +231,57 @@ async fn actor(
             code: 0,
             message: "connection closed".into(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A `426 Upgrade Required` on the handshake (the server's version gate) must classify as the
+    /// terminal `VersionMismatch`, carrying the server's message — not as retryable `Down`. This is
+    /// what stops the client dialing a stale daemon forever.
+    #[tokio::test]
+    async fn version_mismatch_426_is_terminal_with_server_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await; // drain the client's upgrade request
+            let body = "version mismatch: server 9.9.9, client 0.0.1 — restart the server";
+            let resp = format!(
+                "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        let Err(err) = connect(&format!("ws://{addr}"), "0.0.1").await else {
+            panic!("426 must fail the dial");
+        };
+        match err {
+            ConnectError::VersionMismatch(m) => assert!(
+                m.contains("restart the server"),
+                "message should guide the user to restart, got: {m}"
+            ),
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    /// A plain dial failure (nothing listening) stays retryable — a version mismatch must be the
+    /// *only* thing that gives up, so a briefly-not-yet-up daemon still gets waited out.
+    #[tokio::test]
+    async fn refused_connection_is_down_not_fatal() {
+        // Bind then drop, so the port is known-closed (reliable connection-refused, no privileged port).
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let Err(err) = connect(&format!("ws://{addr}"), "0.0.1").await else {
+            panic!("closed port must fail the dial");
+        };
+        assert!(matches!(err, ConnectError::Down(_)), "got {err:?}");
     }
 }

@@ -92,7 +92,23 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+    drain_terminal_input();
     Ok(())
+}
+
+/// Discard any bytes the terminal queued as input but we never read. Mouse tracking (enabled for the
+/// whole session, including the pre-connection "Connecting…" splash) makes the terminal stream
+/// motion reports; if the app exits while some are still queued — a fast fatal boot, or plain
+/// mouse movement during teardown — those bytes outlive us and the shell that regains the terminal
+/// reads them as a garbled command (`^[[<35;208;51M` → "command not found"). Flush the input queue
+/// *after* mouse capture is disabled so nothing leaks. Safe: a raw-mode full-screen app accumulates
+/// no shell-bound type-ahead, so there's nothing legitimate to preserve.
+fn drain_terminal_input() {
+    // SAFETY: `tcflush` on the stdin fd is a simple libc call with no memory effects; TCIFLUSH
+    // discards unread input only (never our already-written output).
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
 }
 
 fn install_panic_hook() {
@@ -106,6 +122,7 @@ fn install_panic_hook() {
             SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen
         );
+        drain_terminal_input();
         original(info);
     }));
 }
