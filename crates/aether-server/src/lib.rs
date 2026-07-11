@@ -18,6 +18,7 @@ mod picker;
 mod server;
 mod sneak;
 mod state;
+mod status;
 mod surround;
 mod syntax;
 mod watcher;
@@ -33,3 +34,4 @@ pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_multi,
     spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions, ServerHandle,
 };
+pub use status::{fetch_status, ServerStatus};

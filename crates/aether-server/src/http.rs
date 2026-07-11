@@ -64,7 +64,7 @@ pub async fn route(stream: TcpStream, state: SharedState) -> anyhow::Result<()> 
     if is_websocket_upgrade(&head[..n]) {
         crate::connection::handle(stream, state).await
     } else {
-        serve_http(stream).await
+        serve_http(stream, state).await
     }
 }
 
@@ -93,7 +93,7 @@ fn is_websocket_upgrade(head: &[u8]) -> bool {
     find_subslice(&head.to_ascii_lowercase(), b"sec-websocket-key").is_some()
 }
 
-async fn serve_http(mut stream: TcpStream) -> anyhow::Result<()> {
+async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let request = read_request_head(&mut stream).await?;
 
     // Reject anything whose `Host` isn't our loopback authority — a DNS-rebound request from a
@@ -110,7 +110,9 @@ async fn serve_http(mut stream: TcpStream) -> anyhow::Result<()> {
     let path = request_path(&request).unwrap_or("/");
     let path = path.split('?').next().unwrap_or("/");
 
-    let response = if path == "/" || path == "/index.html" {
+    let response = if path == "/status" {
+        status_response(&state).await
+    } else if path == "/" || path == "/index.html" {
         http_response("200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes())
     } else if let Some((bytes, content_type)) = path.strip_prefix('/').and_then(load_asset) {
         http_response("200 OK", content_type, &bytes)
@@ -120,6 +122,23 @@ async fn serve_http(mut stream: TcpStream) -> anyhow::Result<()> {
     stream.write_all(&response).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Serialize the [`crate::status::ServerStatus`] snapshot as JSON. The out-of-band diagnostic behind
+/// `ae server status`; behind the same loopback-authority guard as every other route.
+async fn status_response(state: &SharedState) -> Vec<u8> {
+    let status = {
+        let s = state.lock().await;
+        crate::status::ServerStatus::from_state(&s)
+    };
+    match serde_json::to_vec(&status) {
+        Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),
+        Err(_) => http_response(
+            "500 Internal Server Error",
+            "text/plain; charset=utf-8",
+            b"status serialization failed",
+        ),
+    }
 }
 
 /// Load a built asset by its URL-relative path (e.g. `assets/index.js`). Returns the bytes and a

@@ -38,7 +38,7 @@ struct Cli {
     /// Profile (separate instance) to use, e.g. `dev` alongside your daily one [default: default].
     ///
     /// Like browser profiles: each has its own config, sessions, and server on its own port. Also
-    /// read from `AETHER_PROFILE`. See `docs/profiles.md`.
+    /// read from `AETHER_PROFILE`.
     #[arg(short = 'p', long, global = true, env = "AETHER_PROFILE")]
     profile: Option<String>,
 }
@@ -87,6 +87,8 @@ struct ServerArgs {
 enum ServerCommand {
     /// Stop the running server for this profile.
     Stop,
+    /// Report whether the server for this profile is running, plus what it's doing.
+    Status,
 }
 
 #[derive(Args, Debug, Default)]
@@ -380,8 +382,10 @@ fn has_gui_display() -> bool {
 }
 
 fn run_server(args: ServerArgs) -> anyhow::Result<()> {
-    if let Some(ServerCommand::Stop) = args.command {
-        return stop_server();
+    match args.command {
+        Some(ServerCommand::Stop) => return stop_server(),
+        Some(ServerCommand::Status) => return server_status(),
+        None => {}
     }
     let filter = match args.log {
         Some(filter) => tracing_subscriber::EnvFilter::new(filter),
@@ -427,6 +431,117 @@ fn terminate(pid: u32) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn terminate(_pid: u32) -> anyhow::Result<()> {
     anyhow::bail!("`ae server stop` is not supported on this platform")
+}
+
+/// `ae server status` — report whether the server for the active profile is running, plus what it's
+/// doing. Two signals, cheapest first: a pid file (with a liveness check) and a port probe always
+/// print — they work even against a wedged server. When the port actually answers, we additionally
+/// fetch the live `/status` summary (version, clients, buffers, unsaved) over a plain loopback HTTP
+/// GET, and degrade gracefully to the local-only view if that fetch fails.
+fn server_status() -> anyhow::Result<()> {
+    let profile = aether_server::active_profile();
+    let pid = aether_server::running_server_pid()?;
+
+    // No recorded port means the profile was never used (a port is recorded on first start), so
+    // there's nothing running and nothing to probe.
+    let Some(port) = active_profile_port()? else {
+        println!("server: stopped  (profile '{profile}' — never started)");
+        return Ok(());
+    };
+
+    let listening = server_is_up(port);
+    match (pid, listening) {
+        (None, false) => {
+            println!("server: stopped  (profile '{profile}', port {port})");
+            return Ok(());
+        }
+        // pid alive but the port won't accept: a server that's wedged, still booting, or being
+        // shadowed by a foreign process on its port. Report it distinctly from a clean stop.
+        (Some(pid), false) => {
+            println!(
+                "server: unhealthy  (profile '{profile}', pid {pid} alive but port {port} not \
+                 accepting connections)"
+            );
+            return Ok(());
+        }
+        // Port answers → running. Fall through to the detailed report.
+        (_, true) => {}
+    }
+
+    let pid_note = pid.map(|p| format!(", pid {p}")).unwrap_or_default();
+    println!("server: running  (profile '{profile}', port {port}{pid_note})");
+
+    match aether_server::fetch_status(port) {
+        Ok(s) => {
+            // Our own build version equals what we'd announce on connect (both are the workspace
+            // version); a mismatch is exactly what the handshake version gate would reject.
+            let mine = env!("CARGO_PKG_VERSION");
+            if s.version == mine {
+                println!("  version:    {}", s.version);
+            } else {
+                println!(
+                    "  version:    {} — this `ae` is {mine}; run `ae server stop` to pick up the \
+                     new build",
+                    s.version
+                );
+            }
+            println!("  uptime:     {}", format_uptime(s.started_at_unix_ms));
+            println!("  clients:    {}", s.clients);
+            if s.buffers_unsaved > 0 {
+                println!(
+                    "  buffers:    {} open, {} unsaved",
+                    s.buffers_open, s.buffers_unsaved
+                );
+            } else {
+                println!("  buffers:    {} open", s.buffers_open);
+            }
+            println!("  workspaces: {}", s.workspaces_active);
+            match s.idle_timeout_secs {
+                Some(secs) => println!("  mode:       auto-started (reaps after {secs}s idle)"),
+                None => println!("  mode:       persistent (`ae server`)"),
+            }
+        }
+        Err(e) => println!("  (running, but live details unavailable: {e})"),
+    }
+    Ok(())
+}
+
+/// The active profile's recorded port, or `None` if the profile has no `profile.toml` yet. Unlike
+/// [`aether_server::ensure_profile_port`], this never *creates* a profile — asking for status must
+/// not have the side effect of allocating a port.
+fn active_profile_port() -> anyhow::Result<Option<u16>> {
+    let profile = aether_server::active_profile();
+    Ok(aether_server::list_profiles()?
+        .into_iter()
+        .find(|p| p.name == profile)
+        .map(|p| p.port))
+}
+
+/// Format a server's uptime from its start stamp (unix ms) for the status line. Coarse on purpose —
+/// whole seconds, with the largest two units shown.
+fn format_uptime(started_at_unix_ms: u64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(started_at_unix_ms);
+    format_duration_secs(now_ms.saturating_sub(started_at_unix_ms) / 1000)
+}
+
+/// Render a whole-second duration as at most the two largest non-zero units (`3d 4h`, `5m 12s`).
+fn format_duration_secs(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn run_tui(
@@ -566,6 +681,16 @@ mod tests {
             Some("/tmp/.mount_kitty1".into()),
         );
         assert_eq!(exe, std::path::Path::new("/usr/local/bin/ae"));
+    }
+
+    #[test]
+    fn duration_shows_the_two_largest_units() {
+        assert_eq!(format_duration_secs(0), "0s");
+        assert_eq!(format_duration_secs(42), "42s");
+        assert_eq!(format_duration_secs(90), "1m 30s");
+        assert_eq!(format_duration_secs(3_600), "1h 0m");
+        assert_eq!(format_duration_secs(3_661), "1h 1m");
+        assert_eq!(format_duration_secs(90_000), "1d 1h");
     }
 
     #[test]

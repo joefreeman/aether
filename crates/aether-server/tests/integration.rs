@@ -24384,3 +24384,51 @@ async fn saving_clears_the_backup() {
     );
     drop(server);
 }
+
+/// The `/status` HTTP endpoint reports the live server snapshot that `ae server status` prints:
+/// connected clients, open/unsaved buffer counts, the build version, and (for a test server) the
+/// persistent no-idle-timeout mode. The fetch runs on a blocking thread so the current-thread test
+/// runtime is free to service the server task while the synchronous GET is in flight.
+#[tokio::test]
+async fn status_endpoint_reports_clients_and_unsaved_buffers() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    let port = server.port;
+
+    // Baseline: one client, one open buffer, nothing dirty yet.
+    let before = tokio::task::spawn_blocking(move || aether_server::fetch_status(port))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.version, aether_protocol::PROTOCOL_VERSION);
+    assert_eq!(before.clients, 1);
+    assert_eq!(before.buffers_open, 1);
+    assert_eq!(before.buffers_unsaved, 0);
+    assert_eq!(before.workspaces_active, 1);
+    assert_eq!(
+        before.idle_timeout_secs, None,
+        "test servers run persistent (no idle reaper)"
+    );
+
+    // Type into the buffer → it goes dirty, and the unsaved count reflects it.
+    let _typed: EditResult = send_request::<InputText>(
+        &mut ws,
+        100,
+        &InputTextParams {
+            buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let after = tokio::task::spawn_blocking(move || aether_server::fetch_status(port))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.buffers_open, 1);
+    assert_eq!(after.buffers_unsaved, 1);
+
+    drop(server);
+}

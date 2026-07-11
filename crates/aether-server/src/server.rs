@@ -83,9 +83,14 @@ pub async fn run_with_listener(
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    // No-op when the watcher's already running (e.g. `spawn_for_test` initialized it ahead of
-    // the run task to register workspace paths synchronously).
-    let already_started = state.lock().await.watcher.is_some();
+    // Record the reaper setting so `/status` can report persistent vs. auto-started, and no-op the
+    // watcher spawn when it's already running (e.g. `spawn_for_test` initialized it ahead of the
+    // run task to register workspace paths synchronously).
+    let already_started = {
+        let mut s = state.lock().await;
+        s.idle_timeout = idle_timeout;
+        s.watcher.is_some()
+    };
     if !already_started {
         if let Err(e) = watcher::spawn(state.clone()).await {
             tracing::warn!(error = %e, "file watcher failed to start; continuing without it");
