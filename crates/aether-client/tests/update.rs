@@ -2753,7 +2753,7 @@ fn workspaces_delete_confirms_then_deletes_and_guards_active() {
 }
 
 #[test]
-fn buffers_picker_ctrl_d_closes_in_place() {
+fn buffers_picker_close_closes_in_place() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
 
@@ -2813,7 +2813,7 @@ fn buffers_picker_ctrl_d_closes_in_place() {
         "closing the active buffer opens its MRU successor"
     );
 
-    // A dirty buffer: Ctrl-d stages a discard confirm and sends nothing yet.
+    // A dirty buffer: closing it stages a discard confirm and sends nothing yet.
     s.picker.as_mut().unwrap().selected = 2;
     let fx = s.picker_close_buffer();
     assert!(
@@ -2832,6 +2832,84 @@ fn buffers_picker_ctrl_d_closes_in_place() {
     let close = find_request(&fx, "buffer/close").expect("buffer/close fired on confirm");
     assert_eq!(close["buffer_id"], json!(9));
     assert_eq!(close["open_next"], json!(false));
+}
+
+/// The Buffers-picker close chord is `Ctrl-x` (mirroring the editor's `Space x`), not `Ctrl-d`
+/// (which trashes files in the other pickers). Closing the *active* buffer switches the editor to a
+/// successor but keeps the picker open — the user is still working the list.
+#[test]
+fn buffers_picker_ctrl_x_closes_active_buffer_and_keeps_picker_open() {
+    use aether_client::update::Event;
+    use aether_protocol::buffer::BufferOpenResult;
+    use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
+
+    fn buf(buffer_id: u64, display: &str) -> PickerItem {
+        PickerItem::Buffer {
+            buffer_id,
+            display: display.into(),
+            status: BufferDirtyState::Clean,
+            path_index: None,
+            relative_path: None,
+            match_indices: vec![],
+            transient: false,
+            dormant: false,
+        }
+    }
+
+    let mut s = session();
+    // The active editor buffer is id 0 (placeholder default).
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![buf(0, "active.rs"), buf(7, "other.rs")];
+        p.offset = 0;
+        p.total_matches = 2;
+        p.selected = 0; // the active buffer
+    }
+
+    // Ctrl-d no longer closes here — it's the delete-file gesture reserved for the other pickers.
+    let fx = ctrl(&mut s, 'd');
+    assert!(
+        find_request(&fx, "buffer/close").is_none(),
+        "Ctrl-d must not close a buffer in the Buffers picker"
+    );
+    assert!(
+        s.picker.is_some(),
+        "an unhandled chord leaves the picker open"
+    );
+
+    // Ctrl-x closes the highlighted (active) buffer, attaching its MRU successor via open_next.
+    let fx = ctrl(&mut s, 'x');
+    let close = find_request(&fx, "buffer/close").expect("Ctrl-x fires buffer/close");
+    assert_eq!(close["buffer_id"], json!(0));
+    assert_eq!(close["open_next"], json!(true));
+
+    // When the successor switch resolves, the editor rebinds to it *and the picker stays open* — a
+    // switch no longer tears the picker down (see `adopt_switch`); the pick path owns that.
+    let successor = BufferOpenResult {
+        buffer_id: 7,
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: Some("/proj/other.rs".into()),
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None,
+        transient: false,
+        search_summary: None,
+    };
+    let _ = s.on_event(Event::Switched(Ok(successor)));
+    assert_eq!(
+        s.buffer.buffer_id, 7,
+        "editor rebinds to the successor buffer"
+    );
+    assert!(
+        s.picker.is_some(),
+        "closing the active buffer from the picker keeps the picker open"
+    );
 }
 
 #[test]

@@ -111,7 +111,9 @@ pub enum Event {
     CutDone(Result<BufferCutResult, String>),
     /// The shell read the system clipboard for a paste gesture.
     ClipboardRead(PasteKind, Option<String>),
-    /// A buffer switch resolved (close, new scratch, path opens): rebind to this buffer.
+    /// A buffer switch resolved (close, new scratch, path opens): rebind to this buffer. An open
+    /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
+    /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
     /// A grep-driven switch: like [`Event::Switched`] but priming the buffer search with the
     /// grep query (and its match options) so `n`/`Alt-n` step matches the way the grep did.
@@ -1485,8 +1487,14 @@ impl Session {
     }
 
     /// Rebind the session to a freshly opened buffer: reset all per-buffer state (modal,
-    /// diagnostics, viewport binding, prompts/pickers — an externally-triggered switch can
-    /// land mid-pick) and ask the shell to resubscribe. Search history survives switches.
+    /// diagnostics, viewport binding, prompt — an externally-triggered switch can land mid-pick)
+    /// and ask the shell to resubscribe. Search history survives switches.
+    ///
+    /// An open picker is deliberately *not* torn down here — rebinding the buffer doesn't own the
+    /// picker's lifecycle. The pick→open path closes its own picker explicitly ([`Self::picker_accept`]),
+    /// and a picker-initiated close of the active buffer wants the list kept open. A buffer-scoped
+    /// picker (outline, diagnostics) that should dismiss on a buffer change is the picker's own call,
+    /// not a side effect of the switch.
     pub fn adopt_switch(&mut self, open: BufferOpenResult) -> Effects {
         self.mode = Mode::Normal;
         self.pending = Pending::None;
@@ -1501,7 +1509,6 @@ impl Session {
         self.blame = None;
         self.blame_requested = None;
         self.prompt = None;
-        self.picker = None;
         let history = std::mem::take(&mut self.search.history);
         self.search = SearchState {
             history,
@@ -3083,11 +3090,12 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
-            // Ctrl-d in the Buffers picker closes the highlighted row in place (no open) — a live
-            // buffer or a dormant (session-restored) one alike, the server resolves which. `Ctrl-w`
-            // is the obvious mnemonic but the browser swallows it, so `Ctrl-d` matches the
-            // delete-in-picker gesture used by Files/Explorer/Workspaces above.
-            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
+            // Ctrl-x in the Buffers picker closes the highlighted row in place (no open) — a live
+            // buffer or a dormant (session-restored) one alike, the server resolves which. Mirrors
+            // the editor's own `Space x` close, and stays clear of the `Ctrl-d` delete-file gesture
+            // the other pickers use above — closing a buffer drops it from the list, it doesn't
+            // delete anything on disk. The picker stays open (see `picker_close_buffer`).
+            KeyCode::Char('x') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 return self.picker_close_buffer();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
@@ -4227,8 +4235,9 @@ impl Session {
 
     /// Fire `buffer/close` for a buffer chosen in the picker. `open_next` is set only when the
     /// closed buffer is the editor's active one — then the server attaches the viewport to the next
-    /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the
-    /// editor untouched. Either way the picker re-lists from the server's refresh push.
+    /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the editor
+    /// untouched. Either way the picker stays open and re-lists from the server's refresh push (the
+    /// switch doesn't tear it down — see [`Self::adopt_switch`]).
     fn close_picker_buffer(&mut self, buffer_id: BufferId) -> Effects {
         let closing_active = buffer_id == self.buffer.buffer_id;
         self.request_str::<BufferClose>(
