@@ -69,7 +69,7 @@ impl RpcMethod for InputDelete {
 /// `input/delete` *except* for whole-line selections (the line-oriented normal form: anchor at
 /// col 0, cursor on the trailing newline) — there it leaves one empty line to type into rather
 /// than deleting the final newline and joining onto the next line. A multi-line whole-line
-/// selection collapses to a single empty line. Normal-mode `Ctrl-a`.
+/// selection collapses to a single empty line. Normal-mode `Ctrl-e`.
 pub struct InputChange;
 impl RpcMethod for InputChange {
     const NAME: &'static str = "input/change";
@@ -160,7 +160,7 @@ impl RpcMethod for InputDedent {
 
 // ---- input/adjust_number ------------------------------------------------------------------------
 
-/// Adjust the selected integer by `delta` (signed): `Ctrl-e` sends `+count`, `Ctrl-Alt-e` sends
+/// Adjust the selected integer by `delta` (signed): `Ctrl-a` sends `+count`, `Ctrl-Alt-a` sends
 /// `-count`. Selection-only with no scanning: the operand is exactly the selected chars (a point
 /// cursor being the single char under the block), so an unselected `-` or neighbouring digit is
 /// never swept in. A leading `-` *within* the selection is the number's sign, and a zero-padded

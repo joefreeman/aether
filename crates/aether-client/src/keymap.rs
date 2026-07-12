@@ -771,7 +771,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('n'), IgnoreShift(Mods::NONE), A::SearchCycle(Direction::Forward), "Search", "Next match"),
 
     // ---- selection editing / clipboard ----
-    bind!(N, ch('a'), Exact(Mods::CTRL), A::Change, "Edit", "Change selection"),
+    bind!(N, ch('e'), Exact(Mods::CTRL), A::Change, "Edit", "Change selection"),
     bind!(N, ch('d'), Exact(Mods::CTRL), A::DeleteSelection, "Edit", "Delete selection"),
     bind!(N, ch('c'), Exact(Mods::CTRL), A::Copy, "Clipboard", "Copy selection"),
     bind!(N, ch('x'), Exact(Mods::CTRL), A::Cut, "Clipboard", "Cut selection"),
@@ -800,9 +800,11 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines, "Edit", "Join lines"),
     bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent, "Edit", "Indent"),
     bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent, "Edit", "Dedent"),
-    // Global (checked before the Normal table) so these win over the `e` word-end motion there.
-    bind!(G, ch('e'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Increment number"),
-    bind!(G, ch('e'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Decrement number"),
+    // Mode-agnostic (Global so they fire in Insert too); the mode-specific Change/ChangeLine
+    // pair sits on Ctrl-e in NORMAL/INSERT. Global is checked before the mode tables, so these
+    // Ctrl-a chords win everywhere.
+    bind!(G, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Increment number"),
+    bind!(G, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Decrement number"),
     bind!(G, ch('o'), Exact(Mods::CTRL), A::OpenLineBelow, "Edit", "Open line below"),
     bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
     // Mode-agnostic edits (same action in Normal and Insert) live here rather than being split
@@ -823,7 +825,7 @@ static INSERT: &[Binding] = &[
     bind!(I, KeyCode::Down, Any, A::MoveVisualLine(VerticalDirection::Down), "Motion", "Cursor down"),
     // Line-scoped editing mirrors Normal's selection-scoped Ctrl column on the same keys (Insert
     // has no selection to act on); the mode-agnostic Ctrl-f comes from GLOBAL.
-    bind!(I, ch('a'), Exact(Mods::CTRL), A::ChangeLine, "Edit", "Change line"),
+    bind!(I, ch('e'), Exact(Mods::CTRL), A::ChangeLine, "Edit", "Change line"),
     bind!(I, ch('d'), Exact(Mods::CTRL), A::DeleteLine, "Edit", "Delete line"),
     bind!(I, ch('c'), Exact(Mods::CTRL), A::CopyLine, "Clipboard", "Copy line"),
     bind!(I, ch('x'), Exact(Mods::CTRL), A::CutLine, "Clipboard", "Cut line"),
@@ -1083,9 +1085,9 @@ mod tests {
                 boundary: WordBoundary::Word
             })
         ));
-        // Ctrl-e is not a Normal binding — it's GLOBAL's IncrementNumber. The old `Any` catch-all
-        // matched it here too, working only because GLOBAL is looked up first.
-        assert!(e(Mods::CTRL).is_none());
+        // Ctrl-e is the Normal-mode Change binding (selection-editing sibling of Ctrl-d);
+        // increment/decrement now live on Ctrl-a in GLOBAL.
+        assert!(matches!(e(Mods::CTRL), Some(Action::Change)));
     }
 
     #[test]

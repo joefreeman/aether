@@ -9225,8 +9225,8 @@ fn resolve_number_edit(
         .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
 }
 
-/// `Ctrl-e` / `Ctrl-Alt-e`: shift the cursor's number by `delta` in a single edit (so `3` +
-/// `Ctrl-e` is one undo step adding 3). Prechecks for a number at/after the cursor so a miss is a
+/// `Ctrl-a` / `Ctrl-Alt-a`: shift the cursor's number by `delta` in a single edit (so `3` +
+/// `Ctrl-a` is one undo step adding 3). Prechecks for a number at/after the cursor so a miss is a
 /// clean no-op rather than an empty undo entry, mirroring `input_unsurround`.
 pub async fn input_adjust_number(
     state: &SharedState,
@@ -10143,7 +10143,7 @@ enum EditKind {
     /// `position`. Used by Normal-mode `Ctrl-d` / `Delete` / `Ctrl-c`, and by Insert-mode
     /// `Delete` (forward).
     DeleteSelection,
-    /// Change the current selection (Normal-mode `Ctrl-a`): same range as `DeleteSelection`,
+    /// Change the current selection (Normal-mode `Ctrl-e`): same range as `DeleteSelection`,
     /// except a whole-line selection (the line-oriented normal form — anchor at col 0, cursor on
     /// the trailing newline) keeps its final newline, leaving one empty line to type into rather
     /// than joining onto the next line. The client enters Insert mode after the edit.
@@ -10154,7 +10154,7 @@ enum EditKind {
     Backspace,
     /// Delete the cursor's whole line — content and trailing newline. Insert-mode `Ctrl-d`.
     DeleteLine,
-    /// Blank the cursor's line — content only, newline preserved. Insert-mode `Ctrl-c`.
+    /// Blank the cursor's line — content only, newline preserved. Insert-mode `Ctrl-e`.
     ChangeLine,
     /// Replace the cursor's line (content + newline) with `text`. Insert-mode `Ctrl-r`.
     ReplaceLine { text: String },
@@ -10167,7 +10167,7 @@ enum EditKind {
     /// with the inner text. `line` matches `Surround`. `input_unsurround` guarantees a valid pair
     /// exists before issuing this — the no-op case never reaches here.
     Unsurround { line: bool },
-    /// Shift the integer at/after the cursor by `delta` (`Ctrl-e` / `Ctrl-Alt-e`). The number is
+    /// Shift the integer at/after the cursor by `delta` (`Ctrl-a` / `Ctrl-Alt-a`). The number is
     /// scanned from the selection's leading edge (or the point cursor) within its line and replaced
     /// in place; the post-edit cursor selects the whole result, so the selection tracks the digit
     /// count and repeated presses stay on the number. `input_increment_number` guarantees a number

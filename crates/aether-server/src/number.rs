@@ -1,4 +1,4 @@
-//! Increment/decrement a number (`Ctrl-e` / `Ctrl-Alt-e`).
+//! Increment/decrement a number (`Ctrl-a` / `Ctrl-Alt-a`).
 //!
 //! Two operand modes, chosen by the caller (see `handlers::resolve_number_edit`):
 //! - **Normal mode**: the caller passes the exact selected text (a point cursor being the one char

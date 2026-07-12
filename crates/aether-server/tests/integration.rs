@@ -7059,7 +7059,7 @@ async fn decrement_crosses_zero_into_negative() {
 
 #[tokio::test]
 async fn increment_count_applies_in_one_step() {
-    // `5 Ctrl-e` adds 5 in a single undoable edit; one undo restores the original.
+    // `5 Ctrl-a` adds 5 in a single undoable edit; one undo restores the original.
     let (server, mut ws, buffer_id) = setup_with_buffer("v 10\n").await;
     // Select the whole `10` (cols 2–3).
     send_request::<CursorSet>(
@@ -23621,13 +23621,13 @@ async fn sneak_big_word_selects_whole_run() {
     drop(server);
 }
 
-// ---- input/change (Normal-mode `Ctrl-a`) --------------------------------------------------------
+// ---- input/change (Normal-mode `Ctrl-e`) --------------------------------------------------------
 // `Change` shares `DeleteSelection`'s range *except* over a whole-line selection (the `x` normal
 // form: anchor at col 0, cursor on the trailing newline), where it keeps the final newline so you
 // land on an empty line to type into rather than joining onto the next line. The client flips to
 // Insert mode after the edit; these tests cover the server-side range/cursor outcome.
 
-/// `x Ctrl-a` on a single line blanks it and leaves the cursor on the now-empty line — the
+/// `x Ctrl-e` on a single line blanks it and leaves the cursor on the now-empty line — the
 /// trailing newline survives, so the line below is untouched.
 #[tokio::test]
 async fn change_over_whole_line_selection_leaves_empty_line() {
@@ -23746,7 +23746,7 @@ async fn change_over_multi_line_selection_collapses_to_one_empty_line() {
     drop(server);
 }
 
-/// `x Ctrl-a` on an empty line is a no-op that stays put (ready to type), while `x Ctrl-d` removes
+/// `x Ctrl-e` on an empty line is a no-op that stays put (ready to type), while `x Ctrl-d` removes
 /// the line. Both run on the same buffer to show the divergence.
 #[tokio::test]
 async fn change_keeps_empty_line_while_delete_removes_it() {
