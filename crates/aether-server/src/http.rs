@@ -123,7 +123,11 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
     let response = if path == "/status" {
         status_response(&state).await
     } else if path == "/" || path == "/index.html" {
-        http_response("200 OK", "text/html; charset=utf-8", index_html().as_bytes())
+        http_response(
+            "200 OK",
+            "text/html; charset=utf-8",
+            index_html().as_bytes(),
+        )
     } else if let Some((bytes, content_type)) = path.strip_prefix('/').and_then(load_asset) {
         http_response("200 OK", content_type, &bytes)
     } else {
@@ -303,7 +307,10 @@ mod tests {
         let html = index_html();
         // The placeholder is fully substituted for the real version, in a readable meta tag the web
         // client can query — this is the contract `web/src/client.ts` relies on for reload detection.
-        assert!(!html.contains("__AETHER_VERSION__"), "placeholder left unsubstituted");
+        assert!(
+            !html.contains("__AETHER_VERSION__"),
+            "placeholder left unsubstituted"
+        );
         assert!(html.contains(&format!(
             r#"<meta name="aether-version" content="{}" />"#,
             aether_protocol::PROTOCOL_VERSION
