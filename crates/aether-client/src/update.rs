@@ -3100,12 +3100,17 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
-            // Ctrl-x in the Buffers picker closes the highlighted row in place (no open) — a live
-            // buffer or a dormant (session-restored) one alike, the server resolves which. Mirrors
-            // the editor's own `Space x` close, and stays clear of the `Ctrl-d` delete-file gesture
-            // the other pickers use above — closing a buffer drops it from the list, it doesn't
-            // delete anything on disk. The picker stays open (see `picker_close_buffer`).
-            KeyCode::Char('x') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
+            // Ctrl-d in the Buffers picker closes the highlighted row in place (no open) — a live
+            // buffer or a dormant (session-restored) one alike, the server resolves which. It shares
+            // the `Ctrl-d` key with the delete-file gesture above but not the kind (Buffers vs
+            // Files/Explorer/Workspaces), so the two guards stay disjoint; closing a buffer just
+            // drops it from the list, it doesn't delete anything on disk. The picker stays open (see
+            // `picker_close_buffer`). NOT `Ctrl-x` (tempting for the `Space x` mnemonic): every GUI
+            // shell's focused query input claims Ctrl-x as its native Cut and swallows it before the
+            // core ever sees it — the iced forward gate in `app.rs` only forwards keys the input left
+            // uncaptured, and the web `routeOverlayKey` clip filter drops Ctrl-c/v/x/a outright. Only
+            // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 return self.picker_close_buffer();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).

@@ -2858,11 +2858,13 @@ fn buffers_picker_close_closes_in_place() {
     assert_eq!(close["open_next"], json!(false));
 }
 
-/// The Buffers-picker close chord is `Ctrl-x` (mirroring the editor's `Space x`), not `Ctrl-d`
-/// (which trashes files in the other pickers). Closing the *active* buffer switches the editor to a
-/// successor but keeps the picker open — the user is still working the list.
+/// The Buffers-picker close chord is `Ctrl-d` (the delete-file gesture in the other pickers, free
+/// here because the guards are keyed by picker kind). It is deliberately NOT `Ctrl-x`: every GUI
+/// shell's focused query input claims Ctrl-x as its native Cut and swallows it before the core sees
+/// it, so Ctrl-x would only ever work in the TUI. Closing the *active* buffer switches the editor to
+/// a successor but keeps the picker open — the user is still working the list.
 #[test]
-fn buffers_picker_ctrl_x_closes_active_buffer_and_keeps_picker_open() {
+fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
     use aether_client::update::Event;
     use aether_protocol::buffer::BufferOpenResult;
     use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
@@ -2891,20 +2893,21 @@ fn buffers_picker_ctrl_x_closes_active_buffer_and_keeps_picker_open() {
         p.selected = 0; // the active buffer
     }
 
-    // Ctrl-d no longer closes here — it's the delete-file gesture reserved for the other pickers.
-    let fx = ctrl(&mut s, 'd');
+    // Ctrl-x is deliberately NOT the close chord — the GUI shells' query inputs eat it as Cut, so it
+    // must be a no-op in the core rather than a chord that only fires in the TUI.
+    let fx = ctrl(&mut s, 'x');
     assert!(
         find_request(&fx, "buffer/close").is_none(),
-        "Ctrl-d must not close a buffer in the Buffers picker"
+        "Ctrl-x must not close a buffer in the Buffers picker"
     );
     assert!(
         s.picker.is_some(),
         "an unhandled chord leaves the picker open"
     );
 
-    // Ctrl-x closes the highlighted (active) buffer, attaching its MRU successor via open_next.
-    let fx = ctrl(&mut s, 'x');
-    let close = find_request(&fx, "buffer/close").expect("Ctrl-x fires buffer/close");
+    // Ctrl-d closes the highlighted (active) buffer, attaching its MRU successor via open_next.
+    let fx = ctrl(&mut s, 'd');
+    let close = find_request(&fx, "buffer/close").expect("Ctrl-d fires buffer/close");
     assert_eq!(close["buffer_id"], json!(0));
     assert_eq!(close["open_next"], json!(true));
 
