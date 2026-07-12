@@ -351,7 +351,9 @@ impl Session {
                 let mut fx = if r.applied {
                     Effects::none()
                 } else {
-                    Effects::toast("Nothing to undo or redo", ToastKind::Info)
+                    // Grouped so mashing undo/redo at the ends of the stack updates one toast
+                    // in place instead of stacking duplicates on every shell.
+                    Effects::toast_grouped("Nothing to undo or redo", ToastKind::Info, "undo-redo")
                 };
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
@@ -418,7 +420,10 @@ impl Session {
                 self.push_history(query);
                 fx
             }
-            Event::SwitchedPrimed(Ok(None)) => Effects::toast("No more grep hits", ToastKind::Info),
+            Event::SwitchedPrimed(Ok(None)) => {
+                // Grouped so repeatedly stepping past the last hit coalesces to one toast.
+                Effects::toast_grouped("No more grep hits", ToastKind::Info, "grep-nav")
+            }
             Event::SwitchedPrimed(Err(e)) => Effects::error(e),
 
             Event::PromptAccept => self.accept_prompt(),
@@ -445,7 +450,9 @@ impl Session {
                     truncated: false,
                     current_index: 0,
                 });
-                Effects::toast("Invalid regex", ToastKind::Warning)
+                // Re-fires on every keystroke of an in-progress bad pattern; grouped so the shells
+                // refresh one toast in place rather than stacking one per key.
+                Effects::toast_grouped("Invalid regex", ToastKind::Warning, "search-error")
                     .and(self.revert_to_snapshot_cursor())
             }
 
@@ -487,13 +494,15 @@ impl Session {
             Event::NavDone { forward, result } => match result {
                 // Same-buffer step glides, cross-buffer step switches — see `adopt_navigation`.
                 Ok(NavStepResult { target: Some(open) }) => self.adopt_navigation(open),
-                Ok(_) => Effects::toast(
+                // Grouped so mashing back/forward at an end of the jump list updates one toast.
+                Ok(_) => Effects::toast_grouped(
                     if forward {
                         "No later location in history"
                     } else {
                         "No earlier location in history"
                     },
                     ToastKind::Info,
+                    "nav-history",
                 ),
                 Err(e) => Effects::error(e),
             },
@@ -1461,7 +1470,8 @@ impl Session {
         let mut fx = if moved {
             Effects::none()
         } else {
-            Effects::toast(exhausted, ToastKind::Info)
+            // Grouped so repeatedly stepping with nowhere left to go coalesces to one toast.
+            Effects::toast_grouped(exhausted, ToastKind::Info, "step-nav")
         };
         fx.push(Effect::RevealCursor(RevealStyle::Jump));
         fx
@@ -5200,7 +5210,12 @@ impl Session {
                 A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change | A::CutChange
             )
         {
-            return Effects::toast("Not connected — editing unavailable", ToastKind::Info);
+            // Grouped: each blocked keystroke while disconnected refreshes one hint, not a stack.
+            return Effects::toast_grouped(
+                "Not connected — editing unavailable",
+                ToastKind::Info,
+                "edit-blocked",
+            );
         }
         match action {
             // ---- motions ----

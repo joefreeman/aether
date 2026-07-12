@@ -1553,19 +1553,13 @@ impl App {
         group: Option<String>,
     ) -> Task<Message> {
         let message = message.into();
-        match &group {
-            // A grouped toast replaces any existing toast with the same key, so an evolving status
-            // (LSP restart → ready, the diff toggle) updates one toast in place.
-            Some(g) => self
-                .toasts
-                .retain(|t| t.group.as_deref() != Some(g.as_str())),
-            // Ungrouped: drop a repeat of the last message (incremental search re-reports "Invalid
-            // regex" on every keystroke).
-            None => {
-                if self.toasts.last().is_some_and(|t| t.message == message) {
-                    return Task::none();
-                }
-            }
+        // A grouped toast replaces any existing toast with the same key, so an evolving status
+        // (LSP restart → ready, the diff toggle) updates one toast in place. Ungrouped toasts
+        // stack; repeat-prone messages (search errors, nav boundaries) carry a group in the core,
+        // so this replacement is what coalesces them — uniformly across every shell.
+        if let Some(g) = &group {
+            self.toasts
+                .retain(|t| t.group.as_deref() != Some(g.as_str()));
         }
         let id = self.next_toast;
         self.next_toast += 1;

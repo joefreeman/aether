@@ -1524,6 +1524,30 @@ fn diff_toggle_toast_is_grouped() {
 }
 
 #[test]
+fn repeat_prone_toasts_carry_a_group_so_they_coalesce_on_every_shell() {
+    use aether_client::update::Event;
+    // Messages a user can re-trigger in quick succession — an invalid regex re-reported on every
+    // keystroke, stepping past the last grep hit — carry a stable group. Every shell replaces one
+    // toast in place by group, so these no longer stack. (The iced shell used to dedup ungrouped
+    // repeats locally; grouping in the core makes that behaviour uniform and shell-agnostic.)
+    let mut s = session();
+
+    // Invalid regex mid-type: keyed so successive bad keystrokes refresh one toast.
+    let fx = s.on_event(Event::SearchApplied(Err("trailing backslash".into())));
+    assert_eq!(
+        first_toast(&fx),
+        Some(("Invalid regex".into(), Some("search-error".into()))),
+    );
+
+    // Stepping past the last grep hit: keyed so mashing next-hit coalesces.
+    let fx = s.on_event(Event::SwitchedPrimed(Ok(None)));
+    assert_eq!(
+        first_toast(&fx),
+        Some(("No more grep hits".into(), Some("grep-nav".into()))),
+    );
+}
+
+#[test]
 fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     use aether_client::session::{ConnState, Mode};
     use aether_client::update::Event;
