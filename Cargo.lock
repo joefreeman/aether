@@ -26,7 +26,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-ae"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-iced",
  "aether-server",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "aether-client"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-protocol",
  "pulldown-cmark",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aether-iced"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-client",
  "aether-protocol",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "aether-protocol"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "aether-server"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-protocol",
  "anyhow",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tui"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-client",
  "aether-protocol",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "aether-web"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aether-client",
  "aether-protocol",
@@ -5012,7 +5012,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-quiver"
 version = "0.1.0"
-source = "git+https://github.com/joefreeman/quiver?branch=main#613393afff638d0acd43d9794ee9f079fc2e1e67"
+source = "git+https://github.com/joefreeman/quiver?branch=main#6386482cf4a771097304cf7cd4432f9589beab5d"
 dependencies = [
  "cc",
  "tree-sitter-language",
