@@ -3085,14 +3085,15 @@ fn app_settings_wire_shape_and_defaults() {
         wrap: WrapMode::None,
         ligatures: false,
         font_size: 16,
+        hints: false,
     };
     assert_eq!(
         to_value(s).unwrap(),
-        json!({ "wrap": "none", "ligatures": false, "font_size": 16 })
+        json!({ "wrap": "none", "ligatures": false, "font_size": 16, "hints": false })
     );
 
-    // A file with only `wrap` set (added before `ligatures`/`font_size`) reads back with those
-    // defaulting (ligatures on, font size at the default).
+    // A file with only `wrap` set (added before `ligatures`/`font_size`/`hints`) reads back with
+    // those defaulting (ligatures on, font size at the default, hints on).
     let parsed: AppSettings = from_value(json!({ "wrap": "none" })).unwrap();
     assert_eq!(parsed.wrap, WrapMode::None);
     assert!(parsed.ligatures);
@@ -3100,6 +3101,7 @@ fn app_settings_wire_shape_and_defaults() {
         parsed.font_size,
         aether_protocol::settings::default_font_size()
     );
+    assert!(parsed.hints, "hints default on");
 
     // An empty object (a fresh / older settings.toml with no keys) reads back as defaults — every
     // field carries a serde default so settings can be added without breaking old files.
@@ -3109,4 +3111,60 @@ fn app_settings_wire_shape_and_defaults() {
     // Full round-trip.
     let back: AppSettings = from_value(to_value(s).unwrap()).unwrap();
     assert_eq!(back, s);
+}
+
+#[test]
+fn hints_wire_shapes() {
+    use aether_protocol::hints::{
+        HintEvent, HintRecord, HintsRecord, HintsRecordParams, HintsRecordResult, HintsState,
+        HintsStateResult,
+    };
+
+    assert_eq!(HintsRecord::NAME, "hints/record");
+    assert_eq!(HintsState::NAME, "hints/state");
+
+    // Events serialize as snake_case string tags.
+    assert_eq!(to_value(HintEvent::Shown).unwrap(), json!("shown"));
+    assert_eq!(to_value(HintEvent::Used).unwrap(), json!("used"));
+    assert_eq!(to_value(HintEvent::Followed).unwrap(), json!("followed"));
+    assert_eq!(to_value(HintEvent::Dismissed).unwrap(), json!("dismissed"));
+
+    // hints/record params shape.
+    let p = HintsRecordParams {
+        hint_id: "picker-files".into(),
+        event: HintEvent::Followed,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "hint_id": "picker-files", "event": "followed" })
+    );
+
+    // The result's `retired` defaults false when absent (an older server saying just `{}`).
+    let r: HintsRecordResult = from_value(json!({})).unwrap();
+    assert!(!r.retired);
+
+    // Every record field carries a serde default so older files/servers parse forward.
+    let rec: HintRecord = from_value(json!({})).unwrap();
+    assert_eq!(rec, HintRecord::default());
+
+    // hints/state result shape: retired ids + keyed records; empty object = empty state.
+    let empty: HintsStateResult = from_value(json!({})).unwrap();
+    assert_eq!(empty, HintsStateResult::default());
+    let snap: HintsStateResult = from_value(json!({
+        "retired": ["quit"],
+        "active": {
+            "copy": { "uses": 2, "use_days": 1, "last_used_day": 20646,
+                      "last_used_at": 1783966210000u64,
+                      "shows_without_follow": 1.5, "last_shown_at": 1783966200000u64 }
+        }
+    }))
+    .unwrap();
+    assert_eq!(snap.retired, vec!["quit".to_string()]);
+    let copy = snap.active["copy"];
+    assert_eq!(copy.uses, 2);
+    assert!((copy.shows_without_follow - 1.5).abs() < f32::EPSILON);
+
+    // Full round-trip through the wire encoding.
+    let back: HintsStateResult = from_value(to_value(&snap).unwrap()).unwrap();
+    assert_eq!(back, snap);
 }

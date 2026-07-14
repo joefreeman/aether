@@ -283,6 +283,7 @@ pub enum AppSettingId {
     SoftWrap,
     Ligatures,
     FontSize,
+    Hints,
 }
 
 /// Editor font-size presets the [`AppSettingId::FontSize`] row steps through (px). The default
@@ -518,6 +519,10 @@ pub struct Session {
     /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
     /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
     pub font_size: u32,
+    /// Hints on/off — an app-wide setting (`Space .`), seeded from `settings/get` at
+    /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
+    /// hint disappears (and observation stops) when off.
+    pub hints_enabled: bool,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -548,6 +553,11 @@ pub struct Session {
     /// busy→idle `lsp/status_changed` blip doesn't spuriously toast. See the `LspStatusChanged`
     /// handler in [`crate::update`].
     pub(crate) lsp_restart_pending: std::collections::HashSet<String>,
+    /// The hint engine (docs/hints.md): curriculum progress, per-context display
+    /// slots, sampling. Dormant until the `hints/state` snapshot adopts, and gated by
+    /// [`Self::hints_enabled`]. Shells read [`crate::update`]'s `hint_view()` and drive
+    /// `on_hint_tick()`.
+    pub hints: crate::hints::HintEngine,
 }
 
 /// The toast group key identifying one LSP *server instance* — `language` + its `workspace_root`,
@@ -582,6 +592,7 @@ impl Session {
             wrap: WrapMode::Soft,
             ligatures: true,
             font_size: aether_protocol::settings::default_font_size(),
+            hints_enabled: true,
             diff_view: false,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
@@ -597,6 +608,7 @@ impl Session {
             conn: ConnState::Connected,
             relayout_anchor: None,
             lsp_restart_pending: std::collections::HashSet::new(),
+            hints: crate::hints::HintEngine::default(),
         }
     }
 
@@ -625,6 +637,12 @@ impl Session {
                     label: "Font size",
                     control: AppSettingControl::Value(self.font_size),
                     hint: "Editor text size in pixels (GUI/web; the terminal uses its own font)",
+                },
+                AppSettingRow {
+                    id: AppSettingId::Hints,
+                    label: "Hints",
+                    control: AppSettingControl::Toggle(self.hints_enabled),
+                    hint: "Suggest things to try in the corner (Space h dismisses one, Space Alt-h toggles)",
                 },
             ],
         }]
@@ -676,8 +694,9 @@ impl Session {
             .map(|a| a.reference_line(self.buffer.cursor.position))
     }
 
-    /// An inert stand-in for the boot chooser (no workspace picked yet): never rendered and
-    /// never addressed — `update_boot` owns every message while `App.boot` is set.
+    /// The boot chooser's session (no workspace picked yet): every shell raises the Workspaces
+    /// picker over one of these and renders its no-workspace view (no editor) behind it. Picking
+    /// a workspace activates it and the session adopts in place.
     pub fn placeholder() -> Self {
         Session::new(
             String::new(),

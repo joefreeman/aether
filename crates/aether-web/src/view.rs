@@ -54,6 +54,10 @@ pub fn build_view(s: &Session) -> Value {
         "picker": picker(&s.picker, &s.workspace_paths),
         "workspace_settings": workspace_settings(s),
         "app_settings": app_settings(s),
+        "hint": s.hint_view().map(|h| {
+            let (before, keys, after) = h.parts();
+            json!({ "before": before, "keys": keys, "after": after })
+        }),
     })
 }
 

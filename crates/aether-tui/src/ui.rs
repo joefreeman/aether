@@ -180,9 +180,54 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
         place_terminal_cursor(f, state, buffer_area, status_area);
     }
+    // The hint (docs/hints.md): a quiet top-right chip. Above overlays (a picker
+    // context's hints must show over the picker box) — it collides with nothing else up there.
+    draw_hint_corner(f, state, chunks[0]);
     // Transient toasts: stacked in the bottom-right of the content area (above the status row) over
     // everything, since they're ephemeral feedback. Drawn last so a modal never hides them.
     draw_toast_overlay(f, state, chunks[0]);
+}
+
+/// The hint corner (docs/hints.md): one quiet "Hint: …" line in the top-right of the content
+/// area — the key label in accent, the sentence dim, on the panel background. Deliberately
+/// subtler than a toast: ambient chrome, not a notification.
+fn draw_hint_corner(f: &mut Frame, state: &AppState, area: Rect) {
+    const MARGIN_X: u16 = 2;
+    const PREFIX: &str = "Hint: ";
+    let Some((before, keys, after)) = &state.hint else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let max_text = (area.width as usize).saturating_sub((MARGIN_X * 2 + 2) as usize);
+    let fixed = PREFIX.width() + before.width() + keys.width();
+    let mut after = after.clone();
+    if fixed + after.width() > max_text {
+        if fixed + 1 > max_text {
+            return; // no room at all — skip rather than render garbage
+        }
+        after = truncate_to_width(&after, max_text - fixed);
+    }
+    let box_w = (1 + fixed + after.width() + 1) as u16;
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(box_w + MARGIN_X),
+        y: area.y,
+        width: box_w,
+        height: 1,
+    };
+    f.render_widget(Clear, rect);
+    let tint = Style::default().bg(NORD1);
+    let dim = tint.fg(NORD3_BRIGHT);
+    let spans = vec![
+        Span::styled(" ".to_string(), tint),
+        Span::styled(PREFIX.to_string(), dim),
+        Span::styled(before.clone(), dim),
+        Span::styled(keys.clone(), tint.fg(NORD8)),
+        Span::styled(after, dim),
+        Span::styled(" ".to_string(), tint),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)).style(tint), rect);
 }
 
 /// Mute every cell in `area` to a faint grey on the base background — the modal backdrop. Keeps the
@@ -5886,6 +5931,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            hint: None,
             conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,

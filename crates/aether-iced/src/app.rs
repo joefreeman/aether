@@ -20,17 +20,14 @@ use crate::keymap::{
     hover_action, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit, ViewportPlace,
     CURSOR_REST_FRACTION,
 };
-use crate::picker::{PickerMsg, PickerState, Reveal, FETCH_LIMIT};
+use crate::picker::{PickerMsg, PickerState, Reveal};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::Granularity;
-use aether_protocol::envelope::{NotificationMethod, RpcMethod};
+use aether_protocol::envelope::RpcMethod;
 use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::lsp::LspStatus;
-use aether_protocol::picker::{
-    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerUpdate, PickerUpdateParams,
-    PickerView, PickerViewParams,
-};
+use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
@@ -39,8 +36,8 @@ use aether_protocol::viewport::{
     Window, WrapMode,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceCreate, WorkspaceCreateParams,
-    WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceOpenPath,
+    WorkspaceOpenPathParams,
 };
 use aether_protocol::{BufferId, LogicalPosition};
 use iced::widget::{column, container, row, text};
@@ -192,35 +189,6 @@ impl From<crate::connection::ConnectError> for BootError {
     }
 }
 
-/// Pre-session state: the workspace chooser shown on a no-args start. Owns the connection the
-/// session will be built over; all input routes through `update_boot` while this is set.
-struct Boot {
-    handle: Handle,
-    notifications: NotifRx,
-    picker: PickerState,
-    /// Byte caret into `picker.query`. The boot chooser predates the session, so it drives its own
-    /// keycode editing (fake-caret rendering) rather than the core's value-synced query — hence the
-    /// caret lives here, not on the (now caret-free) `PickerState`.
-    query_cursor: usize,
-    /// A workspace was picked and its activation is in flight — input is parked meanwhile.
-    opening: bool,
-    /// The connection died; a retry loop is dialling. Input is parked until it lands.
-    down: bool,
-}
-
-/// A fresh boot-chooser connection after its socket died.
-pub struct BootConn {
-    handle: Handle,
-    notifications: NotifRx,
-    server_started_at: u64,
-}
-
-impl std::fmt::Debug for BootConn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BootConn").finish_non_exhaustive()
-    }
-}
-
 /// The prompt buttons' message space (buttons need `Clone`, the app `Message` isn't).
 #[derive(Debug, Clone, Copy)]
 enum PromptMsg {
@@ -332,9 +300,6 @@ struct Toast {
 
 #[derive(Debug)]
 pub enum Message {
-    /// The boot chooser's pick resolved: the activated workspace, the buffer to land on, and the
-    /// server instance's start stamp (for restart detection once the session exists).
-    SessionReady(Result<Box<(WorkspaceInfo, BufferOpenResult, u64)>, String>),
     /// The boot-connect dial resolved (from the `Connecting` launch state): either a connected
     /// `Session`/`Choose` bootstrap to install, or a failure to retry (or, for a version mismatch,
     /// to surface and stop).
@@ -358,6 +323,10 @@ pub enum Message {
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
+    /// Periodic hint tick (docs/hints.md): stamps the wall clock into the core's hint
+    /// engine, which runs the corner hint's display timer. Subscribed only while a session with
+    /// hints enabled is connected.
+    HintTick,
     Subscribed(Result<ViewportSubscribeResult, String>),
     WindowUpdate(Result<ViewportWindowResult, String>),
 
@@ -374,15 +343,9 @@ pub enum Message {
     Notified(Option<aether_protocol::envelope::Notification>),
     /// A reconnect attempt resolved (the backoff sleep rides inside the attempt task).
     Reconnected(Result<Box<Reestablished>, ReconnectError>),
-    /// The boot chooser's reconnect attempt resolved.
-    BootReconnected(Result<BootConn, BootError>),
 }
 
 pub struct App {
-    /// The workspace chooser (no-args start). While set, `session` is an inert placeholder and
-    /// all messages route through `update_boot`; picking a workspace builds the real session
-    /// over the boot connection and clears this.
-    boot: Option<Boot>,
     /// Set while the app is in the boot-connecting state (`ConnState::Connecting`): the CLI args
     /// the dial task needs, retained so a failed attempt can retry. Cleared the moment a
     /// connection lands and the real session/chooser is installed. While `Some`, input is parked
@@ -427,9 +390,8 @@ pub struct App {
     /// Like `reveal_after_fetch`, but places the cursor at a fixed fraction down once its
     /// (out-of-window) line lands — for `;` / `Alt-;` when the line was scrolled out of the window.
     place_after_fetch: Option<ViewportPlace>,
-    /// The picker results list's scroll offset in px (boot chooser or session picker —
-    /// never both). The core tracks rows, not pixels; resets arrive as
-    /// `Effect::PickerScrollReset`.
+    /// The picker results list's scroll offset in px. The core tracks rows, not pixels; resets
+    /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
     /// The picker search throbber's rotation (radians), advanced from frame ticks while a search is
     /// in progress, with the time of the last tick so the step is frame-rate independent.
@@ -460,14 +422,12 @@ pub struct App {
 
 impl App {
     pub fn new(b: Bootstrap) -> (Self, Task<Message>) {
-        let shell = |boot: Option<Boot>,
-                     session: Session,
+        let shell = |session: Session,
                      handle: Handle,
                      notifications: NotifRx,
                      client_version: String,
                      server_url: String,
                      server_started_at: u64| App {
-            boot,
             boot_args: None,
             boot_attempt: 0,
             session,
@@ -512,7 +472,6 @@ impl App {
                 let mut session = Session::placeholder();
                 session.conn = ConnState::Connecting;
                 let mut app = shell(
-                    None,
                     session,
                     crate::connection::dummy_handle(),
                     crate::connection::dummy_notifications(),
@@ -530,7 +489,6 @@ impl App {
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
                 let mut app = shell(
-                    None,
                     session,
                     b.handle,
                     b.notifications,
@@ -542,58 +500,27 @@ impl App {
                 (app, Task::batch([pump, startup_task]))
             }
             Bootstrap::Choose(b) => {
-                // Open the Workspaces picker on the boot connection; the session is built over
-                // that same connection when the user picks a workspace (`SessionReady`). Until
-                // then `session` is an inert placeholder — `update_boot` owns every message.
+                // The core Workspaces picker over a placeholder session — the same chooser the
+                // TUI/web shells boot into. Picking a workspace activates it and the session
+                // adopts in place (`PickerSelected` → `WorkspaceActivated` → `adopt_switch`).
                 let pump = pump(b.notifications.clone());
-                let handle = b.handle.clone();
-                let view = Task::perform(
-                    async move {
-                        handle
-                            .rpc::<PickerView>(PickerViewParams {
-                                from_selection: false,
-                                kind: PickerKind::Workspaces,
-                                reset: true,
-                                offset: 0,
-                                limit: FETCH_LIMIT,
-                                center_on: None,
-                                center_on_cursor: None,
-                                directory_path: None,
-                                explorer_roots: false,
-                                buffer_id: None,
-                                filters: None,
-                                keybindings: None,
-                            })
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    |result| {
-                        Message::Core(CoreEvent::PickerViewed {
-                            initial: true,
-                            result,
-                        })
-                    },
+                let mut app = shell(
+                    Session::placeholder(),
+                    b.handle,
+                    b.notifications,
+                    b.client_version,
+                    b.server_url,
+                    b.server_started_at,
                 );
-                let boot = Boot {
-                    handle: b.handle.clone(),
-                    notifications: b.notifications.clone(),
-                    picker: PickerState::new(PickerKind::Workspaces),
-                    query_cursor: 0,
-                    opening: false,
-                    down: false,
-                };
-                (
-                    shell(
-                        Some(boot),
-                        Session::placeholder(),
-                        b.handle,
-                        b.notifications,
-                        b.client_version,
-                        b.server_url,
-                        b.server_started_at,
-                    ),
-                    Task::batch([pump, view]),
-                )
+                let chooser = app
+                    .session
+                    .open_picker(PickerKind::Workspaces, None, None, false);
+                // Fetch the app settings + hint snapshot on the boot connection: the chooser
+                // shows the first hint a fresh install ever sees (docs/hints.md), and the engine
+                // is dormant until the snapshot adopts.
+                let startup = app.session.startup();
+                let fx = app.run_core(chooser.and(startup));
+                (app, Task::batch([pump, fx]))
             }
         }
     }
@@ -649,16 +576,25 @@ impl App {
             }
             _ => None,
         });
+        let mut subs = vec![keys];
         // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them
         // only while one of those is actually animating — and never while disconnected, where a
         // picker throbber stuck mid-search (the server stopped answering) would otherwise pin the
         // 60fps redraw loop for the whole reconnect window.
         let animating = self.scroll_anim.is_some() || self.picker_ticking();
-        if self.boot.is_none() && animating && self.session.conn == ConnState::Connected {
-            Subscription::batch([keys, iced::window::frames().map(Message::AnimTick)])
-        } else {
-            keys
+        if animating && self.session.conn == ConnState::Connected {
+            subs.push(iced::window::frames().map(Message::AnimTick));
         }
+        // The hint engine's clock (docs/hints.md): a slow tick while a session with hints on is
+        // connected — including the boot chooser, which is just the Workspaces picker over a
+        // placeholder session. The engine's own idle gate handles unattended windows, so this
+        // needs no focus tracking; with hints off there are no wakeups at all.
+        if self.session.hints_enabled && self.session.conn == ConnState::Connected {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::HintTick),
+            );
+        }
+        Subscription::batch(subs)
     }
 
     /// Whether a picker search is still streaming (drives the throbber animation).
@@ -676,11 +612,8 @@ impl App {
             return Task::none();
         }
         // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
-        // Then the workspace chooser (if any) owns every message until `SessionReady` hands off.
         let task = if self.boot_args.is_some() {
             self.update_connecting(message)
-        } else if self.boot.is_some() {
-            self.update_boot(message)
         } else {
             self.update_inner(message)
         };
@@ -691,13 +624,8 @@ impl App {
     }
 
     /// The overlay `text_input` that should hold focus right now, given session state. Mirrors the
-    /// web's `focusTarget`. The boot chooser drives the workspace picker through `update_boot` with
-    /// its own [`Boot::picker`] (no `text_input` — its query stays on the fake-caret path), so it
-    /// has no focus target here. `None` means "no overlay field" (the editor owns the keyboard).
+    /// web's `focusTarget`. `None` means "no overlay field" (the editor owns the keyboard).
     fn desired_focus(&self) -> Option<OverlayField> {
-        if self.boot.is_some() {
-            return None;
-        }
         // A confirm / LSP-info prompt has no text field; only the save-as prompt does. Its two
         // segments (root filter / path) are controlled `text_input`s with ghost overlays behind
         // them, exactly like the chip editor — focus the active one so its caret shows and plain
@@ -786,489 +714,17 @@ impl App {
         }
     }
 
-    /// Message handling while the workspace chooser is up: a reduced picker vocabulary (type to
-    /// filter, Alt-j/k, Enter/click to pick, Esc quits), plus the `SessionReady` hand-off that
-    /// builds the session over the boot connection.
-    fn update_boot(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::Key { code, mods, text } => self.on_boot_key(code, mods, text),
-            Message::Core(CoreEvent::PickerViewed { initial, result }) => {
-                let Some(boot) = &mut self.boot else {
-                    return Task::none();
-                };
-                match result {
-                    Ok(r) => {
-                        boot.picker.offset = r.effective_offset;
-                        if initial {
-                            boot.picker.generation = r.generation;
-                            boot.picker.total_candidates = r.total_candidates;
-                        }
-                        Task::none()
-                    }
-                    Err(e) => self.error(format!("Workspace list failed: {e}")),
-                }
-            }
-            Message::Notified(Some(n)) => {
-                if let Some(boot) = &mut self.boot {
-                    if n.method == PickerUpdate::NAME {
-                        if let Ok(u) = serde_json::from_value::<PickerUpdateParams>(n.params) {
-                            if boot.picker.apply_update(u) {
-                                tracing::debug!(
-                                    workspaces = boot.picker.total_matches,
-                                    "workspace chooser updated"
-                                );
-                            }
-                        }
-                    }
-                    return pump(boot.notifications.clone());
-                }
-                Task::none()
-            }
-            // The boot connection died under the chooser — dial the fixed address again until a
-            // daemon is back (a restarted daemon rebinds the same port).
-            Message::Notified(None) => {
-                let Some(boot) = &mut self.boot else {
-                    return Task::none();
-                };
-                if boot.down {
-                    return Task::none();
-                }
-                boot.down = true;
-                let note = self.toast(
-                    "Server disconnected — reconnecting…",
-                    ToastKind::Warning,
-                    Some("connection".into()),
-                );
-                Task::batch([note, self.boot_reconnect()])
-            }
-            Message::BootReconnected(Ok(c)) => {
-                let Some(boot) = &mut self.boot else {
-                    return Task::none();
-                };
-                boot.handle = c.handle.clone();
-                boot.notifications = c.notifications.clone();
-                boot.picker = PickerState::new(PickerKind::Workspaces);
-                self.picker_scroll_y = 0.0;
-                boot.opening = false;
-                boot.down = false;
-                self.server_started_at = c.server_started_at;
-                let handle = c.handle;
-                let view = Task::perform(
-                    async move {
-                        handle
-                            .rpc::<PickerView>(PickerViewParams {
-                                from_selection: false,
-                                kind: PickerKind::Workspaces,
-                                reset: true,
-                                offset: 0,
-                                limit: FETCH_LIMIT,
-                                center_on: None,
-                                center_on_cursor: None,
-                                directory_path: None,
-                                explorer_roots: false,
-                                buffer_id: None,
-                                filters: None,
-                                keybindings: None,
-                            })
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    |result| {
-                        Message::Core(CoreEvent::PickerViewed {
-                            initial: true,
-                            result,
-                        })
-                    },
-                );
-                let note = self.toast("Reconnected", ToastKind::Success, Some("connection".into()));
-                Task::batch([pump(c.notifications), view, note])
-            }
-            Message::BootReconnected(Err(BootError::Retry(_))) => self.boot_reconnect(),
-            // Version mismatch while the chooser's connection was down: a stale daemon holds the
-            // port. Stop redialing and leave a persistent error toast; the chooser stays up (marked
-            // down) rather than spinning forever.
-            Message::BootReconnected(Err(BootError::Fatal(e))) => {
-                tracing::warn!(error = %e, "boot chooser reconnect rejected: version mismatch");
-                self.toast(e, ToastKind::Error, Some("connection".into()))
-            }
-            Message::SessionReady(Ok(r)) => {
-                // The pick resolved: the boot connection becomes the session's. The running
-                // pump carries on — same notification channel, now read by the main handler.
-                let Some(boot) = self.boot.take() else {
-                    return Task::none();
-                };
-                let (workspace, open, server_started_at) = *r;
-                tracing::info!(workspace = %workspace.name, "session established");
-                // First activation on the boot connection establishes the restart-detection
-                // baseline (it was 0/unknown while only the chooser was up).
-                self.server_started_at = server_started_at;
-                // A rootless workspace (just created from the chooser) has nowhere to open files —
-                // land in settings on the add-root input so the user can give it a root.
-                let rootless = workspace.paths.is_empty();
-                let buffer = buffer_info(open, &workspace.paths);
-                self.handle = boot.handle;
-                self.notifications = boot.notifications;
-                self.session = Session::new(workspace.name, workspace.paths, buffer);
-                if rootless {
-                    self.session.open_workspace_settings();
-                    if let Some(s) = self.session.workspace_settings.as_mut() {
-                        s.selected = s.input_index();
-                    }
-                }
-                // The editor's first Layout event subscribes the viewport (cell metrics are
-                // only published once it renders). Fetch the persisted app settings now.
-                let startup = self.session.startup();
-                self.run_core(startup)
-            }
-            Message::SessionReady(Err(e)) => {
-                if let Some(boot) = &mut self.boot {
-                    boot.opening = false;
-                }
-                self.error(format!("Open failed: {e}"))
-            }
-            Message::Core(CoreEvent::PickerClicked(abs)) => {
-                if let Some(boot) = &mut self.boot {
-                    boot.picker.selected = abs;
-                }
-                self.boot_accept()
-            }
-            Message::PickerScrolled(y) => {
-                let Some(boot) = &mut self.boot else {
-                    return Task::none();
-                };
-                self.picker_scroll_y = y;
-                match boot
-                    .picker
-                    .scrolled_refetch(crate::picker::first_visible_row(y))
-                {
-                    Some(offset) => self.boot_refetch(offset),
-                    None => Task::none(),
-                }
-            }
-            Message::PickerHovered(h) => {
-                if let Some(boot) = &mut self.boot {
-                    boot.picker.hovered = h;
-                }
-                Task::none()
-            }
-            Message::PickerUnhovered(abs) => {
-                if let Some(boot) = &mut self.boot {
-                    if boot.picker.hovered == Some(abs) {
-                        boot.picker.hovered = None;
-                    }
-                }
-                Task::none()
-            }
-            Message::ToastExpired(id) => {
-                self.toasts.retain(|t| t.id != id);
-                Task::none()
-            }
-            _ => Task::none(),
-        }
-    }
-
-    /// Keys while the workspace chooser is up.
-    fn on_boot_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Task<Message> {
-        let Some(boot) = &mut self.boot else {
-            return Task::none();
-        };
-        if boot.opening || boot.down {
-            return Task::none(); // a pick / reconnect is in flight — park input until it lands
-        }
-        let no_chord = !mods.ctrl && !mods.alt;
-        match code {
-            KeyCode::Esc => return iced::exit(), // nothing behind the chooser to fall back to
-            KeyCode::Enter => return self.boot_accept(),
-            KeyCode::Char('k') if mods.alt && !mods.ctrl => return self.boot_move(-1),
-            KeyCode::Char('j') if mods.alt && !mods.ctrl => return self.boot_move(1),
-            KeyCode::PageUp => {
-                return self.boot_move(-(crate::picker::VISIBLE_ROWS as i64 - 1));
-            }
-            KeyCode::PageDown => {
-                return self.boot_move(crate::picker::VISIBLE_ROWS as i64 - 1);
-            }
-            KeyCode::Backspace if no_chord => {
-                let p = &mut boot.picker;
-                if let Some((i, _)) = p.query[..boot.query_cursor].char_indices().last() {
-                    p.query.remove(i);
-                    boot.query_cursor = i;
-                    return self.boot_query_changed();
-                }
-                return Task::none();
-            }
-            KeyCode::Left if no_chord => {
-                if let Some((i, _)) = boot.picker.query[..boot.query_cursor].char_indices().last() {
-                    boot.query_cursor = i;
-                }
-                return Task::none();
-            }
-            KeyCode::Right if no_chord => {
-                if let Some(c) = boot.picker.query[boot.query_cursor..].chars().next() {
-                    boot.query_cursor += c.len_utf8();
-                }
-                return Task::none();
-            }
-            _ => {}
-        }
-        if no_chord {
-            if let Some(t) = text {
-                let t: String = t.chars().filter(|c| !c.is_control()).collect();
-                if !t.is_empty() {
-                    let at = boot.query_cursor;
-                    boot.picker.query.insert_str(at, &t);
-                    boot.query_cursor = at + t.len();
-                    return self.boot_query_changed();
-                }
-            }
-        }
-        Task::none()
-    }
-
-    /// Enter / click in the chooser: activate the picked workspace over the boot connection
-    /// and open its last buffer (or a fresh transient scratch) — the bootstrap convention.
-    fn boot_accept(&mut self) -> Task<Message> {
-        let Some(boot) = &self.boot else {
-            return Task::none();
-        };
-        let handle = boot.handle.clone();
-        // The synthetic "+ Create workspace …" row: create the workspace named by the query, then land
-        // in it (the session picker reaches this via the core; the boot chooser predates a session,
-        // so it drives the RPCs itself).
-        if boot.picker.selected_is_create() {
-            let name = boot.picker.query.trim().to_string();
-            if name.is_empty() || name.contains('/') || name.contains('\\') {
-                return self
-                    .error("Workspace name can't be empty or contain path separators".into());
-            }
-            if let Some(b) = &mut self.boot {
-                b.opening = true;
-            }
-            return Task::perform(
-                async move {
-                    let created = handle
-                        .rpc::<WorkspaceCreate>(WorkspaceCreateParams { name })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    // A fresh workspace has no roots, so `workspace/create` returns no landing buffer —
-                    // open a scratch so the session lands in *some* editor.
-                    let open = match created.opened {
-                        Some(open) => open,
-                        None => handle
-                            .rpc::<BufferOpen>(BufferOpenParams::default())
-                            .await
-                            .map_err(|e| e.to_string())?,
-                    };
-                    Ok(Box::new((
-                        created.workspace,
-                        open,
-                        created.server_started_at,
-                    )))
-                },
-                Message::SessionReady,
-            );
-        }
-        let Some(PickerItem::Workspace { name, .. }) = boot.picker.selected_item() else {
-            return Task::none();
-        };
-        let name = name.clone();
-        if let Some(b) = &mut self.boot {
-            b.opening = true;
-        }
-        Task::perform(
-            async move {
-                // One composite: activate + land on the workspace's MRU buffer (or a fresh
-                // transient scratch on first visit).
-                let activated = handle
-                    .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
-                        name,
-                        open_last: true,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let open = activated
-                    .opened
-                    .ok_or_else(|| "workspace/activate returned no landing buffer".to_string())?;
-                Ok(Box::new((
-                    activated.workspace,
-                    open,
-                    activated.server_started_at,
-                )))
-            },
-            Message::SessionReady,
-        )
-    }
-
-    /// An RPC on the boot connection, landing as a plain message.
-    fn boot_rpc<M>(
-        &self,
-        params: M::Params,
-        f: impl Fn(Result<M::Result, String>) -> Message + Send + 'static,
-    ) -> Task<Message>
-    where
-        M: RpcMethod + 'static,
-        M::Params: Send,
-        M::Result: Send,
-    {
-        let Some(boot) = &self.boot else {
-            return Task::none();
-        };
-        let handle = boot.handle.clone();
-        Task::perform(
-            async move { handle.rpc::<M>(params).await.map_err(|e| e.to_string()) },
-            f,
-        )
-    }
-
-    fn boot_query_changed(&mut self) -> Task<Message> {
-        let Some(boot) = &mut self.boot else {
-            return Task::none();
-        };
-        let p = &mut boot.picker;
-        p.generation += 1;
-        p.selected = 0;
-        p.offset = 0;
-        let (query, generation) = (p.query.clone(), p.generation);
-        self.picker_scroll_y = 0.0;
-        let q = self.boot_rpc::<PickerQuery>(
-            PickerQueryParams {
-                kind: PickerKind::Workspaces,
-                query,
-                generation,
-                filters: Default::default(),
-            },
-            |_| Message::Noop,
-        );
-        Task::batch([q, self.boot_refetch(0)])
-    }
-
-    fn boot_refetch(&mut self, offset: u32) -> Task<Message> {
-        let Some(boot) = &mut self.boot else {
-            return Task::none();
-        };
-        boot.picker.offset = offset;
-        boot.picker.items.clear();
-        self.boot_rpc::<PickerView>(
-            PickerViewParams {
-                from_selection: false,
-                kind: PickerKind::Workspaces,
-                reset: false,
-                offset,
-                limit: FETCH_LIMIT,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
-                explorer_roots: false,
-                buffer_id: None,
-                filters: None,
-                keybindings: None,
-            },
-            |result| {
-                Message::Core(CoreEvent::PickerViewed {
-                    initial: false,
-                    result,
-                })
-            },
-        )
-    }
-
-    fn boot_move(&mut self, delta: i64) -> Task<Message> {
-        let Some(boot) = &mut self.boot else {
-            return Task::none();
-        };
-        match boot.picker.move_selection(delta) {
-            Some(offset) => self.boot_refetch(offset),
-            None => {
-                reveal_picker_selection(&boot.picker, &mut self.picker_scroll_y, Reveal::Minimal)
-            }
-        }
-    }
-
-    /// One paced boot-reconnect attempt: sleep, dial the fixed address. Failures loop back
-    /// through [`Message::BootReconnected`] — indefinitely, like the session's retry. No workspace
-    /// is active on the boot connection, so there's no instance stamp to learn yet (0); the first
-    /// `workspace/activate` establishes the baseline (nothing is open to lose in the meantime).
-    fn boot_reconnect(&self) -> Task<Message> {
-        let version = self.client_version.clone();
-        let server_url = self.server_url.clone();
-        Task::perform(
-            async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let (handle, rx) = crate::connection::connect(&server_url, &version)
-                    .await
-                    .map_err(BootError::from)?;
-                Ok(BootConn {
-                    handle,
-                    notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
-                    server_started_at: 0,
-                })
-            },
-            Message::BootReconnected,
-        )
-    }
-
-    /// Recovery when a reconnect succeeds but the old workspace is gone (renamed/removed while away):
-    /// re-enter the boot chooser over the fresh connection and fetch the workspace list, mirroring a
-    /// no-args start. Picking a workspace (the renamed one shows under its new name) builds the
-    /// session the usual way.
-    /// Open the Workspaces chooser over a fresh connection: install the boot state and start the
-    /// pump + the chooser's first `picker/view`. Shared by the no-args boot (`Booted` → `Choose`),
-    /// the boot-connection reconnect, and [`Self::reconnect_to_chooser`] (workspace-gone recovery).
-    fn enter_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
-        let view = self.raise_boot_chooser(handle, notifications.clone());
-        Task::batch([pump(notifications), view])
-    }
-
-    /// Install the boot-chooser state and fire its first `picker/view`, WITHOUT starting a
-    /// notification pump — for when a pump is already running on this connection. Used by
-    /// [`Self::enter_boot_chooser`] (which adds the pump for a fresh connection) and directly by
-    /// the [`Effect::ToChooser`] handler, which drops to the chooser mid-session (the live pump
-    /// keeps delivering, now routed through `update_boot`).
-    fn raise_boot_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
-        self.boot = Some(Boot {
-            handle: handle.clone(),
-            notifications,
-            picker: PickerState::new(PickerKind::Workspaces),
-            query_cursor: 0,
-            opening: false,
-            down: false,
-        });
-        Task::perform(
-            async move {
-                handle
-                    .rpc::<PickerView>(PickerViewParams {
-                        from_selection: false,
-                        kind: PickerKind::Workspaces,
-                        reset: true,
-                        offset: 0,
-                        limit: FETCH_LIMIT,
-                        center_on: None,
-                        center_on_cursor: None,
-                        directory_path: None,
-                        explorer_roots: false,
-                        buffer_id: None,
-                        filters: None,
-                        keybindings: None,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())
-            },
-            |result| {
-                Message::Core(CoreEvent::PickerViewed {
-                    initial: true,
-                    result,
-                })
-            },
-        )
-    }
-
-    fn reconnect_to_chooser(&mut self, handle: Handle, notifications: NotifRx) -> Task<Message> {
-        let chooser = self.enter_boot_chooser(handle, notifications);
-        let toast = self.toast(
-            "Workspace no longer exists — pick another",
-            ToastKind::Warning,
-            None,
-        );
-        Task::batch([chooser, toast])
+    /// Drop to the workspace chooser over the live connection: swap in a fresh placeholder
+    /// session (nothing renders behind the picker) and raise the core Workspaces picker — the
+    /// same chooser the TUI/web shells use. Reached from the no-args boot (`Booted` → `Choose`),
+    /// [`Effect::ToChooser`] (an ephemeral context lost its last buffer), and the workspace-gone
+    /// reconnect recovery.
+    fn enter_chooser(&mut self) -> Task<Message> {
+        self.session = Session::placeholder(); // conn = Connected, so notifications keep flowing
+        let fx = self
+            .session
+            .open_picker(PickerKind::Workspaces, None, None, false);
+        self.run_core(fx)
     }
 
     /// Boot-connecting state (`ConnState::Connecting`): the editor chrome is live but there's no
@@ -1311,9 +767,14 @@ impl App {
                 self.boot_args = None;
                 self.boot_attempt = 0;
                 self.server_started_at = b.server_started_at;
-                self.handle = b.handle.clone();
+                self.handle = b.handle;
                 self.notifications = b.notifications.clone();
-                self.enter_boot_chooser(b.handle, b.notifications)
+                let chooser = self.enter_chooser();
+                // Fetch the app settings + hint snapshot on this connection: the chooser shows
+                // the first hint a fresh install ever sees (docs/hints.md).
+                let startup = self.session.startup();
+                let startup = self.run_core(startup);
+                Task::batch([pump(b.notifications), chooser, startup])
             }
             // The dial only ever yields Session/Choose; Connecting can't come back.
             Message::Booted(Ok(Bootstrap::Connecting(_))) => Task::none(),
@@ -1342,14 +803,25 @@ impl App {
         }
     }
 
+    /// Wall clock in Unix ms — the hint engine's injected clock (the core never reads time).
+    pub(crate) fn now_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
-            // Boot-only message that slipped past a finished boot — nothing to do.
-            Message::SessionReady(_) => Task::none(),
             Message::Editor(ev) => self.on_editor_event(ev),
             Message::Key { code, mods, text } => self.on_key(code, mods, text),
             // Handled upstream in `update` (tracked in every phase); listed here only for exhaustiveness.
             Message::ModifiersChanged(_) => Task::none(),
+
+            Message::HintTick => {
+                let fx = self.session.on_hint_tick(Self::now_unix_ms());
+                self.run_core(fx)
+            }
 
             Message::Subscribed(Ok(res)) => {
                 tracing::debug!(
@@ -1528,8 +1000,25 @@ impl App {
                         });
                         Task::batch([pump(r.notifications), self.run_core(fx)])
                     }
-                    // The workspace is gone — re-enter the boot chooser over the fresh connection.
-                    None => self.reconnect_to_chooser(r.handle, r.notifications),
+                    // No workspace to restore: either none was active (the chooser was up when
+                    // the connection dropped — land back in it, quietly) or the one we had is
+                    // gone (renamed/removed while away). Recover into the chooser over the
+                    // fresh connection, mirroring a no-args start.
+                    None => {
+                        let toast = if self.session.is_placeholder() {
+                            // Grouped "connection", replacing the "reconnecting…" toast in
+                            // place — the same evolution the restore path gets from the core.
+                            self.toast("Reconnected", ToastKind::Success, Some("connection".into()))
+                        } else {
+                            self.toast(
+                                "Workspace no longer exists — pick another",
+                                ToastKind::Warning,
+                                None,
+                            )
+                        };
+                        let chooser = self.enter_chooser();
+                        Task::batch([pump(r.notifications), chooser, toast])
+                    }
                 }
             }
             Message::Reconnected(Err(ReconnectError::NotUp)) => {
@@ -1540,9 +1029,9 @@ impl App {
                 let fx = self.session.on_event(CoreEvent::ReconnectFatal(e));
                 self.run_core(fx)
             }
-            // Boot-only messages that slipped past a finished boot — nothing to do. `Booted` is
-            // handled in `update_connecting`; once a session exists it's a stale dial result.
-            Message::BootReconnected(_) | Message::Booted(_) => Task::none(),
+            // `Booted` is handled in `update_connecting`; once a session exists it's a stale
+            // dial result — nothing to do.
+            Message::Booted(_) => Task::none(),
         }
     }
 
@@ -1669,13 +1158,12 @@ impl App {
                     ));
                 }
                 Effect::Reconnect { attempt } => tasks.push(self.try_reconnect(attempt)),
-                Effect::Exit => tasks.push(iced::exit()),
-                Effect::ToChooser => {
-                    // Drop to the workspace chooser over the live connection (no new pump — the
-                    // current one keeps delivering, now routed through `update_boot`).
-                    let (handle, notifications) = (self.handle.clone(), self.notifications.clone());
-                    tasks.push(self.raise_boot_chooser(handle, notifications));
+                Effect::HintTickNow => {
+                    let fx = self.session.on_hint_tick(Self::now_unix_ms());
+                    tasks.push(self.run_core(fx));
                 }
+                Effect::Exit => tasks.push(iced::exit()),
+                Effect::ToChooser => tasks.push(self.enter_chooser()),
                 Effect::ReadClipboard(kind) => tasks.push(self.read_clipboard(kind)),
                 Effect::ShellAction(action) => tasks.push(self.run_shell_action(action)),
                 Effect::RestoreScrollAnchor => {
@@ -1996,6 +1484,9 @@ impl App {
     // ---- actions ----------------------------------------------------------------------------
 
     fn subscribe_task(&mut self) -> Task<Message> {
+        if self.session.is_placeholder() {
+            return Task::none(); // no buffer to subscribe — the mandatory chooser is up
+        }
         let Some((cols, rows)) = self.sent_grid else {
             return Task::none(); // no metrics yet; the first Layout event subscribes
         };
@@ -2073,6 +1564,20 @@ impl App {
                 let (handle, rx) = crate::connection::connect(&server_url, &version)
                     .await
                     .map_err(ReconnectError::from)?;
+                // The connection died while the chooser was up (a placeholder session — its
+                // workspace name is empty, and no real one can be: create validates non-empty).
+                // Nothing to restore; hand back a workspace-less reconnect and the shell
+                // re-raises the chooser. No workspace is activated, so no instance stamp to
+                // learn yet (0) — the next activation re-establishes the baseline.
+                if workspace.is_empty() {
+                    return Ok(Box::new(Reestablished {
+                        handle,
+                        notifications: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
+                        restore: None,
+                        server_url,
+                        server_started_at: 0,
+                    }));
+                }
                 let activated = match handle
                     .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
                         name: workspace,
@@ -2496,39 +2001,48 @@ impl App {
     // ---- view ----------------------------------------------------------------------------------
 
     pub fn view(&self) -> Element<'_, Message> {
-        if let Some(boot) = &self.boot {
-            return self.boot_view(boot);
-        }
-        // Boot-connecting renders the normal editor chrome over a placeholder session (empty editor
-        // + status bar), with the floating "Connecting…" banner — the same familiar feel as a
-        // mid-session reconnect. The editor's Layout fires no RPC while not `Connected`
-        // (`on_editor_event`), and `status_bar` is fully Option-guarded, so the placeholder is safe.
-        let editor = editor::editor(
-            editor::Content {
-                window: self.session.window.as_ref(),
-                cursor: self.session.buffer.cursor,
-                insert_mode: self.session.mode == Mode::Insert,
-                awaiting_key: !matches!(self.session.pending, Pending::None)
-                    || self.session.count.is_some()
-                    || self.session.sneak.is_some(),
-                diff_view: self.session.diff_view,
-                scroll_px: self.scroll_px,
-                scroll_x_px: self.scroll_x_px,
-                blame: self
-                    .session
-                    .blame
-                    .as_ref()
-                    .map(|(line, text)| (*line, text.as_str())),
-                tab_width: TAB_WIDTH,
-                ligatures: self.session.ligatures,
-                font_size: self.session.font_size as f32,
-            },
-            Message::Editor,
-        );
-        let mut base = column![];
-        base = base.push(Element::from(editor));
-        base = base.push(self.status_bar());
-        let mut layers: Vec<Element<'_, Message>> = vec![base.into()];
+        // No workspace picked yet (the mandatory chooser, or the beat after a pick while the
+        // activation is in flight): a plain backdrop with no editor chrome behind the overlays,
+        // matching the TUI/web no-workspace views. The boot-*connecting* placeholder is the
+        // exception — it renders the normal chrome + "Connecting…" banner below (the same
+        // familiar feel as a mid-session reconnect; the editor's Layout fires no RPC while not
+        // `Connected`, and `status_bar` is fully Option-guarded, so the placeholder is safe).
+        let base: Element<'_, Message> =
+            if self.session.is_placeholder() && self.session.conn != ConnState::Connecting {
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(theme::NORD0.into()),
+                        ..container::Style::default()
+                    })
+                    .into()
+            } else {
+                let editor = editor::editor(
+                    editor::Content {
+                        window: self.session.window.as_ref(),
+                        cursor: self.session.buffer.cursor,
+                        insert_mode: self.session.mode == Mode::Insert,
+                        awaiting_key: !matches!(self.session.pending, Pending::None)
+                            || self.session.count.is_some()
+                            || self.session.sneak.is_some(),
+                        diff_view: self.session.diff_view,
+                        scroll_px: self.scroll_px,
+                        scroll_x_px: self.scroll_x_px,
+                        blame: self
+                            .session
+                            .blame
+                            .as_ref()
+                            .map(|(line, text)| (*line, text.as_str())),
+                        tab_width: TAB_WIDTH,
+                        ligatures: self.session.ligatures,
+                        font_size: self.session.font_size as f32,
+                    },
+                    Message::Editor,
+                );
+                column![Element::from(editor), self.status_bar()].into()
+            };
+        let mut layers: Vec<Element<'_, Message>> = vec![base];
         if self.session.mode == Mode::Search {
             layers.push(self.search_bar());
         }
@@ -2542,8 +2056,6 @@ impl App {
                     &self.session.workspace_paths,
                     self.picker_scroll_y,
                     self.spinner_phase,
-                    true,
-                    0,
                 ))
                 .map(|m| match m {
                     PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
@@ -2571,6 +2083,12 @@ impl App {
         if !self.toasts.is_empty() {
             layers.push(self.toast_overlay());
         }
+        // The hint (docs/hints.md): above the overlays (a picker context's hints must
+        // show over the picker) but below the connection banner. Top-right, so it collides with
+        // nothing else.
+        if let Some(hint) = self.session.hint_view() {
+            layers.push(self.hint_corner(hint));
+        }
         // Last so its appearance never shifts an earlier layer's tree position (the picker
         // can be open when the connection drops).
         if self.session.conn != ConnState::Connected {
@@ -2580,6 +2098,39 @@ impl App {
         // tree shape when an overlay opens, resetting widget state (e.g. a scrollable's
         // offset) keyed by tree position.
         iced::widget::stack(layers).into()
+    }
+
+    /// The hint corner (docs/hints.md): a quiet top-right "Hint: …" chip with the key label
+    /// emphasized. Deliberately subtler than a toast: no shadow-heavy card, no animation, no
+    /// icon; it should read as ambient chrome, not a notification.
+    fn hint_corner(&self, hint: aether_client::hints::HintView) -> Element<'_, Message> {
+        let (before, keys, after) = hint.parts();
+        let dim = |s: &'static str| text(s).size(12).font(SANS).color(theme::NORD3_BRIGHT);
+        let body = iced::widget::row![
+            dim("Hint: "),
+            dim(before),
+            text(keys).size(12).font(SANS_BOLD_UI).color(theme::NORD8),
+            dim(after),
+        ];
+        let chip = container(body)
+            .padding([4, 10])
+            .style(|_| container::Style {
+                background: Some(theme::NORD1.into()),
+                border: iced::Border {
+                    radius: 5.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            });
+        container(chip)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .padding(iced::Padding {
+                top: 8.0,
+                right: 12.0,
+                ..iced::Padding::ZERO
+            })
+            .into()
     }
 
     /// Floating connection banner (the web's `#conn-banner`): a top-centred pill while the
@@ -2953,46 +2504,6 @@ impl App {
                     ..container::Style::default()
                 }),
         )
-    }
-
-    /// The no-args start screen: just the Workspaces picker over the editor background.
-    fn boot_view<'a>(&'a self, boot: &'a Boot) -> Element<'a, Message> {
-        let backdrop = container(iced::widget::Space::new())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(theme::NORD0.into()),
-                ..container::Style::default()
-            });
-        // The boot chooser's picker query lives outside the core session (it's driven by
-        // `on_boot_key` / `boot.picker`), so it keeps the fake-caret rendering: `controlled=false`,
-        // and `PickerMsg::Query` can never fire here.
-        let picker = Element::from(crate::picker::overlay(
-            &boot.picker,
-            &[],
-            self.picker_scroll_y,
-            self.spinner_phase,
-            false,
-            boot.query_cursor,
-        ))
-        .map(|m| match m {
-            PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
-            PickerMsg::Scrolled(y) => Message::PickerScrolled(y),
-            PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
-            PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
-            PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
-            // The boot chooser is the Workspaces picker — no query sync, no chip editor, no chip-row
-            // boundary keys — so none of the controlled-input / chip messages can fire here.
-            PickerMsg::Query(_)
-            | PickerMsg::EditorRoot(_)
-            | PickerMsg::EditorPath(_)
-            | PickerMsg::CoreKey(_) => Message::Noop,
-        });
-        let mut layers: Vec<Element<'_, Message>> = vec![backdrop.into(), picker];
-        if !self.toasts.is_empty() {
-            layers.push(self.toast_overlay());
-        }
-        iced::widget::stack(layers).into()
     }
 
     /// The floating search prompt, bottom-left above the status bar — mirrors the web client's
@@ -4648,6 +4159,7 @@ fn window_settings() -> iced::window::Settings {
 mod tests {
     use super::*;
     use crate::picker::{GROUP_GAP, ROW_H};
+    use aether_protocol::picker::{PickerItem, PickerUpdateParams};
 
     /// A grep window: rows [0]=hdr a.rs, [1..=3]=hits, [4]=hdr b.rs, [5..=24]=hits.
     fn grep_state() -> PickerState {

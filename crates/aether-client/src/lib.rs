@@ -13,6 +13,7 @@
 pub mod chips;
 pub mod effect;
 pub mod grid;
+pub mod hints;
 pub mod keymap;
 pub mod labels;
 pub mod markdown;

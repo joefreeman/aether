@@ -54,6 +54,15 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
         // Opt the production daemon into unsaved-buffer backups (left unset elsewhere — see
         // `ServerState::backups_path`). A resolution failure just disables the feature.
         s.backups_path = config::backups_dir().ok();
+        // Hint learning state (docs/hints.md): same opt-in shape as sessions. Loaded
+        // once here; a corrupt file logs and starts fresh rather than refusing to boot.
+        s.hints_path = config::hints_state_path().ok();
+        if let Some(path) = s.hints_path.clone() {
+            match config::load_hints_at(&path) {
+                Ok(hints) => s.hints = hints,
+                Err(e) => tracing::warn!(error = %e, "could not load hint state; starting fresh"),
+            }
+        }
     }
     config::write_runtime_pid(&runtime_path, std::process::id())?;
     // Log the web URL too: the browser client has no config/CLI access, so a human reads (and
@@ -112,6 +121,13 @@ pub async fn run_with_listener(
         tokio::spawn(backup_flush_loop(state.clone()));
     }
 
+    // Same shape for the hint learning state: a periodic dirty-flag flush (the debounce — events
+    // between ticks coalesce into one write) plus a final flush on graceful exit below.
+    let hints_enabled = state.lock().await.hints_path.is_some();
+    if hints_enabled {
+        tokio::spawn(hints_flush_loop(state.clone()));
+    }
+
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -144,7 +160,24 @@ pub async fn run_with_listener(
     if backups_enabled {
         crate::handlers::flush_backups(&state).await;
     }
+    if hints_enabled {
+        crate::handlers::flush_hints(&state).await;
+    }
     Ok(())
+}
+
+/// How often the hint-state flush runs. Long enough that a burst of hint events coalesces into one
+/// write, short enough that a crash loses almost nothing that matters (it's tutorial progress, not
+/// user content).
+const HINTS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Periodically flush the hint learning state until the task is aborted (on server shutdown). See
+/// [`crate::handlers::flush_hints`].
+async fn hints_flush_loop(state: SharedState) {
+    loop {
+        tokio::time::sleep(HINTS_FLUSH_INTERVAL).await;
+        crate::handlers::flush_hints(&state).await;
+    }
 }
 
 /// How often the backup flush runs while the server is up. Short enough that a crash loses at most a
@@ -258,6 +291,19 @@ pub async fn spawn_for_test_multi_with_persistence(
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
+    spawn_for_test_full(workspaces, sessions_path, backups_dir, None).await
+}
+
+/// As [`spawn_for_test_multi_with_persistence`], but also points the server at `hints_path` for
+/// the hint learning state (docs/hints.md), so tests can exercise `hints/record`
+/// aggregation + persistence against a throwaway file. With it set the periodic hints flush runs,
+/// so a test records events then polls the file into existence, like the backup tests do.
+pub async fn spawn_for_test_full(
+    workspaces: Vec<(String, Vec<PathBuf>)>,
+    sessions_path: Option<PathBuf>,
+    backups_dir: Option<PathBuf>,
+    hints_path: Option<PathBuf>,
+) -> anyhow::Result<ServerHandle> {
     use crate::state::WorkspaceEntry;
     use crate::workspace_index::WorkspaceIndex;
 
@@ -273,6 +319,10 @@ pub async fn spawn_for_test_multi_with_persistence(
         let mut s = state.lock().await;
         s.sessions_path = sessions_path;
         s.backups_path = backups_dir;
+        s.hints_path = hints_path;
+        if let Some(path) = s.hints_path.clone() {
+            s.hints = crate::config::load_hints_at(&path).unwrap_or_default();
+        }
         for (name, paths) in &workspaces {
             let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));
             s.workspaces.insert(

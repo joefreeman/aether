@@ -7,9 +7,13 @@
 //!   to the user cache dir (`~/Library/Caches/aether/` on macOS), which is the right home for
 //!   per-machine-session bookkeeping that needn't survive a reboot.
 
+use aether_protocol::hints::{
+    day_from_unix_ms, HintEvent, HintRecord, HintsStateResult, DISMISS_WEIGHT, LEARNED_DAYS,
+    LEARNED_USES,
+};
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -426,6 +430,120 @@ pub fn sort_names_by_recency(names: &mut [String], sessions: &WorkspaceSessions)
                 .unwrap_or(0),
         )
     });
+}
+
+/// Hint learning state (docs/hints.md): which hints are retired ("learned") and the
+/// per-hint counters for the still-active frontier. Machine-managed like [`WorkspaceSessions`] —
+/// it lives beside `sessions.json` in the state dir, and the server is a dumb aggregator: clients
+/// send increment events (`hints/record`), this applies them; ranking and display stay client-side
+/// with the keymap. Retired hints collapse to a bare id — no counters survive retirement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HintsState {
+    #[serde(default)]
+    pub retired: BTreeSet<String>,
+    #[serde(default)]
+    pub active: BTreeMap<String, HintRecord>,
+}
+
+impl HintsState {
+    /// Apply one client-reported event at wall-clock `now_ms` (the server's stamp is
+    /// authoritative). Returns `(changed, retired_now)`: whether anything mutated (drives the
+    /// dirty flag) and whether this event crossed the retirement threshold. Events for
+    /// already-retired hints are ignored — a concurrent window may not have seen the retirement
+    /// yet.
+    pub fn apply(&mut self, hint_id: &str, event: HintEvent, now_ms: u64) -> (bool, bool) {
+        if self.retired.contains(hint_id) {
+            return (false, false);
+        }
+        let rec = self.active.entry(hint_id.to_string()).or_default();
+        match event {
+            HintEvent::Shown | HintEvent::Dismissed => {
+                // Fold the decay-to-date into the stored counter, then count this display
+                // period — an explicit dismissal weighs more than a display that merely lapsed.
+                // Scoring applies the same decay read-only (docs/hints.md §1.6).
+                let add = if event == HintEvent::Dismissed {
+                    DISMISS_WEIGHT
+                } else {
+                    1.0
+                };
+                rec.shows_without_follow =
+                    decayed_shows(rec.shows_without_follow, rec.last_shown_at, now_ms) + add;
+                rec.last_shown_at = now_ms;
+            }
+            HintEvent::Used | HintEvent::Followed => {
+                let day = day_from_unix_ms(now_ms);
+                if rec.uses == 0 {
+                    rec.use_days = 1;
+                } else if day != rec.last_used_day && rec.use_days < LEARNED_DAYS {
+                    rec.use_days += 1;
+                }
+                rec.last_used_day = day;
+                rec.last_used_at = now_ms;
+                rec.uses = (rec.uses + 1).min(LEARNED_USES);
+                if event == HintEvent::Followed {
+                    rec.shows_without_follow = 0.0;
+                }
+                if rec.uses >= LEARNED_USES && rec.use_days >= LEARNED_DAYS {
+                    self.active.remove(hint_id);
+                    self.retired.insert(hint_id.to_string());
+                    return (true, true);
+                }
+            }
+        }
+        (true, false)
+    }
+
+    /// The wire snapshot (`hints/state`).
+    pub fn snapshot(&self) -> HintsStateResult {
+        HintsStateResult {
+            retired: self.retired.iter().cloned().collect(),
+            active: self.active.clone(),
+        }
+    }
+}
+
+/// Half-life, in days, of the shows-without-follow fatigue counter — "not interested" fades so a
+/// hint ignored early can come back when it's relevant (docs/hints.md §1.6). Must agree with the
+/// client core's scoring decay (`aether-client`'s hints module), pinned by docs/hints.md §1.11.
+pub const FATIGUE_HALFLIFE_DAYS: f32 = 3.0;
+
+/// The fatigue counter's value at `now_ms`, decayed from its last fold at `last_shown_at`. Pure;
+/// the server folds it in when accumulating a new show, the client applies the same curve
+/// read-only when scoring.
+pub fn decayed_shows(shows: f32, last_shown_at: u64, now_ms: u64) -> f32 {
+    if shows <= 0.0 || last_shown_at == 0 || now_ms <= last_shown_at {
+        return shows;
+    }
+    let days = (now_ms - last_shown_at) as f32 / 86_400_000.0;
+    shows * (-days / FATIGUE_HALFLIFE_DAYS).exp2()
+}
+
+/// Path to the hint-state file (`<state>/aether/profiles/<name>/hints.json`), beside
+/// `sessions.json`. JSON in the state dir: machine-managed, don't hand-edit.
+pub fn hints_state_path() -> anyhow::Result<PathBuf> {
+    Ok(profile_state_dir()?.join("hints.json"))
+}
+
+/// Load the hint-state file. Missing file = empty state (fresh install / feature never used).
+/// Path-parameterized for tests, like [`load_workspace_sessions_at`].
+pub fn load_hints_at(path: &Path) -> anyhow::Result<HintsState> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HintsState::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading hints at {}", path.display())),
+    };
+    serde_json::from_str(&content).with_context(|| format!("parsing hints at {}", path.display()))
+}
+
+/// Write (or overwrite) the hint-state file, creating the directory if needed.
+pub fn write_hints_at(path: &Path, hints: &HintsState) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating state dir {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(hints).context("serializing hints")?;
+    std::fs::write(path, body).with_context(|| format!("writing hints at {}", path.display()))?;
+    Ok(())
 }
 
 /// Directory containing the per-workspace `.toml` configs. Used by `list_workspace_names`.
@@ -890,6 +1008,7 @@ mod tests {
                 wrap: WrapMode::None,
                 ligatures: false,
                 font_size: 18,
+                ..AppSettings::default()
             },
         )
         .unwrap();
@@ -1000,5 +1119,91 @@ mod tests {
         // real liveness probe, so use a pid that cannot exist instead. `i32::MAX` as a pid is far
         // above any real allocation on Linux or macOS, so `kill` returns ESRCH.
         assert!(!pid_is_alive(i32::MAX as u32));
+    }
+
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn hint_uses_saturate_within_one_day() {
+        let mut h = HintsState::default();
+        let now = 10 * DAY_MS;
+        for _ in 0..5 {
+            let (_, retired) = h.apply("quit", HintEvent::Used, now);
+            assert!(!retired, "same-day uses must never retire a hint");
+        }
+        let rec = h.active["quit"];
+        assert_eq!(rec.uses, LEARNED_USES, "uses saturate at the threshold");
+        assert_eq!(rec.use_days, 1);
+    }
+
+    #[test]
+    fn hint_retires_after_uses_across_two_days() {
+        let mut h = HintsState::default();
+        let day1 = 10 * DAY_MS;
+        let day2 = 11 * DAY_MS;
+        assert_eq!(h.apply("quit", HintEvent::Used, day1), (true, false));
+        assert_eq!(h.apply("quit", HintEvent::Used, day1 + 1), (true, false));
+        // Third use on a second calendar day: uses ≥ 3 across ≥ 2 days → retired.
+        assert_eq!(h.apply("quit", HintEvent::Used, day2), (true, true));
+        assert!(h.retired.contains("quit"));
+        assert!(
+            !h.active.contains_key("quit"),
+            "retirement collapses the record to a bare id"
+        );
+        // Further events on a retired hint are ignored (a concurrent window may still send them).
+        assert_eq!(h.apply("quit", HintEvent::Used, day2), (false, false));
+    }
+
+    #[test]
+    fn follow_resets_fatigue_and_counts_as_use() {
+        let mut h = HintsState::default();
+        let now = 10 * DAY_MS;
+        h.apply("copy", HintEvent::Shown, now);
+        h.apply("copy", HintEvent::Shown, now + 1);
+        assert!(h.active["copy"].shows_without_follow > 1.9);
+        h.apply("copy", HintEvent::Followed, now + 2);
+        let rec = h.active["copy"];
+        assert_eq!(rec.shows_without_follow, 0.0);
+        assert_eq!(rec.uses, 1);
+    }
+
+    #[test]
+    fn dismissal_weighs_more_than_a_lapsed_display() {
+        let mut h = HintsState::default();
+        let now = 10 * DAY_MS;
+        h.apply("grep", HintEvent::Shown, now);
+        h.apply("grep", HintEvent::Dismissed, now + 1);
+        let swf = h.active["grep"].shows_without_follow;
+        assert!(
+            (swf - (1.0 + DISMISS_WEIGHT)).abs() < 1e-3,
+            "expected show + dismissal to stack, got {swf}"
+        );
+    }
+
+    #[test]
+    fn shows_decay_between_display_periods() {
+        let mut h = HintsState::default();
+        let now = 10 * DAY_MS;
+        h.apply("grep", HintEvent::Shown, now);
+        // One fatigue half-life later, the stored count decays to 0.5 before the new show adds 1.
+        let later = now + (FATIGUE_HALFLIFE_DAYS as u64) * DAY_MS;
+        h.apply("grep", HintEvent::Shown, later);
+        let swf = h.active["grep"].shows_without_follow;
+        assert!((swf - 1.5).abs() < 1e-3, "expected ~1.5, got {swf}");
+    }
+
+    #[test]
+    fn hints_state_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hints.json");
+        // Missing file reads as empty state.
+        assert_eq!(load_hints_at(&path).unwrap(), HintsState::default());
+
+        let mut h = HintsState::default();
+        h.apply("quit", HintEvent::Used, 10 * DAY_MS);
+        h.apply("copy", HintEvent::Shown, 10 * DAY_MS);
+        h.retired.insert("insert-mode".into());
+        write_hints_at(&path, &h).unwrap();
+        assert_eq!(load_hints_at(&path).unwrap(), h);
     }
 }

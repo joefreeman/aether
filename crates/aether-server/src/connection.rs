@@ -23,6 +23,7 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDiffView};
+use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::input::{
     EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChange, InputChangeLine,
     InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
@@ -376,6 +377,8 @@ async fn dispatch(
     match method {
         SettingsGet::NAME => run!(SettingsGet, handlers::settings_get),
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
+        HintsRecord::NAME => run!(HintsRecord, handlers::hints_record),
+        HintsState::NAME => run!(HintsState, handlers::hints_state),
         WorkspaceList::NAME => run!(WorkspaceList, handlers::workspace_list),
         WorkspaceActivate::NAME => run!(WorkspaceActivate, handlers::workspace_activate),
         WorkspaceCreate::NAME => run!(WorkspaceCreate, handlers::workspace_create),

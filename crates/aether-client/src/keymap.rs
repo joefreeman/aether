@@ -396,6 +396,14 @@ pub enum Action {
     /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
+
+    // ---- hints (docs/hints.md) ----
+    /// `Space h` — dismiss the corner hint: down-weight it (a deliberate "not now") and show
+    /// another. No-op when the corner is empty.
+    DismissHint,
+    /// `Space Alt-h` — toggle hints on/off (the same switch as the settings-overlay row),
+    /// persisted app-wide.
+    ToggleHints,
 }
 
 impl Action {
@@ -892,6 +900,8 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(L, ch('a'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
+    bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
 ];
 
 #[cfg(test)]

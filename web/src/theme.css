@@ -241,6 +241,25 @@ html, body, #app {
   background: var(--nord11);
   color: var(--nord6);
 }
+
+/* The hint corner (docs/hints.md): a quiet top-right "Hint: …" chip, sentence dim with the
+   key label emphasized. Deliberately subtler than a toast (no shadow, no animation): ambient
+   chrome, not a notification. Plain inline flow — the sentence is text nodes around a key span. */
+#hint-corner {
+  position: fixed;
+  top: 8px;
+  right: 12px;
+  z-index: 30; /* over the overlays (picker hints must show over the picker), under the banner */
+  background: var(--nord1);
+  color: var(--nord3-bright);
+  font: 12px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 3px 10px;
+  border-radius: 5px;
+}
+#hint-corner .hint-keys {
+  color: var(--nord8);
+  font-weight: 600;
+}
 .conn-retry {
   font: inherit;
   background: rgba(0, 0, 0, 0.22);

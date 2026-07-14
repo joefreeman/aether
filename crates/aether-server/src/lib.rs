@@ -31,7 +31,7 @@ pub use config::{
     WorkspaceConfig, WorkspaceMatch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_PROFILE, SERVER_PORT,
 };
 pub use server::{
-    run, run_with_listener, spawn_for_test, spawn_for_test_multi,
+    run, run_with_listener, spawn_for_test, spawn_for_test_full, spawn_for_test_multi,
     spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions, ServerHandle,
 };
 pub use status::{fetch_status, ServerStatus};

@@ -80,6 +80,12 @@ impl WasmSession {
         })
     }
 
+    /// The periodic hint tick (docs/hints.md): the shell's wall clock in Unix ms,
+    /// stamped into the core's hint engine. Returns `Effect[]` (Shown records, at most).
+    pub fn on_hint_tick(&mut self, now_ms: f64) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.on_hint_tick(now_ms as u64)))
+    }
+
     /// A server push (a JSON-RPC notification): `method` + `params` JSON. Returns `Effect[]`.
     pub fn on_event(&mut self, method: String, params: JsValue) -> Result<JsValue, JsValue> {
         let params: Value = from_js(params)?;
@@ -613,6 +619,7 @@ fn effect_value(e: Effect) -> Value {
         }
         Effect::PickerScrollReset => json!({ "tag": "PickerScrollReset" }),
         Effect::Reconnect { attempt } => json!({ "tag": "Reconnect", "attempt": attempt }),
+        Effect::HintTickNow => json!({ "tag": "HintTickNow" }),
         Effect::Exit => json!({ "tag": "Exit" }),
         Effect::ToChooser => json!({ "tag": "ToChooser" }),
         Effect::ShellAction(action) => {

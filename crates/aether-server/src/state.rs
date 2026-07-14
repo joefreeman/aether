@@ -146,6 +146,17 @@ pub struct ServerState {
     /// unset so they never write backups to disk, and the idle reaper keeps its dirty-buffer guard
     /// (with backups off, reaping a dirty buffer would lose work). See `docs/unsaved-persistence.md`.
     pub backups_path: Option<PathBuf>,
+    /// Where to read/write the hint learning state ([`crate::config::HintsState`],
+    /// docs/hints.md). Same convention as [`Self::sessions_path`]: `Some` in the real server (and
+    /// in tests that point it at a tempfile); `None` disables persistence — `hints/record` still
+    /// aggregates in memory so a snapshot within one run stays coherent.
+    pub hints_path: Option<PathBuf>,
+    /// In-memory hint learning state, loaded from [`Self::hints_path`] at boot and
+    /// flushed back by the periodic hints flush (dirty-flag debounced) plus a final flush on
+    /// graceful shutdown.
+    pub hints: crate::config::HintsState,
+    /// Set by `hints/record` when [`Self::hints`] mutated; cleared by the flush that writes it.
+    pub hints_dirty: bool,
     /// The idle-reaper setting this instance was started with: `Some(d)` is a client-conjured
     /// server that self-reaps after `d` idle (see [`crate::server::idle_reaper`]); `None` is the
     /// persistent `ae server` daemon. Set once by `run_with_listener`; `None` until then. Read only
@@ -400,6 +411,9 @@ impl ServerState {
                 .unwrap_or(0),
             sessions_path: None,
             backups_path: None,
+            hints_path: None,
+            hints: crate::config::HintsState::default(),
+            hints_dirty: false,
             idle_timeout: None,
             next_buffer_id: 1,
             next_viewport_id: 1,

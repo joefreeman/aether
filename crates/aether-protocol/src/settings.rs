@@ -30,6 +30,10 @@ pub struct AppSettings {
     /// set of preset sizes.
     #[serde(default = "default_font_size")]
     pub font_size: u32,
+    /// Hints: the passive corner suggestion that walks through the curriculum
+    /// (docs/hints.md). The off-switch only — learning state lives in `hints.json`, not here.
+    #[serde(default = "default_hints")]
+    pub hints: bool,
 }
 
 fn default_wrap() -> WrapMode {
@@ -44,12 +48,17 @@ pub const fn default_font_size() -> u32 {
     14
 }
 
+fn default_hints() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             wrap: default_wrap(),
             ligatures: default_ligatures(),
             font_size: default_font_size(),
+            hints: default_hints(),
         }
     }
 }

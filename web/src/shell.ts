@@ -169,6 +169,7 @@ type EffectTag =
   | "RevealPickerSelection"
   | "PickerScrollReset"
   | "Reconnect"
+  | "HintTickNow"
   | "Exit"
   | "ToChooser"
   | "ShellAction";
@@ -407,6 +408,9 @@ interface CoreView {
   picker: PickerView | null;
   workspace_settings: WorkspaceSettingsView | null;
   app_settings: AppSettingsView | null;
+  /** The hint for the top-right corner (docs/hints.md): the display text split around its
+   *  emphasized key label. null = empty corner. */
+  hint: { before: string; keys: string; after: string } | null;
 }
 
 /** The workspace-settings overlay (`Space ,`), when open (view.rs `workspace_settings`). Core-owned
@@ -785,6 +789,8 @@ export class Shell {
     { el: HTMLElement; fade: number; remove: number }
   >();
   private readonly connBanner: HTMLElement;
+  /** The hint corner (docs/hints.md). */
+  private readonly hintEl: HTMLElement;
   private readonly searchBar: HTMLElement;
   private readonly searchInput: HTMLInputElement;
   private readonly searchPrefixEl: HTMLElement;
@@ -952,6 +958,11 @@ export class Shell {
     this.connBanner.setAttribute("role", "status");
     this.connBanner.setAttribute("aria-live", "polite");
     this.connBanner.style.display = "none";
+    // The hint corner (docs/hints.md): one quiet top-right chip, rendered from
+    // `view.hint` each paint and clocked by a slow interval (see the constructor's tail).
+    this.hintEl = document.createElement("div");
+    this.hintEl.id = "hint-corner";
+    this.hintEl.style.display = "none";
     // Search bar (shown in Search mode) — a persistent native <input> that owns text editing and
     // syncs to the core (search_set_query); nav/commit/cancel keys route through on_key.
     this.searchBar = document.createElement("div");
@@ -1332,6 +1343,7 @@ export class Shell {
       // can be `position: sticky` relative to the scrolling buffer) and removed on dismiss.
       this.workspaceSettingsEl,
       this.appSettingsEl,
+      this.hintEl,
       this.connBanner,
     );
 
@@ -1343,6 +1355,12 @@ export class Shell {
     window.addEventListener("mouseup", () => this.onMouseUp());
     window.addEventListener("resize", () => this.onResize());
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
+    // The hint engine's clock (docs/hints.md): a slow tick while the tab is visible
+    // and the session connected. The engine's own idle gate covers an unattended-but-visible tab.
+    window.setInterval(() => {
+      if (!this.session || !this.connected || document.visibilityState !== "visible") return;
+      this.runEffects(this.session.on_hint_tick(Date.now()) as CoreEffect[], true);
+    }, 2000);
     // The editor owns the whole keyboard, so suppress browser keyup defaults too (e.g. Firefox
     // decides menu-bar focus on the Alt keyup). Hard-reserved combos ignore this and still work.
     window.addEventListener("keyup", (e) => e.preventDefault());
@@ -1826,6 +1844,13 @@ export class Shell {
           break;
         case "PickerScrollReset":
           this.pickerScrollReset = true;
+          break;
+        case "HintTickNow":
+          // The hints snapshot just adopted: stamp the clock into the engine now, so the first
+          // hint shows immediately instead of waiting out the slow interval (docs/hints.md).
+          if (this.session) {
+            this.runEffects(this.session.on_hint_tick(Date.now()) as CoreEffect[], true);
+          }
           break;
         // Deferred to later milestones (browser tab — no process to exit, reconnect handled by a
         // page reload). Explicit no-ops so the exhaustive `default` below stays a drift detector.
@@ -2315,6 +2340,7 @@ export class Shell {
     this.renderPicker(v);
     this.renderWorkspaceSettings(v);
     this.renderAppSettings(v);
+    this.renderHint(v);
     // Re-park focus for the new state (no-op when already right). The focusout self-heal only
     // catches focus *drifting*; this catches the state moving under a still-focused input — e.g. a
     // delete-confirm opening over the Files picker, where the query input would otherwise keep
@@ -2829,6 +2855,24 @@ export class Shell {
    *  setting (`app_settings_toggle`); keyboard nav/toggle routes through the global keydown →
    *  `on_key` (the checkboxes aren't focused), so on open we park focus on `capture`. The flat row
    *  index (across groups) drives both the highlight and the toggle. */
+  /** The hint corner (docs/hints.md): a "Hint: …" line with the key label emphasized, or hidden
+   *  when the corner is empty. */
+  private renderHint(v: CoreView): void {
+    if (!v.hint) {
+      this.hintEl.style.display = "none";
+      return;
+    }
+    this.hintEl.style.display = "";
+    const keys = document.createElement("span");
+    keys.className = "hint-keys";
+    keys.textContent = v.hint.keys;
+    this.hintEl.replaceChildren(
+      document.createTextNode(`Hint: ${v.hint.before}`),
+      keys,
+      document.createTextNode(v.hint.after),
+    );
+  }
+
   private renderAppSettings(v: CoreView): void {
     const as = v.app_settings;
     const wasOpen = this.asOpen;
@@ -2932,12 +2976,8 @@ export class Shell {
    *  start steps into the chip row, then Left/Right navigate, Enter edits, Backspace/Delete removes. */
   private onPickerInputKey(e: KeyboardEvent): void {
     const p = this.snapshot?.picker;
-    // No workspace selected yet: the chooser is mandatory. Unlike the native clients (which exit on
-    // dismiss), a browser tab has nothing to fall back to, so Esc must not close it.
-    if (e.key === "Escape" && this.snapshot?.buffer.buffer_id === 0) {
-      e.preventDefault();
-      return;
-    }
+    // (No Esc special-case for the mandatory no-workspace chooser: the core keeps the picker open
+    // and emits `Exit`, which this shell no-ops — a browser tab has nothing to fall back to.)
     // Ctrl/Cmd-Enter opens the selected item in a new browser tab (keyboard parity with Ctrl-click).
     if (p && this.snapshot && (e.ctrlKey || e.metaKey) && !e.altKey && e.key === "Enter") {
       const sel = p.items[p.selected - p.offset];

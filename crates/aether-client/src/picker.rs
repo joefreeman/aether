@@ -98,6 +98,10 @@ pub struct PickerState {
     /// of the selection — chasing there would yank the window back to the selection and fight the
     /// scroll (a blank, oscillating scrollbar).
     pub refetch_chases_selection: bool,
+    /// True once any real window (`items: Some`) has been adopted — before that, an empty
+    /// `items` means "not loaded yet", not "no results". The hint facts read this so the
+    /// workspace chooser's empty-list hint can't fire on the pre-load flash (docs/hints.md).
+    pub loaded: bool,
 }
 
 /// Braille throbber frames for the "still searching" spinner (left of the picker's count).
@@ -131,7 +135,21 @@ impl PickerState {
             spinner_frame: 0,
             refetch_in_flight: false,
             refetch_chases_selection: false,
+            loaded: false,
         }
+    }
+
+    /// Workspace rows this (Workspaces) picker is showing, or `None` when it isn't the
+    /// Workspaces picker or hasn't adopted a window yet — before that, an empty item list means
+    /// "not loaded", not "no workspaces". Feeds the hint facts (docs/hints.md): zero teaches
+    /// creating a workspace, some teach opening one.
+    pub fn listed_workspaces(&self) -> Option<u32> {
+        (self.kind == PickerKind::Workspaces && self.loaded).then(|| {
+            self.items
+                .iter()
+                .filter(|i| matches!(i, PickerItem::Workspace { .. }))
+                .count() as u32
+        })
     }
 
     /// The throbber glyph to show while a search is in progress (`ticking`), or `None` when settled.
@@ -426,6 +444,9 @@ impl PickerState {
         if let Some(items) = u.items {
             self.items = items;
             self.groups = u.groups;
+            // A real window landed: "no rows" now means genuinely empty, not not-yet-loaded.
+            // The hint facts (docs/hints.md) key the chooser's create-vs-open hint on this.
+            self.loaded = true;
         }
         // Adopt the push's counts + display geometry from a real window (`Some`) or a count tick
         // that's reporting actual progress (`total_matches > 0`). A count-only tick reporting

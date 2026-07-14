@@ -147,14 +147,22 @@ pub enum Effect {
     Reconnect {
         attempt: u32,
     },
-    /// Quit the application.
+    /// Call `Session::on_hint_tick` with the current wall clock, promptly. Emitted when the
+    /// `hints/state` snapshot adopts: the engine is sans-IO (time reaches it only through the
+    /// tick entry point), so without this the first hint would wait out the shell's periodic
+    /// tick interval — the shell answers with one out-of-band tick and the first hint shows
+    /// right after adoption instead of seconds later (docs/hints.md).
+    HintTickNow,
+    /// Quit the application. A shell with no process to quit (the web — a browser tab) maps this
+    /// to a no-op; the mandatory chooser's Esc relies on that (the core keeps the picker open and
+    /// emits `Exit`, so the web chooser simply stays up).
     Exit,
     /// Return to the workspace chooser, discarding the current (now buffer-less) session — used when
     /// the last buffer of an ephemeral context closes on a client that *navigated into* it rather
-    /// than launching for a file (so it shouldn't quit). The shell resets to its boot-chooser
-    /// state (a placeholder session + the Workspaces picker); the core can't do this by mutating its
-    /// own fields because each shell presents its chooser differently (the TUI swaps in a
-    /// placeholder session, iced has a separate `boot` state, the web rebuilds the session).
+    /// than launching for a file (so it shouldn't quit). The shell resets to its boot-chooser state
+    /// (a fresh placeholder session + the Workspaces picker, uniform across all three shells); it's
+    /// an effect rather than a core mutation because the session swap is the shell's — it owns the
+    /// `Session` value and its render state.
     ToChooser,
     /// Read the system clipboard; the text comes back as `Event::ClipboardRead`.
     ReadClipboard(PasteKind),

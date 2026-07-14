@@ -277,6 +277,12 @@ pub async fn run(
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
 
+    // The hint engine's clock (docs/hints.md): a slow tick whose arm is gated below on
+    // "connected + hints on". The engine's own idle gate covers unattended terminals (crossterm
+    // focus events aren't universal, so the TUI ticks whenever the arm is enabled).
+    let mut hint_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    hint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     while !shell.should_quit {
         tokio::select! {
             ev = event_rx.recv() => {
@@ -288,6 +294,12 @@ pub async fn run(
                         Err(_) => break,
                     }
                 }
+            }
+            _ = hint_tick.tick(), if shell.session.conn == ConnState::Connected
+                && shell.session.hints_enabled =>
+            {
+                let fx = shell.session.on_hint_tick(now_unix_ms());
+                shell.run_effects(fx);
             }
             // Only poll the notifications channel while connected. Once the socket dies the channel
             // is closed, so `recv()` returns `None` *immediately* — without this guard the `select!`
@@ -326,6 +338,14 @@ pub async fn run(
         Some(e) => Err(anyhow::anyhow!(e)),
         None => Ok(()),
     }
+}
+
+/// Wall clock in Unix ms — the hint engine's injected clock (the core never reads time).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Shell {
@@ -479,6 +499,10 @@ impl Shell {
                     }
                 }
                 Effect::Reconnect { attempt } => self.spawn_reconnect(attempt),
+                Effect::HintTickNow => {
+                    let fx = self.session.on_hint_tick(now_unix_ms());
+                    self.run_effects(fx);
+                }
                 Effect::Exit => self.should_quit = true,
                 Effect::ToChooser => self.enter_chooser(),
                 Effect::ShellAction(action) => self.run_shell_action(action),
@@ -659,14 +683,6 @@ impl Shell {
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
-        // The no-workspace chooser: Esc dismisses it, which — with nothing behind it to fall back to —
-        // exits the app, matching the native client. (Selecting a workspace instead lands a buffer and
-        // proceeds; that path goes through `on_key` below.) Handled here, before the core closes the
-        // picker, so it's distinguishable from a workspace pick (which also closes the picker).
-        if code == KeyCode::Esc && self.session.is_placeholder() && self.session.picker.is_some() {
-            self.should_quit = true;
-            return;
-        }
         let visible_rows = self.visible_rows();
         // A focused overlay input (save-as, etc.) is edited shell-side: the shell owns the caret
         // and text mechanics, syncing the whole value into the core. Command keys (commit / cancel
@@ -1332,15 +1348,19 @@ impl Shell {
 
     // ---- reconnect (the dial loop; policy lives in the core) ------------------------------
 
-    /// Recovery when a reconnect succeeds but the old workspace is gone (renamed/removed while we
-    /// were away): reset to a placeholder session over the fresh connection and raise the Workspaces
-    /// chooser, mirroring a no-args start. Picking a workspace (the renamed one shows under its new
-    /// name) lands a buffer the usual way.
+    /// Recovery when a reconnect succeeds but there's no workspace to restore: either none was
+    /// active (the chooser was up when the connection dropped — land back in it, quietly) or the
+    /// one we had is gone (renamed/removed while away). Reset to a placeholder session over the
+    /// fresh connection and raise the Workspaces chooser, mirroring a no-args start. Picking a
+    /// workspace (a renamed one shows under its new name) lands a buffer the usual way.
     fn reconnect_to_chooser(&mut self) {
+        let was_choosing = self.session.is_placeholder();
         self.enter_chooser();
-        self.status(StatusMessage::error(
-            "workspace no longer exists — pick another".to_string(),
-        ));
+        self.status(if was_choosing {
+            StatusMessage::success("Reconnected".to_string())
+        } else {
+            StatusMessage::error("workspace no longer exists — pick another".to_string())
+        });
     }
 
     /// Drop to the workspace chooser over the live connection: swap in a fresh placeholder session
@@ -1414,6 +1434,10 @@ impl Shell {
         st.viewport_cols = cols as u32;
         st.viewport_rows = (rows as u32).saturating_sub(1);
         st.conn = s.conn;
+        st.hint = s.hint_view().map(|h| {
+            let (before, keys, after) = h.parts();
+            (before.to_string(), keys.to_string(), after.to_string())
+        });
         st.pending_leader = match s.pending {
             Pending::Leader => Some(PendingLeader::Space),
             _ => None,
@@ -2031,6 +2055,17 @@ async fn dial(
     let (handle, notifications) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(ReconnectError::from)?;
+    // The connection died while the chooser was up (a placeholder session — its workspace name
+    // is empty, and no real one can be: create validates non-empty). Nothing to restore; hand
+    // back a workspace-less reconnect and the shell re-raises the chooser.
+    if workspace.is_empty() {
+        return Ok(Reestablished {
+            handle,
+            notifications,
+            restore: None,
+            restarted: false,
+        });
+    }
     let activated = match handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
             name: workspace,
@@ -2289,6 +2324,7 @@ fn make_state(
         should_quit: false,
         status: StatusMessage::default(),
         toasts: Vec::new(),
+        hint: None,
         conn,
         last_terminal_title: String::new(),
         clipboard: clipboard::new_handle(),

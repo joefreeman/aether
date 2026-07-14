@@ -181,6 +181,10 @@ pub struct AppState {
     /// Active floating toasts, stacked bottom-right (newest at the bottom). Each is expired on a
     /// timer by the shell, keyed by its `id`. Fed from the same stream as `status`.
     pub toasts: Vec<Toast>,
+    /// The hint for the top-right corner (docs/hints.md), as `(before, keys, after)` — the
+    /// display text split around its emphasized key label, mirrored from the core's
+    /// `hint_view().parts()` each sync. `None` = empty corner.
+    pub hint: Option<(String, String, String)>,
     /// Connection state, mirrored from the session. The disconnect toast auto-expires, so the
     /// status bar shows a persistent `reconnecting…` / `disconnected` indicator while it's down.
     pub conn: ConnState,
@@ -772,6 +776,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            hint: None,
             conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,
@@ -801,6 +806,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            hint: None,
             conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,
@@ -833,6 +839,7 @@ mod tests {
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
+            hint: None,
             conn: ConnState::Connected,
             last_terminal_title: String::new(),
             clipboard: None,

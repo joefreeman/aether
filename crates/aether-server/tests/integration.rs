@@ -24432,3 +24432,132 @@ async fn status_endpoint_reports_clients_and_unsaved_buffers() {
 
     drop(server);
 }
+
+/// Hint events (docs/hints.md) aggregate server-side across clients — increments
+/// commute, so two windows can't clobber each other — and the state survives a server restart via
+/// the periodically-flushed `hints.json`. Retirement itself needs uses on two distinct calendar
+/// days, which a wall-clock test can't cross; that logic is unit-tested in `config`.
+#[tokio::test]
+async fn hints_aggregate_across_clients_and_persist() {
+    use aether_protocol::hints::{
+        HintEvent, HintsRecord, HintsRecordParams, HintsRecordResult, HintsState, HintsStateParams,
+        HintsStateResult,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let hints_path = dir.path().join("hints.json");
+
+    let server = aether_server::spawn_for_test_full(
+        vec![("hints-proj".to_string(), vec![dir.path().to_path_buf()])],
+        None,
+        None,
+        Some(hints_path.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Two clients report uses of the same hint; no workspace activation needed (hints are
+    // app-global, like settings).
+    let (mut ws1, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+
+    let r: HintsRecordResult = send_request::<HintsRecord>(
+        &mut ws1,
+        1,
+        &HintsRecordParams {
+            hint_id: "quit".into(),
+            event: HintEvent::Used,
+        },
+    )
+    .await;
+    assert!(!r.retired, "one same-day use never retires");
+    for id in 2..=3 {
+        let _: HintsRecordResult = send_request::<HintsRecord>(
+            &mut ws2,
+            id,
+            &HintsRecordParams {
+                hint_id: "quit".into(),
+                event: HintEvent::Used,
+            },
+        )
+        .await;
+    }
+    // A shown + a follow on a second hint exercises the fatigue counter shape end to end.
+    let _: HintsRecordResult = send_request::<HintsRecord>(
+        &mut ws1,
+        4,
+        &HintsRecordParams {
+            hint_id: "copy".into(),
+            event: HintEvent::Shown,
+        },
+    )
+    .await;
+    let _: HintsRecordResult = send_request::<HintsRecord>(
+        &mut ws1,
+        5,
+        &HintsRecordParams {
+            hint_id: "copy".into(),
+            event: HintEvent::Followed,
+        },
+    )
+    .await;
+
+    // The snapshot reflects both clients' increments: 1 + 2 uses, saturated at the threshold.
+    let snap: HintsStateResult =
+        send_request::<HintsState>(&mut ws1, 6, &HintsStateParams {}).await;
+    assert!(snap.retired.is_empty());
+    let quit = snap.active.get("quit").expect("quit record");
+    assert_eq!(quit.uses, 3, "uses from both clients aggregate");
+    assert_eq!(quit.use_days, 1, "all on one calendar day");
+    let copy = snap.active.get("copy").expect("copy record");
+    assert_eq!(copy.uses, 1);
+    assert_eq!(
+        copy.shows_without_follow, 0.0,
+        "the follow reset the fatigue counter"
+    );
+
+    // The periodic flush (1s) writes the file; poll it into existence like the backup tests do.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&hints_path) {
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if json["active"]["quit"]["uses"].as_u64() == Some(3) {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hints.json never flushed with the aggregated record"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // A fresh server over the same file restores the state.
+    drop(ws1);
+    drop(ws2);
+    drop(server);
+    let server = aether_server::spawn_for_test_full(
+        vec![("hints-proj".to_string(), vec![dir.path().to_path_buf()])],
+        None,
+        None,
+        Some(hints_path.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let snap: HintsStateResult = send_request::<HintsState>(&mut ws, 1, &HintsStateParams {}).await;
+    let quit = snap
+        .active
+        .get("quit")
+        .expect("quit record survived restart");
+    assert_eq!(quit.uses, 3);
+    assert!(snap.active.contains_key("copy"));
+
+    drop(server);
+}

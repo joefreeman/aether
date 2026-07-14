@@ -175,8 +175,7 @@ pub enum PickerMsg {
     Unhovered(u32),
     /// A filter chip was clicked — row index (selection is virtual, like the keyboard path).
     ChipClicked(usize),
-    /// The query `text_input` produced new text (session picker only — the controlled-input path;
-    /// the boot chooser's picker keeps the fake-caret rendering and never emits this).
+    /// The query `text_input` produced new text — the app syncs the value into the core.
     Query(String),
     /// The chip editor's root-filter `text_input` produced new text (multi-root dir editor).
     EditorRoot(String),
@@ -237,19 +236,13 @@ const SANS: iced::Font = iced::Font {
 
 /// Build the picker panel. `roots` are the workspace root paths (rows show a root label only in
 /// multi-root workspaces, like the other clients). `scroll_y` is the shell-tracked scroll
-/// offset of the results list (for the sticky-header pin).
-/// `controlled` selects the query-input rendering: `true` (the session picker) draws a real
-/// `text_input` synced to the core via [`PickerMsg::Query`]; `false` (the boot chooser, whose
-/// query lives outside the core session) keeps the fake-caret rendering driven by key events.
+/// offset of the results list (for the sticky-header pin). The query is a controlled
+/// `text_input` synced to the core via [`PickerMsg::Query`].
 pub fn overlay<'a>(
     state: &'a PickerState,
     roots: &'a [String],
     scroll_y: f32,
     spinner_phase: f32,
-    controlled: bool,
-    // Byte caret into `state.query`, used only by the fake-caret (`!controlled`) boot-chooser path;
-    // the controlled `text_input` owns its own caret, so the session picker passes 0.
-    query_cursor: usize,
 ) -> Element<'a, PickerMsg> {
     let mut panel = column![];
 
@@ -273,127 +266,79 @@ pub fn overlay<'a>(
         input = input.push(text(pfx.clone()).size(13).font(SANS).color(theme::NORD8));
     }
     // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
-    // placeholder is suppressed there (both the controlled and fake-caret paths honour this).
+    // placeholder is suppressed there.
     let show_placeholder = prefix.is_none() && chip_row.is_empty();
-    if controlled {
-        // Session picker: a real `text_input` synced to the core (web parity). NORD6 value, NORD8
-        // caret/selection, dim placeholder, no border/background (the input row's NORD0 is the
-        // box). Width::Shrink so it sits flush after any breadcrumb rather than filling the row and
-        // pushing the count off-screen.
-        // The Explorer's tab-completion ghost: the common-prefix suffix `Tab` would append.
-        let completion = state.explorer_completion().filter(|s| !s.is_empty());
-        // A completion ghost is itself the "what typing does" hint, so it also suppresses the
-        // placeholder (like the breadcrumb / chip row do).
-        let ph = if show_placeholder && completion.is_none() {
-            placeholder(state.kind)
-        } else {
-            ""
-        };
-        // `alt_passthrough` keeps Alt-nav chords (Alt-j/k/l) out of the query input (winit delivers
-        // `Alt+letter` as text on some platforms, which the focused input would otherwise insert).
-        let q_input = iced::widget::text_input(ph, &state.query)
-            .id(query_input_id())
-            .on_input(PickerMsg::Query)
-            .font(SANS)
-            .size(13)
-            .padding(0)
-            // `text_input` has no intrinsic content width — `Shrink` collapses it to nothing
-            // (the typed text wouldn't show). Fill the row up to the count instead (so the
-            // trailing Fill spacer below is skipped for this path).
-            .width(Length::Fill)
-            .style(|_theme, _status| iced::widget::text_input::Style {
-                background: iced::Background::Color(iced::Color::TRANSPARENT),
-                border: iced::Border::default(),
-                icon: theme::NORD6,
-                placeholder: theme::NORD3,
-                value: theme::NORD6,
-                selection: theme::NORD8,
-            });
-        // With chips present — and only while no chip is yet selected (the input still owns focus) —
-        // Left / Backspace at the *start* of the query select the rightmost chip instead of editing
-        // it: the browser tag-input gesture (web parity). Once a chip *is* selected the input is
-        // blurred and the chip-row keys (navigate / remove / deselect) flow to the core directly.
-        let wrapped = if !chip_row.is_empty() && state.chip_selected.is_none() {
-            let last = chip_row.len() - 1;
-            crate::alt_filter::alt_passthrough_intercept(
-                q_input,
-                state.query.clone(),
-                move |key, at_start| {
-                    use iced::keyboard::key::Named;
-                    (at_start
-                        && matches!(
-                            key,
-                            iced::keyboard::Key::Named(Named::ArrowLeft | Named::Backspace)
-                        ))
-                    .then_some(PickerMsg::ChipClicked(last))
-                },
-            )
-        } else {
-            crate::alt_filter::alt_passthrough(q_input)
-        };
-        if state.kind == PickerKind::Explorer {
-            // Always overlay the input on a gray ghost layer — even with no suffix, where it renders
-            // the typed text invisibly under the opaque value and shows nothing. Rendering it
-            // unconditionally keeps the widget-tree shape (and thus the `text_input`'s focus state,
-            // which iced stores by tree position) stable when a suggestion appears or vanishes
-            // mid-type. The ghost layer is Fill-width so the row still lays out like the bare input
-            // (placeholder visible, count pinned right). Mirrors `field_with_ghost`.
-            let suffix = completion.unwrap_or_default();
-            let ghost_text = text(format!("{}{}", state.query, suffix))
-                .size(13)
-                .font(SANS)
-                .color(theme::NORD3_BRIGHT)
-                .shaping(iced::widget::text::Shaping::Advanced)
-                .wrapping(iced::widget::text::Wrapping::None);
-            let ghost_layer: Element<'a, PickerMsg> =
-                row![ghost_text, iced::widget::Space::new().width(Length::Fill)].into();
-            input = input.push(iced::widget::stack![ghost_layer, wrapped]);
-        } else {
-            input = input.push(wrapped);
-        }
-    } else if state.query.is_empty() {
-        let mut q = row![
-            container(iced::widget::Space::new().width(2).height(15)).style(|_| {
-                container::Style {
-                    background: Some(theme::NORD8.into()),
-                    ..container::Style::default()
-                }
-            }),
-        ]
-        .spacing(2)
-        .align_y(iced::Alignment::Center);
-        if show_placeholder {
-            q = q.push(
-                text(placeholder(state.kind))
-                    .size(13)
-                    .font(SANS)
-                    .color(theme::NORD3),
-            );
-        }
-        input = input.push(q);
+    // The query: a real `text_input` synced to the core (web parity). NORD6 value, NORD8
+    // caret/selection, dim placeholder, no border/background (the input row's NORD0 is the box).
+    // The Explorer's tab-completion ghost: the common-prefix suffix `Tab` would append.
+    let completion = state.explorer_completion().filter(|s| !s.is_empty());
+    // A completion ghost is itself the "what typing does" hint, so it also suppresses the
+    // placeholder (like the breadcrumb / chip row do).
+    let ph = if show_placeholder && completion.is_none() {
+        placeholder(state.kind)
     } else {
-        let mut query_row = row![].align_y(iced::Alignment::Center);
-        let pre = &state.query[..query_cursor];
-        let post = &state.query[query_cursor..];
-        if !pre.is_empty() {
-            query_row = query_row.push(text(pre).size(13).font(SANS).color(theme::NORD6));
-        }
-        query_row = query_row.push(
-            container(iced::widget::Space::new().width(2).height(15)).style(|_| container::Style {
-                background: Some(theme::NORD8.into()),
-                ..container::Style::default()
-            }),
-        );
-        if !post.is_empty() {
-            query_row = query_row.push(text(post).size(13).font(SANS).color(theme::NORD6));
-        }
-        input = input.push(query_row);
-    }
-    // The fake-caret query has intrinsic width, so a Fill spacer pushes the count to the right edge.
-    // The controlled `text_input` is itself Fill, so it already does that — a second Fill would
-    // split the row and shrink the input.
-    if !controlled {
-        input = input.push(iced::widget::Space::new().width(Length::Fill));
+        ""
+    };
+    // `alt_passthrough` keeps Alt-nav chords (Alt-j/k/l) out of the query input (winit delivers
+    // `Alt+letter` as text on some platforms, which the focused input would otherwise insert).
+    let q_input = iced::widget::text_input(ph, &state.query)
+        .id(query_input_id())
+        .on_input(PickerMsg::Query)
+        .font(SANS)
+        .size(13)
+        .padding(0)
+        // `text_input` has no intrinsic content width — `Shrink` collapses it to nothing
+        // (the typed text wouldn't show). Fill the row up to the count instead.
+        .width(Length::Fill)
+        .style(|_theme, _status| iced::widget::text_input::Style {
+            background: iced::Background::Color(iced::Color::TRANSPARENT),
+            border: iced::Border::default(),
+            icon: theme::NORD6,
+            placeholder: theme::NORD3,
+            value: theme::NORD6,
+            selection: theme::NORD8,
+        });
+    // With chips present — and only while no chip is yet selected (the input still owns focus) —
+    // Left / Backspace at the *start* of the query select the rightmost chip instead of editing
+    // it: the browser tag-input gesture (web parity). Once a chip *is* selected the input is
+    // blurred and the chip-row keys (navigate / remove / deselect) flow to the core directly.
+    let wrapped = if !chip_row.is_empty() && state.chip_selected.is_none() {
+        let last = chip_row.len() - 1;
+        crate::alt_filter::alt_passthrough_intercept(
+            q_input,
+            state.query.clone(),
+            move |key, at_start| {
+                use iced::keyboard::key::Named;
+                (at_start
+                    && matches!(
+                        key,
+                        iced::keyboard::Key::Named(Named::ArrowLeft | Named::Backspace)
+                    ))
+                .then_some(PickerMsg::ChipClicked(last))
+            },
+        )
+    } else {
+        crate::alt_filter::alt_passthrough(q_input)
+    };
+    if state.kind == PickerKind::Explorer {
+        // Always overlay the input on a gray ghost layer — even with no suffix, where it renders
+        // the typed text invisibly under the opaque value and shows nothing. Rendering it
+        // unconditionally keeps the widget-tree shape (and thus the `text_input`'s focus state,
+        // which iced stores by tree position) stable when a suggestion appears or vanishes
+        // mid-type. The ghost layer is Fill-width so the row still lays out like the bare input
+        // (placeholder visible, count pinned right). Mirrors `field_with_ghost`.
+        let suffix = completion.unwrap_or_default();
+        let ghost_text = text(format!("{}{}", state.query, suffix))
+            .size(13)
+            .font(SANS)
+            .color(theme::NORD3_BRIGHT)
+            .shaping(iced::widget::text::Shaping::Advanced)
+            .wrapping(iced::widget::text::Wrapping::None);
+        let ghost_layer: Element<'a, PickerMsg> =
+            row![ghost_text, iced::widget::Space::new().width(Length::Fill)].into();
+        input = input.push(iced::widget::stack![ghost_layer, wrapped]);
+    } else {
+        input = input.push(wrapped);
     }
     // A rotating throbber sits to the left of the count while a search is still streaming; the count
     // itself shows progress. The app drives `spinner_phase` from frame ticks for a smooth spin.

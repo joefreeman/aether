@@ -2777,6 +2777,103 @@ fn workspaces_delete_confirms_then_deletes_and_guards_active() {
 }
 
 #[test]
+fn chooser_esc_over_placeholder_exits_and_keeps_the_picker() {
+    use aether_protocol::picker::PickerKind;
+
+    // The mandatory chooser: the Workspaces picker over a placeholder session (a no-args start,
+    // or after `ToChooser`). Esc exits — there's nothing behind the picker to fall back to — and
+    // the picker stays open (shells that can't exit, like the web, no-op `Exit` and keep it up).
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(quits(&fx), "Esc in the mandatory chooser exits");
+    assert!(
+        s.picker.is_some(),
+        "the picker stays open (web keeps rendering it)"
+    );
+    assert!(
+        !fx.0
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if *method == "picker/hide")),
+        "no picker/hide — the chooser wasn't dismissed"
+    );
+
+    // The same picker in a real session is an ordinary overlay: Esc closes it, no exit.
+    let mut s = hint_session();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(!quits(&fx), "in-session Esc doesn't exit");
+    assert!(s.picker.is_none(), "in-session Esc dismisses the picker");
+}
+
+#[test]
+fn search_option_toggle_follows_its_hint() {
+    // Search-mode bindings resolve in `on_search_key`, not `run_action` — the observation there
+    // must fire, or the option hints (Alt-c/w/e) never follow and the corner sticks.
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    let _ = key(&mut s, '/');
+    assert_eq!(s.mode, aether_client::session::Mode::Search);
+    let _ = s.on_hint_tick(1_000_000_004_000);
+    let v = s.hint_view().expect("a search option hint displays");
+    let (chord, id) = match v.keys {
+        "Alt-c" => ('c', "search-case"),
+        "Alt-w" => ('w', "search-word"),
+        "Alt-e" => ('e', "search-regex"),
+        other => panic!("unexpected search hint {other}"),
+    };
+    let keys_before = v.keys;
+
+    // Fire the displayed hint's own chord: it must record a follow and rotate out.
+    let fx = s.on_key(KeyCode::Char(chord), Mods::ALT, None, ROWS);
+    assert!(
+        hint_records(&fx)
+            .iter()
+            .any(|(i, ev)| i == id && ev == "followed"),
+        "the option toggle follows its hint: {:?}",
+        hint_records(&fx)
+    );
+    assert!(
+        s.hint_view().map(|v2| v2.keys) != Some(keys_before),
+        "the followed hint rotates out of the corner"
+    );
+}
+
+#[test]
+fn picker_esc_records_the_dismiss_gesture() {
+    use aether_protocol::picker::PickerKind;
+
+    // Esc in an in-session picker demonstrates the picker-dismiss binding: the close records a
+    // `used` (or `followed`, if the hint happened to be on screen) for the hint's learning.
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    let _ = s.open_picker(PickerKind::Files, None, None, false);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(s.picker.is_none(), "Esc closes the picker");
+    assert!(
+        hint_records(&fx)
+            .iter()
+            .any(|(id, _)| id == "picker-dismiss"),
+        "Esc-close records the dismiss demonstration: {:?}",
+        hint_records(&fx)
+    );
+
+    // The mandatory chooser's Esc exits without closing — deliberately NOT a dismiss
+    // demonstration (nothing closed, and the hint is suppressed there anyway).
+    let mut s = session();
+    adopt_hints(&mut s);
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(quits(&fx));
+    assert!(
+        !hint_records(&fx)
+            .iter()
+            .any(|(id, _)| id == "picker-dismiss"),
+        "the exit gesture must not count as a picker dismissal"
+    );
+}
+
+#[test]
 fn buffers_picker_close_closes_in_place() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
@@ -3145,6 +3242,7 @@ fn font_size_setting_steps_and_persists() {
         wrap: WrapMode::Soft,
         ligatures: true,
         font_size: 16,
+        ..AppSettings::default()
     })));
     assert_eq!(s.font_size, 16, "persisted font size is adopted");
     assert!(
@@ -3401,8 +3499,15 @@ fn settings_changed_push_applies_wrap_live() {
 fn startup_fetches_persisted_settings() {
     let mut s = session();
     let fx = s.startup();
-    let (_t, method, _p) = the_request(&fx);
-    assert_eq!(method, "settings/get");
+    let methods: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
+    // The connect sequence fetches the app settings and the hint snapshot together.
+    assert_eq!(methods, vec!["settings/get", "hints/state"]);
 }
 
 #[test]
@@ -3542,6 +3647,93 @@ fn accepting_the_workspaces_create_row_emits_workspace_create() {
     let create = find_request(&fx, "workspace/create").expect("workspace/create fired");
     assert_eq!(create["name"], json!("fresh"));
     assert!(s.picker.is_none(), "the picker closes on create");
+}
+
+#[test]
+fn create_from_chooser_survives_hint_ticks_mid_flight() {
+    use aether_protocol::picker::PickerKind;
+
+    // The full boot-chooser create flow with hints on, a hint tick injected at every await
+    // point — the TUI's 2s tick can land anywhere in the round-trip, and the in-flight session
+    // is briefly a placeholder with no picker. No tick may bounce it to the chooser or exit.
+    let mut s = session();
+    adopt_hints(&mut s);
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+    s.picker.as_mut().unwrap().loaded = true;
+    let _ = s.on_hint_tick(1_000_000_002_000); // the create hint displays
+    let _ = s.picker_set_query("e2e-scratch".into());
+    assert_eq!(s.picker.as_ref().unwrap().create_row_index(), Some(0));
+
+    let no_bounce = |fx: &Effects, at: &str| {
+        assert!(
+            !fx.0
+                .iter()
+                .any(|e| matches!(e, Effect::ToChooser | Effect::Exit)),
+            "no chooser bounce/exit {at}"
+        );
+    };
+
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    no_bounce(&fx, "on accept");
+    let create_token = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, method, .. } if *method == "workspace/create" => Some(*token),
+            _ => None,
+        })
+        .expect("workspace/create fired");
+
+    // Tick while the create is in flight: picker closed, still a placeholder.
+    let fx = s.on_hint_tick(1_000_000_004_000);
+    no_bounce(&fx, "while create in flight");
+
+    let fx = s.on_rpc_result(
+        create_token,
+        Ok(json!({
+            "workspace": { "name": "e2e-scratch", "paths": [] },
+            "server_started_at": 1,
+        })),
+    );
+    no_bounce(&fx, "on create result");
+    let open_token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, method, .. } if *method == "buffer/open" => Some(*token),
+                _ => None,
+            })
+            .expect("scratch buffer/open fired");
+
+    // Tick between the create result and the scratch landing: workspace set, buffer still 0.
+    let fx = s.on_hint_tick(1_000_000_006_000);
+    no_bounce(&fx, "while scratch open in flight");
+
+    let fx = s.on_rpc_result(
+        open_token,
+        Ok(json!({
+            "buffer_id": 1,
+            "language": null,
+            "line_count": 1,
+            "byte_count": 0,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": null,
+            "scratch_number": 1,
+            "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
+        })),
+    );
+    no_bounce(&fx, "on scratch adoption");
+    assert!(!s.is_placeholder(), "the scratch landed");
+    assert_eq!(s.workspace, "e2e-scratch");
+    assert!(s.workspace_settings.is_some(), "settings overlay is up");
+
+    // And a settled tick after landing.
+    let fx = s.on_hint_tick(1_000_000_008_000);
+    no_bounce(&fx, "after landing");
+    assert!(
+        s.workspace_settings.is_some(),
+        "the settings overlay survives the tick"
+    );
 }
 
 #[test]
@@ -4214,5 +4406,506 @@ fn space_alt_x_asks_the_shell_to_open_a_new_window() {
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "opening a window issues no RPC"
+    );
+}
+
+// ---- hints (docs/hints.md) --------------------------------------------------------
+
+/// A non-placeholder session (hints display nowhere on the boot placeholder).
+fn hint_session() -> Session {
+    use aether_client::session::BufferInfo;
+    Session::new(
+        "w".into(),
+        vec!["/tmp/w".into()],
+        BufferInfo {
+            buffer_id: 1,
+            label: "a.rs".into(),
+            path: Some("/tmp/w/a.rs".into()),
+            language: None,
+            revision: 0,
+            saved_revision: 0,
+            cursor: aether_protocol::cursor::CursorState::default(),
+            scroll: None,
+            transient: false,
+            lsp_server: None,
+        },
+    )
+}
+
+/// Every `hints/record` request in `fx`, as `(hint_id, event)` pairs.
+fn hint_records(fx: &Effects) -> Vec<(String, String)> {
+    fx.0.iter()
+        .filter_map(|e| match e {
+            Effect::Request { method, params, .. } if *method == "hints/record" => Some((
+                params["hint_id"].as_str().unwrap().to_string(),
+                params["event"].as_str().unwrap().to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Drive a session through the connect sequence with hints on: `startup()` → canned settings +
+/// (empty) hints snapshot → one tick to stamp the clock and sample the first hint. Returns the
+/// events the tick emitted.
+fn adopt_hints(s: &mut Session) -> Effects {
+    let fx = s.startup();
+    let reqs: Vec<(u64, &str)> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { token, method, .. } => Some((*token, *method)),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        reqs.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
+        vec!["settings/get", "hints/state"],
+        "startup fetches settings then the hint snapshot"
+    );
+    let settings = json!({ "wrap": "soft", "ligatures": true, "font_size": 14, "hints": true });
+    s.on_rpc_result(reqs[0].0, Ok(settings));
+    s.on_rpc_result(reqs[1].0, Ok(json!({})));
+    s.on_hint_tick(1_000_000_000_000) // an arbitrary wall clock, ~2001
+}
+
+#[test]
+fn hints_snapshot_adoption_requests_an_immediate_tick() {
+    use aether_protocol::picker::PickerKind;
+
+    // The boot chooser, as the shells drive it: placeholder session, Workspaces picker, then
+    // startup's snapshot adopts. Adoption must ask the shell for one out-of-band tick
+    // (`HintTickNow`) — the engine is clockless until a tick, and waiting for the periodic one
+    // would hold the first hint back ~2s after boot.
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+    s.picker.as_mut().unwrap().loaded = true;
+    let fx = s.startup();
+    let reqs: Vec<(u64, &str)> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { token, method, .. } => Some((*token, *method)),
+                _ => None,
+            })
+            .collect();
+    let settings = json!({ "wrap": "soft", "ligatures": true, "font_size": 14, "hints": true });
+    let _ = s.on_rpc_result(reqs[0].0, Ok(settings));
+    let fx = s.on_rpc_result(reqs[1].0, Ok(json!({})));
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::HintTickNow)),
+        "adopting the snapshot asks the shell for an immediate tick"
+    );
+    assert!(
+        s.hint_view().is_none(),
+        "still clockless until the tick lands"
+    );
+
+    // The shell answers with one tick: the first intro hint shows now, not seconds later.
+    let _ = s.on_hint_tick(1_000_000_000_000);
+    let v = s
+        .hint_view()
+        .expect("the chooser hint shows on the answering tick");
+    assert!(
+        v.text.contains("creates that workspace"),
+        "an empty chooser leads with the create hint: {}",
+        v.text
+    );
+
+    // A failed snapshot fetch asks for nothing — the engine stays dormant.
+    let mut s = session();
+    let fx = s.startup();
+    let token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, method, .. } if *method == "hints/state" => Some(*token),
+                _ => None,
+            })
+            .expect("hints/state fetched");
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "hints/state",
+            code: -32601,
+            message: "method not found".into(),
+        }),
+    );
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::HintTickNow)),
+        "no tick request when adoption failed"
+    );
+}
+
+#[test]
+fn hints_first_tick_after_adoption_shows_a_survival_hint() {
+    let mut s = hint_session();
+    assert!(s.hint_view().is_none(), "nothing shows before the snapshot");
+    let fx = adopt_hints(&mut s);
+    let view = s
+        .hint_view()
+        .expect("a hint holds the corner after the first tick");
+    let recs = hint_records(&fx);
+    assert_eq!(recs.len(), 1, "exactly one Shown recorded: {recs:?}");
+    assert_eq!(recs[0].1, "shown");
+    let (before, keys, after) = view.parts();
+    assert!(!keys.is_empty(), "the view carries a key label");
+    assert!(
+        !before.is_empty() || !after.is_empty(),
+        "the view carries sentence text around the key slot"
+    );
+}
+
+#[test]
+fn hints_intro_teaches_dismiss_then_toggle() {
+    let mut s = hint_session();
+    let fx = adopt_hints(&mut s);
+    // The tutorial opening: the very first hint teaches dismissal.
+    assert_eq!(hint_records(&fx)[0].0, "dismiss");
+    let view = s.hint_view().unwrap();
+    assert_eq!(view.parts().1, "Space h");
+
+    // Trying it advances the intro to the toggle hint — a follow, not a dismissal.
+    key(&mut s, ' ');
+    let fx = key(&mut s, 'h');
+    let recs = hint_records(&fx);
+    assert!(
+        recs.iter()
+            .any(|(id, ev)| id == "dismiss" && ev == "followed"),
+        "Space h on the dismiss hint is its follow: {recs:?}"
+    );
+    assert!(!recs.iter().any(|(_, ev)| ev == "dismissed"));
+    let view = s.hint_view().expect("the intro continues");
+    assert_eq!(view.parts().1, "Space Alt-h", "the toggle hint is second");
+
+    // Trying *that* follows the toggle hint, turns hints off, persists, and toasts the way back.
+    key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(!s.hints_enabled);
+    assert!(s.hint_view().is_none());
+    let recs = hint_records(&fx);
+    assert!(
+        recs.iter()
+            .any(|(id, ev)| id == "toggle" && ev == "followed"),
+        "Space Alt-h on the toggle hint is its follow: {recs:?}"
+    );
+    let settings: Vec<_> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, params, .. } if *method == "settings/set" => {
+                    Some(params.clone())
+                }
+                _ => None,
+            })
+            .collect();
+    assert_eq!(settings.len(), 1);
+    assert_eq!(settings[0]["hints"], json!(false));
+    assert!(
+        fx.0.iter().any(
+            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints disabled"))
+        ),
+        "turning hints off is confirmed with a toast"
+    );
+}
+
+#[test]
+fn hints_space_h_dismisses_and_rotates() {
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    // Advance past the dismiss hint (following it is the intro's special case); the toggle hint
+    // is an ordinary dismissal target.
+    key(&mut s, ' ');
+    key(&mut s, 'h');
+    let before = s.hint_view().expect("the toggle hint is displayed");
+    assert_eq!(before.parts().1, "Space Alt-h");
+
+    key(&mut s, ' ');
+    let fx = key(&mut s, 'h');
+    let recs = hint_records(&fx);
+    assert!(
+        recs.iter()
+            .any(|(id, ev)| id == "toggle" && ev == "dismissed"),
+        "Space h reports the dismissal: {recs:?}"
+    );
+    assert!(
+        recs.iter().any(|(id, ev)| id == "dismiss" && ev == "used"),
+        "the press also demonstrates the dismiss binding: {recs:?}"
+    );
+    let after = s.hint_view();
+    assert_ne!(after, Some(before), "a dismissed hint rotates away");
+    // The replacement (if the pool had one) was recorded as shown.
+    if after.is_some() {
+        assert!(recs.iter().any(|(_, ev)| ev == "shown"));
+    }
+}
+
+#[test]
+fn hints_space_alt_h_toggles_and_persists() {
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    assert!(s.hint_view().is_some());
+
+    // Space Alt-h off: the corner empties, the flip persists, and a toast names the way back.
+    key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(!s.hints_enabled);
+    assert!(s.hint_view().is_none());
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, params, .. }
+                if *method == "settings/set" && params["hints"] == json!(false)
+        )),
+        "the flip persists"
+    );
+    assert!(
+        fx.0.iter().any(
+            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints disabled"))
+        ),
+        "turning hints off is confirmed with a toast"
+    );
+
+    // And back on.
+    key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(s.hints_enabled);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "settings/set");
+    assert_eq!(params["hints"], json!(true));
+    assert!(
+        fx.0.iter().any(
+            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints enabled"))
+        ),
+        "turning hints back on is confirmed too"
+    );
+}
+
+#[test]
+fn hints_following_the_displayed_binding_records_followed() {
+    let mut s = hint_session();
+    let fx = adopt_hints(&mut s);
+    let shown_id = hint_records(&fx)[0].0.clone();
+
+    // "Press" the displayed hint's binding (the tier-0 hints map to these keys).
+    let fx = match shown_id.as_str() {
+        "dismiss" => {
+            key(&mut s, ' ');
+            key(&mut s, 'h')
+        }
+        "toggle" => {
+            key(&mut s, ' ');
+            s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS)
+        }
+        "help" => {
+            key(&mut s, ' ');
+            key(&mut s, '/')
+        }
+        "quit" => {
+            key(&mut s, ' ');
+            key(&mut s, 'q')
+        }
+        "insert" => key(&mut s, 'i'),
+        "motion-hjkl" => key(&mut s, 'j'),
+        other => panic!("unexpected tier-0 hint in Normal: {other}"),
+    };
+    let recs = hint_records(&fx);
+    assert!(
+        recs.iter()
+            .any(|(id, ev)| *id == shown_id && ev == "followed"),
+        "the on-screen hint's own binding is a follow: {recs:?}"
+    );
+}
+
+#[test]
+fn hints_off_screen_binding_records_used() {
+    let mut s = hint_session();
+    let fx = adopt_hints(&mut s);
+    let shown_id = hint_records(&fx)[0].0.clone();
+    // Press a tier-0 binding that is NOT the displayed hint.
+    let fx = if shown_id == "insert" {
+        key(&mut s, 'j') // motion-hjkl
+    } else {
+        key(&mut s, 'i') // insert — entering Insert also samples that context's hint (a Shown)
+    };
+    let used: Vec<_> = hint_records(&fx)
+        .into_iter()
+        .filter(|(_, ev)| ev == "used")
+        .collect();
+    assert_eq!(used.len(), 1, "exactly one Used event: {used:?}");
+    assert_ne!(used[0].0, shown_id, "an off-screen use is not a follow");
+}
+
+#[test]
+fn hints_setting_gates_view_and_traffic() {
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    assert!(s.hint_view().is_some());
+
+    // Toggle the "Hints" row off via the settings overlay (as a click would).
+    s.open_app_settings();
+    let idx = s
+        .app_setting_rows()
+        .iter()
+        .position(|r| r.label == "Hints")
+        .expect("the hints row exists");
+    let fx = s.on_event(aether_client::update::Event::AppSettingToggle(idx));
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "settings/set");
+    assert_eq!(params["hints"], json!(false), "the flip persists");
+
+    assert!(s.hint_view().is_none(), "the corner empties immediately");
+    let fx = s.on_hint_tick(1_000_000_002_000);
+    assert!(hint_records(&fx).is_empty(), "no traffic while off");
+    let fx = key(&mut s, 'i');
+    assert!(hint_records(&fx).is_empty(), "no observation while off");
+}
+
+#[test]
+fn hints_context_follows_overlays_and_reverts() {
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    let normal_view = s.hint_view().expect("a Normal-mode hint");
+
+    // The app-settings overlay is its own context with (today) an empty pool: corner goes blank.
+    s.open_app_settings();
+    assert!(
+        s.hint_view().is_none(),
+        "no hints are eligible in the Settings context yet"
+    );
+
+    // Esc back to Normal: the frozen slot restores the same hint, with no fresh Shown.
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.hint_view(),
+        Some(normal_view),
+        "the previous hint returns"
+    );
+    assert!(
+        hint_records(&fx).is_empty(),
+        "restoring a frozen slot records nothing"
+    );
+}
+
+#[test]
+fn hints_state_fetch_failure_is_loud() {
+    use aether_client::update::Event;
+    // A daemon that predates the hints RPCs answers `hints/state` with method-not-found (the
+    // version gate can't catch it — a dev rebuild keeps the version string). The engine staying
+    // silently dormant is undebuggable, so the failure surfaces as an actionable toast.
+    let mut s = hint_session();
+    let fx = s.on_event(Event::HintsStateLoaded(Err("method not found".into())));
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Toast { message, kind: ToastKind::Warning, .. }
+                if message.contains("restart the Aether server")
+        )),
+        "a failed hints snapshot fetch must say so"
+    );
+    assert!(s.hint_view().is_none(), "the engine stays dormant");
+
+    // With hints off the failure is irrelevant — stay quiet.
+    let mut s = hint_session();
+    s.hints_enabled = false;
+    let fx = s.on_event(Event::HintsStateLoaded(Err("method not found".into())));
+    assert!(fx.0.is_empty());
+}
+
+#[test]
+fn hints_workspace_chooser_hint_tracks_the_list() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+
+    // The Workspaces picker opens with a *loaded but empty* list (a fresh install's chooser).
+    // Picker state is set directly — the wire adoption path is covered by the picker tests.
+    let mut p = aether_client::picker::PickerState::new(PickerKind::Workspaces);
+    p.loaded = true;
+    s.picker = Some(p);
+    let fx = s.on_hint_tick(1_000_000_002_000);
+    let view = s.hint_view().expect("the chooser offers a hint");
+    assert!(
+        view.text.contains("creates that workspace"),
+        "empty list teaches creation: {}",
+        view.text
+    );
+    assert!(hint_records(&fx)
+        .iter()
+        .any(|(id, ev)| id == "workspace-create" && ev == "shown"));
+
+    // Workspaces exist: the hint flips to opening one.
+    s.picker.as_mut().unwrap().items = vec![PickerItem::Workspace {
+        name: "aether".into(),
+        unsaved_buffers: 0,
+        match_indices: Vec::new(),
+    }];
+    s.on_hint_tick(1_000_000_004_000);
+    let view = s.hint_view().expect("still a chooser hint");
+    assert!(
+        view.text.contains("open the selected workspace"),
+        "a populated list teaches opening: {}",
+        view.text
+    );
+
+    // Before the list loads, neither chooser hint can fire (the pre-load flash must not burn
+    // the create hint's intro slot).
+    let mut s = hint_session();
+    adopt_hints(&mut s);
+    s.picker = Some(aether_client::picker::PickerState::new(
+        PickerKind::Workspaces,
+    ));
+    s.on_hint_tick(1_000_000_002_000);
+    if let Some(view) = s.hint_view() {
+        assert!(
+            !view.text.contains("workspace"),
+            "unloaded list must not claim emptiness: {}",
+            view.text
+        );
+    }
+}
+
+#[test]
+fn hints_boot_chooser_drives_the_corner() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    // The boot chooser (every shell) is the core Workspaces picker over a placeholder session;
+    // its hints run through the ordinary tick/view path — the picker context outranks the
+    // placeholder check (docs/hints.md).
+    let mut s = session();
+    adopt_hints(&mut s);
+    let _ = s.open_picker(PickerKind::Workspaces, None, None, false);
+
+    // List not loaded yet: the chooser pair can't fire (the pre-load flash must not burn
+    // the create hint's intro slot).
+    s.on_hint_tick(1_000_000_002_000);
+    if let Some(v) = s.hint_view() {
+        assert!(
+            !v.text.contains("workspace"),
+            "unloaded list must not claim emptiness: {}",
+            v.text
+        );
+    }
+
+    // Loaded and empty (a fresh install): teach creating — preempting anything sampled.
+    s.picker.as_mut().unwrap().loaded = true;
+    let fx = s.on_hint_tick(1_000_000_004_000);
+    let v = s.hint_view().expect("a chooser hint");
+    assert!(
+        v.text.contains("creates that workspace"),
+        "empty chooser teaches creation: {}",
+        v.text
+    );
+    assert!(hint_records(&fx)
+        .iter()
+        .any(|(id, ev)| id == "workspace-create" && ev == "shown"));
+
+    // Populated: teach opening.
+    s.picker.as_mut().unwrap().items = vec![PickerItem::Workspace {
+        name: "aether".into(),
+        unsaved_buffers: 0,
+        match_indices: Vec::new(),
+    }];
+    s.on_hint_tick(1_000_000_006_000);
+    let v = s.hint_view().expect("a chooser hint");
+    assert!(
+        v.text.contains("open the selected workspace"),
+        "a populated chooser teaches opening: {}",
+        v.text
     );
 }

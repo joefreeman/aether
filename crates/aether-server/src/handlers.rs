@@ -35,6 +35,9 @@ use aether_protocol::git::{
     GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitNavigateHunkParams,
     GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
+use aether_protocol::hints::{
+    HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
+};
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditResult,
     InputAdjustNumberParams, InputMoveLinesParams, InputOpenLineParams, InputSurroundParams,
@@ -161,6 +164,59 @@ pub async fn settings_set(
     }
 
     Ok(params)
+}
+
+// ---- hints/* ------------------------------------------------------------------------------------
+
+/// Apply one hint event (docs/hints.md). App-global like settings — no active workspace
+/// required. The server stamps the wall clock (day attribution and fatigue decay are its call, so
+/// two windows can't disagree) and derives retirement; the write to `hints.json` rides the
+/// periodic dirty-flag flush ([`flush_hints`]), not this request.
+pub async fn hints_record(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: HintsRecordParams,
+) -> Result<HintsRecordResult, RpcError> {
+    let now_ms = crate::config::now_unix_ms();
+    let mut s = state.lock().await;
+    let (changed, retired) = s.hints.apply(&params.hint_id, params.event, now_ms);
+    if changed {
+        s.hints_dirty = true;
+    }
+    Ok(HintsRecordResult { retired })
+}
+
+/// The full hint learning-state snapshot, from memory. Fetched once per connection alongside
+/// `settings/get`.
+pub async fn hints_state(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    _params: HintsStateParams,
+) -> Result<HintsStateResult, RpcError> {
+    let s = state.lock().await;
+    Ok(s.hints.snapshot())
+}
+
+/// Write the hint learning state to disk when it changed since the last flush. The periodic loop
+/// in `server` calls this every second (that's the debounce — hint events between ticks coalesce
+/// into one write) and once more on graceful shutdown. Best-effort like [`flush_backups`]: a no-op
+/// when `hints_path` is unset; logs rather than fails on I/O error. The write happens off the lock
+/// — the state is tiny to clone and `hints.json` has a single writer (this function).
+pub(crate) async fn flush_hints(state: &SharedState) {
+    let (path, snapshot) = {
+        let mut s = state.lock().await;
+        let Some(path) = s.hints_path.clone() else {
+            return;
+        };
+        if !s.hints_dirty {
+            return;
+        }
+        s.hints_dirty = false;
+        (path, s.hints.clone())
+    };
+    if let Err(e) = crate::config::write_hints_at(&path, &snapshot) {
+        tracing::warn!(error = %e, "failed to write hint state");
+    }
 }
 
 /// Activate a workspace for this client. Loads the workspace's config from disk if no client has it

@@ -7,6 +7,9 @@ use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
 use super::effect::{
     Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget,
 };
+use super::hints::{
+    ContextId as HintCtx, HintFacts, HintView, PickerCmd, WireEvent as HintWireEvent,
+};
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::save_as::SaveAsEditor;
@@ -42,6 +45,9 @@ use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
     GitBlameLineParams, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+};
+use aether_protocol::hints::{
+    HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -228,6 +234,11 @@ pub enum Event {
     /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
     /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
     AppSettingsLoaded(Result<AppSettings, String>),
+    /// `hints/state` resolved at boot (alongside the settings fetch): adopt the hint
+    /// learning snapshot (docs/hints.md). The engine stays dormant until this lands — which is
+    /// also the "server connection succeeded" gate for the very first hint. Failure is non-fatal:
+    /// no hints this session.
+    HintsStateLoaded(Result<HintsStateResult, String>),
     /// `settings/set` (from the app-settings overlay) resolved: a failure surfaces as a toast (the
     /// optimistic local change already applied; this only reports persistence trouble).
     AppSettingsSaved(Result<AppSettings, String>),
@@ -261,6 +272,9 @@ impl Session {
     pub fn on_event(&mut self, event: Event) -> Effects {
         let before = self.highlight_trigger_state();
         let fx = self.dispatch_event(event);
+        // Events move the hint context too (a picker/view result opens the picker overlay, a
+        // buffer switch lands, …) — keep the corner in sync outside the key path as well.
+        let fx = fx.and(self.sync_hint_context());
         self.after_step_highlight(fx, before)
     }
 
@@ -955,6 +969,27 @@ impl Session {
                 // Apply the persisted settings at boot.
                 Ok(settings) => self.apply_app_settings(settings),
                 // Non-fatal: keep the defaults already in place. Don't toast at boot.
+                Err(_) => Effects::none(),
+            },
+
+            Event::HintsStateLoaded(result) => match result {
+                Ok(snap) => {
+                    self.hints.adopt(snap);
+                    // The engine is adopted but clockless (time only reaches it through the tick
+                    // entry point) — ask the shell for one immediate tick so the first hint shows
+                    // now rather than on the next periodic tick. Unconditional: the tick is
+                    // self-gating (hints off / no context → it's a cheap no-op).
+                    Effects::one(Effect::HintTickNow)
+                }
+                // Loud, not silent: with the engine dormant the corner just never appears, which
+                // is undebuggable. The one realistic cause is a stale daemon from a dev rebuild
+                // (identical version string, so the connect gate lets it through) that predates
+                // the hints RPCs — say so, and say the fix.
+                Err(_) if self.hints_enabled => Effects::toast_grouped(
+                    "Hints unavailable — restart the Aether server (ae server stop)",
+                    ToastKind::Warning,
+                    "hints",
+                ),
                 Err(_) => Effects::none(),
             },
 
@@ -2970,16 +3005,23 @@ impl Session {
         // primed search matches the same way the grep did.
         let prime =
             (kind == PickerKind::Grep).then(|| (p.query.clone(), p.wire_filters().match_options()));
+        // Hint observation before the picker closes: accepting a workspace row demonstrates the
+        // chooser's open hint (its follow, when displayed).
+        let observed =
+            if kind == PickerKind::Workspaces && matches!(item, PickerItem::Workspace { .. }) {
+                self.observe_picker_cmd(PickerCmd::OpenWorkspace)
+            } else {
+                Effects::none()
+            };
         let hide = self.close_picker();
 
-        hide.and(
-            self.request::<PickerSelect>(PickerSelectParams { kind, item }, move |__r| {
-                Event::PickerSelected {
-                    prime,
-                    result: __r.map_err(|e| e.to_string()),
-                }
-            }),
-        )
+        observed.and(hide).and(self.request::<PickerSelect>(
+            PickerSelectParams { kind, item },
+            move |__r| Event::PickerSelected {
+                prime,
+                result: __r.map_err(|e| e.to_string()),
+            },
+        ))
     }
 
     /// Drop the panel and unsubscribe (the server keeps walker/matcher state for resume).
@@ -3068,11 +3110,26 @@ impl Session {
                 }
             }
         }
+        let placeholder = self.is_placeholder();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         match code {
-            KeyCode::Esc => return self.close_picker(),
+            // The mandatory chooser: over a placeholder session (the Workspaces picker on a
+            // no-args start, or after `ToChooser`) there is nothing behind the picker to fall
+            // back to, so Esc exits instead of dismissing. The picker deliberately stays open —
+            // a shell that can't exit (the web: a browser tab has no process to quit) maps
+            // `Effect::Exit` to a no-op and the chooser simply remains up. Deliberately not a
+            // `PickerCmd::Dismiss` observation: nothing closes here.
+            KeyCode::Esc if placeholder && p.kind == PickerKind::Workspaces => {
+                return Effects::one(Effect::Exit);
+            }
+            // Hint observation before the picker closes (the picker-dismiss hint displays in
+            // this context — Esc while it's up is its follow).
+            KeyCode::Esc => {
+                let observed = self.observe_picker_cmd(PickerCmd::Dismiss);
+                return observed.and(self.close_picker());
+            }
             // Ctrl-Enter opens the highlighted item in a *new* window (GUI-only; a no-op in the TUI),
             // mirroring the web client's Ctrl/Cmd-Enter "open in a new tab". Rows that aren't a
             // new-window target (directories, LSP servers, keybindings, …) fall through to an
@@ -3111,11 +3168,18 @@ impl Session {
             // uncaptured, and the web `routeOverlayKey` clip filter drops Ctrl-c/v/x/a outright. Only
             // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
-                return self.picker_close_buffer();
+                let fx = self.observe_picker_cmd(PickerCmd::CloseBuffer);
+                return fx.and(self.picker_close_buffer());
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
-            KeyCode::Char('k') if mods.alt && !mods.ctrl => return self.picker_move(-1),
-            KeyCode::Char('j') if mods.alt && !mods.ctrl => return self.picker_move(1),
+            KeyCode::Char('k') if mods.alt && !mods.ctrl => {
+                let fx = self.observe_picker_cmd(PickerCmd::MoveSelection);
+                return fx.and(self.picker_move(-1));
+            }
+            KeyCode::Char('j') if mods.alt && !mods.ctrl => {
+                let fx = self.observe_picker_cmd(PickerCmd::MoveSelection);
+                return fx.and(self.picker_move(1));
+            }
             // `Ctrl-g` / `Ctrl-f` in the Explorer: switch to Grep / Files scoped to the
             // browsed directory ("grep here").
             KeyCode::Char('g') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
@@ -3179,7 +3243,14 @@ impl Session {
                 return self.open_glob_prompt(None);
             }
             KeyCode::Char('p') if mods.alt && !mods.ctrl => {
-                return self.open_dir_prompt(None);
+                // Only the kinds that actually have path scopes count as a demonstration —
+                // Alt-p is a no-op elsewhere and must not mark the hint used.
+                let fx = if matches!(p.kind, PickerKind::Files | PickerKind::Grep) {
+                    self.observe_picker_cmd(PickerCmd::AddPathScope)
+                } else {
+                    Effects::none()
+                };
+                return fx.and(self.open_dir_prompt(None));
             }
             KeyCode::PageUp => {
                 return self.picker_move(-(VISIBLE_ROWS as i64 - 1));
@@ -4350,10 +4421,13 @@ impl Session {
         if name.contains('/') || name.contains('\\') {
             return Effects::error("Workspace name can't contain path separators");
         }
+        // Hint observation before the picker closes (the chooser's create hint lives in this
+        // context — a successful create is its follow).
+        let observed = self.observe_picker_cmd(PickerCmd::CreateWorkspace);
         // Drop the picker first — the create both activates the workspace and (when it has no roots)
         // opens the settings overlay, so the picker shouldn't linger underneath.
         let hide = self.close_picker();
-        hide.and(self.request_str::<WorkspaceCreate>(
+        observed.and(hide).and(self.request_str::<WorkspaceCreate>(
             WorkspaceCreateParams { name },
             Event::WorkspaceCreated,
         ))
@@ -4553,7 +4627,113 @@ impl Session {
     /// once their live session is established (at boot, and again after a reconnect rebuilds the
     /// session) and run the returned effect like any other.
     pub fn startup(&mut self) -> Effects {
-        self.request_str::<SettingsGet>(SettingsGetParams {}, Event::AppSettingsLoaded)
+        let fx = self.request_str::<SettingsGet>(SettingsGetParams {}, Event::AppSettingsLoaded);
+        // The hint learning snapshot rides the same connect sequence; re-fetched after a
+        // reconnect too, which reconciles the local mirror against the server's counters.
+        fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded))
+    }
+
+    // ---- hints (docs/hints.md) ------------------------------------------------------
+
+    /// The hint context the session is in right now — which curriculum pool the corner draws
+    /// from. `None` means hints have nowhere to display: the boot placeholder (with no picker),
+    /// confirm/info prompts, the workspace-settings overlay, or an active sneak (whose
+    /// keystrokes are query input, not bindings). Precedence mirrors [`Self::dispatch_key`]'s
+    /// keyboard ownership — except the picker outranks the placeholder check: the boot chooser
+    /// (all shells) is the Workspaces picker over a placeholder session, and it has its own hints.
+    fn hint_context(&self) -> Option<HintCtx> {
+        if let Some(prompt) = &self.prompt {
+            return match prompt {
+                Prompt::SaveAs(_) => Some(HintCtx::SaveAs),
+                _ => None,
+            };
+        }
+        if let Some(p) = &self.picker {
+            return Some(HintCtx::Picker(p.kind));
+        }
+        if self.is_placeholder() {
+            return None;
+        }
+        if self.workspace_settings.is_some() {
+            return None;
+        }
+        if self.app_settings.is_some() {
+            return Some(HintCtx::Settings);
+        }
+        if self.sneak.is_some() {
+            return None;
+        }
+        match self.mode {
+            Mode::Normal => Some(HintCtx::Normal),
+            Mode::Insert => Some(HintCtx::Insert),
+            Mode::Search => Some(HintCtx::Search),
+        }
+    }
+
+    /// The session facts that condition hint display eligibility beyond the context id — the
+    /// engine is sans-IO, so it learns these only when stamped in (docs/hints.md).
+    fn hint_facts(&self) -> HintFacts {
+        HintFacts {
+            workspaces_listed: self.picker.as_ref().and_then(|p| p.listed_workspaces()),
+            mandatory_chooser: self.is_placeholder(),
+        }
+    }
+
+    /// The shared preamble of every hint-engine call: stamp the current facts and resolve the
+    /// context.
+    fn hint_env(&mut self) -> Option<HintCtx> {
+        let facts = self.hint_facts();
+        self.hints.set_facts(facts);
+        self.hint_context()
+    }
+
+    /// The corner hint each shell renders top-right, if any. Pure read — safe to call per frame.
+    pub fn hint_view(&self) -> Option<HintView> {
+        self.hints.view(self.hint_context(), self.hints_enabled)
+    }
+
+    /// The shell's periodic hint tick (every couple of seconds, while the window has focus):
+    /// stamps the wall clock into the engine, runs the display timer/rotation, and flushes any
+    /// hint events to the wire. Cheap when hints are off or nothing is due.
+    pub fn on_hint_tick(&mut self, now_ms: u64) -> Effects {
+        let ctx = self.hint_env();
+        let enabled = self.hints_enabled;
+        let evs = self.hints.on_tick(ctx, now_ms, enabled);
+        self.emit_hint_events(evs)
+    }
+
+    /// Re-sync the hint engine to the session's current context (called after key dispatch and
+    /// event handling — both can open/close overlays). Emits the Shown for a freshly-filled slot.
+    fn sync_hint_context(&mut self) -> Effects {
+        let ctx = self.hint_env();
+        let enabled = self.hints_enabled;
+        let evs = self.hints.sync_context(ctx, enabled);
+        self.emit_hint_events(evs)
+    }
+
+    /// An instrumented picker-vocabulary command fired (`on_picker_key` has no `Action` identity,
+    /// so the curriculum-relevant arms report a [`PickerCmd`] explicitly).
+    fn observe_picker_cmd(&mut self, cmd: PickerCmd) -> Effects {
+        let ctx = self.hint_env();
+        let enabled = self.hints_enabled;
+        let evs = self.hints.observe_picker(cmd, ctx, enabled);
+        self.emit_hint_events(evs)
+    }
+
+    /// Put hint events on the wire (`hints/record`). Fire-and-forget: the server's aggregate is
+    /// reconciled at the next connect, so results are ignored.
+    fn emit_hint_events(&mut self, evs: Vec<HintWireEvent>) -> Effects {
+        let mut fx = Effects::none();
+        for ev in evs {
+            fx = fx.and(self.request_str::<HintsRecord>(
+                HintsRecordParams {
+                    hint_id: ev.hint_id.to_string(),
+                    event: ev.event,
+                },
+                |_| Event::Noop,
+            ));
+        }
+        fx
     }
 
     /// Open the application-settings overlay (`Space .`). Cheap — no RPC; the values it shows
@@ -4643,6 +4823,9 @@ impl Session {
         // and re-measure their cell + reflow when it changes (the terminal ignores it). Adopting the
         // value is enough — the re-render after this event applies it.
         self.font_size = settings.font_size;
+        // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
+        // rendering the corner hint when it's off.
+        self.hints_enabled = settings.hints;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
@@ -4672,8 +4855,7 @@ impl Session {
                 let mut fx = self.request_str::<SettingsSet>(
                     AppSettings {
                         wrap: new_wrap,
-                        ligatures: self.ligatures,
-                        font_size: self.font_size,
+                        ..self.current_app_settings()
                     },
                     Event::AppSettingsSaved,
                 );
@@ -4685,14 +4867,7 @@ impl Session {
             // event applies it (native swaps text shaping, web toggles the font feature). No reflow.
             AppSettingId::Ligatures => {
                 self.ligatures = !self.ligatures;
-                self.request_str::<SettingsSet>(
-                    AppSettings {
-                        wrap: self.wrap,
-                        ligatures: self.ligatures,
-                        font_size: self.font_size,
-                    },
-                    Event::AppSettingsSaved,
-                )
+                self.persist_app_settings()
             }
             // Font size: activating the row cycles to the next preset (wrapping). Like ligatures
             // it's shell-render-only — set the value + persist, and the GUI/web re-render re-measures
@@ -4700,7 +4875,42 @@ impl Session {
             AppSettingId::FontSize => {
                 self.set_font_size(step_font_size(self.font_size, true, true))
             }
+            // Hints: same flip (and toast) as `Space Alt-h`.
+            AppSettingId::Hints => self.toggle_hints(),
         }
+    }
+
+    /// Flip hints on/off, persist, and announce it. Shared by `Space Alt-h` and the settings
+    /// row. The toast is the affordance: turning hints off just empties a corner, which reads as
+    /// nothing happening — and the off-message names the chord, so off is discoverably
+    /// reversible.
+    fn toggle_hints(&mut self) -> Effects {
+        self.hints_enabled = !self.hints_enabled;
+        let msg = if self.hints_enabled {
+            "Hints enabled"
+        } else {
+            "Hints disabled — Space Alt-h re-enables"
+        };
+        self.persist_app_settings()
+            .and(Effects::toast_grouped(msg, ToastKind::Info, "hints"))
+    }
+
+    /// The app settings exactly as this session currently holds them — the base every
+    /// `settings/set` builds on, so a toggle can override one field without restating the rest.
+    fn current_app_settings(&self) -> AppSettings {
+        AppSettings {
+            wrap: self.wrap,
+            ligatures: self.ligatures,
+            font_size: self.font_size,
+            hints: self.hints_enabled,
+        }
+    }
+
+    /// Persist the session's current app settings (`settings/set`), after a field was mutated in
+    /// place. The result only reports persistence trouble — the optimistic local change already
+    /// applied.
+    fn persist_app_settings(&mut self) -> Effects {
+        self.request_str::<SettingsSet>(self.current_app_settings(), Event::AppSettingsSaved)
     }
 
     /// Persist a new editor font size + apply it (the GUI/web re-render reads `self.font_size`).
@@ -4710,14 +4920,7 @@ impl Session {
             return Effects::none();
         }
         self.font_size = font_size;
-        self.request_str::<SettingsSet>(
-            AppSettings {
-                wrap: self.wrap,
-                ligatures: self.ligatures,
-                font_size,
-            },
-            Event::AppSettingsSaved,
-        )
+        self.persist_app_settings()
     }
 
     /// Keys in the search prompt. Text entry (insert / delete / caret) is owned by each shell's
@@ -4769,7 +4972,16 @@ impl Session {
             return self.search_select_last_chip();
         }
         match lookup(KeyContext::Search, code, mods) {
-            Some(b) => self.search_action(b.action),
+            Some(b) => {
+                // Hint observation (docs/hints.md): search-mode bindings resolve here rather
+                // than through `run_action`, so mirror its pre-dispatch observation — the
+                // option hints (Alt-c/w/e) must follow and rotate when their chord fires.
+                let ctx = self.hint_env();
+                let enabled = self.hints_enabled;
+                let evs = self.hints.observe_action(&b.action, ctx, enabled);
+                let observed = self.emit_hint_events(evs);
+                observed.and(self.search_action(b.action))
+            }
             None => Effects::none(),
         }
     }
@@ -5015,8 +5227,12 @@ impl Session {
         text: Option<String>,
         visible_rows: u32,
     ) -> Effects {
+        // Every key is hint-relevant activity (the idle gate), and dispatch may have moved the
+        // hint context (opened an overlay, left Insert) — re-sync so the corner follows.
+        self.hints.note_input();
         let before = self.highlight_trigger_state();
         let fx = self.dispatch_key(code, mods, text, visible_rows);
+        let fx = fx.and(self.sync_hint_context());
         self.after_step_highlight(fx, before)
     }
 
@@ -5185,6 +5401,23 @@ impl Session {
         extend: bool,
         visible_rows: u32,
     ) -> Effects {
+        // Hint observation (docs/hints.md): every resolved binding passes through here — except
+        // search-mode keys, which resolve in `on_search_key` and observe there. Observed (and
+        // its record requests emitted) *before* dispatch, so the context is the one the hint
+        // displayed in (dispatch may open a picker and move it) — and so a `Quit`'s follow
+        // record hits the wire ahead of `Effect::Exit` tearing the process down, rather than
+        // queuing behind it and being lost.
+        let hint_ctx = self.hint_env();
+        let enabled = self.hints_enabled;
+        // `Space h` owns its hint learning inside the engine's `dismiss()` — observing it here
+        // would rotate a followed intro hint before the dismissal ran, dismissing its
+        // replacement instead.
+        let evs = if matches!(action, Action::DismissHint) {
+            Vec::new()
+        } else {
+            self.hints.observe_action(&action, hint_ctx, enabled)
+        };
+        let hint_fx = self.emit_hint_events(evs);
         let task = self.dispatch_action(action, count, extend, visible_rows);
         // Remember the action for `.` to replay. Recorded at dispatch (the RPC is still in flight —
         // a failed motion just leaves a harmless no-op target). `RepeatMotion` itself isn't
@@ -5193,7 +5426,7 @@ impl Session {
         if action.is_repeatable() {
             self.last_repeat = Some(RepeatTarget::Action { action, count });
         }
-        task
+        hint_fx.and(task)
     }
 
     fn dispatch_action(
@@ -5434,6 +5667,16 @@ impl Session {
                 self.open_app_settings();
                 Effects::none()
             }
+            // Dismiss the corner hint (docs/hints.md): a deliberate "not now" — down-weight it
+            // (heavier than a lapsed display) and rotate to another. No-op on an empty corner.
+            A::DismissHint => {
+                let ctx = self.hint_env();
+                let enabled = self.hints_enabled;
+                let evs = self.hints.dismiss(ctx, enabled);
+                self.emit_hint_events(evs)
+            }
+            // Toggle hints app-wide — the keyboard twin of the settings-overlay row.
+            A::ToggleHints => self.toggle_hints(),
             A::NavBack | A::NavForward => {
                 let forward = matches!(action, A::NavForward);
                 let f = move |res: Result<NavStepResult, RpcError>| Event::NavDone {
