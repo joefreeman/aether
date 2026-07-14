@@ -80,6 +80,8 @@ static BASH: OnceLock<LanguageConfig> = OnceLock::new();
 static JSON: OnceLock<LanguageConfig> = OnceLock::new();
 static YAML: OnceLock<LanguageConfig> = OnceLock::new();
 static QUIVER: OnceLock<LanguageConfig> = OnceLock::new();
+static SQL: OnceLock<LanguageConfig> = OnceLock::new();
+static TERRAFORM: OnceLock<LanguageConfig> = OnceLock::new();
 
 /// Everything that distinguishes one injection-free language from another: the grammar, its
 /// queries, and the editing metadata copied into the resulting [`LanguageConfig`]. Named fields
@@ -385,6 +387,35 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 default_indent: IndentStyle::Spaces(2),
                 line_comment: Some("//"),
                 block_comment: None,
+            },
+        )),
+        "sql" => Some(simple(
+            &SQL,
+            LanguageSpec {
+                name: "sql",
+                language: tree_sitter_sequel::LANGUAGE,
+                highlights: tree_sitter_sequel::HIGHLIGHTS_QUERY,
+                // The crate's bundled `indents.scm` uses the `@indent.begin/branch/end` dialect,
+                // which our Helix-style indent engine doesn't recognise — leave it off and fall
+                // back to copying the previous line's indent.
+                indents: None,
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("--"),
+                block_comment: Some(("/*", "*/")),
+            },
+        )),
+        "terraform" | "hcl" | "tf" | "tfvars" => Some(simple(
+            &TERRAFORM,
+            LanguageSpec {
+                name: "terraform",
+                language: tree_sitter_hcl::LANGUAGE,
+                // The `tree-sitter-hcl` crate ships no queries; both are vendored under
+                // `queries/terraform/` (highlights adapted from nvim-treesitter, indents from Helix).
+                highlights: include_str!("../queries/terraform/highlights.scm"),
+                indents: Some(include_str!("../queries/terraform/indents.scm")),
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("#"),
+                block_comment: Some(("/*", "*/")),
             },
         )),
         _ => None,
@@ -937,6 +968,11 @@ mod tests {
             ("json", "{\"a\": 1}"),
             ("yaml", "a: 1\n"),
             ("quiver", "double = #'int { [~, 2] %math.mul }\n"),
+            ("sql", "SELECT id FROM users WHERE id = 1;"),
+            (
+                "terraform",
+                "resource \"aws_instance\" \"web\" {\n  count = 1\n}\n",
+            ),
         ];
         for (lang, source) in cases {
             let cfg =
@@ -975,6 +1011,9 @@ mod tests {
             ("erl", "erlang"),
             ("htm", "html"),
             ("qv", "quiver"),
+            ("tf", "terraform"),
+            ("tfvars", "terraform"),
+            ("hcl", "terraform"),
         ];
         for (alias, canonical) in pairs {
             let a = get_config(alias).unwrap_or_else(|| panic!("alias `{alias}` not registered"));

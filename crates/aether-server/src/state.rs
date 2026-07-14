@@ -1594,6 +1594,8 @@ fn detect_language(path: &Path) -> Option<String> {
             "css" => "css",
             "sh" | "bash" | "zsh" => "bash",
             "qv" => "quiver",
+            "sql" => "sql",
+            "tf" | "tfvars" | "hcl" => "terraform",
             _ => return None,
         }
         .to_string(),

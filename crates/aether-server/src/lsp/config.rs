@@ -153,6 +153,21 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
             root_markers: &[],
             init_options: None,
         },
+        "sql" => LspServerSpec {
+            // `sqls` speaks LSP over stdio by default. Its DB-aware features need a `config.yml`,
+            // but it initializes fine without one (keyword completion / formatting) — fall back to
+            // the project root when no config is present.
+            command: "sqls",
+            args: &[],
+            root_markers: &["config.yml", ".sqls/config.yml"],
+            init_options: None,
+        },
+        "terraform" => LspServerSpec {
+            command: "terraform-ls",
+            args: &["serve"],
+            root_markers: &[".terraform.lock.hcl", ".terraform"],
+            init_options: None,
+        },
         _ => return None,
     };
     Some(spec)
@@ -200,6 +215,9 @@ mod tests {
         assert_eq!(server_spec("elixir").unwrap().command, "elixir-ls");
         assert_eq!(server_spec("erlang").unwrap().command, "elp");
         assert_eq!(server_spec("quiver").unwrap().command, "quiver-lsp");
+        assert_eq!(server_spec("sql").unwrap().command, "sqls");
+        assert_eq!(server_spec("terraform").unwrap().command, "terraform-ls");
+        assert_eq!(server_spec("terraform").unwrap().args, &["serve"]);
         // Workspace-aware languages resolve to the workspace root, not per crate/module.
         assert_eq!(
             workspace_marker("rust"),

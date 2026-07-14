@@ -68,6 +68,8 @@ tree-sitter-css = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
+tree-sitter-sequel = "0.3"
+tree-sitter-hcl = "1.1"
 # Quiver grammar, tracking the upstream repo's `main` branch (the crate lives in its `tree-sitter`
 # subdirectory; Cargo resolves it by package name). Cargo.lock pins the exact commit.
 tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "main" }
