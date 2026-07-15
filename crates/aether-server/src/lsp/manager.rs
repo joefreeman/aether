@@ -80,6 +80,11 @@ pub struct LspManager {
     /// Which server each open document is synced against, for `didChange`/`didClose` routing.
     pub doc_server: HashMap<BufferId, LspServerKey>,
     next_generation: u64,
+    /// **Test seam.** In-process dummy servers keyed by language (see [`super::dummy`]). When a
+    /// language has an entry here, [`launch`] wires up the dummy over in-memory pipes instead of
+    /// spawning the real server process. Empty in production — populated only by
+    /// [`crate::spawn_for_test_with_lsp`], the way `sessions_path`/`hints_path` are test-only.
+    pub dummy_configs: HashMap<String, super::dummy::DummyLspConfig>,
 }
 
 impl LspManager {
@@ -283,6 +288,20 @@ fn file_has_line(path: &Path, needle: &str) -> bool {
 /// Background task: spawn the subprocess, hand off to [`bring_up`]. Marks the handle `Crashed` if
 /// the process can't be spawned.
 pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, generation: u64) {
+    // Test seam: a registered in-process dummy server for this language stands in for the real
+    // process, over in-memory pipes but through the identical `bring_up` handshake path. Checked
+    // first so tests skip both the process spawn and the `shell_env` shell round-trip. Never
+    // populated in production (see [`LspManager::dummy_configs`]).
+    let dummy = { state.lock().await.lsp.dummy_configs.get(&key.language).cloned() };
+    if let Some(config) = dummy {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+        tokio::spawn(super::dummy::serve(sr, sw, config));
+        let (client, inbound) = super::client::connect(cr, cw);
+        bring_up(&state, key, generation, client, inbound, None).await;
+        return;
+    }
     // Resolve the toolchain environment for this root (mise/direnv/asdf/… activation), falling back
     // to the daemon's own environment when there's nothing to add. See [`shell_env`].
     let env = shell_env::resolve(&key.root).await;

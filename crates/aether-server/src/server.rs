@@ -291,7 +291,26 @@ pub async fn spawn_for_test_multi_with_persistence(
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
-    spawn_for_test_full(workspaces, sessions_path, backups_dir, None).await
+    spawn_for_test_full(workspaces, sessions_path, backups_dir, None, Vec::new()).await
+}
+
+/// As [`spawn_for_test`], but registers in-process **dummy language servers** (see
+/// [`crate::lsp::dummy`]) keyed by language, so LSP integration tests run deterministically without
+/// a real server binary. Any buffer whose language has an entry launches the dummy instead of the
+/// real process.
+pub async fn spawn_for_test_with_lsp(
+    workspace_name: impl Into<String>,
+    workspace_paths: Vec<PathBuf>,
+    dummy_lsp: Vec<(String, crate::lsp::dummy::DummyLspConfig)>,
+) -> anyhow::Result<ServerHandle> {
+    spawn_for_test_full(
+        vec![(workspace_name.into(), workspace_paths)],
+        None,
+        None,
+        None,
+        dummy_lsp,
+    )
+    .await
 }
 
 /// As [`spawn_for_test_multi_with_persistence`], but also points the server at `hints_path` for
@@ -303,6 +322,7 @@ pub async fn spawn_for_test_full(
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
     hints_path: Option<PathBuf>,
+    dummy_lsp: Vec<(String, crate::lsp::dummy::DummyLspConfig)>,
 ) -> anyhow::Result<ServerHandle> {
     use crate::state::WorkspaceEntry;
     use crate::workspace_index::WorkspaceIndex;
@@ -320,6 +340,11 @@ pub async fn spawn_for_test_full(
         s.sessions_path = sessions_path;
         s.backups_path = backups_dir;
         s.hints_path = hints_path;
+        // In-process dummy language servers (test seam — see `lsp::dummy`). Seeded before the run
+        // task starts so any buffer opened afterwards launches the dummy, not a real process.
+        for (language, config) in dummy_lsp {
+            s.lsp.dummy_configs.insert(language, config);
+        }
         if let Some(path) = s.hints_path.clone() {
             s.hints = crate::config::load_hints_at(&path).unwrap_or_default();
         }

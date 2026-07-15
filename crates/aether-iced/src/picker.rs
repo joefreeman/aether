@@ -168,7 +168,7 @@ pub fn window_row_at(state: &PickerState, y: f32) -> Option<usize> {
 pub enum PickerMsg {
     /// A row was clicked — absolute index into the match list.
     Click(u32),
-    /// The results list scrolled (absolute y offset in px).
+    /// The jumplist scrolled (absolute y offset in px).
     Scrolled(f32),
     /// The pointer entered / left a row (drives the clickable-underline hover state).
     Hovered(u32),
@@ -226,6 +226,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitChangesFile => "Changes in current file…",
         PickerKind::GitChanges => "Changes in workspace…",
         PickerKind::Keybindings => "Search keybindings…",
+        PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
 
@@ -236,7 +237,7 @@ const SANS: iced::Font = iced::Font {
 
 /// Build the picker panel. `roots` are the workspace root paths (rows show a root label only in
 /// multi-root workspaces, like the other clients). `scroll_y` is the shell-tracked scroll
-/// offset of the results list (for the sticky-header pin). The query is a controlled
+/// offset of the jumplist (for the sticky-header pin). The query is a controlled
 /// `text_input` synced to the core via [`PickerMsg::Query`].
 pub fn overlay<'a>(
     state: &'a PickerState,
@@ -1427,6 +1428,38 @@ fn render_item<'a>(
                 false,
             ));
             r.into()
+        }
+        // A captured entry renders exactly like a grep row (quickfix-style; docs/jumplist.md §2.2):
+        // monospace trimmed preview on the left, right-aligned dim line number on the right — no
+        // dot, no dressing. Most sources are code lines (grep previews, hunk lines); leading
+        // whitespace strips and the indices shift with it.
+        PickerItem::JumplistEntry {
+            line,
+            display,
+            match_indices,
+            ..
+        } => {
+            let trimmed = display.trim_start();
+            let lead = (display.chars().count() - trimmed.chars().count()) as u32;
+            let shifted: Vec<u32> = match_indices
+                .iter()
+                .filter_map(|i| i.checked_sub(lead))
+                .filter(|i| (*i as usize) < PREVIEW_MAX_CHARS)
+                .collect();
+            row![
+                highlighted_owned(
+                    truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
+                    shifted,
+                    theme::NORD4,
+                    iced::Font::MONOSPACE,
+                    hovered,
+                ),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(format!("{}", line + 1)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
         }
     }
 }

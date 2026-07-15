@@ -12,6 +12,7 @@ mod grep;
 mod handlers;
 mod http;
 mod indent;
+mod jumplist;
 mod lsp;
 mod number;
 mod picker;
@@ -32,6 +33,11 @@ pub use config::{
 };
 pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_full, spawn_for_test_multi,
-    spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions, ServerHandle,
+    spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions,
+    spawn_for_test_with_lsp, ServerHandle,
+};
+/// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
+pub use lsp::dummy::{
+    DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange, DummyTextEdit,
 };
 pub use status::{fetch_status, ServerStatus};

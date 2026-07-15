@@ -227,6 +227,7 @@ impl WasmSession {
             None,
             None,
             false,
+            None,
         )))
     }
 

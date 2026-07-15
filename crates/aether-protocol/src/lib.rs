@@ -12,6 +12,7 @@ pub mod error;
 pub mod git;
 pub mod hints;
 pub mod input;
+pub mod jumplist;
 pub mod lsp;
 pub mod nav;
 pub mod path;

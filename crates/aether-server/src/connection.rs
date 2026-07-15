@@ -30,6 +30,7 @@ use aether_protocol::input::{
     InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputText,
     InputToggleComment, InputTransformCase, InputUnsurround,
 };
+use aether_protocol::jumplist::{JumplistCapture, JumplistStep};
 use aether_protocol::lsp::{
     LspDocumentHighlight, LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic,
     LspRestartServer,
@@ -37,7 +38,7 @@ use aether_protocol::lsp::{
 use aether_protocol::nav::{NavGoto, NavStep};
 use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
-    PickerGrepNavigate, PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
+    PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerView,
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
@@ -284,6 +285,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
         s.drop_nav_history_for_client(client_id);
+        s.drop_jumplist_for_client(client_id);
         let pruned_ephemeral = disconnecting_workspace
             .as_deref()
             .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
@@ -445,8 +447,9 @@ async fn dispatch(
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
-        PickerGrepNavigate::NAME => run!(PickerGrepNavigate, handlers::picker_grep_navigate),
         PickerSectionJump::NAME => run!(PickerSectionJump, handlers::picker_section_jump),
+        JumplistCapture::NAME => run!(JumplistCapture, handlers::jumplist_capture),
+        JumplistStep::NAME => run!(JumplistStep, handlers::jumplist_step),
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),

@@ -30,8 +30,9 @@ pub enum PickerKind {
     /// Workspace-wide content search. Each candidate is a single match on a single line; the
     /// query *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes
     /// throw out the prior candidates and start a fresh scan. Persisted hits stay around across
-    /// `hide`/`view` so the user can step through results — they may be stale relative to the
-    /// file on disk after editing, and that's accepted (jumps clamp to the current line bounds).
+    /// `hide`/`view` so a re-open resumes the (potentially slow) search — they may be stale
+    /// relative to the file on disk after editing, and that's accepted (jumps clamp to the
+    /// current line bounds).
     Grep,
     /// Filesystem explorer. Entries are the children of one directory. The query is a *path*
     /// relative to the committed *anchor* directory: its part up to the last `/` selects which
@@ -102,6 +103,13 @@ pub enum PickerKind {
     /// (Enter is a no-op — the picker stays open; Esc dismisses it). Like
     /// [`Workspaces`](Self::Workspaces) it's usable before a workspace is active.
     Keybindings,
+    /// The client's jumplist (`Space j`, docs/jumplist.md), one row per
+    /// captured entry, fuzzy-matched on the entry's display text, grouped by the entries'
+    /// carried source headers (file or section label; a list captured from an ungrouped source
+    /// renders flat). Rebuilt from the live list on every open — nothing to resume, the backing
+    /// list persists regardless. Selecting a row jumps to its entry (via `FileAt`); `Ctrl-j`
+    /// *re-captures* the currently-filtered subset, narrowing the list in place.
+    Jumplist,
 }
 
 impl PickerKind {
@@ -154,15 +162,33 @@ impl PickerKind {
                 | PickerKind::References
                 | PickerKind::DiagnosticsWorkspace
                 | PickerKind::Keybindings
+                | PickerKind::Jumplist
         )
     }
 
     /// Whether `picker/view`'s `center_on_cursor` applies — the picker can resolve a result near
     /// the buffer's cursor and open framed on it (Grep's nearest hit, the changes pickers' nearest
-    /// hunk). Wider than [`Self::groups_by_file`]: it includes the headerless buffer-locked changes
-    /// picker, which still wants to land on "where you are".
+    /// hunk, the jumplist's nearest entry). Wider than [`Self::groups_by_file`]: it includes the
+    /// headerless buffer-locked changes picker, which still wants to land on "where you are".
     pub fn centers_on_cursor(self) -> bool {
-        matches!(self, PickerKind::Grep) || self.is_git_changes()
+        matches!(self, PickerKind::Grep | PickerKind::Jumplist) || self.is_git_changes()
+    }
+
+    /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose
+    /// rows are jump targets into files (docs/jumplist.md). Excludes the file-shaped kinds
+    /// (Files, Buffers) and the non-jump kinds (Explorer, Workspaces, LspServers, Keybindings).
+    /// Includes [`Self::Results`] itself: capturing there replaces the list with the picker's
+    /// currently-filtered subset — iterative narrowing.
+    pub fn captures_to_jumplist(self) -> bool {
+        matches!(
+            self,
+            PickerKind::Grep
+                | PickerKind::Diagnostics
+                | PickerKind::DiagnosticsWorkspace
+                | PickerKind::References
+                | PickerKind::DocumentSymbols
+                | PickerKind::Jumplist
+        ) || self.is_git_changes()
     }
 }
 
@@ -571,6 +597,26 @@ pub enum PickerItem {
         /// Display chord, e.g. `Ctrl-w`, `Space f ␣`.
         keys: String,
         /// Char offsets into [`KeybindingEntry::haystack`] covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One captured entry in the Jumplist picker (docs/jumplist.md). Identity is `index` —
+    /// the entry's position in the captured list, stable for the picker's lifetime (the list
+    /// only changes via a re-capture, which resets the picker). Deliberately flat: one
+    /// presentation-neutral line per entry, quickfix-style — the source pickers' richer row
+    /// dressing (severity colours, stage tints, ± counts) doesn't carry over.
+    JumplistEntry {
+        /// 0-based position in the captured list.
+        index: u32,
+        /// 0-based line of the entry's landing position, rendered right-aligned and dim like a
+        /// grep hit's line number (shells add 1 for display). Every source is position-shaped, so
+        /// this is always meaningful.
+        line: u32,
+        /// The source row's text (grep line, diagnostic message, reference preview, symbol
+        /// name, hunk preview) — rendered verbatim (leading whitespace stripped like a grep
+        /// preview), and the fuzzy haystack.
+        display: String,
+        /// Char offsets into `display` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -990,69 +1036,6 @@ impl RpcMethod for PickerHide {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PickerHideParams {
     pub kind: PickerKind,
-}
-
-// ---- picker/grep_navigate -----------------------------------------------------------------------
-
-/// Step through the cached grep hits from the cursor's current location without re-opening the
-/// picker. Bound to `<` / `>` in Normal mode.
-///
-/// The server looks up the cursor's selection from its own state and uses the selection's
-/// *outer* edges to skip past any match the cursor currently overlaps: Backward compares
-/// against `min(anchor, position)` (so a hit at exactly the selection's start is skipped),
-/// Forward against `max(anchor, position)`. This is what makes `<` go back a *real* step when
-/// the cursor was just placed on a match (e.g. via `>` or via picker selection, where the
-/// cursor's selection covers the entire match).
-///
-/// Direction: Forward = next hit, Backward = previous hit. Resolved against the cached
-/// `PickerKind::Grep` candidates:
-///
-/// - If the current buffer's workspace-relative path is in the hits, find the next/previous match
-///   *after* / *before* the cursor within the file. When the cursor is past the last (or before
-///   the first) hit in the file, fall through to the first / last hit of the next / previous
-///   file in walker order.
-/// - If the current buffer's path is *not* in the hits (or the buffer has no path), virtually
-///   insert it by path comparison and jump to the first / last hit of the file that would sit
-///   immediately after / before it in walker order. For a buffer with no path (scratch), the
-///   fallback is the first / last hit overall.
-///
-/// Returns `None` when there are no cached grep hits at all, or when navigation would walk past
-/// the end of the list (no wraparound).
-pub struct PickerGrepNavigate;
-impl RpcMethod for PickerGrepNavigate {
-    const NAME: &'static str = "picker/grep_navigate";
-    type Params = PickerGrepNavigateParams;
-    type Result = Option<PickerGrepNavigateTarget>;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PickerGrepNavigateParams {
-    pub direction: Direction,
-    pub buffer_id: BufferId,
-    /// Also open the target (transient, jumped to the hit, nav origin recorded, search
-    /// primed with the grep query) and return it in `opened` — the whole `<`/`>` client
-    /// chain in one round-trip (docs/protocol-composites.md, J).
-    #[serde(default)]
-    pub open: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PickerGrepNavigateTarget {
-    /// Absolute canonical path of the target file — feed into `buffer/open`.
-    pub path: String,
-    /// Position to jump to in the target file.
-    pub position: LogicalPosition,
-    /// The grep query the cached hits came from. Echoed so the client can prime the opened
-    /// buffer's search state for `n` / `Alt-n` follow-on, the same way picker selection does.
-    pub query: String,
-    /// The grep search's match options (case / whole-word / literal). Echoed alongside `query` so
-    /// the client's primed search state matches how the grep that found the hits ran. Defaults
-    /// (regex, smartcase) when absent.
-    #[serde(default, skip_serializing_if = "MatchOptions::is_default")]
-    pub options: MatchOptions,
-    /// With `open`: the target, fully opened (transient, at `position`, search primed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<crate::buffer::BufferOpenResult>,
 }
 
 /// Move a picker's selection to the next/previous *section* boundary — the grouping is per-kind:

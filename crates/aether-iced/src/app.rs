@@ -335,7 +335,7 @@ pub enum Message {
     Core(CoreEvent),
     /// Keyboard modifier state changed — stashed in `App::modifiers` for click-time reads (Ctrl-click).
     ModifiersChanged(keyboard::Modifiers),
-    /// The picker's results list scrolled natively (absolute y in px).
+    /// The picker's jumplist scrolled natively (absolute y in px).
     PickerScrolled(f32),
     /// Pointer entered (`Some(abs)`) or left (`None`-if-still-current, see mapping) a row.
     PickerHovered(Option<u32>),
@@ -390,7 +390,7 @@ pub struct App {
     /// Like `reveal_after_fetch`, but places the cursor at a fixed fraction down once its
     /// (out-of-window) line lands — for `;` / `Alt-;` when the line was scrolled out of the window.
     place_after_fetch: Option<ViewportPlace>,
-    /// The picker results list's scroll offset in px. The core tracks rows, not pixels; resets
+    /// The picker jumplist's scroll offset in px. The core tracks rows, not pixels; resets
     /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
     /// The picker search throbber's rotation (radians), advanced from frame ticks while a search is
@@ -512,9 +512,9 @@ impl App {
                     b.server_url,
                     b.server_started_at,
                 );
-                let chooser = app
-                    .session
-                    .open_picker(PickerKind::Workspaces, None, None, false);
+                let chooser =
+                    app.session
+                        .open_picker(PickerKind::Workspaces, None, None, false, None);
                 // Fetch the app settings + hint snapshot on the boot connection: the chooser
                 // shows the first hint a fresh install ever sees (docs/hints.md), and the engine
                 // is dormant until the snapshot adopts.
@@ -723,7 +723,7 @@ impl App {
         self.session = Session::placeholder(); // conn = Connected, so notifications keep flowing
         let fx = self
             .session
-            .open_picker(PickerKind::Workspaces, None, None, false);
+            .open_picker(PickerKind::Workspaces, None, None, false, None);
         self.run_core(fx)
     }
 
@@ -751,7 +751,7 @@ impl App {
                 let startup = match b.explorer_dir {
                     Some(dir) => {
                         self.session
-                            .open_picker(PickerKind::Explorer, Some(dir), None, false)
+                            .open_picker(PickerKind::Explorer, Some(dir), None, false, None)
                     }
                     None => Effects::none(),
                 };
@@ -1526,7 +1526,7 @@ impl App {
 
     // ---- save / reload / close (ask-then-confirm handshakes) --------------------------------
 
-    /// Scroll the results list so the highlighted row is in view: `Top` aligns the row to
+    /// Scroll the jumplist so the highlighted row is in view: `Top` aligns the row to
     /// the top of the pane unless it's already visible (grep file-jumps — landing on a new
     /// file reveals it from its first hit without yanking an in-view jump).
     fn picker_reveal_selected_with(&mut self, reveal: Reveal) -> Task<Message> {
@@ -3252,9 +3252,9 @@ impl App {
                 }
             }
         }
-        if let Some(grep) = self.session.buffer.cursor.grep_position {
+        if let Some(results) = self.session.buffer.cursor.jumplist_position {
             right = right.push(t(
-                format!("grep {}/{}", grep.current, grep.total),
+                format!("({}/{})", results.current, results.total),
                 theme::NORD4,
             ));
         }
@@ -3796,7 +3796,7 @@ fn hover_scroll_px(dir: ScrollDir, unit: ScrollUnit, cell: Option<Size>) -> f32 
     }
 }
 
-/// Scroll the picker's results list so the highlighted row is in view. `Minimal` moves the
+/// Scroll the picker's jumplist so the highlighted row is in view. `Minimal` moves the
 /// least distance; `Top` aligns the row to the top unless it's already fully visible.
 fn reveal_picker_selection(p: &PickerState, scroll_y: &mut f32, reveal: Reveal) -> Task<Message> {
     let Some(y) = reveal_target(p, *scroll_y, reveal) else {

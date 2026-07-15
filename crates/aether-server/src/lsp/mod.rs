@@ -9,6 +9,7 @@
 pub mod client;
 pub mod config;
 pub mod diagnostics;
+pub mod dummy;
 pub mod lifecycle;
 pub mod manager;
 pub mod position;

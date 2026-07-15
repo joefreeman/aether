@@ -81,13 +81,20 @@ pub struct ServerState {
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
-    /// Per-client navigation history (the jump list): back/forward across files, browser-style.
+    /// Per-client navigation history: back/forward across files, browser-style. (Distinct from
+    /// the *jumplist* — the captured picker-results list, [`ServerState::jumplist`].)
     /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
     /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `buffer/open`'s
     /// `record_nav_from`); driven by the TUI's `nav/back`/`nav/forward`. The web client rides
     /// native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
+    /// Per-client jumplist (docs/jumplist.md): the quickfix-style snapshot
+    /// `jumplist/capture` takes of a picker's filtered results, stepped cursor-relative by
+    /// `jumplist/step` (`]` / `[`). Like `nav_history`, transient: replaced by the next capture,
+    /// cleared on workspace switch (entries reference the prior workspace's files) and on
+    /// disconnect.
+    pub jumplist: HashMap<ClientId, crate::jumplist::Jumplist>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
     /// (`git diff`). Populated on `buffer/open` for file-backed buffers; recomputed as the buffer
     /// changes. Empty / absent for scratch buffers and files outside a repo. Shared by all clients
@@ -241,7 +248,7 @@ impl MotionHistory {
     }
 }
 
-/// One location in the navigation history (jump list): a buffer plus the cursor/selection to
+/// One location in the navigation history: a buffer plus the cursor/selection to
 /// restore. The path fields let a closed file be reopened; `buffer_id` is preferred while the
 /// buffer is still open (and is the only handle a scratch buffer has).
 #[derive(Clone, Debug, PartialEq)]
@@ -252,7 +259,7 @@ pub struct NavEntry {
     pub cursor: CursorState,
 }
 
-/// A client's back/forward jump list. Browser semantics: a jump pushes onto `back` and clears
+/// A client's back/forward navigation history. Browser semantics: a jump pushes onto `back` and clears
 /// `forward`; stepping back/forward moves entries between the two and across the "current" cursor.
 #[derive(Default)]
 pub struct NavHistory {
@@ -260,7 +267,7 @@ pub struct NavHistory {
     pub forward: Vec<NavEntry>,
 }
 
-/// Cap on each direction of the jump list, mirroring `MOTION_HISTORY_CAP`'s "transient, not an
+/// Cap on each direction of the nav history, mirroring `MOTION_HISTORY_CAP`'s "transient, not an
 /// audit log" framing — old jumps fall off the bottom.
 pub const NAV_HISTORY_CAP: usize = 100;
 
@@ -396,6 +403,7 @@ impl ServerState {
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
+            jumplist: HashMap::new(),
             git_unstaged_hunks: HashMap::new(),
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
@@ -844,9 +852,15 @@ impl ServerState {
     }
 
     /// Remove the navigation history for the given client. Used on disconnect (a reconnect is a
-    /// fresh session, so the jump list — like cursor/selection state — is not recovered).
+    /// fresh session, so the nav history — like cursor/selection state — is not recovered).
     pub fn drop_nav_history_for_client(&mut self, client_id: ClientId) {
         self.nav_history.remove(&client_id);
+    }
+
+    /// Remove the jumplist for the given client. Used on disconnect, like
+    /// `drop_nav_history_for_client` (and on workspace switch, alongside the picker wipe).
+    pub fn drop_jumplist_for_client(&mut self, client_id: ClientId) {
+        self.jumplist.remove(&client_id);
     }
 
     /// Bump `buffer_id` to the front of its workspace's MRU. Called from `buffer/open` every time
@@ -1055,8 +1069,10 @@ impl ServerState {
         self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
-        // workspace so wipe them all on switch.
+        // workspace so wipe them all on switch. The jumplist goes with them: its
+        // entries point into the prior workspace's files.
         self.pickers.retain(|(c, _), _| *c != client_id);
+        self.jumplist.remove(&client_id);
     }
 }
 

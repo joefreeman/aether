@@ -321,8 +321,14 @@ pub enum Action {
     SearchToggleWord,
     /// `Alt-e` in the search prompt: toggle literal (fixed-string) vs. regex matching.
     SearchToggleRegex,
-    /// `>` / `<` — step through cached grep hits from the cursor, cross-file.
-    GrepNavigate(Direction),
+    /// `]` / `[` — step through the jumplist from the cursor, cross-file, stopping
+    /// at the ends (docs/jumplist.md). Populated by `Ctrl-j` in a picker.
+    JumplistStep(Direction),
+    /// `}` / `{` — like [`Action::JumplistStep`] but restricted to entries in the current
+    /// buffer's file, so you walk one file's hits without jumping away (docs/jumplist.md). Uses
+    /// Shift-bracket, not Alt-bracket, because Alt-bracket collides with terminal escape
+    /// introducers (`ESC [` / `ESC ]`) — see the binding site.
+    JumplistStepInFile(Direction),
     /// `Esc` in Normal — drop the active search (clear highlights).
     DropSearch,
 
@@ -444,6 +450,8 @@ impl Action {
                 | Action::TreeExpand
                 | Action::TreeContract
                 | Action::SearchCycle(_)
+                | Action::JumplistStep(_)
+                | Action::JumplistStepInFile(_)
                 | Action::NextHunk
                 | Action::PrevHunk
                 | Action::NextDiagnostic
@@ -766,9 +774,18 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch(';'), Exact(Mods::NONE), A::PlaceCursor(ViewportPlace::Upper), "Scroll", "Cursor near top"),
     bind!(N, ch(';'), Exact(Mods::ALT), A::PlaceCursor(ViewportPlace::Lower), "Scroll", "Cursor near bottom"),
 
-    // ---- navigation history (cross-file jump list) ----
+    // ---- navigation history (cross-file back/forward) ----
     bind!(N, KeyCode::Backspace, Exact(Mods::NONE), A::NavBack, "Navigation", "Jump back (history)"),
     bind!(N, KeyCode::Backspace, Exact(Mods::ALT), A::NavForward, "Navigation", "Jump forward (history)"),
+    bind!(N, ch(']'), Exact(Mods::NONE), A::JumplistStep(Direction::Forward), "Navigation", "Next jumplist entry"),
+    bind!(N, ch('['), Exact(Mods::NONE), A::JumplistStep(Direction::Backward), "Navigation", "Previous jumplist entry"),
+    // `}`/`{` (Shift-bracket) rather than `Alt-]`/`Alt-[`: an Alt-bracket sends the bytes `ESC [` /
+    // `ESC ]` — the CSI / OSC introducers — so on terminals without the kitty keyboard protocol
+    // (Terminal.app, xterm, tmux, …) `Alt-[` is swallowed and `Alt-]` loses its Alt. `}`/`{` are
+    // literal bytes, reliable on every terminal. `IgnoreShift` because the char already encodes the
+    // Shift; shells differ on whether they also report the modifier (mirrors the `?` binding).
+    bind!(N, ch('}'), IgnoreShift(Mods::NONE), A::JumplistStepInFile(Direction::Forward), "Navigation", "Next jumplist entry in this file"),
+    bind!(N, ch('{'), IgnoreShift(Mods::NONE), A::JumplistStepInFile(Direction::Backward), "Navigation", "Previous jumplist entry in this file"),
 
     // ---- delete / search ----
     bind!(N, KeyCode::Delete, Any, A::DeleteSelection, "Edit", "Delete selection"),
@@ -874,15 +891,14 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Workspaces), "Workspace", "Switch workspace"),
     bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in current buffer"),
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
-    bind!(L, ch('j'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
+    bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
+    bind!(L, ch('n'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
     bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
     bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Workspace git changes (hunks)"),
-    bind!(L, ch('n'), Exact(Mods::NONE), A::GrepNavigate(Direction::Forward), "Search", "Next grep hit"),
-    bind!(L, ch('n'), Exact(Mods::ALT), A::GrepNavigate(Direction::Backward), "Search", "Previous grep hit"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
     bind!(L, ch('q'), Exact(Mods::ALT), A::SaveAndQuit, "App", "Save and quit"),
     bind!(L, ch('/'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
@@ -921,6 +937,33 @@ mod tests {
             keycode_for_binding(Some(KeyCode::Char('/')), Some(KeyCode::Char('?')), false),
             Some(KeyCode::Char('?'))
         );
+    }
+
+    #[test]
+    fn bracket_keys_resolve_to_full_vs_file_scoped_jumplist_steps() {
+        // `]`/`[` step the whole list; `}`/`{` step within the current file. The file-scoped keys
+        // are Shift-bracket (reliable on every terminal, unlike Alt-bracket) and match whether or
+        // not the shell also reports the Shift modifier.
+        let action = |code, mods| lookup(KeyContext::Normal, code, mods).map(|b| b.action);
+        assert!(matches!(
+            action(ch(']'), Mods::NONE),
+            Some(Action::JumplistStep(Direction::Forward))
+        ));
+        assert!(matches!(
+            action(ch('['), Mods::NONE),
+            Some(Action::JumplistStep(Direction::Backward))
+        ));
+        // `}` = forward, with Shift reported (web/iced) and without (TUI folds it into the char).
+        for mods in [Mods::NONE, Mods::SHIFT] {
+            assert!(matches!(
+                action(ch('}'), mods),
+                Some(Action::JumplistStepInFile(Direction::Forward))
+            ));
+            assert!(matches!(
+                action(ch('{'), mods),
+                Some(Action::JumplistStepInFile(Direction::Backward))
+            ));
+        }
     }
 
     #[test]
@@ -1101,16 +1144,21 @@ mod tests {
     }
 
     #[test]
-    fn reveal_bindings_are_tab_hover_and_space_j_m() {
+    fn reveal_bindings_are_tab_hover_and_space_n_m() {
         // Tab triggers hover directly — no leader chord.
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Tab, Mods::NONE).map(|b| b.action),
             Some(Action::Hover)
         ));
-        // Diagnostic-at-cursor and blame live on the Space leader (`j` / `m`).
+        // Diagnostic-at-cursor and blame live on the Space leader (`n` / `m`); `Space j` is
+        // the jumplist picker.
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('n'), Mods::NONE).map(|b| b.action),
+            Some(Action::ShowDiagnostic)
+        ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('j'), Mods::NONE).map(|b| b.action),
-            Some(Action::ShowDiagnostic)
+            Some(Action::OpenPicker(PickerKind::Jumplist))
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),
@@ -1211,7 +1259,7 @@ mod tests {
 
     #[test]
     fn nav_history_on_backspace() {
-        // Backspace / Alt-Backspace drive the cross-file jump list; the arrows are now scroll-only.
+        // Backspace / Alt-Backspace drive the cross-file nav history; the arrows are now scroll-only.
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Backspace, Mods::NONE).map(|b| b.action),
             Some(Action::NavBack)

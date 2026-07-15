@@ -840,6 +840,11 @@ pub enum ItemKey<'a> {
         keys: &'a str,
         desc: &'a str,
     },
+    /// A jumplist entry, identified by its position in the list (the snapshot is
+    /// stable for the picker's lifetime — a re-capture resets it).
+    JumplistEntry {
+        index: u32,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -913,6 +918,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             keys: keys.as_str(),
             desc: desc.as_str(),
         },
+        PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry { index: *index },
     }
 }
 

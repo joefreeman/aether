@@ -1372,7 +1372,7 @@ impl Shell {
         self.session = Session::placeholder(); // conn = Connected, so notifications resume
         let startup = self
             .session
-            .open_picker(PickerKind::Workspaces, None, None, false);
+            .open_picker(PickerKind::Workspaces, None, None, false, None);
         self.run_effects(startup);
     }
 
@@ -2208,7 +2208,8 @@ pub async fn bootstrap(
                 }
                 _ => {
                     let mut session = Session::placeholder();
-                    let startup = session.open_picker(PickerKind::Workspaces, None, None, false);
+                    let startup =
+                        session.open_picker(PickerKind::Workspaces, None, None, false, None);
                     (session, String::new(), Vec::new(), startup)
                 }
             }
@@ -2285,6 +2286,7 @@ pub async fn bootstrap(
                     Some(abs.display().to_string()),
                     None,
                     false,
+                    None,
                 ),
                 _ => Effects::none(),
             };

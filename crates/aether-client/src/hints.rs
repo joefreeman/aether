@@ -87,6 +87,9 @@ pub enum PickerCmd {
     CreateWorkspace,
     /// Enter on a workspace row in the Workspaces picker.
     OpenWorkspace,
+    /// `Ctrl-j` in a capturable picker — snapshot its results into the jumplist
+    /// (docs/jumplist.md).
+    CaptureJumplist,
 }
 
 /// Session facts that condition a hint's display eligibility beyond the context id — the engine
@@ -281,6 +284,27 @@ pub static CURRICULUM: &[HintDef] = &[
         contexts: &[C::Picker(PickerKind::Files), C::Picker(PickerKind::Grep)], keys: "Alt-p",
         trigger: Trigger::Picker(PickerCmd::AddPathScope),
         text: "Use {} to scope results to a path" },
+    // The jumplist trio (docs/jumplist.md): capture from a result-shaped picker, step the
+    // captured entries, reopen the list as a picker.
+    HintDef { id: "jumplist-capture", tier: 4,
+        contexts: &[
+            C::Picker(PickerKind::Grep),
+            C::Picker(PickerKind::Diagnostics),
+            C::Picker(PickerKind::DiagnosticsWorkspace),
+            C::Picker(PickerKind::References),
+            C::Picker(PickerKind::DocumentSymbols),
+            C::Picker(PickerKind::GitChanges),
+            C::Picker(PickerKind::GitChangesFile),
+            C::Picker(PickerKind::Jumplist),
+        ], keys: "Ctrl-j",
+        trigger: Trigger::Picker(PickerCmd::CaptureJumplist),
+        text: "Use {} to capture these results into the jumplist" },
+    HintDef { id: "jumplist-step", tier: 4, contexts: &[C::Normal], keys: "]",
+        trigger: Trigger::Action(|a| matches!(a, Action::JumplistStep(_))),
+        text: "Use {} to step through the jumplist" },
+    HintDef { id: "jumplist-picker", tier: 4, contexts: &[C::Normal], keys: "Space j",
+        trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Jumplist))),
+        text: "Use {} to reopen the jumplist" },
     HintDef { id: "settings", tier: 4, contexts: &[C::Normal], keys: "Space .",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenAppSettings)),
         text: "Use {} to open the app settings" },

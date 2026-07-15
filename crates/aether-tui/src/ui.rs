@@ -1,8 +1,8 @@
 //! Ratatui rendering. The buffer fills the screen except for the bottom status row.
 
 use crate::app::{
-    grep_counter_label, search_counter_label, search_match_count_label, AppState, BufferStatusKind,
-    EditorMode, SearchState, BUFFER_STATUS_DOT,
+    jumplist_counter_label, search_counter_label, search_match_count_label, AppState,
+    BufferStatusKind, EditorMode, SearchState, BUFFER_STATUS_DOT,
 };
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
@@ -2059,6 +2059,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
         Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
+        Some(aether_protocol::picker::PickerKind::Jumplist) => "Filter the jumplist…",
         None => "Search…",
     }
 }
@@ -2267,7 +2268,18 @@ fn picker_item_spans(
         ..
     } = item
     {
-        return grep_hit_spans(*line, preview, match_indices, highlighted, max_width);
+        return preview_row_spans(*line, preview, match_indices, highlighted, max_width);
+    }
+    // A captured entry renders exactly like a grep hit — trimmed preview + right-aligned dim line
+    // number — so the two read alike (docs/jumplist.md §2.2). No dot, no dressing.
+    if let PickerItem::JumplistEntry {
+        line,
+        display,
+        match_indices,
+        ..
+    } = item
+    {
+        return preview_row_spans(*line, display, match_indices, highlighted, max_width);
     }
     if let PickerItem::GitChange {
         preview,
@@ -2506,6 +2518,7 @@ fn picker_item_spans(
         PickerItem::Buffer { .. }
         | PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
+        | PickerItem::JumplistEntry { .. }
         | PickerItem::GitChange { .. }
         | PickerItem::DirEntry { .. }
         | PickerItem::Root { .. }
@@ -2826,11 +2839,11 @@ fn push_styled_with_match_indices(
     }
 }
 
-/// One Grep hit row: the preview (leading whitespace stripped) with `match_indices` highlighted,
-/// then the line number right-aligned at the row's edge in a dim colour — mirroring the web
-/// client's layout. An overflowing preview is cut with a dim `…` so the line number (plus at
-/// least a 2-col gap) always stays visible, whatever its digit count.
-fn grep_hit_spans(
+/// One preview row — a Grep hit or a Jumplist entry: the preview (leading whitespace stripped)
+/// with `match_indices` highlighted, then the line number right-aligned at the row's edge in a
+/// dim colour — mirroring the web client's layout. An overflowing preview is cut with a dim `…`
+/// so the line number (plus at least a 2-col gap) always stays visible, whatever its digit count.
+fn preview_row_spans(
     line: u32,
     preview: &str,
     match_indices: &[u32],
@@ -4743,10 +4756,11 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 spans.push(Span::styled("  ".to_string(), base));
             }
         };
-        let counter_parts: Vec<String> = [search_counter_label(state), grep_counter_label(state)]
-            .into_iter()
-            .flatten()
-            .collect();
+        let counter_parts: Vec<String> =
+            [search_counter_label(state), jumplist_counter_label(state)]
+                .into_iter()
+                .flatten()
+                .collect();
         if !counter_parts.is_empty() {
             right_spans.push(Span::styled(counter_parts.join(" "), base));
         }
@@ -6520,11 +6534,11 @@ mod tests {
         assert_eq!(picker_content_rows(&p), 1);
     }
 
-    // ---- grep_hit_spans ----
+    // ---- preview_row_spans ----
 
     #[test]
     fn grep_hit_line_number_right_aligned() {
-        let spans = grep_hit_spans(41, "let x = 1;", &[], false, 30);
+        let spans = preview_row_spans(41, "let x = 1;", &[], false, 30);
         let text = spans_text(&spans);
         assert!(text.starts_with("let x = 1;"));
         assert!(text.ends_with("42"));
@@ -6657,7 +6671,7 @@ mod tests {
     fn picker_dim_spans_brighten_on_highlighted_row() {
         // NORD3 is illegible on the NORD2 selection background — highlighted rows lift their
         // dim spans (here: the grep line number, the file row's root label) to NORD4.
-        let num = grep_hit_spans(41, "let x = 1;", &[], true, 30);
+        let num = preview_row_spans(41, "let x = 1;", &[], true, 30);
         assert_eq!(num.last().unwrap().style.fg, Some(NORD4));
         let labels = vec!["alpha".to_string(), "beta".to_string()];
         let file = file_item_spans(1, "src/main.rs", &[], None, &labels, true, 40);
@@ -6667,7 +6681,7 @@ mod tests {
     #[test]
     fn grep_hit_truncates_long_preview_keeping_line_number() {
         let preview = "a very long line of code that cannot possibly fit in the row";
-        let spans = grep_hit_spans(99, preview, &[], false, 24);
+        let spans = preview_row_spans(99, preview, &[], false, 24);
         let text = spans_text(&spans);
         assert!(text.contains('…'));
         assert!(text.ends_with("100"));
@@ -6678,7 +6692,7 @@ mod tests {
     fn grep_hit_strips_leading_whitespace_and_shifts_matches() {
         // Match on "hel" at chars 4..7 of the untrimmed preview; after stripping the 4-char
         // indent the highlight must land on the same letters.
-        let spans = grep_hit_spans(0, "    helper();", &[4, 5, 6], false, 40);
+        let spans = preview_row_spans(0, "    helper();", &[4, 5, 6], false, 40);
         let text = spans_text(&spans);
         assert!(text.starts_with("helper();"));
         let hl: String = spans
@@ -6691,9 +6705,34 @@ mod tests {
 
     #[test]
     fn grep_hit_drops_matches_inside_stripped_whitespace() {
-        let spans = grep_hit_spans(0, "    x", &[1, 2], false, 40);
+        let spans = preview_row_spans(0, "    x", &[1, 2], false, 40);
         assert!(spans.iter().all(|s| s.style.fg != Some(NORD13)));
         assert!(spans_text(&spans).starts_with("x "));
+    }
+
+    #[test]
+    fn jumplist_row_renders_identically_to_a_grep_hit() {
+        // The user-visible ask: a Jumplist row strips leading whitespace and shows a right-aligned
+        // line number, exactly like grep. Same (line, text, matches) → byte-identical spans.
+        let item = PickerItem::JumplistEntry {
+            index: 0,
+            line: 40,
+            display: "    helper();".into(),
+            match_indices: vec![4, 5, 6],
+        };
+        let spans = picker_item_spans(&item, &[], false, 40);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("helper();"), "indent stripped: {text:?}");
+        assert!(text.ends_with("41"), "1-based line number right-aligned: {text:?}");
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(NORD13))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "hel", "matches shift onto the same letters");
+        // Identical to the equivalent grep hit — the shared renderer guarantees consistency.
+        let grep = preview_row_spans(40, "    helper();", &[4, 5, 6], false, 40);
+        assert_eq!(text, spans_text(&grep));
     }
 
     // ---- keybinding_item_spans ----

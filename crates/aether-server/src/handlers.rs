@@ -21,7 +21,7 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
     CursorSetParams, CursorState, CursorSwapAnchorParams, CursorTreeSelectParams, CursorUndoParams,
-    CursorUndoResult, Direction, Granularity, GrepPosition, Motion, TreeSelectDirection,
+    CursorUndoResult, Direction, Granularity, JumplistPosition, Motion, TreeSelectDirection,
     VerticalDirection,
 };
 use aether_protocol::directory::{
@@ -44,6 +44,10 @@ use aether_protocol::input::{
     InputTextParams, InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget,
     ToggleCommentParams, UndoRedoParams, UndoResult,
 };
+use aether_protocol::jumplist::{
+    JumplistCaptureParams, JumplistCaptureResult, JumplistStepParams, JumplistStepResult,
+    JumplistStepScope, JumplistStepTarget,
+};
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspDocumentHighlightParams, LspFormatResult,
@@ -53,10 +57,9 @@ use aether_protocol::lsp::{
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, MatchOptions, PickerGrepNavigateParams, PickerGrepNavigateTarget,
-    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerSectionJumpParams,
-    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
-    PickerViewResult,
+    BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
+    PickerSectionJumpParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -1340,7 +1343,7 @@ fn resolve_open_cursor(
             position: clamped,
             anchor: clamped_anchor.unwrap_or(clamped),
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
         if let Some(c) = client_id {
             s.cursors.insert((c, buffer_id), new);
@@ -1369,20 +1372,7 @@ pub async fn buffer_open(
                 .record(entry);
         }
     }
-    let prime = params.prime_search.clone();
-    let prime_options = params.prime_search_options;
-    let mut result = buffer_open_inner(state, ctx, params).await?;
-    // Composite post-step: prime the opened buffer's search, anchored at the just-jumped
-    // cursor so the first match at-or-after lands SELECTED (a grep jump selects the match).
-    // The result's cursor is patched to the selection so clients adopt it directly.
-    if let Some(query) = prime.filter(|q| !q.is_empty()) {
-        if let Some((cursor, summary)) =
-            prime_search_for(state, ctx, result.buffer_id, &query, prime_options).await
-        {
-            result.cursor = cursor;
-            result.search_summary = Some(summary);
-        }
-    }
+    let result = buffer_open_inner(state, ctx, params).await?;
     // Refresh the persisted session for this buffer's workspace: the open changed either its
     // membership (a new file) or its MRU order (a switch), both of which a restart restores from.
     // Skip transient opens — previews never enter the persisted set (see `session_buffer_paths`),
@@ -1398,61 +1388,6 @@ pub async fn buffer_open(
         }
     }
     Ok(result)
-}
-
-/// The `prime_search` post-step of [`buffer_open`]: a `search/set` anchored at the
-/// post-open cursor (the `jump_to` hit), so the match lands selected — the anchored prime
-/// the TUI/web grep flows always used. Errors are dropped (an invalid pattern simply
-/// doesn't prime); the summary goes out as a `search/state_changed` push since the prime
-/// rides another method's response. Returns the post-prime cursor (the selection) and the search
-/// summary, so the caller can also fold the summary into its own response (the push can lose the
-/// race against the buffer switch on the client).
-async fn prime_search_for(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    buffer_id: BufferId,
-    query: &str,
-    options: MatchOptions,
-) -> Option<(CursorState, SearchSummary)> {
-    let anchor = {
-        let s = state.lock().await;
-        s.cursors
-            .get(&(ctx.client_id, buffer_id))
-            .copied()
-            .unwrap_or_default()
-            .position
-    };
-    let r = search_set(
-        state,
-        ctx,
-        SearchSetParams {
-            buffer_id,
-            query: query.to_string(),
-            anchor: Some(anchor),
-            extend: false,
-            from_selection: false,
-            options,
-        },
-    )
-    .await
-    .ok()?;
-    let push = {
-        let s = state.lock().await;
-        s.clients.get(&ctx.client_id).map(|session| {
-            (
-                session.outbound.clone(),
-                Notification {
-                    jsonrpc: JsonRpc,
-                    method: SearchStateChanged::NAME.into(),
-                    params: serde_json::to_value(&r.summary).unwrap_or(serde_json::Value::Null),
-                },
-            )
-        })
-    };
-    if let Some((sender, notif)) = push {
-        let _ = sender.send(notif).await;
-    }
-    Some((r.cursor, r.summary))
 }
 
 /// The scroll position to seed a freshly-opened viewport with. A `jump_to` open (grep
@@ -1532,7 +1467,6 @@ async fn open_restored_scratch(
         scroll,
         lsp_server: None, // scratch buffers are never language-server-backed
         transient: buf.transient,
-        search_summary: None, // set by buffer_open's prime post-step, not here
     };
     s.buffers.insert(id, buf);
     s.buffer_workspaces
@@ -1628,7 +1562,6 @@ async fn buffer_open_inner(
             scroll,
             lsp_server: buffer_lsp_server_ref(&s, buffer_id),
             transient: s.buffers[&buffer_id].transient,
-            search_summary: None, // set by buffer_open's prime post-step, not here
         };
         s.touch_mru(buffer_id);
         pushes.extend(refresh_buffer_pickers(&mut s));
@@ -1685,7 +1618,6 @@ async fn buffer_open_inner(
                     scroll,
                     lsp_server: None, // scratch buffers are never language-server-backed
                     transient: buf.transient,
-                    search_summary: None, // set by buffer_open's prime post-step, not here
                 };
                 s.buffers.insert(id, buf);
                 s.buffer_workspaces
@@ -1798,7 +1730,6 @@ async fn buffer_open_inner(
                 scroll,
                 lsp_server: buffer_lsp_server_ref(&s, existing),
                 transient: s.buffers[&existing].transient,
-                search_summary: None, // set by buffer_open's prime post-step, not here
             };
             s.touch_mru(existing);
             pushes.extend(refresh_buffer_pickers(&mut s));
@@ -1963,7 +1894,6 @@ async fn buffer_open_inner(
         scroll,
         lsp_server: buffer_lsp_server_ref(&s, id),
         transient: buf.transient,
-        search_summary: None, // set by buffer_open's prime post-step, not here
     };
     s.touch_mru(id);
     let mut pushes = refresh_buffer_pickers(&mut s);
@@ -2217,7 +2147,7 @@ pub async fn git_navigate_hunk(
             position
         },
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
@@ -2878,7 +2808,7 @@ pub async fn lsp_navigate_diagnostic(
             position
         },
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
@@ -3727,7 +3657,7 @@ pub async fn search_set(
                     position,
                     anchor: anchor_p,
                     match_bracket: None,
-                    grep_position: None,
+                    jumplist_position: None,
                 };
                 let prev_cursor = cursor;
                 s.cursors.insert(key, new_cursor);
@@ -3927,7 +3857,7 @@ pub async fn sneak_select(
         position: motion::char_to_pos(buf, pos_char),
         anchor: motion::char_to_pos(buf, anchor_char),
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, new_cursor);
     s.record_motion(key, cursor, new_cursor);
@@ -4116,7 +4046,7 @@ async fn search_navigate(
         position,
         anchor: anchor_pos,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
     s.cursors.insert(key, new_cursor);
@@ -4663,7 +4593,7 @@ pub async fn buffer_close(
     })
 }
 
-// ---- nav (jump list) ----------------------------------------------------------------------------
+// ---- nav (back/forward history) -------------------------------------------------------------
 
 /// Map a buffer's canonical path to a `(path_index, relative_path)` within the client's active
 /// workspace, so a nav entry can reopen the file even after it's been closed. `(None, None)` for a
@@ -4736,12 +4666,10 @@ async fn navigate_to(
         jump_to: None,
         jump_to_anchor: None,
         // Stepping history through a since-closed file is a revisit, not a keep: reopen it
-        // transient so walking the jump list doesn't re-accumulate buffers. No effect when the
+        // transient so walking the nav history doesn't re-accumulate buffers. No effect when the
         // buffer is still open (an open never demotes).
         transient: Some(true),
         record_nav_from: None,
-        prime_search: None,
-        prime_search_options: MatchOptions::default(),
     };
     let mut result = buffer_open(state, ctx, open_params).await?;
 
@@ -4751,7 +4679,7 @@ async fn navigate_to(
             position: motion::clamp_position(buf, entry.cursor.position),
             anchor: motion::clamp_position(buf, entry.cursor.anchor),
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         },
         None => entry.cursor,
     };
@@ -4919,7 +4847,7 @@ pub async fn buffer_cut(
         position: new_pos,
         anchor: new_pos,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert((client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
@@ -6084,7 +6012,10 @@ fn build_diagnostic_candidates(
     let mut out: Vec<picker_state::DiagnosticCandidate> = buffer_diagnostics(s, buffer_id)
         .iter()
         .map(|d| picker_state::DiagnosticCandidate {
-            // The buffer-scoped picker renders flat, so the file path-index/relative-path are unused.
+            // The buffer-scoped picker renders flat and opens the current buffer, so it needs no
+            // path-index/relative-path — an empty relative path is the "unset" sentinel. The
+            // jumplist capture treats that as absent and re-derives the parts from `abs_path`
+            // (see `jumplist::relative_parts` / `assign_file_groups`), so don't rely on these here.
             path_index: 0,
             relative_path: String::new(),
             line: d.start.line,
@@ -7214,7 +7145,7 @@ pub async fn cursor_move(
         position: new_pos,
         anchor: new_anchor,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
@@ -7267,7 +7198,7 @@ pub async fn cursor_select_word(
             position,
             anchor,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
     }
     let new_state = working;
@@ -7398,7 +7329,7 @@ async fn cursor_select_line_once(
         position: cursor_pos,
         anchor: anchor_pos,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
@@ -7438,7 +7369,7 @@ pub async fn cursor_swap_anchor(
         position: current.anchor,
         anchor: current.position,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, new_state);
     s.record_motion(key, current, new_state);
@@ -7480,7 +7411,7 @@ pub async fn cursor_select_all(
         position,
         anchor: LogicalPosition { line: 0, col: 0 },
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
@@ -7515,7 +7446,7 @@ pub async fn cursor_set(
         position,
         anchor,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
     s.cursors.insert(key, result);
     s.record_motion(key, current, result);
@@ -7726,7 +7657,7 @@ async fn cursor_expand_once(
         position,
         anchor,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     };
 
     s.cursors.insert(key, new_cursor);
@@ -7927,7 +7858,7 @@ pub async fn input_text(
             position: pos,
             anchor: pos,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
         s.cursors.insert(key, collapsed);
         s.record_motion(key, current, collapsed);
@@ -8474,7 +8405,7 @@ async fn apply_toggle_comment(
             position,
             anchor,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         }
     };
 
@@ -8735,7 +8666,7 @@ async fn apply_toggle_comment(
                     position: pos,
                     anchor: pos,
                     match_bracket: None,
-                    grep_position: None,
+                    jumplist_position: None,
                 }
             } else {
                 oriented(start_pos, new_position)
@@ -8805,7 +8736,7 @@ async fn apply_toggle_comment(
                     position: pos,
                     anchor: pos,
                     match_bracket: None,
-                    grep_position: None,
+                    jumplist_position: None,
                 }
             } else {
                 oriented(inner_start, inner_end)
@@ -9219,7 +9150,7 @@ fn shift_cursor_by_line_map(
         position,
         anchor,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     }
 }
 
@@ -9431,7 +9362,7 @@ async fn apply_indent_or_dedent(
             position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
             anchor: motion::clamp_position(buf_mut, shift_pos(cursor.anchor)),
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
         (revision, new_cursor)
     };
@@ -9631,7 +9562,7 @@ async fn input_move_lines_once(
             position: motion::clamp_position(buf_mut, shift(cursor.position)),
             anchor: motion::clamp_position(buf_mut, shift(cursor.anchor)),
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
         (revision, new_cursor)
     };
@@ -9861,7 +9792,7 @@ async fn input_join_lines_once(
             position: new_pos,
             anchor: new_pos,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         };
         s.cursors.insert((client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
@@ -10079,7 +10010,7 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
         position,
         anchor,
         match_bracket: None,
-        grep_position: None,
+        jumplist_position: None,
     }
 }
 
@@ -10102,62 +10033,52 @@ fn with_match_bracket(buf: &Buffer, mut cursor: CursorState) -> CursorState {
     cursor
 }
 
-/// Populate `grep_position` on a cursor that's about to cross the wire. The cursor counts as
-/// "on" a hit when its selection covers *exactly* the match — `anchor` at the match's first
-/// char and `position` at its last char (orientation-agnostic) — same strictness as
-/// `match_index_for_cursor` uses to gate the in-buffer `A/B` counter. Any motion that grows,
-/// shrinks, or shifts the selection drops the indicator on the next response.
-fn with_grep_position(
+/// Populate `jumplist_position` on a cursor that's about to cross the wire. The cursor counts
+/// as "on" an entry when it sits exactly where a jump to that entry lands: the selection covers
+/// exactly the entry's span (`anchor` at its first char, `position` at its last,
+/// orientation-agnostic) for a spanned entry, or a point cursor at the entry's position for a
+/// point entry — same strictness as `match_index_for_cursor` uses to gate the in-buffer `A/B`
+/// counter. Any motion that grows, shrinks, or shifts the selection drops the indicator on the
+/// next response.
+fn with_jumplist_position(
     s: &ServerState,
     client_id: ClientId,
     buffer_id: BufferId,
     mut cursor: CursorState,
 ) -> CursorState {
-    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+    let Some(list) = s.jumplist.get(&client_id) else {
         return cursor;
     };
-    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
-        return cursor;
-    };
-    if hits.is_empty() {
+    if list.entries.is_empty() {
         return cursor;
     }
     let Some(buf) = s.buffers.get(&buffer_id) else {
         return cursor;
     };
-    let Some(workspace) = s.active_workspace(client_id) else {
-        return cursor;
-    };
-    let Some((current_idx, current_rel)) = buf.canonical_path.as_deref().and_then(|p| {
-        crate::workspace_index::workspace_relative_parts(std::path::Path::new(p), &workspace.paths)
-    }) else {
+    let Some(current_abs) = buf
+        .canonical_path
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned())
+    else {
         return cursor;
     };
     // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
-    // `match_index_for_cursor`).
+    // `match_index_for_cursor`). Entry coordinates may be stale after edits; `pos_to_char`
+    // clamps, same acceptance as jumping to a stale entry.
     let anchor_char = motion::pos_to_char(buf, cursor.anchor);
     let pos_char = motion::pos_to_char(buf, cursor.position);
     let sel_start_char = anchor_char.min(pos_char);
     let sel_end_char = anchor_char.max(pos_char);
-    let total = hits.len() as u32;
-    if let Some(idx) = hits.iter().position(|h| {
-        if h.path_index != current_idx || h.relative_path != current_rel {
+    let total = list.entries.len() as u32;
+    if let Some(idx) = list.entries.iter().position(|e| {
+        if e.abs_path != current_abs {
             return false;
         }
-        let hit_start_pos = LogicalPosition {
-            line: h.line,
-            col: h.col,
-        };
-        let hit_end_excl_pos = LogicalPosition {
-            line: h.line,
-            col: h.col + h.match_byte_len,
-        };
-        let m_start_char = motion::pos_to_char(buf, hit_start_pos);
-        let m_end_char_excl = motion::pos_to_char(buf, hit_end_excl_pos);
-        let m_last_char = m_end_char_excl.saturating_sub(1).max(m_start_char);
-        sel_start_char == m_start_char && sel_end_char == m_last_char
+        let e_start_char = motion::pos_to_char(buf, e.start());
+        let e_end_char = motion::pos_to_char(buf, e.position).max(e_start_char);
+        sel_start_char == e_start_char && sel_end_char == e_end_char
     }) {
-        cursor.grep_position = Some(GrepPosition {
+        cursor.jumplist_position = Some(JumplistPosition {
             current: (idx as u32).saturating_add(1),
             total,
         });
@@ -10167,8 +10088,8 @@ fn with_grep_position(
 
 /// Same as `with_match_bracket` but starts from a `ServerState`: a one-liner for the many
 /// handlers that need to populate the field just before returning. Safe if the buffer was
-/// already dropped (returns the cursor unchanged). Also stamps `grep_position` if the client
-/// has cached grep hits and the cursor is on one.
+/// already dropped (returns the cursor unchanged). Also stamps `jumplist_position` if the client
+/// has a jumplist and the cursor is on one of its entries.
 fn wrap_for_response(
     s: &ServerState,
     client_id: ClientId,
@@ -10180,7 +10101,7 @@ fn wrap_for_response(
         .get(&buffer_id)
         .map(|buf| with_match_bracket(buf, cursor))
         .unwrap_or(cursor);
-    with_grep_position(s, client_id, buffer_id, with_brackets)
+    with_jumplist_position(s, client_id, buffer_id, with_brackets)
 }
 
 enum EditKind {
@@ -10655,7 +10576,7 @@ async fn apply_edit(
             position: position_pos,
             anchor: anchor_pos,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         }
     } else {
         // Point cursor. `PointAt` keeps the caret on the same char (clamped to the edited line's
@@ -10669,7 +10590,7 @@ async fn apply_edit(
             position: post_pos,
             anchor: post_pos,
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         }
     };
     s.cursors.insert((client_id, buffer_id), new_cursor_state);
@@ -12028,15 +11949,29 @@ pub async fn picker_view(
                 .map(Into::into)
                 .collect(),
         ),
+        // Rebuilt from the live captured list on every view — a cheap in-memory clone, and the
+        // backing list persists regardless of the picker, so there's nothing to resume. Opens
+        // empty when nothing has been captured yet.
+        PickerKind::Jumplist => {
+            let s = state.lock().await;
+            picker_state::PickerCandidates::Jumplist(
+                s.jumplist
+                    .get(&client_id)
+                    .map(|list| list.entries.clone())
+                    .unwrap_or_default(),
+            )
+        }
     };
 
     let mut s = state.lock().await;
     let key = (client_id, params.kind);
 
-    // Pre-resolve cursor info if we'll use it for cursor-anchored centering (Grep / GitChanges).
-    // Done before borrowing `pickers` out of `s` so we don't juggle conflicting borrows after the
-    // split.
-    let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>)> =
+    // Pre-resolve cursor info if we'll use it for cursor-anchored centering (Grep / GitChanges /
+    // Jumplist). Done before borrowing `pickers` out of `s` so we don't juggle conflicting
+    // borrows after the split. The third element is the buffer's absolute path — the jumplist
+    // keys entries by it (its files can sit outside every root); the grouped kinds use the
+    // workspace-relative pair.
+    let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>, Option<String>)> =
         match (params.kind, params.center_on_cursor) {
             (kind, Some(buffer_id)) if kind.centers_on_cursor() => {
                 let cursor = s
@@ -12051,6 +11986,11 @@ pub async fn picker_view(
                 } else {
                     cursor.position
                 };
+                let current_abs = s
+                    .buffers
+                    .get(&buffer_id)
+                    .and_then(|b| b.canonical_path.as_deref())
+                    .map(|p| p.to_string_lossy().into_owned());
                 let current_key = s.buffers.get(&buffer_id).and_then(|b| {
                     let workspace = s.active_workspace(client_id)?;
                     b.canonical_path.as_deref().and_then(|p| {
@@ -12060,7 +12000,7 @@ pub async fn picker_view(
                         )
                     })
                 });
-                Some((leading_edge, current_key))
+                Some((leading_edge, current_key, current_abs))
             }
             _ => None,
         };
@@ -12224,7 +12164,7 @@ pub async fn picker_view(
     // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =
         match (cursor_centering_info.as_ref(), &picker.candidates) {
-            (Some((leading_edge, current_key)), picker_state::PickerCandidates::Grep(hits))
+            (Some((leading_edge, current_key, _)), picker_state::PickerCandidates::Grep(hits))
                 if !hits.is_empty() =>
             {
                 find_nearest_grep_hit(
@@ -12245,7 +12185,7 @@ pub async fn picker_view(
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
             (
-                Some((leading_edge, Some(current_key))),
+                Some((leading_edge, Some(current_key), _)),
                 picker_state::PickerCandidates::GitChanges(c),
             ) if !c.is_empty() => find_nearest_git_change(
                 c,
@@ -12253,6 +12193,17 @@ pub async fn picker_view(
                 leading_edge.line,
             )
             .map(|idx| picker.candidates.make_item(idx, Vec::new())),
+            // Jumplist: land on the entry at-or-after the cursor, wrapping — the same
+            // "where you are in the cycle" the `]`/`[` stepping derives, inclusive so the
+            // just-jumped-to entry counts as current (`crate::jumplist::nearest_index`).
+            (
+                Some((leading_edge, _, current_abs)),
+                picker_state::PickerCandidates::Jumplist(entries),
+            ) if !entries.is_empty() => {
+                let idx =
+                    crate::jumplist::nearest_index(entries, current_abs.as_deref(), *leading_edge);
+                Some(picker.candidates.make_item(idx, Vec::new()))
+            }
             _ => None,
         };
 
@@ -12543,111 +12494,205 @@ pub async fn picker_hide(
     Ok(())
 }
 
-/// Step through the client's cached grep hits without re-opening the picker. See the protocol
-/// doc on `PickerGrepNavigate` for the directional + virtual-insert rules. Returns `None` when
-/// there are no cached hits or the cursor is past the last (or before the first) hit with no
-/// further file in the requested direction — the client treats `None` as a no-op.
-pub async fn picker_grep_navigate(
+/// The `buffer/open` params that jump to a captured results entry: transient, cursor landing
+/// exactly as selecting the source row would (`jump_to` + `jump_to_anchor`), origin recorded on
+/// nav history. Entries missing workspace-relative parts (references into dependency sources)
+/// get them re-derived from the active workspace, falling back to an absolute-path (external
+/// buffer) open — the same routing the client's own open flow applies.
+fn jumplist_open_params(
+    s: &ServerState,
+    client_id: ClientId,
+    entry: &crate::jumplist::JumplistEntry,
+    origin: BufferId,
+) -> BufferOpenParams {
+    let mut path_index = entry.path_index;
+    let mut relative_path = entry.relative_path.clone();
+    if relative_path.is_none() {
+        if let Some(workspace) = s.active_workspace(client_id) {
+            if let Some((i, rel)) = crate::workspace_index::workspace_relative_parts(
+                std::path::Path::new(&entry.abs_path),
+                &workspace.paths,
+            ) {
+                path_index = Some(i);
+                relative_path = Some(rel);
+            }
+        }
+    }
+    let absolute_path = relative_path.is_none().then(|| entry.abs_path.clone());
+    BufferOpenParams {
+        path_index,
+        relative_path,
+        absolute_path,
+        jump_to: Some(entry.position),
+        jump_to_anchor: entry.anchor,
+        transient: Some(true),
+        record_nav_from: Some(origin),
+        ..Default::default()
+    }
+}
+
+/// Snapshot the open picker's filtered results into this client's jumplist (docs/jumplist.md).
+/// Doesn't navigate — the client follows up by opening the Jumplist picker framed on the
+/// returned `index`, and Enter there jumps through the ordinary select path. `None` when the
+/// picker has nothing to capture — the previously captured list survives. Replaces any prior
+/// capture otherwise; capturing from the Jumplist picker itself narrows the list to its current
+/// subset.
+pub async fn jumplist_capture(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: PickerGrepNavigateParams,
-) -> Result<Option<PickerGrepNavigateTarget>, RpcError> {
+    params: JumplistCaptureParams,
+) -> Result<Option<JumplistCaptureResult>, RpcError> {
     let client_id = ctx.client_id;
-    let s = state.lock().await;
-    let buffer = s
-        .buffers
-        .get(&params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-    // None for scratch buffers; otherwise the workspace-relative display path the grep candidates
-    // are keyed by. Falls back to None if the client somehow lost its active workspace — the
-    // navigate handler then treats this as "no anchor in the file list" the same way scratch
-    // buffers do.
-    let current_key: Option<(u32, String)> = s.active_workspace(client_id).and_then(|workspace| {
-        buffer.canonical_path.as_deref().and_then(|p| {
-            crate::workspace_index::workspace_relative_parts(
-                std::path::Path::new(p),
-                &workspace.paths,
-            )
-        })
-    });
-
-    let Some(picker) = s.pickers.get(&(client_id, PickerKind::Grep)) else {
+    let mut s = state.lock().await;
+    let s = &mut *s;
+    let Some(picker) = s.pickers.get(&(client_id, params.kind)) else {
+        return Err(RpcError::new(
+            ErrorCode::INVALID_REQUEST,
+            "no active picker for this client",
+        ));
+    };
+    let ci = picker.candidates.position_of(&params.item).ok_or_else(|| {
+        RpcError::invalid_params("selected item is not in the picker's candidate set")
+    })? as u32;
+    let Some((mut list, candidate_indices)) = crate::jumplist::capture(picker, &mut s.matcher)
+    else {
         return Ok(None);
     };
-    let picker_state::PickerCandidates::Grep(ref hits) = picker.candidates else {
-        return Ok(None);
-    };
-    if hits.is_empty() {
-        return Ok(None);
+    // Give every entry its file identity: derive workspace-relative parts from `abs_path` (so the
+    // open resolves the file rather than the root directory) and a `File` group header for the
+    // headerless buffer-scoped sources (so the picker shows which file each row belongs to).
+    if let Some(workspace) = s.active_workspace(client_id) {
+        let roots = workspace.paths.clone();
+        crate::jumplist::assign_file_groups(&mut list.entries, &roots);
     }
+    // A re-capture from the Jumplist picker narrows the list but keeps describing what the
+    // entries are entries *of*: the original source kind and query, not the narrowing query
+    // typed into the Jumplist picker.
+    if params.kind == PickerKind::Jumplist {
+        if let Some(prior) = s.jumplist.get(&client_id) {
+            list.source = prior.source;
+            list.query = prior.query.clone();
+        }
+    }
+    // The highlighted row is normally in the capture; a DocumentSymbols ancestor context row
+    // isn't (capture keeps only real matches) — frame the nearest captured entry at or after
+    // it in candidate order instead.
+    let index = candidate_indices
+        .iter()
+        .position(|&c| c == ci)
+        .or_else(|| {
+            candidate_indices
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > ci)
+                .min_by_key(|(_, &c)| c)
+                .map(|(i, _)| i)
+        })
+        .unwrap_or(0);
+    let total = list.entries.len() as u32;
+    s.jumplist.insert(client_id, list);
+    Ok(Some(JumplistCaptureResult {
+        total,
+        index: index as u32,
+    }))
+}
 
-    // Use the outer edge of the cursor's selection so a hit the cursor currently sits on is
-    // treated as "current" and skipped. Without this, `<` from a freshly-jumped grep result
-    // (where the selection covers the whole match) would land back on the same hit because
-    // the hit's stored start position is < the cursor's end position.
-    let cursor = s
-        .cursors
-        .get(&(client_id, params.buffer_id))
-        .copied()
-        .unwrap_or_default();
-    let (min_edge, max_edge) =
-        if (cursor.anchor.line, cursor.anchor.col) < (cursor.position.line, cursor.position.col) {
+/// Step through the jumplist from the cursor's current location — Normal-mode
+/// `]` / `[` (cross-file) or `Alt-]` / `Alt-[` (`CurrentFile` scope) (docs/jumplist.md).
+/// Cursor-derived, stopping (not wrapping) at the ends; the directional rules live in
+/// [`crate::jumplist::step_index`] (full) / [`crate::jumplist::step_in_file`] (scoped). Returns
+/// [`JumplistStepResult::Empty`] when nothing is captured, [`JumplistStepResult::AtEnd`] at the
+/// boundary in the step direction, and [`JumplistStepResult::NoneInFile`] when a `CurrentFile`
+/// step finds no entries in the buffer's file — each a no-op the client turns into a toast.
+pub async fn jumplist_step(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: JumplistStepParams,
+) -> Result<JumplistStepResult, RpcError> {
+    let client_id = ctx.client_id;
+    let (mut target, open_params) = {
+        let s = state.lock().await;
+        let buffer = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let Some(list) = s.jumplist.get(&client_id) else {
+            return Ok(JumplistStepResult::Empty);
+        };
+        if list.entries.is_empty() {
+            return Ok(JumplistStepResult::Empty);
+        }
+        let current_abs = buffer
+            .canonical_path
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned());
+        // Use the outer edge of the cursor's selection so an entry the cursor currently sits
+        // on is treated as "current" and skipped. Without this, `[` from a freshly-jumped
+        // entry (where the selection covers its span) would land back on the same entry
+        // because the entry's start position is < the cursor's end position.
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
+        let (min_edge, max_edge) = if (cursor.anchor.line, cursor.anchor.col)
+            < (cursor.position.line, cursor.position.col)
+        {
             (cursor.anchor, cursor.position)
         } else {
             (cursor.position, cursor.anchor)
         };
-    let current_key_ref = current_key.as_ref().map(|(i, r)| (*i, r.as_str()));
-    let target = match params.direction {
-        Direction::Forward => find_next_grep_hit(hits, current_key_ref, max_edge),
-        Direction::Backward => find_prev_grep_hit(hits, current_key_ref, min_edge),
-    };
-    let query = picker.query.clone();
-    let options = picker.filters.match_options();
-    let target = target.map(|c| {
-        (
-            c.path_index,
-            c.relative_path.clone(),
-            c.abs_path.clone(),
-            LogicalPosition {
-                line: c.line,
-                col: c.col,
+        let edge = match params.direction {
+            Direction::Forward => max_edge,
+            Direction::Backward => min_edge,
+        };
+        let count = params.count.max(1);
+        let idx = match params.scope {
+            JumplistStepScope::Full => match crate::jumplist::step_index(
+                &list.entries,
+                params.direction,
+                current_abs.as_deref(),
+                edge,
+                count,
+            ) {
+                Some(idx) => idx,
+                // At the boundary in this direction — no move; client toasts "last/first entry".
+                None => return Ok(JumplistStepResult::AtEnd),
             },
-        )
-    });
-    drop(s);
-    let Some((path_index, relative_path, path, position)) = target else {
-        return Ok(None);
+            JumplistStepScope::CurrentFile => match crate::jumplist::step_in_file(
+                &list.entries,
+                params.direction,
+                current_abs.as_deref(),
+                edge,
+                count,
+            ) {
+                crate::jumplist::InFileStep::Moved(idx) => idx,
+                crate::jumplist::InFileStep::AtEnd => return Ok(JumplistStepResult::AtEnd),
+                crate::jumplist::InFileStep::NoneInFile => {
+                    return Ok(JumplistStepResult::NoneInFile)
+                }
+            },
+        };
+        let entry = &list.entries[idx];
+        let target = JumplistStepTarget {
+            path: entry.abs_path.clone(),
+            position: entry.position,
+            anchor: entry.anchor,
+            index: idx as u32 + 1,
+            total: list.entries.len() as u32,
+            opened: None,
+        };
+        let open_params = params
+            .open
+            .then(|| jumplist_open_params(&s, client_id, entry, params.buffer_id));
+        (target, open_params)
     };
-    // Composite post-step (docs/protocol-composites.md, J): open the hit — transient, at
-    // the hit position, jump origin recorded, search primed — in the same round-trip.
-    let opened = if params.open {
-        Some(
-            buffer_open(
-                state,
-                ctx,
-                BufferOpenParams {
-                    path_index: Some(path_index),
-                    relative_path: Some(relative_path),
-                    jump_to: Some(position),
-                    transient: Some(true),
-                    record_nav_from: Some(params.buffer_id),
-                    prime_search: Some(query.clone()),
-                    prime_search_options: options,
-                    ..Default::default()
-                },
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    Ok(Some(PickerGrepNavigateTarget {
-        path,
-        position,
-        query,
-        options,
-        opened,
-    }))
+    // Composite post-step (docs/protocol-composites.md, J): open the entry — transient, landed
+    // like a picker select, jump origin recorded — in the same round-trip.
+    if let Some(open_params) = open_params {
+        target.opened = Some(buffer_open(state, ctx, open_params).await?);
+    }
+    Ok(JumplistStepResult::Moved(target))
 }
 
 /// Move a picker's selection to the next / previous *section* — the header-grouped kinds jump
@@ -12873,47 +12918,11 @@ mod symbol_unit_boundary_tests {
 /// Assumes `hits` are roughly in `(path_index, relative_path, line, col)` order — true in
 /// practice because the walker sorts files that way and ripgrep emits matches per file in line
 /// order.
-fn find_next_grep_hit<'a>(
-    hits: &'a [picker_state::GrepHitCandidate],
-    current: Option<(u32, &str)>,
-    cursor: LogicalPosition,
-) -> Option<&'a picker_state::GrepHitCandidate> {
-    use std::cmp::Ordering;
-    let Some((cur_idx, cur_rel)) = current else {
-        return hits.first();
-    };
-    hits.iter().find(
-        |h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
-            Ordering::Greater => true,
-            Ordering::Equal => (h.line, h.col) > (cursor.line, cursor.col),
-            Ordering::Less => false,
-        },
-    )
-}
-
-fn find_prev_grep_hit<'a>(
-    hits: &'a [picker_state::GrepHitCandidate],
-    current: Option<(u32, &str)>,
-    cursor: LogicalPosition,
-) -> Option<&'a picker_state::GrepHitCandidate> {
-    use std::cmp::Ordering;
-    let Some((cur_idx, cur_rel)) = current else {
-        return hits.last();
-    };
-    hits.iter().rev().find(|h| {
-        match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
-            Ordering::Less => true,
-            Ordering::Equal => (h.line, h.col) < (cursor.line, cursor.col),
-            Ordering::Greater => false,
-        }
-    })
-}
-
 /// First grep hit "at or after" the cursor in walker order, wrapping to the first hit overall
 /// when nothing matches. Used by `picker/view`'s `center_on_cursor` to land the picker
 /// on "where you are" in the result list even when the cursor isn't sitting on a match
 /// exactly. Inclusive (a hit at exactly the cursor's position is the answer), unlike
-/// `find_next_grep_hit` which is strict (`>` skips past the current).
+/// `jumplist/step` which is strict (`>` skips past the current).
 fn find_nearest_grep_hit<'a>(
     hits: &'a [picker_state::GrepHitCandidate],
     current: Option<(u32, &str)>,

@@ -1,4 +1,5 @@
-//! Navigation history (the jump list) — browser-style back/forward across files.
+//! Navigation history — browser-style back/forward across files. (Not the *jumplist* —
+//! that's the captured picker-results list, [`crate::jumplist`].)
 //!
 //! Semantics deliberately mirror browser history: a qualifying jump records a back-entry and
 //! truncates the forward stack; there is no interior reordering or dedup (only the client's own
@@ -18,7 +19,7 @@ use crate::envelope::RpcMethod;
 use crate::BufferId;
 use serde::{Deserialize, Serialize};
 
-/// `nav/step` — step one entry through the jump list in `direction` (`Backward` = back,
+/// `nav/step` — step one entry through the nav history in `direction` (`Backward` = back,
 /// `Forward` = forward, browser-style) and navigate there. The `Alt-Left` / `Alt-Right` keys.
 pub struct NavStep;
 impl RpcMethod for NavStep {
@@ -67,6 +68,6 @@ pub struct NavGotoParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_path: Option<String>,
     /// The cursor/selection to restore (anchor + position). Clamped to the buffer's current
-    /// bounds server-side. `match_bracket`/`grep_position` are recomputed and may be omitted.
+    /// bounds server-side. `match_bracket`/`jumplist_position` are recomputed and may be omitted.
     pub cursor: CursorState,
 }

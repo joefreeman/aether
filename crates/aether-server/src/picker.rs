@@ -484,6 +484,12 @@ pub enum PickerCandidates {
     /// preserved across scroll/resume re-views (the re-view sends no rows), like Diagnostics.
     /// Static for the picker's lifetime — bindings can't change under a running client.
     Keybindings(Vec<KeybindingCandidate>),
+    /// The client's jumplist (docs/jumplist.md), cloned from
+    /// `ServerState.results` on every `picker/view` — cheap, in-memory, and the backing list
+    /// persists regardless of the picker. Positional identity (`PickerItem::JumplistEntry::index`) is
+    /// stable for the picker's lifetime: the list only changes via a re-capture, which resets
+    /// the picker.
+    Jumplist(Vec<crate::jumplist::JumplistEntry>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -511,6 +517,7 @@ impl PickerCandidates {
             PickerCandidates::Symbols(v) => v.len(),
             PickerCandidates::GitChanges(v) => v.len(),
             PickerCandidates::Keybindings(v) => v.len(),
+            PickerCandidates::Jumplist(v) => v.len(),
         }
     }
 
@@ -528,6 +535,7 @@ impl PickerCandidates {
             PickerCandidates::Symbols(_) => PickerKind::DocumentSymbols,
             PickerCandidates::GitChanges(_) => PickerKind::GitChanges,
             PickerCandidates::Keybindings(_) => PickerKind::Keybindings,
+            PickerCandidates::Jumplist(_) => PickerKind::Jumplist,
         }
     }
 
@@ -551,6 +559,7 @@ impl PickerCandidates {
             // `display_at`); kept defined for completeness.
             PickerCandidates::GitChanges(v) => &v[idx].relative_path,
             PickerCandidates::Keybindings(v) => &v[idx].haystack,
+            PickerCandidates::Jumplist(v) => &v[idx].display,
         }
     }
 
@@ -690,6 +699,12 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Jumplist(v) => PickerItem::JumplistEntry {
+                index: idx as u32,
+                line: v[idx].position.line,
+                display: v[idx].display.clone(),
+                match_indices,
+            },
         }
     }
 
@@ -789,6 +804,11 @@ impl PickerCandidates {
             ) => v.iter().position(|c| {
                 c.entry.mode == *mode && c.entry.keys == *keys && c.entry.desc == *desc
             }),
+            // Positional identity: the captured list is a snapshot, stable for the picker's
+            // lifetime (a re-capture resets the picker), so the index alone is the identity.
+            (PickerCandidates::Jumplist(v), PickerItem::JumplistEntry { index, .. }) => {
+                ((*index as usize) < v.len()).then_some(*index as usize)
+            }
             _ => None,
         }
     }
@@ -805,7 +825,8 @@ impl PickerCandidates {
             | PickerCandidates::LspServers(_)
             | PickerCandidates::References(_)
             | PickerCandidates::Symbols(_)
-            | PickerCandidates::Keybindings(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::Keybindings(_)
+            | PickerCandidates::Jumplist(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -906,6 +927,16 @@ impl PickerCandidates {
             // Informational — a shortcut row isn't a jump target and `select` never fires for
             // this kind (the client's Enter just closes the picker), like LspServers.
             PickerCandidates::Keybindings(_) => None,
+            // Entries land exactly as selecting the source row would: `position`/`anchor` were
+            // captured from the source picker's own select semantics.
+            PickerCandidates::Jumplist(v) => {
+                let e = &v[idx];
+                Some(PickerSelectResult::FileAt {
+                    path: e.abs_path.clone(),
+                    position: e.position,
+                    anchor: e.anchor,
+                })
+            }
         }
     }
 }
@@ -1211,12 +1242,15 @@ impl PickerState {
                     self.ranked = keep.into_iter().collect();
                 } else if matches!(
                     &self.candidates,
-                    PickerCandidates::GitChanges(_) | PickerCandidates::Keybindings(_)
+                    PickerCandidates::GitChanges(_)
+                        | PickerCandidates::Keybindings(_)
+                        | PickerCandidates::Jumplist(_)
                 ) {
                     // Grouped kinds: keep matches in document (candidate) order, not score order,
                     // so each group's rows stay a contiguous run the client can put a single
                     // header above — GitChanges' per-file hunks, Keybindings' per-group bindings
-                    // (shipped pre-bucketed). The fuzzy score only decides which rows survive.
+                    // (shipped pre-bucketed), the jumplist's carried source groups. The fuzzy score
+                    // only decides which rows survive.
                     let mut keep: Vec<u32> = scored.into_iter().map(|(_, i)| i).collect();
                     keep.sort_unstable();
                     self.ranked = keep;
@@ -1284,7 +1318,7 @@ impl PickerState {
     /// `None` for an empty query *or* an unparseable pattern — callers distinguish: the empty case
     /// is handled before this is reached (natural order / default preview), so a `None` here during
     /// matching means "invalid regex → no matches".
-    fn content_regex(&self) -> Option<regex::Regex> {
+    pub(crate) fn content_regex(&self) -> Option<regex::Regex> {
         if self.query.is_empty() {
             return None;
         }
@@ -1415,6 +1449,15 @@ impl PickerState {
             }
             PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
             PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
+            // Entries carry their source picker's header; a list captured from an ungrouped
+            // source has none — the picker then renders flat (spans skip, metrics bail).
+            PickerCandidates::Jumplist(v) => v[ci].group.as_ref().map(|g| match g {
+                GroupHeader::File {
+                    path_index,
+                    relative_path,
+                } => (*path_index, relative_path.as_str()),
+                GroupHeader::Label { label } => (u32::MAX, label.as_str()),
+            }),
             _ => None,
         }
     }
@@ -1444,6 +1487,7 @@ impl PickerState {
             PickerCandidates::Keybindings(v) => Some(GroupHeader::Label {
                 label: v[ci].entry.group.clone(),
             }),
+            PickerCandidates::Jumplist(v) => v[ci].group.clone(),
             _ => None,
         }
     }

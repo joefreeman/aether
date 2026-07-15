@@ -181,22 +181,21 @@ pub struct CursorState {
     /// client's match-bracket highlight overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_bracket: Option<(LogicalPosition, LogicalPosition)>,
-    /// `Some` when the cursor is currently sitting on a grep hit from this client's cached
-    /// grep results. Carries the 1-based index of the hit (across the whole workspace, not
-    /// just the current file) and the total hit count, so the status bar can render `(C/D)`
-    /// alongside the in-buffer search counter. `None` when the cursor isn't on any hit or
-    /// there are no cached grep results. Derived per-response like `match_bracket`; never
+    /// `Some` when the cursor is currently sitting on an entry of this client's captured
+    /// jumplist (docs/jumplist.md). Carries the 1-based index of the entry (across the
+    /// whole list, not just the current file) and the total entry count, so the status bar can
+    /// render `C/D` alongside the in-buffer search counter. `None` when the cursor isn't on
+    /// any entry or nothing is captured. Derived per-response like `match_bracket`; never
     /// stored in `state.cursors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grep_position: Option<GrepPosition>,
+    pub jumplist_position: Option<JumplistPosition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrepPosition {
-    /// 1-based index of the hit the cursor is currently on, within the full ordered list of
-    /// cached grep hits.
+pub struct JumplistPosition {
+    /// 1-based index of the entry the cursor is currently on, within the captured list.
     pub current: u32,
-    /// Total number of cached grep hits across the workspace.
+    /// Total number of captured entries.
     pub total: u32,
 }
 

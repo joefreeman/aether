@@ -652,13 +652,14 @@ fn format_total(s: &SearchSummary) -> String {
     }
 }
 
-/// `Some("(3/12)")` when the server reports the cursor is currently on a cached grep hit, paired
-/// with the total hit count across the workspace. `None` whenever there's no cached grep or the
-/// cursor isn't on a hit — the status bar then renders nothing for the grep slot, matching the
-/// "hide when not on a match" treatment for the in-buffer search counter.
-pub fn grep_counter_label(state: &AppState) -> Option<String> {
-    let gp = state.ed().cursor.grep_position?;
-    Some(format!("({}/{})", gp.current, gp.total))
+/// `Some("(3/12)")` when the server reports the cursor is currently on an entry of the captured
+/// jumplist (docs/jumplist.md), paired with the total entry count. `None` whenever
+/// nothing is captured or the cursor isn't on an entry — the status bar then renders nothing
+/// for the results slot, matching the "hide when not on a match" treatment for the in-buffer
+/// search counter.
+pub fn jumplist_counter_label(state: &AppState) -> Option<String> {
+    let rp = state.ed().cursor.jumplist_position?;
+    Some(format!("({}/{})", rp.current, rp.total))
 }
 
 /// Summary line for the search prompt: "3/47", "3/10000+", or "no matches". `None` when the

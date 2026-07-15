@@ -686,6 +686,9 @@ impl PickerState {
             PickerKind::Diagnostics | PickerKind::DiagnosticsWorkspace => "No diagnostics",
             PickerKind::GitChanges | PickerKind::GitChangesFile => "No changes",
             PickerKind::Keybindings => "No keybindings",
+            // Empty list, empty query: advertise how to fill it (a non-empty query that matched
+            // nothing already took the "No matches" arm above).
+            PickerKind::Jumplist => "Nothing captured — Ctrl-j in a picker captures results",
             _ => "No results",
         })
     }
@@ -710,6 +713,9 @@ pub enum ItemKey<'a> {
     /// `(mode, keys, desc)` — a chord can be bound in several modes, and an Alt-variant can
     /// share a description, so all three disambiguate.
     Keybinding(&'a str, &'a str, &'a str),
+    /// The captured entry's position in the jumplist — positional identity, stable for the
+    /// picker's lifetime (a re-capture resets the picker).
+    JumplistEntry(u32),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -807,6 +813,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::Keybinding {
             mode, keys, desc, ..
         } => ItemKey::Keybinding(mode, keys, desc),
+        PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry(*index),
     }
 }
 

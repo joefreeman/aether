@@ -2,7 +2,6 @@
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::search::SearchSummary;
 use crate::viewport::ScrollPosition;
 use crate::{BufferId, LogicalPosition, Revision};
 use serde::{Deserialize, Serialize};
@@ -65,20 +64,6 @@ pub struct BufferOpenParams {
     /// (docs/protocol-composites.md, A). Ignored if the buffer doesn't exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_nav_from: Option<BufferId>,
-    /// Prime the opened buffer's search with this query — a `search/set` anchored at the
-    /// post-open cursor (the `jump_to` hit), so the first match at-or-after lands
-    /// *selected* and `n`/`Alt-n` step on from it. The result's `cursor` reflects the
-    /// selection. Fire-and-forget semantics: pattern errors are dropped. Empty = no-op.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prime_search: Option<String>,
-    /// Match options for the primed search (ignored without `prime_search`) — the grep result's
-    /// case / whole-word / literal options, so the primed search matches the same way the grep
-    /// that found the hit did. Defaults (regex, smartcase) when absent.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::picker::MatchOptions::is_default"
-    )]
-    pub prime_search_options: crate::picker::MatchOptions,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,12 +104,6 @@ pub struct BufferOpenResult {
     /// [`BufferOpenParams::transient`]). Promotion mid-session is pushed via `buffer/state`.
     #[serde(default)]
     pub transient: bool,
-    /// The search summary produced when this open carried a `prime_search` (grep nav / grep
-    /// selection). Carried on the response so the client adopts the match count atomically with
-    /// the buffer switch — the equivalent `search/state_changed` push races the switch and is
-    /// dropped by the client's `buffer_id` guard when it arrives first. `None` for a plain open.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search_summary: Option<SearchSummary>,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

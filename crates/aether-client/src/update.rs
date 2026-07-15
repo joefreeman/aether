@@ -59,6 +59,10 @@ use aether_protocol::input::{
     InputUnsurround, InputUnsurroundParams, LineSide, ToggleCommentParams, UndoRedoParams,
     UndoResult,
 };
+use aether_protocol::jumplist::{
+    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
+    JumplistStepParams, JumplistStepResult, JumplistStepScope,
+};
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspDocumentHighlight, LspDocumentHighlightParams, LspFormat,
@@ -70,11 +74,10 @@ use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavStep, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
-    PickerGrepNavigateParams, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
-    PickerQueryParams, PickerSectionJump, PickerSectionJumpParams, PickerSelect,
-    PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams, PickerView,
-    PickerViewParams, PickerViewResult, ScopedPath,
+    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerHide, PickerHideParams,
+    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSectionJump,
+    PickerSectionJumpParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -121,10 +124,18 @@ pub enum Event {
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
     /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
-    /// A grep-driven switch: like [`Event::Switched`] but priming the buffer search with the
-    /// grep query (and its match options) so `n`/`Alt-n` step matches the way the grep did.
-    /// `Ok(None)` = no more hits.
-    SwitchedPrimed(Result<Option<(String, MatchOptions, BufferOpenResult)>, String>),
+    /// A `jumplist/capture` resolved (picker `Ctrl-j`): the list is snapshotted server-side and
+    /// the source picker swaps to the Jumplist picker. `Ok(None)` = nothing to capture (the
+    /// picker's filtered set was empty); any previously captured list survives. The source
+    /// `PickerKind` rides alongside so the confirmation toast can tell a fresh capture from a
+    /// re-capture (`kind == Jumplist`, i.e. narrowing the list in place).
+    JumplistCaptured(Result<Option<JumplistCaptureResult>, String>, PickerKind),
+    /// A `jumplist/step` resolved (`]` / `[` / `Alt-]` / `Alt-[`): `Moved` carries the opened
+    /// target; `AtEnd` / `NoneInFile` / `Empty` are no-ops turned into a keyed toast. The
+    /// `Direction` and `JumplistStepScope` ride alongside so the boundary toast can name the end
+    /// reached (forward = last, backward = first) and whether it was file-scoped, without the
+    /// server echoing them back.
+    JumplistStepped(Result<JumplistStepResult, String>, Direction, JumplistStepScope),
     /// The prompt's Yes/Save button (keyboard accept routes through `on_prompt_key`).
     PromptAccept,
     PromptCancel,
@@ -168,9 +179,6 @@ pub enum Event {
         result: Result<PickerViewResult, String>,
     },
     PickerSelected {
-        /// Grep selections prime the opened buffer's search with the picker query and its match
-        /// options (derived from the picker's filter chips).
-        prime: Option<(String, MatchOptions)>,
         result: Result<PickerSelectResult, String>,
     },
     /// A picker row was clicked (absolute index) — highlight it and accept.
@@ -417,28 +425,76 @@ impl Session {
             Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_workspace(),
             Event::EphemeralClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
 
-            Event::SwitchedPrimed(Ok(Some((query, options, open)))) => {
-                // Grab the primed summary before `open` is consumed: the equivalent
-                // `search/state_changed` push races this switch and the client's `buffer_id`
-                // guard drops it if it lands before the switch, so the count rode the response.
-                let summary = open.search_summary.clone();
-                // Same-buffer hits glide, cross-buffer hits switch — see `adopt_navigation`.
-                let fx = self.adopt_navigation(open);
-                // adopt_switch reset the search state; adopt the primed query + options (the
-                // server-side search was already set in the open chain) and its summary, so the
-                // search reads and steps exactly as the grep that found the hit did.
-                self.search.query = query.clone();
-                self.search.options = options;
-                self.search.active = true;
-                self.search.summary = summary;
-                self.push_history(query);
-                fx
+            // Captured: swap the source picker for the Jumplist picker, framed on the row that
+            // was highlighted at capture time (its `index` in the new list) — Enter from here jumps
+            // through the ordinary select path. Also how a re-capture from the Jumplist picker
+            // itself lands: same picker, narrowed list, query cleared. Because the Jumplist picker
+            // now looks much like its source, also toast the count so the swap reads as an action.
+            Event::JumplistCaptured(Ok(Some(r)), source) => {
+                let noun = if r.total == 1 { "result" } else { "results" };
+                let msg = if source == PickerKind::Jumplist {
+                    format!("Narrowed jumplist to {} {noun}", r.total)
+                } else {
+                    format!("Captured {} {noun} to the jumplist", r.total)
+                };
+                let toast = Effects::toast_grouped(msg, ToastKind::Success, "jumplist");
+                let hide = self.close_picker();
+                toast.and(hide).and(self.open_picker(
+                    PickerKind::Jumplist,
+                    None,
+                    None,
+                    false,
+                    Some(PickerItem::JumplistEntry {
+                        index: r.index,
+                        // Only `index` identifies the row for centering; line/display unused.
+                        line: 0,
+                        display: String::new(),
+                        match_indices: Vec::new(),
+                    }),
+                ))
             }
-            Event::SwitchedPrimed(Ok(None)) => {
-                // Grouped so repeatedly stepping past the last hit coalesces to one toast.
-                Effects::toast_grouped("No more grep hits", ToastKind::Info, "grep-nav")
+            // Nothing to capture (empty filtered set) — the source picker stays open; say why
+            // nothing visibly happened.
+            Event::JumplistCaptured(Ok(None), _) => {
+                Effects::toast_grouped("Nothing to capture", ToastKind::Info, "jumplist")
             }
-            Event::SwitchedPrimed(Err(e)) => Effects::error(e),
+            Event::JumplistCaptured(Err(e), _) => Effects::error(format!("Capture failed: {e}")),
+
+            Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
+                Some(open) => self.adopt_navigation(open),
+                None => Effects::none(), // open:true is always sent; defensive
+            },
+            // At the boundary — no wrap. Name the end reached (and, when file-scoped, that the
+            // list continues in other files); keyed so holding the key coalesces.
+            Event::JumplistStepped(Ok(JumplistStepResult::AtEnd), direction, scope) => {
+                let msg = match (direction, scope) {
+                    (Direction::Forward, JumplistStepScope::Full) => "Last jumplist entry",
+                    (Direction::Backward, JumplistStepScope::Full) => "First jumplist entry",
+                    (Direction::Forward, JumplistStepScope::CurrentFile) => {
+                        "Last jumplist entry in this file"
+                    }
+                    (Direction::Backward, JumplistStepScope::CurrentFile) => {
+                        "First jumplist entry in this file"
+                    }
+                };
+                Effects::toast_grouped(msg, ToastKind::Info, "jumplist")
+            }
+            // File-scoped (`Alt-]`/`Alt-[`) with no entries in the current file — `]`/`[` would
+            // instead cross into another file.
+            Event::JumplistStepped(Ok(JumplistStepResult::NoneInFile), _, _) => {
+                Effects::toast_grouped(
+                    "No jumplist entries in this file — ] steps across files",
+                    ToastKind::Info,
+                    "jumplist",
+                )
+            }
+            // Grouped so repeatedly pressing `]` with nothing captured coalesces to one toast.
+            Event::JumplistStepped(Ok(JumplistStepResult::Empty), _, _) => Effects::toast_grouped(
+                "Jumplist is empty — Ctrl-j in a picker captures results",
+                ToastKind::Info,
+                "jumplist",
+            ),
+            Event::JumplistStepped(Err(e), _, _) => Effects::error(e),
 
             Event::PromptAccept => self.accept_prompt(),
             Event::PromptCancel => self.decline_prompt(),
@@ -508,7 +564,7 @@ impl Session {
             Event::NavDone { forward, result } => match result {
                 // Same-buffer step glides, cross-buffer step switches — see `adopt_navigation`.
                 Ok(NavStepResult { target: Some(open) }) => self.adopt_navigation(open),
-                // Grouped so mashing back/forward at an end of the jump list updates one toast.
+                // Grouped so mashing back/forward at an end of the nav history updates one toast.
                 Ok(_) => Effects::toast_grouped(
                     if forward {
                         "No later location in history"
@@ -530,12 +586,7 @@ impl Session {
                         // the server gave no distinct span (`end == position`).
                         let start = location.position;
                         let end = location.end;
-                        self.open_path_primed(
-                            location.path,
-                            Some(end),
-                            (end != start).then_some(start),
-                            None,
-                        )
+                        self.open_path_at(location.path, Some(end), (end != start).then_some(start))
                     }
                     None => Effects::toast("No definition found", ToastKind::Info),
                 },
@@ -754,16 +805,13 @@ impl Session {
             // Selections open in place: the window shows one buffer, and the one being
             // replaced is a `Space b` away (buffers persist server-side). Opens are
             // transient previews — switching away from one closes it.
-            Event::PickerSelected {
-                prime,
-                result: Ok(result),
-            } => match result {
-                PickerSelectResult::File { path } => self.open_path_primed(path, None, None, prime),
+            Event::PickerSelected { result: Ok(result) } => match result {
+                PickerSelectResult::File { path } => self.open_path_at(path, None, None),
                 PickerSelectResult::FileAt {
                     path,
                     position,
                     anchor,
-                } => self.open_path_primed(path, Some(position), anchor, prime),
+                } => self.open_path_at(path, Some(position), anchor),
                 PickerSelectResult::Buffer { buffer_id } => {
                     if buffer_id == self.buffer.buffer_id {
                         return Effects::none(); // already showing it
@@ -1083,7 +1131,13 @@ impl Session {
                             // resetting where the user was filtering.
                             fx = fx.and(self.picker_query_changed());
                         } else if kind == PickerKind::Files {
-                            fx = fx.and(self.open_picker(PickerKind::Files, None, None, false));
+                            fx = fx.and(self.open_picker(
+                                PickerKind::Files,
+                                None,
+                                None,
+                                false,
+                                None,
+                            ));
                         }
                     }
                     fx
@@ -1681,29 +1735,23 @@ impl Session {
 
     /// Open a file by absolute path as a transient preview — result-style navigation (picker
     /// selections, goto-definition). Records the jump origin onto the nav history first.
-    /// `prime_search` (grep flows) also sets the opened buffer's search to that query so
-    /// `n`/`Alt-n` step matches.
     ///
     /// A path inside one of the workspace's roots opens as an ordinary root-relative buffer; a path
     /// outside every root — goto-definition into a dependency's source, say — opens as an *external*
     /// guest buffer via `absolute_path` (the same mechanism the `Space Alt-w` open-from-path overlay
     /// uses), rather than refusing with a toast. Either way it lands as a transient preview with the
     /// jump origin on the nav history, so `Alt-Left` returns.
-    pub fn open_path_primed(
+    pub fn open_path_at(
         &mut self,
         path: String,
         jump_to: Option<LogicalPosition>,
         jump_to_anchor: Option<LogicalPosition>,
-        prime: Option<(String, MatchOptions)>,
     ) -> Effects {
         let (path_index, relative_path, absolute_path) =
             match strip_longest_root(&path, &self.workspace_paths) {
                 Some((idx, rel)) => (Some(idx), Some(rel), None),
                 None => (None, None, Some(path)),
             };
-        let prime_search = prime.as_ref().map(|(q, _)| q.clone());
-        let prime_search_options = prime.as_ref().map(|(_, o)| *o).unwrap_or_default();
-        let prime = prime.clone();
         self.request_str::<BufferOpen>(
             BufferOpenParams {
                 path_index,
@@ -1713,15 +1761,9 @@ impl Session {
                 jump_to_anchor,
                 transient: Some(true),
                 record_nav_from: Some(self.buffer.buffer_id),
-                prime_search,
-                prime_search_options,
                 ..Default::default()
             },
-            move |r| match (prime, r) {
-                (Some((q, o)), Ok(open)) => Event::SwitchedPrimed(Ok(Some((q, o, open)))),
-                (None, Ok(open)) => Event::Switched(Ok(open)),
-                (_, Err(e)) => Event::Switched(Err(e)),
-            },
+            Event::Switched,
         )
     }
 
@@ -1912,16 +1954,20 @@ impl Session {
     /// `from_selection` (Grep, `Space Alt-g`) tells the server to seed the query from the buffer's
     /// selection and run the search in this same call — the derived query/generation ride the
     /// `PickerViewed` echo, so there's no separate `picker/query` to send.
+    /// `center_on_override` replaces the per-kind "where you are" default below — the
+    /// capture→Jumplist swap uses it to keep the just-captured row highlighted.
     pub fn open_picker(
         &mut self,
         kind: PickerKind,
         directory_path: Option<String>,
         seed_filters: Option<PickerFilters>,
         from_selection: bool,
+        center_on_override: Option<PickerItem>,
     ) -> Effects {
         let reset = !kind.preserves_state();
         self.picker = Some(PickerState::new(kind));
         let buffer_id = self.buffer.buffer_id;
+        let has_center_override = center_on_override.is_some();
         // Buffers / Workspaces / Explorer / LspServers all open with the highlight on "where you
         // are" — the active buffer/workspace/file/language-server — matched by item key via the
         // `effective_center_on` echo (the display-only fields below are ignored by the match).
@@ -1929,7 +1975,7 @@ impl Session {
         // Workspaces: the active workspace (key is `name`).
         // Explorer: the active buffer's filename, so the listing lands on the current file.
         // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
-        let center_on = match kind {
+        let center_on = center_on_override.or(match kind {
             PickerKind::Buffers => Some(PickerItem::Buffer {
                 buffer_id,
                 display: String::new(),
@@ -1972,7 +2018,7 @@ impl Session {
                     })
             }
             _ => None,
-        };
+        });
 
         let request = self.request::<PickerView>(
             PickerViewParams {
@@ -1982,9 +2028,13 @@ impl Session {
                 limit: FETCH_LIMIT,
                 center_on,
                 // A from-selection grep runs a brand-new search; there are no cached hits to land
-                // the cursor on, so skip cursor-centering for it.
-                center_on_cursor: (!from_selection && kind.centers_on_cursor())
-                    .then_some(buffer_id),
+                // the cursor on, so skip cursor-centering for it. An explicit `center_on`
+                // override (the capture→Jumplist swap's just-captured row) also wins: the
+                // server's cursor resolution would trump the client-passed item otherwise.
+                center_on_cursor: (!from_selection
+                    && !has_center_override
+                    && kind.centers_on_cursor())
+                .then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
                 buffer_id: (from_selection
@@ -2038,7 +2088,7 @@ impl Session {
                 }],
                 ..PickerFilters::default()
             });
-        self.open_picker(PickerKind::Files, None, seed, false)
+        self.open_picker(PickerKind::Files, None, seed, false, None)
     }
 
     /// `Space Alt-g`: open Grep with the query seeded from the buffer's selection — the grep
@@ -2047,7 +2097,7 @@ impl Session {
     /// the `PickerViewed` echo (so there's no follow-up `picker/query`). Sticky filters/options are
     /// preserved. An empty selection just opens grep with no query.
     pub fn open_grep_from_selection(&mut self) -> Effects {
-        self.open_picker(PickerKind::Grep, None, None, true)
+        self.open_picker(PickerKind::Grep, None, None, true, None)
     }
 
     /// `Ctrl-g` / `Ctrl-f` in the Explorer: switch to the Grep / Files picker scoped to the
@@ -2071,7 +2121,7 @@ impl Session {
             });
         let seeded = seeded_filters_for_switch(&p.wire_filters(), dir_scope, target);
         let hide = self.close_picker();
-        hide.and(self.open_picker(target, None, Some(seeded), false))
+        hide.and(self.open_picker(target, None, Some(seeded), false, None))
     }
 
     /// `Space e` / `Space Alt-e`: Explorer at the buffer's directory, or at its workspace root.
@@ -2087,7 +2137,7 @@ impl Session {
                     .map(|p| p.display().to_string())
             }
         });
-        self.open_picker(PickerKind::Explorer, dir, None, false)
+        self.open_picker(PickerKind::Explorer, dir, None, false, None)
     }
 
     /// Explorer navigation: list a different directory (or the workspace roots). Clears the
@@ -2837,7 +2887,7 @@ impl Session {
     /// or `None` when the row isn't a new-window target. The native counterpart of the web client's
     /// `pickerItemUrl`: it supports the same set — files, grep hits, file-backed and scratch buffers,
     /// explorer files, and workspaces — and declines directories, roots, LSP servers, keybindings,
-    /// and the diagnostic/reference/symbol jump lists (all of which the web client also omits).
+    /// and the diagnostic/reference/symbol jump targets (all of which the web client also omits).
     fn picker_item_target(&self) -> Option<WindowTarget> {
         let p = self.picker.as_ref()?;
         // The synthetic "+ Create …" row has nothing to open in another window.
@@ -3001,10 +3051,6 @@ impl Session {
             _ => {}
         }
         let kind = p.kind;
-        // Grep selections carry the query *and* the chips' match options, so the opened buffer's
-        // primed search matches the same way the grep did.
-        let prime =
-            (kind == PickerKind::Grep).then(|| (p.query.clone(), p.wire_filters().match_options()));
         // Hint observation before the picker closes: accepting a workspace row demonstrates the
         // chooser's open hint (its follow, when displayed).
         let observed =
@@ -3018,7 +3064,6 @@ impl Session {
         observed.and(hide).and(self.request::<PickerSelect>(
             PickerSelectParams { kind, item },
             move |__r| Event::PickerSelected {
-                prime,
                 result: __r.map_err(|e| e.to_string()),
             },
         ))
@@ -3170,6 +3215,14 @@ impl Session {
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 let fx = self.observe_picker_cmd(PickerCmd::CloseBuffer);
                 return fx.and(self.picker_close_buffer());
+            }
+            // Ctrl-j: capture the picker's filtered results into the jumplist and jump to
+            // the highlighted row (docs/jumplist.md) — `]`/`[` then step the captured set.
+            // Position-shaped kinds only (`captures_to_jumplist`). Safe on the clipboard front
+            // (unlike Ctrl-c/v/x/a, GUI query inputs don't claim it) and distinct from Enter in
+            // the TUI (crossterm raw mode maps the 0x0A byte to Ctrl-j, not Enter).
+            KeyCode::Char('j') if mods.ctrl && !mods.alt && p.kind.captures_to_jumplist() => {
+                return self.jumplist_capture();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => {
@@ -4201,21 +4254,52 @@ impl Session {
         )
     }
 
-    /// `<`/`>`: step through cached grep hits — navigate, open transient at the hit,
-    /// record nav, prime search, all one server-side composite
-    /// (docs/protocol-composites.md, J).
-    pub fn grep_navigate(&mut self, direction: Direction) -> Effects {
-        self.request_str::<PickerGrepNavigate>(
-            PickerGrepNavigateParams {
-                direction,
+    /// `]`/`[` (full) and `Alt-]`/`Alt-[` (`CurrentFile` scope): step through the jumplist —
+    /// resolve cursor-relative (stopping, not wrapping, at the ends), open transient at the entry,
+    /// record nav, all one server-side composite (docs/protocol-composites.md, J;
+    /// docs/jumplist.md). The direction and scope ride into the event so a boundary result can
+    /// toast the right message.
+    pub fn jumplist_step(
+        &mut self,
+        direction: Direction,
+        count: u32,
+        scope: JumplistStepScope,
+    ) -> Effects {
+        self.request_str::<JumplistStep>(
+            JumplistStepParams {
                 buffer_id: self.buffer.buffer_id,
+                direction,
+                count,
+                scope,
                 open: true,
             },
-            |r| {
-                Event::SwitchedPrimed(r.map(|target| {
-                    target.and_then(|t| t.opened.map(|open| (t.query, t.options, open)))
-                }))
-            },
+            move |r| Event::JumplistStepped(r, direction, scope),
+        )
+    }
+
+    /// Picker `Ctrl-j`: snapshot the picker's filtered results into the jumplist and jump
+    /// to the highlighted row — capture + select in one composite (docs/jumplist.md). The
+    /// picker closes like an accept; `]`/`[` then step the captured set. No-op while an async
+    /// resolve is still filling the list (the snapshot would be partial).
+    fn jumplist_capture(&mut self) -> Effects {
+        let Some(p) = &self.picker else {
+            return Effects::none();
+        };
+        if !p.kind.captures_to_jumplist() || p.ticking {
+            return Effects::none();
+        }
+        let Some(item) = p.selected_item().cloned() else {
+            return Effects::none();
+        };
+        let kind = p.kind;
+        let observed = self.observe_picker_cmd(PickerCmd::CaptureJumplist);
+        // The source picker stays open until the capture lands: on Ok(Some) the handler swaps
+        // it for the Jumplist picker (same row highlighted) and toasts the count; on Ok(None)
+        // nothing was captured and the source picker survives untouched.
+        observed.and(
+            self.request::<JumplistCapture>(JumplistCaptureParams { kind, item }, move |__r| {
+                Event::JumplistCaptured(__r.map_err(|e| e.to_string()), kind)
+            }),
         )
     }
 
@@ -5653,7 +5737,7 @@ impl Session {
                 // The keyboard-shortcut reference is the Keybindings picker: the rows are built
                 // from the keymap tables here in the core and shipped on the `picker/view`, so
                 // every shell gets the same searchable list through the ordinary picker pipeline.
-                self.open_picker(PickerKind::Keybindings, None, None, false)
+                self.open_picker(PickerKind::Keybindings, None, None, false, None)
             }
             A::OpenWorkspaceSettings => {
                 // The workspace-settings overlay now lives in the core (state + key handling); every
@@ -5825,7 +5909,12 @@ impl Session {
             | A::SearchToggleRegex => self.search_action(action),
             A::SearchCycle(direction) => self.search_cycle(direction, count, extend),
             A::SearchFromSelection => self.search_from_selection(),
-            A::GrepNavigate(direction) => self.grep_navigate(direction),
+            A::JumplistStep(direction) => {
+                self.jumplist_step(direction, count, JumplistStepScope::Full)
+            }
+            A::JumplistStepInFile(direction) => {
+                self.jumplist_step(direction, count, JumplistStepScope::CurrentFile)
+            }
             A::DropSearch => self.drop_search(),
 
             // ---- app ----
@@ -5966,7 +6055,7 @@ impl Session {
 
             // ---- pickers ----
             A::OpenPicker(PickerKind::Explorer) => self.open_explorer(false),
-            A::OpenPicker(kind) => self.open_picker(kind, None, None, false),
+            A::OpenPicker(kind) => self.open_picker(kind, None, None, false, None),
             A::OpenFilesInBufferDir => self.open_files_in_buffer_dir(),
             A::OpenGrepFromSelection => self.open_grep_from_selection(),
             A::OpenExplorerAtRoot => self.open_explorer(true),

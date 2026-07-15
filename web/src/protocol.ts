@@ -152,7 +152,7 @@ export interface CursorState {
   position: LogicalPosition;
   anchor: LogicalPosition;
   match_bracket?: [LogicalPosition, LogicalPosition] | null;
-  grep_position?: { current: number; total: number } | null;
+  jumplist_position?: { current: number; total: number } | null;
 }
 
 // ---- bootstrap RPC results (workspace/list, workspace/activate, buffer/open) -------------------------
@@ -279,7 +279,8 @@ export type PickerKind =
   | "lsp_servers"
   | "references"
   | "document_symbols"
-  | "keybindings";
+  | "keybindings"
+  | "jumplist";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -379,6 +380,16 @@ export type PickerItem =
       keys: string;
       /** Code-point offsets into the composed haystack `"{group} > {desc} ({mode}) {keys}"` —
        *  rebased per segment by the shell (mirrors aether-client `keybinding_match_segments`). */
+      match_indices?: number[];
+    }
+  | {
+      kind: "jumplist_entry";
+      /** 0-based position in the jumplist — the row's identity. */
+      index: number;
+      /** 0-based landing line — the right-aligned dim line number, like a grep hit. */
+      line: number;
+      /** The captured entry's flat display text (docs/jumplist.md §2.2). */
+      display: string;
       match_indices?: number[];
     };
 

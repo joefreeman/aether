@@ -999,7 +999,6 @@ fn buffer_open_result_shape() {
             language: "rust".into(),
             workspace_root: "/proj".into(),
         }),
-        search_summary: None,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -1012,11 +1011,6 @@ fn buffer_open_result_shape() {
     assert_eq!(v["cursor"]["position"]["col"], 0);
     // `scroll: None` skips serialisation — keeps the wire shape tight for first-open cases.
     assert!(v.get("scroll").is_none(), "scroll: None should be skipped");
-    // `search_summary: None` (a non-primed open) is skipped too.
-    assert!(
-        v.get("search_summary").is_none(),
-        "search_summary: None should be skipped"
-    );
 }
 
 #[test]
@@ -1038,7 +1032,6 @@ fn buffer_open_result_restored_scroll() {
             sub_row: 0.5,
         }),
         lsp_server: None,
-        search_summary: None,
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
@@ -1694,7 +1687,7 @@ fn nav_goto_params_shape() {
             position: LogicalPosition { line: 9, col: 2 },
             anchor: LogicalPosition { line: 5, col: 0 },
             match_bracket: None,
-            grep_position: None,
+            jumplist_position: None,
         },
     };
     let v = to_value(&p).unwrap();
@@ -1706,7 +1699,7 @@ fn nav_goto_params_shape() {
             "cursor": { "position": {"line": 9, "col": 2}, "anchor": {"line": 5, "col": 0} },
         })
     );
-    // Round-trips with a bare cursor (no match_bracket/grep_position) and a buffer_id reference.
+    // Round-trips with a bare cursor (no match_bracket/jumplist_position) and a buffer_id reference.
     let parsed: NavGotoParams = from_value(json!({
         "buffer_id": 3,
         "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
@@ -3167,4 +3160,142 @@ fn hints_wire_shapes() {
     // Full round-trip through the wire encoding.
     let back: HintsStateResult = from_value(to_value(&snap).unwrap()).unwrap();
     assert_eq!(back, snap);
+}
+
+#[test]
+fn jumplist_wire_shapes() {
+    use aether_protocol::cursor::{CursorState, JumplistPosition};
+    use aether_protocol::jumplist::{
+        JumplistCapture, JumplistCaptureParams, JumplistStep, JumplistStepParams,
+        JumplistStepResult, JumplistStepScope, JumplistStepTarget,
+    };
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    assert_eq!(JumplistCapture::NAME, "jumplist/capture");
+    assert_eq!(JumplistStep::NAME, "jumplist/step");
+
+    // jumplist/capture params: the highlighted item rides verbatim (the picker/select shape);
+    // capture doesn't navigate, so there's no buffer_id.
+    let p = JumplistCaptureParams {
+        kind: PickerKind::Grep,
+        item: PickerItem::GrepHit {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+            line: 4,
+            col: 2,
+            preview: "let x = 1;".into(),
+            match_indices: vec![4],
+        },
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["kind"], "grep");
+    assert_eq!(v["item"]["kind"], "grep_hit");
+    assert_eq!(v["item"]["relative_path"], "src/main.rs");
+
+    // The capture result: entry count + the highlighted row's 0-based position.
+    let r: aether_protocol::jumplist::JumplistCaptureResult =
+        from_value(json!({ "total": 17, "index": 3 })).unwrap();
+    assert_eq!((r.total, r.index), (17, 3));
+
+    // jumplist/step params: count stays off the wire at 1, `open` at false, and `scope` at Full;
+    // all default back.
+    let p = JumplistStepParams {
+        buffer_id: 3,
+        direction: Direction::Forward,
+        count: 1,
+        scope: JumplistStepScope::Full,
+        open: false,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "buffer_id": 3, "direction": "forward" })
+    );
+    let parsed: JumplistStepParams = from_value(json!({
+        "buffer_id": 3, "direction": "backward", "count": 2, "open": true
+    }))
+    .unwrap();
+    assert_eq!(parsed.count, 2);
+    assert!(parsed.open);
+    assert_eq!(parsed.scope, JumplistStepScope::Full, "scope defaults to Full");
+
+    // The file-scoped variant (`Alt-]`) serializes its tag.
+    let scoped = JumplistStepParams {
+        buffer_id: 3,
+        direction: Direction::Forward,
+        count: 1,
+        scope: JumplistStepScope::CurrentFile,
+        open: false,
+    };
+    assert_eq!(
+        to_value(&scoped).unwrap(),
+        json!({ "buffer_id": 3, "direction": "forward", "scope": "current_file" })
+    );
+
+    // Step result: `Moved` is internally tagged (`status`), so the target's fields sit alongside
+    // the tag. `anchor: None` and `opened: None` stay off the wire.
+    let t = JumplistStepTarget {
+        path: "/proj/src/main.rs".into(),
+        position: LogicalPosition { line: 4, col: 9 },
+        anchor: Some(LogicalPosition { line: 4, col: 2 }),
+        index: 3,
+        total: 17,
+        opened: None,
+    };
+    let v = to_value(JumplistStepResult::Moved(t)).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "status": "moved",
+            "path": "/proj/src/main.rs",
+            "position": {"line": 4, "col": 9},
+            "anchor": {"line": 4, "col": 2},
+            "index": 3,
+            "total": 17,
+        })
+    );
+    // The boundary / empty outcomes are bare tags.
+    assert_eq!(
+        to_value(JumplistStepResult::AtEnd).unwrap(),
+        json!({ "status": "at_end" })
+    );
+    assert_eq!(
+        to_value(JumplistStepResult::NoneInFile).unwrap(),
+        json!({ "status": "none_in_file" })
+    );
+    assert_eq!(
+        to_value(JumplistStepResult::Empty).unwrap(),
+        json!({ "status": "empty" })
+    );
+
+    // The cursor's jumplist_position stamp: `{current, total}`, skipped when None.
+    let c = CursorState {
+        position: LogicalPosition { line: 4, col: 9 },
+        anchor: LogicalPosition { line: 4, col: 2 },
+        match_bracket: None,
+        jumplist_position: Some(JumplistPosition {
+            current: 3,
+            total: 17,
+        }),
+    };
+    let v = to_value(c).unwrap();
+    assert_eq!(v["jumplist_position"], json!({"current": 3, "total": 17}));
+    let bare = to_value(CursorState::default()).unwrap();
+    assert!(
+        bare.get("jumplist_position").is_none(),
+        "jumplist_position: None should be skipped"
+    );
+
+    // The Jumplist picker's row shape: positional identity, line number, flat display text.
+    let v = to_value(PickerItem::JumplistEntry {
+        index: 4,
+        line: 5,
+        display: "let x = 1;".into(),
+        match_indices: vec![0, 1],
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "kind": "jumplist_entry", "index": 4, "line": 5, "display": "let x = 1;", "match_indices": [0, 1] })
+    );
+    assert_eq!(to_value(PickerKind::Jumplist).unwrap(), json!("jumplist"));
 }

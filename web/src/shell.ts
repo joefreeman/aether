@@ -90,6 +90,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   references: "List references…",
   document_symbols: "Go to symbol…",
   keybindings: "Search keybindings…",
+  jumplist: "Filter the jumplist…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -776,6 +777,19 @@ function describePickerItem(
         metaMatches: seg.keys,
       };
     }
+    case "jumplist_entry": {
+      // A jumplist entry renders exactly like a grep hit (quickfix-style, docs/jumplist.md §2.2):
+      // the flat display text with the fuzzy highlight and a right-aligned dim line-number meta.
+      // Leading indentation strips like a grep hit (most sources are code lines), shifting the
+      // match indices with it.
+      const trimmed = item.display.trimStart();
+      const lead = [...item.display].length - [...trimmed].length;
+      return {
+        primary: trimmed.trimEnd(),
+        matches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
+        meta: `${item.line + 1}`,
+      };
+    }
   }
 }
 
@@ -1095,7 +1109,7 @@ export class Shell {
     openModal.append(openMsg, openField, openButtons);
     this.openPathEl.append(openModal);
     // The picker overlay is persistent DOM (built once) so its native <input> keeps focus + caret
-    // across re-renders — only the results list is rebuilt. The input owns text editing and syncs
+    // across re-renders — only the jumplist is rebuilt. The input owns text editing and syncs
     // its value to the core (picker_set_query); nav/accept/cancel keys route through on_key.
     this.pickerEl = document.createElement("div");
     this.pickerEl.className = "overlay";
@@ -3259,7 +3273,7 @@ export class Shell {
     this.runEffects(this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[]);
   }
 
-  /** Rebuild just the results list (the persistent input/panel stay, keeping focus + caret). */
+  /** Rebuild just the jumplist (the persistent input/panel stay, keeping focus + caret). */
   /** Map an absolute path to (root index, root-relative path), or null if it's outside every root —
    *  bootstrap only opens files relative to a root. */
   private resolvePath(abs: string, workspacePaths: string[]): { path_index: number; relative_path: string } | null {
@@ -3489,7 +3503,7 @@ export class Shell {
     return row;
   }
 
-  /** The results list scrolled: refetch the window around the new position when it's left the loaded
+  /** The jumplist scrolled: refetch the window around the new position when it's left the loaded
    *  range. `picker_scrolled` returns no effects (and we don't repaint) when the window still covers
    *  the view — including the programmatic scrolls from reveal / scroll-reset. */
   private onPickerListScroll(): void {
@@ -3822,10 +3836,10 @@ export class Shell {
         right.append(c);
       }
     }
-    const grep = v.buffer.cursor.grep_position;
-    if (grep) {
+    const results = v.buffer.cursor.jumplist_position;
+    if (results) {
       const g = document.createElement("span");
-      g.textContent = `grep ${grep.current}/${grep.total}`;
+      g.textContent = `(${results.current}/${results.total})`;
       right.append(g);
     }
     const dc = v.diagnostics;

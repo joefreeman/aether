@@ -30,6 +30,10 @@ use aether_protocol::input::{
     InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
     UndoRedoParams, UndoResult,
 };
+use aether_protocol::jumplist::{
+    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
+    JumplistStepParams, JumplistStepResult, JumplistStepScope,
+};
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
     LspGotoDefinitionResult, LspHover, LspHoverResult, LspReadiness, LspServerStatus, LspStatus,
@@ -37,11 +41,10 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavStepResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerGrepNavigate,
-    PickerGrepNavigateParams, PickerGrepNavigateTarget, PickerHide, PickerHideParams, PickerItem,
-    PickerKind, PickerQuery, PickerQueryParams, PickerSectionJump, PickerSectionJumpParams,
-    PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate, PickerUpdateParams,
-    PickerView, PickerViewParams, ScopedPath,
+    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerHide, PickerHideParams,
+    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSectionJump,
+    PickerSectionJumpParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -1457,9 +1460,9 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
 }
 
 #[tokio::test]
-async fn buffer_open_composite_records_nav_and_primes_search() {
-    // docs/protocol-composites.md, A: `record_nav_from` + `prime_search` fold the old
-    // nav/record -> buffer/open -> search/set client chain into one open.
+async fn buffer_open_composite_records_nav() {
+    // docs/protocol-composites.md, A: `record_nav_from` folds the old nav/record ->
+    // buffer/open client chain into one open.
     let (_server, mut ws, origin_id) = setup_with_buffer("alpha beta\n").await;
 
     let opened: BufferOpenResult = send_request::<BufferOpen>(
@@ -1470,46 +1473,16 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
             path_index: Some(0),
             create_if_missing: true,
             record_nav_from: Some(origin_id),
-            prime_search: Some("nd".into()),
             ..Default::default()
         },
     )
     .await;
     assert_ne!(opened.buffer_id, origin_id);
-    // The primed summary rides the open response (so the client adopts the count atomically with
-    // the switch instead of relying on the racing `search/state_changed` push). "nd" has no match
-    // in the freshly created buffer, so total is 0 but the summary is present.
-    let primed = opened
-        .search_summary
-        .as_ref()
-        .expect("a primed open carries its search summary");
-    assert_eq!(primed.total, 0);
-
-    // The search was primed: stepping works without a prior search/set. ("nd" has no match
-    // in an empty created buffer — prime a buffer with content instead via reopening the
-    // origin.) The primed state exists even with zero matches; total reflects it.
-    let nav: SearchNavResult = send_request::<SearchStep>(
-        &mut ws,
-        11,
-        &SearchStepParams {
-            direction: Direction::Forward,
-            buffer_id: opened.buffer_id,
-            extend: false,
-            count: 1,
-            set_query: None,
-            options: Default::default(),
-        },
-    )
-    .await;
-    assert_eq!(
-        nav.summary.total, 0,
-        "primed query has no match in the empty buffer"
-    );
 
     // The origin was recorded: nav/back from the new buffer returns to it.
     let back: NavStepResult = send_request::<NavStep>(
         &mut ws,
-        12,
+        11,
         &NavStepParams {
             buffer_id: opened.buffer_id,
             direction: Direction::Backward,
@@ -1518,95 +1491,6 @@ async fn buffer_open_composite_records_nav_and_primes_search() {
     .await;
     let landed = back.target.expect("nav history has the recorded origin");
     assert_eq!(landed.buffer_id, origin_id);
-
-    // Prime against real content: reopen the new buffer recording origin again, priming
-    // with a query that matches the ORIGIN buffer? No — prime applies to the OPENED buffer.
-    // Open the origin (has "alpha beta") with a matching prime and step onto a hit.
-    let reopened: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws,
-        13,
-        &BufferOpenParams {
-            buffer_id: Some(origin_id),
-            prime_search: Some("beta".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(reopened.buffer_id, origin_id);
-    // The anchored prime SELECTS the match: "beta" spans cols 6..=9 of "alpha beta".
-    assert_eq!(reopened.cursor.anchor, LogicalPosition { line: 0, col: 6 });
-    assert_eq!(
-        reopened.cursor.position,
-        LogicalPosition { line: 0, col: 9 }
-    );
-    // ...and the summary on the response reflects the single live match.
-    let primed = reopened
-        .search_summary
-        .as_ref()
-        .expect("a primed open carries its search summary");
-    assert_eq!(primed.total, 1);
-    assert_eq!(primed.current_index, 1, "the cursor sits on the match");
-    let nav: SearchNavResult = send_request::<SearchStep>(
-        &mut ws,
-        14,
-        &SearchStepParams {
-            direction: Direction::Forward,
-            buffer_id: origin_id,
-            extend: false,
-            count: 1,
-            set_query: None,
-            options: Default::default(),
-        },
-    )
-    .await;
-    assert_eq!(nav.summary.total, 1);
-    assert_eq!(nav.cursor.position, LogicalPosition { line: 0, col: 9 });
-}
-
-#[tokio::test]
-async fn buffer_open_prime_search_carries_options() {
-    // A grep result primes the opened buffer's search with the grep's match options
-    // (`prime_search_options`), so the primed search matches the same way the grep that found the
-    // hit did. "a.c" as a literal must NOT match "abc".
-    let (_server, mut ws, buffer_id) = setup_with_buffer("a.c abc axc\n").await;
-
-    // Literal prime (default options): "a.c" matches only the exact "a.c".
-    let literal: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws,
-        10,
-        &BufferOpenParams {
-            buffer_id: Some(buffer_id),
-            prime_search: Some("a.c".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(
-        literal.search_summary.as_ref().map(|s| s.total),
-        Some(1),
-        "literal prime (the default) matches only the exact a.c"
-    );
-
-    // Regex prime: same query, but `regex` opts in so "a.c" matches all three.
-    let regex: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws,
-        11,
-        &BufferOpenParams {
-            buffer_id: Some(buffer_id),
-            prime_search: Some("a.c".into()),
-            prime_search_options: MatchOptions {
-                regex: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(
-        regex.search_summary.as_ref().map(|s| s.total),
-        Some(3),
-        "regex prime matches a.c / abc / axc"
-    );
 }
 
 #[tokio::test]
@@ -15015,61 +14899,129 @@ async fn set_point_cursor(
     .await;
 }
 
+/// Capture the client's grep results into the jumplist (the picker `Ctrl-j` flow) with the
+/// hit at `(relative_path, line, col)` as the highlighted row. Capture doesn't navigate — the
+/// client follows with the Jumplist picker. The item's preview/match_indices are irrelevant to
+/// identity (`(path_index, relative_path, line, col)`), so they ride empty.
+async fn capture_grep_results(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    relative_path: &str,
+    line: u32,
+    col: u32,
+) -> JumplistCaptureResult {
+    let r: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        ws,
+        request_id,
+        &JumplistCaptureParams {
+            kind: PickerKind::Grep,
+            item: PickerItem::GrepHit {
+                path_index: 0,
+                relative_path: relative_path.into(),
+                line,
+                col,
+                preview: String::new(),
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    r.expect("grep candidates are non-empty, capture snapshots them")
+}
+
+/// A bare `jumplist/step` (no composite open), returning the raw outcome.
+async fn step_results(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    buffer_id: u64,
+    direction: Direction,
+) -> JumplistStepResult {
+    send_request::<JumplistStep>(
+        ws,
+        request_id,
+        &JumplistStepParams {
+            buffer_id,
+            direction,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: false,
+        },
+    )
+    .await
+}
+
+/// A bare file-scoped `jumplist/step` (`Alt-]` / `Alt-[`, no composite open).
+async fn step_in_file(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    buffer_id: u64,
+    direction: Direction,
+) -> JumplistStepResult {
+    send_request::<JumplistStep>(
+        ws,
+        request_id,
+        &JumplistStepParams {
+            buffer_id,
+            direction,
+            count: 1,
+            scope: JumplistStepScope::CurrentFile,
+            open: false,
+        },
+    )
+    .await
+}
+
 #[tokio::test]
-async fn grep_navigate_open_composite_returns_opened_buffer() {
-    // docs/protocol-composites.md, J: `<`/`>` navigates, opens transient at the hit,
-    // records the jump origin, and primes search — one message.
+async fn jumplist_capture_snapshots_and_step_composite_opens() {
+    // docs/jumplist.md: picker Ctrl-j snapshots the filtered results and reports the
+    // highlighted row's position (the client then shows the Jumplist picker framed on it —
+    // capture itself doesn't navigate). Stepping is the composite that opens.
+    // Workspace needle hits: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
     let (_server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
     set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
 
-    // Backward from main.rs's first hit crosses into lib.rs — a different file, so the
-    // composite opens it.
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+    // Highlighted row: the lib.rs hit — the captured list's first entry (walker order).
+    let captured = capture_grep_results(&mut ws, 22, "src/lib.rs", 0, 3).await;
+    assert_eq!(captured.total, 3, "all three needle hits captured");
+    assert_eq!(
+        captured.index, 0,
+        "the highlighted hit is the list's first entry (0-based, for center_on)"
+    );
+
+    // `[` from before main.rs's hits crosses into lib.rs — the step composite opens it:
+    // transient, the match landed selected (anchor at its start, head on its last char;
+    // "needle" = 6 chars), origin on nav history. No search priming involved.
+    let target: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
-        22,
-        &PickerGrepNavigateParams {
-            direction: Direction::Backward,
+        23,
+        &JumplistStepParams {
             buffer_id,
+            direction: Direction::Backward,
+            count: 1,
+            scope: JumplistStepScope::Full,
             open: true,
         },
     )
     .await;
-    let target = target.expect("hit in earlier file");
-    assert!(target.path.ends_with("src/lib.rs"));
+    let target = target.moved().expect("captured list steps");
     let opened = target.opened.expect("composite opens the target");
     assert_ne!(opened.buffer_id, buffer_id);
-    assert!(opened.transient, "grep jumps open transient previews");
-    // The primed search selects the hit: anchor at its start, head on its last char
-    // ("needle" = 6 chars).
-    assert_eq!(
-        opened.cursor.anchor, target.position,
-        "selection starts at the hit"
-    );
-    assert_eq!(
-        opened.cursor.position,
-        LogicalPosition {
-            line: target.position.line,
-            col: target.position.col + 5,
-        },
-        "head on the match's last char"
-    );
-
-    // The opened buffer's search is primed: stepping works immediately.
-    let nav: SearchNavResult = send_request::<SearchStep>(
-        &mut ws,
-        23,
-        &SearchStepParams {
-            direction: Direction::Forward,
-            buffer_id: opened.buffer_id,
-            extend: false,
-            count: 1,
-            set_query: None,
-            options: Default::default(),
-        },
-    )
-    .await;
-    assert!(nav.summary.total > 0, "search primed with the grep query");
+    assert!(opened.transient, "jumplist jumps open transient previews");
+    assert_eq!(opened.cursor.anchor, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(opened.cursor.position, LogicalPosition { line: 0, col: 8 });
+    // The freshly-landed cursor already carries the status stamp: entry 1 of 3.
+    let rp = opened
+        .cursor
+        .jumplist_position
+        .expect("landed exactly on the captured entry");
+    assert_eq!((rp.current, rp.total), (1, 3));
 
     // And the origin was recorded: nav/back returns to main.rs.
     let back: NavStepResult = send_request::<NavStep>(
@@ -15085,139 +15037,273 @@ async fn grep_navigate_open_composite_returns_opened_buffer() {
 }
 
 #[tokio::test]
-async fn grep_navigate_forward_within_file_then_falls_through_to_next_file() {
-    // Workspace has needle hits at src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4. The walker
-    // visits files in path order, so the cached candidates list is in (path, line, col) order.
+async fn jumplist_step_within_file_falls_through_then_stops_at_end() {
+    // Captured entries (normalized order): src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/main.rs", 1, 4).await;
 
-    // Cursor at the top of main.rs (before any hit) — forward jumps to the first hit in this file.
-    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
-        &mut ws,
-        22,
-        &PickerGrepNavigateParams {
-            direction: Direction::Forward,
-            buffer_id,
-            open: false,
-        },
-    )
-    .await;
-    let target = target.expect("hit in current file");
+    // Cursor at the top of main.rs (before any hit) — forward steps to the first entry in
+    // this file. Targets land selection-shaped: anchor at the match start, position at its
+    // last char ("needle" = 6 chars).
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let target = step_results(&mut ws, 23, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("a captured list resolves the next entry");
     assert!(target.path.ends_with("src/main.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 1, col: 4 });
-    assert_eq!(target.query, "needle");
+    assert_eq!(target.anchor, Some(LogicalPosition { line: 1, col: 4 }));
+    assert_eq!(target.position, LogicalPosition { line: 1, col: 9 });
+    assert_eq!((target.index, target.total), (2, 3));
 
-    // Cursor sitting on the second hit (line 2) — forward falls off the end of main.rs and we
-    // stop (no file alphabetically after src/main.rs has a hit).
-    set_point_cursor(&mut ws, 23, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
-        &mut ws,
-        24,
-        &PickerGrepNavigateParams {
-            direction: Direction::Forward,
-            buffer_id,
-            open: false,
-        },
-    )
-    .await;
-    assert!(target.is_none());
+    // Cursor sitting on the last hit (line 2) — forward falls off the end of main.rs and, with
+    // no later file in the list, STOPS at the end rather than wrapping (reported as AtEnd; the
+    // client toasts "last entry"). This is the no-wrap behaviour.
+    set_point_cursor(&mut ws, 24, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
+    let outcome = step_results(&mut ws, 25, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "forward past the last entry stops, no wrap: {outcome:?}"
+    );
 
     // Backward from inside main.rs falls through to lib.rs after exhausting main.rs's hits.
-    set_point_cursor(&mut ws, 25, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
-        &mut ws,
-        26,
-        &PickerGrepNavigateParams {
-            direction: Direction::Backward,
-            buffer_id,
-            open: false,
-        },
-    )
-    .await;
-    let target = target.expect("hit in earlier file");
+    set_point_cursor(&mut ws, 26, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+    let target = step_results(&mut ws, 27, buffer_id, Direction::Backward)
+        .await
+        .moved()
+        .expect("hit in earlier file");
     assert!(target.path.ends_with("src/lib.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(target.anchor, Some(LogicalPosition { line: 0, col: 3 }));
+    assert_eq!(target.position, LogicalPosition { line: 0, col: 8 });
 
     drop(server);
 }
 
 #[tokio::test]
-async fn grep_navigate_virtual_insert_when_current_file_has_no_hits() {
-    // README.md isn't in the result set. Forward should jump to the first hit alphabetically
-    // *after* it (src/lib.rs, since 'R' < 's'). Backward returns None — no file is before
-    // README.md alphabetically.
+async fn jumplist_step_repeated_press_advances_then_stops_at_end() {
+    // The "repeated press makes progress" property: stepping with the composite open from each
+    // landed position advances entry-by-entry and never sticks — then stops (AtEnd) at the last,
+    // rather than wrapping.
     let (server, mut ws) = setup_grep_with_needle_query().await;
-    let buffer_id = open_test_buffer(&mut ws, 20, "README.md").await;
-    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
 
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+    // From the top of main.rs, forward steps land on 2 then 3 (main.rs's two hits, skipping the
+    // earlier lib.rs entry), then the third press stops at the end — each re-keying off the
+    // just-landed selection.
+    let mut current = buffer_id;
+    let mut seen = Vec::new();
+    for i in 0..2u64 {
+        let target = send_request::<JumplistStep>(
+            &mut ws,
+            30 + i,
+            &JumplistStepParams {
+                buffer_id: current,
+                direction: Direction::Forward,
+                count: 1,
+                scope: JumplistStepScope::Full,
+                open: true,
+            },
+        )
+        .await
+        .moved()
+        .expect("composite opens each entry");
+        current = target.opened.expect("composite opens each entry").buffer_id;
+        seen.push(target.index);
+    }
+    assert_eq!(seen, vec![2, 3], "steps advance one at a time, no sticking");
+
+    // On the last entry now: another forward press stops at the end (no wrap to entry 1).
+    let outcome: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
-        22,
-        &PickerGrepNavigateParams {
+        40,
+        &JumplistStepParams {
+            buffer_id: current,
             direction: Direction::Forward,
-            buffer_id,
-            open: false,
-        },
-    )
-    .await;
-    let target = target.expect("forward jumps to next-file hit");
-    assert!(target.path.ends_with("src/lib.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
-
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
-        &mut ws,
-        23,
-        &PickerGrepNavigateParams {
-            direction: Direction::Backward,
-            buffer_id,
-            open: false,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
         },
     )
     .await;
     assert!(
-        target.is_none(),
-        "nothing in the workspace sorts before README.md"
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "stepping past the last entry stops: {outcome:?}"
     );
 
     drop(server);
 }
 
 #[tokio::test]
-async fn grep_navigate_returns_none_when_no_cached_grep() {
-    // No `picker/view` for Grep + no `picker/query` → there's no Grep picker state for this
-    // client. The handler should return None without erroring, so `<` / `>` is a clean no-op.
-    let (server, mut ws) = setup_grep_workspace().await;
-    let buffer_id = open_test_buffer(&mut ws, 10, "src/main.rs").await;
-    set_point_cursor(&mut ws, 11, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+async fn jumplist_step_takes_a_count() {
+    // `3]`: the count advances entry-by-entry (cycling), one round-trip.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
 
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    // Forward 2 from before main.rs's hits: entry 2 (main:1) then entry 3 (main:2).
+    let target: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
-        12,
-        &PickerGrepNavigateParams {
-            direction: Direction::Forward,
+        23,
+        &JumplistStepParams {
             buffer_id,
+            direction: Direction::Forward,
+            count: 2,
+            scope: JumplistStepScope::Full,
             open: false,
         },
     )
     .await;
-    assert!(target.is_none());
+    let target = target.moved().expect("captured list steps");
+    assert_eq!((target.index, target.total), (3, 3));
+    // A count past the end clamps to the last entry (no wrap) — still a move.
+    let target: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        24,
+        &JumplistStepParams {
+            buffer_id,
+            direction: Direction::Forward,
+            count: 5,
+            scope: JumplistStepScope::Full,
+            open: false,
+        },
+    )
+    .await;
+    assert_eq!(target.moved().expect("clamps to the last entry").index, 3);
 
     drop(server);
 }
 
-/// `grep_position` is `Some` on `CursorState` when the cursor's selection covers a cached
-/// grep hit *exactly* (anchor at match start, position at match's last char), and `None`
-/// otherwise — the same strict endpoint check `match_index_for_cursor` uses for `A/B`.
 #[tokio::test]
-async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
+async fn jumplist_step_virtually_inserts_files_not_in_the_list() {
+    // README.md has no entries. Forward jumps to the first entry of the file sorting *after*
+    // it (src/lib.rs, since 'R' < 's'); backward, with nothing sorting before README.md, has
+    // nowhere to go — it stops at the start (AtEnd) rather than wrapping.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "README.md").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    let target = step_results(&mut ws, 23, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("forward jumps to the next file's entry");
+    assert!(target.path.ends_with("src/lib.rs"));
+    assert_eq!((target.index, target.total), (1, 3));
+
+    let outcome = step_results(&mut ws, 24, buffer_id, Direction::Backward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "nothing sorts before README.md, so backward stops at the start: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn jumplist_step_in_file_stays_in_the_current_file_and_stops() {
+    // `Alt-]` / `Alt-[`: step only among the current file's entries, never falling through.
+    // Captured entries (normalized): src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
 
-    // Hits across the workspace are: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
-    // "needle" is 6 bytes, so the main.rs:1 match covers cols 4..=9 — the cursor must select
-    // exactly that range to count as "on" it. This is the post-`<`/`>` shape (anchor at the
-    // match start, position at its last char).
+    // From the top of main.rs, scoped forward lands its first hit (entry 2), skipping lib.rs.
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let target = step_in_file(&mut ws, 23, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("steps to the file's first entry");
+    assert!(target.path.ends_with("src/main.rs"));
+    assert_eq!((target.index, target.total), (2, 3));
+
+    // On main.rs's first hit, scoped forward → its second hit (entry 3).
+    set_point_cursor(&mut ws, 24, buffer_id, LogicalPosition { line: 1, col: 4 }).await;
+    let target = step_in_file(&mut ws, 25, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("steps to the file's next entry");
+    assert!(target.path.ends_with("src/main.rs"));
+    assert_eq!((target.index, target.total), (3, 3));
+
+    // On main.rs's last hit, scoped forward stops — it does NOT fall through to a later file
+    // (there is none) nor wrap; it's AtEnd within the file.
+    set_point_cursor(&mut ws, 26, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
+    let outcome = step_in_file(&mut ws, 27, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "scoped forward past the file's last entry stops: {outcome:?}"
+    );
+
+    // Scoped backward from main.rs's first hit stops too — it does NOT cross into lib.rs (which
+    // plain `[` would).
+    set_point_cursor(&mut ws, 28, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+    let outcome = step_in_file(&mut ws, 29, buffer_id, Direction::Backward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "scoped backward before the file's first entry stops, no cross-file: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn jumplist_step_in_file_reports_none_for_a_file_without_entries() {
+    // README.md has no captured entries. `Alt-]` there is a distinct no-op (NoneInFile) — unlike
+    // plain `]`, which virtually inserts the file and jumps to an adjacent file's entry.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "README.md").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    let outcome = step_in_file(&mut ws, 23, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::NoneInFile),
+        "no entries in README.md: {outcome:?}"
+    );
+    // Sanity: plain `]` from the same spot DOES move (crosses into src/lib.rs).
+    let outcome = step_results(&mut ws, 24, buffer_id, Direction::Forward).await;
+    assert!(
+        outcome.moved().is_some(),
+        "cross-file step still jumps from a file with no entries"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn jumplist_step_reports_empty_without_a_capture() {
+    // Grep results exist server-side, but nothing was captured — `]` is a clean no-op reported as
+    // Empty (the client toasts how to capture). The old implicit grep-hits stepping is gone by
+    // design.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    let outcome = step_results(&mut ws, 22, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::Empty),
+        "no captured list: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// `jumplist_position` is `Some` on `CursorState` when the cursor's selection covers a captured
+/// entry *exactly* (anchor at its span start, position at its last char), and `None`
+/// otherwise — the same strict endpoint check `match_index_for_cursor` uses for `A/B`.
+#[tokio::test]
+async fn cursor_carries_jumplist_position_when_selection_covers_an_entry() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 30, "src/lib.rs", 0, 3).await;
+
+    // Captured entries: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
+    // "needle" is 6 bytes, so the main.rs:1 entry covers cols 4..=9 — the cursor must select
+    // exactly that range to count as "on" it. This is the post-jump shape (anchor at the
+    // span start, position at its last char).
     let st: CursorState = send_request::<CursorSet>(
         &mut ws,
         21,
@@ -15229,11 +15315,13 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         },
     )
     .await;
-    let gp = st.grep_position.expect("selection covers the hit exactly");
-    assert_eq!(gp.current, 2);
-    assert_eq!(gp.total, 3);
+    let rp = st
+        .jumplist_position
+        .expect("selection covers the entry exactly");
+    assert_eq!(rp.current, 2);
+    assert_eq!(rp.total, 3);
 
-    // Orientation-agnostic: swapping anchor/position still counts as "on" the hit.
+    // Orientation-agnostic: swapping anchor/position still counts as "on" the entry.
     let st: CursorState = send_request::<CursorSet>(
         &mut ws,
         22,
@@ -15245,10 +15333,10 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         },
     )
     .await;
-    assert!(st.grep_position.is_some());
+    assert!(st.jumplist_position.is_some());
 
-    // A point cursor at the hit's start (anchor == position == match start) doesn't cover the
-    // whole match — indicator clears, matching how A/B drops a partial selection.
+    // A point cursor at the entry's start (anchor == position == span start) doesn't cover the
+    // whole span — indicator clears, matching how A/B drops a partial selection.
     let st: CursorState = send_request::<CursorSet>(
         &mut ws,
         23,
@@ -15260,9 +15348,9 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         },
     )
     .await;
-    assert!(st.grep_position.is_none());
+    assert!(st.jumplist_position.is_none());
 
-    // A larger selection that contains the match but extends past it also doesn't count.
+    // A larger selection that contains the span but extends past it also doesn't count.
     let st: CursorState = send_request::<CursorSet>(
         &mut ws,
         24,
@@ -15274,13 +15362,13 @@ async fn cursor_carries_grep_position_when_selection_covers_a_hit() {
         },
     )
     .await;
-    assert!(st.grep_position.is_none());
+    assert!(st.jumplist_position.is_none());
 
     drop(server);
 }
 
 /// `picker/view`'s `center_on_cursor` resolves to the nearest cached hit at-or-after
-/// the cursor — not just exact-on-a-match like `cursor.grep_position`. Lets `Space g` open on
+/// the cursor — not just exact-on-a-match like `cursor.jumplist_position`. Lets `Space g` open on
 /// "where you are" in the result list even when the cursor is between matches.
 #[tokio::test]
 async fn picker_view_centers_on_cursor_nearest_grep_hit() {
@@ -15361,20 +15449,21 @@ async fn picker_view_centers_on_cursor_nearest_grep_hit() {
     drop(server);
 }
 
-/// The cursor that comes back from `search_set` (used by `<`/`>` to prime in-buffer search)
-/// must carry `grep_position` — without `wrap_for_response` being called on the response, the
-/// status bar would only see the indicator on the next motion.
+/// The cursor that comes back from any cursor-returning RPC (here `search_set`) must carry
+/// `jumplist_position` — without `wrap_for_response` being called on the response, the status
+/// bar would only see the indicator on the next motion.
 #[tokio::test]
-async fn search_set_response_carries_grep_position() {
+async fn search_set_response_carries_jumplist_position() {
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
 
-    // Park the cursor before any hit, then SearchSet with anchor at the first match position —
-    // this mirrors what the TUI's grep_navigate flow does after `<` / `>`.
-    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    // Park the cursor before any hit, then SearchSet with anchor at the second entry's start —
+    // the landed selection covers that entry exactly.
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
-        22,
+        23,
         &SearchSetParams {
             buffer_id,
             query: "needle".into(),
@@ -15385,52 +15474,26 @@ async fn search_set_response_carries_grep_position() {
         },
     )
     .await;
-    // search_set parked us on the match — selection covers cols 4..=9, which is the hit.
+    // search_set parked us on the match — selection covers cols 4..=9, which is the entry.
     assert_eq!(r.cursor.anchor, LogicalPosition { line: 1, col: 4 });
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 9 });
-    let gp = r
+    let rp = r
         .cursor
-        .grep_position
+        .jumplist_position
         .expect("search_set response should be wrapped");
-    assert_eq!(gp.current, 2);
-    assert_eq!(gp.total, 3);
+    assert_eq!(rp.current, 2);
+    assert_eq!(rp.total, 3);
 
     drop(server);
 }
 
 #[tokio::test]
-async fn cursor_grep_position_is_none_without_cached_grep() {
-    let (server, mut ws) = setup_grep_workspace().await;
-    let buffer_id = open_test_buffer(&mut ws, 10, "src/lib.rs").await;
-    let st: CursorState = send_request::<CursorSet>(
-        &mut ws,
-        11,
-        &CursorSetParams {
-            granularity: Granularity::Char,
-            buffer_id,
-            position: LogicalPosition { line: 0, col: 3 },
-            anchor: LogicalPosition { line: 0, col: 3 },
-        },
-    )
-    .await;
-    assert!(st.grep_position.is_none());
-
-    drop(server);
-}
-
-/// Regression: when the cursor's selection covers a grep match (e.g. after picker selection
-/// primes the search, leaving anchor at the match start and position at the match end), `<`
-/// should skip *past* the current match rather than landing back on it. The server compares
-/// against the selection's leading edge for Backward, not the trailing edge.
-#[tokio::test]
-async fn grep_navigate_backward_skips_currently_selected_match() {
+async fn cursor_jumplist_position_is_none_without_a_capture() {
+    // Grep results are cached server-side, but nothing was captured: the stamp must stay off —
+    // the cached picker state alone no longer drives the status counter.
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
-
-    // Simulate the post-jump cursor: selection covers the "needle" match on line 1 (cols 4–9,
-    // since "needle" is 6 chars; inclusive cursor lands on the last char, col 9; anchor at
-    // the start of the match, col 4).
-    let _: CursorState = send_request::<CursorSet>(
+    let st: CursorState = send_request::<CursorSet>(
         &mut ws,
         21,
         &CursorSetParams {
@@ -15441,38 +15504,510 @@ async fn grep_navigate_backward_skips_currently_selected_match() {
         },
     )
     .await;
+    assert!(st.jumplist_position.is_none());
 
-    // Backward must walk past this match (start at col 4 == selection's leading edge) and land
-    // on the previous hit in src/lib.rs:0:3.
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+    drop(server);
+}
+
+/// Capture works per-kind: from the workspace changes picker, hunk rows become point-landing
+/// entries on their anchor lines, grouped by file, stepping across files like grep hits.
+#[tokio::test]
+async fn jumplist_capture_from_git_changes_picker() {
+    use aether_protocol::viewport::DiffStage;
+
+    // The changes-picker fixture: a committed file modified on disk + an untracked file —
+    // one modification hunk in a.rs and one whole-file-add hunk in new.rs.
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\ntwo\nthree\n");
+    std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("changes-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "changes-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let buffer_id = open_test_buffer(&mut ws, 2, "a.rs").await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    assert_eq!(view.total_candidates, 2, "one hunk per file");
+
+    // Ctrl-j with the a.rs hunk highlighted. Hunk identity is
+    // `(path_index, relative_path, hunk_index)` — the display fields ride empty.
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        4,
+        &JumplistCaptureParams {
+            kind: PickerKind::GitChanges,
+            item: PickerItem::GitChange {
+                path_index: 0,
+                relative_path: "a.rs".into(),
+                hunk_index: 0,
+                line: 1,
+                stage: DiffStage::Unstaged,
+                added: 1,
+                removed: 1,
+                preview: String::new(),
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    let captured = captured.expect("hunks captured");
+    assert_eq!((captured.index, captured.total), (0, 2));
+
+    // Stepping from the top of a.rs lands the hunk entry: a point cursor on the anchor line,
+    // stamped as entry 1 of 2.
+    set_point_cursor(&mut ws, 5, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let target: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        6,
+        &JumplistStepParams {
+            buffer_id,
+            direction: Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    let target = target.moved().expect("captured hunks step");
+    let opened = target.opened.expect("composite opens the hunk");
+    assert_eq!(opened.cursor.position, LogicalPosition { line: 1, col: 0 });
+    assert!(opened.cursor.is_point());
+    let rp = opened
+        .cursor
+        .jumplist_position
+        .expect("landed on the hunk entry");
+    assert_eq!((rp.current, rp.total), (1, 2));
+
+    // Step forward crosses into the untracked file's whole-file hunk (a point entry).
+    let target = step_results(&mut ws, 7, opened.buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("captured hunks step");
+    assert!(target.path.ends_with("new.rs"));
+    assert_eq!(target.position, LogicalPosition { line: 0, col: 0 });
+    assert_eq!(target.anchor, None, "hunk entries land a point");
+    assert_eq!((target.index, target.total), (2, 2));
+
+    drop(server);
+}
+
+/// The Jumplist picker (`Space j`): rows are the captured entries with their source group
+/// headers; a fuzzy query narrows them in place (candidate order preserved); selecting jumps
+/// like the source picker's Enter; and `Ctrl-j` re-captures the filtered subset — iterative
+/// narrowing (docs/jumplist.md §2.6).
+#[tokio::test]
+async fn jumplist_picker_lists_filters_and_recaptures() {
+    use aether_protocol::picker::GroupHeader;
+
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Open the picker: three rows in captured order under their file headers.
+    let view = send_request::<PickerView>(
         &mut ws,
         22,
-        &PickerGrepNavigateParams {
-            direction: Direction::Backward,
-            buffer_id,
-            open: false,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
         },
     )
     .await;
-    let target = target.expect("backward should step past the current match");
-    assert!(target.path.ends_with("src/lib.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 0, col: 3 });
+    assert_eq!(view.total_candidates, 3);
+    let update = view.update.expect("the view carries its initial window");
+    assert_eq!(update.kind, PickerKind::Jumplist);
+    let items = update.items();
+    assert_eq!(items.len(), 3);
+    let PickerItem::JumplistEntry {
+        index, line, display, ..
+    } = &items[0]
+    else {
+        panic!("expected JumplistEntry, got {:?}", items[0]);
+    };
+    assert_eq!(*index, 0);
+    // The row carries the entry's landing line (0-based) for the right-aligned line number —
+    // lib.rs's hit is on line 0; main.rs's hits below are on lines 1 and 2.
+    assert_eq!(*line, 0);
+    assert!(
+        display.contains("needle"),
+        "row text is the source line: {display}"
+    );
+    let lines: Vec<u32> = items
+        .iter()
+        .map(|it| match it {
+            PickerItem::JumplistEntry { line, .. } => *line,
+            other => panic!("expected JumplistEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(lines, vec![0, 1, 2], "each row carries its source line");
+    // Group spans carry the source picker's file headers.
+    assert!(
+        update.groups.iter().any(|g| matches!(
+            &g.header,
+            GroupHeader::File { relative_path, .. } if relative_path == "src/lib.rs"
+        )),
+        "lib.rs header present, got {:?}",
+        update.groups
+    );
 
-    // Forward from the same selection skips past the trailing edge (col 9) and lands on the
-    // next hit at line 2 col 4.
-    let target: Option<PickerGrepNavigateTarget> = send_request::<PickerGrepNavigate>(
+    // Enter on a row jumps exactly like the source picker's select (match landed selected).
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
         23,
-        &PickerGrepNavigateParams {
-            direction: Direction::Forward,
-            buffer_id,
-            open: false,
+        &PickerSelectParams {
+            kind: PickerKind::Jumplist,
+            item: items[2].clone(),
         },
     )
     .await;
-    let target = target.expect("forward should step past the current match");
+    match selected {
+        PickerSelectResult::FileAt {
+            path,
+            position,
+            anchor,
+        } => {
+            assert!(path.ends_with("src/main.rs"));
+            assert_eq!(anchor, Some(LogicalPosition { line: 2, col: 4 }));
+            assert_eq!(position, LogicalPosition { line: 2, col: 9 });
+        }
+        other => panic!("expected FileAt, got {other:?}"),
+    }
+
+    // Filter to the two main.rs call sites: "();" fuzzy-matches "    needle();" but not
+    // "fn needle() {}" (no semicolon).
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        24,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Jumplist,
+            query: "();".into(),
+            generation: 1,
+        },
+    )
+    .await;
+
+    // Ctrl-j re-captures the filtered subset — item index 1 is the original list's second
+    // entry (main.rs:1), which becomes the narrowed list's first.
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        25,
+        &JumplistCaptureParams {
+            kind: PickerKind::Jumplist,
+            item: PickerItem::JumplistEntry {
+                index: 1,
+                // Identity is `index`; line/display are ignored on capture.
+                line: 0,
+                display: String::new(),
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    let captured = captured.expect("the filtered subset captures");
+    assert_eq!(captured.total, 2, "narrowed to the two main.rs hits");
+    assert_eq!(
+        captured.index, 0,
+        "the highlighted entry leads the narrowed list"
+    );
+
+    // Stepping now walks the narrowed set only: from the top of main.rs → 1, 2, then stops at
+    // the end — lib.rs's entry is no longer in the list.
+    set_point_cursor(&mut ws, 26, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let mut current = buffer_id;
+    let mut seen = Vec::new();
+    for i in 0..2u64 {
+        let target = send_request::<JumplistStep>(
+            &mut ws,
+            27 + i,
+            &JumplistStepParams {
+                buffer_id: current,
+                direction: Direction::Forward,
+                count: 1,
+                scope: JumplistStepScope::Full,
+                open: true,
+            },
+        )
+        .await
+        .moved()
+        .expect("narrowed list steps");
+        assert!(
+            target.path.ends_with("src/main.rs"),
+            "lib.rs is out of the narrowed list"
+        );
+        current = target.opened.expect("composite opens").buffer_id;
+        seen.push(target.index);
+    }
+    assert_eq!(seen, vec![1, 2], "the narrowed list is the two main.rs hits");
+
+    // On the last narrowed entry, forward stops — lib.rs is not reachable by wrapping.
+    let outcome: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        40,
+        &JumplistStepParams {
+            buffer_id: current,
+            direction: Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "narrowed list stops at its end: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// `Space j` opens the Jumplist picker framed on "where you are": `center_on_cursor` resolves
+/// the entry at-or-after the cursor (inclusive — the just-jumped-to entry counts), wrapping
+/// past the end, and echoes it via `effective_center_on` for the client to highlight.
+#[tokio::test]
+async fn jumplist_picker_centers_on_the_cursor_nearest_entry() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+    // Entries: lib.rs:0:3 (#0), main.rs:1:4 (#1), main.rs:2:4 (#2). Cursor before main.rs's
+    // first entry → nearest at-or-after is #1.
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
+    let view_params = |center: Option<u64>| PickerViewParams {
+        from_selection: false,
+        filters: None,
+        kind: PickerKind::Jumplist,
+        reset: true,
+        offset: 0,
+        limit: 30,
+        center_on: None,
+        center_on_cursor: center,
+        directory_path: None,
+        buffer_id: None,
+        explorer_roots: false,
+        keybindings: None,
+    };
+    let view = send_request::<PickerView>(&mut ws, 23, &view_params(Some(buffer_id))).await;
+    match view.effective_center_on {
+        Some(PickerItem::JumplistEntry { index, .. }) => assert_eq!(index, 1),
+        other => panic!("expected a resolved JumplistEntry, got {other:?}"),
+    }
+
+    // Past every entry in the buffer's file — and the list — the resolution wraps to #0.
+    set_point_cursor(&mut ws, 24, buffer_id, LogicalPosition { line: 3, col: 0 }).await;
+    let view = send_request::<PickerView>(&mut ws, 25, &view_params(Some(buffer_id))).await;
+    match view.effective_center_on {
+        Some(PickerItem::JumplistEntry { index, .. }) => assert_eq!(index, 0),
+        other => panic!("expected a resolved JumplistEntry, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+/// With nothing captured, the Jumplist picker opens empty (the shells' placeholder explains) —
+/// cheap discoverability, not an error.
+#[tokio::test]
+async fn jumplist_picker_opens_empty_without_a_capture() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    assert_eq!(view.total_candidates, 0);
+
+    drop(server);
+}
+
+/// Regression carried over from grep navigation: when the cursor's selection covers an entry
+/// (the post-jump shape — anchor at the entry's start, position at its end), `[` should skip
+/// *past* the current entry rather than landing back on it. The server compares against the
+/// selection's leading edge for Backward, not the trailing edge.
+#[tokio::test]
+async fn jumplist_step_backward_skips_currently_selected_entry() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Simulate the post-jump cursor: selection covers the "needle" match on line 1 (cols 4–9,
+    // since "needle" is 6 chars; inclusive cursor lands on the last char, col 9; anchor at
+    // the start of the match, col 4).
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        22,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 9 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+
+    // Backward must walk past this entry (start at col 4 == selection's leading edge) and land
+    // on the previous entry in src/lib.rs:0:3.
+    let target = step_results(&mut ws, 23, buffer_id, Direction::Backward)
+        .await
+        .moved()
+        .expect("backward should step past the current entry");
+    assert!(target.path.ends_with("src/lib.rs"));
+    assert_eq!(target.anchor, Some(LogicalPosition { line: 0, col: 3 }));
+
+    // Forward from the same selection skips past the trailing edge (col 9) and lands on the
+    // next entry at line 2 col 4.
+    let target = step_results(&mut ws, 24, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("forward should step past the current entry");
     assert!(target.path.ends_with("src/main.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 2, col: 4 });
+    assert_eq!(target.anchor, Some(LogicalPosition { line: 2, col: 4 }));
+
+    drop(server);
+}
+
+/// A workspace switch wipes the captured list along with the picker state — its entries point
+/// into the prior workspace's files, so `]` afterwards is a no-op until the next capture.
+/// (Re-activating the *same* workspace is not a switch and preserves it, like pickers.)
+#[tokio::test]
+async fn workspace_switch_wipes_the_captured_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::write(dir_path.join("hay.txt"), "a needle here\n").unwrap();
+    std::mem::forget(dir);
+    let server = spawn_for_test_multi(vec![
+        ("p1".into(), vec![dir_path.clone()]),
+        ("p2".into(), vec![dir_path]),
+    ])
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p1".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // Grep for the needle and capture the single hit.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: true,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+    let buffer_id = open_test_buffer(&mut ws, 12, "hay.txt").await;
+    let _ = capture_grep_results(&mut ws, 13, "hay.txt", 0, 2).await;
+    assert!(
+        step_results(&mut ws, 14, buffer_id, Direction::Forward)
+            .await
+            .moved()
+            .is_some(),
+        "captured list steps before the switch"
+    );
+
+    // Switching to a different workspace tears the per-client state down, results included.
+    let activated: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        15,
+        &WorkspaceActivateParams {
+            name: "p2".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    let landed = activated.opened.expect("workspace lands on a buffer");
+    assert!(
+        matches!(
+            step_results(&mut ws, 16, landed.buffer_id, Direction::Forward).await,
+            JumplistStepResult::Empty
+        ),
+        "the captured list did not survive the workspace switch"
+    );
 
     drop(server);
 }
@@ -19542,7 +20077,19 @@ async fn open_and_subscribe(
     root: &std::path::Path,
     rel_path: &str,
 ) -> (aether_server::ServerHandle, Ws) {
-    let server = spawn_for_test(workspace, vec![root.to_path_buf()])
+    open_and_subscribe_with_lsp(workspace, root, rel_path, Vec::new()).await
+}
+
+/// [`open_and_subscribe`] with in-process **dummy language servers** registered per language (see
+/// `aether_server::DummyLspConfig`), so the opened buffer's LSP launch uses the dummy instead of a
+/// real server binary — deterministic and fast, so the test needn't be `#[ignore]`d.
+async fn open_and_subscribe_with_lsp(
+    workspace: &str,
+    root: &std::path::Path,
+    rel_path: &str,
+    dummy_lsp: Vec<(String, aether_server::DummyLspConfig)>,
+) -> (aether_server::ServerHandle, Ws) {
+    let server = aether_server::spawn_for_test_with_lsp(workspace, vec![root.to_path_buf()], dummy_lsp)
         .await
         .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -19937,42 +20484,113 @@ async fn lsp_ready_erlang() {
 
 /// Wait until a `viewport/lines_changed` carries diagnostics (`want`=true) or none (`want`=false).
 /// Returns false on timeout.
-async fn wait_for_diag_state(ws: &mut Ws, want: bool, timeout_secs: u64) -> bool {
-    use std::time::Duration;
-    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        loop {
-            let text = next_text(ws).await;
-            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
-            {
-                if n.method == ViewportLinesChanged::NAME {
-                    let p: ViewportLinesChangedParams =
-                        serde_json::from_value(n.params).expect("typed");
-                    let has = p
-                        .replacement_lines
-                        .iter()
-                        .any(|l| !l.diagnostics.is_empty());
-                    if has == want {
-                        return;
-                    }
-                }
-            }
+/// Poll the buffer-scoped diagnostics picker until it lists a non-empty diagnostic, returning that
+/// row. Reads from the `picker/view` **response** (`PickerViewResult::update`, built synchronously
+/// from state) rather than the one-shot viewport push — which `send_request` discards — so it's
+/// robust against a dummy LSP that publishes near-instantly. Panics after ~5s.
+async fn wait_for_buffer_diagnostic(
+    ws: &mut Ws,
+    buffer_id: u64,
+    id_base: u64,
+) -> aether_protocol::picker::PickerItem {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
+    for i in 0..100u64 {
+        let view: PickerViewResult = send_request::<PickerView>(
+            ws,
+            id_base + i,
+            &PickerViewParams {
+                from_selection: false,
+                filters: None,
+                kind: PickerKind::Diagnostics,
+                reset: true,
+                offset: 0,
+                limit: 50,
+                center_on: None,
+                center_on_cursor: None,
+                directory_path: None,
+                buffer_id: Some(buffer_id),
+                explorer_roots: false,
+                keybindings: None,
+            },
+        )
+        .await;
+        if let Some(item) = view.update.and_then(|u| {
+            u.items()
+                .iter()
+                .find(|it| matches!(it, PickerItem::Diagnostic { message, .. } if !message.is_empty()))
+                .cloned()
+        }) {
+            return item;
         }
-    })
-    .await
-    .is_ok()
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("dummy diagnostic never appeared in the buffer diagnostics picker");
+}
+
+/// Poll the buffer diagnostics picker (via the `picker/view` response — robust against swallowed
+/// pushes) until the presence of a diagnostic matches `want`. Panics after ~5s. For the
+/// dummy-driven "an edit clears the error" tests.
+async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, id_base: u64, want: bool) {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
+    for i in 0..100u64 {
+        let view: PickerViewResult = send_request::<PickerView>(
+            ws,
+            id_base + i,
+            &PickerViewParams {
+                from_selection: false,
+                filters: None,
+                kind: PickerKind::Diagnostics,
+                reset: true,
+                offset: 0,
+                limit: 50,
+                center_on: None,
+                center_on_cursor: None,
+                directory_path: None,
+                buffer_id: Some(buffer_id),
+                explorer_roots: false,
+                keybindings: None,
+            },
+        )
+        .await;
+        let has = view
+            .update
+            .map(|u| {
+                u.items().iter().any(
+                    |it| matches!(it, PickerItem::Diagnostic { message, .. } if !message.is_empty()),
+                )
+            })
+            .unwrap_or(false);
+        if has == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("buffer diagnostics present={want} never reached");
 }
 
 /// Regression test: undo must send `didChange` so the server re-analyzes and clears a diagnostic for
 /// an error that was undone. Without the fix, undo bypassed `notify_change` and the squiggle stuck.
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn lsp_diagnostics_clear_on_undo() {
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "fn main() {}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("undo-rust", dir.path(), "main.rs").await;
+    use aether_server::{DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = lay_out(&[("main.rs", "fn main() {}\n")]);
+    // The dummy publishes an error while the buffer contains the stray `@`; undo removes it → clear.
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(0, 0, 1),
+            severity: 1,
+            message: "syntax error".into(),
+        }],
+        diagnostics_trigger: Some(DiagnosticsTrigger::Present("@".into())),
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("undo-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     // Re-open by path to learn the buffer id (dedups to the same buffer).
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
@@ -20015,10 +20633,7 @@ async fn lsp_diagnostics_clear_on_undo() {
         },
     )
     .await;
-    assert!(
-        wait_for_diag_state(&mut ws, true, 90).await,
-        "expected a diagnostic after introducing an error"
-    );
+    wait_for_buffer_diag_present(&mut ws, buffer_id, 200, true).await;
 
     // Undo — the fix must send didChange so the server re-analyzes the reverted text and clears it.
     let undo: UndoResult = send_request::<EditUndo>(
@@ -20032,12 +20647,9 @@ async fn lsp_diagnostics_clear_on_undo() {
     )
     .await;
     assert!(undo.applied);
-    let cleared = wait_for_diag_state(&mut ws, false, 90).await;
+    // If undo didn't send didChange, the dummy would still see `@` and keep the diagnostic.
+    wait_for_buffer_diag_present(&mut ws, buffer_id, 300, false).await;
     drop(server);
-    assert!(
-        cleared,
-        "diagnostics did not clear after undo (didChange not sent on undo?)"
-    );
 }
 
 /// Regression test: toggle-comment edits the buffer directly (not via the shared `apply_edit`)
@@ -20045,14 +20657,27 @@ async fn lsp_diagnostics_clear_on_undo() {
 /// analyzing the pre-toggle text and everything position-based (document highlights, hover,
 /// diagnostics) goes stale.
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "@\nfn main() {}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("toggle-rust", dir.path(), "main.rs").await;
+    use aether_server::{DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = lay_out(&[("main.rs", "@\nfn main() {}\n")]);
+    // The dummy flags the stray token until the line is commented out — modelled as "clear once the
+    // buffer contains `//`", which the toggle-comment inserts.
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(0, 0, 1),
+            severity: 1,
+            message: "syntax error".into(),
+        }],
+        diagnostics_trigger: Some(DiagnosticsTrigger::Absent("//".into())),
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "toggle-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20069,10 +20694,7 @@ async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
     )
     .await;
     let buffer_id = open.buffer_id;
-    assert!(
-        wait_for_diag_state(&mut ws, true, 90).await,
-        "expected a diagnostic for the stray token"
-    );
+    wait_for_buffer_diag_present(&mut ws, buffer_id, 200, true).await;
 
     // Comment out the offending line — the fix must send didChange so the language server
     // re-analyzes and drops the diagnostic.
@@ -20087,12 +20709,9 @@ async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
         },
     )
     .await;
-    let cleared = wait_for_diag_state(&mut ws, false, 90).await;
+    // If toggle-comment didn't send didChange, the dummy wouldn't see the `//` and would keep it.
+    wait_for_buffer_diag_present(&mut ws, buffer_id, 300, false).await;
     drop(server);
-    assert!(
-        cleared,
-        "diagnostics did not clear after toggle-comment (didChange not sent?)"
-    );
 }
 
 /// Place the cursor at `(line, col)` in `buffer_id`.
@@ -20149,15 +20768,17 @@ async fn lsp_hover_without_a_server_reports_no_server() {
 /// Phase 3: hover at the cursor returns the symbol's info from rust-analyzer. Polls until the
 /// server has analyzed the file (hover is empty until then).
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn lsp_hover_returns_contents() {
+    use aether_server::DummyLspConfig;
     use std::time::Duration;
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "fn main() {\n    let _x: i32 = 1;\n}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("hover-rust", dir.path(), "main.rs").await;
+    let dir = lay_out(&[("main.rs", "fn main() {\n    let _x: i32 = 1;\n}\n")]);
+    let dummy = DummyLspConfig {
+        hover: Some("```rust\nfn main()\n```".into()),
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("hover-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20176,8 +20797,9 @@ async fn lsp_hover_returns_contents() {
     let buffer_id = open.buffer_id;
     set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on `main`
 
+    // The dummy answers immediately once its handshake lands; retry until the server is Ready.
     let mut id = 100;
-    let contents = tokio::time::timeout(Duration::from_secs(90), async {
+    let contents = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let r: LspHoverResult =
                 send_request::<LspHover>(&mut ws, id, &LspBufferParams { buffer_id }).await;
@@ -20187,30 +20809,37 @@ async fn lsp_hover_returns_contents() {
                     return c;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
     drop(server);
-    let contents = contents.expect("hover did not return contents within 90s");
-    eprintln!("hover contents:\n{contents}");
+    let contents = contents.expect("hover did not return contents");
     assert!(
         contents.contains("fn main"),
-        "expected the fn signature, got: {contents}"
+        "expected the dummy hover, got: {contents}"
     );
 }
 
-/// Phase 3: goto-definition at a call site resolves to the definition's location.
+/// Phase 3: goto-definition at a call site resolves to the definition's location. The dummy returns
+/// a canned target; this exercises Aether's `LocationLink`/`Location` parsing and the inclusive-span
+/// landing (cursor on the name's last char, anchor at its start).
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn lsp_goto_definition_resolves() {
+    use aether_server::{DummyLspConfig, DummyRange};
     use std::time::Duration;
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("def-rust", dir.path(), "main.rs").await;
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n",
+    )]);
+    let dummy = DummyLspConfig {
+        // `helper` is declared on line 0, cols 3..8 (half-open) → the name span.
+        definition: Some(DummyRange::on(0, 3, 9)),
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("def-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20230,7 +20859,7 @@ async fn lsp_goto_definition_resolves() {
     set_cursor(&mut ws, 11, buffer_id, 4, 14).await; // inside the `helper()` call
 
     let mut id = 100;
-    let loc = tokio::time::timeout(Duration::from_secs(90), async {
+    let loc = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let r: LspGotoDefinitionResult =
                 send_request::<LspGotoDefinition>(&mut ws, id, &LspBufferParams { buffer_id })
@@ -20239,13 +20868,12 @@ async fn lsp_goto_definition_resolves() {
             if let Some(loc) = r.location {
                 return loc;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
     drop(server);
-    let loc = loc.expect("goto-definition did not resolve within 90s");
-    eprintln!("definition at {}:{}", loc.path, loc.position.line);
+    let loc = loc.expect("goto-definition did not resolve");
     assert!(
         loc.path.ends_with("main.rs"),
         "unexpected path: {}",
@@ -20266,15 +20894,23 @@ async fn lsp_goto_definition_resolves() {
 /// preview. Re-opens until rust-analyzer has indexed enough to answer (the resolve before that
 /// returns empty).
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn references_picker_lists_all_uses() {
+    use aether_server::{DummyLspConfig, DummyRange};
     use std::time::Duration;
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("refs-rust", dir.path(), "main.rs").await;
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n",
+    )]);
+    let dummy = DummyLspConfig {
+        // `helper` declaration (line 0, cols 3..9) and call site (line 4, cols 12..18); the
+        // declaration is also the definition, so Aether flags that row `is_definition`.
+        references: vec![DummyRange::on(0, 3, 9), DummyRange::on(4, 12, 18)],
+        definition: Some(DummyRange::on(0, 3, 9)),
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("refs-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20308,7 +20944,7 @@ async fn references_picker_lists_all_uses() {
     )
     .await;
 
-    let final_update = tokio::time::timeout(Duration::from_secs(90), async {
+    let final_update = tokio::time::timeout(Duration::from_secs(10), async {
         let mut id = 100;
         loop {
             // Each open mints a fresh resolve; the initial push is empty + ticking, then the
@@ -20348,11 +20984,11 @@ async fn references_picker_lists_all_uses() {
             if done.total_matches > 0 {
                 return done;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("references did not resolve within 90s");
+    .expect("references did not resolve");
     drop(server);
 
     assert_eq!(final_update.kind, PickerKind::References);
@@ -20419,23 +21055,34 @@ async fn references_picker_lists_all_uses() {
     assert!(*is_definition, "that occurrence is the definition");
 }
 
-/// Phase 5: `lsp/format` reformats the buffer via rust-analyzer (rustfmt). Polls until the server
-/// is ready enough to return edits, then saves and checks the on-disk text is canonically
-/// formatted. A second format must leave that canonical text untouched (no corruption from
-/// re-applying edits).
+/// Phase 5: `lsp/format` applies the server's edits to the buffer, and saving writes the formatted
+/// text; a second format leaves already-canonical text untouched (re-applied edits don't corrupt
+/// it). The dummy returns one whole-document edit — this exercises Aether's edit application, not a
+/// real formatter.
 #[tokio::test]
-#[ignore = "needs rust-analyzer + rustfmt"]
 async fn lsp_format_reformats() {
+    use aether_server::{DummyLspConfig, DummyRange, DummyTextEdit};
     use std::time::Duration;
-    require_server_on_path("rust-analyzer");
     const FORMATTED: &str = "fn main() {\n    let _x = 1;\n}\n";
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        // Deliberately mis-spaced/under-indented — rustfmt has work to do.
-        ("main.rs", "fn main() {\nlet _x=1;\n}\n"),
-    ]);
+    // Deliberately mis-spaced/under-indented; the dummy "formats" it by replacing the whole buffer.
+    let dir = lay_out(&[("main.rs", "fn main() {\nlet _x=1;\n}\n")]);
+    let dummy = DummyLspConfig {
+        formatting: vec![DummyTextEdit {
+            // Whole document: (0,0) to the position past the final newline (line 3, col 0).
+            range: DummyRange {
+                line: 0,
+                character: 0,
+                end_line: 3,
+                end_character: 0,
+            },
+            new_text: FORMATTED.into(),
+        }],
+        ..Default::default()
+    };
     let main_path = dir.path().join("main.rs");
-    let (server, mut ws) = open_and_subscribe("fmt-rust", dir.path(), "main.rs").await;
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("fmt-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20453,9 +21100,9 @@ async fn lsp_format_reformats() {
     .await;
     let buffer_id = open.buffer_id;
 
-    // Poll until rust-analyzer is ready enough to return formatting edits.
+    // Poll until the dummy's handshake lands and formatting edits apply.
     let mut id = 100;
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let r: LspFormatResult =
                 send_request::<LspFormat>(&mut ws, id, &LspBufferParams { buffer_id }).await;
@@ -20463,11 +21110,11 @@ async fn lsp_format_reformats() {
             if r.status == FormatStatus::Applied {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("format did not apply within 90s");
+    .expect("format did not apply");
 
     // Save and verify the on-disk content is canonically formatted.
     let save_params = BufferSaveParams {
@@ -20566,20 +21213,25 @@ async fn lsp_format_json_reformats() {
 }
 
 /// Phase: the buffer-scoped diagnostics picker lists the buffer's diagnostics and selecting one
-/// resolves to its location (FileAt). Real rust-analyzer.
+/// resolves to its location (FileAt). Uses an in-process dummy LSP.
 #[tokio::test]
-#[ignore = "needs rust-analyzer"]
 async fn lsp_diagnostics_picker_lists_and_selects() {
     use aether_protocol::picker::{
-        PickerItem, PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
-        PickerUpdateParams, PickerView, PickerViewParams,
+        PickerItem, PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult,
     };
-    require_server_on_path("rust-analyzer");
-    let dir = lay_out(&[
-        ("Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"p\"\npath = \"main.rs\"\n"),
-        ("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n"),
-    ]);
-    let (server, mut ws) = open_and_subscribe("diagpick", dir.path(), "main.rs").await;
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = lay_out(&[("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n")]);
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(1, 17, 29),
+            severity: 1,
+            message: "mismatched types".into(),
+        }],
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("diagpick", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20596,45 +21248,13 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
     )
     .await;
     let buffer_id = open.buffer_id;
-    assert!(
-        wait_for_diag_state(&mut ws, true, 90).await,
-        "diagnostics should arrive"
-    );
 
-    // Open the diagnostics picker for this buffer.
-    let _view = send_request::<PickerView>(
-        &mut ws,
-        20,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Diagnostics,
-            reset: true,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: Some(buffer_id),
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
-    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert_eq!(update.kind, PickerKind::Diagnostics);
-
-    let diag_item = update.items().iter().find_map(|i| match i {
-        PickerItem::Diagnostic { message, .. } if !message.is_empty() => Some(i.clone()),
-        _ => None,
-    });
-    let diag_item = diag_item.expect("picker lists at least one diagnostic");
-    if let PickerItem::Diagnostic {
-        severity, message, ..
-    } = &diag_item
-    {
-        eprintln!("diagnostic picker item: [{severity:?}] {message}");
-    }
+    // Poll the picker until the dummy's diagnostic lands.
+    let diag_item = wait_for_buffer_diagnostic(&mut ws, buffer_id, 20).await;
+    assert!(matches!(
+        &diag_item,
+        PickerItem::Diagnostic { message, .. } if message == "mismatched types"
+    ));
 
     // Selecting it resolves to the buffer's file at the diagnostic position.
     let result: PickerSelectResult = send_request::<PickerSelect>(
@@ -20651,6 +21271,130 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         PickerSelectResult::FileAt { path, .. } => assert!(path.ends_with("main.rs"), "got {path}"),
         other => panic!("expected FileAt, got {other:?}"),
     }
+}
+
+/// Regression (user-reported): capturing the **buffer-scoped** diagnostics picker into the
+/// jumplist, then stepping. The buffer-scoped candidates carry no relative path (the flat picker
+/// opens the current buffer), so the entry used to get `relative_path: Some("")` and `]`/`[` opened
+/// `root + ""` — the workspace *directory* — failing with "Is a directory". Selecting worked
+/// because select opens by `abs_path`. The fix derives real parts from `abs_path` at capture, and
+/// also groups the entries by file so the picker shows which file they're in. Uses an in-process
+/// dummy LSP that publishes one canned diagnostic — deterministic, no real server.
+#[tokio::test]
+async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
+    use aether_protocol::picker::{
+        GroupHeader, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = lay_out(&[("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n")]);
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(1, 17, 29), // the `"not an int"` literal
+            severity: 1,                      // Error
+            message: "mismatched types".into(),
+        }],
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("diagjump", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    // The dummy publishes on didOpen from the async launch task; poll the buffer-scoped diagnostics
+    // picker (built synchronously from state, carried in the view *response*) until the diagnostic
+    // lands. Polling the response — not the one-shot viewport push, which `send_request` discards —
+    // makes this robust against the dummy being near-instant.
+    let diag_item = wait_for_buffer_diagnostic(&mut ws, buffer_id, 20).await;
+
+    // Capture it into the jumplist.
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        21,
+        &JumplistCaptureParams {
+            kind: PickerKind::Diagnostics,
+            item: diag_item,
+        },
+    )
+    .await;
+    assert!(
+        captured.expect("diagnostics capture").total >= 1,
+        "at least one diagnostic captured"
+    );
+
+    // The Jumplist picker now groups the entries under a File header for main.rs — even though the
+    // source buffer-diagnostics picker rendered flat.
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        22,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: true,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let vu = view.update.expect("jumplist view carries its window");
+    assert!(
+        vu.groups.iter().any(|g| matches!(
+            &g.header,
+            GroupHeader::File { relative_path, .. } if relative_path == "main.rs"
+        )),
+        "buffer-diagnostics jumplist is grouped by file, got {:?}",
+        vu.groups
+    );
+
+    // Stepping opens main.rs (the file) — not the workspace root directory.
+    set_point_cursor(&mut ws, 23, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let stepped: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        24,
+        &JumplistStepParams {
+            buffer_id,
+            direction: Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    let target = stepped
+        .moved()
+        .expect("step resolves the diagnostic entry (no directory error)");
+    assert!(
+        target.path.ends_with("main.rs"),
+        "step opens the file, got {}",
+        target.path
+    );
+    assert!(
+        target.opened.is_some(),
+        "the composite open succeeded (would be an Err on the old directory bug)"
+    );
+
+    drop(server);
 }
 
 /// The browser client is served by the same daemon on the same loopback port the WebSocket uses:
@@ -20950,7 +21694,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     drop(server);
 }
 
-// -------- nav (jump list) ------------------------------------------------------------------------
+// -------- nav (back/forward history) --------------------------------------------------------------
 
 /// Open + viewport-subscribe a file, returning (buffer_id, viewport_id). Mirrors a client switching
 /// buffers: the client only ever has one viewport, since subscribing supersedes (and drops) the
@@ -21170,7 +21914,7 @@ async fn nav_goto_reopens_by_path() {
                 position: LogicalPosition { line: 2, col: 1 },
                 anchor: LogicalPosition { line: 2, col: 1 },
                 match_bracket: None,
-                grep_position: None,
+                jumplist_position: None,
             },
         },
     )
@@ -24452,6 +25196,7 @@ async fn hints_aggregate_across_clients_and_persist() {
         None,
         None,
         Some(hints_path.clone()),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -24545,6 +25290,7 @@ async fn hints_aggregate_across_clients_and_persist() {
         None,
         None,
         Some(hints_path.clone()),
+        Vec::new(),
     )
     .await
     .unwrap();
