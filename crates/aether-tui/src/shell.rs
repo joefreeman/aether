@@ -871,16 +871,21 @@ impl Shell {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        // While a picker is open its overlay owns the screen: the wheel moves the highlight,
-        // and clicks fall through to the picker rather than the buffer underneath.
+        // While a picker is open its overlay owns the screen: the wheel moves the highlight, a
+        // press lands on the picker (see `on_picker_press`) — never on the buffer underneath.
         if self.session.picker.is_some() {
-            let delta = match m.kind {
-                MouseEventKind::ScrollUp => -1,
-                MouseEventKind::ScrollDown => 1,
-                _ => return,
-            };
-            let fx = self.session.picker_wheel(delta);
-            self.run_effects(fx);
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    let fx = self.session.picker_wheel(-1);
+                    self.run_effects(fx);
+                }
+                MouseEventKind::ScrollDown => {
+                    let fx = self.session.picker_wheel(1);
+                    self.run_effects(fx);
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.on_picker_press(m),
+                _ => {}
+            }
             return;
         }
         // The hover popover owns the wheel while the cursor is over it (scrolls the popover, not the
@@ -930,6 +935,42 @@ impl Shell {
             }
             MouseEventKind::Up(MouseButton::Left) => self.session.pointer_release(),
             _ => {}
+        }
+    }
+
+    /// A left press while the picker overlay is up, hit-tested against what was drawn:
+    ///
+    /// - a result row selects *and* accepts it — `PickerClicked` is the same core path Enter takes,
+    ///   shared with the native and web clients (row click opens the file, drills into a directory,
+    ///   creates from the synthetic "+ Create …" row, …);
+    /// - the dim backdrop dismisses the picker (the other clients' click-away gesture), except for
+    ///   the mandatory chooser, which no dismissal gesture may close;
+    /// - the box's own chrome (input row, group headers, borders) is swallowed.
+    fn on_picker_press(&mut self, m: MouseEvent) {
+        // Shift-click is the terminal's own text selection, as in the buffer — leave it alone.
+        if m.modifiers.contains(KeyModifiers::SHIFT) {
+            return;
+        }
+        // A confirm prompt raised from the picker (delete this file, discard that buffer) owns
+        // input while it's up, as it does for the keyboard: a press declines it rather than
+        // slipping an accept past it — the native client's click-away-declines rule.
+        if self.session.prompt.is_some() {
+            let fx = self.session.decline_prompt();
+            self.run_effects(fx);
+            return;
+        }
+        let (cols, rows) = self.term;
+        match ui::picker_hit(&self.state, cols, rows, m.row, m.column) {
+            ui::PickerHit::Item(i) => {
+                // The hit is a window-relative index; the core selects by absolute index.
+                let abs = self.state.picker.offset + i as u32;
+                self.dispatch(CoreEvent::PickerClicked(abs));
+            }
+            ui::PickerHit::Backdrop if !self.session.picker_is_mandatory() => {
+                let fx = self.session.close_picker();
+                self.run_effects(fx);
+            }
+            ui::PickerHit::Backdrop | ui::PickerHit::Chrome => {}
         }
     }
 

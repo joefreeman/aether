@@ -17,7 +17,7 @@ use aether_protocol::viewport::{
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -108,6 +108,25 @@ const CURSOR_LINE_MODIFIED_BG: Color = Color::Rgb(74, 70, 50);
 const CURSOR_LINE_STAGED_ADDED_BG: Color = Color::Rgb(58, 69, 60);
 const CURSOR_LINE_STAGED_MODIFIED_BG: Color = Color::Rgb(67, 65, 56);
 
+/// Whether the status row is drawn. It takes the terminal's bottom row and the content pane —
+/// where every overlay is centred — gets the rest. Shared by [`draw`] and [`content_area`] so the
+/// renderer and the mouse hit-tests can't disagree about where the content pane ends.
+fn shows_status_row(state: &AppState) -> bool {
+    state.has_editor() || state.conn == ConnState::Connecting
+}
+
+/// The content pane in a `cols × rows` terminal — [`draw`]'s first chunk, the rect the picker and
+/// the other overlays are centred in. Reconstructed for hit-testing a mouse press against what was
+/// painted (the shell tracks the terminal size, not the layout).
+fn content_area(state: &AppState, cols: u16, rows: u16) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: cols,
+        height: rows.saturating_sub(shows_status_row(state) as u16),
+    }
+}
+
 pub fn draw(f: &mut Frame, state: &AppState) {
     // The status row carries save-as / new-file prompts and the dirty + cursor indicator for an
     // active editor. The add-root prompt lives *inside* the settings overlay, not here. Transient
@@ -115,7 +134,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // is shown only for an active editor, leaving the no-workspace view its full vertical space.
     // The status row shows for an active editor, and also at boot while `Connecting` (no editor
     // yet) so the connection indicator has its familiar home — the chrome is up from the start.
-    let show_status = state.has_editor() || state.conn == ConnState::Connecting;
+    let show_status = shows_status_row(state);
     let constraints: &[Constraint] = if show_status {
         &[Constraint::Min(1), Constraint::Length(1)]
     } else {
@@ -1507,18 +1526,33 @@ fn overlay_block() -> Block<'static> {
         .style(Style::default().bg(NORD0).fg(NORD4))
 }
 
-fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+/// The picker overlay's on-screen geometry. [`draw_picker_overlay`] paints from it and
+/// [`picker_hit`] maps mouse presses back through it, so the renderer and the pointer can't drift
+/// apart. Rects are absolute (terminal cells) and already horizontally padded where the painter
+/// pads.
+struct PickerLayout {
+    /// The bordered box, borders included.
+    box_area: Rect,
+    /// The query / chips row.
+    input: Rect,
+    /// The chip-editor line below the input, when one is open.
+    chip_editor: Option<Rect>,
+    /// The full-width rule under the input, when the box has content to separate.
+    separator: Option<Rect>,
+    /// The results pane — the rows [`picker_window_rows`] fills.
+    results: Rect,
+}
+
+/// Lay out the picker overlay inside `area` (the content pane). `None` when the box would be too
+/// small to draw anything meaningful — the renderer then draws nothing, so nothing is hit-testable
+/// either.
+fn picker_layout(state: &AppState, area: Rect) -> Option<PickerLayout> {
     let editor_open = state.picker.chip_editor.is_some();
-    let box_area = collapsed_picker_box_rect(area, picker_content_rows(&state.picker), editor_open);
+    let content_rows = picker_content_rows(&state.picker);
+    let box_area = collapsed_picker_box_rect(area, content_rows, editor_open);
     if box_area.width < 4 || box_area.height < 3 {
-        return; // Too small to draw anything meaningful.
+        return None;
     }
-    f.render_widget(Clear, box_area);
-
-    let block = overlay_block();
-    let inner = block.inner(box_area);
-    f.render_widget(block, box_area);
-
     // Inner layout: input row, the chip editor line when one is open (revealed *below* the
     // input so chips + query stay visible while editing), separator row (full-width, ties into
     // the borders), results. The separator row only exists when there's content to separate —
@@ -1526,7 +1560,8 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     // overconstrained vertical split (more `Length(1)` rows than the collapsed box has) makes
     // ratatui's solver zero out an *earlier* row, so an unconditional separator constraint in
     // a content-less box would swallow the editor line and render the separator in its place.
-    let has_content = picker_content_rows(&state.picker) > 0;
+    let inner = overlay_block().inner(box_area);
+    let has_content = content_rows > 0;
     let mut constraints = vec![Constraint::Length(1)];
     if editor_open {
         constraints.push(Constraint::Length(1));
@@ -1539,17 +1574,93 @@ fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
-    draw_picker_input_row(f, state, pad_horizontal(rows[0]));
     let mut next = 1;
-    if editor_open {
-        draw_chip_editor_row(f, state, pad_horizontal(rows[next]));
+    let chip_editor = editor_open.then(|| {
+        let r = rows[next];
         next += 1;
-    }
-    if has_content {
-        draw_picker_separator(f, box_area, rows[next]);
+        pad_horizontal(r)
+    });
+    let separator = has_content.then(|| {
+        let r = rows[next];
         next += 1;
+        r
+    });
+    Some(PickerLayout {
+        box_area,
+        input: pad_horizontal(rows[0]),
+        chip_editor,
+        separator,
+        results: pad_horizontal(rows[next]),
+    })
+}
+
+fn draw_picker_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(layout) = picker_layout(state, area) else {
+        return; // Too small to draw anything meaningful.
+    };
+    f.render_widget(Clear, layout.box_area);
+    f.render_widget(overlay_block(), layout.box_area);
+    draw_picker_input_row(f, state, layout.input);
+    if let Some(editor) = layout.chip_editor {
+        draw_chip_editor_row(f, state, editor);
     }
-    draw_picker_results(f, state, pad_horizontal(rows[next]));
+    if let Some(separator) = layout.separator {
+        draw_picker_separator(f, layout.box_area, separator);
+    }
+    draw_picker_results(f, state, layout.results);
+}
+
+/// Where a mouse press landed while the picker overlay is up — the terminal's answer to the pixel
+/// shells' per-row `mouse_area` / `mousedown` handlers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerHit {
+    /// A selectable row: the item's index *within the fetched window* (add `picker.offset` for the
+    /// absolute index the core's click event takes).
+    Item(usize),
+    /// Somewhere else inside the box — input row, chip editor, a group header, an inter-group gap,
+    /// the borders, the padding, the scrollbar. Swallowed: the press does nothing.
+    Chrome,
+    /// Outside the box, on the dimmed backdrop.
+    Backdrop,
+}
+
+/// Hit-test a press at terminal cell `(row, col)` against the picker overlay as drawn in a
+/// `cols × rows` terminal. Runs the same [`picker_layout`] the renderer paints from and the same
+/// view-row expansion [`draw_picker_results`] iterates, so a press always resolves to the row
+/// under the pointer.
+pub fn picker_hit(state: &AppState, cols: u16, rows: u16, row: u16, col: u16) -> PickerHit {
+    let area = content_area(state, cols, rows);
+    // Nothing drawn (a terminal too small for the box) — treat the whole screen as backdrop.
+    let Some(layout) = picker_layout(state, area) else {
+        return PickerHit::Backdrop;
+    };
+    let at = Position::new(col, row);
+    if !layout.box_area.contains(at) {
+        return PickerHit::Backdrop;
+    }
+    if !layout.results.contains(at) {
+        return PickerHit::Chrome;
+    }
+    // The pane holds the empty / "Finding…" message instead of rows.
+    if picker_empty_message(&state.picker).is_some() {
+        return PickerHit::Chrome;
+    }
+    let view_rows = picker_window_rows(state.picker.items.len(), &state.picker.groups);
+    let top = state.picker.visible_start.min(view_rows.len());
+    let pane_row = (row - layout.results.y) as usize;
+    // The sticky group header is stamped *over* the pane's top row, so a press there hits the
+    // header — not the item it covers (mirrors the pin in `draw_picker_results`).
+    let pinned = state.picker.kind.is_some_and(pins_group_header)
+        && !state.picker.groups.is_empty()
+        && picker_governing_group(&view_rows, top).is_some();
+    if pane_row == 0 && pinned {
+        return PickerHit::Chrome;
+    }
+    match view_rows.get(top + pane_row) {
+        Some(PickerRow::Item(i)) => PickerHit::Item(*i),
+        // A header, a gap, or past the last row: nothing to select.
+        _ => PickerHit::Chrome,
+    }
 }
 
 /// The LSP-server detail screen (`Space l` → Enter on a server): a full-size box rendering the
@@ -5931,17 +6042,19 @@ mod tests {
         assert!(!pins_group_header(PickerKind::Files));
     }
 
-    /// Render the whole picker overlay to an in-memory terminal and read the rows back, so we can
-    /// build a bare `AppState` around a picker.
-    fn render_picker_rows(picker: crate::picker::PickerState) -> Vec<String> {
+    /// Terminal size the picker render tests draw into.
+    const TEST_COLS: u16 = 60;
+    const TEST_ROWS: u16 = 24;
+
+    /// A bare `AppState` (no editor, so the picker overlay is all there is to draw) around a picker.
+    fn picker_app(picker: crate::picker::PickerState) -> AppState {
         use crate::app::StatusMessage;
-        use ratatui::{backend::TestBackend, Terminal};
-        let state = AppState {
+        AppState {
             workspace_name: "demo".into(),
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
-            viewport_cols: 60,
-            viewport_rows: 24,
+            viewport_cols: TEST_COLS as u32,
+            viewport_rows: TEST_ROWS as u32,
             should_quit: false,
             status: StatusMessage::default(),
             toasts: Vec::new(),
@@ -5960,9 +6073,14 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
-        };
-        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-        terminal.draw(|f| draw(f, &state)).unwrap();
+        }
+    }
+
+    /// Render the whole picker overlay to an in-memory terminal and read the rows back.
+    fn render_rows(state: &AppState) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(TEST_COLS, TEST_ROWS)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -5971,6 +6089,24 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn render_picker_rows(picker: crate::picker::PickerState) -> Vec<String> {
+        render_rows(&picker_app(picker))
+    }
+
+    /// The screen cell (row, col) where `needle` is rendered — the pointer position a user aiming
+    /// at that text would click. Panics if it isn't on screen.
+    fn cell_of(rows: &[String], needle: &str) -> (u16, u16) {
+        rows.iter()
+            .enumerate()
+            .find_map(|(y, line)| line.find(needle).map(|x| (y as u16, x as u16)))
+            .unwrap_or_else(|| panic!("{needle:?} not rendered in\n{}", rows.join("\n")))
+    }
+
+    /// Hit-test a press at `(row, col)` against the picker overlay as drawn for `state`.
+    fn hit_at(state: &AppState, (row, col): (u16, u16)) -> PickerHit {
+        picker_hit(state, TEST_COLS, TEST_ROWS, row, col)
     }
 
     /// End-to-end render check for the sticky header: with the window scrolled into the *middle*
@@ -6029,6 +6165,169 @@ mod tests {
         assert!(
             joined.contains("HIT4"),
             "the selected hit should be visible"
+        );
+    }
+
+    /// A press on a flat picker's row resolves to *that* row: every rendered entry hit-tests back to
+    /// its own window index (the index the shell turns into the core's absolute selection). Driven
+    /// through the real render, so the hit-test and the painter are checked against each other.
+    #[test]
+    fn picker_click_resolves_to_the_row_under_the_pointer() {
+        let items = flat_items(10);
+        let state = picker_app(crate::picker::PickerState {
+            open: true,
+            kind: Some(PickerKind::Files),
+            total_matches: items.len() as u32,
+            items,
+            ..Default::default()
+        });
+        let rows = render_rows(&state);
+        for i in 0..10 {
+            let name = format!("f{i}.rs");
+            assert_eq!(
+                hit_at(&state, cell_of(&rows, &name)),
+                PickerHit::Item(i),
+                "clicking {name} should select row {i}"
+            );
+        }
+    }
+
+    /// In a grouped picker the pane interleaves headers and gap rows with the items. A press on a
+    /// hit selects that hit — the index accounts for the non-selectable rows above it — while a
+    /// press on a file header or the blank gap above it does nothing.
+    #[test]
+    fn picker_click_skips_group_headers_and_gaps() {
+        let (items, groups) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
+        // Give the hits distinguishable previews so `cell_of` can find each row.
+        let items: Vec<PickerItem> = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| match item {
+                PickerItem::GrepHit {
+                    path_index,
+                    relative_path,
+                    line,
+                    col,
+                    match_indices,
+                    ..
+                } => PickerItem::GrepHit {
+                    path_index,
+                    relative_path,
+                    line,
+                    col,
+                    preview: format!("HIT{i}"),
+                    match_indices,
+                },
+                other => other,
+            })
+            .collect();
+        let state = picker_app(crate::picker::PickerState {
+            open: true,
+            kind: Some(PickerKind::Grep),
+            total_matches: items.len() as u32,
+            total_display_rows: Some(items.len() as u32 + groups.len() as u32),
+            items,
+            groups,
+            ..Default::default()
+        });
+        let rows = render_rows(&state);
+        for i in 0..4 {
+            let preview = format!("HIT{i}");
+            assert_eq!(
+                hit_at(&state, cell_of(&rows, &preview)),
+                PickerHit::Item(i),
+                "clicking {preview} should select item {i}"
+            );
+        }
+        // View rows: 0=Hdr a.rs, 1=HIT0, 2=HIT1, 3=Gap, 4=Hdr b.rs, 5=HIT2, 6=HIT3. The interior
+        // header and the blank gap above it aren't selectable.
+        let (header_row, header_col) = cell_of(&rows, "b.rs");
+        assert_eq!(
+            hit_at(&state, (header_row, header_col)),
+            PickerHit::Chrome,
+            "the b.rs group header isn't a selectable row"
+        );
+        assert_eq!(
+            hit_at(&state, (header_row - 1, header_col)),
+            PickerHit::Chrome,
+            "the gap above the b.rs header isn't a selectable row"
+        );
+    }
+
+    /// The sticky header is stamped over the pane's top row, hiding the item scrolled under it — so
+    /// a press there hits the header, not the invisible row beneath. (Same state as
+    /// `sticky_header_pins_over_the_top_row_when_scrolled_mid_group`: view row 3, HIT2, is covered.)
+    #[test]
+    fn picker_click_on_the_pinned_header_selects_nothing() {
+        let items: Vec<PickerItem> = (0..8)
+            .map(|n| PickerItem::GrepHit {
+                path_index: 0,
+                relative_path: "a.rs".into(),
+                line: n,
+                col: 0,
+                preview: format!("HIT{n}"),
+                match_indices: Vec::new(),
+            })
+            .collect();
+        let state = picker_app(crate::picker::PickerState {
+            open: true,
+            kind: Some(PickerKind::Grep),
+            items,
+            groups: vec![GroupSpan {
+                start: 0,
+                header: GroupHeader::File {
+                    path_index: 0,
+                    relative_path: "a.rs".into(),
+                },
+            }],
+            total_matches: 8,
+            selected: 4,
+            visible_start: 3,
+            ..Default::default()
+        });
+        let rows = render_rows(&state);
+        assert_eq!(
+            hit_at(&state, cell_of(&rows, "a.rs")),
+            PickerHit::Chrome,
+            "the pinned header must not select the hit it covers"
+        );
+        // The rows below the pin are still live: HIT3 is view row 4, the first uncovered item.
+        assert_eq!(hit_at(&state, cell_of(&rows, "HIT3")), PickerHit::Item(3));
+    }
+
+    /// Presses outside the results pane: the query row (and the rest of the box's chrome) is
+    /// swallowed, while anything beyond the box is a backdrop press — the shell's click-away.
+    #[test]
+    fn picker_click_separates_chrome_from_backdrop() {
+        let items = flat_items(4);
+        let state = picker_app(crate::picker::PickerState {
+            open: true,
+            kind: Some(PickerKind::Files),
+            total_matches: items.len() as u32,
+            items,
+            ..Default::default()
+        });
+        let rows = render_rows(&state);
+        assert_eq!(
+            hit_at(&state, cell_of(&rows, "Find files…")),
+            PickerHit::Chrome,
+            "the query row is chrome, not a result row"
+        );
+        // A four-item box collapses to its content, so everything below its bottom border — down to
+        // the screen's last row — is backdrop. The border itself still belongs to the box.
+        let (bottom, _) = cell_of(&rows, "╰");
+        assert_eq!(
+            hit_at(&state, (bottom, TEST_COLS / 2)),
+            PickerHit::Chrome,
+            "the bottom border is the box, not the backdrop"
+        );
+        assert_eq!(
+            hit_at(&state, (bottom + 1, TEST_COLS / 2)),
+            PickerHit::Backdrop
+        );
+        assert_eq!(
+            hit_at(&state, (TEST_ROWS - 1, TEST_COLS - 1)),
+            PickerHit::Backdrop
         );
     }
 

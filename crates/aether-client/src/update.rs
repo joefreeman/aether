@@ -3086,6 +3086,18 @@ impl Session {
         Effects::none()
     }
 
+    /// Is the open picker the *mandatory* chooser — the Workspaces picker over a placeholder
+    /// session (a no-args start, or after `ToChooser`)? There's nothing behind it to fall back to,
+    /// so no dismissal gesture may close it: Esc exits the process instead (see
+    /// [`Self::on_picker_key`]) and a shell's click-away leaves it up.
+    pub fn picker_is_mandatory(&self) -> bool {
+        self.is_placeholder()
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.kind == PickerKind::Workspaces)
+    }
+
     pub fn close_picker(&mut self) -> Effects {
         let Some(p) = self.picker.take() else {
             return Effects::none();
@@ -3155,18 +3167,17 @@ impl Session {
                 }
             }
         }
-        let placeholder = self.is_placeholder();
+        let mandatory = self.picker_is_mandatory();
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         match code {
-            // The mandatory chooser: over a placeholder session (the Workspaces picker on a
-            // no-args start, or after `ToChooser`) there is nothing behind the picker to fall
-            // back to, so Esc exits instead of dismissing. The picker deliberately stays open —
-            // a shell that can't exit (the web: a browser tab has no process to quit) maps
-            // `Effect::Exit` to a no-op and the chooser simply remains up. Deliberately not a
+            // The mandatory chooser ([`Self::picker_is_mandatory`]): there is nothing behind the
+            // picker to fall back to, so Esc exits instead of dismissing. The picker deliberately
+            // stays open — a shell that can't exit (the web: a browser tab has no process to quit)
+            // maps `Effect::Exit` to a no-op and the chooser simply remains up. Deliberately not a
             // `PickerCmd::Dismiss` observation: nothing closes here.
-            KeyCode::Esc if placeholder && p.kind == PickerKind::Workspaces => {
+            KeyCode::Esc if mandatory => {
                 return Effects::one(Effect::Exit);
             }
             // Hint observation before the picker closes (the picker-dismiss hint displays in
