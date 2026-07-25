@@ -160,6 +160,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let modal_open = state.picker.open
         || state.workspace_settings.is_some()
         || state.app_settings.is_some()
+        || state.app_info.is_some()
         || state.picker.lsp_detail.is_some();
     // Status-bar prompts dim the editor too, so attention moves to the prompt: the save-as path
     // input and the y/N confirm prompts. Search is deliberately excluded — it live-highlights
@@ -187,6 +188,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // core drills into `Prompt::LspInfo`, so it's not part of the picker box.
     if let Some(detail) = state.picker.lsp_detail.as_ref() {
         draw_lsp_detail_overlay(f, detail, chunks[0]);
+    }
+    // Application info (Space ?): the same box as the LSP detail, one section per group.
+    if let Some(info) = state.app_info.as_ref() {
+        draw_app_info_overlay(f, info, chunks[0]);
     }
     if show_status {
         draw_status(f, state, chunks[1]);
@@ -405,6 +410,16 @@ struct HoverLayout {
     needs_scrollbar: bool,
     /// Fully-styled, width-wrapped display lines.
     lines: Vec<Line<'static>>,
+}
+
+/// The on-screen rectangle of the app-info dialog (border included), or `None` when it isn't open.
+/// Used by the mouse handler to hit-test a press: inside is swallowed, outside dismisses. Derived
+/// from the same [`picker_box_rect`] the renderer uses, against the editor area reconstructed from
+/// the stored viewport size — so the hit box can't drift from what was drawn.
+pub fn app_info_rect(state: &AppState) -> Option<Rect> {
+    state.app_info.as_ref()?;
+    let area = Rect::new(0, 0, state.viewport_cols as u16, state.viewport_rows as u16);
+    Some(picker_box_rect(area))
 }
 
 /// The on-screen rectangle of the hover popup (border included), or `None` when no popup is showing.
@@ -1703,14 +1718,14 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
         Line::from(""),
     ];
     let w = text_w as usize;
-    push_lsp_detail_row(&mut lines, "Language", &detail.language, NORD4, w);
-    push_lsp_detail_row(&mut lines, "Workspace", &detail.workspace_root, NORD4, w);
+    push_detail_row(&mut lines, "Language", &detail.language, NORD4, w);
+    push_detail_row(&mut lines, "Workspace", &detail.workspace_root, NORD4, w);
     if let LspStatus::Crashed { code, message } = &detail.status {
         let mut msg = message.clone();
         if let Some(c) = code {
             msg.push_str(&format!(" (exit code {c})"));
         }
-        push_lsp_detail_row(&mut lines, "Error", &msg, NORD11, w);
+        push_detail_row(&mut lines, "Error", &msg, NORD11, w);
     }
     for (i, p) in detail.progress.iter().enumerate() {
         let mut text = p.title.clone();
@@ -1721,7 +1736,7 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
             text.push_str(&format!("  {msg}"));
         }
         // The label appears once; further operations keep the value column.
-        push_lsp_detail_row(
+        push_detail_row(
             &mut lines,
             if i == 0 { "Working" } else { "" },
             &text,
@@ -1754,10 +1769,78 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
     }
 }
 
-/// One labelled row of the LSP detail: a dim `Label` column, then the value in `color`, wrapped
-/// to the remaining width with continuation lines indented to the value column. An empty label
-/// keeps the column (wrap continuations; second and later Working operations).
-fn push_lsp_detail_row(
+/// The application-info dialog (`Space ?`): build identity, the daemon we're connected to, and
+/// where this profile's state lives. Shares the LSP detail's box and label/value rows — they're the
+/// same kind of screen, and the section headings are the only thing this one adds.
+///
+/// Content is entirely the core's ([`aether_client::app_info::sections`]); the TUI picks the box
+/// and the colours.
+fn draw_app_info_overlay(f: &mut Frame, info: &crate::app::AppInfoView, area: Rect) {
+    let box_area = picker_box_rect(area);
+    if box_area.width < 4 || box_area.height < 3 {
+        return;
+    }
+    f.render_widget(Clear, box_area);
+    let block = overlay_block();
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let area = pad_horizontal(inner);
+    let text_w = area.width.saturating_sub(2).max(1) as usize; // reserve the scrollbar column + gap
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Aether".to_string(),
+            Style::default().fg(NORD6).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, section) in info.sections.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.title.to_string(),
+            Style::default().fg(NORD8),
+        )));
+        for row in &section.rows {
+            // Yellow is the drift warning — the one row here that means something is wrong rather
+            // than merely being a fact about the install.
+            let color = match row.tone {
+                aether_client::app_info::InfoTone::Warn => NORD13,
+                aether_client::app_info::InfoTone::Normal => NORD4,
+            };
+            push_detail_row(&mut lines, row.label, &row.value, color, text_w);
+        }
+    }
+    let total = lines.len() as u16;
+    let body_h = area.height;
+    info.scroll.record(total, body_h);
+    let offset = info.scroll.offset();
+    let text_area = Rect {
+        width: text_w as u16,
+        ..area
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(NORD0).fg(NORD4))
+            .scroll((offset, 0)),
+        text_area,
+    );
+    if total > body_h {
+        let bar = Rect {
+            x: area.x + area.width - 1,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        draw_vertical_scrollbar(f, bar, offset, total, body_h);
+    }
+}
+
+/// One labelled row of a detail dialog (LSP server, app info): a dim `Label` column, then the value
+/// in `color`, wrapped to the remaining width with continuation lines indented to the value column.
+/// An empty label keeps the column (wrap continuations; second and later Working operations).
+fn push_detail_row(
     lines: &mut Vec<Line<'static>>,
     label: &str,
     value: &str,
@@ -6067,6 +6150,7 @@ mod tests {
             save_prompt: None,
             open_path_prompt: None,
             confirm_prompt: None,
+            app_info: None,
             editor: None,
             workspace_settings: None,
             app_settings: None,
@@ -6074,6 +6158,62 @@ mod tests {
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
         }
+    }
+
+    fn app_info_app() -> AppState {
+        let mut st = picker_app(crate::picker::PickerState::default());
+        st.app_info = Some(crate::app::AppInfoView {
+            sections: aether_client::app_info::sections(&aether_protocol::app::AppInfo {
+                version: "0.9.9".into(),
+                commit: Some("abc1234".into()),
+                commit_dirty: false,
+                debug_build: false,
+                appimage: None,
+                profile: "dev".into(),
+                port: Some(2385),
+                pid: 42,
+                started_at_unix_ms: 0,
+                uptime_secs: 90,
+                idle_timeout_secs: None,
+                clients: 1,
+                buffers_open: 2,
+                buffers_unsaved: 0,
+                workspaces_active: 1,
+                paths: Default::default(),
+            }),
+            scroll: Default::default(),
+        });
+        st
+    }
+
+    /// The dialog draws into the same box the pickers use, and its rows land on screen.
+    #[test]
+    fn app_info_dialog_renders_in_the_picker_box() {
+        let rows = render_rows(&app_info_app());
+        let screen = rows.join("\n");
+        for needle in ["Aether", "Version", "0.9.9", "Instance", "Profile", "dev"] {
+            assert!(screen.contains(needle), "{needle:?} missing from\n{screen}");
+        }
+    }
+
+    /// The mouse hit box the shell tests presses against must be the box that was actually drawn —
+    /// otherwise a click just inside the border would read as a backdrop press and dismiss.
+    #[test]
+    fn app_info_rect_matches_the_drawn_box() {
+        let st = app_info_app();
+        let rect = app_info_rect(&st).expect("open dialog has a rect");
+        assert_eq!(
+            rect,
+            picker_box_rect(Rect::new(0, 0, TEST_COLS, TEST_ROWS)),
+            "hit box tracks the renderer's geometry"
+        );
+        // The dialog's own border column is inside the box (a press there is swallowed, not a
+        // backdrop dismiss).
+        assert!(rect.width >= 4 && rect.height >= 3);
+
+        let mut closed = app_info_app();
+        closed.app_info = None;
+        assert!(app_info_rect(&closed).is_none());
     }
 
     /// Render the whole picker overlay to an in-memory terminal and read the rows back.
@@ -7022,7 +7162,10 @@ mod tests {
         let spans = picker_item_spans(&item, &[], false, 40);
         let text = spans_text(&spans);
         assert!(text.starts_with("helper();"), "indent stripped: {text:?}");
-        assert!(text.ends_with("41"), "1-based line number right-aligned: {text:?}");
+        assert!(
+            text.ends_with("41"),
+            "1-based line number right-aligned: {text:?}"
+        );
         let hl: String = spans
             .iter()
             .filter(|s| s.style.fg == Some(NORD13))

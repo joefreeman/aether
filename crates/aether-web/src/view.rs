@@ -235,6 +235,23 @@ fn prompt(p: &Option<Prompt>, workspace_paths: &[String]) -> Value {
         }
         Some(Prompt::SaveAs(ed)) => save_as(ed, workspace_paths),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
+        // App info: ship the *composed sections*, not the raw snapshot. Row selection, ordering and
+        // wording are the core's (shared with the native shells); the browser only paints them, so
+        // it can't drift from what the TUI and GUI show.
+        Some(Prompt::AppInfo(info)) => json!({
+            "kind": "appinfo",
+            "sections": aether_client::app_info::sections(info)
+                .into_iter()
+                .map(|s| json!({
+                    "title": s.title,
+                    "rows": s.rows.into_iter().map(|r| json!({
+                        "label": r.label,
+                        "value": r.value,
+                        "warn": r.tone == aether_client::app_info::InfoTone::Warn,
+                    })).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        }),
         // Open-from-path: a single plain path field (no root chips). The shell renders an
         // `<input>` and syncs its value via `open_path_set_input`.
         Some(Prompt::OpenPath(field)) => json!({ "kind": "openpath", "input": field.text }),

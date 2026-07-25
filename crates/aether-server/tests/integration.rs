@@ -15660,7 +15660,10 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     let items = update.items();
     assert_eq!(items.len(), 3);
     let PickerItem::JumplistEntry {
-        index, line, display, ..
+        index,
+        line,
+        display,
+        ..
     } = &items[0]
     else {
         panic!("expected JumplistEntry, got {:?}", items[0]);
@@ -15779,7 +15782,11 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
         current = target.opened.expect("composite opens").buffer_id;
         seen.push(target.index);
     }
-    assert_eq!(seen, vec![1, 2], "the narrowed list is the two main.rs hits");
+    assert_eq!(
+        seen,
+        vec![1, 2],
+        "the narrowed list is the two main.rs hits"
+    );
 
     // On the last narrowed entry, forward stops — lib.rs is not reachable by wrapping.
     let outcome: JumplistStepResult = send_request::<JumplistStep>(
@@ -20089,9 +20096,10 @@ async fn open_and_subscribe_with_lsp(
     rel_path: &str,
     dummy_lsp: Vec<(String, aether_server::DummyLspConfig)>,
 ) -> (aether_server::ServerHandle, Ws) {
-    let server = aether_server::spawn_for_test_with_lsp(workspace, vec![root.to_path_buf()], dummy_lsp)
-        .await
-        .unwrap();
+    let server =
+        aether_server::spawn_for_test_with_lsp(workspace, vec![root.to_path_buf()], dummy_lsp)
+            .await
+            .unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -20588,9 +20596,13 @@ async fn lsp_diagnostics_clear_on_undo() {
         diagnostics_trigger: Some(DiagnosticsTrigger::Present("@".into())),
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("undo-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "undo-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     // Re-open by path to learn the buffer id (dedups to the same buffer).
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
@@ -20776,9 +20788,13 @@ async fn lsp_hover_returns_contents() {
         hover: Some("```rust\nfn main()\n```".into()),
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("hover-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "hover-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20837,9 +20853,13 @@ async fn lsp_goto_definition_resolves() {
         definition: Some(DummyRange::on(0, 3, 9)),
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("def-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "def-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -20908,9 +20928,13 @@ async fn references_picker_lists_all_uses() {
         definition: Some(DummyRange::on(0, 3, 9)),
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("refs-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "refs-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -21080,9 +21104,13 @@ async fn lsp_format_reformats() {
         ..Default::default()
     };
     let main_path = dir.path().join("main.rs");
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("fmt-rust", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "fmt-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -21220,7 +21248,10 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         PickerItem, PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult,
     };
     use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
-    let dir = lay_out(&[("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n")]);
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn main() {\n    let _x: i32 = \"not an int\";\n}\n",
+    )]);
     let dummy = DummyLspConfig {
         diagnostics: vec![DummyDiagnostic {
             range: DummyRange::on(1, 17, 29),
@@ -21229,9 +21260,13 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         }],
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("diagpick", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "diagpick",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -21286,7 +21321,10 @@ async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
         GroupHeader, PickerKind, PickerView, PickerViewParams, PickerViewResult,
     };
     use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
-    let dir = lay_out(&[("main.rs", "fn main() {\n    let _x: i32 = \"not an int\";\n}\n")]);
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn main() {\n    let _x: i32 = \"not an int\";\n}\n",
+    )]);
     let dummy = DummyLspConfig {
         diagnostics: vec![DummyDiagnostic {
             range: DummyRange::on(1, 17, 29), // the `"not an int"` literal
@@ -21295,9 +21333,13 @@ async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
         }],
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("diagjump", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "diagjump",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,
@@ -25173,6 +25215,57 @@ async fn status_endpoint_reports_clients_and_unsaved_buffers() {
         .unwrap();
     assert_eq!(after.buffers_open, 1);
     assert_eq!(after.buffers_unsaved, 1);
+
+    drop(server);
+}
+
+/// `app/info` (the `Space ?` dialog) reports the same snapshot as `/status` — one builder serves
+/// both, so the in-app dialog and `ae server status` can't disagree about what the server is. Also
+/// pins the fields that only the RPC path exposes: build identity, profile, pid, and the bound port.
+#[tokio::test]
+async fn app_info_matches_the_status_endpoint() {
+    use aether_protocol::app::{AppInfo, AppInfoGet, AppInfoParams};
+
+    let (server, mut ws, _buffer_id) = setup_with_buffer("hello\n").await;
+    let port = server.port;
+
+    let info: AppInfo = send_request::<AppInfoGet>(&mut ws, 200, &AppInfoParams {}).await;
+
+    assert_eq!(info.version, aether_protocol::PROTOCOL_VERSION);
+    assert_eq!(info.commit.as_deref(), aether_protocol::BUILD_COMMIT);
+    assert!(info.debug_build, "tests run against a debug build");
+    assert_eq!(info.pid, std::process::id(), "in-process test server");
+    assert_eq!(
+        info.port,
+        Some(port),
+        "the bound (ephemeral) port, not the one profile.toml recorded"
+    );
+    assert_eq!(info.clients, 1);
+    assert_eq!(info.buffers_open, 1);
+    assert_eq!(info.buffers_unsaved, 0);
+    assert_eq!(info.workspaces_active, 1);
+    assert_eq!(
+        info.idle_timeout_secs, None,
+        "test servers run persistent (no idle reaper)"
+    );
+
+    // The HTTP snapshot is the same payload. Compare the fields that can't drift between two calls
+    // — uptime advances between them, so it's excluded rather than made flaky.
+    let via_http = tokio::task::spawn_blocking(move || aether_server::fetch_status(port))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        AppInfo {
+            uptime_secs: 0,
+            ..via_http
+        },
+        AppInfo {
+            uptime_secs: 0,
+            ..info
+        },
+        "`app/info` and `GET /status` serve one snapshot"
+    );
 
     drop(server);
 }

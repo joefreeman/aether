@@ -1359,6 +1359,95 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
     }
 }
 
+/// `Space ?` fetches the snapshot rather than composing one client-side (the build, pid, port and
+/// counts all describe the *server*), then opens the dialog when it lands.
+#[test]
+fn space_question_opens_the_app_info_dialog() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+
+    let mut s = session();
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    // A terminal reports `?` with SHIFT held; the binding uses `IgnoreShift` so both that and the
+    // GUI/web's already-resolved character hit it.
+    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()), ROWS);
+    assert!(
+        find_request(&fx, "app/info").is_some(),
+        "the dialog's content is fetched from the server"
+    );
+    assert!(s.prompt.is_none(), "nothing opens until the snapshot lands");
+
+    let _ = s.on_event(Event::AppInfoLoaded(Ok(app_info())));
+    assert!(matches!(s.prompt, Some(Prompt::AppInfo(_))), "dialog opens");
+}
+
+/// `Ctrl-c` copies the whole snapshot and *stays open* (copying isn't dismissing); any other key
+/// closes. It's the editor's own Copy chord — safe here because the dialog has no text input to
+/// claim it first, unlike a picker's query field.
+#[test]
+fn app_info_ctrl_c_copies_and_keeps_the_dialog_open() {
+    use aether_client::session::Prompt;
+
+    let mut s = session();
+    s.prompt = Some(Prompt::AppInfo(Box::new(app_info())));
+    let fx = s.on_key(KeyCode::Char('c'), Mods::CTRL, None, ROWS);
+    let copied = written_clipboard(&fx).expect("Ctrl-c copies");
+    // The copied text is the rendered dialog, so a row can't exist in one and not the other.
+    assert!(copied.contains("0.9.9") && copied.contains("dev") && copied.contains("Paths"));
+    assert!(
+        matches!(s.prompt, Some(Prompt::AppInfo(_))),
+        "copying leaves the dialog up"
+    );
+
+    // A bare `c` is not the copy chord — it closes like any other key.
+    let fx = s.on_key(KeyCode::Char('c'), Mods::NONE, Some("c".into()), ROWS);
+    assert!(s.prompt.is_none(), "any other key closes");
+    assert!(written_clipboard(&fx).is_none());
+
+    s.prompt = Some(Prompt::AppInfo(Box::new(app_info())));
+    let fx = s.on_key(KeyCode::Char('q'), Mods::NONE, Some("q".into()), ROWS);
+    assert!(s.prompt.is_none(), "any other key closes");
+    assert!(written_clipboard(&fx).is_none());
+}
+
+/// A failed fetch surfaces as an error toast instead of an empty dialog.
+#[test]
+fn app_info_failure_toasts_rather_than_opening() {
+    use aether_client::update::Event;
+
+    let mut s = session();
+    let fx = s.on_event(Event::AppInfoLoaded(Err("server gone".into())));
+    assert!(s.prompt.is_none());
+    assert!(fx.0.iter().any(|e| matches!(
+        e,
+        aether_client::effect::Effect::Toast { message, .. } if message.contains("server gone")
+    )));
+}
+
+fn app_info() -> aether_protocol::app::AppInfo {
+    aether_protocol::app::AppInfo {
+        version: "0.9.9".into(),
+        commit: Some("abc1234".into()),
+        commit_dirty: false,
+        debug_build: false,
+        appimage: None,
+        profile: "dev".into(),
+        port: Some(2385),
+        pid: 42,
+        started_at_unix_ms: 0,
+        uptime_secs: 90,
+        idle_timeout_secs: None,
+        clients: 1,
+        buffers_open: 2,
+        buffers_unsaved: 0,
+        workspaces_active: 1,
+        paths: aether_protocol::app::AppPaths {
+            config_dir: Some("/c".into()),
+            ..Default::default()
+        },
+    }
+}
+
 #[test]
 fn lsp_info_restart_is_ctrl_r_not_plain_r() {
     use aether_client::session::Prompt;

@@ -10,6 +10,7 @@
 //! but a browser shell bridges `web-sys` sockets and needs no discovery. (Known debt for
 //! an actual wasm shell: a `Send`-bound feature toggle on the effect futures.)
 
+pub mod app_info;
 pub mod chips;
 pub mod effect;
 pub mod grid;

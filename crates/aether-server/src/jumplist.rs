@@ -432,13 +432,19 @@ pub fn step_in_file(
     };
     match direction {
         Direction::Forward => {
-            let Some(pos) = in_file.iter().position(|&i| past(i) > (edge.line, edge.col)) else {
+            let Some(pos) = in_file
+                .iter()
+                .position(|&i| past(i) > (edge.line, edge.col))
+            else {
                 return InFileStep::AtEnd;
             };
             InFileStep::Moved(in_file[(pos + extra).min(in_file.len() - 1)])
         }
         Direction::Backward => {
-            let Some(pos) = in_file.iter().rposition(|&i| past(i) < (edge.line, edge.col)) else {
+            let Some(pos) = in_file
+                .iter()
+                .rposition(|&i| past(i) < (edge.line, edge.col))
+            else {
                 return InFileStep::AtEnd;
             };
             InFileStep::Moved(in_file[pos.saturating_sub(extra)])
@@ -861,10 +867,7 @@ mod tests {
         let mut entries = vec![labeled_entry, external];
         assign_file_groups(&mut entries, &roots);
         // An existing header (references' Label) is preserved; parts are still derived.
-        assert!(matches!(
-            entries[0].group,
-            Some(GroupHeader::Label { .. })
-        ));
+        assert!(matches!(entries[0].group, Some(GroupHeader::Label { .. })));
         assert_eq!(entries[0].relative_path.as_deref(), Some("a.rs"));
         // Out-of-workspace: nothing to derive, stays ungrouped (opens by absolute path).
         assert_eq!(entries[1].path_index, None);

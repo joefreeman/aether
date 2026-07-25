@@ -1226,9 +1226,10 @@ impl App {
             } => {
                 // The hover popover stays open while wheel-scrolling the buffer behind it —
                 // `hover_overlay` re-anchors it to its line (clamped to the window) each frame.
-                // With a picker open, its scrollable owns wheel input over the list; wheel
-                // over the backdrop shouldn't scroll the editor behind it either.
-                if self.session.picker.is_some() {
+                // With a picker or a modal prompt open, the overlay's own scrollable owns wheel
+                // input over the box; wheel over the backdrop shouldn't scroll the editor behind
+                // it either — a modal owns the screen, matching the press path above.
+                if self.session.picker.is_some() || self.session.prompt.is_some() {
                     return Task::none();
                 }
                 self.scroll_by(delta_px);
@@ -2614,6 +2615,9 @@ impl App {
     /// The modal dialog, centred — web `modal.ts` styling (nord1 panel, message + buttons or
     /// the save-as path input). Buttons need `Clone` messages, so the content is built in
     /// [`PromptMsg`] space and mapped.
+    ///
+    /// Geometry comes from [`prompt_box`] — see there for why the info dialog is shaped differently
+    /// from the question-shaped prompts.
     fn prompt_overlay(&self) -> Element<'_, Message> {
         let prompt = self.session.prompt.as_ref().unwrap();
         // The save-as arm embeds a controlled `text_input` (which produces `Message`), so the
@@ -2736,6 +2740,48 @@ impl App {
                     col = col.push(kv("Working", line));
                 }
                 col.spacing(10).into()
+            }
+            // Application info (`Space ?`). Rows come from the core so all three shells agree on
+            // content and wording; the GUI contributes the heading treatment and the label column.
+            // Long values (absolute paths) wrap inside the fixed-width prompt box rather than being
+            // truncated — a half path is worse than a two-line one.
+            Prompt::AppInfo(info) => {
+                use aether_client::app_info::InfoTone;
+                // Two nested spacings, not one: rows within a section sit tight (3px) and the gap
+                // between sections (12px) does the grouping. A single uniform spacing made the
+                // dialog tall enough to overflow a small window.
+                let mut col = column![text("Aether")
+                    .size(14)
+                    .font(SANS_BOLD_UI)
+                    .color(theme::NORD6)]
+                .spacing(12);
+                for section in aether_client::app_info::sections(info) {
+                    let mut rows = column![text(section.title)
+                        .size(12)
+                        .font(SANS_BOLD_UI)
+                        .color(theme::NORD8)]
+                    .spacing(3);
+                    for r in section.rows {
+                        // Yellow marks the client/server build mismatch — the only row here that
+                        // reports a problem rather than a fact.
+                        let value_color = match r.tone {
+                            InfoTone::Warn => theme::NORD13,
+                            InfoTone::Normal => theme::NORD6,
+                        };
+                        rows = rows.push(
+                            row![
+                                container(
+                                    text(r.label).size(13).font(SANS).color(theme::NORD3_BRIGHT)
+                                )
+                                .width(84),
+                                text(r.value).size(13).font(SANS).color(value_color),
+                            ]
+                            .spacing(8),
+                        );
+                    }
+                    col = col.push(rows);
+                }
+                col.into()
             }
             Prompt::Confirm { kind, .. } => column![
                 text(format!("{}?", confirm_phrase(kind)))
@@ -2903,9 +2949,28 @@ impl App {
                 .into()
             }
         };
+        let info_dialog = matches!(prompt, Prompt::AppInfo(_));
+        let PromptBox { width, top, max_h } = prompt_box(info_dialog, self.view_size.height);
+        let body: Element<'_, Message> = if info_dialog {
+            // Both widths are `Fill` on purpose. A scrollable defaults to `Shrink`, so it would
+            // size to its widest row and draw the scrollbar against the *text* rather than the box
+            // edge; filling makes its bounds the box's, which is where the bar belongs. The padding
+            // sits inside the scrollable so the bar clears the box border rather than the content.
+            iced::widget::scrollable(container(body).padding(16).width(Length::Fill))
+                .width(Length::Fill)
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::new()
+                        .width(5)
+                        .margin(0)
+                        .scroller_width(5),
+                ))
+                .into()
+        } else {
+            container(body).padding(16).into()
+        };
         let boxed = container(body)
-            .width(420)
-            .padding(16)
+            .width(width)
+            .max_height(max_h)
             .style(|_| container::Style {
                 background: Some(theme::NORD1.into()),
                 border: iced::Border {
@@ -2926,7 +2991,7 @@ impl App {
             .align_x(iced::alignment::Horizontal::Center)
             .align_y(iced::alignment::Vertical::Top)
             .padding(iced::Padding {
-                top: 120.0,
+                top,
                 ..iced::Padding::ZERO
             })
             .style(|_| container::Style {
@@ -3882,6 +3947,36 @@ fn format_total(s: &SearchSummary) -> String {
     }
 }
 
+/// Box geometry for the modal prompt overlay.
+struct PromptBox {
+    width: f32,
+    /// Gap above the box — also the bottom margin [`PromptBox::max_h`] reserves.
+    top: f32,
+    /// Height cap; taller content scrolls inside the box instead of running off the window.
+    max_h: f32,
+}
+
+/// Size and place the prompt box. Two shapes, because there are two kinds of prompt:
+///
+/// * A **question** (confirm / save-as / open-path) is short and wants to sit near eye level, so it
+///   keeps the narrower box and the lower offset.
+/// * The **info dialog** is a reference screen: it's wider (absolute paths would otherwise wrap
+///   three times), and it sits at the picker's offset so the app's two "read something" overlays
+///   line up rather than appearing at different heights.
+///
+/// Either way the height is capped to leave `top` clear at *both* ends, so the box is never taller
+/// than the window — the cut-off the fixed-height version suffered in a small window. The floor
+/// keeps it usable on a very short window, where scrolling inside a small box beats a box drawn
+/// past the bottom edge.
+fn prompt_box(info_dialog: bool, view_height: f32) -> PromptBox {
+    let top = if info_dialog { 56.0 } else { 120.0 };
+    PromptBox {
+        width: if info_dialog { 560.0 } else { 420.0 },
+        top,
+        max_h: (view_height - top * 2.0).max(120.0),
+    }
+}
+
 /// Compose the prompt phrasing for a confirmation. The core supplies the structured reason
 /// ([`ConfirmKind`]); wording is the native client's presentational choice (the dialog then
 /// appends `?` and offers Yes/No).
@@ -4160,6 +4255,39 @@ mod tests {
     use super::*;
     use crate::picker::{GROUP_GAP, ROW_H};
     use aether_protocol::picker::{PickerItem, PickerUpdateParams};
+
+    /// The info dialog is capped to leave its own top offset clear at both ends, so it can't run
+    /// off a short window — the bug that made it clip before it was made scrollable.
+    #[test]
+    fn info_dialog_never_exceeds_the_window() {
+        for view_h in [400.0, 700.0, 1080.0, 2160.0] {
+            let b = prompt_box(true, view_h);
+            assert!(
+                b.top + b.max_h + b.top <= view_h.max(b.top * 2.0 + 120.0),
+                "box at {view_h}px window: top {} + max_h {} overflows",
+                b.top,
+                b.max_h
+            );
+        }
+    }
+
+    /// On a very short window the cap bottoms out rather than collapsing to nothing — a small
+    /// scrolling box still beats an unusable one.
+    #[test]
+    fn info_dialog_height_has_a_floor() {
+        assert_eq!(prompt_box(true, 100.0).max_h, 120.0);
+        assert_eq!(prompt_box(true, 0.0).max_h, 120.0);
+    }
+
+    /// The info dialog is the wide, picker-aligned shape; the question prompts keep the narrow,
+    /// lower one.
+    #[test]
+    fn prompt_shapes_differ_by_kind() {
+        let info = prompt_box(true, 1000.0);
+        let question = prompt_box(false, 1000.0);
+        assert!(info.width > question.width);
+        assert!(info.top < question.top, "info sits at the picker's offset");
+    }
 
     /// A grep window: rows [0]=hdr a.rs, [1..=3]=hits, [4]=hdr b.rs, [5..=24]=hits.
     fn grep_state() -> PickerState {

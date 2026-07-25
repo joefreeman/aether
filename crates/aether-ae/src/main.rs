@@ -485,7 +485,23 @@ fn server_status() -> anyhow::Result<()> {
                     s.version
                 );
             }
-            println!("  uptime:     {}", format_uptime(s.started_at_unix_ms));
+            // Which *build*, not just which release: between releases the version is constant while
+            // the code moves, so the commit is what identifies the running daemon. Same line the
+            // in-app info dialog shows.
+            let mut build = s.commit.clone().unwrap_or_else(|| "unknown commit".into());
+            if s.commit_dirty {
+                build.push_str(" (modified)");
+            }
+            build.push_str(if s.debug_build {
+                " · debug"
+            } else {
+                " · release"
+            });
+            println!("  build:      {build}");
+            println!(
+                "  uptime:     {}",
+                aether_client::app_info::format_duration_secs(s.uptime_secs)
+            );
             println!("  clients:    {}", s.clients);
             if s.buffers_unsaved > 0 {
                 println!(
@@ -499,6 +515,15 @@ fn server_status() -> anyhow::Result<()> {
             match s.idle_timeout_secs {
                 Some(secs) => println!("  mode:       auto-started (reaps after {secs}s idle)"),
                 None => println!("  mode:       persistent (`ae server`)"),
+            }
+            // Where this profile's state lives. Profile-scoped and therefore not guessable, and the
+            // answer to most "reset it" / "why is it remembering that?" questions. Omitted when the
+            // server couldn't resolve them — the same failure that disables the feature there.
+            if let Some(p) = &s.paths.config_dir {
+                println!("  config:     {p}");
+            }
+            if let Some(p) = &s.paths.state_dir {
+                println!("  state:      {p}");
             }
         }
         Err(e) => println!("  (running, but live details unavailable: {e})"),
@@ -515,33 +540,6 @@ fn active_profile_port() -> anyhow::Result<Option<u16>> {
         .into_iter()
         .find(|p| p.name == profile)
         .map(|p| p.port))
-}
-
-/// Format a server's uptime from its start stamp (unix ms) for the status line. Coarse on purpose —
-/// whole seconds, with the largest two units shown.
-fn format_uptime(started_at_unix_ms: u64) -> String {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(started_at_unix_ms);
-    format_duration_secs(now_ms.saturating_sub(started_at_unix_ms) / 1000)
-}
-
-/// Render a whole-second duration as at most the two largest non-zero units (`3d 4h`, `5m 12s`).
-fn format_duration_secs(secs: u64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let mins = (secs % 3_600) / 60;
-    let s = secs % 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {mins}m")
-    } else if mins > 0 {
-        format!("{mins}m {s}s")
-    } else {
-        format!("{s}s")
-    }
 }
 
 fn run_tui(
@@ -681,16 +679,6 @@ mod tests {
             Some("/tmp/.mount_kitty1".into()),
         );
         assert_eq!(exe, std::path::Path::new("/usr/local/bin/ae"));
-    }
-
-    #[test]
-    fn duration_shows_the_two_largest_units() {
-        assert_eq!(format_duration_secs(0), "0s");
-        assert_eq!(format_duration_secs(42), "42s");
-        assert_eq!(format_duration_secs(90), "1m 30s");
-        assert_eq!(format_duration_secs(3_600), "1h 0m");
-        assert_eq!(format_duration_secs(3_661), "1h 1m");
-        assert_eq!(format_duration_secs(90_000), "1d 1h");
     }
 
     #[test]

@@ -17,6 +17,9 @@ gui = ["dep:aether-iced"]
 
 [dependencies]
 aether-server = { workspace = true }
+# Already in the graph via the shells; a direct dep so `ae server status` can render the app-info
+# snapshot with the same formatters the in-app dialog uses instead of its own copy.
+aether-client = { workspace = true }
 aether-tui = { workspace = true }
 aether-iced = { workspace = true, optional = true }
 

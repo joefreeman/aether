@@ -184,6 +184,11 @@ pub enum Prompt {
     SaveAs(Box<crate::save_as::SaveAsEditor>),
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
+    /// Application info & diagnostics (`Space ?`): build identity, live instance, on-disk paths.
+    /// Rendered from [`crate::app_info::sections`] so every shell shows the same rows; `Ctrl-c`
+    /// copies the lot as text, any other key closes. Re-fetched on each open — the counts inside go
+    /// stale immediately, so there's nothing worth caching.
+    AppInfo(Box<aether_protocol::app::AppInfo>),
     /// The open-from-path overlay (`Space Alt-w`): a single, workspace-agnostic path field. Unlike
     /// [`Self::SaveAs`] (a root-relative chip editor), this is a plain absolute/relative path —
     /// `Enter` opens it via `workspace/open_path` (external buffer outside the roots, or a fresh

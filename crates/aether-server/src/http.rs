@@ -138,12 +138,13 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
     Ok(())
 }
 
-/// Serialize the [`crate::status::ServerStatus`] snapshot as JSON. The out-of-band diagnostic behind
-/// `ae server status`; behind the same loopback-authority guard as every other route.
+/// Serialize the [`aether_protocol::app::AppInfo`] snapshot as JSON — the same payload the
+/// `app/info` RPC returns, so the dialog and the CLI can't disagree. The out-of-band diagnostic
+/// behind `ae server status`; behind the same loopback-authority guard as every other route.
 async fn status_response(state: &SharedState) -> Vec<u8> {
     let status = {
         let s = state.lock().await;
-        crate::status::ServerStatus::from_state(&s)
+        crate::status::app_info(&s)
     };
     match serde_json::to_vec(&status) {
         Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),

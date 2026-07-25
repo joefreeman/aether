@@ -12,6 +12,7 @@ use crate::state::{
 };
 use crate::surround;
 use crate::wrap;
+use aether_protocol::app::{AppInfo, AppInfoParams};
 use aether_protocol::buffer::{
     BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopyParams, BufferCopyResult,
     BufferCutResult, BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult,
@@ -119,6 +120,23 @@ pub async fn workspace_list(
             .map(|name| WorkspaceSummary { name })
             .collect(),
     })
+}
+
+// ---- app/* -------------------------------------------------------------------------------------
+
+/// Snapshot the running application for the info dialog (`Space ?`): build identity, live instance,
+/// on-disk state locations. App-global — no active workspace required, which matters because one
+/// reason to open the dialog is that the client is in a state where nothing else works.
+///
+/// The same snapshot backs `GET /status` (see [`crate::status`]), so the dialog and
+/// `ae server status` can never disagree about what the server is.
+pub async fn app_info(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    _params: AppInfoParams,
+) -> Result<AppInfo, RpcError> {
+    let s = state.lock().await;
+    Ok(crate::status::app_info(&s))
 }
 
 /// Read the global application settings (`$XDG_CONFIG_HOME/aether/settings.toml`). Returns defaults

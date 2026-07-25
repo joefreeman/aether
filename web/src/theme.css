@@ -570,10 +570,32 @@ html, body, #app {
 /* Title: status dot (picker-row colours) + bold server name. */
 .modal.lsp-info .modal-message { font-weight: 600; }
 .lsp-info-icon { margin-right: 8px; display: inline-flex; align-items: center; }
-.lsp-info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
-.lsp-info-key { color: var(--nord3-brighter); }
-.lsp-info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
+/* Label/value grid, shared by the LSP detail and the app-info dialog — both are the same kind of
+   read-only "facts about a thing" screen, so they read identically. */
+.info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
+.info-key { color: var(--nord3-brighter); }
+.info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
 .lsp-info-hint { color: var(--nord3-brighter); font-size: 12px; }
+
+/* Application info (Space ?). Same box as the LSP detail, plus section headings. Height-capped
+   and self-scrolling like
+   `.picker`: the overlay is `position: fixed` and doesn't scroll, so an uncapped dialog would be
+   clipped by a short window rather than reachable. */
+.modal.app-info {
+  width: min(560px, 88vw);
+  max-height: 76vh;
+  overflow-y: auto;
+}
+.modal.app-info .modal-message { font-weight: 600; }
+/* Tighter than the LSP detail's shared `.info-rows`, to match the native dialog's row pitch: the
+   modal's 1.5 line-height plus a 5px gap reads far airier there than iced's 13px text at 3px
+   spacing. Rows hug, and the gap between *sections* does the grouping instead. Scoped to app-info
+   so the LSP dialog (a handful of rows, no sections) keeps its roomier spacing. */
+.modal.app-info .info-rows { gap: 2px 16px; line-height: 1.35; margin-bottom: 0; }
+.app-info-section { color: var(--nord8); font-weight: 600; font-size: 12px; margin: 12px 0 3px; }
+.app-info-section:first-of-type { margin-top: 10px; }
+/* Only the client/server build-mismatch row — the one thing here that's actionable. */
+.info-val.warn { color: var(--nord13); }
 
 /* Workspace settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
 .modal.workspace-settings { width: min(640px, 88vw); }

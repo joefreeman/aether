@@ -259,6 +259,16 @@ type PromptView =
       path_invalid: boolean;
     }
   | { kind: "lspinfo"; status: LspServerStatus }
+  /** Application info (`Space ?`). Pre-composed by the core into titled sections of label/value
+   *  rows, so all three shells show identical content; `warn` marks the client/server build
+   *  mismatch. `y` copies (handled in the core), any other key closes. */
+  | {
+      kind: "appinfo";
+      sections: {
+        title: string;
+        rows: { label: string; value: string; warn: boolean }[];
+      }[];
+    }
   /** Open-from-path: a single plain `<input>` path field (no root chips). The core opens it via
    *  `workspace/open_path` on Enter and syncs typed text via `open_path_set_input`. */
   | { kind: "openpath"; input: string };
@@ -893,7 +903,7 @@ export class Shell {
   private readonly hoverEl: HTMLElement;
   private readonly hoverStrut: HTMLElement;
   private hoverOpen = false;
-  /** Content of the currently-shown popover, retained so Ctrl-y can copy it as plain text. */
+  /** Content of the currently-shown popover, retained so Ctrl-c can copy it as plain text. */
   private hoverContent?: HoverContent;
   /** Tab favicon: the "ae" app mark when the buffer is clean, a state-coloured dot when dirty (the
    *  tab's stand-in for the status bar's dirty marker). The clean mark is monochrome, so its ink
@@ -1577,7 +1587,7 @@ export class Shell {
     // by the core (`keymap::hover_action` via the wasm `hover_key`), so the chords never drift.
     // Copy/scroll keep it open; any other key dismisses it — Esc is then consumed, every other key
     // still acts on the buffer. (Content is also freely mouse-selectable; theme.css lifts
-    // `user-select` on #hover — this Ctrl-y path is the copy-all.)
+    // `user-select` on #hover — this Ctrl-c path is the copy-all.)
     if (this.hoverOpen) {
       const ha = hover_key(e.key, e.ctrlKey, e.altKey, e.shiftKey) as HoverKeyResult;
       if (ha?.kind === "copy") {
@@ -1674,7 +1684,7 @@ export class Shell {
     this.runEffects(effects);
   }
 
-  /** The current popover as plain text (for Ctrl-y). Markdown flattens via the shared serializer;
+  /** The current popover as plain text (for Ctrl-c). Markdown flattens via the shared serializer;
    *  diagnostic/commit blocks join by blank lines. */
   private hoverPlainText(): string {
     const c = this.hoverContent;
@@ -2598,8 +2608,34 @@ export class Shell {
       (p.kind === "confirm" ? " confirm-overlay" : "") +
       (p.kind === "lspinfo" ? " lsp-info-overlay" : "");
     const modal = document.createElement("div");
-    modal.className = "modal" + (p.kind === "lspinfo" ? " lsp-info" : "");
-    if (p.kind === "confirm") {
+    modal.className =
+      "modal" +
+      (p.kind === "lspinfo" ? " lsp-info" : "") +
+      (p.kind === "appinfo" ? " app-info" : "");
+    if (p.kind === "appinfo") {
+      // Content is entirely the core's (same rows the TUI and GUI draw); this only paints them.
+      const header = document.createElement("div");
+      header.className = "modal-message";
+      header.textContent = "Aether";
+      modal.append(header);
+      for (const section of p.sections) {
+        const title = document.createElement("div");
+        title.className = "app-info-section";
+        title.textContent = section.title;
+        const rows = document.createElement("div");
+        rows.className = "info-rows";
+        for (const r of section.rows) {
+          const key = document.createElement("span");
+          key.className = "info-key";
+          key.textContent = r.label;
+          const val = document.createElement("span");
+          val.className = "info-val" + (r.warn ? " warn" : "");
+          val.textContent = r.value;
+          rows.append(key, val);
+        }
+        modal.append(title, rows);
+      }
+    } else if (p.kind === "confirm") {
       const msg = document.createElement("div");
       msg.className = "modal-message";
       msg.textContent = confirmMessage(p.confirm);
@@ -2652,13 +2688,13 @@ export class Shell {
       icon.append(statusIcon(cls, cls === "lsp-busy"));
       header.append(icon, document.createTextNode(st.name));
       const rows = document.createElement("div");
-      rows.className = "lsp-info-rows";
+      rows.className = "info-rows";
       const kv = (k: string, v: string) => {
         const key = document.createElement("span");
-        key.className = "lsp-info-key";
+        key.className = "info-key";
         key.textContent = k;
         const val = document.createElement("span");
-        val.className = "lsp-info-val";
+        val.className = "info-val";
         val.textContent = v;
         rows.append(key, val);
       };
@@ -3872,18 +3908,21 @@ export class Shell {
     }
 
     this.statusEl.replaceChildren(left, right);
-    // Mirror the native clients: "[workspace] label - Aether"; an ephemeral / no-workspace context
-    // drops the `[workspace]` chrome and shows just the label (or "Aether" with no label). The label
-    // is segment-elided to the same fixed cap as the native titles (aether-client's TITLE_LABEL_MAX)
-    // so an external file's absolute path doesn't overflow the tab title.
+    // Mirror the native clients: "[workspace] label", with no app-name suffix (see
+    // aether-client's `window_title` — the favicon already says which app this tab is). An
+    // ephemeral / no-workspace context drops the `[workspace]` chrome and shows just the label;
+    // with nothing at all to show, the app name stands in rather than leaving an empty title, which
+    // would make the browser display the raw URL. The label is segment-elided to the same fixed cap
+    // as the native titles (aether-client's TITLE_LABEL_MAX) so an external file's absolute path
+    // doesn't overflow the tab title.
     const titleLabel = v.buffer.label
       ? truncatePath(v.buffer.label, undefined, TITLE_LABEL_MAX).display
       : "";
     document.title = showsWorkspaceChrome(v.workspace)
-      ? `${titleLabel ? `[${v.workspace}] ${titleLabel}` : `[${v.workspace}]`} - Aether`
-      : titleLabel
-        ? `${titleLabel} - Aether`
-        : "Aether";
+      ? titleLabel
+        ? `[${v.workspace}] ${titleLabel}`
+        : `[${v.workspace}]`
+      : titleLabel || "Aether";
     this.updateFavicon(v);
   }
 

@@ -70,7 +70,7 @@ pub fn profiles_dir() -> anyhow::Result<PathBuf> {
 /// The active profile's config subtree: `<config>/aether/profiles/<name>/`. User-authored durable
 /// config (settings, workspace configs, `profile.toml`) lives under here. Machine-managed state
 /// (sessions, unsaved-buffer backups) lives under [`profile_state_dir`] instead.
-fn profile_config_dir() -> anyhow::Result<PathBuf> {
+pub fn profile_config_dir() -> anyhow::Result<PathBuf> {
     Ok(profiles_dir()?.join(active_profile()))
 }
 
@@ -81,7 +81,7 @@ fn profile_config_dir() -> anyhow::Result<PathBuf> {
 ///
 /// `state_dir()` is `Some` only where `$XDG_STATE_HOME` exists (Linux/BSD); elsewhere (macOS,
 /// Windows) there's no state-home concept, so fall back to the always-present `data_local_dir()`.
-fn profile_state_dir() -> anyhow::Result<PathBuf> {
+pub fn profile_state_dir() -> anyhow::Result<PathBuf> {
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
     let root = base

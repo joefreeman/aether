@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod app;
 pub mod buffer;
 pub mod cursor;
 pub mod directory;
@@ -63,6 +64,29 @@ pub fn is_ephemeral_workspace_id(id: &str) -> bool {
 /// Sourced from the workspace version (every crate sets `version.workspace = true`), so this and the
 /// server's/native clients' `CARGO_PKG_VERSION` are guaranteed equal within a build.
 pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Short git SHA this binary was built from, or `None` when it wasn't built from a checkout (a
+/// source tarball, a machine without `git`). Stamped by `build.rs`.
+///
+/// [`PROTOCOL_VERSION`] identifies a *release*; this identifies a *build*. Between releases the
+/// version is constant while the code moves daily, so the SHA is what actually answers "which
+/// binary is this?" — the question `app/info` exists to settle.
+pub const BUILD_COMMIT: Option<&str> = {
+    let c = env!("AETHER_COMMIT");
+    if c.is_empty() {
+        None
+    } else {
+        Some(c)
+    }
+};
+
+/// Whether the working tree had uncommitted changes when this binary was built — i.e. whether
+/// [`BUILD_COMMIT`] fully describes it. Always `false` when the commit is unknown.
+pub const BUILD_DIRTY: bool = matches!(env!("AETHER_COMMIT_DIRTY").as_bytes(), [b'1']);
+
+/// Whether this is a debug build (`debug_assertions` on). Worth reporting next to the commit: a
+/// debug build of the same commit performs differently enough to explain a "why is this slow?".
+pub const BUILD_DEBUG: bool = cfg!(debug_assertions);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalPosition {

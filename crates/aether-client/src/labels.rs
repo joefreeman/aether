@@ -207,7 +207,7 @@ pub fn truncate_path(label: &str, max_chars: usize) -> String {
 /// `[…]` is omitted entirely when there's no real workspace — a connecting/chooser state (so no
 /// stray `[]`) *and* an ephemeral "(no workspace)" context, which shows just the buffer label.
 /// Long paths are segment-elided (see [`truncate_path`]) so an external file's absolute path doesn't
-/// overflow the title bar. Shells append `" - Aether"` (and the TUI prepends a dirty dot).
+/// overflow the title bar. The TUI prepends a dirty dot; no shell appends the app name.
 pub fn title_body(workspace: &str, label: &str) -> Option<String> {
     if workspace.is_empty() {
         // Boot / connecting / chooser: no workspace *and* no buffer — the title is just the app name.
@@ -226,14 +226,20 @@ pub fn title_body(workspace: &str, label: &str) -> Option<String> {
     })
 }
 
-/// The full window title: the [`title_body`] plus `" - Aether"`, or just `"Aether"` when no
-/// workspace is active (so a fresh/connecting window reads `Aether`, not `[] `).
+/// The full window title: just the [`title_body`]. The app name is deliberately *not* appended —
+/// the title bar is narrow and `[workspace] path` is the part that distinguishes one window from
+/// another; the desktop/browser already labels the app (the GUI via its `application_id`, the tab
+/// via its favicon).
+///
+/// The one exception is having nothing to say at all — boot, connecting, the chooser — where the
+/// name stands in. An empty title isn't neutral: a browser falls back to showing the raw URL and a
+/// window list shows a blank entry, both of which read as a bug rather than as "nothing open yet".
 pub fn window_title(workspace: &str, label: &str) -> String {
-    match title_body(workspace, label) {
-        Some(body) => format!("{body} - Aether"),
-        None => "Aether".to_string(),
-    }
+    title_body(workspace, label).unwrap_or_else(|| APP_NAME.to_string())
 }
+
+/// Stand-in title for a window with no workspace and no buffer. See [`window_title`].
+pub const APP_NAME: &str = "Aether";
 
 #[cfg(test)]
 mod tests {
@@ -323,17 +329,16 @@ mod tests {
     }
 
     #[test]
-    fn window_title_omits_empty_workspace_and_appends_app_name() {
-        // No workspace (boot/connecting/chooser): just the app name — never a stray `[]`.
-        assert_eq!(window_title("", ""), "Aether");
-        assert_eq!(window_title("", "ignored"), "Aether");
+    fn window_title_is_the_body_alone_with_no_app_name_suffix() {
+        // With a workspace the title is just what distinguishes this window — no app-name suffix.
+        assert_eq!(window_title("demo", ""), "[demo]");
+        assert_eq!(window_title("demo", "src/main.rs"), "[demo] src/main.rs");
+        assert!(!window_title("demo", "src/main.rs").contains(APP_NAME));
+        // No workspace (boot/connecting/chooser): the app name stands in for an otherwise empty
+        // title — never a stray `[]`, and never blank (which shows the URL in a browser tab).
+        assert_eq!(window_title("", ""), APP_NAME);
+        assert_eq!(window_title("", "ignored"), APP_NAME);
         assert_eq!(title_body("", ""), None);
-        // With a workspace, the `[workspace] label` body gains the " - Aether" suffix.
-        assert_eq!(window_title("demo", ""), "[demo] - Aether");
-        assert_eq!(
-            window_title("demo", "src/main.rs"),
-            "[demo] src/main.rs - Aether"
-        );
     }
 
     #[test]
@@ -388,11 +393,8 @@ mod tests {
             Some("outside.rs".into())
         );
         assert_eq!(title_body("ephemeral/3", ""), None);
-        assert_eq!(
-            window_title("ephemeral/3", "outside.rs"),
-            "outside.rs - Aether"
-        );
-        assert_eq!(window_title("ephemeral/3", ""), "Aether");
+        assert_eq!(window_title("ephemeral/3", "outside.rs"), "outside.rs");
+        assert_eq!(window_title("ephemeral/3", ""), APP_NAME);
         // A persisted workspace still gets the bracket.
         assert!(shows_workspace_chrome("demo"));
     }

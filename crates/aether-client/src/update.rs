@@ -20,6 +20,7 @@ use super::session::{
     SearchState, Session, SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
+use aether_protocol::app::{AppInfoGet, AppInfoParams};
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopy, BufferCopyParams,
     BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult,
@@ -135,7 +136,13 @@ pub enum Event {
     /// `Direction` and `JumplistStepScope` ride alongside so the boundary toast can name the end
     /// reached (forward = last, backward = first) and whether it was file-scoped, without the
     /// server echoing them back.
-    JumplistStepped(Result<JumplistStepResult, String>, Direction, JumplistStepScope),
+    JumplistStepped(
+        Result<JumplistStepResult, String>,
+        Direction,
+        JumplistStepScope,
+    ),
+    /// An `app/info` snapshot resolved (`Space ?`): open the info dialog, or toast the failure.
+    AppInfoLoaded(Result<aether_protocol::app::AppInfo, String>),
     /// The prompt's Yes/Save button (keyboard accept routes through `on_prompt_key`).
     PromptAccept,
     PromptCancel,
@@ -381,6 +388,14 @@ impl Session {
                 fx
             }
             Event::UndoRedoDone(Err(e)) => Effects::error(e),
+
+            // Opening replaces whatever prompt was up: `Space ?` is only reachable from Normal mode
+            // via the leader, so nothing that owns the keyboard can be underneath it.
+            Event::AppInfoLoaded(Ok(info)) => {
+                self.prompt = Some(Prompt::AppInfo(Box::new(info)));
+                Effects::none()
+            }
+            Event::AppInfoLoaded(Err(e)) => Effects::error(format!("App info failed: {e}")),
 
             Event::CopyDone(Ok(r)) => {
                 let mut fx =
@@ -1838,6 +1853,23 @@ impl Session {
                     info.status = aether_protocol::lsp::LspStatus::Restarting;
                     info.progress.clear();
                     self.prompt = Some(Prompt::LspInfo(info));
+                    return fx;
+                }
+                Effects::none()
+            }
+            Prompt::AppInfo(info) => {
+                // `Ctrl-c` copies the whole snapshot as text — the paste-into-a-bug-report gesture,
+                // and why the dialog beats `ae server status` in another terminal. The editor's own
+                // Copy chord ([`Action::Copy`]), same as the hover popover's copy: this dialog has
+                // no text input, so nothing claims the chord before the core sees it (the hazard in
+                // docs — a *focused query input* — doesn't apply here).
+                // Any other key closes (the prompt was already taken above).
+                if code == KeyCode::Char('c') && mods.ctrl && !mods.alt {
+                    let text = crate::app_info::to_plain_text(&info);
+                    let mut fx = Effects::toast("Copied app info", ToastKind::Success);
+                    fx.push(Effect::WriteClipboard(text));
+                    // Stay open: copying isn't dismissing, and the toast confirms it landed.
+                    self.prompt = Some(Prompt::AppInfo(info));
                     return fx;
                 }
                 Effects::none()
@@ -5279,7 +5311,9 @@ impl Session {
                 self.prompt = Some(p);
                 self.on_prompt_key(KeyCode::Enter, Mods::default(), None)
             }
-            Some(Prompt::LspInfo(_)) | None => Effects::none(),
+            // Informational dialogs have nothing to accept — the button dismisses them, which
+            // taking the prompt above already did.
+            Some(Prompt::LspInfo(_) | Prompt::AppInfo(_)) | None => Effects::none(),
         }
     }
 
@@ -5762,6 +5796,12 @@ impl Session {
                 self.open_app_settings();
                 Effects::none()
             }
+            // Fetched rather than assembled client-side: the build identity, pid, port and counts
+            // all describe the *server* process, and half the value of the dialog is that it
+            // reports the daemon you're actually connected to rather than the one you assume.
+            A::ShowAppInfo => self.request::<AppInfoGet>(AppInfoParams {}, |r| {
+                Event::AppInfoLoaded(r.map_err(|e| e.to_string()))
+            }),
             // Dismiss the corner hint (docs/hints.md): a deliberate "not now" — down-weight it
             // (heavier than a lapsed display) and rotate to another. No-op on an empty corner.
             A::DismissHint => {

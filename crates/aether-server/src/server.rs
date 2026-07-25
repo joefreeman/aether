@@ -92,12 +92,16 @@ pub async fn run_with_listener(
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    // Record the reaper setting so `/status` can report persistent vs. auto-started, and no-op the
-    // watcher spawn when it's already running (e.g. `spawn_for_test` initialized it ahead of the
-    // run task to register workspace paths synchronously).
+    // Record the reaper setting so `/status` can report persistent vs. auto-started, and the bound
+    // port alongside it (taken from the listener, so it's the port in use rather than the one
+    // `profile.toml` recorded). Also no-op the watcher spawn when it's already running (e.g.
+    // `spawn_for_test` initialized it ahead of the run task to register workspace paths
+    // synchronously).
+    let bound_port = listener.local_addr().ok().map(|a| a.port());
     let already_started = {
         let mut s = state.lock().await;
         s.idle_timeout = idle_timeout;
+        s.port = bound_port;
         s.watcher.is_some()
     };
     if !already_started {

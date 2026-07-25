@@ -402,6 +402,10 @@ pub enum Action {
     /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
+    /// `Space ?` — the application-info dialog: build identity, the daemon we're connected to, and
+    /// where this profile's state lives. Sits next to `Space /` (the shortcut reference) because
+    /// both answer "what is this thing doing?" — one about keys, one about the install.
+    ShowAppInfo,
 
     // ---- hints (docs/hints.md) ----
     /// `Space h` — dismiss the corner hint: down-weight it (a deliberate "not now") and show
@@ -902,6 +906,10 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
     bind!(L, ch('q'), Exact(Mods::ALT), A::SaveAndQuit, "App", "Save and quit"),
     bind!(L, ch('/'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
+    // `?` is a shifted `/` on every layout we care about, so the terminal reports it with SHIFT set
+    // while the GUI/web report the resolved character — `IgnoreShift` accepts both. Deliberately
+    // adjacent to `Space /`.
+    bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
@@ -1164,6 +1172,26 @@ mod tests {
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),
             Some(Action::ShowCommitInfo)
         ));
+        // `Space ?` is the info dialog, next to `Space /`'s shortcut reference. A terminal reports
+        // the shifted `/` with SHIFT held while the GUI/web hand over the resolved character, so
+        // both must resolve — the whole point of binding it `IgnoreShift`.
+        for mods in [Mods::NONE, Mods::SHIFT] {
+            assert!(
+                matches!(
+                    lookup(KeyContext::Leader, ch('?'), mods).map(|b| b.action),
+                    Some(Action::ShowAppInfo)
+                ),
+                "Space ? must resolve with mods {mods:?}"
+            );
+        }
+        // It renders as a plain `Space ?` in the shortcut list — `IgnoreShift` must not leak a
+        // "Shift-" into the label.
+        assert_eq!(
+            lookup(KeyContext::Leader, ch('?'), Mods::SHIFT)
+                .map(|b| b.key_label())
+                .as_deref(),
+            Some("Space ?")
+        );
         // Go-to-definition is on Enter; the Space leader's `d` is the workspace diagnostics list, and
         // `Alt-d` the current buffer's.
         assert!(matches!(

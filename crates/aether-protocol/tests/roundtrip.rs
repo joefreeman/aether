@@ -3163,6 +3163,82 @@ fn hints_wire_shapes() {
 }
 
 #[test]
+fn app_info_wire_shapes() {
+    use aether_protocol::app::{AppInfo, AppInfoGet, AppInfoParams, AppPaths};
+
+    assert_eq!(AppInfoGet::NAME, "app/info");
+    assert_eq!(to_value(AppInfoParams {}).unwrap(), json!({}));
+
+    let info = AppInfo {
+        version: "9.9.9".into(),
+        commit: Some("abc1234".into()),
+        commit_dirty: true,
+        debug_build: true,
+        appimage: Some("/apps/aether.AppImage".into()),
+        profile: "dev".into(),
+        port: Some(2385),
+        pid: 4242,
+        started_at_unix_ms: 1_700_000_000_000,
+        uptime_secs: 61,
+        idle_timeout_secs: Some(300),
+        clients: 2,
+        buffers_open: 5,
+        buffers_unsaved: 1,
+        workspaces_active: 3,
+        paths: AppPaths {
+            config_dir: Some("/c".into()),
+            state_dir: Some("/s".into()),
+            settings: Some("/c/settings.toml".into()),
+            sessions: Some("/s/sessions.json".into()),
+            hints: Some("/s/hints.json".into()),
+            backups: Some("/s/backups".into()),
+        },
+    };
+    let v = to_value(&info).unwrap();
+    // `version` must stay top-level and unnested: the web client reads it straight off `/status` to
+    // decide its cached bundle is stale, and a *stale* bundle has to keep finding it on a *newer*
+    // server's response. Nesting it would break the very check that triggers the reload.
+    assert_eq!(v["version"], json!("9.9.9"));
+    assert_eq!(v["paths"]["config_dir"], json!("/c"));
+    let back: AppInfo = from_value(v).unwrap();
+    assert_eq!(back, info);
+
+    // Absent optionals stay off the wire rather than serializing as nulls.
+    let bare = AppInfo {
+        commit: None,
+        appimage: None,
+        port: None,
+        idle_timeout_secs: None,
+        paths: AppPaths::default(),
+        ..info
+    };
+    let v = to_value(&bare).unwrap();
+    for key in ["commit", "appimage", "port", "idle_timeout_secs"] {
+        assert!(v.get(key).is_none(), "{key} should be omitted when absent");
+    }
+    assert_eq!(v["paths"], json!({}));
+
+    // Every additive field defaults, so a client built against a newer protocol can still read an
+    // older server's payload (and `ae server status` keeps working across an upgrade either way).
+    let old: AppInfo = from_value(json!({
+        "version": "0.1.0",
+        "profile": "default",
+        "pid": 7,
+        "started_at_unix_ms": 0,
+        "clients": 0,
+        "buffers_open": 0,
+        "buffers_unsaved": 0,
+        "workspaces_active": 0
+    }))
+    .unwrap();
+    assert_eq!(old.commit, None);
+    assert!(!old.commit_dirty);
+    assert!(!old.debug_build);
+    assert_eq!(old.uptime_secs, 0);
+    assert_eq!(old.paths, AppPaths::default());
+}
+
+#[test]
 fn jumplist_wire_shapes() {
     use aether_protocol::cursor::{CursorState, JumplistPosition};
     use aether_protocol::jumplist::{
@@ -3216,7 +3292,11 @@ fn jumplist_wire_shapes() {
     .unwrap();
     assert_eq!(parsed.count, 2);
     assert!(parsed.open);
-    assert_eq!(parsed.scope, JumplistStepScope::Full, "scope defaults to Full");
+    assert_eq!(
+        parsed.scope,
+        JumplistStepScope::Full,
+        "scope defaults to Full"
+    );
 
     // The file-scoped variant (`Alt-]`) serializes its tag.
     let scoped = JumplistStepParams {

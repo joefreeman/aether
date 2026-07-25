@@ -1,52 +1,59 @@
-//! The `/status` payload: a read-only snapshot of the running server, consumed by `ae server
-//! status`. This is *not* part of the JSON-RPC wire protocol — it's an out-of-band diagnostic
-//! served over the same loopback port's HTTP surface (see [`crate::http::serve_http`]), so a
-//! short-lived CLI can read it with a plain HTTP GET instead of a WebSocket + JSON-RPC handshake.
+//! The application snapshot: build identity, live instance, and on-disk state locations.
 //!
-//! The type lives here (server-side) rather than in `aether-protocol` because it isn't a protocol
-//! message; the fetch helper lives here too so the wire contract — what the server writes and how a
-//! client reads it back — stays in one place.
+//! One builder, two consumers. [`AppInfo`] is the result of the `app/info` RPC (the `Space ?`
+//! dialog) *and* the body of `GET /status` — an out-of-band diagnostic on the same loopback port
+//! (see [`crate::http::serve_http`]) that `ae server status` and the web client's staleness check
+//! read with a plain HTTP GET, no WebSocket handshake needed. Serving one struct both ways is
+//! deliberate: a separate CLI-only shape drifted from the dialog's the moment either grew a field.
+//!
+//! The type itself lives in `aether-protocol` (it *is* a protocol message now); the fetch helper
+//! lives here so the wire contract — what the server writes and how a short-lived CLI reads it
+//! back — stays in one place.
 
+use aether_protocol::app::{AppInfo, AppPaths};
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
 
-/// A snapshot of the running server, returned as JSON from `GET /status`. Fields are additive: the
-/// CLI deserializes leniently, so a newer server can add fields without breaking an older `ae`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerStatus {
-    /// The running server's build version ([`aether_protocol::PROTOCOL_VERSION`]). The CLI compares
-    /// it to its own to flag a version drift — an old daemon that a freshly-installed client can't
-    /// even connect to, because the handshake version gate would reject it (see `crate::connection`).
-    pub version: String,
-    /// When this instance started (unix ms). Drives an accurate uptime, independent of the runtime
-    /// file's mtime.
-    pub started_at_unix_ms: u64,
-    /// Connected clients right now (TUI / GUI / web sessions).
-    pub clients: usize,
-    /// Open buffers across all workspaces.
-    pub buffers_open: usize,
-    /// How many open buffers have unsaved edits — what you'd want to know before `ae server stop`.
-    pub buffers_unsaved: usize,
-    /// Activated (loaded) workspaces.
-    pub workspaces_active: usize,
-    /// Idle-reaper setting: `Some(secs)` is a client-conjured instance that self-reaps after that
-    /// many idle seconds; `None` is the persistent `ae server` daemon.
-    pub idle_timeout_secs: Option<u64>,
+/// Build the snapshot from the authoritative in-memory state. Cheap — counts plus a handful of path
+/// derivations — so it's fine to call under the state lock, and cheap enough that the dialog
+/// re-fetches on every open rather than caching numbers that go stale immediately.
+pub fn app_info(s: &crate::state::ServerState) -> AppInfo {
+    let now = crate::config::now_unix_ms();
+    AppInfo {
+        version: aether_protocol::PROTOCOL_VERSION.to_string(),
+        commit: aether_protocol::BUILD_COMMIT.map(str::to_string),
+        commit_dirty: aether_protocol::BUILD_DIRTY,
+        debug_build: aether_protocol::BUILD_DEBUG,
+        // Read at snapshot time rather than cached at boot: it's the environment of the *server*
+        // process, which is the binary this whole struct describes.
+        appimage: std::env::var("APPIMAGE").ok().filter(|p| !p.is_empty()),
+        profile: crate::config::active_profile().to_string(),
+        port: s.port,
+        pid: std::process::id(),
+        started_at_unix_ms: s.started_at_unix_ms,
+        // Saturating: a backwards clock jump reads as zero uptime rather than wrapping to ~584
+        // million years, which is the more useful lie.
+        uptime_secs: now.saturating_sub(s.started_at_unix_ms) / 1000,
+        idle_timeout_secs: s.idle_timeout.map(|d| d.as_secs()),
+        clients: s.clients.len(),
+        buffers_open: s.buffers.len(),
+        buffers_unsaved: s.buffers.values().filter(|b| b.dirty).count(),
+        workspaces_active: s.workspaces.len(),
+        paths: paths(),
+    }
 }
 
-impl ServerStatus {
-    /// Build the snapshot from the authoritative in-memory state. Pure and cheap — just reads
-    /// counts — so it's fine to call under the state lock.
-    pub fn from_state(s: &crate::state::ServerState) -> Self {
-        ServerStatus {
-            version: aether_protocol::PROTOCOL_VERSION.to_string(),
-            started_at_unix_ms: s.started_at_unix_ms,
-            clients: s.clients.len(),
-            buffers_open: s.buffers.len(),
-            buffers_unsaved: s.buffers.values().filter(|b| b.dirty).count(),
-            workspaces_active: s.workspaces.len(),
-            idle_timeout_secs: s.idle_timeout.map(|d| d.as_secs()),
-        }
+/// Resolve the active profile's on-disk locations. Each is independently fallible (no XDG base
+/// dirs), and a failure here mirrors the feature being disabled server-side — so an absent row in
+/// the dialog is itself the diagnostic, not a rendering gap.
+fn paths() -> AppPaths {
+    let show = |p: anyhow::Result<std::path::PathBuf>| p.ok().map(|p| p.display().to_string());
+    AppPaths {
+        config_dir: show(crate::config::profile_config_dir()),
+        state_dir: show(crate::config::profile_state_dir()),
+        settings: show(crate::config::app_settings_path()),
+        sessions: show(crate::config::workspace_sessions_path()),
+        hints: show(crate::config::hints_state_path()),
+        backups: show(crate::config::backups_dir()),
     }
 }
 
@@ -56,7 +63,7 @@ impl ServerStatus {
 /// timeouts so a wedged server — port open but not serving — surfaces as an error the caller reports
 /// as "unhealthy" rather than hanging. The `Host` header must name a loopback authority or the
 /// server 403s it (its DNS-rebinding guard — see [`crate::http::is_loopback_authority`]).
-pub fn fetch_status(port: u16) -> anyhow::Result<ServerStatus> {
+pub fn fetch_status(port: u16) -> anyhow::Result<AppInfo> {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     use std::time::Duration;
@@ -93,37 +100,48 @@ mod tests {
 
     #[test]
     fn status_json_roundtrips() {
-        let s = ServerStatus {
-            version: "9.9.9".into(),
-            started_at_unix_ms: 1_700_000_000_000,
-            clients: 2,
-            buffers_open: 5,
-            buffers_unsaved: 1,
-            workspaces_active: 3,
-            idle_timeout_secs: Some(300),
-        };
+        let s = app_info(&crate::state::ServerState::new());
         let json = serde_json::to_string(&s).unwrap();
-        let back: ServerStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.version, "9.9.9");
-        assert_eq!(back.buffers_unsaved, 1);
-        assert_eq!(back.idle_timeout_secs, Some(300));
+        let back: AppInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
     }
 
-    /// Unknown fields (a newer server) don't break deserialization — the CLI stays forward-compatible.
+    /// Unknown fields (a newer server) don't break deserialization — the CLI stays
+    /// forward-compatible. The counterpart property (an *older* payload missing today's fields) is
+    /// covered by the serde defaults exercised below.
     #[test]
     fn status_ignores_unknown_fields() {
         let json = r#"{
             "version": "1.0.0",
+            "profile": "default",
+            "pid": 1,
             "started_at_unix_ms": 0,
             "clients": 0,
             "buffers_open": 0,
             "buffers_unsaved": 0,
             "workspaces_active": 0,
-            "idle_timeout_secs": null,
             "future_field": "ignored"
         }"#;
-        let s: ServerStatus = serde_json::from_str(json).unwrap();
+        let s: AppInfo = serde_json::from_str(json).unwrap();
         assert_eq!(s.version, "1.0.0");
         assert_eq!(s.idle_timeout_secs, None);
+        // Everything the old `/status` shape didn't carry defaults rather than failing the parse,
+        // so a freshly-installed CLI can still read a running older daemon.
+        assert_eq!(s.commit, None);
+        assert_eq!(s.uptime_secs, 0);
+        assert_eq!(s.paths, AppPaths::default());
+    }
+
+    /// `version` must stay a top-level field: the web client reads it off `/status` to decide its
+    /// cached bundle is stale, and a nested/renamed field would break exactly the check that tells
+    /// an outdated bundle to reload. See `web/src/client.ts`.
+    #[test]
+    fn version_is_top_level_on_the_wire() {
+        let s = app_info(&crate::state::ServerState::new());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            v.get("version").and_then(|v| v.as_str()),
+            Some(aether_protocol::PROTOCOL_VERSION)
+        );
     }
 }

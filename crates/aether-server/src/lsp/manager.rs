@@ -292,7 +292,15 @@ pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, 
     // process, over in-memory pipes but through the identical `bring_up` handshake path. Checked
     // first so tests skip both the process spawn and the `shell_env` shell round-trip. Never
     // populated in production (see [`LspManager::dummy_configs`]).
-    let dummy = { state.lock().await.lsp.dummy_configs.get(&key.language).cloned() };
+    let dummy = {
+        state
+            .lock()
+            .await
+            .lsp
+            .dummy_configs
+            .get(&key.language)
+            .cloned()
+    };
     if let Some(config) = dummy {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (cr, cw) = tokio::io::split(client_io);

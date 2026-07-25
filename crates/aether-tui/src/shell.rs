@@ -643,7 +643,7 @@ impl Shell {
 
     async fn on_key(&mut self, k: KeyEvent) {
         // Hover: the popover reuses the editor's own Copy / Scroll bindings (resolved by
-        // `keymap::hover_action`, so the chords never drift) — Ctrl-y copies its content, the scroll
+        // `keymap::hover_action`, so the chords never drift) — Ctrl-c copies its content, the scroll
         // keys pan it and keep it open; any other key dismisses it.
         if self.state.hover.is_some() {
             if let Some((code, mods, _)) = translate_key(&k) {
@@ -679,6 +679,27 @@ impl Shell {
             }
             self.state.hover = None;
             return;
+        }
+        // App-info dialog: the scroll keys pan it and keep it open, exactly as they do the hover
+        // popover (same `hover_action` resolution, so the chords can't drift from the editor's).
+        // Everything else — including `y` (copy) — falls through to the core, which owns the
+        // dialog's "copy or close" rule. Without this the terminal would have no keyboard way to
+        // reach the bottom of the dialog in a short window; the GUI and web get it from their
+        // native scrollables.
+        if self.state.app_info.is_some() {
+            if let Some((code, mods, _)) = translate_key(&k) {
+                if let Some(HoverAction::Scroll { dir, unit }) = hover_action(code, mods) {
+                    if let Some(v) = self.state.app_info.as_mut() {
+                        let down = matches!(dir, ScrollDir::Down);
+                        match unit {
+                            ScrollUnit::Line => v.scroll.scroll_by(if down { 1 } else { -1 }),
+                            ScrollUnit::Half => v.scroll.half(down),
+                            ScrollUnit::Page => v.scroll.page(down),
+                        }
+                    }
+                    return;
+                }
+            }
         }
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
@@ -871,6 +892,41 @@ impl Shell {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        // The app-info dialog is modal: like the picker, it owns the screen while up, so neither a
+        // click nor the wheel may reach the buffer behind it. The wheel scrolls the dialog (the
+        // Paths section runs past a short terminal); a click inside is swallowed, and a click on
+        // the backdrop dismisses it — the same "click the editor behind to cancel" rule the other
+        // prompts document.
+        if self.state.app_info.is_some() {
+            match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let delta = if matches!(m.kind, MouseEventKind::ScrollUp) {
+                        -3
+                    } else {
+                        3
+                    };
+                    if let Some(v) = self.state.app_info.as_mut() {
+                        v.scroll.scroll_by(delta);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let inside = ui::app_info_rect(&self.state)
+                        .map(|r| {
+                            m.column >= r.x
+                                && m.column < r.x + r.width
+                                && m.row >= r.y
+                                && m.row < r.y + r.height
+                        })
+                        .unwrap_or(false);
+                    if !inside {
+                        let fx = self.session.decline_prompt();
+                        self.run_effects(fx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         // While a picker is open its overlay owns the screen: the wheel moves the highlight, a
         // press lands on the picker (see `on_picker_press`) — never on the buffer underneath.
         if self.session.picker.is_some() {
@@ -1811,6 +1867,9 @@ impl Shell {
         st.save_prompt = None;
         st.open_path_prompt = None;
         st.picker.lsp_detail = None;
+        // Taken rather than cleared: the app-info dialog's scroll position is shell-owned and must
+        // survive a re-sync, or a wheel scroll would snap back to the top on the next event.
+        let prev_app_info = st.app_info.take();
         match &self.session.prompt {
             Some(Prompt::Confirm { kind, .. }) => {
                 st.confirm_prompt = Some(crate::app::ConfirmPrompt {
@@ -1834,6 +1893,15 @@ impl Shell {
                 input.set(field.text.clone());
                 input.cursor = open_path_cursor.unwrap_or(field.text.len());
                 st.open_path_prompt = Some(input);
+            }
+            Some(Prompt::AppInfo(info)) => {
+                // Rows come from the core so all three shells agree; the TUI adds only scroll.
+                // Recomposed each sync — cheap — but the scroll carries over from the previous
+                // sync so wheel position sticks while the dialog stays open.
+                st.app_info = Some(crate::app::AppInfoView {
+                    sections: aether_client::app_info::sections(info),
+                    scroll: prev_app_info.map(|v| v.scroll).unwrap_or_default(),
+                });
             }
             Some(Prompt::LspInfo(status)) => {
                 // The dedicated detail pane the LSP-servers picker renders. Scroll is
@@ -2376,6 +2444,7 @@ fn make_state(
         save_prompt: None,
         open_path_prompt: None,
         confirm_prompt: None,
+        app_info: None,
         editor: None,
         workspace_settings: None,
         app_settings: None,

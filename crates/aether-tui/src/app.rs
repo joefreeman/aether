@@ -209,6 +209,10 @@ pub struct AppState {
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
     pub confirm_prompt: Option<ConfirmPrompt>,
+    /// Active application-info dialog (`Space ?`), as sections composed by the core
+    /// ([`aether_client::app_info::sections`]). A top-level modal like the LSP detail — the rows
+    /// themselves are the core's call, so this holds only what the TUI adds: the scroll position.
+    pub app_info: Option<AppInfoView>,
     /// `None` before a workspace is activated, or transiently while switching. Most key handlers
     /// early-return without touching state in that case; the no-workspace view (workspace picker)
     /// is rendered instead by `ui::draw`.
@@ -304,6 +308,16 @@ pub struct WorkspaceSettingsState {
 pub struct AppSettingsState {
     pub groups: Vec<aether_client::session::AppSettingGroup>,
     pub selected: usize,
+}
+
+/// The application-info dialog's view state. The content is entirely the core's — this adds only
+/// the terminal-side scroll position, since the Paths section can run past a short window.
+#[derive(Debug)]
+pub struct AppInfoView {
+    pub sections: Vec<aether_client::app_info::InfoSection>,
+    /// Interior-mutable like the LSP detail's: the renderer records the geometry, the key handler
+    /// reads it back to clamp.
+    pub scroll: crate::scroll::ScrollState,
 }
 
 /// Generic `[y/N]` confirmation overlay. The save-as overwrite confirm and the close-with-
@@ -528,25 +542,26 @@ pub fn refresh_terminal_title(state: &mut AppState) {
 /// changed on disk, so the title answers "what am I editing, and is it saved?" at a glance. The
 /// dot leads (not trails) to match the favicon's position in the web client's tab; a terminal
 /// title can't carry colour, so every non-clean state shows the same plain dot (the status bar
-/// colour-codes it). Before any workspace is active we fall back to a bare `Aether` placeholder;
-/// without a buffer (transient workspace-switch window) we just show the workspace name.
+/// colour-codes it). The app name isn't appended — see [`aether_client::labels::window_title`];
+/// before any workspace is active it stands in as the whole title, and without a buffer (transient
+/// workspace-switch window) we just show the workspace name.
 fn terminal_title(state: &AppState) -> String {
     // The label is only meaningful with an open editor (the transient workspace-switch window has
-    // none). `title_body` yields `None` before a workspace is active → the title is just `Aether`.
+    // none). `title_body` yields `None` before a workspace is active → the title is just the app name.
     let label = if state.has_editor() {
         state.ed().file_label.as_str()
     } else {
         ""
     };
     let Some(body) = aether_client::labels::title_body(&state.workspace_name, label) else {
-        return "Aether".to_string();
+        return aether_client::labels::APP_NAME.to_string();
     };
     let dot = if state.has_editor() && state.buffer_status().is_some() {
         format!("{BUFFER_STATUS_DOT} ")
     } else {
         String::new()
     };
-    format!("{dot}{body} - Aether")
+    format!("{dot}{body}")
 }
 
 /// Whether a keybinding is mid-entry and waiting for the next keystroke to complete it: `f`/`t`
@@ -786,6 +801,7 @@ mod tests {
             save_prompt: None,
             open_path_prompt: None,
             confirm_prompt: None,
+            app_info: None,
             editor: None,
             workspace_settings: None,
             app_settings: None,
@@ -816,6 +832,7 @@ mod tests {
             save_prompt: None,
             open_path_prompt: None,
             confirm_prompt: None,
+            app_info: None,
             editor: None,
             workspace_settings: None,
             app_settings: None,
@@ -823,10 +840,10 @@ mod tests {
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
         };
-        assert_eq!(terminal_title(&state), "[demo] - Aether");
+        assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
         state.editor = Some(stub_editor_state("(scratch 0)"));
-        assert_eq!(terminal_title(&state), "[demo] (scratch 0) - Aether");
+        assert_eq!(terminal_title(&state), "[demo] (scratch 0)");
     }
 
     #[test]
@@ -849,6 +866,7 @@ mod tests {
             save_prompt: None,
             open_path_prompt: None,
             confirm_prompt: None,
+            app_info: None,
             editor: Some(stub_editor_state("src/main.rs")),
             workspace_settings: None,
             app_settings: None,
@@ -857,17 +875,17 @@ mod tests {
             diagnostic_counts: std::collections::HashMap::new(),
         };
         // Clean buffer → no dot.
-        assert_eq!(terminal_title(&state), "[demo] src/main.rs - Aether");
+        assert_eq!(terminal_title(&state), "[demo] src/main.rs");
         // Local edits → leading dot.
         if let Some(ed) = state.editor.as_mut() {
             ed.revision = 5;
         }
-        assert_eq!(terminal_title(&state), "● [demo] src/main.rs - Aether");
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
         // External delete is still a (single, plain) leading dot — the title can't colour-code it.
         if let Some(ed) = state.editor.as_mut() {
             ed.externally_deleted = true;
         }
-        assert_eq!(terminal_title(&state), "● [demo] src/main.rs - Aether");
+        assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
     }
 
     /// Minimal `EditorState` for title tests — only the fields the title code reads matter

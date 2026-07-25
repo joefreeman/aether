@@ -31,13 +31,13 @@ pub use config::{
     profile_idle_timeout_secs, running_server_pid, set_active_profile, ProfileEntry,
     WorkspaceConfig, WorkspaceMatch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_PROFILE, SERVER_PORT,
 };
+/// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
+pub use lsp::dummy::{
+    DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange, DummyTextEdit,
+};
 pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_full, spawn_for_test_multi,
     spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions,
     spawn_for_test_with_lsp, ServerHandle,
 };
-/// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
-pub use lsp::dummy::{
-    DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange, DummyTextEdit,
-};
-pub use status::{fetch_status, ServerStatus};
+pub use status::{app_info, fetch_status};

@@ -11,6 +11,7 @@
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
+use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{
     BufferClose, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave, BufferSetTransient,
 };
@@ -377,6 +378,7 @@ async fn dispatch(
     }
 
     match method {
+        AppInfoGet::NAME => run!(AppInfoGet, handlers::app_info),
         SettingsGet::NAME => run!(SettingsGet, handlers::settings_get),
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
         HintsRecord::NAME => run!(HintsRecord, handlers::hints_record),

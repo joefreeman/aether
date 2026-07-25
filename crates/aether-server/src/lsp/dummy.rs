@@ -148,7 +148,12 @@ where
                     .pointer("/params/contentChanges")
                     .and_then(Value::as_array)
                     .and_then(|c| c.last())
-                    .map(|c| c.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                    .map(|c| {
+                        c.get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    })
                     .unwrap_or_default();
                 docs.insert(uri.clone(), text.clone());
                 publish_diagnostics(&mut writer, &config, &uri, &text).await;

@@ -169,6 +169,11 @@ pub struct ServerState {
     /// persistent `ae server` daemon. Set once by `run_with_listener`; `None` until then. Read only
     /// to report it in the `/status` snapshot — the reaper itself owns the timeout separately.
     pub idle_timeout: Option<Duration>,
+    /// The loopback port this instance actually bound, recorded by `run_with_listener` from the
+    /// listener itself rather than from `profile.toml` — so it's the port clients are really talking
+    /// to, including the ephemeral one an in-process test server gets. `None` until then.
+    /// Diagnostic only (the `app/info` snapshot); nothing routes on it.
+    pub port: Option<u16>,
     next_buffer_id: u64,
     next_viewport_id: u64,
 }
@@ -423,6 +428,7 @@ impl ServerState {
             hints: crate::config::HintsState::default(),
             hints_dirty: false,
             idle_timeout: None,
+            port: None,
             next_buffer_id: 1,
             next_viewport_id: 1,
         }
