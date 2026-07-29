@@ -17389,6 +17389,146 @@ async fn watcher_reloads_clean_buffer_on_external_write() {
     drop(server);
 }
 
+/// Regression: a silent reload that shrinks the file below the viewport's scroll position must
+/// clamp the stored scroll and push a non-empty, in-range window. Previously the stale scroll
+/// made `pushed_range` collapse to an empty range past EOF and the client showed a blank buffer.
+#[tokio::test]
+async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
+    let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer(&long).await;
+
+    // Re-subscribe deep into the file (supersedes the setup's line-0 viewport).
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 5,
+            scroll: ScrollPosition {
+                logical_line: 150,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert_eq!(sub.window.first_logical_line, 145);
+
+    // Park the cursor deep too, so the reload's clamp has something to do.
+    let st: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        11,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition { line: 150, col: 0 },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(st.position.line, 150);
+
+    // External rewrite far shorter than the scroll position — the watcher silently reloads.
+    std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+
+    // 6 lines: ropey counts the trailing empty line after the final newline.
+    let new_line_count = 6;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let push = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let p = expect_notification_within::<ViewportLinesChanged>(&mut ws, remaining).await;
+        if p.line_count == new_line_count {
+            break p;
+        }
+    };
+
+    // Scroll clamps to the last line (5); with rows 10 + overscan 5 the range saturates to the
+    // whole file. The essential invariants: non-empty and inside the new bounds.
+    let (start, end) = (
+        push.range.start_logical_line,
+        push.range.end_logical_line_exclusive,
+    );
+    assert!(start < end, "pushed window must be non-empty, got {start}..{end}");
+    assert!(end <= new_line_count);
+    assert_eq!((start, end), (0, new_line_count));
+    assert_eq!(push.replacement_lines.len(), (end - start) as usize);
+
+    // The clamped cursor rides the push — without it the client shows a stale position (and no
+    // cursor block at all) until the next round-trip.
+    let cursor = push
+        .cursor
+        .expect("reload's lines_changed carries the authoritative cursor");
+    assert_eq!(
+        cursor.position.line,
+        new_line_count - 1,
+        "cursor clamped into the new bounds"
+    );
+
+    // The healed scroll state also serves follow-up scrolls normally.
+    let scrolled: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws,
+        11,
+        &ViewportScrollParams {
+            viewport_id: sub.viewport_id,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+        },
+    )
+    .await;
+    assert_eq!(scrolled.window.first_logical_line, 0);
+    assert!(!scrolled.window.lines.is_empty());
+
+    drop(server);
+}
+
+/// Subscribing with a stale out-of-range scroll (e.g. a restored position for a file that shrank
+/// while unwatched) must anchor to the end of the buffer, not return an empty window.
+#[tokio::test]
+async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\n").await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 1000,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let w = &sub.window;
+    assert_eq!(w.line_count, 4);
+    assert!(
+        w.first_logical_line < w.last_logical_line_exclusive,
+        "window must be non-empty, got {}..{}",
+        w.first_logical_line,
+        w.last_logical_line_exclusive
+    );
+    assert!(w.last_logical_line_exclusive <= w.line_count);
+    assert!(!w.lines.is_empty());
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn watcher_flags_dirty_buffer_on_external_write() {
     let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;

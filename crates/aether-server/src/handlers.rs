@@ -2392,6 +2392,7 @@ pub async fn git_apply_hunk(
                         buffer_both_hunks(&s, buffer_id),
                         buffer_diagnostics(&s, buffer_id),
                         buffer_git_status(&s, buffer_id),
+                        lines_changed_cursor(&s, vp),
                     ),
                 ));
             }
@@ -3072,6 +3073,7 @@ pub async fn lsp_format(
                 buffer_both_hunks(&s, buffer_id),
                 buffer_diagnostics(&s, buffer_id),
                 buffer_git_status(&s, buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -3531,6 +3533,7 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
                 buffer_both_hunks(s, buffer_id),
                 diagnostics,
                 buffer_git_status(s, buffer_id),
+                lines_changed_cursor(s, vp),
             ),
         ));
     }
@@ -4226,6 +4229,7 @@ fn collect_viewport_refresh(
             line_count,
             max_scroll_logical_line: window.max_scroll_logical_line,
             git_status: window.git_status,
+            cursor: lines_changed_cursor(s, vp),
         };
         pushes.push((
             sender,
@@ -4907,6 +4911,7 @@ pub async fn buffer_cut(
                 buffer_both_hunks(&s, params.buffer_id),
                 buffer_diagnostics(&s, params.buffer_id),
                 buffer_git_status(&s, params.buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -5331,6 +5336,7 @@ pub(crate) fn reload_buffer_locked(
                 buffer_both_hunks(s, buffer_id),
                 buffer_diagnostics(s, buffer_id),
                 buffer_git_status(s, buffer_id),
+                lines_changed_cursor(s, vp),
             ),
         ));
     }
@@ -5780,8 +5786,11 @@ fn require_viewport_mut(
 
 /// Compute the logical-line range to push for a viewport. Each logical line wraps to >= 1 visual
 /// row, so sending `rows + 2*overscan_rows` logical lines is a safe over-approximation of the
-/// visible + overscan area.
+/// visible + overscan area. A scroll line past the end of the buffer (a stale restore, or a
+/// shrink under the viewport) anchors to the last line rather than collapsing to an empty range
+/// past EOF.
 fn pushed_range(scroll_line: u32, rows: u32, overscan: u32, line_count: u32) -> (u32, u32) {
+    let scroll_line = scroll_line.min(line_count.saturating_sub(1));
     let first = scroll_line.saturating_sub(overscan);
     let last_excl = scroll_line
         .saturating_add(rows)
@@ -5796,9 +5805,26 @@ fn pushed_range(scroll_line: u32, rows: u32, overscan: u32, line_count: u32) -> 
 /// leaves the viewport's range clamped to the smaller post-mutation size and the freshly
 /// restored lines never reach the client.
 fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, line_count: u32) {
+    let max_line = line_count.saturating_sub(1);
     for vp in s.viewports.values_mut() {
         if vp.buffer_id != buffer_id {
             continue;
+        }
+        // A shrink can leave the viewport scrolled past EOF (a watcher reload of a rewritten
+        // file, an undo, another client's delete). Clamp the stored scroll like reload clamps
+        // cursors — otherwise the pushed range is empty and the client shows a blank buffer.
+        // The restore map gets the same clamp so a buffer switch doesn't resurrect the stale
+        // position.
+        if vp.scroll_logical_line > max_line {
+            vp.scroll_logical_line = max_line;
+            vp.scroll_sub_row = 0.0;
+            s.last_scroll.insert(
+                (vp.client_id, buffer_id),
+                ScrollPosition {
+                    logical_line: max_line,
+                    sub_row: 0.0,
+                },
+            );
         }
         let (first, last_excl) = pushed_range(
             vp.scroll_logical_line,
@@ -6604,6 +6630,7 @@ pub fn set_diagnostics_and_refresh(
                 buffer_both_hunks(s, buffer_id),
                 diags,
                 buffer_git_status(s, buffer_id),
+                lines_changed_cursor(s, vp),
             ),
         ));
     }
@@ -8853,6 +8880,7 @@ async fn apply_toggle_comment(
                 buffer_both_hunks(&s, buffer_id),
                 buffer_diagnostics(&s, buffer_id),
                 buffer_git_status(&s, buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -9425,6 +9453,7 @@ async fn apply_indent_or_dedent(
                 buffer_both_hunks(&s, buffer_id),
                 buffer_diagnostics(&s, buffer_id),
                 buffer_git_status(&s, buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -9629,6 +9658,7 @@ async fn input_move_lines_once(
                 buffer_both_hunks(&s, buffer_id),
                 buffer_diagnostics(&s, buffer_id),
                 buffer_git_status(&s, buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -9846,6 +9876,7 @@ async fn input_join_lines_once(
                     buffer_both_hunks(&s, buffer_id),
                     buffer_diagnostics(&s, buffer_id),
                     buffer_git_status(&s, buffer_id),
+                    lines_changed_cursor(&s, vp),
                 ),
             ));
         }
@@ -9997,6 +10028,7 @@ async fn apply_undo_or_redo(
                 buffer_both_hunks(&s, buffer_id),
                 buffer_diagnostics(&s, buffer_id),
                 buffer_git_status(&s, buffer_id),
+                lines_changed_cursor(&s, vp),
             ),
         ));
     }
@@ -10657,6 +10689,7 @@ async fn apply_edit(
             buffer_both_hunks(&s, buffer_id),
             buffer_diagnostics(&s, buffer_id),
             buffer_git_status(&s, buffer_id),
+            lines_changed_cursor(&s, vp),
         );
         pushes.push((sender, notif));
     }
@@ -10734,6 +10767,14 @@ fn workspace_candidates(
     out
 }
 
+/// The authoritative cursor to ride a `viewport/lines_changed` push for this viewport's client,
+/// decorated the same way RPC responses are (`wrap_for_response`). `None` when the client has no
+/// cursor on the buffer — the client then keeps its local state.
+fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
+    let cursor = s.cursors.get(&(vp.client_id, vp.buffer_id)).copied()?;
+    Some(wrap_for_response(s, vp.client_id, vp.buffer_id, cursor))
+}
+
 fn build_lines_changed_notif(
     buffer: &Buffer,
     vp: &Viewport,
@@ -10742,6 +10783,7 @@ fn build_lines_changed_notif(
     hunks: &[crate::git::DiffHunk],
     diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
     git_status: Option<GitBufferStatus>,
+    cursor: Option<CursorState>,
 ) -> Notification {
     let line_count = buffer.line_count();
     let new_first = vp.first_logical_line.min(line_count);
@@ -10780,6 +10822,7 @@ fn build_lines_changed_notif(
         line_count,
         max_scroll_logical_line: window.max_scroll_logical_line,
         git_status: window.git_status,
+        cursor,
     };
     Notification {
         jsonrpc: JsonRpc,
@@ -14136,5 +14179,44 @@ mod seed_reference_center_tests {
         let ranked: Vec<u32> = vec![2, 0, 1];
         let seed = seed_reference_center(&refs, &ranked, Some("/a.rs"), at(4, 6));
         assert_eq!(seed, Some((0, 2)), "candidate 2 is at rank 0");
+    }
+}
+
+#[cfg(test)]
+mod pushed_range_tests {
+    use super::pushed_range;
+
+    #[test]
+    fn in_range_scroll_spans_visible_plus_overscan() {
+        assert_eq!(pushed_range(100, 10, 5, 500), (95, 115));
+    }
+
+    #[test]
+    fn clamps_to_buffer_ends() {
+        // Near the top: overscan saturates at line 0.
+        assert_eq!(pushed_range(2, 10, 5, 500), (0, 17));
+        // Near the bottom: the range stops at line_count.
+        assert_eq!(pushed_range(495, 10, 5, 500), (490, 500));
+    }
+
+    #[test]
+    fn scroll_past_eof_anchors_to_last_line_not_empty() {
+        // The buffer shrank under the viewport (watcher reload, undo). The old scroll is far
+        // past EOF; the range must anchor to the end, never collapse to an empty window.
+        let (first, last_excl) = pushed_range(300, 10, 5, 50);
+        assert!(first < last_excl, "range must be non-empty");
+        assert!(last_excl <= 50);
+        assert_eq!((first, last_excl), (44, 50));
+    }
+
+    #[test]
+    fn scroll_past_eof_on_tiny_buffer_covers_it_entirely() {
+        assert_eq!(pushed_range(1000, 10, 5, 3), (0, 3));
+    }
+
+    #[test]
+    fn single_line_buffer_is_never_empty() {
+        assert_eq!(pushed_range(0, 10, 5, 1), (0, 1));
+        assert_eq!(pushed_range(42, 10, 5, 1), (0, 1));
     }
 }

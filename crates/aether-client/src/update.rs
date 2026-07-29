@@ -3767,6 +3767,12 @@ impl Session {
                 // way, e.g. another client's), and keep the cursor in view under the new
                 // geometry (the shell clamps + reveals).
                 self.buffer.revision = p.revision;
+                // Server-side cursor moves with no request in flight (e.g. the clamp a watcher
+                // reload applies when the file shrank under the cursor) ride the push; adopt
+                // before the shells reveal against the new window.
+                if let Some(cursor) = p.cursor {
+                    self.buffer.cursor = cursor;
+                }
                 self.window = Some(Window {
                     first_logical_line: p.range.start_logical_line,
                     last_logical_line_exclusive: p.range.end_logical_line_exclusive,

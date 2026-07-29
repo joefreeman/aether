@@ -792,6 +792,59 @@ fn buffer_state_push_follows_a_save_as_rename() {
     assert_eq!(s.buffer.label, "sub/bar.md");
 }
 
+/// A `viewport/lines_changed` push carrying a cursor adopts it — the server moved the cursor
+/// with no request in flight (e.g. the clamp a watcher reload applies when the file shrank
+/// under it). A push without one leaves the client's cursor alone.
+#[test]
+fn lines_changed_push_adopts_the_server_cursor() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::ViewportLinesChanged;
+    use aether_protocol::LogicalPosition;
+
+    let mut s = session();
+    s.viewport_id = Some(7);
+
+    let push = |cursor: serde_json::Value| {
+        let mut params = json!({
+            "viewport_id": 7,
+            "revision": 9,
+            "range": {"start_logical_line": 0, "end_logical_line_exclusive": 6},
+            "replacement_lines": [],
+            "line_count": 6,
+            "max_scroll_logical_line": 0,
+            "total_visual_rows": 6,
+            "first_visual_row": 0,
+            "max_line_width": 0,
+        });
+        if !cursor.is_null() {
+            params["cursor"] = cursor;
+        }
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: ViewportLinesChanged::NAME.into(),
+            params,
+        })
+    };
+
+    let _ = s.on_event(push(
+        json!({"position": {"line": 5, "col": 2}, "anchor": {"line": 5, "col": 2}}),
+    ));
+    assert_eq!(
+        s.buffer.cursor.position,
+        LogicalPosition { line: 5, col: 2 },
+        "the pushed cursor is adopted"
+    );
+
+    // No cursor on the push (nothing stored server-side): local state is kept.
+    let _ = s.on_event(push(serde_json::Value::Null));
+    assert_eq!(
+        s.buffer.cursor.position,
+        LogicalPosition { line: 5, col: 2 },
+        "a cursor-less push leaves the cursor alone"
+    );
+}
+
 #[test]
 fn workspace_renamed_push_adopts_the_new_name() {
     use aether_client::update::Event;

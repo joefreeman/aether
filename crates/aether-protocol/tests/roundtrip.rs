@@ -40,7 +40,7 @@ use aether_protocol::sneak::{
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
-    LogicalLineRender, VirtualRow, VirtualRowKind,
+    LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow, VirtualRowKind,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -1135,6 +1135,58 @@ fn directory_list_result_skips_none_parent() {
         "parent: None should be skipped on the wire"
     );
     assert_eq!(v["entries"], json!([]));
+}
+
+#[test]
+fn viewport_lines_changed_params_cursor_shape() {
+    let base = ViewportLinesChangedParams {
+        viewport_id: 7,
+        revision: 42,
+        range: LogicalLineRange {
+            start_logical_line: 10,
+            end_logical_line_exclusive: 20,
+        },
+        replacement_lines: Vec::new(),
+        line_count: 100,
+        max_scroll_logical_line: 90,
+        total_visual_rows: 100,
+        first_visual_row: 10,
+        max_line_width: 0,
+        git_status: None,
+        cursor: None,
+    };
+    // Without a cursor the field is absent on the wire, and absent deserializes to `None` —
+    // older servers/clients interoperate.
+    let v = to_value(&base).unwrap();
+    assert!(
+        v.get("cursor").is_none(),
+        "cursor: None should be skipped on the wire"
+    );
+    let back: ViewportLinesChangedParams = from_value(v).unwrap();
+    assert!(back.cursor.is_none());
+
+    let with_cursor = ViewportLinesChangedParams {
+        cursor: Some(CursorState {
+            position: LogicalPosition { line: 5, col: 3 },
+            anchor: LogicalPosition { line: 5, col: 3 },
+            match_bracket: None,
+            jumplist_position: None,
+        }),
+        ..base
+    };
+    let v = to_value(&with_cursor).unwrap();
+    assert_eq!(
+        v["cursor"],
+        json!({
+            "position": {"line": 5, "col": 3},
+            "anchor": {"line": 5, "col": 3},
+        })
+    );
+    let back: ViewportLinesChangedParams = from_value(v).unwrap();
+    assert_eq!(
+        back.cursor.unwrap().position,
+        LogicalPosition { line: 5, col: 3 }
+    );
 }
 
 #[test]

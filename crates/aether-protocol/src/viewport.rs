@@ -1,5 +1,6 @@
 //! Viewport messages — §7 of the protocol doc.
 
+use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitBufferStatus;
 use crate::lsp::{DiagnosticCounts, LspServerStatus};
@@ -365,4 +366,11 @@ pub struct ViewportLinesChangedParams {
     /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,
+    /// The authoritative cursor for the receiving client after the change, decorated like an RPC
+    /// response (`match_bracket`, `jumplist_position`). Lets the client adopt server-side cursor
+    /// moves that have no request in flight — e.g. the clamp a watcher reload applies when the
+    /// file shrank under the cursor. `None` when the client has no cursor on the buffer; the
+    /// client then keeps its local state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<CursorState>,
 }
