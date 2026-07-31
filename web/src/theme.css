@@ -43,6 +43,25 @@
   /* ...and staged counterparts, so the cursor on a staged line keeps its dimmer identity. */
   --cursor-line-staged-added-bg: #3a453c;
   --cursor-line-staged-modified-bg: #434138;
+
+  /* ---- Chrome text sizing ----
+     Everything outside the buffer (status bar, pickers, dialogs, hover, toasts, hints) sizes from
+     `--ui-font-size`, which shell.ts sets from the `ui_font_size` app setting. 13px is its default
+     and the size every chrome rule below was hand-tuned at, so the other tiers are expressed as
+     ratios of it — the 12/11 secondary shades and the 14/15/16 headings keep their relationship at
+     any base. The buffer text is a separate setting (`buffer_font_size`), applied to #app.
+     Pixel dimensions that *hold* chrome text (panel widths, the popover cap) scale the same way;
+     pure whitespace (padding, gaps) stays fixed — it doesn't clip. */
+  --ui-font-size: 13px;
+  --ui-fine: calc(var(--ui-font-size) * 11 / 13);
+  --ui-small: calc(var(--ui-font-size) * 12 / 13);
+  --ui-heading: calc(var(--ui-font-size) * 14 / 13);
+  --ui-heading-lg: calc(var(--ui-font-size) * 15 / 13);
+  --ui-title: calc(var(--ui-font-size) * 16 / 13);
+  /* The status bar's outer height (its 1.5 line-height plus 2px padding either side) — what the
+     floating chrome above it (search bar, toasts) offsets by, so they keep clearing it as the
+     chrome grows. */
+  --ui-status-h: calc(var(--ui-font-size) * 1.5 + 4px);
 }
 
 html, body, #app {
@@ -138,7 +157,7 @@ html, body, #app {
   gap: 12px;
   background: var(--nord1);
   color: var(--nord4);
-  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   padding: 2px 8px;
   white-space: pre;
   overflow: hidden;
@@ -192,8 +211,8 @@ html, body, #app {
 /* Toasts — transient messages, top-right, auto-dismissing. */
 #toasts {
   position: fixed;
-  /* Sit above the status bar (≈24px: 13px/1.5 text + 2px padding each side) with a small gap. */
-  bottom: 34px;
+  /* Sit above the status bar (--ui-status-h) with a small gap. */
+  bottom: calc(var(--ui-status-h) + 10px);
   right: 12px;
   z-index: 30;
   display: flex;
@@ -208,11 +227,11 @@ html, body, #app {
   border-left-width: 3px;
   border-radius: 4px;
   padding: 6px 12px;
-  max-width: 420px;
+  max-width: calc(var(--ui-font-size) * 420 / 13);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   transition: opacity 0.4s ease;
   /* Sans-serif like the rest of the chrome (popovers, status), not the editor's monospace. */
-  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 .toast.fade { opacity: 0; }
 .toast.error { border-left-color: var(--nord11); }
@@ -232,7 +251,7 @@ html, body, #app {
   gap: 10px;
   background: var(--nord13);
   color: var(--nord0);
-  font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-small)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding: 6px 14px;
   border-radius: 6px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
@@ -252,7 +271,7 @@ html, body, #app {
   z-index: 30; /* over the overlays (picker hints must show over the picker), under the banner */
   background: var(--nord1);
   color: var(--nord3-bright);
-  font: 12px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-small)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding: 3px 10px;
   border-radius: 5px;
 }
@@ -280,7 +299,7 @@ html, body, #app {
   bottom: 4px;
   z-index: 20;
   width: fit-content;
-  max-width: 600px;
+  max-width: calc(var(--ui-font-size) * 600 / 13);
   max-height: 40vh;
   overflow: auto;
   overscroll-behavior: contain; /* wheeling the popover never chains to the buffer's scroll */
@@ -298,7 +317,7 @@ html, body, #app {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
   /* Popover prose (hover/commit/diagnostic) is sans-serif like the rest of the chrome; only
      code spans/fences stay monospace (see `#hover code` / `.md-code` below). */
-  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 /* Markdown hover (LSP). A flex column with a uniform `gap` matches the native client's markdown
    inter-element spacing; heading/base/code sizes match it too, and headings are white (not tinted)
@@ -307,16 +326,16 @@ html, body, #app {
   white-space: normal;
   display: flex;
   flex-direction: column;
-  gap: 11px;
+  gap: calc(var(--ui-font-size) * 11 / 13);
 }
 #hover .md-line { margin: 0; }
 #hover .md-heading { font-weight: bold; color: var(--nord6); }
-#hover .md-h1 { font-size: 16px; }
-#hover .md-h2 { font-size: 15px; }
-#hover .md-h3 { font-size: 14px; }
+#hover .md-h1 { font-size: var(--ui-title); }
+#hover .md-h2 { font-size: var(--ui-heading-lg); }
+#hover .md-h3 { font-size: var(--ui-heading); }
 #hover .md-h4,
 #hover .md-h5,
-#hover .md-h6 { font-size: 13px; }
+#hover .md-h6 { font-size: var(--ui-font-size); }
 #hover .md-code {
   margin: 0;
   padding: 6px 8px;
@@ -324,7 +343,7 @@ html, body, #app {
   border-radius: 4px;
   white-space: pre-wrap;
   font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--ui-small);
 }
 #hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--nord8); }
 /* Lists: the list is one flex item (outer spacing via the gap); items get a small internal gap. */
@@ -358,9 +377,9 @@ html, body, #app {
 #searchbar {
   position: fixed;
   left: 12px;
-  bottom: 32px;
+  bottom: calc(var(--ui-status-h) + 8px);
   z-index: 15;
-  width: min(420px, 60vw);
+  width: min(calc(var(--ui-font-size) * 420 / 13), 60vw);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -377,13 +396,13 @@ html, body, #app {
   outline: none;
   background: transparent;
   color: var(--nord6);
-  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 .search-input::placeholder { color: var(--nord3); }
 .search-count {
   color: var(--nord4);
   flex: 0 0 auto;
-  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 .row { display: flex; min-height: 1.4em; } /* keep blank lines from collapsing to zero height */
@@ -499,11 +518,11 @@ html, body, #app {
 
 /* ---- Modal dialogs (confirm / save-as) ---- */
 .modal {
-  min-width: 360px;
+  min-width: calc(var(--ui-font-size) * 360 / 13);
   max-width: 70vw;
   background: var(--nord1);
   color: var(--nord6);
-  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   border: 1px solid var(--nord3);
   border-radius: 6px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
@@ -553,7 +572,7 @@ html, body, #app {
 .modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
 /* Dim per-button shortcut hint (the confirm buttons advertise `y`/`n`). Inherits the button's
    text colour so it stays legible on both the plain and red fills. */
-.modal-btn .modal-key { margin-left: 7px; font-size: 11px; opacity: 0.55; }
+.modal-btn .modal-key { margin-left: 7px; font-size: var(--ui-fine); opacity: 0.55; }
 
 /* Pickers + dialogs (save-as, workspace settings) share the picker offset (8vh from .overlay).
    Only confirmations sit lower, so a confirm over a picker doesn't align with it; and they layer
@@ -575,7 +594,7 @@ html, body, #app {
 .info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
 .info-key { color: var(--nord3-brighter); }
 .info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
-.lsp-info-hint { color: var(--nord3-brighter); font-size: 12px; }
+.lsp-info-hint { color: var(--nord3-brighter); font-size: var(--ui-small); }
 
 /* Application info (Space ?). Same box as the LSP detail, plus section headings. Height-capped
    and self-scrolling like
@@ -592,7 +611,7 @@ html, body, #app {
    spacing. Rows hug, and the gap between *sections* does the grouping instead. Scoped to app-info
    so the LSP dialog (a handful of rows, no sections) keeps its roomier spacing. */
 .modal.app-info .info-rows { gap: 2px 16px; line-height: 1.35; margin-bottom: 0; }
-.app-info-section { color: var(--nord8); font-weight: 600; font-size: 12px; margin: 12px 0 3px; }
+.app-info-section { color: var(--nord8); font-weight: 600; font-size: var(--ui-small); margin: 12px 0 3px; }
 .app-info-section:first-of-type { margin-top: 10px; }
 /* Only the client/server build-mismatch row — the one thing here that's actionable. */
 .info-val.warn { color: var(--nord13); }
@@ -602,7 +621,7 @@ html, body, #app {
 .modal.workspace-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
 /* Small gray labels (matching the native client). Tucked tight above their field (~3px) so each
    label+field reads as one group, with a wider gap (8px) above it from the previous group. */
-.ps-label { color: var(--nord3-brighter); font-size: 12px; margin: 8px 0 3px; }
+.ps-label { color: var(--nord3-brighter); font-size: var(--ui-small); margin: 8px 0 3px; }
 /* Name + add-root native <input> fields: boxed, frost border when focused. */
 .ps-input {
   display: block;
@@ -669,7 +688,7 @@ html, body, #app {
   font: inherit;
 }
 .ps-add-input::placeholder { color: var(--nord3-brighter); font-style: italic; }
-.ps-error { color: var(--nord11); font-size: 12px; margin-top: 8px; }
+.ps-error { color: var(--nord11); font-size: var(--ui-small); margin-top: 8px; }
 
 /* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,
    then per-setting blocks of a label-left / native-checkbox-right row with the description grouped
@@ -679,7 +698,7 @@ html, body, #app {
 .modal.app-settings .modal-message { font-weight: 600; margin-bottom: 14px; }
 .as-group { margin-bottom: 16px; }
 .as-group:last-of-type { margin-bottom: 0; }
-.as-group-title { color: var(--nord8); font-size: 12px; font-weight: 600; margin: 0 0 10px; }
+.as-group-title { color: var(--nord8); font-size: var(--ui-small); font-weight: 600; margin: 0 0 10px; }
 .as-setting { margin-bottom: 12px; }
 .as-setting:last-child { margin-bottom: 0; }
 .as-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -701,7 +720,7 @@ html, body, #app {
 /* Focus rings just the control — a future setting may pair several controls in one row. */
 .as-setting.selected .as-check,
 .as-setting.selected .as-value { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
-.as-desc { color: var(--nord3-brighter); font-size: 12px; margin-top: 2px; }
+.as-desc { color: var(--nord3-brighter); font-size: var(--ui-small); margin-top: 2px; }
 
 /* ---- Picker overlay (command-palette style) ---- */
 .overlay {
@@ -715,13 +734,13 @@ html, body, #app {
   z-index: 10;
 }
 .picker {
-  width: min(720px, 80vw);
+  width: min(calc(var(--ui-font-size) * 720 / 13), 80vw);
   max-height: 70vh;
   display: flex;
   flex-direction: column;
   background: var(--nord1);
   color: var(--nord6);
-  font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   border: 1px solid var(--nord3);
   border-radius: 6px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
@@ -769,9 +788,9 @@ html, body, #app {
   color: var(--nord8);
   padding: 1px 7px;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: var(--ui-small);
   white-space: nowrap;
-  max-width: 220px;
+  max-width: calc(var(--ui-font-size) * 220 / 13);
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
@@ -1014,7 +1033,7 @@ a.picker-row:not(.selected):hover .picker-main {
   flex: 0 0 auto;
   margin-left: 12px;
   color: var(--nord3-brighter);
-  font-size: 12px;
+  font-size: var(--ui-small);
   white-space: nowrap;
 }
 /* "Still searching" throbber: a conventional spinning ring, left of the count. CSS drives the
@@ -1022,8 +1041,8 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-spinner {
   flex: 0 0 auto;
   margin-left: 12px;
-  width: 11px;
-  height: 11px;
+  width: var(--ui-fine);
+  height: var(--ui-fine);
   border: 2px solid var(--nord3);
   border-top-color: var(--nord8);
   border-radius: 50%;

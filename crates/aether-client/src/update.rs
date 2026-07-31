@@ -4909,17 +4909,20 @@ impl Session {
             return Effects::none();
         }
 
-        // Left/Right step a value row (font size) without wrapping — a natural stepper. They're
-        // inert on a toggle row (Enter/Space flips those).
+        // Left/Right step a value row (either font size) without wrapping — a natural stepper.
+        // They're inert on a toggle row (Enter/Space flips those).
         let left = code == KeyCode::Left || (mods.alt && code == KeyCode::Char('h'));
         let right = code == KeyCode::Right || (mods.alt && code == KeyCode::Char('l'));
         if left || right {
-            if let Some(AppSettingId::FontSize) =
-                self.app_setting_rows().get(selected).map(|r| r.id)
-            {
-                return self.set_font_size(step_font_size(self.font_size, right, false));
-            }
-            return Effects::none();
+            return match self.app_setting_rows().get(selected).map(|r| r.id) {
+                Some(AppSettingId::BufferFontSize) => {
+                    self.set_buffer_font_size(step_font_size(self.buffer_font_size, right, false))
+                }
+                Some(AppSettingId::UiFontSize) => {
+                    self.set_ui_font_size(step_font_size(self.ui_font_size, right, false))
+                }
+                _ => Effects::none(),
+            };
         }
 
         if code == KeyCode::Enter || code == KeyCode::Char(' ') {
@@ -4952,10 +4955,11 @@ impl Session {
         // (native = text shaping, web = font feature), so adopting the value is enough — the
         // re-render after this event applies it. No reflow / round-trip like wrap needs.
         self.ligatures = settings.ligatures;
-        // Font size is likewise client-side: the GUI/web shells read `self.font_size` each render
-        // and re-measure their cell + reflow when it changes (the terminal ignores it). Adopting the
-        // value is enough — the re-render after this event applies it.
-        self.font_size = settings.font_size;
+        // Both font sizes are likewise client-side: the GUI/web shells read them each render — the
+        // buffer size re-measures the cell + reflows, the UI size rescales the chrome (the terminal
+        // ignores both). Adopting the values is enough; the re-render after this event applies them.
+        self.buffer_font_size = settings.buffer_font_size;
+        self.ui_font_size = settings.ui_font_size;
         // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
         // rendering the corner hint when it's off.
         self.hints_enabled = settings.hints;
@@ -5002,11 +5006,14 @@ impl Session {
                 self.ligatures = !self.ligatures;
                 self.persist_app_settings()
             }
-            // Font size: activating the row cycles to the next preset (wrapping). Like ligatures
-            // it's shell-render-only — set the value + persist, and the GUI/web re-render re-measures
-            // the cell and reflows. `step` lets the Left/Right keys pass a non-wrapping direction.
-            AppSettingId::FontSize => {
-                self.set_font_size(step_font_size(self.font_size, true, true))
+            // Font sizes: activating either row cycles to the next preset (wrapping). Like ligatures
+            // they're shell-render-only — set the value + persist, and the GUI/web re-render applies
+            // it. `step` lets the Left/Right keys pass a non-wrapping direction.
+            AppSettingId::BufferFontSize => {
+                self.set_buffer_font_size(step_font_size(self.buffer_font_size, true, true))
+            }
+            AppSettingId::UiFontSize => {
+                self.set_ui_font_size(step_font_size(self.ui_font_size, true, true))
             }
             // Hints: same flip (and toast) as `Space Alt-h`.
             AppSettingId::Hints => self.toggle_hints(),
@@ -5034,7 +5041,8 @@ impl Session {
         AppSettings {
             wrap: self.wrap,
             ligatures: self.ligatures,
-            font_size: self.font_size,
+            buffer_font_size: self.buffer_font_size,
+            ui_font_size: self.ui_font_size,
             hints: self.hints_enabled,
         }
     }
@@ -5046,13 +5054,24 @@ impl Session {
         self.request_str::<SettingsSet>(self.current_app_settings(), Event::AppSettingsSaved)
     }
 
-    /// Persist a new editor font size + apply it (the GUI/web re-render reads `self.font_size`).
-    /// No-op when unchanged. Shared by the row's activate-cycle and the Left/Right stepper.
-    fn set_font_size(&mut self, font_size: u32) -> Effects {
-        if font_size == self.font_size {
+    /// Persist a new buffer text size + apply it (the GUI/web re-render reads
+    /// `self.buffer_font_size`, re-measures its cell and reflows). No-op when unchanged. Shared by
+    /// the row's activate-cycle and the Left/Right stepper.
+    fn set_buffer_font_size(&mut self, font_size: u32) -> Effects {
+        if font_size == self.buffer_font_size {
             return Effects::none();
         }
-        self.font_size = font_size;
+        self.buffer_font_size = font_size;
+        self.persist_app_settings()
+    }
+
+    /// The same for the chrome around the buffer (`self.ui_font_size`) — no reflow, the GUI/web
+    /// shells just rescale their chrome on the next render.
+    fn set_ui_font_size(&mut self, font_size: u32) -> Effects {
+        if font_size == self.ui_font_size {
+            return Effects::none();
+        }
+        self.ui_font_size = font_size;
         self.persist_app_settings()
     }
 

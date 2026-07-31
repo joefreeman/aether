@@ -51,6 +51,89 @@ pub const GIT_STAGED_ADDED_BG: Color = rgb(0x2f3631);
 pub const GIT_STAGED_MODIFIED_BG: Color = rgb(0x35342d);
 pub const GIT_STAGED_DELETED_BG: Color = rgb(0x33252a);
 
+/// Chrome sizing, derived from the `ui_font_size` app setting (`Space .`). Every size in the chrome
+/// — status bar, pickers, dialogs, hover, toasts, hints — goes through here, so the whole UI scales
+/// as one knob. The buffer text is *not* chrome: it has its own setting (`buffer_font_size`) that
+/// the editor widget reads directly.
+///
+/// The hand-tuned literals the chrome was built from (13 body, 12 secondary, 14 heading, 24px picker
+/// rows, …) are kept as sizes-at-the-default-base and scaled by [`Ui::at`], so the size hierarchy
+/// survives at any base rather than collapsing into one flat size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ui {
+    /// The setting's value in px. This *is* the body tier; every other tier is a ratio of it.
+    base: f32,
+}
+
+/// The base the chrome literals were hand-tuned against — the denominator in [`Ui::at`]. Tied to the
+/// setting's default, so a fresh install renders pixel-identical to the pre-setting chrome.
+const TUNED_BASE: f32 = aether_protocol::settings::default_ui_font_size() as f32;
+
+impl Ui {
+    pub fn new(ui_font_size: u32) -> Self {
+        Ui {
+            base: ui_font_size as f32,
+        }
+    }
+
+    /// Scale a dimension that was hand-tuned at [`TUNED_BASE`] to the current base. Used for text
+    /// sizes and for the pixel dimensions that hold text (row heights, label columns, dialog
+    /// widths) — pure whitespace (paddings, gaps, shadows) stays fixed, since it doesn't clip.
+    pub fn at(self, tuned_px: f32) -> f32 {
+        tuned_px * self.base / TUNED_BASE
+    }
+
+    /// Body text: picker rows, dialog copy, status-bar segments.
+    pub fn body(self) -> f32 {
+        self.base
+    }
+
+    /// Secondary text: counts, meta columns, descriptions, chips, the hint chip.
+    pub fn small(self) -> f32 {
+        self.at(12.0)
+    }
+
+    /// Fine print: the `(y)`/`(n)` key suffix on modal buttons.
+    pub fn fine(self) -> f32 {
+        self.at(11.0)
+    }
+
+    /// A `●` drawn as text inside a row (picker bullets), sized to read as a dot rather than a
+    /// glyph.
+    pub fn dot(self) -> f32 {
+        self.at(9.0)
+    }
+
+    /// Dialog titles and section headings.
+    pub fn heading(self) -> f32 {
+        self.at(14.0)
+    }
+
+    /// A non-text control's box (the settings checkbox).
+    pub fn control(self) -> f32 {
+        self.at(16.0)
+    }
+
+    /// One line of chrome text including leading — what a stack of chrome lines measures per line
+    /// (the hover popover's height estimate).
+    pub fn line_height(self) -> f32 {
+        self.at(19.0)
+    }
+
+    /// Rough px-per-character for chrome sans text, for the status bar's elide budget (chars
+    /// approximate px there — see `status_bar`).
+    pub fn char_width(self) -> f32 {
+        self.at(6.5)
+    }
+
+    /// Every picker display row (item or group header) is exactly this tall — the unit the
+    /// virtual-scroll spacer math is built on. Rounded to whole pixels so row boundaries stay crisp
+    /// and the spacer arithmetic doesn't accumulate fractions.
+    pub fn row_h(self) -> f32 {
+        self.at(24.0).round()
+    }
+}
+
 // Cursor-line variants on changed lines under the diff view, so the cursorline doesn't hide
 // the change colour.
 pub const CURSOR_LINE_ADDED_BG: Color = rgb(0x3a4d3a);
@@ -146,5 +229,38 @@ mod tests {
         assert_eq!(highlight_color("nonsense"), None);
         // Emphasis is listed but has no colour of its own.
         assert_eq!(highlight_color("text.emphasis"), None);
+    }
+
+    /// At the default `ui_font_size` the scale reproduces the literals the chrome was hand-tuned
+    /// with — a fresh install must render exactly as it did before the setting existed.
+    #[test]
+    fn default_ui_scale_reproduces_the_tuned_sizes() {
+        let ui = Ui::new(aether_protocol::settings::default_ui_font_size());
+        assert_eq!(ui.body(), 13.0);
+        assert_eq!(ui.small(), 12.0);
+        assert_eq!(ui.fine(), 11.0);
+        assert_eq!(ui.dot(), 9.0);
+        assert_eq!(ui.heading(), 14.0);
+        assert_eq!(ui.control(), 16.0);
+        assert_eq!(ui.row_h(), 24.0);
+    }
+
+    /// Every tier scales with the setting — including the picker's row height, which holds the row
+    /// text (a row that didn't grow would clip it) — and the hierarchy between tiers survives.
+    #[test]
+    fn ui_scale_grows_with_the_setting() {
+        let ui = Ui::new(26); // twice the default base
+        assert_eq!(ui.body(), 26.0);
+        assert_eq!(ui.small(), 24.0);
+        assert_eq!(ui.row_h(), 48.0);
+        assert_eq!(ui.at(720.0), 1440.0, "panel widths track the text they hold");
+        assert!(ui.dot() < ui.fine() && ui.fine() < ui.small());
+        assert!(ui.small() < ui.body() && ui.body() < ui.heading());
+
+        // A smaller base shrinks the same way, and rounding keeps row boundaries on whole pixels.
+        let ui = Ui::new(11);
+        assert!(ui.body() < 13.0);
+        assert_eq!(ui.row_h(), (11.0 * 24.0 / 13.0_f32).round());
+        assert_eq!(ui.row_h().fract(), 0.0);
     }
 }

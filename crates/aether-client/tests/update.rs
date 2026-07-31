@@ -3476,45 +3476,65 @@ fn space_m_shows_blame_commit() {
 }
 
 #[test]
-fn font_size_setting_steps_and_persists() {
+fn font_size_settings_step_and_persist_independently() {
     use aether_client::keymap::{KeyCode, Mods};
     use aether_client::session::AppSettingId;
     use aether_client::update::Event;
     use aether_protocol::settings::AppSettings;
     use aether_protocol::viewport::WrapMode;
 
-    // Persisted font size is adopted into the session (render-only, like ligatures — no effects).
+    // Persisted font sizes are adopted into the session (render-only, like ligatures — no effects).
     let mut s = session();
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
         wrap: WrapMode::Soft,
         ligatures: true,
-        font_size: 16,
+        buffer_font_size: 16,
+        ui_font_size: 12,
         ..AppSettings::default()
     })));
-    assert_eq!(s.font_size, 16, "persisted font size is adopted");
+    assert_eq!(s.buffer_font_size, 16, "persisted buffer size is adopted");
+    assert_eq!(s.ui_font_size, 12, "persisted UI size is adopted");
     assert!(
         fx.0.is_empty(),
-        "font size is render-only — no reflow effect"
+        "font sizes are render-only — no reflow effect"
     );
 
-    // The Font size row sits in the app-settings overlay. Activating it (Enter/Space/click) steps
-    // to the next preset and persists via settings/set.
+    // Both rows sit in the app-settings overlay. Activating one (Enter/Space/click) steps it to the
+    // next preset and persists via settings/set — and leaves the other size alone.
     s.open_app_settings();
-    let rows = s.app_setting_rows();
-    let idx = rows
-        .iter()
-        .position(|r| matches!(r.id, AppSettingId::FontSize))
-        .expect("a Font size row");
-    let fx = s.app_settings_toggle(idx);
-    assert_eq!(s.font_size, 18, "16 → next preset 18");
+    let row_index = |s: &aether_client::session::Session, want: AppSettingId| {
+        s.app_setting_rows()
+            .iter()
+            .position(|r| r.id == want)
+            .unwrap_or_else(|| panic!("a {want:?} row"))
+    };
+    let buffer_row = row_index(&s, AppSettingId::BufferFontSize);
+    let fx = s.app_settings_toggle(buffer_row);
+    assert_eq!(s.buffer_font_size, 18, "16 → next preset 18");
+    assert_eq!(s.ui_font_size, 12, "the UI size is untouched");
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
-    assert_eq!(params["font_size"], json!(18));
+    assert_eq!(params["buffer_font_size"], json!(18));
+    assert_eq!(params["ui_font_size"], json!(12));
 
     // Left steps down to the previous preset (no wrap), also persisting.
     let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
-    assert_eq!(s.font_size, 16, "Left steps down a preset");
+    assert_eq!(s.buffer_font_size, 16, "Left steps down a preset");
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
-    assert_eq!(params["font_size"], json!(16));
+    assert_eq!(params["buffer_font_size"], json!(16));
+
+    // The UI row is its own stepper over the same presets, and moves only the UI size.
+    let ui_row = row_index(&s, AppSettingId::UiFontSize);
+    let fx = s.app_settings_toggle(ui_row);
+    assert_eq!(s.ui_font_size, 13, "12 → next preset 13");
+    assert_eq!(s.buffer_font_size, 16, "the buffer size is untouched");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["ui_font_size"], json!(13));
+
+    let fx = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+    assert_eq!(s.ui_font_size, 14, "Right steps up a preset");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["ui_font_size"], json!(14));
+    assert_eq!(params["buffer_font_size"], json!(16));
 }
 
 #[test]
@@ -4708,7 +4728,7 @@ fn adopt_hints(s: &mut Session) -> Effects {
         vec!["settings/get", "hints/state"],
         "startup fetches settings then the hint snapshot"
     );
-    let settings = json!({ "wrap": "soft", "ligatures": true, "font_size": 14, "hints": true });
+    let settings = json!({ "wrap": "soft", "ligatures": true, "buffer_font_size": 14, "ui_font_size": 13, "hints": true });
     s.on_rpc_result(reqs[0].0, Ok(settings));
     s.on_rpc_result(reqs[1].0, Ok(json!({})));
     s.on_hint_tick(1_000_000_000_000) // an arbitrary wall clock, ~2001
@@ -4733,7 +4753,7 @@ fn hints_snapshot_adoption_requests_an_immediate_tick() {
                 _ => None,
             })
             .collect();
-    let settings = json!({ "wrap": "soft", "ligatures": true, "font_size": 14, "hints": true });
+    let settings = json!({ "wrap": "soft", "ligatures": true, "buffer_font_size": 14, "ui_font_size": 13, "hints": true });
     let _ = s.on_rpc_result(reqs[0].0, Ok(settings));
     let fx = s.on_rpc_result(reqs[1].0, Ok(json!({})));
     assert!(

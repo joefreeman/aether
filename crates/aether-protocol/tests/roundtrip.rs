@@ -3124,29 +3124,45 @@ fn app_settings_wire_shape_and_defaults() {
     assert_eq!(AppSettings::default().wrap, WrapMode::Soft);
     assert!(AppSettings::default().ligatures);
 
-    // Wire shape: `wrap` serializes as the lowercase WrapMode tag; `ligatures` as a bool; `font_size`
-    // as a number.
+    // Wire shape: `wrap` serializes as the lowercase WrapMode tag; `ligatures` as a bool; the two
+    // font sizes as numbers under their own keys.
     let s = AppSettings {
         wrap: WrapMode::None,
         ligatures: false,
-        font_size: 16,
+        buffer_font_size: 16,
+        ui_font_size: 12,
         hints: false,
     };
     assert_eq!(
         to_value(s).unwrap(),
-        json!({ "wrap": "none", "ligatures": false, "font_size": 16, "hints": false })
+        json!({
+            "wrap": "none",
+            "ligatures": false,
+            "buffer_font_size": 16,
+            "ui_font_size": 12,
+            "hints": false,
+        })
     );
 
-    // A file with only `wrap` set (added before `ligatures`/`font_size`/`hints`) reads back with
-    // those defaulting (ligatures on, font size at the default, hints on).
+    // A file with only `wrap` set (added before the others) reads back with those defaulting
+    // (ligatures on, both font sizes at their defaults, hints on).
     let parsed: AppSettings = from_value(json!({ "wrap": "none" })).unwrap();
     assert_eq!(parsed.wrap, WrapMode::None);
     assert!(parsed.ligatures);
     assert_eq!(
-        parsed.font_size,
-        aether_protocol::settings::default_font_size()
+        parsed.buffer_font_size,
+        aether_protocol::settings::default_buffer_font_size()
+    );
+    assert_eq!(
+        parsed.ui_font_size,
+        aether_protocol::settings::default_ui_font_size()
     );
     assert!(parsed.hints, "hints default on");
+
+    // The pre-split `font_size` key is not read back as either size — it's gone, and a file still
+    // carrying it lands on the defaults rather than silently applying the old value to one of them.
+    let parsed: AppSettings = from_value(json!({ "font_size": 20 })).unwrap();
+    assert_eq!(parsed, AppSettings::default());
 
     // An empty object (a fresh / older settings.toml with no keys) reads back as defaults — every
     // field carries a serde default so settings can be added without breaking old files.

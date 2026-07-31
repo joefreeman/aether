@@ -390,8 +390,11 @@ interface CoreView {
   wrap: WrapMode;
   diff_view: boolean;
   ligatures: boolean;
-  /** Editor font size in px (the synced `font_size` app setting). */
-  font_size: number;
+  /** Buffer text size in px (the synced `buffer_font_size` app setting). */
+  buffer_font_size: number;
+  /** Chrome text size in px (the synced `ui_font_size` app setting) — status bar, pickers,
+   *  dialogs, hover, toasts, hints. */
+  ui_font_size: number;
   window: BufferWindow | null;
   viewport_id: number | null;
   buffer: {
@@ -874,12 +877,13 @@ export class Shell {
 
   private cols = 80;
   private rows = 24;
-  /** The `#app` root element — its `font-size` is the editor size (the buffer inherits it), driven
-   *  by the synced `font_size` app setting. */
+  /** The `#app` root element — its `font-size` is the buffer size (the buffer inherits it), driven
+   *  by the synced `buffer_font_size` app setting. */
   private rootEl!: HTMLElement;
-  /** The font size (px) currently applied to the DOM, so `render` re-measures only when it changes.
-   *  The authoritative value is the core's `view.font_size`. */
-  private appliedFontSize = 0;
+  /** The font sizes (px) currently applied to the DOM, so `render` re-applies only on a change.
+   *  The authoritative values are the core's `view.buffer_font_size` / `view.ui_font_size`. */
+  private appliedBufferFontSize = 0;
+  private appliedUiFontSize = 0;
   /** The most recent `view()` — refreshed every `render()`, read by the geometry methods so they
    *  don't re-serialize the window on every scroll event. */
   private snapshot: CoreView | null = null;
@@ -1989,15 +1993,25 @@ export class Shell {
     }
   }
 
-  /** Apply the editor font size from the synced `font_size` app setting: set the `#app` font-size
-   *  (the buffer inherits it) and re-measure the cell, then resize the server viewport so soft-wrap
-   *  reflows. Called at the top of `render`, so it only re-measures (the in-flight render then draws
-   *  at the new cell) and kicks the async resize — it must not re-enter `render` itself. No-op when
-   *  unchanged. */
-  private applyFontSize(px: number): void {
-    if (px === this.appliedFontSize) return;
-    this.appliedFontSize = px;
-    this.rootEl.style.fontSize = `${px}px`;
+  /** Apply the two synced font sizes.
+   *
+   *  The buffer size goes on `#app` (the buffer inherits it) and needs a cell re-measure plus a
+   *  viewport resize so soft-wrap reflows to the new column count. The UI size is just the
+   *  `--ui-font-size` custom property on the document root: theme.css derives every chrome size
+   *  from it (and the picker's row height is measured from a real row each render), so the next
+   *  paint picks it up with no measuring here.
+   *
+   *  Called at the top of `render`, so it only re-measures (the in-flight render then draws at the
+   *  new cell) and kicks the async resize — it must not re-enter `render` itself. Each half no-ops
+   *  when unchanged. */
+  private applyFontSizes(bufferPx: number, uiPx: number): void {
+    if (uiPx !== this.appliedUiFontSize) {
+      this.appliedUiFontSize = uiPx;
+      document.documentElement.style.setProperty("--ui-font-size", `${uiPx}px`);
+    }
+    if (bufferPx === this.appliedBufferFontSize) return;
+    this.appliedBufferFontSize = bufferPx;
+    this.rootEl.style.fontSize = `${bufferPx}px`;
     this.cell = measureCell(this.bufferEl);
     // `onResize` recomputes the grid and, when a viewport is already subscribed, issues the reflow
     // RPC; before the first subscribe it just updates cols/rows (the subscribe reads them). It does
@@ -2357,8 +2371,8 @@ export class Shell {
     }
     const v = this.view();
     this.snapshot = v;
-    // Adopt the synced editor font size before drawing, so this paint uses the right cell metrics.
-    this.applyFontSize(v.font_size);
+    // Adopt the synced font sizes before drawing, so this paint uses the right cell metrics.
+    this.applyFontSizes(v.buffer_font_size, v.ui_font_size);
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);

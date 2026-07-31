@@ -920,11 +920,12 @@ impl App {
             }
 
             Message::PickerScrolled(y) => {
+                let ui = self.ui();
                 let Some(p) = &mut self.session.picker else {
                     return Task::none();
                 };
                 self.picker_scroll_y = y;
-                match p.scrolled_refetch(crate::picker::first_visible_row(y)) {
+                match p.scrolled_refetch(crate::picker::first_visible_row(y, ui)) {
                     Some(offset) => {
                         // Free pixel scroll — the view moved, not the selection — so the reply must
                         // not chase the highlight back (`chase_selection = false`).
@@ -1531,10 +1532,11 @@ impl App {
     /// the top of the pane unless it's already visible (grep file-jumps — landing on a new
     /// file reveals it from its first hit without yanking an in-view jump).
     fn picker_reveal_selected_with(&mut self, reveal: Reveal) -> Task<Message> {
+        let ui = self.ui();
         let Some(p) = &self.session.picker else {
             return Task::none();
         };
-        reveal_picker_selection(p, &mut self.picker_scroll_y, reveal)
+        reveal_picker_selection(p, &mut self.picker_scroll_y, reveal, ui)
     }
 
     // ---- search ---------------------------------------------------------------------------
@@ -2001,6 +2003,13 @@ impl App {
 
     // ---- view ----------------------------------------------------------------------------------
 
+    /// The chrome's sizing scale, from the `ui_font_size` app setting. Every chrome size in the
+    /// view goes through this (the buffer has its own `buffer_font_size`, read by the editor
+    /// widget) — see [`theme::Ui`].
+    fn ui(&self) -> theme::Ui {
+        theme::Ui::new(self.session.ui_font_size)
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         // No workspace picked yet (the mandatory chooser, or the beat after a pick while the
         // activation is in flight): a plain backdrop with no editor chrome behind the overlays,
@@ -2037,7 +2046,7 @@ impl App {
                             .map(|(line, text)| (*line, text.as_str())),
                         tab_width: TAB_WIDTH,
                         ligatures: self.session.ligatures,
-                        font_size: self.session.font_size as f32,
+                        font_size: self.session.buffer_font_size as f32,
                     },
                     Message::Editor,
                 );
@@ -2057,6 +2066,7 @@ impl App {
                     &self.session.workspace_paths,
                     self.picker_scroll_y,
                     self.spinner_phase,
+                    self.ui(),
                 ))
                 .map(|m| match m {
                     PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
@@ -2105,12 +2115,13 @@ impl App {
     /// emphasized. Deliberately subtler than a toast: no shadow-heavy card, no animation, no
     /// icon; it should read as ambient chrome, not a notification.
     fn hint_corner(&self, hint: aether_client::hints::HintView) -> Element<'_, Message> {
+        let ui = self.ui();
         let (before, keys, after) = hint.parts();
-        let dim = |s: &'static str| text(s).size(12).font(SANS).color(theme::NORD3_BRIGHT);
+        let dim = |s: &'static str| text(s).size(ui.small()).font(SANS).color(theme::NORD3_BRIGHT);
         let body = iced::widget::row![
             dim("Hint: "),
             dim(before),
-            text(keys).size(12).font(SANS_BOLD_UI).color(theme::NORD8),
+            text(keys).size(ui.small()).font(SANS_BOLD_UI).color(theme::NORD8),
             dim(after),
         ];
         let chip = container(body)
@@ -2138,13 +2149,14 @@ impl App {
     /// connection isn't healthy — yellow while the retry loop dials, red once
     /// re-establishing failed terminally.
     fn conn_banner(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let (label, bg, fg) = match self.session.conn {
             ConnState::Failed => ("Disconnected", theme::NORD11, theme::NORD6),
             // Boot before the daemon is up — distinct copy from a mid-session blip.
             ConnState::Connecting => ("Connecting…", theme::NORD13, theme::NORD0),
             _ => ("Reconnecting…", theme::NORD13, theme::NORD0),
         };
-        let pill = container(text(label).size(12).font(SANS).color(fg))
+        let pill = container(text(label).size(ui.small()).font(SANS).color(fg))
             .padding([6, 14])
             .style(move |_| container::Style {
                 background: Some(bg.into()),
@@ -2183,6 +2195,7 @@ impl App {
     /// `WorkspaceSettingsMsg` mapped inline to `Message` (since the inputs already produce `Message`,
     /// the whole tree is `Message`-typed rather than mapped at the end).
     fn workspace_settings_body(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let s = self.session.workspace_settings.as_ref().unwrap();
 
         // An editable field: a controlled `text_input` keyed to its core setter. Wrapped in a
@@ -2194,7 +2207,7 @@ impl App {
             |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
                 // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
                 // the text. Both states are the same widget now, so the box height is already consistent.
-                overlay_input(fieldkind, placeholder, value)
+                overlay_input(fieldkind, placeholder, value, ui)
             };
 
         // A boxed, optionally-highlighted input/row container.
@@ -2227,7 +2240,7 @@ impl App {
 
         let label = |t: &str| {
             text(t.to_string())
-                .size(12)
+                .size(ui.small())
                 .font(SANS)
                 .color(theme::NORD3_BRIGHT)
         };
@@ -2245,7 +2258,7 @@ impl App {
 
         let mut col = column![
             text("Workspace settings")
-                .size(14)
+                .size(ui.heading())
                 .font(SANS_BOLD_UI)
                 .color(theme::NORD6),
             name_group,
@@ -2258,16 +2271,16 @@ impl App {
         if s.roots.is_empty() {
             roots_col = roots_col.push(
                 text("(no roots — add one below)")
-                    .size(12)
+                    .size(ui.small())
                     .font(SANS)
                     .color(theme::NORD3_BRIGHT),
             );
         }
         // A bulleted row: `• <content> …`, indented one bullet-gap from the label (web parity).
         // No row box — selection tints only the path text (see below).
-        fn bulleted(inner: Element<'_, Message>) -> Element<'_, Message> {
+        fn bulleted<'a>(inner: Element<'a, Message>, ui: theme::Ui) -> Element<'a, Message> {
             container(
-                row![text("•").size(13).font(SANS).color(theme::NORD6), inner]
+                row![text("•").size(ui.body()).font(SANS).color(theme::NORD6), inner]
                     .align_y(iced::Alignment::Center)
                     .spacing(6),
             )
@@ -2282,7 +2295,7 @@ impl App {
 
         for (i, root) in s.roots.iter().enumerate() {
             let highlighted = s.selected == i + 1;
-            let delete = iced::widget::button(text("✕").size(12).font(SANS).color(theme::NORD6))
+            let delete = iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
                 .padding([2, 8])
                 .style(|_, status| iced::widget::button::Style {
                     background: Some(
@@ -2310,7 +2323,7 @@ impl App {
             });
             // Selection tints just the path text (web/terminal parity), so the background hugs the
             // text — no padding, so the text lines up with the borderless add-root input below.
-            let path = container(text(root.clone()).size(13).font(SANS).color(theme::NORD6)).style(
+            let path = container(text(root.clone()).size(ui.body()).font(SANS).color(theme::NORD6)).style(
                 move |_| container::Style {
                     background: highlighted.then(|| theme::NORD2.into()),
                     border: iced::Border {
@@ -2323,24 +2336,23 @@ impl App {
             let inner = row![path, iced::widget::Space::new().width(Length::Fill), delete,]
                 .align_y(iced::Alignment::Center)
                 .spacing(6);
-            roots_col = roots_col.push(bulleted(inner.into()));
+            roots_col = roots_col.push(bulleted(inner.into(), ui));
         }
 
         // The always-present add-root input row — a borderless input after its bullet, so the caret
         // is the focus cue (web/terminal parity), not a box.
-        roots_col = roots_col.push(bulleted(field(
-            OverlayField::WorkspaceAddRoot,
-            &s.add.text,
-            "Add root...",
-        )));
+        roots_col = roots_col.push(bulleted(
+            field(OverlayField::WorkspaceAddRoot, &s.add.text, "Add root..."),
+            ui,
+        ));
         col = col.push(roots_col);
 
         if let Some(err) = &s.error {
-            col = col.push(text(err.clone()).size(12).font(SANS).color(theme::NORD11));
+            col = col.push(text(err.clone()).size(ui.small()).font(SANS).color(theme::NORD11));
         }
 
         let boxed = container(col.spacing(8))
-            .width(480)
+            .width(ui.at(480.0))
             .padding(16)
             .style(|_| container::Style {
                 background: Some(theme::NORD1.into()),
@@ -2379,11 +2391,12 @@ impl App {
     /// closes). Only the focused setting's *checkbox* is ringed (not the whole row). Mirrors the
     /// workspace-settings modal box + dimmed backdrop.
     fn app_settings_overlay(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let s = self.session.app_settings.as_ref().unwrap();
         let groups = self.session.app_setting_groups();
 
         let mut col = column![text("Application settings")
-            .size(14)
+            .size(ui.heading())
             .font(SANS_BOLD_UI)
             .color(theme::NORD6)]
         .spacing(14);
@@ -2392,7 +2405,7 @@ impl App {
         let mut flat = 0usize;
         for group in &groups {
             let mut gcol = column![text(group.title.to_string())
-                .size(12)
+                .size(ui.small())
                 .font(SANS_BOLD_UI)
                 .color(theme::NORD8)]
             .spacing(10);
@@ -2406,7 +2419,7 @@ impl App {
                 // activates the row (flip / step to the next preset), the same as Enter/Space.
                 let control: Element<'_, Message> = match r.control {
                     AppSettingControl::Toggle(on) => iced::widget::checkbox(on)
-                        .size(16)
+                        .size(ui.control())
                         .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i)))
                         .into(),
                     AppSettingControl::Value(v) => {
@@ -2414,7 +2427,7 @@ impl App {
                         // button carries the row index (a `usize`) and we map it to `Message` — the
                         // same pattern as the workspace-settings delete button.
                         let btn = iced::widget::button(
-                            text(v.to_string()).size(13).font(SANS).color(theme::NORD6),
+                            text(v.to_string()).size(ui.body()).font(SANS).color(theme::NORD6),
                         )
                         .padding([2, 8])
                         .style(|_, status| iced::widget::button::Style {
@@ -2457,7 +2470,7 @@ impl App {
                 let field = column![
                     row![
                         text(r.label.to_string())
-                            .size(13)
+                            .size(ui.body())
                             .font(SANS)
                             .color(theme::NORD6),
                         iced::widget::Space::new().width(Length::Fill),
@@ -2466,7 +2479,7 @@ impl App {
                     .align_y(iced::Alignment::Center)
                     .spacing(6),
                     text(r.hint.to_string())
-                        .size(12)
+                        .size(ui.small())
                         .font(SANS)
                         .color(theme::NORD3_BRIGHT),
                 ]
@@ -2477,7 +2490,7 @@ impl App {
         }
 
         let boxed = container(col.spacing(14))
-            .width(420)
+            .width(ui.at(420.0))
             .padding(16)
             .style(|_| container::Style {
                 background: Some(theme::NORD1.into()),
@@ -2510,6 +2523,7 @@ impl App {
     /// The floating search prompt, bottom-left above the status bar — mirrors the web client's
     /// `#searchbar` (query + beam cursor, match count on the right).
     fn search_bar(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         // The query input is a controlled `text_input` (web parity): its value is the core's
         // search query, edits sync via `search_set_query`, and Enter/Up/Down/Esc bubble to
         // `on_key` (commit / history nav / cancel) since `on_submit` is unset. With option chips
@@ -2521,7 +2535,7 @@ impl App {
                 .id(OverlayField::Search.id())
                 .on_input(SearchInputMsg::Typed)
                 .font(SANS)
-                .size(13)
+                .size(ui.body())
                 .padding(0)
                 .width(Length::Fill)
                 .style(|_theme, _status| iced::widget::text_input::Style {
@@ -2568,7 +2582,7 @@ impl App {
         let selected = self.session.search.chip_selected;
         let mut chips_row = row![].spacing(4).align_y(iced::Alignment::Center);
         for (i, chip) in chips.iter().enumerate() {
-            chips_row = chips_row.push(option_chip(chip, selected == Some(i)));
+            chips_row = chips_row.push(option_chip(chip, selected == Some(i), ui));
         }
         if !chips.is_empty() {
             chips_row = chips_row.push(iced::widget::Space::new().width(6));
@@ -2579,10 +2593,10 @@ impl App {
             .align_y(iced::Alignment::Center);
         bar = bar.push(iced::widget::Space::new().width(Length::Fill));
         if let Some(count) = self.search_count_label() {
-            bar = bar.push(text(count).size(13).font(SANS).color(theme::NORD4));
+            bar = bar.push(text(count).size(ui.body()).font(SANS).color(theme::NORD4));
         }
         let prompt = container(bar)
-            .width(420)
+            .width(ui.at(420.0))
             .padding([5, 10])
             .style(|_| container::Style {
                 background: Some(theme::NORD1.into()),
@@ -2619,6 +2633,7 @@ impl App {
     /// Geometry comes from [`prompt_box`] — see there for why the info dialog is shaped differently
     /// from the question-shaped prompts.
     fn prompt_overlay(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let prompt = self.session.prompt.as_ref().unwrap();
         // The save-as arm embeds a controlled `text_input` (which produces `Message`), so the
         // whole body is built in `Message` space: the Clone-only buttons map their `PromptMsg`
@@ -2642,13 +2657,13 @@ impl App {
                    msg: PromptMsg|
          -> Element<'_, Message> {
             let mut content = row![text(label.to_string())
-                .size(13)
+                .size(ui.body())
                 .font(SANS)
                 .color(theme::NORD6)]
             .spacing(7)
             .align_y(iced::Alignment::Center);
             if let Some(key) = key {
-                content = content.push(text(format!("({key})")).size(11).font(SANS).color(
+                content = content.push(text(format!("({key})")).size(ui.fine()).font(SANS).color(
                     iced::Color {
                         a: 0.55,
                         ..theme::NORD6
@@ -2694,12 +2709,12 @@ impl App {
                     row![
                         container(
                             text(k.to_string())
-                                .size(13)
+                                .size(ui.body())
                                 .font(SANS)
                                 .color(theme::NORD3_BRIGHT)
                         )
-                        .width(90),
-                        text(v).size(13).font(SANS).color(theme::NORD6),
+                        .width(ui.at(90.0)),
+                        text(v).size(ui.body()).font(SANS).color(theme::NORD6),
                     ]
                     .spacing(8)
                 };
@@ -2717,9 +2732,9 @@ impl App {
                 };
                 let mut col = column![
                     row![
-                        text("● ").size(14).color(dot),
+                        text("● ").size(ui.heading()).color(dot),
                         text(info.name.clone())
-                            .size(13)
+                            .size(ui.body())
                             .font(SANS_BOLD_UI)
                             .color(theme::NORD6),
                     ]
@@ -2751,13 +2766,13 @@ impl App {
                 // between sections (12px) does the grouping. A single uniform spacing made the
                 // dialog tall enough to overflow a small window.
                 let mut col = column![text("Aether")
-                    .size(14)
+                    .size(ui.heading())
                     .font(SANS_BOLD_UI)
                     .color(theme::NORD6)]
                 .spacing(12);
                 for section in aether_client::app_info::sections(info) {
                     let mut rows = column![text(section.title)
-                        .size(12)
+                        .size(ui.small())
                         .font(SANS_BOLD_UI)
                         .color(theme::NORD8)]
                     .spacing(3);
@@ -2771,10 +2786,10 @@ impl App {
                         rows = rows.push(
                             row![
                                 container(
-                                    text(r.label).size(13).font(SANS).color(theme::NORD3_BRIGHT)
+                                    text(r.label).size(ui.body()).font(SANS).color(theme::NORD3_BRIGHT)
                                 )
-                                .width(84),
-                                text(r.value).size(13).font(SANS).color(value_color),
+                                .width(ui.at(84.0)),
+                                text(r.value).size(ui.body()).font(SANS).color(value_color),
                             ]
                             .spacing(8),
                         );
@@ -2785,7 +2800,7 @@ impl App {
             }
             Prompt::Confirm { kind, .. } => column![
                 text(format!("{}?", confirm_phrase(kind)))
-                    .size(13)
+                    .size(ui.body())
                     .font(SANS)
                     .color(theme::NORD6),
                 row![
@@ -2828,6 +2843,7 @@ impl App {
                             PickerMsg::EditorRoot,
                             true,
                             Boundary::ConfirmRoot,
+                        ui,
                         ));
                     } else {
                         // Unfocused root: the chosen label in breadcrumb blue — or the raw filter
@@ -2842,10 +2858,10 @@ impl App {
                         };
                         let color = if invalid { theme::NORD11 } else { theme::NORD8 };
                         root_group =
-                            root_group.push(text(display).size(13).font(SANS).color(color));
+                            root_group.push(text(display).size(ui.body()).font(SANS).color(color));
                     }
                     root_group =
-                        root_group.push(text(":").size(13).font(SANS).color(theme::NORD3_BRIGHT));
+                        root_group.push(text(":").size(ui.body()).font(SANS).color(theme::NORD3_BRIGHT));
                     field = field.push(root_group).spacing(6);
                 }
                 // The path field: typed value plus the gray `path_ghost` suffix, red on invalid
@@ -2864,6 +2880,7 @@ impl App {
                     PickerMsg::EditorPath,
                     false,
                     path_boundary,
+                ui,
                 ));
                 let field: Element<'_, Message> = Element::from(field).map(|m| match m {
                     PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::SaveAsRoot, s),
@@ -2873,7 +2890,7 @@ impl App {
                     _ => Message::Noop,
                 });
                 column![
-                    text("Save as").size(13).font(SANS).color(theme::NORD6),
+                    text("Save as").size(ui.body()).font(SANS).color(theme::NORD6),
                     container(field)
                         .padding([5, 8])
                         .width(Length::Fill)
@@ -2909,7 +2926,7 @@ impl App {
                     .id(OverlayField::OpenPath.id())
                     .on_input(|s| s)
                     .font(SANS)
-                    .size(13)
+                    .size(ui.body())
                     .padding(0)
                     .width(Length::Fill)
                     .style(|_theme, _status| iced::widget::text_input::Style {
@@ -2923,7 +2940,7 @@ impl App {
                 let input: Element<'_, Message> = Element::from(inner)
                     .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
                 column![
-                    text("Open file").size(13).font(SANS).color(theme::NORD6),
+                    text("Open file").size(ui.body()).font(SANS).color(theme::NORD6),
                     container(input)
                         .padding([5, 8])
                         .width(Length::Fill)
@@ -2950,7 +2967,7 @@ impl App {
             }
         };
         let info_dialog = matches!(prompt, Prompt::AppInfo(_));
-        let PromptBox { width, top, max_h } = prompt_box(info_dialog, self.view_size.height);
+        let PromptBox { width, top, max_h } = prompt_box(info_dialog, self.view_size.height, ui);
         let body: Element<'_, Message> = if info_dialog {
             // Both widths are `Fill` on purpose. A scrollable defaults to `Shrink`, so it would
             // size to its widest row and draw the scrollbar against the *text* rather than the box
@@ -3004,6 +3021,7 @@ impl App {
     /// The hover popover, anchored at the cursor cell: below it when there's room, above
     /// otherwise (estimated from the content's line count), clamped into the view.
     fn hover_overlay(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let content = self.hover.as_ref().unwrap();
         let mut est_lines = 0usize;
         let body: Element<'_, Message> = match content {
@@ -3022,15 +3040,15 @@ impl App {
                     let line: Element<'_, Message> = match b.severity {
                         Some(sev) => row![
                             text(theme::diag_glyph(sev))
-                                .size(13)
+                                .size(ui.body())
                                 .font(SANS)
                                 .color(color),
-                            text(b.text.clone()).size(13).font(SANS).color(color),
+                            text(b.text.clone()).size(ui.body()).font(SANS).color(color),
                         ]
                         .spacing(6)
                         .align_y(iced::Alignment::Start)
                         .into(),
-                        None => text(b.text.clone()).size(13).font(SANS).color(color).into(),
+                        None => text(b.text.clone()).size(ui.body()).font(SANS).color(color).into(),
                     };
                     col = col.push(line);
                 }
@@ -3041,7 +3059,7 @@ impl App {
                 est_lines: n,
             } => {
                 est_lines = *n;
-                md_doc(blocks)
+                md_doc(blocks, ui)
             }
         };
         // Anchor at the cursor cell. Pick below/above by the room each side has for the
@@ -3051,7 +3069,7 @@ impl App {
         // horizontal column and parks against the edge it left by (rather than jumping to a corner).
         const MARGIN: f32 = 4.0;
         const MAX_H: f32 = 380.0;
-        let est_h = est_lines as f32 * 19.0 + 20.0;
+        let est_h = est_lines as f32 * ui.line_height() + 20.0;
         let mut anchor = None;
         let mut max_h = MAX_H;
         if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
@@ -3243,7 +3261,8 @@ impl App {
     /// transient), git cluster. Right: grep position, diagnostic counts, cursor position, LSP
     /// health dot.
     fn status_bar(&self) -> Element<'_, Message> {
-        let t = |s: String, color: iced::Color| text(s).size(13).font(SANS).color(color);
+        let ui = self.ui();
+        let t = |s: String, color: iced::Color| text(s).size(ui.body()).font(SANS).color(color);
 
         let mut left = row![];
         if let Some(color) = self.buffer_state_color() {
@@ -3257,12 +3276,12 @@ impl App {
         }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
-        let budget = ((self.view_size.width * 0.5 / 6.5) as usize).max(12);
+        let budget = ((self.view_size.width * 0.5 / ui.char_width()) as usize).max(12);
         let name = text(crate::labels::truncate_path(
             &self.session.buffer.label,
             budget,
         ))
-        .size(13)
+        .size(ui.body())
         .color(theme::NORD4)
         .font(
             // A transient (preview) buffer slants the file label, like the other clients.
@@ -3370,6 +3389,7 @@ impl App {
     /// Bottom-right toast stack, above the status bar — layout and accent colours mirror the
     /// web client's `#toasts` (a `▌` glyph stands in for its 3px left border).
     fn toast_overlay(&self) -> Element<'_, Message> {
+        let ui = self.ui();
         let mut stack_col = column![].spacing(8).align_x(iced::Alignment::End);
         for toast in &self.toasts {
             let accent = match toast.kind {
@@ -3387,7 +3407,7 @@ impl App {
                 container(
                     container(
                         text(toast.message.clone())
-                            .size(13)
+                            .size(ui.body())
                             .font(SANS)
                             .color(theme::NORD4),
                     )
@@ -3448,7 +3468,7 @@ impl App {
 /// (`picker::chip_el`): compact label on a raised NORD2 background, NORD8 text, the whole-word chip
 /// underlined; the keyboard-selected chip inverts (NORD8 background, NORD0 text). Chips are
 /// keyboard-driven (Left/Right select, Backspace removes, Enter cycles), so this is non-interactive.
-fn option_chip<'a>(chip: &crate::chips::Chip, selected: bool) -> Element<'a, Message> {
+fn option_chip<'a>(chip: &crate::chips::Chip, selected: bool, ui: theme::Ui) -> Element<'a, Message> {
     let underline = matches!(chip.id, crate::chips::ChipId::Word);
     let (bg, fg) = if selected {
         (theme::NORD8, theme::NORD0)
@@ -3456,7 +3476,7 @@ fn option_chip<'a>(chip: &crate::chips::Chip, selected: bool) -> Element<'a, Mes
         (theme::NORD2, theme::NORD8)
     };
     let spans: Vec<iced::widget::text::Span<'a>> = vec![iced::widget::span(chip.label.clone())
-        .size(12)
+        .size(ui.small())
         .font(SANS)
         .color(fg)
         .underline(underline)];
@@ -3501,7 +3521,12 @@ const SANS_BOLD_UI: iced::Font = iced::Font {
 /// `iced::widget::text_input`'s builder requires `Message: Clone`, which the app's `Message` is
 /// not, so it's built in the tiny `Clone` [`Typed`] space and `.map`'d to `Message` (the same
 /// indirection the picker/prompt overlays use for their Clone-only button messages).
-fn overlay_input<'a>(field: OverlayField, placeholder: &str, value: &str) -> Element<'a, Message> {
+fn overlay_input<'a>(
+    field: OverlayField,
+    placeholder: &str,
+    value: &str,
+    ui: theme::Ui,
+) -> Element<'a, Message> {
     // `alt_passthrough` keeps Alt-chords (the nav idiom) out of the input — winit delivers
     // `Alt+letter` as text on some platforms, which a focused `text_input` would otherwise insert.
     crate::alt_filter::alt_passthrough(
@@ -3509,7 +3534,7 @@ fn overlay_input<'a>(field: OverlayField, placeholder: &str, value: &str) -> Ele
             .id(field.id())
             .on_input(Typed)
             .font(SANS)
-            .size(13)
+            .size(ui.body())
             .padding(0)
             .style(|_theme, _status| iced::widget::text_input::Style {
                 background: iced::Background::Color(iced::Color::TRANSPARENT),
@@ -3577,21 +3602,23 @@ enum HoverPlace {
 // blocks, accent inline code with no background, white headings, underlined links). Sizes/spacing
 // mirror the web client's CSS.
 
+/// Hover-Markdown sizing, as tuned-at-the-default-base pixels (see [`theme::Ui::at`]): body text,
+/// code blocks, and the gap between blocks.
 const MD_TEXT: f32 = 13.0;
 const MD_CODE: f32 = 12.0;
 const MD_SPACING: f32 = 11.0;
 
 /// Render the hover Markdown AST: a column of block elements. Everything is cloned, so the result
 /// doesn't borrow the AST (`'static`).
-fn md_doc(blocks: &[MdBlock]) -> Element<'static, Message> {
-    let mut col = column![].spacing(MD_SPACING);
+fn md_doc(blocks: &[MdBlock], ui: theme::Ui) -> Element<'static, Message> {
+    let mut col = column![].spacing(ui.at(MD_SPACING));
     for b in blocks {
-        col = col.push(md_block(b));
+        col = col.push(md_block(b, ui));
     }
     col.into()
 }
 
-fn md_block(b: &MdBlock) -> Element<'static, Message> {
+fn md_block(b: &MdBlock, ui: theme::Ui) -> Element<'static, Message> {
     match b {
         MdBlock::Heading { level, content } => {
             let size = match level {
@@ -3600,13 +3627,13 @@ fn md_block(b: &MdBlock) -> Element<'static, Message> {
                 3 => 14.0,
                 _ => MD_TEXT,
             };
-            md_rich(content, true, theme::NORD6, size)
+            md_rich(content, true, theme::NORD6, ui.at(size))
         }
-        MdBlock::Paragraph { content } => md_rich(content, false, theme::NORD4, MD_TEXT),
+        MdBlock::Paragraph { content } => md_rich(content, false, theme::NORD4, ui.at(MD_TEXT)),
         MdBlock::Code { code, .. } => container(
             text(code.clone())
                 .font(iced::Font::MONOSPACE)
-                .size(MD_CODE)
+                .size(ui.at(MD_CODE))
                 .color(theme::NORD4),
         )
         .width(Length::Fill)
@@ -3621,7 +3648,7 @@ fn md_block(b: &MdBlock) -> Element<'static, Message> {
         })
         .into(),
         MdBlock::List { ordered, items } => {
-            let mut col = column![].spacing(MD_SPACING * 0.5);
+            let mut col = column![].spacing(ui.at(MD_SPACING) * 0.5);
             for (i, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("{}.", i + 1)
@@ -3629,12 +3656,16 @@ fn md_block(b: &MdBlock) -> Element<'static, Message> {
                     "•".to_string()
                 };
                 col = col.push(
-                    row![text(marker).size(MD_TEXT).color(theme::NORD4), md_doc(item),].spacing(6),
+                    row![
+                        text(marker).size(ui.at(MD_TEXT)).color(theme::NORD4),
+                        md_doc(item, ui),
+                    ]
+                    .spacing(6),
                 );
             }
             col.into()
         }
-        MdBlock::Quote { content } => row![md_bar(), md_doc(content)].spacing(8).into(),
+        MdBlock::Quote { content } => row![md_bar(), md_doc(content, ui)].spacing(8).into(),
         MdBlock::Rule => container(iced::widget::Space::new())
             .width(Length::Fill)
             .height(1)
@@ -3863,8 +3894,13 @@ fn hover_scroll_px(dir: ScrollDir, unit: ScrollUnit, cell: Option<Size>) -> f32 
 
 /// Scroll the picker's jumplist so the highlighted row is in view. `Minimal` moves the
 /// least distance; `Top` aligns the row to the top unless it's already fully visible.
-fn reveal_picker_selection(p: &PickerState, scroll_y: &mut f32, reveal: Reveal) -> Task<Message> {
-    let Some(y) = reveal_target(p, *scroll_y, reveal) else {
+fn reveal_picker_selection(
+    p: &PickerState,
+    scroll_y: &mut f32,
+    reveal: Reveal,
+    ui: theme::Ui,
+) -> Task<Message> {
+    let Some(y) = reveal_target(p, *scroll_y, reveal, ui) else {
         return Task::none();
     };
     *scroll_y = y;
@@ -3878,24 +3914,24 @@ fn reveal_picker_selection(p: &PickerState, scroll_y: &mut f32, reveal: Reveal) 
 /// in view. Grep hits reserve one row of clearance above (the web client's
 /// `scroll-margin-top`): the sticky file header pins over the list's first visible row, so
 /// a hit revealed flush to the top edge would sit hidden underneath it.
-fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal) -> Option<f32> {
+fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) -> Option<f32> {
     let sd = p.selected_display_row()?;
     // Row-index × ROW_H, plus the inter-group gap pixels above the row (gaps sit outside the
     // display-row unit — same compensation as the overlay's spacers).
     let gaps =
         p.gaps_above_window() + p.gaps_before_display_rel(sd.saturating_sub(p.window_base()));
-    let top = sd as f32 * crate::picker::ROW_H + gaps as f32 * crate::picker::GROUP_GAP;
-    let bottom = top + crate::picker::ROW_H;
+    let top = sd as f32 * ui.row_h() + gaps as f32 * crate::picker::GROUP_GAP;
+    let bottom = top + ui.row_h();
     // Kinds that pin a sticky group header over the top row (grep's file path, Keybindings'
     // group label) need a revealed row to clear one row's height or it slides under the header
     // (the bug grep hit first, then Keybindings). Same predicate as the pin itself.
     let clearance = if crate::picker::pins_group_header(p.kind) {
-        crate::picker::ROW_H
+        ui.row_h()
     } else {
         0.0
     };
     let m_top = (top - clearance).max(0.0);
-    let h = crate::picker::list_height(p);
+    let h = crate::picker::list_height(p, ui);
     let visible = m_top >= scroll_y && bottom <= scroll_y + h;
     match reveal {
         Reveal::Top if !visible => Some(m_top),
@@ -3968,10 +4004,10 @@ struct PromptBox {
 /// than the window — the cut-off the fixed-height version suffered in a small window. The floor
 /// keeps it usable on a very short window, where scrolling inside a small box beats a box drawn
 /// past the bottom edge.
-fn prompt_box(info_dialog: bool, view_height: f32) -> PromptBox {
+fn prompt_box(info_dialog: bool, view_height: f32, ui: theme::Ui) -> PromptBox {
     let top = if info_dialog { 56.0 } else { 120.0 };
     PromptBox {
-        width: if info_dialog { 560.0 } else { 420.0 },
+        width: ui.at(if info_dialog { 560.0 } else { 420.0 }),
         top,
         max_h: (view_height - top * 2.0).max(120.0),
     }
@@ -4253,7 +4289,18 @@ fn window_settings() -> iced::window::Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::{GROUP_GAP, ROW_H};
+    use crate::picker::GROUP_GAP;
+
+    /// The chrome scale at its default `ui_font_size` — the geometry these tests were written
+    /// against (row height, prompt widths). `Ui::row_h()` is the display-row unit the picker's
+    /// virtual scroll and the reveal math both count in.
+    fn ui() -> theme::Ui {
+        theme::Ui::new(aether_protocol::settings::default_ui_font_size())
+    }
+
+    fn row_h() -> f32 {
+        ui().row_h()
+    }
     use aether_protocol::picker::{PickerItem, PickerUpdateParams};
 
     /// The info dialog is capped to leave its own top offset clear at both ends, so it can't run
@@ -4261,7 +4308,7 @@ mod tests {
     #[test]
     fn info_dialog_never_exceeds_the_window() {
         for view_h in [400.0, 700.0, 1080.0, 2160.0] {
-            let b = prompt_box(true, view_h);
+            let b = prompt_box(true, view_h, ui());
             assert!(
                 b.top + b.max_h + b.top <= view_h.max(b.top * 2.0 + 120.0),
                 "box at {view_h}px window: top {} + max_h {} overflows",
@@ -4275,16 +4322,16 @@ mod tests {
     /// scrolling box still beats an unusable one.
     #[test]
     fn info_dialog_height_has_a_floor() {
-        assert_eq!(prompt_box(true, 100.0).max_h, 120.0);
-        assert_eq!(prompt_box(true, 0.0).max_h, 120.0);
+        assert_eq!(prompt_box(true, 100.0, ui()).max_h, 120.0);
+        assert_eq!(prompt_box(true, 0.0, ui()).max_h, 120.0);
     }
 
     /// The info dialog is the wide, picker-aligned shape; the question prompts keep the narrow,
     /// lower one.
     #[test]
     fn prompt_shapes_differ_by_kind() {
-        let info = prompt_box(true, 1000.0);
-        let question = prompt_box(false, 1000.0);
+        let info = prompt_box(true, 1000.0, ui());
+        let question = prompt_box(false, 1000.0, ui());
         assert!(info.width > question.width);
         assert!(info.top < question.top, "info sits at the picker's offset");
     }
@@ -4332,26 +4379,26 @@ mod tests {
     fn grep_reveal_clears_the_sticky_header() {
         let mut s = grep_state();
         // Scrolled so display row 6 (a b.rs hit) is first visible, pinned header over it.
-        let scroll = 6.0 * ROW_H;
+        let scroll = 6.0 * row_h();
         s.selected = 4; // display row 6 — the first visible row, pinned header over it
         assert_eq!(
-            reveal_target(&s, scroll, Reveal::Minimal),
-            Some(5.0 * ROW_H + GROUP_GAP),
+            reveal_target(&s, scroll, Reveal::Minimal, ui()),
+            Some(5.0 * row_h() + GROUP_GAP),
             "selection on the pinned-over first row needs a one-row scroll (plus the group gap above it)"
         );
         // One row below the top edge is genuinely visible — no scroll.
         s.selected = 5; // display row 7
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), None);
+        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), None);
         // Top-aligned reveals (grep file jumps) leave the same clearance.
         s.selected = 22; // display row 24 — below the 18-row viewport (rows 6..24)
         assert_eq!(
-            reveal_target(&s, scroll, Reveal::Top),
-            Some(23.0 * ROW_H + GROUP_GAP),
+            reveal_target(&s, scroll, Reveal::Top, ui()),
+            Some(23.0 * row_h() + GROUP_GAP),
             "the row aligns with its clearance row at the top"
         );
         // The first hit of the list reveals to 0 — its real header row is above it.
         s.selected = 0; // display row 1
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), Some(0.0));
+        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), Some(0.0));
     }
 
     /// The Keybindings picker pins its group header the same way grep pins its file header, so
@@ -4392,19 +4439,19 @@ mod tests {
             explorer_peek_missing: false,
         }));
         // Scrolled so display row 6 (an Edit row) is first visible, pinned "Edit" header over it.
-        let scroll = 6.0 * ROW_H;
+        let scroll = 6.0 * row_h();
         s.selected = 4; // display row 6 — the first visible row, pinned header over it
         assert_eq!(
-            reveal_target(&s, scroll, Reveal::Minimal),
-            Some(5.0 * ROW_H + GROUP_GAP),
+            reveal_target(&s, scroll, Reveal::Minimal, ui()),
+            Some(5.0 * row_h() + GROUP_GAP),
             "selection on the pinned-over first row needs a one-row scroll (plus the group gap above it)"
         );
         // One row below the top edge is genuinely visible — no scroll.
         s.selected = 5; // display row 7
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), None);
+        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), None);
         // The list's first item reveals to 0 — its real header row is above it.
         s.selected = 0; // display row 1
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), Some(0.0));
+        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), Some(0.0));
     }
 
     /// Non-grep pickers have no headers: the first row is revealed flush to the top.
@@ -4433,13 +4480,13 @@ mod tests {
             center_on: None,
             explorer_peek_missing: false,
         }));
-        let scroll = 6.0 * ROW_H;
+        let scroll = 6.0 * row_h();
         s.selected = 6; // first visible row — visible as-is
-        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal), None);
+        assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), None);
         s.selected = 5;
         assert_eq!(
-            reveal_target(&s, scroll, Reveal::Minimal),
-            Some(5.0 * ROW_H)
+            reveal_target(&s, scroll, Reveal::Minimal, ui()),
+            Some(5.0 * row_h())
         );
     }
 

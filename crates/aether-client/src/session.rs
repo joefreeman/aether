@@ -287,13 +287,17 @@ pub struct AppSettingsOverlay {
 pub enum AppSettingId {
     SoftWrap,
     Ligatures,
-    FontSize,
+    /// Size of the file text itself.
+    BufferFontSize,
+    /// Size of everything around it — status bar, pickers, dialogs.
+    UiFontSize,
     Hints,
 }
 
-/// Editor font-size presets the [`AppSettingId::FontSize`] row steps through (px). The default
-/// ([`aether_protocol::settings::default_font_size`]) is one of them, so the stored value always
-/// lands on a preset and the row's "current" maps cleanly to an index.
+/// Font-size presets the two font-size rows step through (px). Both defaults
+/// ([`aether_protocol::settings::default_buffer_font_size`] and `default_ui_font_size`) are in the
+/// list, so a stored value always lands on a preset and the row's "current" maps cleanly to an
+/// index.
 pub const FONT_SIZE_PRESETS: &[u32] = &[10, 11, 12, 13, 14, 16, 18, 20, 24];
 
 /// Step `current` to an adjacent font-size preset. `up` picks the larger neighbour. With `wrap`,
@@ -520,10 +524,15 @@ pub struct Session {
     /// `settings/get` at boot. The shells read it each render to pick their text shaping
     /// (native) / font feature (web); the core just holds the value.
     pub ligatures: bool,
-    /// Editor font size in px — an app-wide setting (`Space .`), seeded from `settings/get` at
+    /// Buffer text size in px — an app-wide setting (`Space .`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
     /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
-    pub font_size: u32,
+    pub buffer_font_size: u32,
+    /// UI text size in px — the same deal for everything *around* the buffer (status bar, pickers,
+    /// dialogs, hover, toasts, hints), which the GUI/web shells scale from this one number. Sized
+    /// separately from [`Self::buffer_font_size`]: chrome density and code size are different
+    /// preferences.
+    pub ui_font_size: u32,
     /// Hints on/off — an app-wide setting (`Space .`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
     /// hint disappears (and observation stops) when off.
@@ -596,7 +605,8 @@ impl Session {
             window: None,
             wrap: WrapMode::Soft,
             ligatures: true,
-            font_size: aether_protocol::settings::default_font_size(),
+            buffer_font_size: aether_protocol::settings::default_buffer_font_size(),
+            ui_font_size: aether_protocol::settings::default_ui_font_size(),
             hints_enabled: true,
             diff_view: false,
             diagnostics: DiagnosticCounts::default(),
@@ -638,10 +648,16 @@ impl Session {
                     hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
                 },
                 AppSettingRow {
-                    id: AppSettingId::FontSize,
-                    label: "Font size",
-                    control: AppSettingControl::Value(self.font_size),
-                    hint: "Editor text size in pixels (GUI/web; the terminal uses its own font)",
+                    id: AppSettingId::BufferFontSize,
+                    label: "Buffer font size",
+                    control: AppSettingControl::Value(self.buffer_font_size),
+                    hint: "File text size in pixels (GUI/web; the terminal uses its own font)",
+                },
+                AppSettingRow {
+                    id: AppSettingId::UiFontSize,
+                    label: "UI font size",
+                    control: AppSettingControl::Value(self.ui_font_size),
+                    hint: "Status bar, picker and dialog text size in pixels (GUI/web)",
                 },
                 AppSettingRow {
                     id: AppSettingId::Hints,

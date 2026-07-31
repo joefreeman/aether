@@ -24,12 +24,18 @@ pub struct AppSettings {
     /// font features. The server stores it but doesn't act on it.
     #[serde(default = "default_ligatures")]
     pub ligatures: bool,
-    /// Editor font size in px. Another client-side render choice the server only stores: the
-    /// GUI/web clients render the buffer at this size (and reflow soft-wrap to the new width); the
-    /// terminal client ignores it (the terminal owns its font). The overlay steps it through a small
-    /// set of preset sizes.
-    #[serde(default = "default_font_size")]
-    pub font_size: u32,
+    /// Buffer text size in px — the file content itself. Another client-side render choice the
+    /// server only stores: the GUI/web clients render the buffer at this size (and reflow soft-wrap
+    /// to the new width); the terminal client ignores it (the terminal owns its font). The overlay
+    /// steps it through a small set of preset sizes.
+    #[serde(default = "default_buffer_font_size")]
+    pub buffer_font_size: u32,
+    /// UI text size in px — everything *around* the buffer (status bar, pickers, dialogs, hover,
+    /// toasts, hints). Sized independently of [`Self::buffer_font_size`] so the chrome can stay
+    /// compact while the code is large, or vice versa. Same story otherwise: client-side render
+    /// only, GUI/web honour it, the terminal ignores it.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: u32,
     /// Hints: the passive corner suggestion that walks through the curriculum
     /// (docs/hints.md). The off-switch only — learning state lives in `hints.json`, not here.
     #[serde(default = "default_hints")]
@@ -44,8 +50,14 @@ fn default_ligatures() -> bool {
     true
 }
 
-pub const fn default_font_size() -> u32 {
+pub const fn default_buffer_font_size() -> u32 {
     14
+}
+
+/// A notch below the buffer default: the chrome is dense (status bar, picker rows) and reads as
+/// secondary to the text, which is what the hand-tuned sizes it replaced already assumed.
+pub const fn default_ui_font_size() -> u32 {
+    13
 }
 
 fn default_hints() -> bool {
@@ -57,7 +69,8 @@ impl Default for AppSettings {
         AppSettings {
             wrap: default_wrap(),
             ligatures: default_ligatures(),
-            font_size: default_font_size(),
+            buffer_font_size: default_buffer_font_size(),
+            ui_font_size: default_ui_font_size(),
             hints: default_hints(),
         }
     }
