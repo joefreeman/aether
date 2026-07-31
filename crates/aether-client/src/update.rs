@@ -55,8 +55,8 @@ use aether_protocol::input::{
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputChangeLine,
     InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
     InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
-    InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputText,
-    InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
+    InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputTab,
+    InputText, InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
     InputUnsurround, InputUnsurroundParams, LineSide, ToggleCommentParams, UndoRedoParams,
     UndoResult,
 };
@@ -5874,13 +5874,9 @@ impl Session {
             // ---- edits ----
             A::Backspace => self.edit::<InputBackspace>(BufferOnlyParams { buffer_id }),
             A::NewlineIndent => self.edit::<InputNewlineAndIndent>(BufferOnlyParams { buffer_id }),
-            A::InsertTab => self.edit::<InputText>(InputTextParams {
-                buffer_id,
-                text: "\t".into(),
-                select_pasted: false,
-                replace_selection: false,
-                at: None,
-            }),
+            // The whitespace itself is the server's call — it owns the buffer's indent style, so
+            // `Tab` lands spaces or a tab to match what `Enter` and `Ctrl-l` already produce.
+            A::InsertTab => self.edit::<InputTab>(BufferOnlyParams { buffer_id }),
             A::DeletePoint => self.edit::<InputDelete>(CountedEditParams {
                 buffer_id,
                 count: 1,

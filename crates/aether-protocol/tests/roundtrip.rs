@@ -21,8 +21,9 @@ use aether_protocol::git::{
     GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
-    CountedEditParams, InputAdjustNumber, InputAdjustNumberParams, InputSurround,
-    InputSurroundParams, InputText, InputTextParams, UndoRedoParams,
+    BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
+    InputBackspace, InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams,
+    UndoRedoParams,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -902,6 +903,21 @@ fn toggle_comment_params() {
     let defaulted: ToggleCommentParams =
         from_value(json!({"buffer_id": 1, "style": "line"})).unwrap();
     assert_eq!(defaulted.target, SurroundTarget::Selection);
+}
+
+/// `input/tab` carries no payload of its own — the indent step is computed server-side from the
+/// buffer's style — so its params are the bare `BufferOnlyParams` it shares with its inverse,
+/// `input/backspace`.
+#[test]
+fn input_tab_method() {
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(InputTab::NAME, "input/tab");
+    assert_eq!(InputBackspace::NAME, "input/backspace");
+
+    let params = to_value(BufferOnlyParams { buffer_id: 7 }).unwrap();
+    assert_eq!(params, json!({"buffer_id": 7}));
+    let parsed: BufferOnlyParams = from_value(json!({"buffer_id": 7})).unwrap();
+    assert_eq!(parsed.buffer_id, 7);
 }
 
 #[test]

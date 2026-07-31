@@ -7974,6 +7974,62 @@ pub async fn input_backspace(
     apply_edit(state, client_id, params.buffer_id, EditKind::Backspace).await
 }
 
+/// `input/tab` — insert one indent step at the cursor (Insert-mode `Tab`).
+///
+/// The step comes from the buffer's `indent_style`, the same source `Enter`'s smart indent and
+/// `input/indent` use, so a file never ends up with tabs from one key and spaces from another.
+/// The insert goes through [`input_text`], so undo grouping, viewport pushes and cursor stamping
+/// are identical to typing the whitespace by hand.
+pub async fn input_tab(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    let text = {
+        let s = state.lock().await;
+        let buf = s
+            .buffers
+            .get(&params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let cursor = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default();
+        let char_idx = motion::pos_to_char(buf, cursor.position);
+        crate::indent::step_at(
+            &buf.text,
+            buf.indent_style,
+            char_idx,
+            client_tab_width(&s, client_id, params.buffer_id),
+        )
+    };
+    input_text(
+        state,
+        ctx,
+        InputTextParams {
+            buffer_id: params.buffer_id,
+            text,
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await
+}
+
+/// The tab width this client renders `buffer_id` at, for edits whose result has to line up with
+/// what's on screen. Borrowed from any of the client's viewports on the buffer (they're all the
+/// same in practice); 4 when it has none — an edit through a buffer it isn't viewing.
+fn client_tab_width(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> u32 {
+    s.viewports
+        .values()
+        .find(|v| v.buffer_id == buffer_id && v.client_id == client_id)
+        .map(|v| v.tab_width)
+        .unwrap_or(4)
+}
+
 pub async fn input_delete_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -10354,12 +10410,21 @@ async fn apply_edit(
             }
         }
         EditKind::Backspace => {
+            // Inside a line's leading whitespace this steps back to the previous tab stop, so one
+            // `Backspace` undoes one `input/tab`; everywhere else it stays a single char. The span
+            // never crosses the line start, so the backward motion can't run onto the line above.
+            let count = crate::indent::backspace_span(
+                &buf.text,
+                buf.indent_style,
+                motion::pos_to_char(buf, cursor.position),
+                client_tab_width(&s, client_id, buffer_id),
+            ) as u32;
             let prev = motion::resolve_motion(
                 buf,
                 cursor.position,
                 &Motion::Char {
                     direction: Direction::Backward,
-                    count: 1,
+                    count,
                 },
             );
             let (lo, hi) = motion::ordered(cursor.position, prev);

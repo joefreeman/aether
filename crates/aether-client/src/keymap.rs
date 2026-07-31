@@ -847,7 +847,7 @@ static INSERT: &[Binding] = &[
     bind!(I, KeyCode::Backspace, Any, A::Backspace, "Edit", "Delete character before cursor"),
     bind!(I, KeyCode::Delete, Any, A::DeletePoint, "Edit", "Delete character at cursor"),
     bind!(I, KeyCode::Enter, Any, A::NewlineIndent, "Edit", "Newline and indent"),
-    bind!(I, KeyCode::Tab, Any, A::InsertTab, "Edit", "Insert tab"),
+    bind!(I, KeyCode::Tab, Any, A::InsertTab, "Edit", "Indent to next tab stop"),
     bind!(I, KeyCode::Left, Any, A::MoveChar(Direction::Backward), "Motion", "Cursor left"),
     bind!(I, KeyCode::Right, Any, A::MoveChar(Direction::Forward), "Motion", "Cursor right"),
     bind!(I, KeyCode::Up, Any, A::MoveVisualLine(VerticalDirection::Up), "Motion", "Cursor up"),

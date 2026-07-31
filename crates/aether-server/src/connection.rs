@@ -28,7 +28,7 @@ use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::input::{
     EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChange, InputChangeLine,
     InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
-    InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputText,
+    InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputTab, InputText,
     InputToggleComment, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::jumplist::{JumplistCapture, JumplistStep};
@@ -425,6 +425,7 @@ async fn dispatch(
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
         InputChange::NAME => run!(InputChange, handlers::input_change),
         InputBackspace::NAME => run!(InputBackspace, handlers::input_backspace),
+        InputTab::NAME => run!(InputTab, handlers::input_tab),
         InputDeleteLine::NAME => run!(InputDeleteLine, handlers::input_delete_line),
         InputChangeLine::NAME => run!(InputChangeLine, handlers::input_change_line),
         InputReplaceLine::NAME => run!(InputReplaceLine, handlers::input_replace_line),

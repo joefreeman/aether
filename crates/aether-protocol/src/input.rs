@@ -105,6 +105,23 @@ impl RpcMethod for InputBackspace {
     type Result = EditResult;
 }
 
+// ---- input/tab ------------------------------------------------------------------------------
+
+/// Insert one indent step at the cursor: whitespace reaching the next tab stop, in the buffer's
+/// own indent style. A tab-indented buffer gets a literal `\t`; a space-indented one gets however
+/// many spaces reach the next multiple of its width, so `Tab` from a ragged column pads to
+/// alignment instead of overshooting. Insert-mode `Tab`.
+///
+/// Distinct from `input/indent`, which adds a level to whole *lines* — this is a cursor insertion
+/// and leaves any selection where it is. Its inverse is `input/backspace`, which steps back to
+/// the previous stop within a line's leading whitespace.
+pub struct InputTab;
+impl RpcMethod for InputTab {
+    const NAME: &'static str = "input/tab";
+    type Params = BufferOnlyParams;
+    type Result = EditResult;
+}
+
 // ---- line operations (Insert-mode Ctrl-d / Ctrl-c / Ctrl-r) -------------------------------------
 
 /// Delete the cursor's line entirely — both content and trailing newline. The buffer shrinks

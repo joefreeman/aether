@@ -3393,6 +3393,21 @@ fn toggle_wrap_flips_between_soft_and_none() {
     assert_eq!(s.wrap, WrapMode::Soft);
 }
 
+/// Insert-mode `Tab` asks the server for an indent step rather than sending a literal `\t` of its
+/// own — the buffer's indent style lives server-side, so the client can't compute the whitespace.
+#[test]
+fn insert_tab_requests_an_indent_step() {
+    let mut s = session();
+    key(&mut s, 'i');
+    assert_eq!(s.mode, aether_client::session::Mode::Insert);
+
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/tab");
+    // No text on the wire: the payload is just the buffer.
+    assert_eq!(params.get("text"), None);
+}
+
 #[test]
 fn tab_triggers_hover() {
     let mut s = session();

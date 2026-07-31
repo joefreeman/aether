@@ -26,9 +26,9 @@ use aether_protocol::input::{
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
     InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams,
     InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams,
-    InputText, InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
-    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
-    UndoRedoParams, UndoResult,
+    InputTab, InputText, InputTextParams, InputToggleComment, InputTransformCase,
+    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget,
+    ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
@@ -2850,6 +2850,141 @@ async fn input_delete_backspace_removes_char_before_cursor() {
         notif.replacement_lines[0].visual_rows[0].segments[0].text,
         "hell"
     );
+
+    drop(server);
+}
+
+/// Move the cursor to `(line, col)` and press `Tab`, returning the resulting buffer text.
+async fn tab_at(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    buffer_id: u64,
+    line: u32,
+    col: u32,
+) -> String {
+    let pos = LogicalPosition { line, col };
+    send_request::<CursorSet>(
+        ws,
+        90,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputTab>(ws, 91, &BufferOnlyParams { buffer_id }).await;
+    buffer_text(ws, 92, buffer_id).await
+}
+
+/// `Tab` inserts the buffer's indent unit, not a literal tab — and only enough of it to reach the
+/// next stop, so it pads a ragged column instead of overshooting.
+#[tokio::test]
+async fn input_tab_inserts_spaces_to_the_next_stop() {
+    // No language and no indented lines to learn from → the 2-space fallback.
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\n").await;
+    assert_eq!(tab_at(&mut ws, buffer_id, 0, 0).await, "  alpha\n");
+    drop(server);
+
+    // A `.rs` file with nothing to detect from takes Rust's 4-space default.
+    let (server, mut ws, open) = setup_with_named_file("a.rs", "fn f() {}\n").await;
+    let buffer_id = open.buffer_id;
+    assert_eq!(open.language.as_deref(), Some("rust"));
+    assert_eq!(tab_at(&mut ws, buffer_id, 0, 0).await, "    fn f() {}\n");
+    // Now at col 4 (already on a stop) another press takes a whole unit...
+    assert_eq!(
+        tab_at(&mut ws, buffer_id, 0, 4).await,
+        "        fn f() {}\n"
+    );
+    // ...but from a ragged column it pads onto the stop: col 10 (just past `fn`) → 2, not 4.
+    assert_eq!(
+        tab_at(&mut ws, buffer_id, 0, 10).await,
+        "        fn   f() {}\n"
+    );
+    drop(server);
+}
+
+/// A tab-indented buffer still gets a literal tab: the style comes from the buffer, so Go files
+/// and Makefiles keep their hard tabs.
+#[tokio::test]
+async fn input_tab_inserts_a_tab_in_tab_indented_buffers() {
+    // Detected from the file's own indentation, whatever the language.
+    let (server, mut ws, buffer_id) = setup_with_buffer("if x {\n\ty\n}\n").await;
+    assert_eq!(tab_at(&mut ws, buffer_id, 2, 0).await, "if x {\n\ty\n\t}\n");
+    drop(server);
+
+    // Or from the language default when there's nothing to detect — Go indents with tabs.
+    let (server, mut ws, open) = setup_with_named_file("a.go", "package main\n").await;
+    assert_eq!(open.language.as_deref(), Some("go"));
+    assert_eq!(
+        tab_at(&mut ws, open.buffer_id, 0, 0).await,
+        "\tpackage main\n"
+    );
+    drop(server);
+}
+
+/// `Backspace` is `Tab`'s inverse inside the indent: one press removes the whole step. Outside
+/// it — after any text on the line — it stays an ordinary one-character delete.
+#[tokio::test]
+async fn input_backspace_steps_back_through_indent() {
+    let (server, mut ws, open) = setup_with_named_file("a.rs", "fn f() {}\n").await;
+    let buffer_id = open.buffer_id;
+
+    // Tab in, then Backspace out: back to where we started, in one press each.
+    assert_eq!(tab_at(&mut ws, buffer_id, 0, 0).await, "    fn f() {}\n");
+    let _: EditResult =
+        send_request::<InputBackspace>(&mut ws, 20, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(buffer_text(&mut ws, 21, buffer_id).await, "fn f() {}\n");
+
+    // From a ragged column it lands on the stop below rather than clearing the lot: 6 → 4.
+    let pos = LogicalPosition { line: 0, col: 0 };
+    send_request::<CursorSet>(
+        &mut ws,
+        22,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        23,
+        &InputTextParams {
+            buffer_id,
+            text: "      ".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let r: EditResult =
+        send_request::<InputBackspace>(&mut ws, 24, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 4 });
+    assert_eq!(buffer_text(&mut ws, 25, buffer_id).await, "    fn f() {}\n");
+
+    // After text, one char at a time — even though col 8 sits exactly on a stop. (Col 8 is the
+    // `(` in `    fn f() {}`, so the deleted char is the `f` before it.)
+    let pos = LogicalPosition { line: 0, col: 8 };
+    send_request::<CursorSet>(
+        &mut ws,
+        26,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    let _: EditResult =
+        send_request::<InputBackspace>(&mut ws, 27, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(buffer_text(&mut ws, 28, buffer_id).await, "    fn () {}\n");
 
     drop(server);
 }

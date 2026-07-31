@@ -36,6 +36,76 @@ impl IndentStyle {
     }
 }
 
+/// The whitespace `Tab` inserts at `char_idx` (`input/tab`): a literal tab in a tab-indented
+/// buffer, otherwise however many spaces reach the next multiple of the indent width.
+///
+/// Measured in *display* columns, so a stop is a real on-screen stop even on a line that already
+/// contains tabs, and pressing `Tab` from a mid-line column pads to alignment rather than
+/// overshooting by a full unit.
+pub fn step_at(text: &ropey::Rope, style: IndentStyle, char_idx: usize, tab_width: u32) -> String {
+    let width = match style {
+        IndentStyle::Tab => return "\t".to_string(),
+        IndentStyle::Spaces(n) => n.max(1) as u32,
+    };
+    let col = display_col(text, char_idx, tab_width);
+    " ".repeat((width - (col % width)) as usize)
+}
+
+/// How many chars `Backspace` should delete at `char_idx` — the inverse of [`step_at`].
+///
+/// Normally 1. Inside a line's *leading whitespace* of a space-indented buffer it deletes back to
+/// the previous tab stop instead, so one `Backspace` undoes one `Tab` rather than nibbling a
+/// space at a time (VS Code's `useTabStops`, vim's `softtabstop`). Bounded by the run of spaces
+/// actually in front of the cursor, so it never swallows a tab or a character: in a mixed
+/// `\t   ` indent the spaces go first, then the tab, one press each.
+pub fn backspace_span(
+    text: &ropey::Rope,
+    style: IndentStyle,
+    char_idx: usize,
+    tab_width: u32,
+) -> usize {
+    let IndentStyle::Spaces(width) = style else {
+        // A tab *is* one stop — deleting the single char is already the right step.
+        return 1;
+    };
+    let width = width.max(1) as u32;
+    let line_start = text.line_to_char(text.char_to_line(char_idx));
+
+    // One pass over the line prefix: bail the moment it turns out not to be pure indent, and
+    // otherwise come out with the cursor's display column and the space run behind it.
+    let mut col = 0u32;
+    let mut spaces = 0u32;
+    let mut chars = 0u32;
+    for c in text.slice(line_start..char_idx).chars() {
+        if c != ' ' && c != '\t' {
+            return 1;
+        }
+        col += crate::wrap::char_display_width(c, col, tab_width);
+        spaces = if c == ' ' { spaces + 1 } else { 0 };
+        chars += 1;
+    }
+    if chars == 0 {
+        return 1;
+    }
+    // An already-aligned cursor steps a full width back; a ragged one steps onto the stop below.
+    let step = match col % width {
+        0 => width,
+        remainder => remainder,
+    };
+    step.min(spaces).max(1) as usize
+}
+
+/// Display column of `char_idx`: the chars before it on its line, with tabs advanced to their
+/// stops.
+fn display_col(text: &ropey::Rope, char_idx: usize, tab_width: u32) -> u32 {
+    let line_start = text.line_to_char(text.char_to_line(char_idx));
+    let mut col = 0;
+    for c in text.slice(line_start..char_idx).chars() {
+        col += crate::wrap::char_display_width(c, col, tab_width);
+    }
+    col
+}
+
 /// Scan up to the first ~1000 lines of `text` and infer the indent unit. Returns `None` when
 /// the buffer has no indented lines to learn from (empty / single-line / all top-level), in
 /// which case the caller should fall back to the language's default.
@@ -413,6 +483,91 @@ mod tests {
         let cursor_byte = src.rfind('}').unwrap() + 1;
         let levels = compute_indent_levels(&iq, &tree, src.as_bytes(), cursor_byte, 3);
         assert_eq!(levels, 0, "post-closing-brace line should outdent to 0");
+    }
+
+    // ---- tab / backspace steps -------------------------------------------------------------------
+
+    /// Char offset of `needle`'s first occurrence — the cursor position under test.
+    fn at(src: &str, needle: &str) -> usize {
+        src[..src.find(needle).expect("needle in source")]
+            .chars()
+            .count()
+    }
+
+    #[test]
+    fn step_at_reaches_the_next_stop() {
+        let src = "fn f() {\n  y\nlet a = 1;\n";
+        let rope = ropey::Rope::from_str(src);
+        let step = |char_idx| step_at(&rope, IndentStyle::Spaces(4), char_idx, 4);
+        // Column 0 (and any other multiple of the width) takes a full unit.
+        assert_eq!(step(at(src, "fn")), "    ");
+        // A ragged column pads onto the stop rather than overshooting: col 2 → 2 spaces, not 4.
+        assert_eq!(step(at(src, "y")), "  ");
+        // Mid-line, after text, is the same rule — col 1 → 3 spaces, col 6 → 2.
+        assert_eq!(step(at(src, "et a")), "   ");
+        assert_eq!(step(at(src, "= 1")), "  ");
+    }
+
+    #[test]
+    fn step_at_uses_the_buffers_style() {
+        let rope = ropey::Rope::from_str("hello\n");
+        // A tab-indented buffer inserts the tab itself, wherever the cursor is.
+        assert_eq!(step_at(&rope, IndentStyle::Tab, 0, 4), "\t");
+        assert_eq!(step_at(&rope, IndentStyle::Tab, 3, 4), "\t");
+        // Widths other than 4 follow their own stops.
+        assert_eq!(step_at(&rope, IndentStyle::Spaces(2), 0, 4), "  ");
+        assert_eq!(step_at(&rope, IndentStyle::Spaces(2), 3, 4), " ");
+        assert_eq!(step_at(&rope, IndentStyle::Spaces(8), 0, 4), " ".repeat(8));
+    }
+
+    #[test]
+    fn step_at_counts_tabs_at_their_rendered_width() {
+        // `\t` renders 4 wide, so a cursor after it is at column 4 — already on a stop, and the
+        // next one is a full unit away. Counting it as one char would wrongly emit 3 spaces.
+        let rope = ropey::Rope::from_str("\tx\n");
+        assert_eq!(step_at(&rope, IndentStyle::Spaces(4), 1, 4), "    ");
+        // With a narrower render width the same tab lands on column 2.
+        assert_eq!(step_at(&rope, IndentStyle::Spaces(4), 1, 2), "  ");
+    }
+
+    #[test]
+    fn backspace_span_steps_back_through_indent() {
+        let src = "        deep\n";
+        let rope = ropey::Rope::from_str(src);
+        let span = |char_idx| backspace_span(&rope, IndentStyle::Spaces(4), char_idx, 4);
+        // On a stop: a whole unit. Ragged: back onto the stop below.
+        assert_eq!(span(8), 4);
+        assert_eq!(span(4), 4);
+        assert_eq!(span(6), 2);
+        assert_eq!(span(1), 1);
+        // Nothing before the cursor — nothing to step over.
+        assert_eq!(span(0), 1);
+    }
+
+    #[test]
+    fn backspace_span_is_one_outside_the_indent() {
+        let src = "    let x = 1;\n";
+        let rope = ropey::Rope::from_str(src);
+        let span = |char_idx| backspace_span(&rope, IndentStyle::Spaces(4), char_idx, 4);
+        // After text, `Backspace` is an ordinary character delete — even when the cursor happens
+        // to sit on a tab stop, and even for the run of spaces between words.
+        assert_eq!(span(at(src, "x")), 1);
+        assert_eq!(span(at(src, "= 1")), 1);
+        assert_eq!(span(src.chars().count() - 1), 1);
+        // Tab-indented buffers delete their one tab char per press.
+        let tabs = ropey::Rope::from_str("\t\tdeep\n");
+        assert_eq!(backspace_span(&tabs, IndentStyle::Tab, 2, 4), 1);
+    }
+
+    #[test]
+    fn backspace_span_never_eats_past_a_tab() {
+        // Mixed indent: the spaces go one press at a time down to the tab, then the tab itself.
+        // Deleting "to the previous stop" blindly would swallow the tab with them.
+        let rope = ropey::Rope::from_str("\t   x\n");
+        let span = |char_idx| backspace_span(&rope, IndentStyle::Spaces(4), char_idx, 4);
+        assert_eq!(span(4), 3, "3 spaces sit between the tab (col 4) and col 7");
+        assert_eq!(span(2), 1);
+        assert_eq!(span(1), 1, "the tab itself");
     }
 
     // ---- indent style detection ----------------------------------------------------------------
