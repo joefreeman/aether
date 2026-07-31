@@ -8,6 +8,7 @@ use super::picker::PickerState;
 use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::CommitInfo;
+use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
 use aether_protocol::picker::{CaseMode, MatchOptions};
@@ -101,14 +102,13 @@ pub struct SearchState {
     /// A committed search exists (highlights shown, `n`/`Alt-n` cycle it).
     pub active: bool,
     pub summary: Option<SearchSummary>,
-    pub history: Vec<String>,
-    pub history_cursor: Option<usize>,
-    pub history_draft: String,
     /// The `?` variant: grow the selection from the entry point to each incremental match.
     pub extend_to_cursor: bool,
-    /// How the query matches: case mode, whole-word, and regex-vs-literal. Sticky across `/`
-    /// presses within a session (like the grep picker's filters); toggled in the search prompt
-    /// (`Alt-c` / `Alt-w` / `Alt-e`) and adopted from a grep result that primed the search.
+    /// How the query matches: case mode, whole-word, and regex-vs-literal. Toggled in the search
+    /// prompt (`Alt-c` / `Alt-w` / `Alt-e`) and reset to the defaults on every `/` — options are
+    /// part of the search you're running, not standing configuration, exactly as every picker's
+    /// chips are (`PickerReset::All` on open). `Up` recalls a past query with the options it ran
+    /// under (docs/input-history.md §4a); Esc restores the pre-prompt search and its options.
     pub options: MatchOptions,
     /// Which option chip is "selected" for keyboard editing, mirroring the grep picker's
     /// `chip_selected`. `Some(i)` indexes [`SearchState::option_chips`]; Left/Right walk the row,
@@ -137,6 +137,107 @@ impl SearchState {
         }
         // No Dir chips here, so `workspace_paths` is irrelevant.
         crate::chips::derive_chips(&values, &[])
+    }
+}
+
+/// `Up`/`Down` recall for the overlay text inputs (docs/input-history.md): the buffer-search
+/// prompt, the grep query, and the glob / path chip editors.
+///
+/// Each entry carries the *configuration* it ran under as well as the text, so a recall reproduces
+/// the search rather than just its words — see [`HistoryEntry`].
+///
+/// The *lists* are server-owned and workspace-scoped — fetched on connect and after every
+/// workspace switch, appended to on commit — but the *walk* is entirely local, so a recall is a
+/// keystroke, not a round-trip. One nav cursor for the session, not one per list: only a single
+/// input has the keyboard at a time, and moving between them (or editing the value) abandons the
+/// walk, which is what [`Self::reset`] does.
+#[derive(Default)]
+pub struct InputHistory {
+    lists: HistoryLists,
+    nav: Option<HistoryNav>,
+}
+
+/// A recall in progress: where in the list we are, and what the user had before starting —
+/// text *and* configuration, both restored when they step back past the newest entry. Stashing the
+/// configuration is what makes the walk non-destructive: `Up` may replace your chip row, `Down`
+/// puts it back.
+struct HistoryNav {
+    kind: HistoryKind,
+    index: usize,
+    draft: HistoryEntry,
+}
+
+impl InputHistory {
+    /// Adopt a `history/state` snapshot, discarding any walk in progress. Replaces rather than
+    /// merges: the server's copy already includes everything this client recorded.
+    pub fn adopt(&mut self, lists: HistoryLists) {
+        self.lists = lists;
+        self.nav = None;
+    }
+
+    /// The list for `kind`, oldest first. Exposed for the shells' status/help surfaces and tests.
+    pub fn list(&self, kind: HistoryKind) -> &[HistoryEntry] {
+        self.lists.get(kind)
+    }
+
+    /// Abandon any walk in progress. Called whenever the field's value changes underneath us
+    /// (typing) or the focused input opens/closes — the stashed draft would be stale either way.
+    pub fn reset(&mut self) {
+        self.nav = None;
+    }
+
+    /// Append a committed entry locally, applying the shared dedupe/cap rule. Returns whether the
+    /// list changed — `false` means the caller can skip the `history/record` round-trip.
+    pub fn record(&mut self, kind: HistoryKind, entry: HistoryEntry) -> bool {
+        self.lists.record(kind, entry)
+    }
+
+    /// Step one entry towards *older* (`Up`). Returns the entry to install — text and the
+    /// configuration it ran under — or `None` when there's nothing to recall (empty list) or we're
+    /// already at the oldest. `current` is what the field holds right now, stashed as the draft
+    /// when a walk starts so `Down` can restore it.
+    pub fn prev(&mut self, kind: HistoryKind, current: HistoryEntry) -> Option<HistoryEntry> {
+        let len = self.lists.get(kind).len();
+        if len == 0 {
+            return None;
+        }
+        // A walk on a *different* field's list starts over — the stale draft belongs to an input
+        // that no longer has the keyboard.
+        let index = match &self.nav {
+            Some(nav) if nav.kind == kind => {
+                if nav.index == 0 {
+                    return None; // oldest entry — stay put rather than wrap
+                }
+                nav.index - 1
+            }
+            _ => len - 1,
+        };
+        let draft = match self.nav.take() {
+            Some(nav) if nav.kind == kind => nav.draft,
+            _ => current,
+        };
+        self.nav = Some(HistoryNav { kind, index, draft });
+        Some(self.lists.get(kind)[index].clone())
+    }
+
+    /// Step one entry towards *newer* (`Down`), ending by restoring the stashed draft — its
+    /// configuration included, so a walk that replaced the chip row leaves it as it found it.
+    /// Returns `None` when no walk is in progress (nothing newer to go to).
+    pub fn next(&mut self, kind: HistoryKind) -> Option<HistoryEntry> {
+        let nav = self.nav.take()?;
+        if nav.kind != kind {
+            return None;
+        }
+        let len = self.lists.get(kind).len();
+        if nav.index + 1 < len {
+            let index = nav.index + 1;
+            let entry = self.lists.get(kind)[index].clone();
+            self.nav = Some(HistoryNav { index, ..nav });
+            Some(entry)
+        } else {
+            // Past the newest entry: back to what the user had, walk over.
+            Some(nav.draft)
+        }
     }
 }
 
@@ -508,6 +609,9 @@ pub struct Session {
     pub count: Option<u32>,
     pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
+    /// `Up`/`Down` recall for every overlay text input (docs/input-history.md). Session-wide, not
+    /// per-overlay: the lists are workspace-scoped and only one input has the keyboard at a time.
+    pub history: InputHistory,
     /// Active sneak word-jump session (`s`/`S`), or `None` when not sneaking. While `Some`, the key
     /// handler interprets keystrokes as query/label input rather than normal-mode bindings.
     pub sneak: Option<SneakState>,
@@ -599,6 +703,7 @@ impl Session {
             count: None,
             last_repeat: None,
             search: SearchState::default(),
+            history: InputHistory::default(),
             sneak: None,
             visible_lines: None,
             viewport_id: None,

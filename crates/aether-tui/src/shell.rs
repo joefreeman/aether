@@ -1725,9 +1725,6 @@ impl Shell {
             active: s.active,
             summary: s.summary.clone(),
             snapshot: None,
-            history: s.history.clone(),
-            history_cursor: s.history_cursor,
-            history_draft: s.history_draft.clone(),
             extend_to_cursor: s.extend_to_cursor,
             option_chips: s
                 .option_chips()

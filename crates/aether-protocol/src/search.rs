@@ -105,9 +105,9 @@ pub struct SearchStepParams {
     /// skipped and the zero-total summary comes back as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_query: Option<String>,
-    /// Match options for the `set_query` revive (ignored without it) — the client's sticky search
-    /// options, so a revived search matches the way it did before it was dropped. Defaults
-    /// (regex, smartcase) when absent.
+    /// Match options for the `set_query` revive (ignored without it) — the options the revived
+    /// history entry recorded, so it matches the way it did before it was dropped (a regex revived
+    /// as a literal would quietly find nothing). Defaults (literal, smartcase) when absent.
     #[serde(default, skip_serializing_if = "MatchOptions::is_default")]
     pub options: MatchOptions,
 }

@@ -39,6 +39,9 @@ use aether_protocol::git::{
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
 };
+use aether_protocol::history::{
+    HistoryRecordParams, HistoryRecordResult, HistoryStateParams, HistoryStateResult,
+};
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditResult,
     InputAdjustNumberParams, InputMoveLinesParams, InputOpenLineParams, InputSurroundParams,
@@ -59,7 +62,7 @@ use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
-    PickerSectionJumpParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    PickerReset, PickerSectionJumpParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
     PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
@@ -237,6 +240,72 @@ pub(crate) async fn flush_hints(state: &SharedState) {
     };
     if let Err(e) = crate::config::write_hints_at(&path, &snapshot) {
         tracing::warn!(error = %e, "failed to write hint state");
+    }
+}
+
+// ---- history/* --------------------------------------------------------------------------------
+
+/// The active workspace's input-history lists (docs/input-history.md). Deliberately *not* an
+/// error without an active workspace: the boot chooser fetches this on connect before any
+/// workspace exists, and an ephemeral ("(no workspace)") context has no stable key to file
+/// history under — both get empty lists, which the client treats as "nothing to recall".
+pub async fn history_state(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    _params: HistoryStateParams,
+) -> Result<HistoryStateResult, RpcError> {
+    let s = state.lock().await;
+    let lists = match history_workspace(&s, ctx.client_id) {
+        Some(name) => s.history.lists(&name),
+        None => Default::default(),
+    };
+    Ok(HistoryStateResult { lists })
+}
+
+/// Append one committed value to the active workspace's list. Silently a no-op without a
+/// persistable workspace (same rule as [`history_state`]) and for a value the shared
+/// dedupe/cap rule rejects; the write to `history.json` rides the periodic flush
+/// ([`flush_history`]), not this request.
+pub async fn history_record(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: HistoryRecordParams,
+) -> Result<HistoryRecordResult, RpcError> {
+    let mut s = state.lock().await;
+    let Some(workspace) = history_workspace(&s, ctx.client_id) else {
+        return Ok(HistoryRecordResult {});
+    };
+    if s.history.record(&workspace, params.kind, params.entry) {
+        s.history_dirty = true;
+    }
+    Ok(HistoryRecordResult {})
+}
+
+/// The workspace name to file this client's history under, or `None` when there's nothing
+/// persistable: no workspace active yet, or an ephemeral one (a synthesized context for a file
+/// outside every workspace — its id is minted per run, so history filed under it could never be
+/// recalled). [`WorkspaceEntry::name`] already draws that line: `Some` ⇔ a `<name>.toml` on disk.
+fn history_workspace(s: &ServerState, client_id: ClientId) -> Option<String> {
+    s.active_workspace(client_id)?.name.clone()
+}
+
+/// Write the input-history lists to disk when they changed since the last flush. Same contract as
+/// [`flush_hints`] — periodic dirty-flag debounce plus a final flush on graceful shutdown,
+/// best-effort, write off the lock.
+pub(crate) async fn flush_history(state: &SharedState) {
+    let (path, snapshot) = {
+        let mut s = state.lock().await;
+        let Some(path) = s.history_path.clone() else {
+            return;
+        };
+        if !s.history_dirty {
+            return;
+        }
+        s.history_dirty = false;
+        (path, s.history.clone())
+    };
+    if let Err(e) = crate::config::write_history_at(&path, &snapshot) {
+        tracing::warn!(error = %e, "failed to write input history");
     }
 }
 
@@ -1121,12 +1190,19 @@ pub async fn workspace_rename(
     // under the state lock like every other session-file write, so it can't race a concurrent
     // persist. Best-effort; the workspace still works without it, so a failure only logs.
     {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
         if let Some(path) = s.sessions_path.clone() {
             if let Err(e) = crate::config::rename_workspace_session_at(&path, &old_name, &new_name)
             {
                 tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename workspace session");
             }
+        }
+        // The input-history lists follow the name too (docs/input-history.md) — they're keyed by
+        // workspace, and a rename shouldn't read as "history lost". In-memory + dirty flag; the
+        // periodic flush writes it, like every other `history.json` mutation.
+        if let Some(lists) = s.history.workspaces.remove(&old_name) {
+            s.history.workspaces.insert(new_name.clone(), lists);
+            s.history_dirty = true;
         }
     }
 
@@ -1229,11 +1305,15 @@ pub async fn workspace_delete(
     // under the state lock like every other session-file write, so it can't race a concurrent
     // persist. Best-effort; a stale entry is harmless (it'd just never be listed), so we only log.
     {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
         if let Some(path) = s.sessions_path.clone() {
             if let Err(e) = crate::config::remove_workspace_session_at(&path, &name) {
                 tracing::warn!(workspace = %name, error = %e, "failed to remove workspace session");
             }
+        }
+        // Same for its input history — a deleted workspace leaves no orphan lists behind.
+        if s.history.workspaces.remove(&name).is_some() {
+            s.history_dirty = true;
         }
     }
 
@@ -11897,7 +11977,7 @@ pub async fn picker_view(
                 // default).
                 let filters = match params.filters.clone() {
                     Some(f) => f,
-                    None if params.reset => Default::default(),
+                    None if params.reset == PickerReset::All => Default::default(),
                     None => {
                         let s = state.lock().await;
                         s.pickers
@@ -11910,7 +11990,7 @@ pub async fn picker_view(
                     state,
                     client_id,
                     params.directory_path.as_deref(),
-                    params.reset,
+                    params.reset == PickerReset::All,
                     &filters,
                 )
                 .await?;
@@ -12154,21 +12234,32 @@ pub async fn picker_view(
     let mut grep_search_to_spawn: Option<(String, aether_protocol::picker::PickerFilters, u64)> =
         None;
 
-    // (Re-)hydrate picker state. `reset` always wipes; otherwise we keep whatever was persisted
-    // from a prior `view`/`query`/`hide` cycle. Split-borrow `pickers` and `matcher` from `s`
-    // so we can hold mutable references to both at once.
+    // (Re-)hydrate picker state per the requested reset scope: `All` on a fresh open, `Keep` on a
+    // re-view within one (scroll refetch, hide/re-attach, Explorer navigation), which preserves
+    // whatever the prior `view`/`query`/`hide` cycle left behind. Split-borrow `pickers` and
+    // `matcher` from `s` so we can hold mutable references to both at once.
     let ServerState {
         pickers, matcher, ..
     } = &mut *s;
-    if params.reset {
-        pickers.remove(&key);
-    }
+    // A wiping open drops the slot outright — query, hits, chips, highlight. The *generation* is
+    // the one thing that must not restart: grep's streaming worker is cancelled by comparing the
+    // generation it was spawned with against the live picker's (see `grep::spawn_search`), and a
+    // walk from the previous open keeps running after `hide`. Restarting the counter at 0 would let
+    // that stale worker's generation collide with the reopened picker's and append hits for the
+    // *old* query into the new list, so carry the retired slot's generation forward past it.
+    let carried_generation = match params.reset {
+        PickerReset::Keep => None,
+        PickerReset::All => pickers.remove(&key).map(|p| p.generation + 1),
+    };
     match pickers.entry(key) {
         std::collections::hash_map::Entry::Vacant(e) => {
             let mut ps = picker_state::PickerState::new(candidates);
             // GitChangesFile shares GitChanges' candidate type, so pin the slot's kind to the
             // requested one — the `picker/update` push echoes it and the client drops mismatches.
             ps.kind = params.kind;
+            if let Some(generation) = carried_generation {
+                ps.generation = generation;
+            }
             e.insert(ps);
         }
         std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -12290,23 +12381,6 @@ pub async fn picker_view(
     // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =
         match (cursor_centering_info.as_ref(), &picker.candidates) {
-            (Some((leading_edge, current_key, _)), picker_state::PickerCandidates::Grep(hits))
-                if !hits.is_empty() =>
-            {
-                find_nearest_grep_hit(
-                    hits,
-                    current_key.as_ref().map(|(i, r)| (*i, r.as_str())),
-                    *leading_edge,
-                )
-                .map(|c| PickerItem::GrepHit {
-                    path_index: c.path_index,
-                    relative_path: c.relative_path.clone(),
-                    line: c.line,
-                    col: c.col,
-                    preview: c.preview.clone(),
-                    match_indices: c.match_indices.clone(),
-                })
-            }
             // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
@@ -12615,7 +12689,26 @@ pub async fn picker_hide(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     if let Some(picker) = s.pickers.get_mut(&(client_id, params.kind)) {
+        // Closing throws the picker's state away rather than parking it. Nothing would ever read it
+        // again — every `PickerReset::Keep` view is sent by a picker that's still attached, and the
+        // next open wipes regardless — so this makes "closed ⇒ empty" a server-side invariant
+        // instead of something each client open has to honour.
+        //
+        // The generation bump is the part that does real work: it's how an in-flight `grep` walk
+        // learns it has been superseded (`grep::spawn_search` compares against the live picker's on
+        // every batch). Without it, dismissing a search left the walk scanning the whole workspace
+        // to completion, appending hits to a list nobody would see and still emitting count-only
+        // pushes to a client with no picker open. The slot itself stays as the generation holder —
+        // removing it would restart the counter at 0 and let that same walk collide with the next
+        // open's generation.
         picker.subscribed = None;
+        picker.generation += 1;
+        picker.query.clear();
+        picker.filters = Default::default();
+        picker.candidates.clear();
+        picker.ranked.clear();
+        picker.last_completed_search = None;
+        picker.pending_async_load = None;
     }
     Ok(())
 }
@@ -13034,39 +13127,6 @@ mod symbol_unit_boundary_tests {
         // On the first unit's header → nothing before it.
         assert_eq!(symbol_unit_boundary(&s, &r, 0, Direction::Backward), None);
     }
-}
-
-/// First grep hit "after" the cursor. Within the same file: the first hit whose `(line, col)` is
-/// past the cursor's. Across files: the first hit whose `(path_index, relative_path)` sorts after
-/// `current`. If the current buffer has no path (scratch or outside every root), every hit counts
-/// as "after" and we return the first.
-///
-/// Assumes `hits` are roughly in `(path_index, relative_path, line, col)` order — true in
-/// practice because the walker sorts files that way and ripgrep emits matches per file in line
-/// order.
-/// First grep hit "at or after" the cursor in walker order, wrapping to the first hit overall
-/// when nothing matches. Used by `picker/view`'s `center_on_cursor` to land the picker
-/// on "where you are" in the result list even when the cursor isn't sitting on a match
-/// exactly. Inclusive (a hit at exactly the cursor's position is the answer), unlike
-/// `jumplist/step` which is strict (`>` skips past the current).
-fn find_nearest_grep_hit<'a>(
-    hits: &'a [picker_state::GrepHitCandidate],
-    current: Option<(u32, &str)>,
-    cursor: LogicalPosition,
-) -> Option<&'a picker_state::GrepHitCandidate> {
-    use std::cmp::Ordering;
-    let Some((cur_idx, cur_rel)) = current else {
-        return hits.first();
-    };
-    hits.iter()
-        .find(
-            |h| match (h.path_index, h.relative_path.as_str()).cmp(&(cur_idx, cur_rel)) {
-                Ordering::Greater => true,
-                Ordering::Equal => (h.line, h.col) >= (cursor.line, cursor.col),
-                Ordering::Less => false,
-            },
-        )
-        .or_else(|| hits.first())
 }
 
 /// Candidate index of the hunk in `current`'s file nearest at-or-after `cursor_line`, falling back

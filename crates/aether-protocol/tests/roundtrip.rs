@@ -1854,11 +1854,9 @@ fn picker_item_git_change_is_tagged() {
         to_value(PickerKind::GitChangesFile).unwrap(),
         json!("git_changes_file")
     );
-    // Both changes pickers preserve state and centre on the cursor's hunk, but only the workspace one
-    // renders file headers — the buffer-locked file picker is a single, headerless file.
-    assert!(
-        PickerKind::GitChanges.preserves_state() && PickerKind::GitChangesFile.preserves_state()
-    );
+    // Both changes pickers centre on the cursor's hunk, but only the workspace one renders file
+    // headers — the buffer-locked file picker is a single, headerless file.
+    assert!(PickerKind::GitChanges.centers_on_cursor());
     assert!(
         PickerKind::GitChanges.groups_by_file() && !PickerKind::GitChangesFile.groups_by_file()
     );
@@ -2140,11 +2138,11 @@ fn keybinding_entry_haystack_composes_in_display_order() {
 
 #[test]
 fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
-    use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerViewParams};
+    use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
         from_selection: false,
         kind: PickerKind::Keybindings,
-        reset: true,
+        reset: PickerReset::All,
         offset: 0,
         limit: 30,
         center_on: None,
@@ -2241,11 +2239,11 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
 
 #[test]
 fn picker_view_params_omit_center_on_when_none() {
-    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
         from_selection: false,
         kind: PickerKind::Files,
-        reset: true,
+        reset: PickerReset::All,
         offset: 0,
         limit: 30,
         center_on: None,
@@ -2262,21 +2260,127 @@ fn picker_view_params_omit_center_on_when_none() {
         "None center_on should be skipped"
     );
     assert_eq!(v["kind"], "files");
-    assert_eq!(v["reset"], true);
+    assert_eq!(v["reset"], "all");
     assert!(
         v.get("from_selection").is_none(),
         "default from_selection is skipped on the wire"
     );
 }
 
+/// The reset scope is a two-valued string on the wire marking *fresh open vs re-view* — not a
+/// per-kind policy. There is no longer any kind-dependent branch to pin here: `All` is what every
+/// open sends, `Keep` is what every scroll/re-view within one open sends.
+#[test]
+fn picker_reset_wire_shape() {
+    use aether_protocol::picker::{PickerKind, PickerReset};
+    assert_eq!(to_value(PickerReset::Keep).unwrap(), json!("keep"));
+    assert_eq!(to_value(PickerReset::All).unwrap(), json!("all"));
+    // An absent `reset` means "keep" — the scroll/re-view path within one open.
+    assert_eq!(
+        serde_json::from_value::<PickerReset>(json!("keep")).unwrap(),
+        PickerReset::default()
+    );
+
+    // Grep no longer opens framed on the cursor's nearest hit — there are no hits to frame.
+    assert!(!PickerKind::Grep.centers_on_cursor());
+    assert!(PickerKind::Jumplist.centers_on_cursor() && PickerKind::GitChanges.centers_on_cursor());
+}
+
+/// Grep is the only picker whose query is recallable — the fuzzy kinds filter a live candidate
+/// set, where a stale query means nothing.
+#[test]
+fn only_grep_maps_to_an_input_history_list() {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::picker::PickerKind;
+    assert_eq!(PickerKind::Grep.history_kind(), Some(HistoryKind::Grep));
+    for kind in [
+        PickerKind::Files,
+        PickerKind::Buffers,
+        PickerKind::Explorer,
+        PickerKind::GitChanges,
+        PickerKind::Workspaces,
+    ] {
+        assert_eq!(kind.history_kind(), None, "{kind:?} has no query history");
+    }
+}
+
+/// `history/*` wire shapes: the kind is a snake_case tag and every list defaults, so a file or
+/// payload written before a list existed still parses.
+#[test]
+fn history_wire_shapes_round_trip() {
+    use aether_protocol::history::{
+        HistoryEntry, HistoryKind, HistoryLists, HistoryRecordParams, HistoryStateResult,
+    };
+    use aether_protocol::picker::{MatchOptions, PickerFilters};
+    assert_eq!(to_value(HistoryKind::Search).unwrap(), json!("search"));
+    assert_eq!(to_value(HistoryKind::Grep).unwrap(), json!("grep"));
+    assert_eq!(to_value(HistoryKind::Glob).unwrap(), json!("glob"));
+    assert_eq!(to_value(HistoryKind::Path).unwrap(), json!("path"));
+
+    // The entry flattens into the params, and default filters vanish from the wire entirely.
+    let params = HistoryRecordParams {
+        kind: HistoryKind::Grep,
+        entry: HistoryEntry::bare("fn resolve"),
+    };
+    assert_eq!(
+        to_value(&params).unwrap(),
+        json!({ "kind": "grep", "value": "fn resolve" })
+    );
+    // A configured entry carries the chip row that produced it.
+    let scoped = HistoryRecordParams {
+        kind: HistoryKind::Grep,
+        entry: HistoryEntry {
+            value: "fn resolve".into(),
+            filters: PickerFilters {
+                regex: true,
+                globs: vec!["*.rs".into()],
+                ..Default::default()
+            },
+        },
+    };
+    assert_eq!(
+        to_value(&scoped).unwrap(),
+        json!({
+            "kind": "grep",
+            "value": "fn resolve",
+            "filters": { "regex": true, "globs": ["*.rs"] }
+        })
+    );
+    // The search prompt has no scoping, so its entries carry match options only.
+    let searched = HistoryEntry::with_options(
+        "f.o",
+        MatchOptions {
+            regex: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        to_value(&searched).unwrap(),
+        json!({ "value": "f.o", "filters": { "regex": true } })
+    );
+    assert!(searched.filters.match_options().regex);
+
+    let mut lists = HistoryLists::default();
+    lists.record(HistoryKind::Glob, HistoryEntry::bare("*.rs"));
+    let result = HistoryStateResult { lists };
+    let v = to_value(&result).unwrap();
+    assert_eq!(v["lists"]["glob"], json!([{ "value": "*.rs" }]));
+    assert_eq!(v["lists"]["grep"], json!([]));
+    // Missing lists parse as empty rather than failing.
+    let parsed: HistoryStateResult =
+        serde_json::from_value(json!({ "lists": { "search": [{ "value": "foo" }] } })).unwrap();
+    assert_eq!(parsed.lists.search, vec![HistoryEntry::bare("foo")]);
+    assert!(parsed.lists.path.is_empty());
+}
+
 #[test]
 fn picker_view_params_from_selection_serialized() {
-    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     // `Space Alt-g`: grep-for-selection rides `from_selection` + the active buffer id.
     let p = PickerViewParams {
         from_selection: true,
         kind: PickerKind::Grep,
-        reset: false,
+        reset: PickerReset::Keep,
         offset: 0,
         limit: 30,
         center_on: None,
@@ -2297,11 +2401,11 @@ fn picker_view_params_from_selection_serialized() {
 
 #[test]
 fn picker_view_params_center_on_serialized() {
-    use aether_protocol::picker::{PickerItem, PickerKind, PickerViewParams};
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
         from_selection: false,
         kind: PickerKind::Files,
-        reset: false,
+        reset: PickerReset::Keep,
         offset: 0,
         limit: 30,
         center_on: Some(PickerItem::File {
@@ -2695,11 +2799,11 @@ fn picker_item_dir_entry_carries_git_status() {
 
 #[test]
 fn picker_view_params_directory_path_skipped_when_none() {
-    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
         from_selection: false,
         kind: PickerKind::Explorer,
-        reset: false,
+        reset: PickerReset::Keep,
         offset: 0,
         limit: 30,
         center_on: None,
@@ -2719,11 +2823,11 @@ fn picker_view_params_directory_path_skipped_when_none() {
 
 #[test]
 fn picker_view_params_directory_path_serialized() {
-    use aether_protocol::picker::{PickerKind, PickerViewParams};
+    use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
         from_selection: false,
         kind: PickerKind::Explorer,
-        reset: true,
+        reset: PickerReset::All,
         offset: 0,
         limit: 30,
         center_on: None,

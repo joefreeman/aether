@@ -12,6 +12,7 @@ pub mod envelope;
 pub mod error;
 pub mod git;
 pub mod hints;
+pub mod history;
 pub mod input;
 pub mod jumplist;
 pub mod lsp;

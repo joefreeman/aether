@@ -164,6 +164,17 @@ pub struct ServerState {
     pub hints: crate::config::HintsState,
     /// Set by `hints/record` when [`Self::hints`] mutated; cleared by the flush that writes it.
     pub hints_dirty: bool,
+    /// Where to read/write the input-history lists ([`crate::config::HistoryFile`],
+    /// docs/input-history.md). Same convention as [`Self::hints_path`]: `Some` in the real server
+    /// (and in tests that point it at a tempfile); `None` disables persistence — `history/record`
+    /// still accumulates in memory so recall works within one run.
+    pub history_path: Option<PathBuf>,
+    /// In-memory input-history lists keyed by workspace, loaded from [`Self::history_path`] at
+    /// boot and flushed back by the periodic flush (dirty-flag debounced) plus a final flush on
+    /// graceful shutdown.
+    pub history: crate::config::HistoryFile,
+    /// Set when [`Self::history`] mutated; cleared by the flush that writes it.
+    pub history_dirty: bool,
     /// The idle-reaper setting this instance was started with: `Some(d)` is a client-conjured
     /// server that self-reaps after `d` idle (see [`crate::server::idle_reaper`]); `None` is the
     /// persistent `ae server` daemon. Set once by `run_with_listener`; `None` until then. Read only
@@ -427,6 +438,9 @@ impl ServerState {
             hints_path: None,
             hints: crate::config::HintsState::default(),
             hints_dirty: false,
+            history_path: None,
+            history: crate::config::HistoryFile::default(),
+            history_dirty: false,
             idle_timeout: None,
             port: None,
             next_buffer_id: 1,

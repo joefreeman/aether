@@ -1232,7 +1232,7 @@ fn space_slash_opens_the_keybindings_picker_with_its_rows() {
     let fx = key(&mut s, '/');
     let params = find_request(&fx, "picker/view").expect("Space / opens via picker/view");
     assert_eq!(params["kind"], "keybindings");
-    assert_eq!(params["reset"], true);
+    assert_eq!(params["reset"], "all");
     // The rows ride the open: the keymap tables live client-side, the server only matches.
     let rows = params["keybindings"].as_array().expect("rows shipped");
     assert!(
@@ -1949,7 +1949,7 @@ fn space_alt_g_opens_grep_from_selection() {
     );
     assert!(
         params["filters"].is_null(),
-        "no dir scope — grep-for-selection is workspace-wide, sticky filters aside"
+        "no seeded filters — grep-for-selection is a fresh workspace-wide open"
     );
     // Not a cursor-centred resume: a fresh search has no cached hits to land on.
     assert!(params
@@ -2012,6 +2012,68 @@ fn search_option_toggles_cycle_and_ride_the_request() {
     assert_eq!(
         s.search.options,
         aether_protocol::picker::MatchOptions::default()
+    );
+}
+
+/// Each `/` opens at the defaults — options are part of the search you're running, not standing
+/// configuration, matching how a picker open resets its chips. Esc still restores the committed
+/// search *and* the options it ran under, because the snapshot is taken before the reset.
+#[test]
+fn search_prompt_opens_with_default_options() {
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::{CaseMode, MatchOptions};
+    let mut s = session();
+
+    // Commit a regex, case-sensitive search.
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("fn \\w+".into());
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(s.search.active);
+    assert!(s.search.options.regex && s.search.options.case == CaseMode::Sensitive);
+
+    // Re-opening the prompt starts clean: no leftover regex to silently change what the next
+    // query matches, and no chips rendered above it.
+    let _ = key(&mut s, '/');
+    assert_eq!(s.search.options, MatchOptions::default());
+    assert_eq!(s.search.query, "");
+    assert!(s.search.option_chips().is_empty());
+
+    // The next search runs literally, without inheriting anything.
+    let fx = s.search_set_query("fn".into());
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "search/set");
+    assert_eq!(params.get("options"), None, "all-default options, skipped");
+
+    // Esc puts the previous search back exactly as it was — query, active flag and options.
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "fn \\w+");
+    assert!(s.search.active);
+    assert!(s.search.options.regex && s.search.options.case == CaseMode::Sensitive);
+}
+
+/// `Alt-/` starts a search too, so it starts one at the defaults — it must not inherit the options
+/// of whatever search ran before it, and unlike the prompt it shows no chip row that would reveal
+/// what got carried over.
+#[test]
+fn search_from_selection_runs_at_default_options() {
+    use aether_client::keymap::Mods;
+    let mut s = session();
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("foo".into());
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS); // regex
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS); // whole-word
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    let fx = s.search_from_selection();
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "search/set");
+    assert_eq!(params["from_selection"], json!(true));
+    assert_eq!(
+        params.get("options"),
+        None,
+        "all-default: literal, smartcase, no whole-word inherited from the previous search"
     );
 }
 
@@ -2581,26 +2643,110 @@ fn free_scroll_refetch_does_not_chase_the_selection() {
     assert_eq!(p.offset, 200, "window stayed where it was scrolled");
 }
 
+/// Accepting a row resolves it **before** closing the picker. `picker/hide` releases the picker's
+/// state server-side, and requests go out in enqueue order, so a `picker/select` behind the close
+/// would find no candidate set and come back `invalid params` instead of jumping. Ordering only,
+/// but it's the whole contract — kind-independent, checked here on the changes picker.
 #[test]
-fn grep_open_does_not_reset_scroll_but_fresh_pickers_do() {
-    // A fresh picker (Files) resets the list to the top on open. Grep preserves state and resumes
-    // onto its saved selection — often deep in the results — where `effective_center_on` drives a
-    // reveal; emitting a scroll reset there would snap the window back to the top, blanking the view.
+fn accepting_a_row_selects_before_it_closes() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::GitChanges, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![PickerItem::GitChange {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+            hunk_index: 0,
+            line: 12,
+            stage: Default::default(),
+            added: 1,
+            removed: 0,
+            preview: "let x = 1;".into(),
+            match_indices: Vec::new(),
+        }];
+        p.selected = 0;
+    }
+
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let methods: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
+    let select = methods.iter().position(|m| *m == "picker/select");
+    let hide = methods.iter().position(|m| *m == "picker/hide");
+    assert!(
+        select.is_some() && hide.is_some(),
+        "accept both selects and closes, got {methods:?}"
+    );
+    assert!(
+        select < hide,
+        "select must reach the server while the picker still has candidates, got {methods:?}"
+    );
+}
+
+/// Trashing a file from the Files picker re-lists it *without* throwing away what you'd typed.
+/// Files' candidates come from the workspace index, so the list has to be re-bound server-side —
+/// but via a `Keep` re-view, not a fresh open, which would also wipe the query and chips as a side
+/// effect of a delete. The Explorer branch of the same handler keeps its query for the same reason.
+#[test]
+fn trashing_from_the_files_picker_relists_without_clearing_the_query() {
+    use aether_client::update::Event;
     use aether_protocol::picker::PickerKind;
 
     let mut s = session();
-    let fx = s.open_picker(PickerKind::Grep, None, None, false, None);
-    assert!(
-        !fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
-        "grep (state-preserving) open must not reset the scroll — it resumes onto its selection"
-    );
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    let _ = s.picker_set_query("main".into());
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.selected = 7;
+    }
 
-    let mut s = session();
-    let fx = s.open_picker(PickerKind::Files, None, None, false, None);
-    assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
-        "a fresh Files picker resets the scroll to the top on open"
+    let fx = s.on_event(Event::PathDeleted {
+        noun: "file",
+        result: Ok(serde_json::from_value(json!({})).unwrap()),
+    });
+
+    let view = find_request(&fx, "picker/view").expect("re-lists via picker/view");
+    assert_eq!(
+        view["reset"],
+        json!("keep"),
+        "a re-view re-binds the index without wiping the query"
     );
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.query, "main", "the query you typed survives the delete");
+    assert_eq!(
+        p.selected, 0,
+        "but the highlight resets — its row just went"
+    );
+}
+
+#[test]
+fn every_picker_open_resets_the_scroll() {
+    // No picker resumes any more, so every open starts the list at the top. The kinds that want to
+    // land elsewhere (the changes pickers, the jumplist) centre via the `effective_center_on` echo,
+    // which arrives with the response and reveals *after* this — the order Buffers and the Explorer
+    // have always opened in.
+    use aether_protocol::picker::PickerKind;
+
+    for kind in [
+        PickerKind::Files,
+        PickerKind::Grep,
+        PickerKind::GitChanges,
+        PickerKind::GitChangesFile,
+        PickerKind::Buffers,
+    ] {
+        let mut s = session();
+        let fx = s.open_picker(kind, None, None, false, None);
+        assert!(
+            fx.0.iter().any(|e| matches!(e, Effect::PickerScrollReset)),
+            "{kind:?} opens fresh, so its scroll resets to the top"
+        );
+    }
 }
 
 #[test]
@@ -2853,20 +2999,31 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
     );
 }
 
+/// The changes pickers open fresh like everything else — their query and chips don't outlive an
+/// open — and land on the cursor's hunk instead of a saved highlight. `Space Alt-c` also re-points
+/// at the active buffer on every open, so it carries `buffer_id` too.
 #[test]
-fn git_changes_opens_without_reset_to_resume_query_and_filters() {
+fn changes_pickers_open_fresh_and_centre_on_the_cursor() {
     use aether_protocol::picker::PickerKind;
-    // GitChanges preserves its query + filters server-side across opens (like Grep), so the client
-    // opens it with `reset: false` — the server keeps the prior state and re-snapshots candidates.
-    let mut s = session();
-    let fx = s.open_picker(PickerKind::GitChanges, None, None, false, None);
-    let view = find_request(&fx, "picker/view").expect("opens via picker/view");
-    assert_eq!(view["kind"], json!("git_changes"));
-    assert_eq!(
-        view["reset"],
-        json!(false),
-        "GitChanges resumes its server-side query + filters"
-    );
+    for (kind, wire) in [
+        (PickerKind::GitChanges, "git_changes"),
+        (PickerKind::GitChangesFile, "git_changes_file"),
+    ] {
+        let mut s = session();
+        let fx = s.open_picker(kind, None, None, false, None);
+        let view = find_request(&fx, "picker/view").expect("opens via picker/view");
+        assert_eq!(view["kind"], json!(wire));
+        assert_eq!(
+            view["reset"],
+            json!("all"),
+            "{kind:?} starts over — no resumed query or chips"
+        );
+        assert_eq!(
+            view["center_on_cursor"],
+            json!(s.buffer.buffer_id),
+            "{kind:?} frames the hunk nearest the live cursor instead"
+        );
+    }
 }
 
 #[test]
@@ -3788,8 +3945,12 @@ fn startup_fetches_persisted_settings() {
                 _ => None,
             })
             .collect();
-    // The connect sequence fetches the app settings and the hint snapshot together.
-    assert_eq!(methods, vec!["settings/get", "hints/state"]);
+    // The connect sequence fetches the app settings, the hint snapshot and the workspace's
+    // input-history lists together.
+    assert_eq!(
+        methods,
+        vec!["settings/get", "hints/state", "history/state"]
+    );
 }
 
 #[test]
@@ -4037,10 +4198,20 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
     })));
     assert_eq!(s.workspace, "fresh");
     // Rather than leave the previous workspace's buffer behind, a scratch is opened (a `buffer/open`
-    // with no buffer_id/path) so the user lands in some editor in the new workspace.
-    let (_, method, _) = the_request(&fx);
+    // with no buffer_id/path) so the user lands in some editor in the new workspace. The new
+    // workspace's (empty) input-history lists are fetched alongside — the old ones were another
+    // workspace's.
+    let methods: Vec<&str> = fx
+        .0
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Request { method, .. } => Some(*method),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        method, "buffer/open",
+        methods,
+        vec!["history/state", "buffer/open"],
         "opens a fresh scratch in the new workspace"
     );
     // The settings overlay auto-opens, focused on the add-root input (index = roots.len() + 1 = 1).
@@ -4740,12 +4911,13 @@ fn adopt_hints(s: &mut Session) -> Effects {
             .collect();
     assert_eq!(
         reqs.iter().map(|(_, m)| *m).collect::<Vec<_>>(),
-        vec!["settings/get", "hints/state"],
-        "startup fetches settings then the hint snapshot"
+        vec!["settings/get", "hints/state", "history/state"],
+        "startup fetches settings, the hint snapshot, then the input-history lists"
     );
     let settings = json!({ "wrap": "soft", "ligatures": true, "buffer_font_size": 14, "ui_font_size": 13, "hints": true });
     s.on_rpc_result(reqs[0].0, Ok(settings));
     s.on_rpc_result(reqs[1].0, Ok(json!({})));
+    s.on_rpc_result(reqs[2].0, Ok(json!({})));
     s.on_hint_tick(1_000_000_000_000) // an arbitrary wall clock, ~2001
 }
 
@@ -5188,5 +5360,384 @@ fn hints_boot_chooser_drives_the_corner() {
         v.text.contains("open the selected workspace"),
         "a populated chooser teaches opening: {}",
         v.text
+    );
+}
+
+// ---- input history (docs/input-history.md) --------------------------------------------------
+
+/// The plain values of one recall list — most assertions don't care about the carried filters.
+fn hist(s: &Session, kind: aether_protocol::history::HistoryKind) -> Vec<&str> {
+    s.history.list(kind).iter().map(|e| e.value.as_str()).collect()
+}
+
+/// Adopt a canned set of recall lists, as `history/state` would at boot. Entries may be written as
+/// bare strings when the test doesn't care about the filters they carry; anything else is passed
+/// through as the full `{ value, filters }` wire shape.
+fn adopt_history(s: &mut Session, lists: serde_json::Value) {
+    use aether_client::update::Event;
+    use aether_protocol::history::HistoryStateResult;
+    let expanded: serde_json::Value = lists
+        .as_object()
+        .expect("lists is an object")
+        .iter()
+        .map(|(kind, entries)| {
+            let entries: Vec<serde_json::Value> = entries
+                .as_array()
+                .expect("a list of entries")
+                .iter()
+                .map(|e| match e {
+                    serde_json::Value::String(v) => json!({ "value": v }),
+                    other => other.clone(),
+                })
+                .collect();
+            (kind.clone(), serde_json::Value::Array(entries))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let result: HistoryStateResult = serde_json::from_value(json!({ "lists": expanded })).unwrap();
+    let _ = s.on_event(Event::HistoryLoaded(Ok(result)));
+}
+
+/// `Up`/`Down` in the search prompt walk the committed queries: `Up` steps towards older and stops
+/// at the oldest, `Down` comes back and restores what was being typed. Each step re-runs the
+/// incremental search so the matches preview as you go.
+#[test]
+fn search_up_down_walk_the_query_history_and_restore_the_draft() {
+    use aether_client::session::Mode;
+    let mut s = session();
+    adopt_history(&mut s, json!({ "search": ["older", "newer"] }));
+
+    let _ = key(&mut s, '/');
+    assert_eq!(s.mode, Mode::Search);
+    let _ = s.search_set_query("draft".into());
+
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "newer", "Up recalls the newest entry");
+    assert_eq!(
+        find_request(&fx, "search/set").map(|p| p["query"].clone()),
+        Some(json!("newer")),
+        "each recall previews its matches"
+    );
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "older");
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "older", "the oldest entry doesn't wrap");
+
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "newer");
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.search.query, "draft",
+        "stepping past the newest restores the typed draft"
+    );
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "draft", "and stays there");
+
+    // Alt-k/j remain as the unlisted alias.
+    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.query, "newer");
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert_eq!(s.search.query, "draft");
+}
+
+/// Typing abandons a walk: the next `Up` starts again from the newest entry and stashes the *new*
+/// draft, rather than continuing from where the previous walk left off.
+#[test]
+fn typing_abandons_a_history_walk() {
+    let mut s = session();
+    adopt_history(&mut s, json!({ "search": ["one", "two"] }));
+    let _ = key(&mut s, '/');
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "one");
+
+    let _ = s.search_set_query("typed".into());
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "two", "the walk restarts from the newest");
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "typed", "and restores the newer draft");
+}
+
+/// Committing a search records it — once. The record is applied locally *and* sent to the server
+/// (which persists it for other windows); a repeat of the newest entry sends nothing.
+#[test]
+fn committing_a_search_records_it_locally_and_server_side() {
+    use aether_protocol::history::HistoryKind;
+    let mut s = session();
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("needle".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert_eq!(
+        find_request(&fx, "history/record"),
+        Some(&json!({ "kind": "search", "value": "needle" }))
+    );
+    assert_eq!(hist(&s, HistoryKind::Search), ["needle"]);
+
+    // Same query again: already the newest entry, so no list change and no traffic.
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("needle".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(find_request(&fx, "history/record").is_none());
+    assert_eq!(hist(&s, HistoryKind::Search), ["needle"]);
+}
+
+/// The grep picker's query recalls on `Up`/`Down` — and only grep's does, since Alt-k/j own list
+/// movement in every picker and the fuzzy kinds have no query worth recalling.
+#[test]
+fn grep_picker_query_recalls_on_up_down() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    adopt_history(&mut s, json!({ "grep": ["fn resolve", "wrap_state"] }));
+
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "wrap_state");
+    assert_eq!(
+        find_request(&fx, "picker/query").map(|p| p["query"].clone()),
+        Some(json!("wrap_state")),
+        "the recalled query re-runs the search"
+    );
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "fn resolve");
+
+    // Alt-k still moves the highlight rather than the history.
+    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "fn resolve");
+
+    // Files has no query history: Up is inert there (and mustn't touch the query).
+    let mut s = session();
+    adopt_history(&mut s, json!({ "grep": ["fn resolve"] }));
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    let _ = s.picker_set_query("mai".into());
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "mai");
+    assert!(find_request(&fx, "picker/query").is_none());
+}
+
+/// Closing the grep picker is what commits its query to the history — not each keystroke, or the
+/// list would fill with prefixes. Queries too short to have run a search aren't recorded.
+#[test]
+fn closing_grep_records_the_settled_query_only() {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    // Typing streams queries but records nothing.
+    for q in ["w", "wr", "wrap"] {
+        let fx = s.picker_set_query(q.into());
+        assert!(find_request(&fx, "history/record").is_none());
+    }
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(
+        find_request(&fx, "history/record"),
+        Some(&json!({ "kind": "grep", "value": "wrap" })),
+        "only the query the user settled on is recorded"
+    );
+    assert_eq!(hist(&s, HistoryKind::Grep), ["wrap"]);
+
+    // A one-character query never ran a search, so it never enters the history.
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let _ = s.picker_set_query("w".into());
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(find_request(&fx, "history/record").is_none());
+    assert_eq!(hist(&s, HistoryKind::Grep), ["wrap"]);
+}
+
+/// Grep opens fully reset — query, hits and chips — like every kind but the changes pickers. The
+/// server holds the filters, so all the client does is ask for the wiping scope.
+#[test]
+fn grep_opens_fully_reset() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    let fx = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let view = find_request(&fx, "picker/view").expect("opens via picker/view");
+    assert_eq!(view["reset"], json!("all"));
+    assert!(
+        view.get("center_on_cursor").is_none(),
+        "nothing to centre on — the hits went with the query"
+    );
+    // The client-side chip row starts empty too, so the render can't show chips the server has
+    // just dropped (it adopts `filters` back from the view result).
+    assert_eq!(
+        s.picker.as_ref().map(|p| p.wire_filters()),
+        Some(aether_protocol::picker::PickerFilters::default())
+    );
+}
+
+/// The glob and path chip editors recall on `Up`/`Down` too, from separate lists, and commit their
+/// field text on Enter. Alt-j/k stay on suggestion cycling.
+#[test]
+fn chip_editor_fields_recall_and_record_separately() {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    adopt_history(
+        &mut s,
+        json!({ "glob": ["*.toml", "*.rs"], "path": ["crates/aether-server"] }),
+    );
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+
+    // Alt-g opens the glob editor; Up walks the glob list (not the path one).
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let ed = s.picker.as_ref().unwrap().chip_editor.as_ref().unwrap();
+    assert_eq!(ed.input.text, "*.rs");
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let ed = s.picker.as_ref().unwrap().chip_editor.as_ref().unwrap();
+    assert_eq!(ed.input.text, "*.toml");
+
+    // Enter commits: the chip lands and the field text is recorded.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert_eq!(
+        find_request(&fx, "history/record"),
+        Some(&json!({ "kind": "glob", "value": "*.toml" }))
+    );
+    // `*.toml` was already in the list; re-committing moves it to newest rather than duplicating.
+    assert_eq!(hist(&s, HistoryKind::Glob), ["*.rs", "*.toml"]);
+    assert_eq!(
+        hist(&s, HistoryKind::Path),
+        ["crates/aether-server"],
+        "the path list is untouched by a glob commit"
+    );
+}
+
+/// A recalled search restores the *match options* it ran under, not just its text — a regex
+/// recalled under literal matching would quietly match nothing. Stepping back off the walk
+/// restores the options the user had, so a recall is never destructive.
+#[test]
+fn search_recall_restores_match_options_and_down_restores_yours() {
+    use aether_protocol::picker::{CaseMode, MatchOptions};
+
+    let mut s = session();
+    adopt_history(
+        &mut s,
+        json!({ "search": [{ "value": "f.o", "filters": { "regex": true } }] }),
+    );
+
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("plain".into());
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS); // smart -> sensitive
+    assert_eq!(s.search.options.case, CaseMode::Sensitive);
+
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "f.o");
+    assert_eq!(
+        s.search.options,
+        MatchOptions {
+            regex: true,
+            ..Default::default()
+        },
+        "the recalled entry's options replace the current ones wholesale"
+    );
+    // The re-run carries them, so the preview matches the way the recalled search did.
+    assert_eq!(
+        find_request(&fx, "search/set").map(|p| p["options"].clone()),
+        Some(json!({ "regex": true }))
+    );
+
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(s.search.query, "plain");
+    assert_eq!(
+        s.search.options.case,
+        CaseMode::Sensitive,
+        "Down restores the options that were in effect before the walk"
+    );
+    assert!(!s.search.options.regex);
+}
+
+/// The same for grep, over the whole chip row: recall reproduces the search that was run — scope
+/// included — and `Down` puts the row you had back.
+#[test]
+fn grep_recall_restores_the_chip_row() {
+    use aether_protocol::picker::{PickerKind, ScopedPath};
+
+    let mut s = session();
+    adopt_history(
+        &mut s,
+        json!({ "grep": [{
+            "value": "fn resolve",
+            "filters": { "regex": true, "globs": ["*.ts"] }
+        }] }),
+    );
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    // Start from a different scope of the user's own: a `*.rs` glob.
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.chips = aether_client::chips::adopt_filters(&aether_protocol::picker::PickerFilters {
+            globs: vec!["*.rs".into()],
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "crates".into(),
+                is_file: false,
+            }],
+            ..Default::default()
+        });
+    }
+
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.query, "fn resolve");
+    let filters = p.wire_filters();
+    assert_eq!(filters.globs, ["*.ts"], "the entry's globs replace the row");
+    assert!(filters.regex, "and its match options come back too");
+    assert!(
+        filters.directories.is_empty(),
+        "the dir scope the entry didn't have is gone"
+    );
+    // Query and the adopted filters travel together — one round-trip, no intermediate search
+    // under a half-applied configuration.
+    let q = find_request(&fx, "picker/query").expect("re-runs the search");
+    assert_eq!(q["query"], json!("fn resolve"));
+    assert_eq!(q["filters"]["globs"], json!(["*.ts"]));
+
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let restored = s.picker.as_ref().unwrap().wire_filters();
+    assert_eq!(restored.globs, ["*.rs"], "Down restores the user's own row");
+    assert_eq!(restored.directories.len(), 1);
+    assert!(!restored.regex);
+}
+
+/// Closing grep records the chip row alongside the query, so the entry can reproduce the search.
+#[test]
+fn closing_grep_records_the_chip_row_with_the_query() {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let _ = s.picker_set_query("wrap".into());
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS); // Alt-e: regex on
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert_eq!(
+        find_request(&fx, "history/record"),
+        Some(&json!({ "kind": "grep", "value": "wrap", "filters": { "regex": true } })),
+        "the filters ride the record as flattened fields"
+    );
+    let entry = &s.history.list(HistoryKind::Grep)[0];
+    assert!(entry.filters.regex);
+}
+
+/// Re-running a remembered term under different filters updates that entry rather than adding a
+/// second row that reads identically while walking.
+#[test]
+fn re_recording_a_term_updates_its_filters_in_place() {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    for regex in [false, true] {
+        let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+        let _ = s.picker_set_query("wrap".into());
+        if regex {
+            let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
+        }
+        let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    }
+    assert_eq!(hist(&s, HistoryKind::Grep), ["wrap"], "one row, not two");
+    assert!(
+        s.history.list(HistoryKind::Grep)[0].filters.regex,
+        "the newest configuration wins"
     );
 }

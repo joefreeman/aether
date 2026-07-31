@@ -11,6 +11,7 @@ use aether_protocol::hints::{
     day_from_unix_ms, HintEvent, HintRecord, HintsStateResult, DISMISS_WEIGHT, LEARNED_DAYS,
     LEARNED_USES,
 };
+use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -543,6 +544,69 @@ pub fn write_hints_at(path: &Path, hints: &HintsState) -> anyhow::Result<()> {
     }
     let body = serde_json::to_string_pretty(hints).context("serializing hints")?;
     std::fs::write(path, body).with_context(|| format!("writing hints at {}", path.display()))?;
+    Ok(())
+}
+
+/// Input-history state (docs/input-history.md): the `Up`/`Down` recall lists for the overlay text
+/// inputs, keyed by workspace name. Machine-managed like [`WorkspaceSessions`] and [`HintsState`],
+/// and — like them — the server is a dumb aggregator: clients append committed values and own the
+/// navigation. A `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral
+/// workspaces are never recorded here (no stable identity to file the history under), matching
+/// [`WorkspaceSessions`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryFile {
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, HistoryLists>,
+}
+
+impl HistoryFile {
+    /// The recall lists for one workspace — empty (not absent) for a workspace that's never
+    /// recorded anything, so the caller can hand a client a snapshot unconditionally.
+    pub fn lists(&self, workspace: &str) -> HistoryLists {
+        self.workspaces.get(workspace).cloned().unwrap_or_default()
+    }
+
+    /// Append a committed entry to one workspace's list, applying the shared dedupe + cap rule
+    /// ([`HistoryLists::record`]). Returns whether anything changed (drives the dirty flag).
+    pub fn record(&mut self, workspace: &str, kind: HistoryKind, entry: HistoryEntry) -> bool {
+        let lists = self.workspaces.entry(workspace.to_string()).or_default();
+        if lists.record(kind, entry) {
+            true
+        } else {
+            // Don't leave an empty entry behind for a no-op record — it would write a bare
+            // `{"<workspace>": {}}` stanza into the file for nothing.
+            if lists == &HistoryLists::default() {
+                self.workspaces.remove(workspace);
+            }
+            false
+        }
+    }
+}
+
+/// Path to the input-history file (`<state>/aether/profiles/<name>/history.json`), beside
+/// `sessions.json`. JSON in the state dir: machine-managed, don't hand-edit.
+pub fn history_state_path() -> anyhow::Result<PathBuf> {
+    Ok(profile_state_dir()?.join("history.json"))
+}
+
+/// Load the input-history file. Missing file = empty state, like [`load_hints_at`].
+pub fn load_history_at(path: &Path) -> anyhow::Result<HistoryFile> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HistoryFile::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading history at {}", path.display())),
+    };
+    serde_json::from_str(&content).with_context(|| format!("parsing history at {}", path.display()))
+}
+
+/// Write (or overwrite) the input-history file, creating the directory if needed.
+pub fn write_history_at(path: &Path, history: &HistoryFile) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating state dir {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(history).context("serializing history")?;
+    std::fs::write(path, body).with_context(|| format!("writing history at {}", path.display()))?;
     Ok(())
 }
 

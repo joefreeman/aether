@@ -27,7 +27,7 @@ use aether_protocol::buffer::{
     BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferSetTransient,
     BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
 };
-use aether_protocol::cursor::Direction;
+use aether_protocol::cursor::{Direction, VerticalDirection};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
     CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
@@ -49,6 +49,10 @@ use aether_protocol::git::{
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
+};
+use aether_protocol::history::{
+    HistoryEntry, HistoryKind, HistoryRecord, HistoryRecordParams, HistoryState,
+    HistoryStateParams, HistoryStateResult,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -76,9 +80,10 @@ use aether_protocol::nav::{NavStep, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerHide, PickerHideParams,
-    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerSectionJump,
+    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset, PickerSectionJump,
     PickerSectionJumpParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
+    MIN_GREP_QUERY_LEN,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -254,6 +259,10 @@ pub enum Event {
     /// also the "server connection succeeded" gate for the very first hint. Failure is non-fatal:
     /// no hints this session.
     HintsStateLoaded(Result<HintsStateResult, String>),
+    /// `history/state` resolved: adopt the active workspace's `Up`/`Down` recall lists
+    /// (docs/input-history.md). Fetched at boot and after every workspace switch. Failure is
+    /// non-fatal — the lists stay as they were and recall just has less to offer.
+    HistoryLoaded(Result<HistoryStateResult, String>),
     /// `settings/set` (from the app-settings overlay) resolved: a failure surfaces as a toast (the
     /// optimistic local change already applied; this only reports persistence trouble).
     AppSettingsSaved(Result<AppSettings, String>),
@@ -565,13 +574,13 @@ impl Session {
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
                 self.search.query = query.clone();
-                // The selection is searched literally, so the committed search is too — clear
-                // `regex` while keeping case / whole-word.
-                self.search.options.regex = false;
+                // Mirror the defaults the request went out with, so the committed search's state
+                // matches how the server is actually matching it.
+                self.search.options = MatchOptions::default();
                 self.search.active = true;
                 self.search.summary = Some(r.summary);
-                self.push_history(query);
-                Effects::none()
+                let entry = HistoryEntry::with_options(query, self.search.options);
+                self.record_history(HistoryKind::Search, entry)
             }
             Event::SearchFromSel(Ok(None)) => Effects::none(), // empty selection
             Event::SearchFromSel(Err(e)) => Effects::error(e),
@@ -753,8 +762,9 @@ impl Session {
                         p.directory = r.directory_path;
                         p.directory_parent = r.directory_parent;
                         if initial {
-                            // Adopt the resumed query (grep preserves it across opens) and
-                            // the persisted filters (seeded opens get their seed echoed).
+                            // Adopt the resumed query (the changes pickers preserve theirs across
+                            // opens; every other kind comes back empty) and the persisted filters
+                            // (seeded opens get their seed echoed).
                             p.generation = r.generation;
                             p.query = r.query;
                             p.total_candidates = r.total_candidates;
@@ -870,7 +880,10 @@ impl Session {
                 // last buffer of an ephemeral context reached this way returns to the chooser
                 // rather than quitting (see `leave_ephemeral_workspace`).
                 self.launched_with_file = false;
-                self.adopt_switch(open)
+                // The recall lists are workspace-scoped, so the ones we hold are now the wrong
+                // workspace's — not stale, wrong. Refetch before any overlay can read them.
+                let fx = self.fetch_history();
+                fx.and(self.adopt_switch(open))
             }
             Event::WorkspaceActivated(Err(e)) => {
                 Effects::error(format!("Workspace switch failed: {e}"))
@@ -883,7 +896,10 @@ impl Session {
                 self.workspace = workspace.name.clone();
                 self.workspace_paths = workspace.paths;
                 self.launched_with_file = false;
-                let mut fx = match opened {
+                // Workspace-scoped recall lists — empty for a brand-new workspace, but the fetch
+                // is what *clears* the previous workspace's (see `WorkspaceActivated`).
+                let mut fx = self.fetch_history();
+                fx = fx.and(match opened {
                     // The workspace came with a landing buffer (it had roots / history). Adopt it.
                     Some(open) => self.adopt_switch(open),
                     // A fresh workspace has no roots and so no landing buffer — open a scratch so the
@@ -892,7 +908,7 @@ impl Session {
                     None => self.request::<BufferOpen>(BufferOpenParams::default(), move |__r| {
                         Event::Switched(__r.map_err(|e| e.to_string()))
                     }),
-                };
+                });
                 fx.push(Effect::Toast {
                     message: format!("Created workspace {}", workspace.name),
                     kind: ToastKind::Success,
@@ -1035,6 +1051,13 @@ impl Session {
                 Err(_) => Effects::none(),
             },
 
+            Event::HistoryLoaded(result) => {
+                if let Ok(snap) = result {
+                    self.history.adopt(snap.lists);
+                }
+                Effects::none()
+            }
+
             Event::HintsStateLoaded(result) => match result {
                 Ok(snap) => {
                     self.hints.adopt(snap);
@@ -1113,7 +1136,7 @@ impl Session {
                 self.request::<PickerView>(
                     PickerViewParams {
                         kind,
-                        reset: false,
+                        reset: PickerReset::Keep,
                         offset: 0,
                         limit: FETCH_LIMIT,
                         center_on: Some(target),
@@ -1146,13 +1169,19 @@ impl Session {
                             // resetting where the user was filtering.
                             fx = fx.and(self.picker_query_changed());
                         } else if kind == PickerKind::Files {
-                            fx = fx.and(self.open_picker(
-                                PickerKind::Files,
-                                None,
-                                None,
-                                false,
-                                None,
-                            ));
+                            // Same idea, different mechanism: Files' candidates come from the
+                            // workspace index, so re-running the query server-side wouldn't drop
+                            // the trashed entry — the list has to be re-bound, which a `Keep`
+                            // re-view does (`Arc::ptr_eq` fails against the re-walked index). A
+                            // fresh *open* would re-bind too, but it would also wipe the query and
+                            // chips, which is a surprising thing for a delete to do. Only the
+                            // highlight resets, since the row under it just vanished.
+                            if let Some(p) = self.picker.as_mut() {
+                                p.selected = 0;
+                            }
+                            fx = fx
+                                .and(Effects::one(Effect::PickerScrollReset))
+                                .and(self.picker_refetch(0, false));
                         }
                     }
                     fx
@@ -1602,7 +1631,8 @@ impl Session {
 
     /// Rebind the session to a freshly opened buffer: reset all per-buffer state (modal,
     /// diagnostics, viewport binding, prompt — an externally-triggered switch can land mid-pick)
-    /// and ask the shell to resubscribe. Search history survives switches.
+    /// and ask the shell to resubscribe. Input history is workspace-scoped, not per-buffer, so it
+    /// lives on the session ([`Session::history`]) and this doesn't touch it.
     ///
     /// An open picker is deliberately *not* torn down here — rebinding the buffer doesn't own the
     /// picker's lifecycle. The pick→open path closes its own picker explicitly ([`Self::picker_accept`]),
@@ -1623,11 +1653,7 @@ impl Session {
         self.blame = None;
         self.blame_requested = None;
         self.prompt = None;
-        let history = std::mem::take(&mut self.search.history);
-        self.search = SearchState {
-            history,
-            ..SearchState::default()
-        };
+        self.search = SearchState::default();
         self.buffer = buffer_info(open, &self.workspace_paths);
         Effects::one(Effect::Resubscribe)
     }
@@ -1782,16 +1808,38 @@ impl Session {
         )
     }
 
-    /// Append a committed search to the history (deduped against the latest entry, capped).
-    pub fn push_history(&mut self, query: String) {
-        const SEARCH_HISTORY_MAX: usize = 100;
-        if query.is_empty() || self.search.history.last() == Some(&query) {
-            return;
+    /// Record a committed value to its input-history list (docs/input-history.md) and, when that
+    /// actually changed the list, tell the server so it persists and other windows see it. The
+    /// local apply is not optimism — it's the same [`HistoryLists::record`] rule the server runs,
+    /// so the two can't disagree; the round-trip is fire-and-forget.
+    pub fn record_history(&mut self, kind: HistoryKind, entry: HistoryEntry) -> Effects {
+        if !self.history.record(kind, entry.clone()) {
+            return Effects::none();
         }
-        self.search.history.push(query);
-        let overflow = self.search.history.len().saturating_sub(SEARCH_HISTORY_MAX);
-        if overflow > 0 {
-            self.search.history.drain(..overflow);
+        self.request_str::<HistoryRecord>(HistoryRecordParams { kind, entry }, |_| Event::Noop)
+    }
+
+    /// Fetch the active workspace's recall lists. Runs on connect (from [`Self::startup`]) and
+    /// again after every workspace switch — the lists are workspace-scoped, so a switch makes the
+    /// ones we hold wrong, not merely stale.
+    fn fetch_history(&mut self) -> Effects {
+        self.history.reset();
+        self.request_str::<HistoryState>(HistoryStateParams {}, Event::HistoryLoaded)
+    }
+
+    /// Step the focused input's history one entry (`Up` = older, `Down` = newer). Returns the
+    /// entry to install — value *and* the configuration it ran under — or `None` when there's
+    /// nothing to recall: an empty list, an end of the walk, or no walk in progress to come back
+    /// from. `current` is what the field holds now, stashed so `Down` can restore it whole.
+    fn history_step(
+        &mut self,
+        kind: HistoryKind,
+        dir: VerticalDirection,
+        current: HistoryEntry,
+    ) -> Option<HistoryEntry> {
+        match dir {
+            VerticalDirection::Up => self.history.prev(kind, current),
+            VerticalDirection::Down => self.history.next(kind),
         }
     }
 
@@ -1978,8 +2026,10 @@ impl Session {
 
     // ---- pickers ----------------------------------------------------------------------------
 
-    /// Open a picker: subscribe a window and let `picker/update` pushes fill it. Grep resumes
-    /// its prior query/hits (centred on the cursor's nearest hit); the rest reset.
+    /// Open a picker: subscribe a window and let `picker/update` pushes fill it. Every open is a
+    /// fresh one ([`PickerReset::All`], uniform across kinds) — no query, chips or highlight
+    /// carries over from the last time this picker was up. The kinds that want to land somewhere
+    /// meaningful derive it from the *live* cursor instead ([`PickerKind::centers_on_cursor`]).
     /// `directory_path` seeds the Explorer's listing (its `Space e` = the buffer's directory).
     /// `seed_filters` replaces the server's persisted set (Explorer→Grep/Files switches,
     /// `Space Alt-f`); the echo through `PickerViewed` rebuilds the chip row.
@@ -1996,8 +2046,9 @@ impl Session {
         from_selection: bool,
         center_on_override: Option<PickerItem>,
     ) -> Effects {
-        let reset = !kind.preserves_state();
         self.picker = Some(PickerState::new(kind));
+        // A fresh input owns the keyboard now; anything the last one was recalling is over.
+        self.history.reset();
         let buffer_id = self.buffer.buffer_id;
         let has_center_override = center_on_override.is_some();
         // Buffers / Workspaces / Explorer / LspServers all open with the highlight on "where you
@@ -2055,7 +2106,7 @@ impl Session {
         let request = self.request::<PickerView>(
             PickerViewParams {
                 kind,
-                reset,
+                reset: PickerReset::All,
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
@@ -2090,14 +2141,10 @@ impl Session {
                 result: __r.map_err(|e| e.to_string()),
             },
         );
-        // Reset the scroll to the top only for a fresh list. A state-preserving picker (grep) resumes
-        // onto its saved selection — often deep in the results — and the `effective_center_on` echo
-        // drives a reveal to it; a scroll reset here would fight that, snapping back to the top.
-        if reset {
-            Effects::one(Effect::PickerScrollReset).and(request)
-        } else {
-            request
-        }
+        // Every open starts the list at the top. A kind that wants to land somewhere else centres
+        // via the `effective_center_on` echo, which arrives with the response and reveals *after*
+        // this — the same order Buffers and the Explorer have always opened in.
+        Effects::one(Effect::PickerScrollReset).and(request)
     }
 
     /// `Space Alt-f`: open Files pre-scoped to the active buffer's directory — a normal dir filter
@@ -2126,8 +2173,9 @@ impl Session {
     /// `Space Alt-g`: open Grep with the query seeded from the buffer's selection — the grep
     /// equivalent of `Alt-/`. The server slices the selection, installs it as a literal query, and
     /// runs the search in the same `picker/view`; the derived query/generation ride back through
-    /// the `PickerViewed` echo (so there's no follow-up `picker/query`). Sticky filters/options are
-    /// preserved. An empty selection just opens grep with no query.
+    /// the `PickerViewed` echo (so there's no follow-up `picker/query`). It's an ordinary open, so
+    /// the chip row starts empty and the selection is searched workspace-wide. An empty selection
+    /// just opens grep with no query.
     pub fn open_grep_from_selection(&mut self) -> Effects {
         self.open_picker(PickerKind::Grep, None, None, true, None)
     }
@@ -2217,7 +2265,7 @@ impl Session {
         fx = fx.and(self.request::<PickerView>(
             PickerViewParams {
                 kind: PickerKind::Explorer,
-                reset: false,
+                reset: PickerReset::Keep,
                 offset: 0,
                 limit: FETCH_LIMIT,
                 center_on,
@@ -2298,7 +2346,7 @@ impl Session {
         self.request::<PickerView>(
             PickerViewParams {
                 kind,
-                reset: false,
+                reset: PickerReset::Keep,
                 offset,
                 limit: FETCH_LIMIT,
                 center_on: None,
@@ -2385,6 +2433,9 @@ impl Session {
             return Effects::none();
         }
         p.query = query;
+        // Typing abandons any history walk in progress (the recall path sets `query` directly, so
+        // it doesn't come through here).
+        self.history.reset();
         self.picker_query_changed()
     }
 
@@ -2396,7 +2447,8 @@ impl Session {
             return Effects::none();
         }
         self.search.query = query;
-        self.search.history_cursor = None;
+        // Typing abandons any history walk in progress — the stashed draft is stale now.
+        self.history.reset();
         self.incremental_search()
     }
 
@@ -2502,6 +2554,14 @@ impl Session {
             return Effects::none();
         }
         ed.input.set(text);
+        // Typing abandons any history walk (the recall path writes `input` directly).
+        self.history.reset();
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        let Some(ed) = p.chip_editor.as_mut() else {
+            return Effects::none();
+        };
         let refresh = ed.is_dir() && ed.path_edited(&workspace_paths);
         let mut fx = Effects::none();
         if refresh {
@@ -2625,7 +2685,7 @@ impl Session {
                 Effects::one(Effect::PickerScrollReset).and(self.request::<PickerView>(
                     PickerViewParams {
                         kind: PickerKind::Explorer,
-                        reset: false,
+                        reset: PickerReset::Keep,
                         offset: 0,
                         limit: FETCH_LIMIT,
                         center_on: None,
@@ -2809,6 +2869,21 @@ impl Session {
         let Some(ed) = p.chip_editor.take() else {
             return Effects::none();
         };
+        // The committed field text goes to the input history (docs/input-history.md), whether or
+        // not it changed the chip row: re-committing the same scope is still a use, and recording
+        // the *typed* text (not the parsed scope) is what lets recall replay it verbatim.
+        let recorded = if ed.is_dir() {
+            (HistoryKind::Path, ed.input.text.trim().to_string())
+        } else {
+            // A glob that normalizes away (empty, bare `*`) is a chip *removal*, not a value —
+            // `record_history` drops the empty string, so nothing lands.
+            (
+                HistoryKind::Glob,
+                chips::normalize_glob(&ed.input.text).unwrap_or_default(),
+            )
+        };
+        // These two lists carry no configuration: for them the value *is* the configuration.
+        let recorded = (recorded.0, HistoryEntry::bare(recorded.1));
         let changed = match ed.kind {
             chips::ChipEditorKind::Glob { edit } => {
                 let normalized = chips::normalize_glob(&ed.input.text);
@@ -2823,10 +2898,12 @@ impl Session {
                 chips::commit_dir_edit(&mut p.chips, value, edit)
             }
         };
+        self.history.reset();
+        let fx = self.record_history(recorded.0, recorded.1);
         if !changed {
-            return Effects::none();
+            return fx;
         }
-        self.apply_picker_filter_change()
+        fx.and(self.apply_picker_filter_change())
     }
 
     /// Alt-l: descend into the highlighted explorer directory (Enter does too, via accept).
@@ -3091,14 +3168,18 @@ impl Session {
             } else {
                 Effects::none()
             };
-        let hide = self.close_picker();
-
-        observed.and(hide).and(self.request::<PickerSelect>(
-            PickerSelectParams { kind, item },
-            move |__r| Event::PickerSelected {
+        // Resolve the pick *before* closing. `picker/hide` releases the picker's state
+        // server-side, and requests go out in enqueue order (docs/protocol-composites.md), so a
+        // `picker/select` behind the close would have no candidate set left to resolve its item
+        // against — an `invalid params` error instead of a jump. Closing second also reads right:
+        // the row is resolved, then the list goes away.
+        let select = self.request::<PickerSelect>(PickerSelectParams { kind, item }, move |__r| {
+            Event::PickerSelected {
                 result: __r.map_err(|e| e.to_string()),
-            },
-        ))
+            }
+        });
+
+        observed.and(select).and(self.close_picker())
     }
 
     /// Drop the panel and unsubscribe (the server keeps walker/matcher state for resume).
@@ -3134,11 +3215,31 @@ impl Session {
         let Some(p) = self.picker.take() else {
             return Effects::none();
         };
-
-        self.request::<PickerHide>(PickerHideParams { kind: p.kind }, move |__r| {
-            let _ = __r;
-            Event::Noop
-        })
+        self.history.reset();
+        // Closing is what commits the query to the input history (docs/input-history.md) — grep
+        // searches per keystroke, so recording on change would store `h`, `ha`, `han`… Only the
+        // query the user actually settled on lands, and only if it was long enough to have run a
+        // search at all. Covers accept and dismiss alike: both funnel through here.
+        // The whole chip row rides along, so recalling the query later reproduces the search it
+        // was — scope, match options and all.
+        let mut fx = match p.kind.history_kind() {
+            Some(kind) if p.query.chars().count() >= MIN_GREP_QUERY_LEN => {
+                let entry = HistoryEntry {
+                    value: p.query.clone(),
+                    filters: p.wire_filters(),
+                };
+                self.record_history(kind, entry)
+            }
+            _ => Effects::none(),
+        };
+        fx = fx.and(self.request::<PickerHide>(
+            PickerHideParams { kind: p.kind },
+            move |__r| {
+                let _ = __r;
+                Event::Noop
+            },
+        ));
+        fx
     }
 
     /// Keys while a picker is open: list navigation + query editing.
@@ -3266,6 +3367,35 @@ impl Session {
             // the TUI (crossterm raw mode maps the 0x0A byte to Ctrl-j, not Enter).
             KeyCode::Char('j') if mods.ctrl && !mods.alt && p.kind.captures_to_jumplist() => {
                 return self.jumplist_capture();
+            }
+            // Up/Down recall this picker's query history (docs/input-history.md) — grep only,
+            // the one kind whose query is a question you re-ask rather than a live filter over a
+            // candidate set. They're free here precisely because the *list* moves on Alt-k/j, and
+            // they reach the core in every shell (no text input claims a bare arrow-up).
+            KeyCode::Up | KeyCode::Down if no_chord && p.kind.history_kind().is_some() => {
+                let dir = if code == KeyCode::Up {
+                    VerticalDirection::Up
+                } else {
+                    VerticalDirection::Down
+                };
+                let kind = p.kind.history_kind().unwrap();
+                let current = HistoryEntry {
+                    value: p.query.clone(),
+                    filters: p.wire_filters(),
+                };
+                let Some(entry) = self.history_step(kind, dir, current) else {
+                    return Effects::none(); // nothing to recall; leave the picker alone
+                };
+                // Not via `picker_set_query` — that's the shell's typing sync, which abandons the
+                // walk we're in the middle of. Install the query *and* the chip row the entry
+                // carries (a recall reproduces the search, not just its words), then re-run:
+                // `picker_query_changed` sends the query and the freshly adopted filters together,
+                // so it's one round-trip. Stepping back off the walk restores the chips you had.
+                if let Some(p) = &mut self.picker {
+                    p.query = entry.value;
+                    p.adopt_filters(&entry.filters);
+                }
+                return self.picker_query_changed();
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => {
@@ -3495,9 +3625,40 @@ impl Session {
             {
                 ed.field = ChipEditorField::Root;
             }
+            // Up/Down recall this field's prior values (docs/input-history.md): globs and paths
+            // keep separate lists — a `*.rs` is never a path — and the root typeahead has none
+            // (it's a fixed candidate set, cycled with Alt-j/k). The recalled path text is
+            // whatever was committed, so it replays through the same listing refresh a typed
+            // value would.
+            KeyCode::Up | KeyCode::Down if no_chord && !in_root => {
+                let dir = if code == KeyCode::Up {
+                    VerticalDirection::Up
+                } else {
+                    VerticalDirection::Down
+                };
+                let kind = if is_dir {
+                    HistoryKind::Path
+                } else {
+                    HistoryKind::Glob
+                };
+                let current = HistoryEntry::bare(ed.input.text.clone());
+                let Some(entry) = self.history_step(kind, dir, current) else {
+                    return Effects::none();
+                };
+                let Some(ed) = self.picker.as_mut().and_then(|p| p.chip_editor.as_mut()) else {
+                    return Effects::none();
+                };
+                ed.input.set(entry.value);
+                let refresh = ed.is_dir() && ed.path_edited(&workspace_paths);
+                let mut fx = Effects::none();
+                if refresh {
+                    fx = fx.and(self.refresh_chip_editor_listing());
+                }
+                return fx.and(self.sync_live_filters());
+            }
             // Cycle the focused segment's matches: root typeahead candidates (wrapping), or
-            // the path field's directory suggestions (clamped). Glob: no-op — reserved for
-            // input history, matching the search bar.
+            // the path field's directory suggestions (clamped). Glob: no-op — its recall lives on
+            // Up/Down below, like every other overlay input.
             KeyCode::Char(c @ ('j' | 'k')) if mods.alt && !mods.ctrl => {
                 let down = c == 'j';
                 if in_root {
@@ -4001,9 +4162,16 @@ impl Session {
 
     // ---- search ----------------------------------------------------------------------------
 
-    /// `/` or `?`: open the search prompt. Snapshots cursor/query for Esc-restore (the shell
-    /// anchors its scroll via the effect) and clears the server-side search so stale
+    /// `/` or `?`: open the search prompt. Snapshots cursor/query/options for Esc-restore (the
+    /// shell anchors its scroll via the effect) and clears the server-side search so stale
     /// highlights disappear immediately.
+    ///
+    /// The prompt opens at its defaults — empty query *and* default match options — the same way
+    /// every picker opens at [`PickerReset::All`]. Options used to be sticky across `/`
+    /// presses, but a case or regex toggle left over from an earlier search silently changes what
+    /// the next one matches; `Up` recalls a past query together with the options it ran under
+    /// (docs/input-history.md §4a) when you do want the old configuration back. The snapshot is
+    /// taken *before* the reset, so Esc still restores a committed search exactly as it was.
     pub fn enter_search(&mut self, extend_to_cursor: bool) -> Effects {
         self.search.snapshot = Some(SearchSnapshot {
             cursor: self.buffer.cursor,
@@ -4011,10 +4179,10 @@ impl Session {
             active: self.search.active,
             options: self.search.options,
         });
+        self.search.options = MatchOptions::default();
         self.search.active = false;
         self.search.summary = None;
-        self.search.history_cursor = None;
-        self.search.history_draft.clear();
+        self.history.reset();
         self.search.chip_selected = None;
         self.search.extend_to_cursor = extend_to_cursor;
         self.mode = Mode::Search;
@@ -4165,8 +4333,7 @@ impl Session {
     pub fn abort_search(&mut self) -> Effects {
         self.mode = Mode::Normal;
         self.search.extend_to_cursor = false;
-        self.search.history_cursor = None;
-        self.search.history_draft.clear();
+        self.history.reset();
         self.search.chip_selected = None;
         let Some(snap) = self.search.snapshot.take() else {
             return Effects::none();
@@ -4209,23 +4376,25 @@ impl Session {
         fx
     }
 
-    /// Enter in the prompt: keep the query as the committed search.
+    /// Enter in the prompt: keep the query as the committed search. Commit is also what makes the
+    /// query recallable — the incremental preview types a new query on every keystroke, so
+    /// recording anything earlier would fill the history with prefixes.
     pub fn commit_search(&mut self) -> Effects {
         self.search.snapshot = None;
+        let mut fx = Effects::none();
         if self.search.query.is_empty() {
             self.search.active = false;
             self.search.summary = None;
         } else {
             self.search.active = true;
-            let q = self.search.query.clone();
-            self.push_history(q);
+            let entry = HistoryEntry::with_options(self.search.query.clone(), self.search.options);
+            fx = self.record_history(HistoryKind::Search, entry);
         }
-        self.search.history_cursor = None;
-        self.search.history_draft.clear();
+        self.history.reset();
         self.search.extend_to_cursor = false;
         self.search.chip_selected = None;
         self.mode = Mode::Normal;
-        Effects::none()
+        fx
     }
 
     /// `n`/`Alt-n`: step match-to-match; with no active search, revive the most recent
@@ -4234,11 +4403,15 @@ impl Session {
         let revive = if self.search.active {
             None
         } else {
-            match self.search.history.last().cloned() {
-                Some(q) => {
-                    self.search.query = q.clone();
+            // Revive the newest entry *with its match options* — the revived query rides the nav
+            // RPC below alongside `self.search.options`, and a regex revived as a literal would
+            // quietly match nothing.
+            match self.history.list(HistoryKind::Search).last().cloned() {
+                Some(entry) => {
+                    self.search.query = entry.value.clone();
+                    self.search.options = entry.filters.match_options();
                     self.search.active = true;
-                    Some(q)
+                    Some(entry.value)
                 }
                 None => return Effects::none(),
             }
@@ -4269,12 +4442,11 @@ impl Session {
                 anchor: None,
                 extend: false,
                 from_selection: true,
-                // Searching a selection is a literal search — force `regex` off (the server matches
-                // the raw selection text literally). Case / whole-word stay sticky.
-                options: MatchOptions {
-                    regex: false,
-                    ..self.search.options
-                },
+                // "Find this text" runs at the defaults, like a prompt open ([`Self::enter_search`]):
+                // literal (the server matches the raw selection text), smartcase, no whole-word.
+                // Inheriting the previous search's options would be worse here than in the prompt —
+                // there's no visible chip row to show what got carried over.
+                options: MatchOptions::default(),
             },
             |r| {
                 Event::SearchFromSel(
@@ -4763,7 +4935,10 @@ impl Session {
         let fx = self.request_str::<SettingsGet>(SettingsGetParams {}, Event::AppSettingsLoaded);
         // The hint learning snapshot rides the same connect sequence; re-fetched after a
         // reconnect too, which reconciles the local mirror against the server's counters.
-        fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded))
+        let fx = fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded));
+        // So do the input-history lists (docs/input-history.md). Empty at a boot chooser — no
+        // workspace is active yet — and refetched by the switch that activates one.
+        fx.and(self.fetch_history())
     }
 
     // ---- hints (docs/hints.md) ------------------------------------------------------
@@ -5201,14 +5376,8 @@ impl Session {
         match action {
             Action::SearchCommit => self.commit_search(),
             Action::SearchAbort => self.abort_search(),
-            Action::SearchHistoryPrev => {
-                self.history_up();
-                self.incremental_search()
-            }
-            Action::SearchHistoryNext => {
-                self.history_down();
-                self.incremental_search()
-            }
+            Action::SearchHistoryPrev => self.search_history_step(VerticalDirection::Up),
+            Action::SearchHistoryNext => self.search_history_step(VerticalDirection::Down),
             // The Alt-chord toggles deselect any chip — they're the "chord" interaction, distinct
             // from chip-row editing.
             Action::SearchToggleCase => {
@@ -5230,33 +5399,20 @@ impl Session {
         }
     }
 
-    fn history_up(&mut self) {
-        if self.search.history.is_empty() {
-            return;
-        }
-        let idx = match self.search.history_cursor {
-            None => {
-                self.search.history_draft = self.search.query.clone();
-                self.search.history.len() - 1
+    /// `Up`/`Down` (or `Alt-k`/`Alt-j`) in the search prompt: recall a prior query *with the match
+    /// options it ran under* and re-run the incremental search, so stepping the history previews
+    /// each match as you go. Restoring the options is not a nicety — a regex recalled under
+    /// literal matching silently finds nothing. A step with nothing to recall leaves the prompt
+    /// untouched.
+    fn search_history_step(&mut self, dir: VerticalDirection) -> Effects {
+        let current = HistoryEntry::with_options(self.search.query.clone(), self.search.options);
+        match self.history_step(HistoryKind::Search, dir, current) {
+            Some(entry) => {
+                self.search.query = entry.value;
+                self.search.options = entry.filters.match_options();
+                self.incremental_search()
             }
-            Some(0) => 0,
-            Some(i) => i - 1,
-        };
-        self.search.history_cursor = Some(idx);
-        self.search.query = self.search.history[idx].clone();
-    }
-
-    fn history_down(&mut self) {
-        match self.search.history_cursor {
-            None => {} // already past the newest entry
-            Some(i) if i + 1 < self.search.history.len() => {
-                self.search.history_cursor = Some(i + 1);
-                self.search.query = self.search.history[i + 1].clone();
-            }
-            Some(_) => {
-                self.search.history_cursor = None;
-                self.search.query = std::mem::take(&mut self.search.history_draft);
-            }
+            None => Effects::none(),
         }
     }
 

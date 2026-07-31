@@ -63,6 +63,16 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
                 Err(e) => tracing::warn!(error = %e, "could not load hint state; starting fresh"),
             }
         }
+        // Input-history lists (docs/input-history.md): same opt-in shape again.
+        s.history_path = config::history_state_path().ok();
+        if let Some(path) = s.history_path.clone() {
+            match config::load_history_at(&path) {
+                Ok(history) => s.history = history,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not load input history; starting fresh")
+                }
+            }
+        }
     }
     config::write_runtime_pid(&runtime_path, std::process::id())?;
     // Log the web URL too: the browser client has no config/CLI access, so a human reads (and
@@ -125,11 +135,15 @@ pub async fn run_with_listener(
         tokio::spawn(backup_flush_loop(state.clone()));
     }
 
-    // Same shape for the hint learning state: a periodic dirty-flag flush (the debounce — events
-    // between ticks coalesce into one write) plus a final flush on graceful exit below.
-    let hints_enabled = state.lock().await.hints_path.is_some();
-    if hints_enabled {
-        tokio::spawn(hints_flush_loop(state.clone()));
+    // Same shape for the two dirty-flag state files — hint learning and input history: one
+    // periodic flush (the debounce — events between ticks coalesce into one write) plus a final
+    // flush on graceful exit below. Each flush no-ops when its own path is unset.
+    let aggregates_enabled = {
+        let s = state.lock().await;
+        s.hints_path.is_some() || s.history_path.is_some()
+    };
+    if aggregates_enabled {
+        tokio::spawn(aggregate_flush_loop(state.clone()));
     }
 
     loop {
@@ -164,23 +178,26 @@ pub async fn run_with_listener(
     if backups_enabled {
         crate::handlers::flush_backups(&state).await;
     }
-    if hints_enabled {
+    if aggregates_enabled {
         crate::handlers::flush_hints(&state).await;
+        crate::handlers::flush_history(&state).await;
     }
     Ok(())
 }
 
-/// How often the hint-state flush runs. Long enough that a burst of hint events coalesces into one
-/// write, short enough that a crash loses almost nothing that matters (it's tutorial progress, not
-/// user content).
-const HINTS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the aggregate-state flush runs. Long enough that a burst of events coalesces into one
+/// write, short enough that a crash loses almost nothing that matters (tutorial progress and
+/// recall lists, not user content).
+const AGGREGATE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Periodically flush the hint learning state until the task is aborted (on server shutdown). See
-/// [`crate::handlers::flush_hints`].
-async fn hints_flush_loop(state: SharedState) {
+/// Periodically flush the client-aggregated state files — hint learning (docs/hints.md) and input
+/// history (docs/input-history.md) — until the task is aborted (on server shutdown). See
+/// [`crate::handlers::flush_hints`] and [`crate::handlers::flush_history`].
+async fn aggregate_flush_loop(state: SharedState) {
     loop {
-        tokio::time::sleep(HINTS_FLUSH_INTERVAL).await;
+        tokio::time::sleep(AGGREGATE_FLUSH_INTERVAL).await;
         crate::handlers::flush_hints(&state).await;
+        crate::handlers::flush_history(&state).await;
     }
 }
 
@@ -295,7 +312,7 @@ pub async fn spawn_for_test_multi_with_persistence(
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
-    spawn_for_test_full(workspaces, sessions_path, backups_dir, None, Vec::new()).await
+    spawn_for_test_full(workspaces, sessions_path, backups_dir, None, None, Vec::new()).await
 }
 
 /// As [`spawn_for_test`], but registers in-process **dummy language servers** (see
@@ -312,20 +329,23 @@ pub async fn spawn_for_test_with_lsp(
         None,
         None,
         None,
+        None,
         dummy_lsp,
     )
     .await
 }
 
-/// As [`spawn_for_test_multi_with_persistence`], but also points the server at `hints_path` for
-/// the hint learning state (docs/hints.md), so tests can exercise `hints/record`
-/// aggregation + persistence against a throwaway file. With it set the periodic hints flush runs,
-/// so a test records events then polls the file into existence, like the backup tests do.
+/// As [`spawn_for_test_multi_with_persistence`], but also points the server at the two
+/// client-aggregated state files — `hints_path` (docs/hints.md) and `history_path`
+/// (docs/input-history.md) — so tests can exercise `hints/record` / `history/record` aggregation
+/// and persistence against throwaway files. With either set the periodic flush runs, so a test
+/// records events then polls the file into existence, like the backup tests do.
 pub async fn spawn_for_test_full(
     workspaces: Vec<(String, Vec<PathBuf>)>,
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
     hints_path: Option<PathBuf>,
+    history_path: Option<PathBuf>,
     dummy_lsp: Vec<(String, crate::lsp::dummy::DummyLspConfig)>,
 ) -> anyhow::Result<ServerHandle> {
     use crate::state::WorkspaceEntry;
@@ -351,6 +371,10 @@ pub async fn spawn_for_test_full(
         }
         if let Some(path) = s.hints_path.clone() {
             s.hints = crate::config::load_hints_at(&path).unwrap_or_default();
+        }
+        s.history_path = history_path;
+        if let Some(path) = s.history_path.clone() {
+            s.history = crate::config::load_history_at(&path).unwrap_or_default();
         }
         for (name, paths) in &workspaces {
             let workspace_index = Arc::new(WorkspaceIndex::new(paths.clone()));

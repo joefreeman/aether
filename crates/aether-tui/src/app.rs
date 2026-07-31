@@ -46,7 +46,8 @@ pub struct PendingFind {
 
 /// Client-side mirror of the server's search state. The server owns the match list (and pushes
 /// per-line highlights via viewport line renders); the client just tracks the query, the latest
-/// summary, the history list, and the snapshot used to revert from EditorMode::Search via Esc.
+/// summary, and the snapshot used to revert from EditorMode::Search via Esc. Query recall lives on
+/// the core session (`InputHistory`, docs/input-history.md), not here — nothing renders it.
 #[derive(Debug, Default)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub struct SearchState {
@@ -59,15 +60,6 @@ pub struct SearchState {
     pub summary: Option<SearchSummary>,
     /// Snapshot of pre-search-mode state, used by Esc to revert.
     pub snapshot: Option<SearchSnapshot>,
-    /// Committed queries, oldest first. Up/Down in EditorMode::Search browses this; `n`/`Alt-n` with
-    /// no active search re-activates the most recent entry.
-    pub history: Vec<String>,
-    /// `None` while the user is typing a fresh query; `Some(i)` while they're browsing the entry
-    /// at `history[i]`. Any edit (typing/backspace) snaps back to `None`.
-    pub history_cursor: Option<usize>,
-    /// The live-typed query, stashed when the user steps into history with Up so that Down can
-    /// restore it on the way back out.
-    pub history_draft: String,
     /// True while in a `?`-initiated search: instead of re-selecting just the matched word, each
     /// incremental match grows the selection from where `?` was pressed (the snapshot anchor) to the
     /// match. Reset on every entry into search mode and on commit/abort.

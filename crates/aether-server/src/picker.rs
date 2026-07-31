@@ -521,6 +521,30 @@ impl PickerCandidates {
         }
     }
 
+    /// Drop the candidates, keeping the variant (so the slot still knows its kind). What
+    /// `picker/hide` uses to release a closed picker's results — notably a finished or in-flight
+    /// grep walk's hits, which are unbounded.
+    pub fn clear(&mut self) {
+        match self {
+            PickerCandidates::Files { files, git_status } => {
+                *files = Default::default();
+                *git_status = Default::default();
+            }
+            PickerCandidates::Buffers(v) => v.clear(),
+            PickerCandidates::Grep(v) => v.clear(),
+            PickerCandidates::Explorer(e) => e.entries.clear(),
+            PickerCandidates::ExplorerRoots(v) => v.clear(),
+            PickerCandidates::Workspaces(v) => v.clear(),
+            PickerCandidates::Diagnostics(v) => v.clear(),
+            PickerCandidates::LspServers(v) => v.clear(),
+            PickerCandidates::References(v) => v.clear(),
+            PickerCandidates::Symbols(v) => v.clear(),
+            PickerCandidates::GitChanges(v) => v.clear(),
+            PickerCandidates::Keybindings(v) => v.clear(),
+            PickerCandidates::Jumplist(v) => v.clear(),
+        }
+    }
+
     pub fn kind(&self) -> PickerKind {
         match self {
             PickerCandidates::Files { .. } => PickerKind::Files,
@@ -981,7 +1005,9 @@ pub struct PickerState {
     /// resolve to an in-workspace directory. Set wherever the peek listing is (re)built; echoed in
     /// `picker/update` so the client only offers "+ Create directory" when it's actually missing.
     pub explorer_peek_missing: bool,
-    /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`.
+    /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`,
+    /// which also clears the rest of the slot — the fields around this one are only ever populated
+    /// while a picker is open.
     pub subscribed: Option<SubscribedWindow>,
     /// References only: tracks an in-flight async resolve (the `textDocument/references` round-trip
     /// runs off the lock, so the picker opens empty and is populated by a spawned task). `Some(epoch)`

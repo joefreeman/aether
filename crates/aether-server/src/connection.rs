@@ -25,6 +25,7 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDiffView};
 use aether_protocol::hints::{HintsRecord, HintsState};
+use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
     EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChange, InputChangeLine,
     InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
@@ -383,6 +384,8 @@ async fn dispatch(
         SettingsSet::NAME => run!(SettingsSet, handlers::settings_set),
         HintsRecord::NAME => run!(HintsRecord, handlers::hints_record),
         HintsState::NAME => run!(HintsState, handlers::hints_state),
+        HistoryRecord::NAME => run!(HistoryRecord, handlers::history_record),
+        HistoryState::NAME => run!(HistoryState, handlers::history_state),
         WorkspaceList::NAME => run!(WorkspaceList, handlers::workspace_list),
         WorkspaceActivate::NAME => run!(WorkspaceActivate, handlers::workspace_activate),
         WorkspaceCreate::NAME => run!(WorkspaceCreate, handlers::workspace_create),

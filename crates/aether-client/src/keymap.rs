@@ -388,7 +388,8 @@ pub enum Action {
     /// changes/diagnostics *modes* use a dedicated kind instead (see [`PickerKind::GitChangesFile`]).
     OpenFilesInBufferDir,
     /// `Space Alt-g` — open Grep with the query seeded from the buffer's selection (the grep
-    /// equivalent of `Alt-/`). Sticky filters/options carry over; an empty selection just opens grep.
+    /// equivalent of `Alt-/`). A fresh open, so the chip row starts empty like any other; an empty
+    /// selection just opens grep.
     OpenGrepFromSelection,
     /// `Space Alt-e` — Explorer at the buffer's workspace root rather than its directory.
     OpenExplorerAtRoot,
@@ -871,9 +872,14 @@ static INSERT: &[Binding] = &[
 static SEARCH: &[Binding] = &[
     bind!(KeyContext::Search, KeyCode::Esc, Any, A::SearchAbort, "Search", "Abort search"),
     bind!(KeyContext::Search, KeyCode::Enter, Any, A::SearchCommit, "Search", "Commit search"),
-    // Alt-k/j (not Up/Down) browse history — same chord as the TUI / picker inputs.
-    bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "Search", "Previous query in history"),
-    bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "Search", "Next query in history"),
+    // Up/Down browse the query history (docs/input-history.md) — the same chord in every overlay
+    // text input (the grep query, the glob/path chip editors). They're safe here and there because
+    // no shell's text input claims a bare arrow-up, and because the *list* keys in the pickers are
+    // Alt-k/j. Alt-k/j stay as an unlisted alias for the muscle memory that predates this.
+    bind!(KeyContext::Search, KeyCode::Up, Exact(Mods::NONE), A::SearchHistoryPrev, "Search", "Previous query in history"),
+    bind!(KeyContext::Search, KeyCode::Down, Exact(Mods::NONE), A::SearchHistoryNext, "Search", "Next query in history"),
+    bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "", ""),
+    bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "", ""),
     // Match-option toggles, mirroring the grep picker's chip chords (Alt-c / Alt-w / Alt-e).
     bind!(KeyContext::Search, ch('c'), Exact(Mods::ALT), A::SearchToggleCase, "Search", "Cycle case sensitivity"),
     bind!(KeyContext::Search, ch('w'), Exact(Mods::ALT), A::SearchToggleWord, "Search", "Toggle whole-word match"),

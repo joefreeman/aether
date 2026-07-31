@@ -27,8 +27,9 @@ use tokio::sync::mpsc;
 
 /// Minimum query length that triggers a search. Below this the picker shows an empty result set
 /// and doesn't spawn a worker — typing "a" on a large repo would otherwise produce thousands of
-/// hits the user is about to throw away with the next keystroke.
-pub const MIN_QUERY_LEN: usize = 2;
+/// hits the user is about to throw away with the next keystroke. Lives in the protocol because
+/// the client applies the same floor when deciding what to record to the input history.
+pub const MIN_QUERY_LEN: usize = aether_protocol::picker::MIN_GREP_QUERY_LEN;
 
 /// Per-batch flush threshold (in hits) inside the blocking walker. Tuned so the streaming push
 /// feels responsive without locking the global mutex on every match.

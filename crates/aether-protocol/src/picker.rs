@@ -12,6 +12,7 @@
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitStatus;
+use crate::history::HistoryKind;
 use crate::lsp::{LspProgress, LspStatus};
 use crate::viewport::{DiagnosticSeverity, DiffStage};
 use crate::{BufferId, LogicalPosition};
@@ -29,10 +30,11 @@ pub enum PickerKind {
     Buffers,
     /// Workspace-wide content search. Each candidate is a single match on a single line; the
     /// query *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes
-    /// throw out the prior candidates and start a fresh scan. Persisted hits stay around across
-    /// `hide`/`view` so a re-open resumes the (potentially slow) search — they may be stale
-    /// relative to the file on disk after editing, and that's accepted (jumps clamp to the
-    /// current line bounds).
+    /// throw out the prior candidates and start a fresh scan. Each open starts a *fresh* search:
+    /// query, hits and filter chips all go ([`PickerReset::All`]) — the jobs the old resume did are
+    /// covered better elsewhere (the jumplist keeps a result set you can step with `]`/`[`,
+    /// docs/jumplist.md; `Up` recalls a past query *with its chips*, docs/input-history.md). Hits
+    /// are still preserved *within* one open, across the scroll/re-view cycle.
     Grep,
     /// Filesystem explorer. Entries are the children of one directory. The query is a *path*
     /// relative to the committed *anchor* directory: its part up to the last `/` selects which
@@ -84,7 +86,10 @@ pub enum PickerKind {
     /// row colours like the inline diff. The candidate set is a one-shot snapshot taken on open —
     /// computed from disk + index, but using the *live buffer* text for any file currently open,
     /// so unsaved edits are reflected. Untracked files appear as a single whole-file addition.
-    /// Selecting a hunk jumps to its anchor line (via `FileAt`). Reset on each open (not preserved).
+    /// Selecting a hunk jumps to its anchor line (via `FileAt`). Each open is fresh — query, chips
+    /// and highlight all reset — and lands on the hunk nearest the cursor
+    /// ([`Self::centers_on_cursor`]), which resumes a review better than a saved highlight could:
+    /// it tracks where you are now, and can't point at a hunk you've since staged away.
     GitChanges,
     /// The working-tree changes of a *single* buffer — the modal sibling of [`GitChanges`], opened
     /// by `Space Alt-c`. Locked to the buffer named by [`PickerViewParams::buffer_id`] (the active
@@ -120,19 +125,14 @@ impl PickerKind {
         matches!(self, PickerKind::GitChanges | PickerKind::GitChangesFile)
     }
 
-    /// Whether this picker saves its highlight + query on hide/select so the next open
-    /// resumes the prior state. Only Grep does — its candidate set is the result of a
-    /// (potentially slow) workspace scan and dropping it on every reopen would be wasteful.
-    /// The others reset on each open so the picker stays contextual: Files and Buffers reset
-    /// the query so each open is a fresh search; Explorer resets back to the active buffer's
-    /// directory so it acts like "show me where I am" rather than a persistent file-manager
-    /// session.
-    pub fn preserves_state(self) -> bool {
-        // Grep keeps its (expensive) search results; the changes pickers keep their query +
-        // filters so a re-open resumes. All rebuild their candidate set on re-view regardless
-        // (the changes pickers re-snapshot the working tree), and the server wipes a client's
-        // pickers on workspace switch, so persisted state never leaks across workspaces.
-        matches!(self, PickerKind::Grep) || self.is_git_changes()
+    /// Which input-history list this picker's query draws on for `Up`/`Down` recall
+    /// (docs/input-history.md), if any. Only Grep, because only Grep's query *is* a search: the
+    /// other kinds fuzzy-filter a live candidate set (the workspace's files, the open buffers, a
+    /// directory listing, the working tree's hunks), where recalling yesterday's string to narrow
+    /// today's set means little. Grep instead re-runs a workspace walk, and the walk is the
+    /// expensive, repeatable thing worth naming.
+    pub fn history_kind(self) -> Option<HistoryKind> {
+        (self == PickerKind::Grep).then_some(HistoryKind::Grep)
     }
 
     /// Whether this picker groups its rows into per-file sections, rendering a non-selectable file
@@ -167,17 +167,22 @@ impl PickerKind {
     }
 
     /// Whether `picker/view`'s `center_on_cursor` applies — the picker can resolve a result near
-    /// the buffer's cursor and open framed on it (Grep's nearest hit, the changes pickers' nearest
-    /// hunk, the jumplist's nearest entry). Wider than [`Self::groups_by_file`]: it includes the
+    /// the buffer's cursor and open framed on it (the changes pickers' nearest hunk, the
+    /// jumplist's nearest entry). Wider than [`Self::groups_by_file`]: it includes the
     /// headerless buffer-locked changes picker, which still wants to land on "where you are".
+    ///
+    /// This is what carries the weight now that no picker resumes its highlight
+    /// ([`PickerReset`]): "where you are" is derived from the live cursor on every open, so it
+    /// can't go stale the way a saved selection did. Grep is deliberately absent — it opens with no
+    /// hits to frame, so there is nothing for a cursor to resolve against.
     pub fn centers_on_cursor(self) -> bool {
-        matches!(self, PickerKind::Grep | PickerKind::Jumplist) || self.is_git_changes()
+        self == PickerKind::Jumplist || self.is_git_changes()
     }
 
     /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose
     /// rows are jump targets into files (docs/jumplist.md). Excludes the file-shaped kinds
     /// (Files, Buffers) and the non-jump kinds (Explorer, Workspaces, LspServers, Keybindings).
-    /// Includes [`Self::Results`] itself: capturing there replaces the list with the picker's
+    /// Includes [`Self::Jumplist`] itself: capturing there replaces the list with the picker's
     /// currently-filtered subset — iterative narrowing.
     pub fn captures_to_jumplist(self) -> bool {
         matches!(
@@ -685,10 +690,11 @@ impl CaseMode {
 /// defaults (`Smart`, off, off) mean "literal, smartcase" — regex is opt-in — so an all-default
 /// value is a no-op on the wire and equivalent to the field being absent.
 ///
-/// Grep derives these from its filter chips; buffer search toggles them in the search prompt
-/// (`Alt-c` / `Alt-w` / `Alt-e`). When a grep result primes a buffer's search the grep options
-/// ride along (`BufferOpenParams::prime_search_options`) so the primed search matches the same
-/// way the grep that found it did.
+/// Grep and the changes pickers derive these from their filter chips; buffer search toggles them in
+/// the search prompt (`Alt-c` / `Alt-w` / `Alt-e`). Neither side carries them into the *next*
+/// search: a picker open resets its chips ([`PickerReset::All`]) and a prompt open resets its
+/// options, so the only way a past configuration comes back is recalling the entry that recorded it
+/// (docs/input-history.md §4a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MatchOptions {
     #[serde(default, skip_serializing_if = "CaseMode::is_smart")]
@@ -816,13 +822,48 @@ impl PickerFilters {
             regex: self.regex,
         }
     }
+
+    /// The inverse: a filter set carrying only match options, no scoping. How the buffer search —
+    /// which has options but nothing to scope — stores its configuration in an input-history entry
+    /// (docs/input-history.md).
+    pub fn from_match_options(options: MatchOptions) -> Self {
+        PickerFilters {
+            case: options.case,
+            whole_word: options.whole_word,
+            regex: options.regex,
+            ..PickerFilters::default()
+        }
+    }
 }
 
 // ---- picker/view --------------------------------------------------------------------------------
 
-/// Attach to a picker, declare the scroll window to be pushed, and start receiving updates. If
-/// `reset` is true, any persisted state (query, selection) is wiped first; otherwise the picker
-/// resumes from whatever the prior `view`/`query`/`hide` cycle left behind. If `center_on` is
+/// Whether this `picker/view` is a **fresh open** or a **re-view within one open** — not a per-kind
+/// policy. Every kind opens with [`PickerReset::All`]; every scroll refetch and navigation step
+/// *within* an open sends [`PickerReset::Keep`], which is what stops the window cycle from
+/// re-running the search underneath it. Closing the picker ([`PickerHide`]) releases its state, so
+/// there is never anything on the far side of a close for `Keep` to resume.
+///
+/// It used to be a per-kind table (`PickerKind::reset_on_open`), with Grep and the two changes
+/// pickers keeping some or all of their state across opens. That went away in stages
+/// (docs/input-history.md §5): state surviving an open is state the user can't see and didn't ask
+/// for, and it silently changes what the next open shows. Getting back to a previous result set is
+/// the jumplist's job (`Ctrl-j`, docs/jumplist.md) and getting back to a previous query is the
+/// input history's (`Up`) — both explicit acts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerReset {
+    /// Resume from whatever the prior `view`/`query` cycle left behind — a re-view within one open.
+    #[default]
+    Keep,
+    /// Wipe the whole slot — query, candidates, filters, selection — so the picker opens exactly as
+    /// it would on the first open of the session. What every fresh open sends.
+    All,
+}
+
+/// Attach to a picker, declare the scroll window to be pushed, and start receiving updates.
+/// `reset` says how much persisted state (query, candidates, filters) is wiped first; the picker
+/// otherwise resumes from whatever the prior `view`/`query` cycle left behind. If `center_on` is
 /// provided, the server picks an offset that frames the named item — this is how the client
 /// restores its highlight on resume. `offset` and `center_on` are mutually exclusive —
 /// `center_on` wins if both are sent.
@@ -836,9 +877,10 @@ impl RpcMethod for PickerView {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PickerViewParams {
     pub kind: PickerKind,
-    /// Wipe persisted query and matcher state before attaching.
+    /// How much persisted state to wipe before attaching: [`PickerReset::All`] on a fresh open,
+    /// [`PickerReset::Keep`] on a re-view within one.
     #[serde(default)]
-    pub reset: bool,
+    pub reset: PickerReset,
     /// First row of the window the client wants pushed. Ignored when `center_on` is set.
     #[serde(default)]
     pub offset: u32,
@@ -850,12 +892,13 @@ pub struct PickerViewParams {
     pub center_on: Option<PickerItem>,
     /// Cursor-anchored open: when set, the server resolves this buffer's cursor to the nearest
     /// candidate and uses it as the effective `center_on`, overriding any explicit `center_on` the
-    /// client passed. The resolution is per-kind: **Grep** picks the nearest cached hit (at-or-after
-    /// the cursor's leading selection edge in walker order, wrapping to the first hit); **GitChanges**
-    /// picks the hunk in the buffer's own file nearest at-or-after the cursor line (else that file's
-    /// last hunk). The resolved item is echoed back in `effective_center_on` so the client can use it
-    /// as its highlight. This is what makes `Space g` / `Space c` land on "where you are" in the
-    /// result list. No-op for the other kinds, and when the buffer has no matching candidate.
+    /// client passed. The resolution is per-kind ([`PickerKind::centers_on_cursor`]): **GitChanges**
+    /// picks the hunk in the buffer's own file nearest at-or-after the cursor line (else that
+    /// file's last hunk); **Jumplist** the nearest captured entry. The resolved item is echoed back
+    /// in `effective_center_on` so the client can use it as its highlight. This is what makes
+    /// `Space c` / `Space j` land on "where you are" in the list. No-op for the other kinds
+    /// (including Grep, which opens with an empty result set), and when the buffer has no matching
+    /// candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub center_on_cursor: Option<BufferId>,
     /// Explorer only: absolute path of the directory to list. `None` means "keep whatever
@@ -869,7 +912,7 @@ pub struct PickerViewParams {
     #[serde(default, skip_serializing_if = "is_false")]
     pub explorer_roots: bool,
     /// Diagnostics only: the buffer to list diagnostics for. Required when opening the Diagnostics
-    /// picker (`reset: true`); `None` on resume/scroll re-views (the candidate snapshot is kept).
+    /// picker (a wiping [`PickerReset`]); `None` on scroll re-views (the candidate snapshot is kept).
     /// Also carries the active buffer for [`PickerViewParams::from_selection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
@@ -881,8 +924,7 @@ pub struct PickerViewParams {
     #[serde(default, skip_serializing_if = "is_false")]
     pub from_selection: bool,
     /// Replace the persisted filters before attaching. `None` keeps whatever the prior
-    /// `view`/`query`/`hide` cycle left behind (the default, no-op filters on first open or
-    /// after `reset`). `Some` is how a client opens a picker pre-scoped (e.g. `Space Alt-f` /
+    /// `view`/`query` cycle left behind (the default, no-op filters on a fresh open). `Some` is how a client opens a picker pre-scoped (e.g. `Space Alt-f` /
     /// `Space Alt-g` seeding the buffer's directory chip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<PickerFilters>,
@@ -930,21 +972,29 @@ pub struct PickerViewResult {
     /// the other picker kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_parent: Option<String>,
-    /// The filters now in effect (all-default on first open or after `reset`). Echoed so a
-    /// resuming client can rebuild its chip row, the same way `query` restores the input text.
+    /// The filters now in effect — all-default after a [`PickerReset::All`] open, the resumed set
+    /// for the changes pickers, the caller's seed for a seeded open. Echoed so the client can
+    /// rebuild its chip row from the server's copy, which is the authority; the client's chip list
+    /// is a render of this, not a parallel store.
     #[serde(default, skip_serializing_if = "PickerFilters::is_default")]
     pub filters: PickerFilters,
     /// The initial result window (items at `effective_offset`). Mirrors the `picker/update` push
     /// the server also emits, but riding the response lets the client render items atomically with
     /// adopting `generation`/`effective_offset`. The separate push can arrive *before* this
     /// response, when the client's `generation`/`offset` still differ and its staleness guard
-    /// discards it — most visible on a Grep resume, where the picker reopens showing the restored
-    /// query but no rows. `None` only when there is no subscribed window.
+    /// discards it. `None` only when there is no subscribed window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<PickerUpdateParams>,
 }
 
 // ---- picker/query -------------------------------------------------------------------------------
+
+/// Shortest grep query that actually runs a search. Below this the server installs the query
+/// (so the input shows what you typed) but doesn't walk the workspace — a one-character pattern
+/// matches most of it. Shared so the client can apply the same floor without a round-trip:
+/// it's what decides whether a query is worth recording to the input history
+/// (docs/input-history.md) when the picker closes.
+pub const MIN_GREP_QUERY_LEN: usize = 2;
 
 /// Update the active query. The client mints `generation` (monotonic per query change); the
 /// server tags subsequent `picker/update` pushes with the same generation so the client can
@@ -1023,9 +1073,16 @@ pub enum PickerSelectResult {
 
 // ---- picker/hide --------------------------------------------------------------------------------
 
-/// Stop pushing updates for this picker. The underlying walker/matcher state stays alive so the
-/// next `view` with `reset: false` resumes from where it left off. No payload — the client owns
-/// the highlight and persists it locally.
+/// The user closed this picker: stop pushing updates *and* release its state — query, chips,
+/// results, highlight. Nothing resumes from it; the next `view` is a fresh open
+/// ([`PickerReset::All`]).
+///
+/// Releasing at the close rather than at the next open is what stops the work: a `grep` walk
+/// streams into its picker until the generation moves past the one it was spawned with, so a
+/// dismissed search used to keep scanning the whole workspace, filling a list nobody would see.
+/// Closing bumps the generation, and the walk drops out at its next batch.
+///
+/// No payload — the client owns the highlight, and doesn't persist it either.
 pub struct PickerHide;
 impl RpcMethod for PickerHide {
     const NAME: &'static str = "picker/hide";
