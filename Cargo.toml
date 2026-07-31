@@ -70,6 +70,10 @@ tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.7"
 tree-sitter-sequel = "0.3"
 tree-sitter-hcl = "1.1"
+# Dockerfile grammar. The `tree-sitter-dockerfile` crate is an unmaintained ABI-14 build; this is
+# the maintained fork of it (same grammar lineage, covers `Containerfile` too) and ships both a
+# highlights and an injections query.
+tree-sitter-containerfile = "0.9"
 # Quiver grammar, tracking the upstream repo's `main` branch (the crate lives in its `tree-sitter`
 # subdirectory; Cargo resolves it by package name). Cargo.lock pins the exact commit.
 tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "main" }

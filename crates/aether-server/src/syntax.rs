@@ -3,6 +3,7 @@
 use crate::indent::{expand_inherits, CompiledIndentQuery, IndentStyle};
 use aether_protocol::viewport::Highlight;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::OnceLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
@@ -82,6 +83,7 @@ static YAML: OnceLock<LanguageConfig> = OnceLock::new();
 static QUIVER: OnceLock<LanguageConfig> = OnceLock::new();
 static SQL: OnceLock<LanguageConfig> = OnceLock::new();
 static TERRAFORM: OnceLock<LanguageConfig> = OnceLock::new();
+static DOCKERFILE: OnceLock<LanguageConfig> = OnceLock::new();
 
 /// Everything that distinguishes one injection-free language from another: the grammar, its
 /// queries, and the editing metadata copied into the resulting [`LanguageConfig`]. Named fields
@@ -158,10 +160,12 @@ fn tsx_highlights() -> &'static str {
         .as_str()
 }
 
-/// Resolve a language name (canonical or alias) to its config. Recognises file extensions
-/// (`"rs"`, `"py"`) and common markdown-fence aliases (`"sh"`, `"js"`, `"yml"`) so both the
-/// extension-based detection path and injection-language lookups share one table. Input is
-/// lowercased; unknown names return `None`.
+/// Resolve a language name (canonical or alias) to its config. The alias arms below **are** the
+/// extension table: every extension we detect (`"rs"`, `"py"`, `"tfvars"`) is listed as an alias
+/// alongside the markdown-fence short names (`"sh"`, `"js"`, `"yml"`), so extension-based
+/// detection ([`config_for_path`]), injection-language lookups, and an explicit `language` on
+/// `buffer/open` all resolve through this one table. Input is lowercased; unknown names return
+/// `None`.
 pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
@@ -418,8 +422,78 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 block_comment: Some(("/*", "*/")),
             },
         )),
+        // Registered by hand rather than via [`simple`] because the grammar ships an injections
+        // query: `RUN` bodies and `RUN <<EOF` heredocs parse as bash, and `COPY <<EOF file.json`
+        // heredocs as json/yaml/toml. (Its `comment`/`xml` injections name languages we don't
+        // register, so [`compute_injections`] skips them.)
+        "dockerfile" | "docker" | "containerfile" => Some(DOCKERFILE.get_or_init(|| {
+            let language: Language = tree_sitter_containerfile::LANGUAGE.into();
+            let query = Query::new(&language, tree_sitter_containerfile::HIGHLIGHTS_QUERY)
+                .expect("dockerfile highlights query compiles");
+            let injection_query =
+                Query::new(&language, tree_sitter_containerfile::INJECTIONS_QUERY)
+                    .expect("dockerfile injection query compiles");
+            LanguageConfig {
+                name: "dockerfile",
+                language,
+                query,
+                injection_query: Some(injection_query),
+                indent_query: None,
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("#"),
+                block_comment: None,
+            }
+        })),
         _ => None,
     }
+}
+
+/// How a file *name* selects a language, for the cases an extension can't express. Matched
+/// against the lowercased name, so the literals in [`FILE_RULES`] must themselves be lowercase.
+enum FileRule {
+    /// The complete file name — the rule for names that carry a dot of their own (`go.mod`,
+    /// `cargo.lock`). Nothing needs it yet, so only the tests construct it.
+    #[allow(dead_code)]
+    Name(&'static str),
+    /// The part before the first `.`, so per-target variants come along: `dockerfile` matches
+    /// `Dockerfile`, `Dockerfile.dev` and `Dockerfile.prod` alike.
+    Stem(&'static str),
+}
+
+impl FileRule {
+    /// Does this rule select `name`? `name` must already be lowercased (see [`FILE_RULES`]).
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            FileRule::Name(n) => name == *n,
+            FileRule::Stem(s) => name.split('.').next() == Some(*s),
+        }
+    }
+}
+
+/// File names that select a language regardless of extension, each paired with a name
+/// [`get_config`] accepts. Ordered — the first matching rule wins.
+///
+/// Deliberately short: this is only for names the extension table *can't* express. A Dockerfile
+/// has no extension in its canonical spelling, and `Dockerfile.dev`'s extension is `dev`; the
+/// mirrored `web.Dockerfile` spelling needs no rule because `dockerfile` is a normal alias.
+const FILE_RULES: &[(FileRule, &str)] = &[
+    (FileRule::Stem("dockerfile"), "dockerfile"),
+    (FileRule::Stem("containerfile"), "dockerfile"),
+];
+
+/// The language config for a file on disk: its name against [`FILE_RULES`] first, then its
+/// extension through [`get_config`]. `None` when neither is registered.
+///
+/// The single detection path — callers wanting just the language *name* take `.name` off the
+/// result, which keeps detection and the registry from drifting apart.
+pub fn config_for_path(path: &Path) -> Option<&'static LanguageConfig> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    for (rule, language) in FILE_RULES {
+        if rule.matches(&name) {
+            return get_config(language);
+        }
+    }
+    get_config(path.extension()?.to_str()?)
 }
 
 pub fn make_parser(config: &LanguageConfig) -> Parser {
@@ -616,6 +690,13 @@ fn overlay_captures(
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let name = capture_names[cap.index as usize];
+            // `@spell`/`@nospell` mark prose for an editor's spell checker; they name no colour and
+            // ride along *after* the real capture on the same node (`(comment) @comment @spell` in
+            // the dockerfile grammar). Left in, the equal-length tiebreak would let them overwrite
+            // the capture they accompany and the node would render unstyled.
+            if matches!(name, "spell" | "nospell") {
+                continue;
+            }
             let s = cap.node.start_byte().max(query_range.start);
             let e = cap.node.end_byte().min(query_range.end);
             if s < e {
@@ -875,6 +956,122 @@ mod tests {
     }
 
     #[test]
+    fn config_for_path_detects_by_extension_then_name() {
+        let lang = |p: &str| config_for_path(Path::new(p)).map(|c| c.name);
+        // Extensions resolve through the registry's alias arms — no separate table.
+        assert_eq!(lang("/w/src/main.rs"), Some("rust"));
+        assert_eq!(lang("/w/a.py"), Some("python"));
+        assert_eq!(lang("/w/vars.tfvars"), Some("terraform"));
+        assert_eq!(lang("/w/component.tsx"), Some("tsx"));
+        assert_eq!(lang("/w/README.MD"), Some("markdown"));
+        // File-name rules win over the extension, and cover the extensionless spelling.
+        assert_eq!(lang("/w/Dockerfile"), Some("dockerfile"));
+        assert_eq!(lang("/w/Dockerfile.dev"), Some("dockerfile"));
+        assert_eq!(lang("/w/Containerfile"), Some("dockerfile"));
+        assert_eq!(lang("/w/web.Dockerfile"), Some("dockerfile"));
+        // Neither rule nor alias: no grammar.
+        assert_eq!(lang("/w/.dockerignore"), None);
+        assert_eq!(lang("/w/notes.xyz"), None);
+        assert_eq!(lang("/w/LICENSE"), None);
+        assert_eq!(lang("/w/some/dir/"), None);
+    }
+
+    #[test]
+    fn file_rule_matching() {
+        // `Name` is exact — the rule for names carrying a dot of their own.
+        assert!(FileRule::Name("go.mod").matches("go.mod"));
+        assert!(!FileRule::Name("go.mod").matches("go.sum"));
+        assert!(!FileRule::Name("makefile").matches("makefile.inc"));
+        // `Stem` ignores everything from the first dot on.
+        assert!(FileRule::Stem("dockerfile").matches("dockerfile"));
+        assert!(FileRule::Stem("dockerfile").matches("dockerfile.dev"));
+        assert!(!FileRule::Stem("dockerfile").matches("web.dockerfile"));
+        assert!(!FileRule::Stem("dockerfile").matches("dockerfiles"));
+    }
+
+    /// [`FILE_RULES`] is matched against a lowercased file name and resolved through
+    /// [`get_config`], so a mixed-case literal or a typo'd language name would silently never
+    /// fire.
+    #[test]
+    fn file_rules_are_lowercase_and_name_registered_languages() {
+        for (rule, language) in FILE_RULES {
+            let literal = match rule {
+                FileRule::Name(n) | FileRule::Stem(n) => *n,
+            };
+            assert_eq!(
+                literal,
+                literal.to_ascii_lowercase(),
+                "`{literal}` can never match: rules are compared against a lowercased file name",
+            );
+            assert!(
+                get_config(language).is_some(),
+                "rule for `{literal}` names unregistered language `{language}`",
+            );
+        }
+    }
+
+    #[test]
+    fn dockerfile_highlights_instructions_and_comments() {
+        let cfg = get_config("dockerfile").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "# base image\nFROM rust:1 AS build\nENV RUST_LOG=debug\nEXPOSE 8080\n";
+        let tree = parser.parse(source, None).unwrap();
+        let highlights = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let pos = source.find(needle).unwrap() as u32;
+            highlights
+                .iter()
+                .find(|h| h.start <= pos && h.end > pos)
+                .map(|h| h.kind.clone())
+        };
+        assert!(
+            kind_at("FROM").is_some_and(|k| k.contains("keyword")),
+            "FROM → keyword, got {:?}",
+            kind_at("FROM")
+        );
+        assert!(
+            kind_at("AS").is_some_and(|k| k.contains("keyword")),
+            "AS → keyword"
+        );
+        // The grammar's rule is `(comment) @comment @spell`: two captures over the identical span,
+        // so whichever is applied last wins. `spell` is an annotation no theme colours, so if it
+        // won here comments would silently render unstyled.
+        assert!(
+            kind_at("# base").is_some_and(|k| k.contains("comment")),
+            "comment → comment, got {:?}",
+            kind_at("# base")
+        );
+        assert!(
+            kind_at("8080").is_some_and(|k| k.contains("number")),
+            "exposed port → number"
+        );
+    }
+
+    #[test]
+    fn dockerfile_run_body_injects_bash() {
+        // The grammar injects bash over each `RUN` body, so shell keywords inside an instruction
+        // get shell colouring rather than being one flat run of text.
+        let cfg = get_config("dockerfile").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "FROM alpine\nRUN if [ -f /tmp/x ]; then echo hi; fi\n";
+        let tree = parser.parse(source, None).unwrap();
+        let injections = compute_injections(cfg, &tree, source);
+        assert!(
+            injections.iter().any(|l| l.config.name == "bash"),
+            "expected a bash injection layer, got {:?}",
+            injections.iter().map(|l| l.config.name).collect::<Vec<_>>()
+        );
+        let highlights = highlights_for_range(cfg, &tree, &injections, source, 0, source.len());
+        let then_byte = source.find("then").unwrap() as u32;
+        assert!(
+            highlights
+                .iter()
+                .any(|h| h.start <= then_byte && h.end > then_byte && h.kind.contains("keyword")),
+            "expected bash keyword highlight for `then` inside the RUN body",
+        );
+    }
+
+    #[test]
     fn markdown_inline_injects_emphasis_strong_and_code_span() {
         // The block grammar emits an `(inline)` injection over running text; resolving it to the
         // `markdown_inline` grammar is what produces emphasis / strong / code-span captures.
@@ -973,6 +1170,7 @@ mod tests {
                 "terraform",
                 "resource \"aws_instance\" \"web\" {\n  count = 1\n}\n",
             ),
+            ("dockerfile", "FROM alpine:3\nRUN echo hi\n"),
         ];
         for (lang, source) in cases {
             let cfg =
@@ -1014,6 +1212,8 @@ mod tests {
             ("tf", "terraform"),
             ("tfvars", "terraform"),
             ("hcl", "terraform"),
+            ("docker", "dockerfile"),
+            ("containerfile", "dockerfile"),
         ];
         for (alias, canonical) in pairs {
             let a = get_config(alias).unwrap_or_else(|| panic!("alias `{alias}` not registered"));

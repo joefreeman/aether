@@ -168,6 +168,15 @@ pub fn server_spec(language: &str) -> Option<LspServerSpec> {
             root_markers: &[".terraform.lock.hcl", ".terraform"],
             init_options: None,
         },
+        "dockerfile" => LspServerSpec {
+            // `docker-langserver` ships in the `dockerfile-language-server-nodejs` npm package. It
+            // analyses a single file (lint + completion + hover), so there's no project marker to
+            // look for — fall back to the workspace root.
+            command: "docker-langserver",
+            args: &["--stdio"],
+            root_markers: &[],
+            init_options: None,
+        },
         _ => return None,
     };
     Some(spec)
@@ -218,6 +227,10 @@ mod tests {
         assert_eq!(server_spec("sql").unwrap().command, "sqls");
         assert_eq!(server_spec("terraform").unwrap().command, "terraform-ls");
         assert_eq!(server_spec("terraform").unwrap().args, &["serve"]);
+        assert_eq!(
+            server_spec("dockerfile").unwrap().command,
+            "docker-langserver"
+        );
         // Workspace-aware languages resolve to the workspace root, not per crate/module.
         assert_eq!(
             workspace_marker("rust"),

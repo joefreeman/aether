@@ -1596,32 +1596,11 @@ impl Buffer {
     }
 }
 
+/// The language name for a path, or `None` if we have no grammar for it. Detection itself lives
+/// in [`syntax::config_for_path`] — file-name rules plus the registry's alias table — so there's
+/// no second extension list here to drift out of step with the one languages are registered in.
 fn detect_language(path: &Path) -> Option<String> {
-    let ext = path.extension()?.to_str()?;
-    Some(
-        match ext.to_ascii_lowercase().as_str() {
-            "rs" => "rust",
-            "toml" => "toml",
-            "md" | "markdown" => "markdown",
-            "json" => "json",
-            "py" => "python",
-            "js" | "mjs" | "cjs" | "jsx" => "javascript",
-            "ts" => "typescript",
-            "tsx" => "tsx",
-            "go" => "go",
-            "ex" | "exs" => "elixir",
-            "erl" | "hrl" => "erlang",
-            "yaml" | "yml" => "yaml",
-            "html" | "htm" => "html",
-            "css" => "css",
-            "sh" | "bash" | "zsh" => "bash",
-            "qv" => "quiver",
-            "sql" => "sql",
-            "tf" | "tfvars" | "hcl" => "terraform",
-            _ => return None,
-        }
-        .to_string(),
-    )
+    Some(syntax::config_for_path(path)?.name.to_string())
 }
 
 /// Pick the buffer's indent unit: detect from the text first, fall back to the language's

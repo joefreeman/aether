@@ -8939,6 +8939,37 @@ async fn setup_with_named_file(
     (server, ws, open)
 }
 
+/// Dockerfiles are detected by file *name*, not extension: the canonical `Dockerfile` has no
+/// extension at all, and per-target variants would otherwise be detected by their suffix
+/// (`Dockerfile.dev` → `dev`). The mirrored `web.Dockerfile` spelling comes through the
+/// extension table instead, and `.dockerignore` must not be swept up by either.
+#[tokio::test]
+async fn dockerfile_is_detected_by_file_name() {
+    for name in [
+        "Dockerfile",
+        "Dockerfile.dev",
+        "dockerfile",
+        "web.Dockerfile",
+        "Containerfile",
+        "Containerfile.build",
+    ] {
+        let (server, _ws, open) = setup_with_named_file(name, "FROM alpine:3\nRUN echo hi\n").await;
+        assert_eq!(
+            open.language.as_deref(),
+            Some("dockerfile"),
+            "`{name}` should open as dockerfile"
+        );
+        drop(server);
+    }
+
+    let (server, _ws, open) = setup_with_named_file(".dockerignore", "target\n").await;
+    assert_eq!(
+        open.language, None,
+        "`.dockerignore` is not a Dockerfile (its first `.`-separated part is empty)"
+    );
+    drop(server);
+}
+
 /// Two block toggles (`Ctrl-Alt-y` twice) must be a no-op overall: wrap then unwrap restores
 /// both the text and the cursor, without re-setting the cursor between presses (press 2 acts
 /// on whatever selection press 1 left behind — exactly the double-tap gesture).

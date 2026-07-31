@@ -43,6 +43,7 @@ tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-sequel.workspace = true
 tree-sitter-hcl.workspace = true
+tree-sitter-containerfile.workspace = true
 tree-sitter-quiver.workspace = true
 streaming-iterator.workspace = true
 git2.workspace = true
