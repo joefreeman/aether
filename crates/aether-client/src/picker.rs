@@ -23,6 +23,11 @@ pub enum Reveal {
 
 pub struct PickerState {
     pub kind: PickerKind,
+    /// Whether the active workspace declares any projects (`docs/projects.md`). Only the
+    /// workspace-symbols picker reads it, to tell "your query matched nothing" from "nothing can
+    /// answer here yet" — two very different things to show an empty list for. Stamped when the
+    /// picker opens; a project added mid-picker is a re-open away.
+    pub workspace_has_projects: bool,
     /// The query value. Text editing (caret, insert, delete) is owned by each shell's input —
     /// native `text_input`/`<input>` in the rich clients, a shell-local editor in the TUI — which
     /// syncs the whole value via [`crate::update`]'s `picker_set_query`. The core keeps only the
@@ -111,6 +116,8 @@ impl PickerState {
     pub fn new(kind: PickerKind) -> Self {
         PickerState {
             kind,
+            // Stamped by `open_picker`, which knows the session's projects.
+            workspace_has_projects: false,
             query: String::new(),
             generation: 0,
             items: Vec::new(),
@@ -682,6 +689,13 @@ impl PickerState {
         Some(match self.kind {
             PickerKind::References => "No references found",
             PickerKind::DocumentSymbols => "No symbols found",
+            // Two distinct states, and conflating them would be the difference between "your query
+            // matched nothing" and "this feature can't work here yet" — see
+            // `docs/workspace-symbols.md` § Scope.
+            PickerKind::WorkspaceSymbols if !self.workspace_has_projects => {
+                "No projects configured"
+            }
+            PickerKind::WorkspaceSymbols => "No symbols found",
             _ if !self.query.is_empty() => "No matches",
             PickerKind::Diagnostics | PickerKind::DiagnosticsWorkspace => "No diagnostics",
             PickerKind::GitChanges | PickerKind::GitChangesFile => "No changes",
@@ -1405,6 +1419,7 @@ mod tests {
         use aether_protocol::picker::SymbolKind;
         let sym = |name: &str, context: bool| PickerItem::Symbol {
             path: "/a".into(),
+            display_path: String::new(),
             line: 0,
             col: 0,
             name: name.into(),

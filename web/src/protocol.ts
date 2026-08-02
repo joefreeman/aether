@@ -279,6 +279,7 @@ export type PickerKind =
   | "lsp_servers"
   | "references"
   | "document_symbols"
+  | "workspace_symbols"
   | "keybindings"
   | "jumplist";
 

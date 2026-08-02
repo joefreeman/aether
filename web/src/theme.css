@@ -711,6 +711,13 @@ html, body, #app {
 /* `gap` matches the picker's own editor row (6px): `.picker-editor-sep` cancels it with a -6px
    pull so the `:` sits flush against the root, leaving the gap between the colon and the path. */
 .picker-editor-field { display: flex; align-items: baseline; gap: 6px; flex: 1 1 auto; min-width: 0; }
+/* The gap before the add-project row's language segment. A plain space, not a separator glyph —
+   the row already reads `root: path` and a second punctuation mark competes with the `:`. With a
+   static (hugging) path it grows, pushing the language to the right edge like the tags on the
+   project rows above; behind a focused (flex-1) path input it stays fixed — the input already
+   pushes, and a second grower would steal half its width. */
+.ps-language-gap { flex: 0 0 auto; width: 12px; }
+.ps-language-gap.grow { flex-grow: 1; }
 .ps-error { color: var(--nord11); font-size: var(--ui-small); margin-top: 8px; }
 
 /* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,

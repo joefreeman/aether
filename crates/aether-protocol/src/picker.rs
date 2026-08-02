@@ -108,6 +108,18 @@ pub enum PickerKind {
     /// (Enter is a no-op — the picker stays open; Esc dismisses it). Like
     /// [`Workspaces`](Self::Workspaces) it's usable before a workspace is active.
     Keybindings,
+    /// **Workspace-wide** symbol search (`Space Alt-o`, docs/workspace-symbols.md) — the modal
+    /// sibling of [`DocumentSymbols`](Self::DocumentSymbols). Answered by LSP `workspace/symbol`
+    /// across the servers pinned by the workspace's declared *projects* (docs/projects.md), and
+    /// deliberately **not** every ready server: a lazily-launched one is reaped when its last
+    /// buffer closes, which would make the same query answer differently depending on what happens
+    /// to be open.
+    ///
+    /// Query-driven like [`Grep`](Self::Grep) rather than a snapshot like `DocumentSymbols`: most
+    /// servers return nothing for an empty query, so each `picker/query` re-issues the request and
+    /// results stream in per server. Rows are [`PickerItem::Symbol`] carrying a `display_path`
+    /// (symbols can come from dependencies outside every root), grouped by file.
+    WorkspaceSymbols,
     /// The client's jumplist (`Space j`, docs/jumplist.md), one row per
     /// captured entry, fuzzy-matched on the entry's display text, grouped by the entries'
     /// carried source headers (file or section label; a list captured from an ungrouped source
@@ -161,6 +173,7 @@ impl PickerKind {
                 | PickerKind::GitChanges
                 | PickerKind::References
                 | PickerKind::DiagnosticsWorkspace
+                | PickerKind::WorkspaceSymbols
                 | PickerKind::Keybindings
                 | PickerKind::Jumplist
         )
@@ -192,6 +205,7 @@ impl PickerKind {
                 | PickerKind::DiagnosticsWorkspace
                 | PickerKind::References
                 | PickerKind::DocumentSymbols
+                | PickerKind::WorkspaceSymbols
                 | PickerKind::Jumplist
         ) || self.is_git_changes()
     }
@@ -535,8 +549,16 @@ pub enum PickerItem {
     /// is the `DocumentSymbol` signature (shown dim), empty for flat servers; `depth` is the nesting
     /// level (0 = top-level) so the row can indent members under their container.
     Symbol {
-        /// Absolute canonical path to the buffer's file.
+        /// Absolute canonical path to the symbol's file.
         path: String,
+        /// Row label: workspace-relative when the file lives inside a root, else the absolute path.
+        /// Empty for [`PickerKind::DocumentSymbols`], where every symbol is in the picked buffer and
+        /// the client already knows which file that is. Populated for
+        /// [`PickerKind::WorkspaceSymbols`], where a symbol can come from a dependency or the
+        /// standard library — outside every root, so no `path_index` applies (same treatment as
+        /// [`PickerItem::Reference`]).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        display_path: String,
         /// 0-based line of the symbol's name.
         line: u32,
         /// 0-based byte offset of the symbol's name within the line.

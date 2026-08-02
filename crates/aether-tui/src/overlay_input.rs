@@ -35,6 +35,8 @@ pub enum OverlayField {
     WorkspaceAddProject,
     /// Its leading root-typeahead segment (multi-root workspaces only).
     WorkspaceAddProjectRoot,
+    /// Its trailing language-typeahead segment.
+    WorkspaceAddProjectLanguage,
     /// A picker's query input (Files/Buffers/Grep/Explorer/…).
     PickerQuery,
     /// The filter chip editor's root-typeahead segment (multi-root dir filters).

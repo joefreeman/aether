@@ -312,6 +312,16 @@ impl WasmSession {
         ))
     }
 
+    /// Replace the add-project row's language override. Returns `Effect[]`.
+    pub fn workspace_settings_set_add_project_language(
+        &mut self,
+        text: String,
+    ) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(
+            self.inner.workspace_settings_set_add_project_language(text),
+        ))
+    }
+
     /// A project row's delete button was clicked (0-based index): open the shared confirm prompt
     /// for undeclaring it. Returns `Effect[]`.
     pub fn workspace_settings_remove_project(&mut self, index: u32) -> Result<JsValue, JsValue> {

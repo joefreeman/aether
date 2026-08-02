@@ -293,6 +293,7 @@ pub static CURRICULUM: &[HintDef] = &[
             C::Picker(PickerKind::DiagnosticsWorkspace),
             C::Picker(PickerKind::References),
             C::Picker(PickerKind::DocumentSymbols),
+            C::Picker(PickerKind::WorkspaceSymbols),
             C::Picker(PickerKind::GitChanges),
             C::Picker(PickerKind::GitChangesFile),
             C::Picker(PickerKind::Jumplist),

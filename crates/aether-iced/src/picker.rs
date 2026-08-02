@@ -180,6 +180,10 @@ pub enum PickerMsg {
     EditorRoot(String),
     /// The chip editor's path/glob `text_input` produced new text.
     EditorPath(String),
+    /// A third typeahead segment's `text_input` produced new text — the workspace-settings
+    /// add-project row's language override. (Named for the shape, not the owner: the two above are
+    /// spoken for, and a fourth consumer would want the same.)
+    EditorExtra(String),
     /// A chip-boundary key a focused `text_input` would otherwise swallow, forwarded to the core's
     /// keymap (`:` confirm-root, Backspace step-to-root). The app maps it to a `Message::Key`.
     CoreKey(crate::keymap::KeyCode),
@@ -222,6 +226,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::LspServers => "List LSPs…",
         PickerKind::References => "List references…",
         PickerKind::DocumentSymbols => "Go to symbol…",
+        PickerKind::WorkspaceSymbols => "Go to symbol in workspace…",
         PickerKind::GitChangesFile => "Changes in current file…",
         PickerKind::GitChanges => "Changes in workspace…",
         PickerKind::Keybindings => "Search keybindings…",
@@ -745,11 +750,22 @@ pub(crate) fn field_with_ghost<'a>(
     // pushed outside would sit `CARET_SLACK` px adrift, which is visible as a gap before the colon
     // while the segment has focus (and absent once it settles to a plain label).
     //
+    // The placeholder rides in this layer too, when there's nothing else to draw: the stack sizes
+    // to the layer, so a placeholder left to the `text_input` gets clipped to a glyph or two in
+    // `hug` mode (the empty layer has no width). Drawing it here makes it the sizer as well — the
+    // colour matches what the input's own placeholder style would use, and the input's placeholder
+    // stays empty so the two never double-draw.
+    let content = format!("{}{}{}", input.text, suffix, trailing);
+    let layer_str = if content.is_empty() {
+        placeholder.to_string()
+    } else {
+        content
+    };
     // `text_input` hardcodes `Shaping::Advanced`; the bare `text` widget defaults to `Basic`. The
     // two shapers give different glyph advances, so without matching this the layers drift apart
     // character by character and the gray prefix leaks out from under the opaque value (and the
     // suffix lands in the wrong place). Match the shaper so the layers stay glyph-aligned.
-    let ghost_text = text(format!("{}{}{}", input.text, suffix, trailing))
+    let ghost_text = text(layer_str)
         .size(ui.body())
         .font(SANS)
         .color(theme::NORD3_BRIGHT)
@@ -766,7 +782,8 @@ pub(crate) fn field_with_ghost<'a>(
         row![ghost_text, iced::widget::Space::new().width(CARET_SLACK)].into();
     // The controlled input on top: transparent background so the gray suffix shows through after
     // the typed text; opaque NORD6 (or red) value covers the gray prefix; NORD8 caret/selection.
-    let field_inner = iced::widget::text_input(placeholder, &input.text)
+    // No placeholder on the input itself — the ghost layer draws it (see above).
+    let field_inner = iced::widget::text_input("", &input.text)
         .id(id)
         .on_input(on_input)
         .font(SANS)

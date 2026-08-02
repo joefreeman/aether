@@ -925,6 +925,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
+    bind!(L, ch('o'), Exact(Mods::ALT), A::OpenPicker(PickerKind::WorkspaceSymbols), "Code", "Workspace symbols"),
     bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
     bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Workspace git changes (hunks)"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),

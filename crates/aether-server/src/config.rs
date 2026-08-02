@@ -234,29 +234,29 @@ fn list_profiles_at(dir: &Path) -> anyhow::Result<Vec<ProfileEntry>> {
 
 pub use aether_protocol::settings::AppSettings;
 
-/// A declared project: the marker file identifying a buildable unit — a `Cargo.toml`, a `go.mod`, a
-/// `package.json` — whose language server is pinned open while the workspace is active
-/// (`docs/projects.md`).
+/// A declared project: the **directory** of a buildable unit — a crate, a package, a module — whose
+/// language server is pinned open while the workspace is active (`docs/projects.md`).
 ///
-/// The path is **relative to the root it's declared under** ([`RootConfig`]), so relocating a
-/// workspace means editing one `path` line and every project beneath it follows. Its final
-/// component selects the server via [`crate::lsp::config::language_for_marker`]; its parent
-/// directory is the root the server is launched at.
+/// The path is relative to the root it's declared under ([`RootConfig`]), so relocating a workspace
+/// means editing one `path` line and every project beneath it follows. `"."` is the root itself.
 ///
-/// Two forms, so the common case stays a bare string:
+/// The directory *is* the LSP root — there's no parent-of-a-marker-file indirection. Its language is
+/// inferred from the build manifests inside it (`Cargo.toml` → rust, `go.mod` → go, …), which is the
+/// only thing marker files are still used for. Declare the language explicitly when the directory
+/// has several kinds of manifest, or none at all — a Python tree with no `pyproject.toml`, say.
 ///
 /// ```toml
 /// [[roots]]
 /// path = "/src/aether"
-/// projects = ["Cargo.toml", { path = "web/package.json", language = "typescript" }]
+/// projects = [".", "web", { path = "scripts", language = "python" }]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProjectEntry {
-    /// Bare marker path; the language is inferred from its file name.
+    /// Bare directory path; the language is inferred from the manifests inside it.
     Path(PathBuf),
-    /// Marker path with an explicit language, for a marker whose name doesn't imply one (or implies
-    /// the wrong one) — `package.json` could be either TypeScript or JavaScript.
+    /// Directory path with an explicit language, for a directory whose manifests don't imply exactly
+    /// one — several kinds, or none.
     Detailed {
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,7 +265,7 @@ pub enum ProjectEntry {
 }
 
 impl ProjectEntry {
-    /// The marker path, relative to the root this entry is declared under.
+    /// The project directory, relative to the root this entry is declared under.
     pub fn path(&self) -> &Path {
         match self {
             ProjectEntry::Path(p) => p,
@@ -290,7 +290,7 @@ impl ProjectEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootConfig {
     pub path: PathBuf,
-    /// Marker paths relative to `path`. Absent from the file when empty.
+    /// Project directories relative to `path` (`"."` is this root itself). Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectEntry>,
 }
@@ -304,7 +304,7 @@ pub struct RootConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRef {
     pub root_index: u32,
-    /// Marker path relative to `roots[root_index]`.
+    /// Project directory relative to `roots[root_index]`; `"."` is the root itself.
     pub relative_path: PathBuf,
     pub language: Option<String>,
 }
@@ -343,9 +343,8 @@ pub fn drop_root_from_projects(projects: &mut Vec<ProjectRef>, removed: u32) {
 /// A [`ProjectRef`] checked against the workspace and resolved to the server it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProject {
-    /// Absolute path to the marker file.
-    pub path: PathBuf,
-    /// The marker's parent directory — the root the language server is launched at.
+    /// The project directory — and the root the language server is launched at. They're the same
+    /// thing now: you declare the root directly rather than a file inside it.
     pub root: PathBuf,
     /// The language whose [`crate::lsp::config::server_spec`] to launch. Not yet canonicalized;
     /// `LspServerKey::new` does that when the key is built.
@@ -354,15 +353,33 @@ pub struct ResolvedProject {
 
 /// Resolve a declared project against the workspace's roots.
 ///
-/// Every failure here is the config disagreeing with the world — a deleted crate, a typo, a marker
-/// we don't recognise — so each returns a human-readable message for display rather than aborting
-/// anything. Activation surfaces them and carries on with the projects that did resolve.
+/// Every failure here is the config disagreeing with the world — a deleted directory, a typo, a tree
+/// whose language we can't work out — so each returns a human-readable message for display rather
+/// than aborting anything. Activation surfaces them and carries on with the projects that resolved.
 pub fn resolve_project(
     project: &ProjectRef,
     workspace_roots: &[PathBuf],
 ) -> Result<ResolvedProject, String> {
+    let dir = project_dir(project, workspace_roots)?;
+    let language = match project.language.as_deref() {
+        Some(l) => l.to_string(),
+        None => infer_language(&dir)?,
+    };
+    if crate::lsp::config::server_spec(&language).is_none() {
+        return Err(format!("no language server configured for {language}"));
+    }
+    Ok(ResolvedProject {
+        root: dir,
+        language,
+    })
+}
+
+/// The directory a project declaration names — its root joined with the relative path — with the
+/// containment rules enforced. The path half of [`resolve_project`], split out so
+/// [`infer_project_language`] can locate declarations without resolving their language.
+fn project_dir(project: &ProjectRef, workspace_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let rel = &project.relative_path;
-    let root = workspace_roots
+    let workspace_root = workspace_roots
         .get(project.root_index as usize)
         .ok_or_else(|| {
             format!(
@@ -370,18 +387,13 @@ pub fn resolve_project(
                 project.root_index
             )
         })?;
-    if rel.as_os_str().is_empty() {
-        return Err("project path is empty".to_string());
-    }
     if rel.is_absolute() {
         return Err(format!(
             "project path must be relative to its root: {}",
             rel.display()
         ));
     }
-    let path = root.join(rel);
-    let display = path.display();
-    // Nesting makes containment structural, but `..` can still climb out of the root — and a
+    // Nesting under a root makes containment structural, but `..` can still climb out — and a
     // project outside every root is exactly what `buffer/open` refuses to start a server for (the
     // workspace-trust boundary), so it stays rejected.
     if rel
@@ -390,39 +402,112 @@ pub fn resolve_project(
     {
         return Err(format!("project path escapes its root: {}", rel.display()));
     }
-    // The common drift: a branch switch or a deleted crate leaves the config pointing at nothing.
+    // `.` (and the empty string, which older configs may carry) names the root itself.
+    let dir = if rel.as_os_str().is_empty() || rel == Path::new(".") {
+        workspace_root.clone()
+    } else {
+        workspace_root.join(rel)
+    };
+    // The common drift: a branch switch or a deleted package leaves the config pointing at nothing.
     // Checked here rather than at launch so the settings overlay can show it without starting
     // anything.
-    if !path.exists() {
-        return Err(format!("project marker does not exist: {display}"));
+    if !dir.is_dir() {
+        return Err(format!("project directory does not exist: {}", dir.display()));
     }
-    let lsp_root = path
-        .parent()
-        .ok_or_else(|| format!("project path has no parent directory: {display}"))?
-        .to_path_buf();
+    Ok(dir)
+}
 
-    let language = match project.language.as_deref() {
-        Some(l) => l.to_string(),
-        None => {
-            let file_name = rel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| format!("project path has no file name: {display}"))?;
-            crate::lsp::config::language_for_marker(file_name)
-                .ok_or_else(|| {
-                    format!("don't recognise {file_name} as a project marker; set `language` explicitly")
-                })?
-                .to_string()
+/// The language the settings dialog's add-project row should suggest for a prospective declaration
+/// (`workspace/infer_language`): the single language the directory's manifests identify, once the
+/// languages `declared` projects already pin for that same directory are excluded — a directory
+/// holding several projects in several languages is declared once per language, so the useful
+/// suggestion is the one not yet added.
+///
+/// `None` — never an error, unlike [`resolve_project`] — when the path doesn't resolve to a
+/// directory (half-typed paths are the caller's normal input), when no manifest is found, or when
+/// several candidates remain.
+pub fn infer_project_language(
+    project: &ProjectRef,
+    workspace_roots: &[PathBuf],
+    declared: &[ProjectRef],
+) -> Option<String> {
+    let dir = project_dir(project, workspace_roots).ok()?;
+    let mut candidates = manifest_languages(&dir).ok()?;
+    for d in declared {
+        let Ok(declared_dir) = project_dir(d, workspace_roots) else {
+            continue; // a broken declaration pins nothing, so it excludes nothing
+        };
+        if declared_dir != dir {
+            continue;
         }
-    };
-    if crate::lsp::config::server_spec(&language).is_none() {
-        return Err(format!("no language server configured for {language}"));
+        match d.language.as_deref() {
+            // An explicit declaration excludes its (canonical) language.
+            Some(l) => {
+                let canonical = crate::lsp::config::canonical_language(l);
+                candidates.retain(|c| *c != canonical);
+            }
+            // An infer-on-activation declaration owns whatever the directory's manifests single
+            // out — the same inference `resolve_project` runs for it.
+            None => {
+                if let Ok(l) = infer_language(&dir) {
+                    candidates.retain(|c| *c != l);
+                }
+            }
+        }
     }
-    Ok(ResolvedProject {
-        path,
-        root: lsp_root,
-        language,
-    })
+    match candidates.as_slice() {
+        [one] => Some(one.to_string()),
+        _ => None,
+    }
+}
+
+/// Work out a project directory's language from the build manifests inside it.
+///
+/// One entry means one server, so an ambiguous directory is an error rather than a guess: a stray
+/// `package.json` for build tooling next to a `pyproject.toml` shouldn't quietly start tsserver.
+/// Declaring `language` resolves it, and declaring the directory twice is how you ask for both.
+///
+/// Only the directory's own entries are considered — not its subdirectories, whose manifests belong
+/// to *their* projects.
+fn infer_language(dir: &Path) -> Result<String, String> {
+    match manifest_languages(dir)?.as_slice() {
+        [] => Err(format!(
+            "no build manifest in {} — set `language` explicitly",
+            dir.display()
+        )),
+        [one] => Ok(one.to_string()),
+        many => {
+            let mut names: Vec<&str> = many.to_vec();
+            names.sort_unstable();
+            Err(format!(
+                "{} looks like several languages ({}) — set `language` explicitly",
+                dir.display(),
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// The canonical languages the directory's own build manifests identify — not its subdirectories',
+/// whose manifests belong to *their* projects. Deduped through
+/// [`crate::lsp::config::canonical_language`], so `package.json` alongside `tsconfig.json` reads as
+/// one language, not two. Errs only when the directory can't be read at all.
+fn manifest_languages(dir: &Path) -> Result<Vec<&'static str>, String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Err(format!("can't read project directory: {}", dir.display()));
+    };
+    let mut found: Vec<&'static str> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(language) = crate::lsp::config::language_for_marker(name) {
+            let canonical = crate::lsp::config::canonical_language(language);
+            if !found.contains(&canonical) {
+                found.push(canonical);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// A workspace's on-disk definition: its roots, each with the projects declared under it.
@@ -1634,55 +1719,105 @@ mod tests {
         assert!(cfg.project_refs().is_empty());
     }
 
-    /// A marker file in a temp root, for resolution tests.
-    fn project_fixture(marker: &str) -> (tempfile::TempDir, ProjectRef, Vec<PathBuf>) {
+    /// A project directory containing `marker`, plus the workspace roots to resolve against.
+    fn project_fixture(
+        rel_dir: &str,
+        marker: &str,
+    ) -> (tempfile::TempDir, ProjectRef, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(marker);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+        let project_dir = if rel_dir.is_empty() {
+            dir.path().to_path_buf()
+        } else {
+            dir.path().join(rel_dir)
+        };
+        std::fs::create_dir_all(&project_dir).unwrap();
+        if !marker.is_empty() {
+            std::fs::write(project_dir.join(marker), "").unwrap();
         }
-        std::fs::write(&path, "").unwrap();
         let roots = vec![dir.path().to_path_buf()];
         let project = ProjectRef {
             root_index: 0,
-            relative_path: PathBuf::from(marker),
+            relative_path: PathBuf::from(if rel_dir.is_empty() { "." } else { rel_dir }),
             language: None,
         };
         (dir, project, roots)
     }
 
+    /// The declared directory *is* the LSP root — no parent-of-a-marker-file indirection — and its
+    /// language comes from the manifests inside it.
     #[test]
-    fn resolve_derives_root_and_language_from_the_marker() {
-        let (dir, project, roots) = project_fixture("Cargo.toml");
+    fn resolve_uses_the_directory_as_root_and_infers_its_language() {
+        let (dir, project, roots) = project_fixture("", "Cargo.toml");
         let resolved = resolve_project(&project, &roots).unwrap();
         assert_eq!(resolved.language, "rust");
-        assert_eq!(resolved.root, dir.path(), "root is the marker's parent");
-        assert_eq!(resolved.path, dir.path().join("Cargo.toml"));
+        assert_eq!(resolved.root, dir.path(), "`.` is the root itself");
 
-        // A marker nested below the root roots the server at *its* directory, not the workspace's.
-        let (dir, project, roots) = project_fixture("crates/inner/Cargo.toml");
+        let (dir, project, roots) = project_fixture("crates/inner", "Cargo.toml");
         let resolved = resolve_project(&project, &roots).unwrap();
         assert_eq!(resolved.root, dir.path().join("crates/inner"));
     }
 
-    /// `package.json` can't tell TS from JS, so the explicit language wins over the inferred one.
+    /// Manifests that collapse to one language aren't ambiguous — `package.json` and
+    /// `tsconfig.json` are both TypeScript.
     #[test]
-    fn declared_language_overrides_the_marker() {
-        let (_dir, mut project, roots) = project_fixture("package.json");
+    fn sibling_manifests_of_one_language_are_not_ambiguous() {
+        let (dir, project, roots) = project_fixture("web", "package.json");
+        std::fs::write(dir.path().join("web/tsconfig.json"), "").unwrap();
         assert_eq!(
             resolve_project(&project, &roots).unwrap().language,
             "typescript"
         );
-        project.language = Some("javascript".into());
+    }
+
+    /// One entry means one server, so a directory that could be either is an error rather than a
+    /// guess — declaring `language` (or the directory twice) is how you say which.
+    #[test]
+    fn several_languages_in_one_directory_need_an_explicit_choice() {
+        let (dir, mut project, roots) = project_fixture("svc", "pyproject.toml");
+        std::fs::write(dir.path().join("svc/package.json"), "").unwrap();
+
+        let err = resolve_project(&project, &roots).unwrap_err();
+        assert!(err.contains("several languages"), "got {err}");
+        assert!(
+            err.contains("python") && err.contains("typescript"),
+            "got {err}"
+        );
+
+        project.language = Some("python".into());
         assert_eq!(
             resolve_project(&project, &roots).unwrap().language,
-            "javascript"
+            "python"
         );
+    }
+
+    /// The case the directory form exists for: a source tree with no build manifest at all.
+    #[test]
+    fn a_directory_with_no_manifest_needs_an_explicit_language() {
+        let (_dir, mut project, roots) = project_fixture("databricks", "");
+        let err = resolve_project(&project, &roots).unwrap_err();
+        assert!(err.contains("no build manifest"), "got {err}");
+
+        project.language = Some("python".into());
+        assert_eq!(
+            resolve_project(&project, &roots).unwrap().language,
+            "python"
+        );
+    }
+
+    /// Only the directory's *own* manifests count — a subdirectory's belong to its own project.
+    #[test]
+    fn nested_manifests_do_not_leak_into_the_parent() {
+        let (dir, project, roots) = project_fixture("outer", "");
+        std::fs::create_dir_all(dir.path().join("outer/inner")).unwrap();
+        std::fs::write(dir.path().join("outer/inner/Cargo.toml"), "").unwrap();
+        assert!(resolve_project(&project, &roots)
+            .unwrap_err()
+            .contains("no build manifest"));
     }
 
     #[test]
     fn resolve_rejects_the_config_being_wrong_about_the_world() {
-        let (dir, project, roots) = project_fixture("Cargo.toml");
+        let (dir, project, roots) = project_fixture("pkg", "Cargo.toml");
 
         let rel = |p: &str| ProjectRef {
             root_index: 0,
@@ -1691,27 +1826,21 @@ mod tests {
         };
 
         // An absolute path has no root to be relative to.
-        assert!(rel("/elsewhere/Cargo.toml")
+        assert!(rel("/elsewhere")
             .pipe_resolve(&roots)
             .unwrap_err()
             .contains("must be relative"));
 
         // `..` climbs out of the root — the workspace-trust boundary still applies.
-        assert!(rel("../Cargo.toml")
+        assert!(rel("../pkg")
             .pipe_resolve(&roots)
             .unwrap_err()
             .contains("escapes its root"));
 
         // A root that no longer exists (removed while the project referred to it).
-        assert!(resolve_project(&rel("Cargo.toml"), &[])
+        assert!(resolve_project(&rel("pkg"), &[])
             .unwrap_err()
             .contains("root 0 which is gone"));
-
-        // A marker we don't know, with no explicit language to fall back on.
-        assert!(rel("Makefile")
-            .pipe_resolve(&roots)
-            .unwrap_err()
-            .contains("project marker"));
 
         // A language with no configured server.
         let mut bad_lang = project.clone();
@@ -1721,35 +1850,10 @@ mod tests {
             .contains("no language server"));
 
         // Deleted underneath us (branch switch) — the common drift.
-        std::fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("pkg")).unwrap();
         assert!(resolve_project(&project, &roots)
             .unwrap_err()
             .contains("does not exist"));
-    }
-
-    /// Removing a root takes its projects with it and shifts the ones above down — the one place a
-    /// root index is maintained by hand, and where getting it wrong silently re-points a project.
-    #[test]
-    fn dropping_a_root_repairs_project_indices() {
-        let p = |root_index: u32, name: &str| ProjectRef {
-            root_index,
-            relative_path: PathBuf::from(name),
-            language: None,
-        };
-        let mut projects = vec![p(0, "a"), p(1, "b"), p(1, "c"), p(2, "d")];
-
-        crate::config::drop_root_from_projects(&mut projects, 1);
-
-        // Root 1's two projects are gone; root 2's has slid down to 1. Root 0's is untouched.
-        assert_eq!(
-            projects,
-            vec![p(0, "a"), p(1, "d")],
-            "projects under the removed root go with it; those above shift down",
-        );
-
-        // Removing the last root leaves the rest alone.
-        crate::config::drop_root_from_projects(&mut projects, 1);
-        assert_eq!(projects, vec![p(0, "a")]);
     }
 
     /// Test-only sugar so the rejection cases above read as one line each.
@@ -1760,5 +1864,93 @@ mod tests {
         fn pipe_resolve(&self, roots: &[PathBuf]) -> Result<ResolvedProject, String> {
             resolve_project(self, roots)
         }
+    }
+
+    // ---- infer_project_language (the add-project row's live suggestion) ------------------------
+
+    /// The typical case: one manifest, no declarations to exclude — suggest its language.
+    #[test]
+    fn infer_suggests_the_single_manifest_language() {
+        let (_dir, project, roots) = project_fixture("pkg", "Cargo.toml");
+        assert_eq!(
+            infer_project_language(&project, &roots, &[]),
+            Some("rust".into())
+        );
+    }
+
+    /// Everything `resolve_project` would *error* on comes back `None` here — half-typed paths are
+    /// the caller's normal input, so there is no failure worth reporting.
+    #[test]
+    fn infer_returns_none_rather_than_erroring() {
+        let (dir, project, roots) = project_fixture("svc", "pyproject.toml");
+
+        // Ambiguous: a second, different-language manifest appears.
+        std::fs::write(dir.path().join("svc/package.json"), "").unwrap();
+        assert_eq!(infer_project_language(&project, &roots, &[]), None);
+
+        let rel = |p: &str| ProjectRef {
+            root_index: 0,
+            relative_path: PathBuf::from(p),
+            language: None,
+        };
+        // A directory that doesn't (yet) exist — the mid-typing state.
+        assert_eq!(infer_project_language(&rel("sv"), &roots, &[]), None);
+        // No manifest at all.
+        std::fs::create_dir_all(dir.path().join("plain")).unwrap();
+        assert_eq!(infer_project_language(&rel("plain"), &roots, &[]), None);
+        // Escaping the root stays rejected.
+        assert_eq!(infer_project_language(&rel("../x"), &roots, &[]), None);
+    }
+
+    /// A directory holding several projects in several languages is declared once per language, so
+    /// the useful suggestion is the one not yet added — and once every candidate is declared,
+    /// nothing is suggested.
+    #[test]
+    fn infer_excludes_languages_already_declared_for_the_directory() {
+        let (dir, project, roots) = project_fixture("svc", "pyproject.toml");
+        std::fs::write(dir.path().join("svc/package.json"), "").unwrap();
+
+        let declared = |lang: &str| ProjectRef {
+            root_index: 0,
+            relative_path: PathBuf::from("svc"),
+            language: Some(lang.into()),
+        };
+        // Python already declared → the remaining candidate is TypeScript.
+        assert_eq!(
+            infer_project_language(&project, &roots, &[declared("python")]),
+            Some("typescript".into())
+        );
+        // Both declared → nothing left to suggest.
+        assert_eq!(
+            infer_project_language(&project, &roots, &[declared("python"), declared("typescript")]),
+            None
+        );
+        // Exclusion is canonical: a `javascript` declaration owns the TypeScript-family candidate.
+        assert_eq!(
+            infer_project_language(&project, &roots, &[declared("python"), declared("javascript")]),
+            None
+        );
+        // A declaration for a *different* directory excludes nothing here.
+        let mut elsewhere = declared("python");
+        elsewhere.relative_path = PathBuf::from("other");
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        assert_eq!(
+            infer_project_language(&project, &roots, &[elsewhere]),
+            None // python + typescript both still candidates → ambiguous
+        );
+    }
+
+    /// A declaration with no explicit language pins whatever the directory's manifests single out,
+    /// so it excludes exactly that — typing the directory again suggests nothing rather than the
+    /// language it already has.
+    #[test]
+    fn infer_excludes_an_inferred_declarations_language() {
+        let (_dir, project, roots) = project_fixture("pkg", "Cargo.toml");
+        let declared = ProjectRef {
+            root_index: 0,
+            relative_path: PathBuf::from("pkg"),
+            language: None,
+        };
+        assert_eq!(infer_project_language(&project, &roots, &[declared]), None);
     }
 }

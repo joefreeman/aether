@@ -209,11 +209,17 @@ mod tests {
         };
         let mut lists = HistoryLists::default();
         assert!(lists.record(HistoryKind::Search, HistoryEntry::bare("f.o")));
-        assert!(lists.record(HistoryKind::Search, HistoryEntry::with_options("f.o", regex)));
+        assert!(lists.record(
+            HistoryKind::Search,
+            HistoryEntry::with_options("f.o", regex)
+        ));
         assert_eq!(values(&lists.search), ["f.o"]);
         assert_eq!(lists.search[0].filters.match_options(), regex);
         // Exactly the same value *and* filters is the no-op case.
-        assert!(!lists.record(HistoryKind::Search, HistoryEntry::with_options("f.o", regex)));
+        assert!(!lists.record(
+            HistoryKind::Search,
+            HistoryEntry::with_options("f.o", regex)
+        ));
     }
 
     #[test]

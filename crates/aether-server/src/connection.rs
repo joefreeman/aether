@@ -50,7 +50,8 @@ use aether_protocol::viewport::{
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete,
-    WorkspaceList, WorkspaceOpenPath, WorkspaceRemoveProject, WorkspaceRemoveRoot, WorkspaceRename,
+    WorkspaceInferLanguage, WorkspaceList, WorkspaceOpenPath, WorkspaceRemoveProject,
+    WorkspaceRemoveRoot, WorkspaceRename,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;
@@ -403,6 +404,9 @@ async fn dispatch(
         WorkspaceAddProject::NAME => run!(WorkspaceAddProject, handlers::workspace_add_project),
         WorkspaceRemoveProject::NAME => {
             run!(WorkspaceRemoveProject, handlers::workspace_remove_project)
+        }
+        WorkspaceInferLanguage::NAME => {
+            run!(WorkspaceInferLanguage, handlers::workspace_infer_language)
         }
         WorkspaceRename::NAME => run!(WorkspaceRename, handlers::workspace_rename),
         WorkspaceDelete::NAME => run!(WorkspaceDelete, handlers::workspace_delete),

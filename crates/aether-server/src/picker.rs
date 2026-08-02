@@ -380,6 +380,39 @@ impl SymbolCandidate {
     }
 }
 
+/// One workspace-symbols candidate — a symbol from an LSP `workspace/symbol` response
+/// (`docs/workspace-symbols.md`). `name` is the fuzzy haystack; `(line, col)` drives the `FileAt`
+/// jump.
+///
+/// Cross-file *and* potentially cross-root: rust-analyzer and gopls report symbols from
+/// dependencies and the standard library, which live outside every workspace root. So it carries its
+/// own absolute `abs_path` plus a `display_path` that's workspace-relative only when it can be —
+/// exactly the treatment [`ReferenceCandidate`] uses.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolCandidate {
+    pub abs_path: String,
+    /// Row label: workspace-relative when inside a root, else the absolute path.
+    pub display_path: String,
+    /// 0-based line of the symbol's name.
+    pub line: u32,
+    /// 0-based *byte* offset within that line (converted from the server's encoding).
+    pub col: u32,
+    /// Symbol name — the fuzzy haystack and the row's primary label.
+    pub name: String,
+    pub symbol_kind: aether_protocol::picker::SymbolKind,
+    /// `SymbolInformation::containerName` — the enclosing type/module, shown dim after the name.
+    pub container: String,
+}
+
+impl WorkspaceSymbolCandidate {
+    /// Identity for dedup. Two declared projects can cover the same code (a Cargo workspace root and
+    /// one of its member crates), so the *same* symbol arrives from different servers — and, because
+    /// results are merged incrementally, usually in different batches.
+    pub fn dedup_key(&self) -> (&str, u32, u32, &str) {
+        (&self.abs_path, self.line, self.col, &self.name)
+    }
+}
+
 /// One LSP-servers-picker candidate — a language server for the active workspace. `name` is the
 /// fuzzy haystack; `language` is the key the client restarts by. Rebuilt on every `picker/view`
 /// and on each `lsp/status_changed` (the list is tiny and the status changes), so the row's
@@ -476,6 +509,9 @@ pub enum PickerCandidates {
     /// snapshot; preserved across non-reset re-views (like References) so scrolling doesn't rebuild
     /// against a possibly-changed set.
     Symbols(Vec<SymbolCandidate>),
+    /// Workspace-wide symbols from the pinned projects' servers. Grows as each server answers
+    /// (`docs/workspace-symbols.md` § Merging), like Grep's streaming hits rather than a snapshot.
+    WorkspaceSymbols(Vec<WorkspaceSymbolCandidate>),
     /// The workspace's working-tree hunks, grouped by file. Built fresh on every `picker/view`
     /// (a snapshot of the repo state at open); the query fuzzy-filters the file path while keeping
     /// the file grouping (document order, like the symbols outline).
@@ -515,6 +551,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(v) => v.len(),
             PickerCandidates::References(v) => v.len(),
             PickerCandidates::Symbols(v) => v.len(),
+            PickerCandidates::WorkspaceSymbols(v) => v.len(),
             PickerCandidates::GitChanges(v) => v.len(),
             PickerCandidates::Keybindings(v) => v.len(),
             PickerCandidates::Jumplist(v) => v.len(),
@@ -539,6 +576,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(v) => v.clear(),
             PickerCandidates::References(v) => v.clear(),
             PickerCandidates::Symbols(v) => v.clear(),
+            PickerCandidates::WorkspaceSymbols(v) => v.clear(),
             PickerCandidates::GitChanges(v) => v.clear(),
             PickerCandidates::Keybindings(v) => v.clear(),
             PickerCandidates::Jumplist(v) => v.clear(),
@@ -557,6 +595,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(_) => PickerKind::LspServers,
             PickerCandidates::References(_) => PickerKind::References,
             PickerCandidates::Symbols(_) => PickerKind::DocumentSymbols,
+            PickerCandidates::WorkspaceSymbols(_) => PickerKind::WorkspaceSymbols,
             PickerCandidates::GitChanges(_) => PickerKind::GitChanges,
             PickerCandidates::Keybindings(_) => PickerKind::Keybindings,
             PickerCandidates::Jumplist(_) => PickerKind::Jumplist,
@@ -579,6 +618,7 @@ impl PickerCandidates {
             PickerCandidates::LspServers(v) => &v[idx].name,
             PickerCandidates::References(v) => &v[idx].preview,
             PickerCandidates::Symbols(v) => &v[idx].name,
+            PickerCandidates::WorkspaceSymbols(v) => &v[idx].name,
             // Not used as a match haystack (GitChanges greps content via SubstringContent, not
             // `display_at`); kept defined for completeness.
             PickerCandidates::GitChanges(v) => &v[idx].relative_path,
@@ -682,6 +722,8 @@ impl PickerCandidates {
                 let c = &v[idx];
                 PickerItem::Symbol {
                     path: c.abs_path.clone(),
+                    // Buffer-local: the client already knows the file, so no label.
+                    display_path: String::new(),
                     line: c.start.line,
                     col: c.start.col,
                     name: c.name.clone(),
@@ -691,6 +733,24 @@ impl PickerCandidates {
                     // `context` is query-dependent (a candidate is "context" only when it's an
                     // ancestor of a match but not matched itself) — set by `build_window_items`,
                     // which knows the current match set; here it defaults off.
+                    context: false,
+                    match_indices,
+                }
+            }
+            PickerCandidates::WorkspaceSymbols(v) => {
+                let c = &v[idx];
+                PickerItem::Symbol {
+                    path: c.abs_path.clone(),
+                    display_path: c.display_path.clone(),
+                    line: c.line,
+                    col: c.col,
+                    name: c.name.clone(),
+                    symbol_kind: c.symbol_kind,
+                    // The container name stands in for the signature `documentSymbol` gives us —
+                    // `SymbolInformation` has no `detail`, and the enclosing type is the next most
+                    // useful thing to show dim after the name.
+                    detail: c.container.clone(),
+                    depth: 0,
                     context: false,
                     match_indices,
                 }
@@ -807,6 +867,16 @@ impl PickerCandidates {
             ) => v
                 .iter()
                 .position(|c| c.abs_path == *path && c.start.line == *line && c.start.col == *col),
+            // Same item type, different candidate shape: workspace symbols carry one position
+            // rather than a name span, so they match on it directly.
+            (
+                PickerCandidates::WorkspaceSymbols(v),
+                PickerItem::Symbol {
+                    path, line, col, ..
+                },
+            ) => v
+                .iter()
+                .position(|c| c.abs_path == *path && c.line == *line && c.col == *col),
             (
                 PickerCandidates::GitChanges(v),
                 PickerItem::GitChange {
@@ -849,6 +919,10 @@ impl PickerCandidates {
             | PickerCandidates::LspServers(_)
             | PickerCandidates::References(_)
             | PickerCandidates::Symbols(_)
+            // Fuzzy here *orders* but must never filter — the server did the matching, and its
+            // query conventions (rust-analyzer's `#`/`*`) would fail a literal fuzzy match. See
+            // `rerank`'s workspace-symbols arm and `docs/workspace-symbols.md` § Merging.
+            | PickerCandidates::WorkspaceSymbols(_)
             | PickerCandidates::Keybindings(_)
             | PickerCandidates::Jumplist(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
@@ -943,6 +1017,19 @@ impl PickerCandidates {
                     path: c.abs_path.clone(),
                     position: c.end,
                     anchor: (c.end != c.start).then_some(c.start),
+                })
+            }
+            PickerCandidates::WorkspaceSymbols(v) => {
+                let c = &v[idx];
+                // `workspace/symbol` gives one position, not a name span, so there's nothing to
+                // select — land the cursor on the symbol.
+                Some(PickerSelectResult::FileAt {
+                    path: c.abs_path.clone(),
+                    position: LogicalPosition {
+                        line: c.line,
+                        col: c.col,
+                    },
+                    anchor: None,
                 })
             }
             // Query-less default (anchor line). The query-aware variant — landing on the matched
@@ -1245,6 +1332,27 @@ impl PickerState {
                         scored.push((score, i as u32));
                     }
                 }
+                if matches!(self.candidates, PickerCandidates::WorkspaceSymbols(_)) {
+                    // Order, never filter. The *server* ran the match — and some servers give the
+                    // query extra meaning (rust-analyzer widens into dependencies with a trailing
+                    // `#`, the stdlib with `*`), which a literal fuzzy match against symbol names
+                    // fails on every row. Filtering here would empty the picker for a query that
+                    // worked perfectly at the server.
+                    //
+                    // So: matches sort by score and keep their `match_indices` (they highlight);
+                    // everything the server returned that nucleo *doesn't* match keeps its arrival
+                    // order at the tail, unhighlighted. See `docs/workspace-symbols.md` § Merging.
+                    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                    let matched: std::collections::HashSet<u32> =
+                        scored.iter().map(|(_, i)| *i).collect();
+                    self.ranked = scored.iter().map(|(_, i)| *i).collect();
+                    self.ranked.extend(
+                        (0..self.candidates.len() as u32).filter(|i| {
+                            !matched.contains(i) && passes(&self.candidates, *i as usize)
+                        }),
+                    );
+                    return;
+                }
                 if let PickerCandidates::Symbols(syms) = &self.candidates {
                     // DocumentSymbols read as a tree: keep the matches in document order (not score
                     // order) and pull in each match's ancestor chain so the filtered list shows the
@@ -1474,6 +1582,9 @@ impl PickerState {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
             PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+            // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
+            // jumplist's label groups.
+            PickerCandidates::WorkspaceSymbols(v) => Some((u32::MAX, v[ci].display_path.as_str())),
             PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
             // Entries carry their source picker's header; a list captured from an ungrouped
             // source has none — the picker then renders flat (spans skip, metrics bail).
@@ -1502,6 +1613,13 @@ impl PickerState {
             PickerCandidates::Diagnostics(v) => Some(GroupHeader::File {
                 path_index: v[ci].path_index,
                 relative_path: v[ci].relative_path.clone(),
+            }),
+            // A `Label`, not a `File`, header: a symbol can come from a dependency outside every
+            // root, where no `path_index` exists to render a root label from. `display_path` is
+            // already "workspace-relative when it can be, absolute otherwise", which is exactly the
+            // header text either way. (Cost: no sticky pinning — see `groups_by_file`.)
+            PickerCandidates::WorkspaceSymbols(v) => Some(GroupHeader::Label {
+                label: v[ci].display_path.clone(),
             }),
             PickerCandidates::References(v) => Some(GroupHeader::Label {
                 label: if v[ci].is_definition {
@@ -2236,6 +2354,7 @@ mod tests {
         match c.make_item(1, vec![0, 1]) {
             PickerItem::Symbol {
                 path,
+                display_path: _,
                 line,
                 col,
                 name,
@@ -2267,6 +2386,7 @@ mod tests {
         assert_eq!(c.position_of(&c.make_item(0, vec![])), Some(0));
         let elsewhere = PickerItem::Symbol {
             path: "/proj/src/lib.rs".into(),
+            display_path: String::new(),
             line: 99,
             col: 0,
             name: "ignored".into(),

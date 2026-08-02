@@ -815,15 +815,15 @@ impl Shell {
                 SettingsRow::AddRoot => Some(OverlayField::WorkspaceAddRoot),
                 // The add-project row is a two-segment path editor; focus follows whichever
                 // segment it has active (the root typeahead only exists in multi-root workspaces).
-                SettingsRow::AddProject => Some(
-                    if self.session.workspace_paths.len() > 1
-                        && ps.add_project.field == ChipEditorField::Root
-                    {
-                        OverlayField::WorkspaceAddProjectRoot
-                    } else {
-                        OverlayField::WorkspaceAddProject
-                    },
-                ),
+                SettingsRow::AddProject => Some(if ps.on_add_project_language {
+                    OverlayField::WorkspaceAddProjectLanguage
+                } else if self.session.workspace_paths.len() > 1
+                    && ps.add_project.field == ChipEditorField::Root
+                {
+                    OverlayField::WorkspaceAddProjectRoot
+                } else {
+                    OverlayField::WorkspaceAddProject
+                }),
                 // A root/project row is a selection, not a text field.
                 SettingsRow::Root(_) | SettingsRow::Project(_) => None,
             };
@@ -865,6 +865,12 @@ impl Shell {
                 .workspace_settings
                 .as_ref()
                 .map(|s| s.add_project.root_filter.text.clone())
+                .unwrap_or_default(),
+            OverlayField::WorkspaceAddProjectLanguage => self
+                .session
+                .workspace_settings
+                .as_ref()
+                .map(|s| s.add_project_language.text.clone())
                 .unwrap_or_default(),
             OverlayField::WorkspaceAddRoot => self
                 .session
@@ -916,6 +922,9 @@ impl Shell {
             OverlayField::WorkspaceAddProjectRoot => {
                 self.session.workspace_settings_set_add_project_root(value)
             }
+            OverlayField::WorkspaceAddProjectLanguage => self
+                .session
+                .workspace_settings_set_add_project_language(value),
             OverlayField::PickerQuery => self.session.picker_set_query(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
@@ -1663,6 +1672,18 @@ impl Shell {
             path_input: add_project_input,
             path_ghost: ed.path_ghost(),
             path_invalid: ed.path_invalid(),
+            language_input: {
+                let mut t = crate::text_input::TextInput::default();
+                t.set(core.add_project_language.text.clone());
+                t.cursor = field_cursor(
+                    OverlayField::WorkspaceAddProjectLanguage,
+                    core.add_project_language.text.len(),
+                );
+                t
+            },
+            language_ghost: core.language_ghost(),
+            language_invalid: core.language_invalid(),
+            on_language: core.on_add_project_language,
         };
 
         // Flatten the core's row model into display order, carrying each row's selection index so

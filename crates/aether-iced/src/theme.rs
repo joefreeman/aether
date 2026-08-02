@@ -253,7 +253,11 @@ mod tests {
         assert_eq!(ui.body(), 26.0);
         assert_eq!(ui.small(), 24.0);
         assert_eq!(ui.row_h(), 48.0);
-        assert_eq!(ui.at(720.0), 1440.0, "panel widths track the text they hold");
+        assert_eq!(
+            ui.at(720.0),
+            1440.0,
+            "panel widths track the text they hold"
+        );
         assert!(ui.dot() < ui.fine() && ui.fine() < ui.small());
         assert!(ui.small() < ui.body() && ui.body() < ui.heading());
 

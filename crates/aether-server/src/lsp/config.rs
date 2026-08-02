@@ -38,30 +38,6 @@ pub fn workspace_marker(language: &str) -> WorkspaceMarker {
     }
 }
 
-/// Every language [`server_spec`] answers for. Kept in sync with its match arms by
-/// `all_languages_have_specs`; used by the marker-table drift test and by project resolution.
-pub const SERVER_LANGUAGES: &[&str] = &[
-    "rust",
-    "toml",
-    "python",
-    "go",
-    "typescript",
-    "javascript",
-    "tsx",
-    "json",
-    "html",
-    "css",
-    "yaml",
-    "bash",
-    "markdown",
-    "elixir",
-    "erlang",
-    "quiver",
-    "sql",
-    "terraform",
-    "dockerfile",
-];
-
 /// The language a server is *keyed* under, collapsing languages that share one [`LspServerSpec`].
 ///
 /// `typescript`, `javascript` and `tsx` are one `typescript-language-server` invocation with one set
@@ -331,9 +307,11 @@ mod tests {
         assert!(server_spec("brainfuck").is_none());
     }
 
+    /// The protocol's list is what a project may declare; this keeps it honest against the table
+    /// that actually launches things.
     #[test]
     fn all_languages_have_specs() {
-        for lang in SERVER_LANGUAGES {
+        for lang in aether_protocol::lsp::SERVER_LANGUAGES {
             assert!(
                 server_spec(lang).is_some(),
                 "{lang} is listed in SERVER_LANGUAGES but has no spec",
@@ -358,7 +336,7 @@ mod tests {
     /// a marker is added to a spec but not to [`language_for_marker`].
     #[test]
     fn every_root_marker_reverses_to_its_language() {
-        for lang in SERVER_LANGUAGES {
+        for lang in aether_protocol::lsp::SERVER_LANGUAGES {
             for marker in server_spec(lang).unwrap().root_markers {
                 // Markers can be relative paths (`.sqls/config.yml`); the reverse map keys on the
                 // file name, which is what a declared project path also yields.

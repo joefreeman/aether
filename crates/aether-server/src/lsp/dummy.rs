@@ -91,6 +91,30 @@ pub struct DummyLspConfig {
     /// `textDocument/formatting` edits; also flips `documentFormattingProvider` in the handshake so
     /// Aether's `lsp/format` doesn't short-circuit with "no formatter".
     pub formatting: Vec<DummyTextEdit>,
+    /// `workspace/symbol` results, and flips `workspaceSymbolProvider` in the handshake. Each entry
+    /// is `(name, absolute path, line, character)`; the reply echoes the query only insofar as
+    /// `symbol_query_filter` says to, so a test can exercise the "server matched it, nucleo didn't"
+    /// path deliberately.
+    pub workspace_symbols: Vec<DummySymbol>,
+    /// When true, only return symbols whose name contains the query — the ordinary case. Left false,
+    /// the server returns *everything* regardless of query, which is how a test reproduces a server
+    /// whose match rules differ from ours (rust-analyzer's `#` widening, say).
+    pub symbol_query_filter: bool,
+}
+
+/// One `workspace/symbol` result for [`DummyLspConfig`].
+#[derive(Debug, Clone)]
+pub struct DummySymbol {
+    pub name: String,
+    /// Absolute path of the file the symbol lives in. Tests point this at a real temp file so the
+    /// position conversion has a line to read.
+    pub path: String,
+    pub line: u32,
+    /// LSP character offset (the server's encoding — the dummy advertises UTF-8).
+    pub character: u32,
+    /// LSP `SymbolKind`; 12 (Function) is a reasonable default.
+    pub kind: u8,
+    pub container: String,
 }
 
 /// Run one dummy server to completion over `reader`/`writer` (the server ends of a duplex pipe).
@@ -127,6 +151,7 @@ where
                             "definitionProvider": config.definition.is_some(),
                             "referencesProvider": !config.references.is_empty(),
                             "documentFormattingProvider": !config.formatting.is_empty(),
+                            "workspaceSymbolProvider": !config.workspace_symbols.is_empty(),
                         },
                         "serverInfo": { "name": "dummy-lsp" },
                     }),
@@ -183,6 +208,29 @@ where
                     .map(|r| json!({ "uri": uri, "range": r.to_json() }))
                     .collect();
                 respond(&mut writer, id, Value::Array(locs)).await;
+            }
+            "workspace/symbol" => {
+                let query = str_at(&msg, &["params", "query"]);
+                let syms: Vec<Value> = config
+                    .workspace_symbols
+                    .iter()
+                    .filter(|s| !config.symbol_query_filter || s.name.contains(&query))
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "kind": s.kind,
+                            "containerName": s.container,
+                            "location": {
+                                "uri": super::uri::path_to_uri(std::path::Path::new(&s.path)),
+                                "range": {
+                                    "start": { "line": s.line, "character": s.character },
+                                    "end": { "line": s.line, "character": s.character + s.name.chars().count() as u32 },
+                                },
+                            },
+                        })
+                    })
+                    .collect();
+                respond(&mut writer, id, Value::Array(syms)).await;
             }
             "textDocument/formatting" => {
                 let edits: Vec<Value> = config

@@ -63,6 +63,18 @@ impl LspServerKey {
     }
 }
 
+/// One server the workspace-symbols fan-out will ask, resolved under the state lock so the caller
+/// can drop it before awaiting the round-trips.
+#[derive(Clone)]
+pub struct SymbolServer {
+    pub client: LspClient,
+    pub encoding: PositionEncoding,
+    /// The root the server was launched at — what a `Dir` filter scopes against to decide whether
+    /// this server is worth asking at all.
+    pub root: PathBuf,
+    pub language: String,
+}
+
 /// A language server and the buffers synced against it.
 pub struct LspHandle {
     pub language: String,
@@ -77,6 +89,9 @@ pub struct LspHandle {
     pub position_encoding: PositionEncoding,
     /// Whether the server advertises whole-document formatting (set from the handshake).
     pub document_formatting: bool,
+    /// Whether the server advertises `workspace/symbol` (set from the handshake). Gates it out of
+    /// the workspace-symbols fan-out (`docs/workspace-symbols.md`).
+    pub workspace_symbol: bool,
     /// Buffers we've sent `didOpen` for (and not yet `didClose`).
     pub open_buffers: HashSet<BufferId>,
     /// Kept alive by a declared project rather than by an open buffer (`docs/projects.md`). A
@@ -131,6 +146,7 @@ impl LspManager {
                 client: None,
                 position_encoding: PositionEncoding::Utf16,
                 document_formatting: false,
+                workspace_symbol: false,
                 open_buffers: HashSet::new(),
                 registered_buffers: HashSet::new(),
                 pinned: false,
@@ -151,6 +167,33 @@ impl LspManager {
         if let Some(h) = self.servers.get_mut(key) {
             h.pinned = true;
         }
+    }
+
+    /// Every server that may answer a workspace-symbol query for `workspace_id`
+    /// (`docs/workspace-symbols.md`): pinned by a declared project, handshaken, and advertising
+    /// `workspace/symbol`.
+    ///
+    /// The scoping rule lives here, in one place. Deliberately *not* "every ready server": a
+    /// lazily-launched one is reaped when its last buffer closes, so including it would make the
+    /// same query return different results depending on which files happen to be open.
+    pub fn symbol_servers(&self, workspace_id: &str) -> Vec<SymbolServer> {
+        self.servers
+            .iter()
+            .filter(|(k, h)| {
+                k.workspace == workspace_id
+                    && h.pinned
+                    && h.workspace_symbol
+                    && matches!(h.status, LspStatus::Ready)
+            })
+            .filter_map(|(k, h)| {
+                Some(SymbolServer {
+                    client: h.client.clone()?,
+                    encoding: h.position_encoding,
+                    root: k.root.clone(),
+                    language: k.language.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Drop every pin held by `workspace_id` and tear down the servers that were only alive because
@@ -451,6 +494,7 @@ async fn bring_up(
             h.client = Some(client.clone());
             h.position_encoding = caps.position_encoding;
             h.document_formatting = caps.document_formatting;
+            h.workspace_symbol = caps.workspace_symbol;
             // Keep the launch command as the name when the server reports none (vscode json/css/
             // html) rather than overwriting it with a placeholder.
             if let Some(name) = &caps.name {
@@ -501,6 +545,11 @@ async fn bring_up(
         out
     };
     send_all(pushes).await;
+
+    // A pinned server arriving late must not leave an already-typed workspace-symbols query
+    // permanently missing its results (`docs/workspace-symbols.md` § Re-query when a server becomes
+    // ready).
+    crate::symbols::requery_ready_server(&state, &key).await;
 
     inbound_loop(state.clone(), key, generation, inbound).await;
 }
@@ -1066,6 +1115,7 @@ mod tests {
             client: Some(client),
             position_encoding: PositionEncoding::Utf8,
             document_formatting: true,
+            workspace_symbol: true,
             open_buffers: HashSet::new(),
             registered_buffers: HashSet::new(),
             pinned: false,
@@ -1095,6 +1145,7 @@ mod tests {
             client: None,
             position_encoding: PositionEncoding::Utf8,
             document_formatting: false,
+            workspace_symbol: true,
             open_buffers: HashSet::new(),
             registered_buffers: HashSet::new(),
             pinned: false,

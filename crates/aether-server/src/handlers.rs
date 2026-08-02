@@ -81,7 +81,8 @@ use aether_protocol::viewport::{
 };
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
-    WorkspaceAddRootParams, WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceInfo,
+    WorkspaceAddRootParams, WorkspaceCreateParams, WorkspaceDeleteParams,
+    WorkspaceInferLanguageParams, WorkspaceInferLanguageResult, WorkspaceInfo,
     WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceProject,
     WorkspaceRemoveProjectParams, WorkspaceRemoveRootParams, WorkspaceRemoveRootResult,
     WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams, WorkspaceSummary,
@@ -1190,12 +1191,15 @@ pub async fn workspace_add_project(
     _ctx: &mut ConnectionCtx,
     params: WorkspaceAddProjectParams,
 ) -> Result<WorkspaceInfo, RpcError> {
-    // Canonicalized, like a root: the stored path has to be comparable against the workspace's
-    // canonical roots for the in-a-root check, and this is also where a marker that doesn't exist
-    // is caught.
+    // A project is a directory relative to its root. An empty path means the root itself; store it
+    // as `.` so the written config reads the same as a hand-edited one.
+    let relative_path = match params.relative_path.trim().trim_end_matches('/') {
+        "" => ".".to_string(),
+        p => p.to_string(),
+    };
     let project = crate::config::ProjectRef {
         root_index: params.path_index,
-        relative_path: std::path::PathBuf::from(&params.relative_path),
+        relative_path: std::path::PathBuf::from(&relative_path),
         language: params.language,
     };
 
@@ -1211,7 +1215,7 @@ pub async fn workspace_add_project(
     {
         return Err(RpcError::invalid_params(format!(
             "{} is already a project of workspace {}",
-            params.relative_path, params.workspace
+            relative_path, params.workspace
         )));
     }
     // Validate before committing anything — the message is the whole value of failing here.
@@ -1247,6 +1251,37 @@ pub async fn workspace_add_project(
         paths: entry_paths,
         projects: entry_projects,
     })
+}
+
+/// The add-project row's live inference (`docs/projects.md`): the language a declaration of this
+/// directory would pin, or `None` when the manifests don't single one out. Read-only, and never an
+/// error for a path that doesn't resolve — the client asks as the user types, so half-typed paths
+/// are the normal input.
+pub async fn workspace_infer_language(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: WorkspaceInferLanguageParams,
+) -> Result<WorkspaceInferLanguageResult, RpcError> {
+    // Normalize exactly as `workspace_add_project` stores: trailing `/` trimmed, empty → `.` (the
+    // root itself) — so the same-directory exclusion matches declarations however the path was typed.
+    let relative_path = match params.relative_path.trim().trim_end_matches('/') {
+        "" => ".".to_string(),
+        p => p.to_string(),
+    };
+    let project = crate::config::ProjectRef {
+        root_index: params.path_index,
+        relative_path: std::path::PathBuf::from(&relative_path),
+        language: None,
+    };
+
+    let s = state.lock().await;
+    let workspace = s
+        .workspaces
+        .get(&params.workspace)
+        .ok_or_else(|| RpcError::unknown_workspace(&params.workspace))?;
+    let language =
+        crate::config::infer_project_language(&project, &workspace.paths, &workspace.projects);
+    Ok(WorkspaceInferLanguageResult { language })
 }
 
 /// Undeclare a project, unpinning its server (which then reaps unless buffers hold it up).
@@ -11546,6 +11581,40 @@ pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
 /// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
 /// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
 /// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
+/// The absolute directories a picker's `Dir` chips scope to, resolved against the workspace roots.
+/// Empty when nothing is scoped.
+fn scoped_dirs(
+    filters: &aether_protocol::picker::PickerFilters,
+    roots: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    filters
+        .directories
+        .iter()
+        .filter_map(|d| {
+            let root = roots.get(d.path_index as usize)?;
+            Some(if d.relative_path.is_empty() {
+                root.clone()
+            } else {
+                root.join(&d.relative_path)
+            })
+        })
+        .collect()
+}
+
+/// Whether a language server rooted at `root` can contribute anything under `scopes`.
+///
+/// This is what makes the `Dir` chip *prune the fan-out* rather than merely filter its results
+/// (`docs/workspace-symbols.md`): a server whose root is disjoint from every scoped directory has
+/// nothing to say, so it isn't asked at all — one fewer round-trip, and one fewer slow project to
+/// wait on. Either containment direction counts: a scope inside the server's root, or a server root
+/// inside the scope.
+fn dir_scope_admits(root: &std::path::Path, scopes: &[std::path::PathBuf]) -> bool {
+    scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|s| s.starts_with(root) || root.starts_with(s))
+}
+
 /// Drop `workspace_id`'s project pins once no client has it active, reaping the servers that only
 /// the pins were keeping alive (`docs/projects.md`).
 ///
@@ -12399,6 +12468,11 @@ pub async fn picker_view(
         // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
         // the prior snapshot via `preserve_existing`.
         PickerKind::DocumentSymbols => picker_state::PickerCandidates::Symbols(Vec::new()),
+        // Workspace symbols are query-driven (`docs/workspace-symbols.md`): the picker opens empty
+        // and each `picker/query` fans out afresh, exactly as Grep does.
+        PickerKind::WorkspaceSymbols => {
+            picker_state::PickerCandidates::WorkspaceSymbols(Vec::new())
+        }
         PickerKind::GitChanges => {
             // Snapshot the roots + every in-root open buffer (live combined hunks + text) under a
             // brief lock, then build off-lock — the repo walk + per-file diffs must not block the
@@ -12648,6 +12722,13 @@ pub async fn picker_view(
                 (
                     picker_state::PickerCandidates::Symbols(_),
                     picker_state::PickerCandidates::Symbols(_),
+                ) => true,
+                // WorkspaceSymbols: the accumulated fan-out results *are* the search, like Grep's —
+                // a scroll/resume re-view must not wipe what the servers have answered so far. A
+                // genuinely new search comes from `picker/query`, which clears them itself.
+                (
+                    picker_state::PickerCandidates::WorkspaceSymbols(_),
+                    picker_state::PickerCandidates::WorkspaceSymbols(_),
                 ) => true,
                 // GitChangesFile: locked to a buffer, so re-views send an empty placeholder — keep
                 // the snapshot then, but a fresh open carries the buffer's hunks and rebuilds.
@@ -12914,6 +12995,12 @@ pub async fn picker_query(
                 picker.last_completed_search = None;
             }
         }
+        // Workspace symbols: the query is the search, so drop the prior answers and let the
+        // fan-out (spawned below, off the lock) refill them server by server.
+        PickerKind::WorkspaceSymbols => {
+            picker.candidates = picker_state::PickerCandidates::WorkspaceSymbols(Vec::new());
+            picker.ranked.clear();
+        }
         // Explorer: the query is a path. Re-list the directory it peeks into (anchor + the path
         // part) before reranking, so typing `src/` descends and `src/ma` filters `src`. Skip in
         // Roots mode (candidates aren't a directory listing) and before the first view (no
@@ -12960,6 +13047,10 @@ pub async fn picker_query(
     let will_spawn_grep_search = matches!(params.kind, PickerKind::Grep)
         && query_for_grep.len() >= grep::MIN_QUERY_LEN
         && !grep_cache_hit;
+    // Same minimum as grep: below it an LSP fan-out is pure churn (one request per pinned server,
+    // none cancellable — see `docs/workspace-symbols.md`).
+    let will_spawn_symbol_search = matches!(params.kind, PickerKind::WorkspaceSymbols)
+        && query_for_grep.len() >= grep::MIN_QUERY_LEN;
     // Mark the initial push as ticking when we're about to spawn the search. Without this the
     // client would briefly see "0 hits, search finished" between sending the query and the
     // coordinator's first batch landing. Send it as a count-only tick (`items: None`) too: the
@@ -12968,6 +13059,7 @@ pub async fn picker_query(
     // every keystroke. `None` keeps it on screen until the first real batch — or the completion
     // push (always `Some(...)` from `build_update`) — replaces it. No stale rows can get stuck.
     if will_spawn_grep_search
+        || will_spawn_symbol_search
         || (matches!(
             params.kind,
             PickerKind::References | PickerKind::DocumentSymbols
@@ -12980,6 +13072,23 @@ pub async fn picker_query(
         }
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    // Resolve the eligible servers under the lock (the scoping rule lives in `symbol_servers`),
+    // plus the roots for display-path shortening. A `Dir` filter prunes the fan-out rather than
+    // merely filtering results: a server whose root is disjoint from the scope can't contribute.
+    let symbol_fanout = will_spawn_symbol_search
+        .then(|| {
+            let workspace = s.active_workspace(client_id)?;
+            let roots = workspace.paths.clone();
+            let scopes = scoped_dirs(&filters_for_grep, &roots);
+            let servers: Vec<_> = s
+                .lsp
+                .symbol_servers(&workspace.id)
+                .into_iter()
+                .filter(|srv| dir_scope_admits(&srv.root, &scopes))
+                .collect();
+            Some((servers, roots))
+        })
+        .flatten();
     let workspace_index_for_grep = if matches!(params.kind, PickerKind::Grep) {
         // Active-workspace lookup can fail in the (defensively-handled) case where the client
         // somehow lost its active workspace between opening the picker and querying it. Skip the
@@ -12993,6 +13102,18 @@ pub async fn picker_query(
 
     if let (Some(sender), Some(params)) = (outbound, update) {
         let _ = sender.send(picker_update_notif(params)).await;
+    }
+
+    if let Some((servers, roots)) = symbol_fanout {
+        for server in servers {
+            let state = state.clone();
+            let query = query_for_grep.clone();
+            let roots = roots.clone();
+            tokio::spawn(async move {
+                let found = crate::symbols::query_server(&server, &query, &roots).await;
+                crate::symbols::merge_results(&state, client_id, generation, found).await;
+            });
+        }
     }
 
     if will_spawn_grep_search {

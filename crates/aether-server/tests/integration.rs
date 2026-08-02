@@ -21154,14 +21154,435 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, id_base: u64,
 
 // ---- declared projects & pinned language servers (docs/projects.md) -------------------------
 
-/// A project declared under the workspace's first (and only) root. Projects are stored relative to
-/// their root, so the fixtures name markers the way the config file does.
+/// A project declared under the workspace's first (and only) root. A project is a *directory*
+/// relative to that root — `"."` being the root itself — with its language inferred from the build
+/// manifests inside it.
 fn project_ref(relative_path: &str) -> aether_server::ProjectRef {
     aether_server::ProjectRef {
         root_index: 0,
         relative_path: std::path::PathBuf::from(relative_path),
         language: None,
     }
+}
+
+/// `workspace/infer_language`, the add-project row's live suggestion: a directory's single manifest
+/// language comes back; a language the workspace already declares for that directory is excluded
+/// (so a two-language directory suggests the one not yet added); and a half-typed path is `None`,
+/// never an error.
+#[tokio::test]
+async fn workspace_infer_language_suggests_and_excludes() {
+    use aether_protocol::workspace::{
+        WorkspaceInferLanguage, WorkspaceInferLanguageParams, WorkspaceInferLanguageResult,
+    };
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("svc/pyproject.toml", ""),
+        ("svc/package.json", "{}"),
+        ("pkg/Cargo.toml", "[package]\nname = \"p\"\n"),
+    ]);
+    // `svc` is already declared as its Python half; the dummy keeps the pin from hunting for a
+    // real language-server binary.
+    let mut python_half = project_ref("svc");
+    python_half.language = Some("python".into());
+    let server = aether_server::spawn_for_test_with_projects(
+        "infer",
+        vec![dir.path().to_path_buf()],
+        vec![python_half],
+        vec![("python".into(), DummyLspConfig::default())],
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+
+    let params = |rel: &str| WorkspaceInferLanguageParams {
+        workspace: "infer".into(),
+        path_index: 0,
+        relative_path: rel.into(),
+    };
+
+    // An undeclared single-manifest directory suggests its language.
+    let r: WorkspaceInferLanguageResult =
+        send_request::<WorkspaceInferLanguage>(&mut ws, 1, &params("pkg")).await;
+    assert_eq!(r.language.as_deref(), Some("rust"));
+    // The declared Python project is excluded, leaving the TypeScript half — and the trailing `/`
+    // (how a completed path arrives from the editor) is normalized away before matching.
+    let r: WorkspaceInferLanguageResult =
+        send_request::<WorkspaceInferLanguage>(&mut ws, 2, &params("svc/")).await;
+    assert_eq!(r.language.as_deref(), Some("typescript"));
+    // A half-typed path is simply "nothing inferred".
+    let r: WorkspaceInferLanguageResult =
+        send_request::<WorkspaceInferLanguage>(&mut ws, 3, &params("sv")).await;
+    assert_eq!(r.language, None);
+}
+
+// ---- workspace symbols (docs/workspace-symbols.md) -------------------------------------------
+
+/// A dummy symbol at `line`/`character` of `path`.
+fn dummy_symbol(
+    name: &str,
+    path: &std::path::Path,
+    line: u32,
+    character: u32,
+) -> aether_server::DummySymbol {
+    aether_server::DummySymbol {
+        name: name.into(),
+        path: path.display().to_string(),
+        line,
+        character,
+        kind: 12, // Function
+        container: String::new(),
+    }
+}
+
+/// Open the workspace-symbols picker and run one query, returning the rows the server settled on.
+/// Polls the `picker/view` response rather than waiting on pushes, because `send_request` eats
+/// notifications (see `docs/projects.md`'s dummy-fixture note).
+async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
+    let _ = send_request::<PickerView>(
+        ws,
+        90,
+        &PickerViewParams {
+            kind: PickerKind::WorkspaceSymbols,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 50,
+            from_selection: false,
+            filters: None,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let _: () = send_request::<PickerQuery>(
+        ws,
+        91,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: query.into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    // The fan-out is spawned, so poll the view until it settles.
+    for i in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let view = send_request::<PickerView>(
+            ws,
+            200 + i,
+            &PickerViewParams {
+                kind: PickerKind::WorkspaceSymbols,
+                reset: PickerReset::Keep,
+                offset: 0,
+                limit: 50,
+                from_selection: false,
+                filters: None,
+                center_on: None,
+                center_on_cursor: None,
+                directory_path: None,
+                buffer_id: None,
+                explorer_roots: false,
+                keybindings: None,
+            },
+        )
+        .await;
+        if let Some(items) = view.update.as_ref().and_then(|u| u.items.clone()) {
+            if !items.is_empty() {
+                return items;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Symbols come from the pinned project's server, with positions resolved against files that were
+/// never opened.
+#[tokio::test]
+async fn workspace_symbols_come_from_the_pinned_project_server() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\nfn helper_one() {}\n"),
+    ]);
+    let target = dir.path().join("src/main.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("helper_one", &target, 1, 3)],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let rows = workspace_symbol_rows(&mut ws, "helper").await;
+    let PickerItem::Symbol {
+        name,
+        display_path,
+        line,
+        col,
+        ..
+    } = rows.first().expect("a symbol row")
+    else {
+        panic!("expected a Symbol row, got {:?}", rows.first());
+    };
+    assert_eq!(name, "helper_one");
+    assert_eq!(
+        display_path, "src/main.rs",
+        "workspace-relative inside a root"
+    );
+    assert_eq!(*line, 1);
+    // Column converted against the real file, which was never opened as a buffer.
+    assert_eq!(*col, 3);
+}
+
+/// The scoping rule: a workspace with no declared projects has no pinned servers, so the picker
+/// answers nothing even though a language server could be launched for its files.
+#[tokio::test]
+async fn workspace_symbols_need_a_declared_project() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn helper_one() {}\n"),
+    ]);
+    let target = dir.path().join("src/main.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("helper_one", &target, 0, 3)],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    // No projects declared — the server is only launched lazily, by opening a buffer.
+    let server = aether_server::spawn_for_test_with_lsp(
+        "no-projects",
+        vec![dir.path().to_path_buf()],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "no-projects".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    // Open a buffer, so a server *is* running — it just isn't pinned by a project.
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("src/main.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    await_lsp_state(&server, "a lazily-launched server", |v| {
+        v.len() == 1 && v[0].ready && !v[0].pinned
+    })
+    .await;
+
+    assert!(
+        workspace_symbol_rows(&mut ws, "helper").await.is_empty(),
+        "an unpinned server must not answer workspace symbols",
+    );
+}
+
+/// Selecting a row must actually resolve to a jump. The item is matched back to its candidate by
+/// identity (`position_of`), and a missing arm there fails *every* select with "not in the picker" —
+/// invisible until you press Enter.
+#[tokio::test]
+async fn workspace_symbol_select_resolves_to_a_jump() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\nfn helper_one() {}\n"),
+    ]);
+    let target = dir.path().join("src/main.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("helper_one", &target, 1, 3)],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-select",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-select".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let rows = workspace_symbol_rows(&mut ws, "helper").await;
+    let item = rows.first().expect("a symbol row").clone();
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        300,
+        &PickerSelectParams {
+            kind: PickerKind::WorkspaceSymbols,
+            item,
+        },
+    )
+    .await;
+    match selected {
+        PickerSelectResult::FileAt { path, position, .. } => {
+            assert_eq!(path, target.display().to_string());
+            assert_eq!(position.line, 1);
+            assert_eq!(position.col, 3);
+        }
+        other => panic!("expected FileAt, got {other:?}"),
+    }
+}
+
+/// A symbol outside every root — a dependency, say — renders its absolute path rather than
+/// pretending to be workspace-relative.
+#[tokio::test]
+async fn workspace_symbols_outside_a_root_show_an_absolute_path() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\n"),
+    ]);
+    // A second temp dir standing in for a dependency checkout outside the workspace.
+    let dep = lay_out(&[("dep.rs", "pub fn dep_helper() {}\n")]);
+    let dep_file = dep.path().join("dep.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("dep_helper", &dep_file, 0, 7)],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-dep",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-dep".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let rows = workspace_symbol_rows(&mut ws, "dep_he").await;
+    let PickerItem::Symbol { display_path, .. } = rows.first().expect("a symbol row") else {
+        panic!("expected a Symbol row");
+    };
+    assert_eq!(
+        display_path,
+        &dep_file.display().to_string(),
+        "no root contains it, so there is no relative form to show",
+    );
+}
+
+/// The server matched it, so it shows — even when our own fuzzy matcher wouldn't. This is what
+/// keeps rust-analyzer's `#`/`*` query conventions working: a literal fuzzy match of `foo#` against
+/// symbol names fails every row, and filtering on that would empty a picker that worked at the
+/// server.
+#[tokio::test]
+async fn workspace_symbols_keep_server_matches_our_matcher_would_reject() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\n"),
+    ]);
+    let target = dir.path().join("src/main.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("totally_unrelated", &target, 0, 3)],
+        // The server ignores the query entirely — standing in for a server whose match rules differ
+        // from ours.
+        symbol_query_filter: false,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-loose",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-loose".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // `zzz#` matches nothing about `totally_unrelated` under any fuzzy rule.
+    let rows = workspace_symbol_rows(&mut ws, "zzz#").await;
+    assert_eq!(rows.len(), 1, "a server match survives our rerank");
+    let PickerItem::Symbol {
+        name,
+        match_indices,
+        ..
+    } = &rows[0]
+    else {
+        panic!("expected a Symbol row");
+    };
+    assert_eq!(name, "totally_unrelated");
+    assert!(
+        match_indices.is_empty(),
+        "unmatched by us, so nothing to highlight",
+    );
 }
 
 /// Poll until `f` holds against the server's LSP state, or fail after ~2s. Server startup is a
@@ -21199,7 +21620,7 @@ async fn declared_project_starts_a_server_with_no_buffer_open() {
     let server = aether_server::spawn_for_test_with_projects(
         "pinned",
         vec![dir.path().to_path_buf()],
-        vec![project_ref("Cargo.toml")],
+        vec![project_ref(".")],
         vec![("rust".into(), DummyLspConfig::default())],
     )
     .await
@@ -21223,7 +21644,7 @@ async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
     let server = aether_server::spawn_for_test_with_projects(
         "pinned-open",
         vec![dir.path().to_path_buf()],
-        vec![project_ref("Cargo.toml")],
+        vec![project_ref(".")],
         vec![("rust".into(), DummyLspConfig::default())],
     )
     .await
@@ -21294,7 +21715,7 @@ async fn reactivating_after_the_last_client_leaves_restores_the_pins() {
     let server = aether_server::spawn_for_test_with_projects(
         "restart",
         vec![dir.path().to_path_buf()],
-        vec![project_ref("Cargo.toml")],
+        vec![project_ref(".")],
         vec![("rust".into(), DummyLspConfig::default())],
     )
     .await
@@ -21358,7 +21779,7 @@ async fn sibling_language_buffers_share_one_server() {
     let server = aether_server::spawn_for_test_with_projects(
         "ts-js",
         vec![dir.path().to_path_buf()],
-        vec![project_ref("package.json")],
+        vec![project_ref(".")],
         vec![("typescript".into(), DummyLspConfig::default())],
     )
     .await

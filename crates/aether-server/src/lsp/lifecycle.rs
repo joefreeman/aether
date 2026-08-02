@@ -27,6 +27,10 @@ pub struct ServerCaps {
     /// Many servers don't (pyright, bash-language-server, marksman, …); `lsp/format` uses this to
     /// say "no formatter for X" rather than a vague "nothing to format".
     pub document_formatting: bool,
+    /// Whether the server advertises `workspaceSymbolProvider`. The workspace-symbols picker
+    /// (`docs/workspace-symbols.md`) skips servers without it rather than sending a request they'll
+    /// error on — several of the small servers (yaml, css, dockerfile) don't implement it.
+    pub workspace_symbol: bool,
 }
 
 /// Perform the `initialize`/`initialized` handshake against `workspace_root`. `init_options`, when
@@ -94,10 +98,17 @@ pub async fn initialize(
         .and_then(|c| c.get("documentFormattingProvider"))
         .map(|v| v != &Value::Bool(false))
         .unwrap_or(false);
+    // Same three-state shape: `true` / `false` / a `WorkspaceSymbolOptions` object / absent.
+    let workspace_symbol = result
+        .get("capabilities")
+        .and_then(|c| c.get("workspaceSymbolProvider"))
+        .map(|v| v != &Value::Bool(false))
+        .unwrap_or(false);
     client.notify("initialized", json!({}))?;
     Ok(ServerCaps {
         name,
         position_encoding,
+        workspace_symbol,
         document_formatting,
     })
 }

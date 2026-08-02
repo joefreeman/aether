@@ -119,6 +119,14 @@ fn workspace_settings(s: &Session) -> Value {
         "first_project_index": ps.input_index() + 1,
         "add": field(&ps.add),
         "add_project": path_editor(&ps.add_project, &s.workspace_paths),
+        // The add-project row's optional language override — a typeahead over the languages a
+        // server exists for, so the field can only ever produce one that starts something.
+        "add_project_language": {
+            "input": ps.add_project_language.text,
+            "ghost": ps.language_ghost(),
+            "invalid": ps.language_invalid(),
+            "focused": ps.on_add_project_language,
+        },
         "error": ps.error,
     })
 }

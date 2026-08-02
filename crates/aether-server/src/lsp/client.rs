@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -38,7 +39,13 @@ pub enum LspError {
     Rpc { code: i64, message: String },
     #[error("language server connection closed")]
     Closed,
+    #[error("language server did not answer in time")]
+    Timeout,
 }
+
+/// Default deadline for a request. Generous enough for a cold rust-analyzer answering its first
+/// query, short enough that a wedged server doesn't hold an entry in `pending` indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, LspError>>>>>;
 
@@ -54,6 +61,23 @@ impl LspClient {
     /// Issue a request and await its response. Resolves to the `result` value, or an error if the
     /// server replied with one or the connection dropped.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::request`] with an explicit deadline.
+    ///
+    /// Every request is bounded, because we have no way to take one back: LSP's `$/cancelRequest`
+    /// isn't implemented here, so a superseded request stays in flight server-side regardless. The
+    /// timeout is about *our* bookkeeping — without it a server that never answers leaks its entry
+    /// in `pending` forever, and the workspace-symbols picker fans out one request per pinned server
+    /// per keystroke (`docs/workspace-symbols.md`), so those add up quickly.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, LspError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -67,9 +91,14 @@ impl LspClient {
             self.pending.lock().await.remove(&id);
             return Err(LspError::Closed);
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(LspError::Closed), // reader task dropped the sender
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(LspError::Closed), // reader task dropped the sender
+            Err(_) => {
+                // Drop our half so a late reply is discarded rather than accumulating.
+                self.pending.lock().await.remove(&id);
+                Err(LspError::Timeout)
+            }
         }
     }
 

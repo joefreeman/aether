@@ -232,6 +232,8 @@ pub enum OverlayField {
     WorkspaceAddProject,
     /// Its leading root-typeahead segment (multi-root workspaces).
     WorkspaceAddProjectRoot,
+    /// Its trailing language-typeahead segment.
+    WorkspaceAddProjectLanguage,
     /// The chip editor's root-filter input (multi-root dir editor).
     ChipRoot,
     /// The chip editor's path/glob input.
@@ -251,6 +253,7 @@ impl OverlayField {
             OverlayField::WorkspaceAddRoot => "overlay-workspace-addroot",
             OverlayField::WorkspaceAddProject => "overlay-workspace-addproject",
             OverlayField::WorkspaceAddProjectRoot => "overlay-workspace-addproject-root",
+            OverlayField::WorkspaceAddProjectLanguage => "overlay-workspace-addproject-language",
             OverlayField::ChipRoot => "overlay-chip-root",
             OverlayField::ChipPath => "overlay-chip-path",
         })
@@ -695,15 +698,15 @@ impl App {
                 SettingsRow::Name => Some(OverlayField::WorkspaceName),
                 SettingsRow::AddRoot => Some(OverlayField::WorkspaceAddRoot),
                 // Two segments — focus follows whichever the editor has active.
-                SettingsRow::AddProject => Some(
-                    if self.session.workspace_paths.len() > 1
-                        && s.add_project.field == aether_client::chips::ChipEditorField::Root
-                    {
-                        OverlayField::WorkspaceAddProjectRoot
-                    } else {
-                        OverlayField::WorkspaceAddProject
-                    },
-                ),
+                SettingsRow::AddProject => Some(if s.on_add_project_language {
+                    OverlayField::WorkspaceAddProjectLanguage
+                } else if self.session.workspace_paths.len() > 1
+                    && s.add_project.field == aether_client::chips::ChipEditorField::Root
+                {
+                    OverlayField::WorkspaceAddProjectRoot
+                } else {
+                    OverlayField::WorkspaceAddProject
+                }),
                 SettingsRow::Root(_) | SettingsRow::Project(_) => None,
             };
         }
@@ -1481,6 +1484,9 @@ impl App {
             OverlayField::WorkspaceAddProjectRoot => {
                 self.session.workspace_settings_set_add_project_root(value)
             }
+            OverlayField::WorkspaceAddProjectLanguage => self
+                .session
+                .workspace_settings_set_add_project_language(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
         }
@@ -2132,6 +2138,8 @@ impl App {
                     PickerMsg::Query(q) => Message::OverlayInput(OverlayField::PickerQuery, q),
                     PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::ChipRoot, s),
                     PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::ChipPath, s),
+                    // The chip editor has only two segments; the third is settings-only.
+                    PickerMsg::EditorExtra(_) => Message::Noop,
                     PickerMsg::CoreKey(code) => core_key_message(code),
                 }),
             );
@@ -2432,7 +2440,7 @@ impl App {
         ));
         col = col.push(roots_col);
 
-        // The Projects group (docs/projects.md): declared marker files whose language servers stay
+        // The Projects group (docs/projects.md): declared directories whose language servers stay
         // pinned while the workspace is active. Same shape as Roots — bulleted rows with a delete
         // button, then an always-present add input — with a trailing tag per row carrying either the
         // language it pins or, in red, why it can't be used.
@@ -2505,10 +2513,8 @@ impl App {
         // Rendering the ghosts is what makes `Alt-j/k` cycling *visible* — without them the
         // candidate changes underneath and the row looks inert.
         //
-        // Unfocused and empty, it collapses to a plain "Add project..." label instead. That's the
-        // same affordance the add-root row gives, and it sidesteps a sizing trap: `field_with_ghost`
-        // stacks the input over a ghost layer and takes its width from that layer, so an empty field
-        // has almost no width and a placeholder inside it renders clipped to a glyph or two.
+        // Unfocused and empty, it collapses to a plain "Add project..." label instead — the same
+        // affordance the add-root row gives.
         use crate::picker::{field_with_ghost, Boundary, PickerMsg};
         let ed = &s.add_project;
         let roots = &self.session.workspace_paths;
@@ -2564,30 +2570,90 @@ impl App {
                 }
                 project_row = project_row.push(root_group).spacing(6);
             }
-            // Placeholder is always empty here: the ghost layer behind the input is what shows
-            // suggestions, and a placeholder drawn on top of it would overlap.
-            project_row = project_row.push(field_with_ghost(
-                &ed.input,
-                ed.path_ghost(),
-                ed.path_invalid(),
-                OverlayField::WorkspaceAddProject.id(),
-                "",
-                "",
-                PickerMsg::EditorPath,
-                false,
-                if multi_root {
-                    Boundary::PathToRoot
+            // A live input only while the path segment itself has focus. Otherwise static text —
+            // a ghost left showing while another segment is focused reads as part of the value
+            // (`databricks/` trailed by `.databricks/` looks like the path you're committing).
+            if s.on_add_project_language {
+                project_row = project_row.push(
+                    text(ed.input.text.clone())
+                        .size(ui.body())
+                        .font(SANS)
+                        .color(if ed.path_invalid() {
+                            theme::NORD11
+                        } else {
+                            theme::NORD6
+                        }),
+                );
+            } else {
+                // Placeholder is always empty here: the ghost layer behind the input is what shows
+                // suggestions, and a placeholder drawn on top of it would overlap.
+                project_row = project_row.push(field_with_ghost(
+                    &ed.input,
+                    ed.path_ghost(),
+                    ed.path_invalid(),
+                    OverlayField::WorkspaceAddProject.id(),
+                    "",
+                    "",
+                    PickerMsg::EditorPath,
+                    false,
+                    if multi_root {
+                        Boundary::PathToRoot
+                    } else {
+                        Boundary::None
+                    },
+                    ui,
+                ));
+            }
+            // The optional language override, right-aligned like the language tags on the project
+            // rows above. Only appears once it has focus or a value — an empty segment on every row
+            // would be noise for the nine-in-ten projects whose language is inferable.
+            if s.on_add_project_language || !s.add_project_language.text.is_empty() {
+                // A plain gap rather than a glyph: the row already reads `root: path`, and a second
+                // punctuation mark competes with the `:` for meaning. When the path renders as
+                // static text it hugs its content, so the gap does the pushing (`Fill`); a focused
+                // path is a `Fill` input that already pushes the segment to the right edge, and a
+                // second `Fill` would steal half its width.
+                let gap: Length = if s.on_add_project_language {
+                    Length::Fill
                 } else {
-                    Boundary::None
-                },
-                ui,
-            ));
+                    ui.at(12.0).into()
+                };
+                project_row = project_row.push(iced::widget::Space::new().width(gap));
+                if s.on_add_project_language {
+                    project_row = project_row.push(field_with_ghost(
+                        &s.add_project_language,
+                        s.language_ghost(),
+                        s.language_invalid(),
+                        OverlayField::WorkspaceAddProjectLanguage.id(),
+                        "language",
+                        "",
+                        PickerMsg::EditorExtra,
+                        true,
+                        Boundary::None,
+                        ui,
+                    ));
+                } else {
+                    project_row = project_row.push(
+                        text(s.add_project_language.text.clone())
+                            .size(ui.body())
+                            .font(SANS)
+                            .color(if s.language_invalid() {
+                                theme::NORD11
+                            } else {
+                                theme::NORD3_BRIGHT
+                            }),
+                    );
+                }
+            }
             Element::from(project_row).map(|m| match m {
                 PickerMsg::EditorRoot(s) => {
                     Message::OverlayInput(OverlayField::WorkspaceAddProjectRoot, s)
                 }
                 PickerMsg::EditorPath(s) => {
                     Message::OverlayInput(OverlayField::WorkspaceAddProject, s)
+                }
+                PickerMsg::EditorExtra(s) => {
+                    Message::OverlayInput(OverlayField::WorkspaceAddProjectLanguage, s)
                 }
                 PickerMsg::CoreKey(code) => core_key_message(code),
                 _ => Message::Noop,
@@ -2605,8 +2671,10 @@ impl App {
             );
         }
 
+        // Wider than the other overlays: the add-project row carries three segments (root, path,
+        // language) and cramping them makes the path unreadable.
         let boxed = container(col.spacing(8))
-            .width(ui.at(480.0))
+            .width(ui.at(640.0))
             .padding(16)
             .style(|_| container::Style {
                 background: Some(theme::NORD1.into()),

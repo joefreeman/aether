@@ -103,11 +103,11 @@ use aether_protocol::viewport::{
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
     WorkspaceAddProjectParams, WorkspaceAddRoot, WorkspaceAddRootParams, WorkspaceCreate,
-    WorkspaceCreateParams, WorkspaceDelete, WorkspaceDeleteParams, WorkspaceInfo,
-    WorkspaceOpenPath, WorkspaceOpenPathParams, WorkspaceRemoveProject,
-    WorkspaceRemoveProjectParams, WorkspaceRemoveRoot, WorkspaceRemoveRootParams,
-    WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams, WorkspaceRenamed,
-    WorkspaceRenamedParams,
+    WorkspaceCreateParams, WorkspaceDelete, WorkspaceDeleteParams, WorkspaceInferLanguage,
+    WorkspaceInferLanguageParams, WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
+    WorkspaceRemoveProject, WorkspaceRemoveProjectParams, WorkspaceRemoveRoot,
+    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams,
+    WorkspaceRenamed, WorkspaceRenamedParams,
 };
 use aether_protocol::{BufferId, LogicalPosition};
 
@@ -223,6 +223,14 @@ pub enum Event {
     AddProjectListing {
         abs: String,
         result: Result<DirectoryListResult, String>,
+    },
+    /// `workspace/infer_language` for the add-project row resolved, keyed by the
+    /// `(path_index, relative_path)` it asked about so a stale reply (the editor moved on) is
+    /// dropped. Errors collapse to `None` at the request site — a background suggestion has
+    /// nothing useful to say about failure.
+    AddProjectLanguageInferred {
+        key: (u32, String),
+        language: Option<String>,
     },
     /// `picker/section_jump` resolved: the next/prev section start (None at the ends) — the
     /// next file's first hit (Grep) or the next top-level symbol (DocumentSymbols).
@@ -1002,6 +1010,11 @@ impl Session {
                         if let Some(s) = self.workspace_settings.as_mut() {
                             s.add_project.input.clear();
                             s.add_project.suggestion_idx = 0;
+                            s.add_project_language.clear();
+                            s.add_project_language_selected = 0;
+                            s.on_add_project_language = false;
+                            s.language_inferred = false;
+                            s.inference_key = None;
                             s.error = None;
                             s.selected = s.add_project_index();
                         }
@@ -1170,6 +1183,35 @@ impl Session {
                         match result {
                             Ok(r) => st.add_project.set_dir_listing(r.entries),
                             Err(_) => st.add_project.set_dir_listing_failed(),
+                        }
+                    }
+                }
+                Effects::none()
+            }
+
+            Event::AddProjectLanguageInferred { key, language } => {
+                if let Some(s) = self.workspace_settings.as_mut() {
+                    // Only the *latest* ask may touch the field, and only while the user hasn't:
+                    // an inferred value is replaceable, a typed one is theirs.
+                    if s.inference_key.as_ref() == Some(&key)
+                        && (s.language_inferred || s.add_project_language.text.is_empty())
+                    {
+                        match language {
+                            Some(l) => {
+                                if s.add_project_language.text != l {
+                                    s.add_project_language = crate::chips::Input::new(l);
+                                    s.add_project_language_selected = 0;
+                                }
+                                s.language_inferred = true;
+                            }
+                            // Nothing inferred any more — an earlier suggestion goes away with
+                            // the directory that produced it.
+                            None if s.language_inferred => {
+                                s.add_project_language.clear();
+                                s.add_project_language_selected = 0;
+                                s.language_inferred = false;
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -2106,7 +2148,11 @@ impl Session {
         from_selection: bool,
         center_on_override: Option<PickerItem>,
     ) -> Effects {
-        self.picker = Some(PickerState::new(kind));
+        let mut fresh = PickerState::new(kind);
+        // Stamped at open so the workspace-symbols picker can distinguish "no matches" from
+        // "nothing can answer here" (docs/workspace-symbols.md § Scope).
+        fresh.workspace_has_projects = !self.workspace_projects.is_empty();
+        self.picker = Some(fresh);
         // A fresh input owns the keyboard now; anything the last one was recalling is over.
         self.history.reset();
         let buffer_id = self.buffer.buffer_id;
@@ -2602,7 +2648,8 @@ impl Session {
     }
 
     /// Replace the add-project row's path-segment text wholesale (native `<input>` parity, as
-    /// above), refreshing its completion listing if the directory portion moved.
+    /// above), refreshing its completion listing if the directory portion moved and re-syncing the
+    /// language suggestion to the newly named directory.
     pub fn workspace_settings_set_add_project(&mut self, text: String) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
         let Some(s) = self.workspace_settings.as_mut() else {
@@ -2613,11 +2660,11 @@ impl Session {
         }
         s.add_project.input.set(text);
         s.error = None;
+        let mut fx = Effects::none();
         if s.add_project.path_edited(&workspace_paths) {
-            self.refresh_add_project_listing()
-        } else {
-            Effects::none()
+            fx = fx.and(self.refresh_add_project_listing());
         }
+        fx.and(self.sync_add_project_inference())
     }
 
     /// Replace the add-project row's *root* segment filter (multi-root workspaces only).
@@ -2632,11 +2679,12 @@ impl Session {
         s.add_project.root_filter.set(text);
         s.add_project.root_selected = 0;
         s.error = None;
+        let mut fx = Effects::none();
         if s.add_project.sync_dir_listing(&workspace_paths) {
-            self.refresh_add_project_listing()
-        } else {
-            Effects::none()
+            fx = fx.and(self.refresh_add_project_listing());
         }
+        // The chosen root is half the (root, path) pair the suggestion hangs off.
+        fx.and(self.sync_add_project_inference())
     }
 
     /// Fire `directory/list` for the add-project editor's current (root, dir-portion) pair. Mirrors
@@ -2658,6 +2706,46 @@ impl Session {
                 result: __r.map_err(|e| e.to_string()),
             }
         })
+    }
+
+    /// Keep the add-project row's language suggestion in step with its (root, path) pair: when the
+    /// pair moves, ask the server what language declaring that directory would pin
+    /// (`workspace/infer_language` — the directory's own manifests, minus languages already
+    /// declared for it). The result pre-fills an untouched language segment
+    /// ([`Event::AddProjectLanguageInferred`]); one the user has typed into is left alone. Deduped
+    /// on the pair, so calling this after any key that might have moved it is free.
+    fn sync_add_project_inference(&mut self) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return Effects::none();
+        };
+        let target = s.add_project.save_target(&workspace_paths);
+        if target == s.inference_key {
+            return Effects::none();
+        }
+        s.inference_key = target.clone();
+        let workspace = s.workspace_name.clone();
+        let Some((path_index, relative_path)) = target else {
+            // The path emptied: an inferred suggestion goes with it (a typed language stays).
+            if s.language_inferred {
+                s.add_project_language.clear();
+                s.add_project_language_selected = 0;
+                s.language_inferred = false;
+            }
+            return Effects::none();
+        };
+        let key = (path_index, relative_path.clone());
+        self.request::<WorkspaceInferLanguage>(
+            WorkspaceInferLanguageParams {
+                workspace,
+                path_index,
+                relative_path,
+            },
+            move |r| Event::AddProjectLanguageInferred {
+                key,
+                language: r.ok().and_then(|v| v.language),
+            },
+        )
     }
 
     /// Replace the chip editor's path-field text wholesale (the web client's native `<input>` owns
@@ -4811,6 +4899,11 @@ impl Session {
             add: TextField::default(),
             // Multi-root workspaces open on the root segment (there's a choice to make); a
             // single-root one skips straight to the path, where its only root is implied.
+            add_project_language: crate::chips::Input::default(),
+            add_project_language_selected: 0,
+            on_add_project_language: false,
+            language_inferred: false,
+            inference_key: None,
             add_project: Box::new(PathEditor::new(
                 String::new(),
                 if self.workspace_paths.len() > 1 {
@@ -4869,6 +4962,17 @@ impl Session {
         // and hands `Tab`/`Shift-Tab` back once it runs out of segments so traversal continues
         // through the dialog. Anything it ignores falls through to the dialog keys below.
         if row == SettingsRow::AddProject {
+            // The language segment sits after the editor's own two, so it takes the keys first when
+            // it has focus.
+            if self
+                .workspace_settings
+                .as_ref()
+                .is_some_and(|s| s.on_add_project_language)
+            {
+                if let Some(fx) = self.on_add_project_language_key(code, mods) {
+                    return fx;
+                }
+            }
             let workspace_paths = self.workspace_paths.clone();
             let outcome = self.workspace_settings.as_mut().map(|s| {
                 path_editor_key(
@@ -4887,14 +4991,24 @@ impl Session {
                     self.workspace_settings = None;
                     return Effects::none();
                 }
+                // Editor chords can rewrite the path (Alt-l accept, Alt-Backspace pop) or re-aim
+                // the root (Alt-j/k in the root segment) — re-sync the language suggestion either
+                // way; it dedupes on the (root, path) pair, so an unmoved pair costs nothing.
                 Some(PathEditorKey::Handled { refresh: true }) => {
-                    return self.refresh_add_project_listing()
+                    let fx = self.refresh_add_project_listing();
+                    return fx.and(self.sync_add_project_inference());
                 }
-                Some(PathEditorKey::Handled { refresh: false }) => return Effects::none(),
-                // Off the end of the editor's segments — carry on through the dialog. It's the
-                // last row, so forward wraps round to the name field; backward steps to the row
-                // above.
-                Some(PathEditorKey::NextField) => return self.settings_step_field(true),
+                Some(PathEditorKey::Handled { refresh: false }) => {
+                    return self.sync_add_project_inference()
+                }
+                // Tab off the editor's last segment enters the language field rather than leaving
+                // the row; only Tab off *that* moves on. Backward still steps to the row above.
+                Some(PathEditorKey::NextField) => {
+                    if let Some(s) = self.workspace_settings.as_mut() {
+                        s.on_add_project_language = true;
+                    }
+                    return Effects::none();
+                }
                 Some(PathEditorKey::PrevField) => return self.settings_step_field(false),
                 Some(PathEditorKey::Ignored) | None => {}
             }
@@ -4949,6 +5063,91 @@ impl Session {
         // `_set_add_project`. The core handles only the command keys above; any other key here is a
         // no-op.
         let _ = text;
+        Effects::none()
+    }
+
+    /// Keys while the add-project row's language segment has focus. `None` means "not mine" — the
+    /// key falls through to the path editor and then the dialog.
+    ///
+    /// A typeahead over the supported languages, mirroring the root segment's: `Alt-j/k` cycle the
+    /// matches, `Alt-l` adopts the highlighted one, `Shift-Tab`/`Alt-h` step back into the path, and
+    /// `Tab` leaves the row. Text entry is shell-owned, synced via
+    /// [`Self::workspace_settings_set_add_project_language`].
+    fn on_add_project_language_key(&mut self, code: KeyCode, mods: Mods) -> Option<Effects> {
+        let alt = mods.alt && !mods.ctrl;
+        let no_chord = !mods.ctrl && !mods.alt;
+        match code {
+            // Leaving forwards settles on the highlighted candidate, so a partly typed `pyth`
+            // commits as `python` rather than as text the server would reject.
+            KeyCode::Tab if no_chord => {
+                self.adopt_highlighted_language();
+                if let Some(s) = self.workspace_settings.as_mut() {
+                    s.on_add_project_language = false;
+                }
+                Some(self.settings_step_field(true))
+            }
+            KeyCode::BackTab | KeyCode::Char('h') if code == KeyCode::BackTab || alt => {
+                if let Some(s) = self.workspace_settings.as_mut() {
+                    s.on_add_project_language = false;
+                }
+                Some(Effects::none())
+            }
+            KeyCode::Char('l') if alt => {
+                self.adopt_highlighted_language();
+                Some(Effects::none())
+            }
+            KeyCode::Char(c @ ('j' | 'k')) if alt => {
+                if let Some(s) = self.workspace_settings.as_mut() {
+                    let n = s.language_candidates().len();
+                    if n > 0 {
+                        let sel = s.add_project_language_selected.min(n - 1);
+                        s.add_project_language_selected = if c == 'j' {
+                            (sel + 1) % n
+                        } else {
+                            (sel + n - 1) % n
+                        };
+                    }
+                }
+                Some(Effects::none())
+            }
+            // Enter commits the whole row from here too.
+            KeyCode::Enter if no_chord => {
+                self.adopt_highlighted_language();
+                Some(self.commit_add_project())
+            }
+            _ => None,
+        }
+    }
+
+    /// Replace the typed language filter with the candidate it resolves to. A no-op when nothing
+    /// matches, so an invalid entry stays visible (and red) rather than being silently rewritten.
+    fn adopt_highlighted_language(&mut self) {
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return;
+        };
+        // An empty field means "infer" — leaving it must not invent the first candidate.
+        if s.add_project_language.text.is_empty() {
+            return;
+        }
+        if let Some(full) = s.highlighted_language() {
+            s.add_project_language = crate::chips::Input::new(full.to_string());
+            s.add_project_language_selected = 0;
+        }
+    }
+
+    /// Replace the add-project row's language filter wholesale (native `<input>` parity). An edit
+    /// arriving here is the user typing (a core-driven autofill syncs the *same* text back through
+    /// the shells, which the no-change guard swallows) — so the field stops being "inferred" and
+    /// later inference results leave it alone.
+    pub fn workspace_settings_set_add_project_language(&mut self, text: String) -> Effects {
+        if let Some(s) = self.workspace_settings.as_mut() {
+            if s.add_project_language.text != text {
+                s.add_project_language.set(text);
+                s.add_project_language_selected = 0;
+                s.language_inferred = false;
+                s.error = None;
+            }
+        }
         Effects::none()
     }
 
@@ -5039,11 +5238,13 @@ impl Session {
         )
     }
 
-    /// Commit the add-project row: emit `workspace/add_project` for the editor's (root, path) pair.
+    /// Commit the add-project row: emit `workspace/add_project` for the editor's (root, path) pair
+    /// and the chosen language.
     ///
-    /// No language is sent — the server infers it from the marker's file name, which covers every
-    /// marker but `package.json`. Declaring that one as JavaScript rather than TypeScript means
-    /// editing the TOML; it's a rare enough distinction not to earn a third segment in the row.
+    /// The language is optional — left blank the server infers it from the directory's build
+    /// manifests, which covers the common case. Typed, it must be one of ours: an unmatched filter
+    /// refuses the commit rather than sending text the server would reject, so the field can only
+    /// ever produce a language that starts something.
     fn commit_add_project(&mut self) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
         let Some(s) = self.workspace_settings.as_ref() else {
@@ -5052,13 +5253,21 @@ impl Session {
         let workspace = s.workspace_name.clone();
         // `save_target` yields the literal typed path under the chosen root — no snapping to the
         // highlighted suggestion (that's what Tab is for), which matters here too: you may be
-        // naming a marker the completion listing hasn't caught up with.
+        // naming a directory the completion listing hasn't caught up with.
         let Some((path_index, relative_path)) = s.add_project.save_target(&workspace_paths) else {
             return Effects::none();
         };
         if relative_path.trim().is_empty() {
             return Effects::none();
         }
+        if s.language_invalid() {
+            let typed = s.add_project_language.text.clone();
+            if let Some(s) = self.workspace_settings.as_mut() {
+                s.error = Some(format!("{typed} is not a language Aether has a server for"));
+            }
+            return Effects::none();
+        }
+        let language = s.chosen_language();
         if let Some(s) = self.workspace_settings.as_mut() {
             s.error = None;
         }
@@ -5067,7 +5276,7 @@ impl Session {
                 workspace,
                 path_index,
                 relative_path,
-                language: None,
+                language,
             },
             Event::WorkspaceProjectAdded,
         )

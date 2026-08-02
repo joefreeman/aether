@@ -8,6 +8,35 @@
 //! Defined in Phase 0 ahead of the transport so the wire shape is pinned and the status UI can be
 //! built against it; the server side that emits these lands in Phase 1.
 
+/// Every language Aether can launch a server for — the set a *project* may declare
+/// (`docs/projects.md`).
+///
+/// Lives in the protocol rather than the server because both ends need it: the server matches it
+/// against its `server_spec` table (a drift test enforces that), and the client validates the
+/// workspace-settings language field against it, so the dialog can only ever offer a language that
+/// will actually start something.
+pub const SERVER_LANGUAGES: &[&str] = &[
+    "bash",
+    "css",
+    "dockerfile",
+    "elixir",
+    "erlang",
+    "go",
+    "html",
+    "javascript",
+    "json",
+    "markdown",
+    "python",
+    "quiver",
+    "rust",
+    "sql",
+    "terraform",
+    "toml",
+    "tsx",
+    "typescript",
+    "yaml",
+];
+
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::{BufferId, LogicalPosition};

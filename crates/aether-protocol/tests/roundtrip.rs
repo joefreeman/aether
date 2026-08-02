@@ -1583,6 +1583,34 @@ fn workspace_remove_project_params_round_trip() {
 }
 
 #[test]
+fn workspace_infer_language_round_trip() {
+    use aether_protocol::workspace::{
+        WorkspaceInferLanguage, WorkspaceInferLanguageParams, WorkspaceInferLanguageResult,
+    };
+    assert_eq!(WorkspaceInferLanguage::NAME, "workspace/infer_language");
+
+    let p = WorkspaceInferLanguageParams {
+        workspace: "aether".into(),
+        path_index: 1,
+        relative_path: "databricks/".into(),
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"workspace": "aether", "path_index": 1, "relative_path": "databricks/"}),
+    );
+
+    // An inferred language is present; "nothing inferred" omits the key entirely.
+    let r = WorkspaceInferLanguageResult {
+        language: Some("python".into()),
+    };
+    assert_eq!(to_value(&r).unwrap(), json!({"language": "python"}));
+    let r = WorkspaceInferLanguageResult { language: None };
+    assert_eq!(to_value(&r).unwrap(), json!({}));
+    let back: WorkspaceInferLanguageResult = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(back.language, None);
+}
+
+#[test]
 fn workspace_list_result_shape() {
     use aether_protocol::workspace::WorkspaceListResult;
     let r = WorkspaceListResult {
@@ -2103,11 +2131,16 @@ fn picker_item_reference_is_tagged() {
 fn picker_item_symbol_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind, SymbolKind};
     assert_eq!(
+        to_value(PickerKind::WorkspaceSymbols).unwrap(),
+        json!("workspace_symbols")
+    );
+    assert_eq!(
         to_value(PickerKind::DocumentSymbols).unwrap(),
         json!("document_symbols")
     );
     let item = PickerItem::Symbol {
         path: "/home/u/proj/src/lib.rs".into(),
+        display_path: String::new(),
         line: 10,
         col: 3,
         name: "parse_header".into(),
@@ -2137,6 +2170,7 @@ fn picker_item_symbol_is_tagged() {
     // A context (ancestor) row serializes the flag.
     let ctx = PickerItem::Symbol {
         path: "/a".into(),
+        display_path: String::new(),
         line: 0,
         col: 0,
         name: "Outer".into(),
@@ -2577,6 +2611,7 @@ fn picker_update_carries_center_on_symbol() {
         total_display_rows: None,
         center_on: Some(Box::new(PickerItem::Symbol {
             path: "/p/a.rs".into(),
+            display_path: String::new(),
             line: 3,
             col: 0,
             name: "main".into(),

@@ -99,7 +99,7 @@ pub struct WorkspaceProject {
     /// positional reference would be fragile (the config file nests projects under their root
     /// instead, so it has no index at all).
     pub path_index: u32,
-    /// Marker path relative to that root (`Cargo.toml`, `web/package.json`).
+    /// Project directory relative to that root (`.`, `web`, `crates/server`).
     pub relative_path: String,
     /// The language whose server this project pins — inferred from the marker's file name, or
     /// declared explicitly for markers that don't imply one. Empty when the entry doesn't resolve.
@@ -227,11 +227,11 @@ pub struct WorkspaceRemoveRootResult {
     pub next_buffer_id: Option<crate::BufferId>,
 }
 
-/// Declare a project in a workspace (`docs/projects.md`): a marker file whose language server is
-/// pinned open while the workspace is active. The server validates the path (relative, inside its
-/// root, existing, a marker it recognises or one with an explicit `language`), appends it to the
-/// TOML under that root, and launches the server straight away rather than waiting for the next
-/// activation.
+/// Declare a project in a workspace (`docs/projects.md`): a *directory* whose language server is
+/// pinned open while the workspace is active. The server validates it (relative, inside its root,
+/// exists, and its language either inferable from the build manifests inside or given explicitly),
+/// appends it to the TOML under that root, and launches the server straight away rather than waiting
+/// for the next activation.
 ///
 /// Refuses duplicates and anything that fails to resolve — unlike activation, which skips bad
 /// entries and carries on, a *new* declaration should fail loudly while the user is looking at it.
@@ -249,10 +249,10 @@ pub struct WorkspaceAddProjectParams {
     /// the user in multi-root workspaces (the path editor's root field); always `0` when there's
     /// only one root.
     pub path_index: u32,
-    /// Marker path relative to that root.
+    /// Project directory relative to that root; empty (or `"."`) is the root itself.
     pub relative_path: String,
-    /// Overrides the language inferred from the marker's name. Needed for markers that don't imply
-    /// one on their own — `package.json` could be either TypeScript or JavaScript.
+    /// Overrides the language inferred from the directory's build manifests. Needed when it has
+    /// several kinds, or none at all — a Python tree with no `pyproject.toml`, say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
@@ -273,6 +273,43 @@ pub struct WorkspaceRemoveProjectParams {
     /// The project to drop, as it appears in [`WorkspaceProject`].
     pub path_index: u32,
     pub relative_path: String,
+}
+
+/// What language would declaring this directory as a project pin? The settings dialog's add-project
+/// row asks as the user types, so the language segment can be pre-filled with the answer (still
+/// editable — a typed language overrides, and committing with the field empty re-infers
+/// server-side anyway).
+///
+/// Read-only: the same manifest scan `workspace/add_project`'s validation runs, with one addition —
+/// languages the workspace *already declares* for this directory are excluded, because a directory
+/// holding several projects in several languages is declared once per language and the useful
+/// suggestion is the one not yet added. `language` comes back `None` whenever the directory doesn't
+/// (yet) resolve or its manifests don't single out exactly one language; never an RPC error, since
+/// half-typed paths are this method's normal input.
+pub struct WorkspaceInferLanguage;
+impl RpcMethod for WorkspaceInferLanguage {
+    const NAME: &'static str = "workspace/infer_language";
+    type Params = WorkspaceInferLanguageParams;
+    type Result = WorkspaceInferLanguageResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceInferLanguageParams {
+    pub workspace: String,
+    /// Root the prospective project would be declared under (index into the workspace's roots) —
+    /// the add-project row's root segment.
+    pub path_index: u32,
+    /// Directory relative to that root, as typed. A trailing `/` and the empty/`.` forms (the root
+    /// itself) are normalized server-side exactly as `workspace/add_project` normalizes them.
+    pub relative_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceInferLanguageResult {
+    /// The single language the directory's own build manifests identify, after excluding languages
+    /// already declared for it. Absent when there is no such single language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// Rename a workspace. Moves the on-disk config (`<old>.toml` → `<new>.toml`) and re-keys the

@@ -89,6 +89,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   lsp_servers: "List LSPs…",
   references: "List references…",
   document_symbols: "Go to symbol…",
+  workspace_symbols: "Go to symbol in workspace…",
   keybindings: "Search keybindings…",
   jumplist: "Filter the jumplist…",
 };
@@ -466,6 +467,13 @@ interface WorkspaceSettingsView {
   first_project_index: number;
   add: EditorInput;
   add_project: PathEditorView;
+  /** The add-project row's optional language override — empty means "infer from the directory". */
+  add_project_language: {
+    input: string;
+    ghost: string | null;
+    invalid: boolean;
+    focused: boolean;
+  };
   error: string | null;
 }
 
@@ -959,6 +967,8 @@ export class Shell {
   private readonly psAddInput: HTMLInputElement;
   private readonly psAddProjectInput: HTMLInputElement;
   private readonly psAddProjectRootInput: HTMLInputElement;
+  private readonly psAddProjectLanguageInput: HTMLInputElement;
+  private psAddProjectLanguageGhost: HTMLElement | null = null;
   /** The add-project row's field area, rebuilt per render like save-as's. */
   private readonly psAddProjectFieldEl: HTMLElement;
   private psAddProjectGhost: HTMLElement | null = null;
@@ -1398,6 +1408,12 @@ export class Shell {
       if (this.session)
         this.runEffects(this.session.workspace_settings_set_add_project(v) as CoreEffect[]);
     });
+    this.psAddProjectLanguageInput = projectInput((v) => {
+      if (this.session)
+        this.runEffects(
+          this.session.workspace_settings_set_add_project_language(v) as CoreEffect[],
+        );
+    });
     // Rebuilt per render (which segment is an input vs. static text changes with focus).
     this.psAddProjectFieldEl = document.createElement("span");
     this.psAddProjectFieldEl.className = "picker-editor-field";
@@ -1635,10 +1651,12 @@ export class Shell {
       const ps = v.workspace_settings;
       if (ps.selected === 0) return this.psNameInput;
       if (ps.selected === ps.input_index) return this.psAddInput;
-      if (ps.selected === ps.add_project_index)
+      if (ps.selected === ps.add_project_index) {
+        if (ps.add_project_language.focused) return this.psAddProjectLanguageInput;
         return ps.add_project.multi_root && ps.add_project.field === "root"
           ? this.psAddProjectRootInput
           : this.psAddProjectInput;
+      }
       return this.capture;
     }
     return this.capture;
@@ -1669,6 +1687,7 @@ export class Shell {
       this.psAddInput,
       this.psAddProjectInput,
       this.psAddProjectRootInput,
+      this.psAddProjectLanguageInput,
     ]);
   }
 
@@ -3100,7 +3119,8 @@ export class Shell {
       this.psAddProjectSepEl = sep;
       parts.push(sep);
     }
-    if (focused && !onRoot) {
+    const onLanguage = focused && ps.add_project_language.focused;
+    if (focused && !onRoot && !onLanguage) {
       parts.push(this.projectWrap(this.psAddProjectInput, false));
     } else {
       const span = document.createElement("span");
@@ -3108,7 +3128,50 @@ export class Shell {
       span.textContent = ed.input;
       parts.push(span);
     }
+    // The optional language override, right-aligned like the language tags on the project rows
+    // above — only once it has focus or a value, so it isn't noise on the nine-in-ten projects
+    // whose language is inferable.
+    const lang = ps.add_project_language;
+    if (onLanguage || lang.input.length > 0) {
+      // A plain gap rather than a glyph, and *not* `picker-editor-sep` — that class carries a -6px
+      // pull to sit the root's `:` flush against its text, which would jam this against the path.
+      // When the path renders as a static span it hugs its text, so the gap does the pushing
+      // (`grow`); a focused path is a flex-1 input that already pushes the segment to the right
+      // edge, and a second grower would steal half its width.
+      const pathIsInput = focused && !onRoot && !onLanguage;
+      const gap = document.createElement("span");
+      gap.className = pathIsInput ? "ps-language-gap" : "ps-language-gap grow";
+      parts.push(gap);
+      if (onLanguage) {
+        const wrap = document.createElement("span");
+        wrap.className = "picker-editor-rootwrap hug";
+        const ghost = document.createElement("span");
+        ghost.className = "picker-editor-ghost";
+        this.psAddProjectLanguageInput.classList.add("picker-editor-root");
+        wrap.append(ghost, this.psAddProjectLanguageInput);
+        this.psAddProjectLanguageGhost = ghost;
+        parts.push(wrap);
+      } else {
+        const span = document.createElement("span");
+        span.className = lang.invalid
+          ? "picker-editor-seg invalid"
+          : "picker-editor-seg root";
+        span.textContent = lang.input;
+        parts.push(span);
+      }
+    }
     this.psAddProjectFieldEl.replaceChildren(...parts);
+    if (onLanguage) {
+      if (this.psAddProjectLanguageInput.value !== lang.input) {
+        this.setInputValue(this.psAddProjectLanguageInput, lang.input);
+      }
+      this.psAddProjectLanguageInput.classList.toggle("invalid", lang.invalid);
+      // An empty field shows a "language" hint through the ghost layer — the layer is also the
+      // hug wrap's sizer, so a native placeholder on the input would render clipped (native-client
+      // parity: iced draws its placeholder through the ghost layer for the same reason).
+      const hint = lang.input.length === 0 ? "language" : null;
+      this.fillGhost(this.psAddProjectLanguageGhost, lang.input, lang.ghost ?? hint);
+    }
 
     if (onRoot) {
       if (this.psAddProjectRootInput.value !== ed.root_filter) {
@@ -3821,7 +3884,9 @@ export class Shell {
             ? "Finding references…"
             : p.kind === "document_symbols"
               ? "Finding symbols…"
-              : "Searching…";
+              : p.kind === "workspace_symbols"
+                ? "Searching projects…"
+                : "Searching…";
       } else {
         text = p.empty_note ?? "";
       }

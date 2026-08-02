@@ -4292,6 +4292,44 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     );
 }
 
+/// The workspace-symbols picker distinguishes "your query matched nothing" from "nothing here can
+/// answer" — the second is a config problem the user resolves elsewhere, so saying "No symbols
+/// found" would send them looking in the wrong place.
+#[test]
+fn workspace_symbols_empty_note_names_the_missing_projects() {
+    use aether_protocol::picker::PickerKind;
+    use aether_protocol::workspace::WorkspaceProject;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+
+    // No projects declared: the note points at where you'd declare one. (A fresh picker is
+    // `ticking` until the first push settles it; the note is about the settled state.)
+    let _ = s.open_picker(PickerKind::WorkspaceSymbols, None, None, false, None);
+    s.picker.as_mut().unwrap().ticking = false;
+    let note = s.picker.as_ref().unwrap().empty_note();
+    assert!(
+        note.is_some_and(|n| n.contains("No projects")),
+        "expected a no-projects note, got {note:?}",
+    );
+
+    // With one declared, an empty result really is "no matches".
+    s.workspace_projects = vec![WorkspaceProject {
+        path_index: 0,
+        relative_path: "Cargo.toml".into(),
+        language: "rust".into(),
+        error: None,
+    }];
+    let _ = s.open_picker(PickerKind::WorkspaceSymbols, None, None, false, None);
+    s.picker.as_mut().unwrap().ticking = false;
+    let note = s.picker.as_ref().unwrap().empty_note();
+    assert!(
+        note.is_some_and(|n| n.contains("No symbols")),
+        "expected a no-matches note, got {note:?}",
+    );
+}
+
 /// Boot seeds a session straight from the activation result, without going through
 /// `sync_workspace_info` — so `Session::new` has to carry *everything* the server sent. Regression
 /// test: it dropped the declared projects, and a freshly launched client showed an empty Projects
@@ -4465,6 +4503,240 @@ fn settings_alt_j_does_not_traverse_fields() {
     );
 }
 
+/// A ghost belongs to the segment being edited. Left showing while another has focus it reads as
+/// part of the value — a path of `databricks/` trailed by a `.databricks/` suggestion looks like the
+/// path you're about to commit.
+#[test]
+fn moving_off_a_segment_drops_its_ghost() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    for _ in 0..3 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    // A listing gives the path segment something to suggest.
+    let _ = s.workspace_settings_set_add_project("dat".into());
+    if let Some(st) = s.workspace_settings.as_mut() {
+        st.add_project
+            .set_dir_listing(vec![aether_protocol::directory::DirectoryEntry {
+                name: "databricks".into(),
+                is_dir: true,
+            }]);
+    }
+    assert!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_project
+            .path_ghost()
+            .is_some(),
+        "the focused path segment suggests",
+    );
+
+    // Tab into the language segment: the path's suggestion is no longer being offered.
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert!(ps.on_add_project_language);
+    assert!(
+        ps.language_ghost().is_none(),
+        "an empty language field ghosts nothing — it would read as a default",
+    );
+}
+
+/// The language segment only accepts a language we have a server for. That's the point of it: a
+/// typo silently sent to the server comes back as an error you can't act on from the dialog.
+#[test]
+fn settings_language_segment_only_accepts_supported_languages() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    // name → root → add-root → add-project(path) → add-project(language).
+    for _ in 0..4 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    assert!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .on_add_project_language
+    );
+    let _ = s.workspace_settings_set_add_project("databricks".into());
+
+    // A prefix resolves to the one language it names, and Alt-l settles the text on it.
+    let _ = s.workspace_settings_set_add_project_language("pyth".into());
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert!(!ps.language_invalid());
+    assert_eq!(ps.chosen_language().as_deref(), Some("python"));
+    assert_eq!(ps.language_ghost().as_deref(), Some("on"));
+    s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_project_language
+            .text,
+        "python"
+    );
+
+    // Nonsense is refused rather than sent.
+    let _ = s.workspace_settings_set_add_project_language("cobol".into());
+    assert!(s.workspace_settings.as_ref().unwrap().language_invalid());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "workspace/add_project").is_none(),
+        "an unsupported language must not reach the server",
+    );
+    assert!(s
+        .workspace_settings
+        .as_ref()
+        .unwrap()
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("cobol")));
+
+    // Empty means "infer", which is the common case and must still commit.
+    let _ = s.workspace_settings_set_add_project_language(String::new());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let add = find_request(&fx, "workspace/add_project").expect("commits with no language");
+    assert!(
+        add.get("language").is_none(),
+        "absent, so the server infers"
+    );
+}
+
+/// Token + params of the (first) `method` request in `fx` — for results that must be fed back.
+fn request_with_token<'a>(fx: &'a Effects, method: &str) -> Option<(u64, &'a serde_json::Value)> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::Request {
+            token,
+            method: m,
+            params,
+        } if *m == method => Some((*token, params)),
+        _ => None,
+    })
+}
+
+/// Typing a directory into the add-project row asks the server what language declaring it would
+/// pin (`workspace/infer_language`); the answer pre-fills the untouched language segment and
+/// commits explicitly, like a typed language would.
+#[test]
+fn typing_a_project_path_infers_its_language() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+
+    let fx = s.workspace_settings_set_add_project("databricks/".into());
+    let (token, params) =
+        request_with_token(&fx, "workspace/infer_language").expect("asks the server as you type");
+    assert_eq!(params["workspace"], json!("aether"));
+    assert_eq!(params["path_index"], json!(0));
+    assert_eq!(params["relative_path"], json!("databricks/"));
+
+    let _ = s.on_rpc_result(token, Ok(json!({"language": "python"})));
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project_language.text, "python");
+    assert!(ps.language_inferred);
+
+    // The suggestion commits as an explicit language, exactly as if it had been typed.
+    for _ in 0..3 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS); // name → root → add-root → add-project
+    }
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let add = find_request(&fx, "workspace/add_project").expect("commits");
+    assert_eq!(add["language"], json!("python"));
+}
+
+/// The reply is keyed to the (root, path) pair it was asked about — one that lands after the
+/// editor moved on must not fill the field for the wrong directory.
+#[test]
+fn a_stale_inference_reply_is_dropped() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+
+    let fx = s.workspace_settings_set_add_project("databricks/".into());
+    let (stale, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+    let fx = s.workspace_settings_set_add_project("web/".into());
+    let (current, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+
+    // The first directory's answer arrives late: dropped.
+    let _ = s.on_rpc_result(stale, Ok(json!({"language": "python"})));
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_project_language
+            .text,
+        ""
+    );
+    // The current directory's answer fills.
+    let _ = s.on_rpc_result(current, Ok(json!({"language": "typescript"})));
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_project_language
+            .text,
+        "typescript"
+    );
+}
+
+/// The field is the user's once they've typed in it: inference stops touching it. An *inferred*
+/// value, by contrast, follows the path — replaced when the new directory infers differently,
+/// cleared when it infers nothing (or the path empties).
+#[test]
+fn a_typed_language_beats_inference_but_an_inferred_one_follows_the_path() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+
+    // Typed first, inferred later: the typed value stays.
+    let fx = s.workspace_settings_set_add_project("databricks/".into());
+    let (token, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+    let _ = s.workspace_settings_set_add_project_language("go".into());
+    let _ = s.on_rpc_result(token, Ok(json!({"language": "python"})));
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project_language.text, "go");
+    assert!(!ps.language_inferred);
+
+    // Inferred, then the path moves somewhere nothing infers for: the suggestion clears.
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    let fx = s.workspace_settings_set_add_project("pkg/".into());
+    let (token, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+    let _ = s.on_rpc_result(token, Ok(json!({"language": "rust"})));
+    let fx = s.workspace_settings_set_add_project("plain/".into());
+    let (token, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+    let _ = s.on_rpc_result(token, Ok(json!({})));
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project_language.text, "", "nothing inferred any more");
+    assert!(!ps.language_inferred);
+
+    // And emptying the path clears an inferred suggestion without waiting on the server.
+    let fx = s.workspace_settings_set_add_project("pkg/".into());
+    let (token, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
+    let _ = s.on_rpc_result(token, Ok(json!({"language": "rust"})));
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_project_language
+            .text,
+        "rust"
+    );
+    let _ = s.workspace_settings_set_add_project(String::new());
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project_language.text, "");
+    assert!(!ps.language_inferred);
+}
+
 /// The overlay is two lists, each with a trailing input. This pins the whole index→row mapping,
 /// which every shell's rendering and focus routing depends on.
 #[test]
@@ -4531,7 +4803,13 @@ fn settings_navigation_reaches_the_add_project_row() {
     assert_eq!(ps.row(), SettingsRow::AddProject);
     assert!(ps.on_input(), "both add rows count as text inputs");
 
-    // Past the last field, Tab cycles round to the first rather than trapping you at the bottom.
+    // Tab off the path enters the row's trailing language segment, still on the same row...
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.row(), SettingsRow::AddProject);
+    assert!(ps.on_add_project_language);
+
+    // ...and only Tab off *that* cycles round to the first field.
     s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
@@ -4801,6 +5079,7 @@ fn symbol_push_center_on_lands_the_highlight() {
     }
     let sym = |line: u32, name: &str| PickerItem::Symbol {
         path: "/a.rs".into(),
+        display_path: String::new(),
         line,
         col: 0,
         name: name.into(),
@@ -4857,6 +5136,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
     }
     let sym = |line: u32, name: &str| PickerItem::Symbol {
         path: "/a.rs".into(),
+        display_path: String::new(),
         line,
         col: 0,
         name: name.into(),

@@ -359,6 +359,27 @@ pub struct WorkspaceSettings {
     /// project is stored relative to its root, so the root genuinely isn't in the path and has to
     /// be chosen; that's exactly what this editor's root field is for.
     pub add_project: Box<crate::path_editor::PathEditor>,
+    /// The add-project row's optional language segment — a typeahead over
+    /// [`aether_protocol::lsp::SERVER_LANGUAGES`], the languages a server exists for. Left empty the
+    /// server infers from the directory's build manifests; typed, it overrides — which is the only
+    /// way to declare a tree that has no manifest (a Python package with no `pyproject.toml`) or
+    /// several.
+    ///
+    /// It's a *separate* field rather than a third [`crate::path_editor::PathEditor`] segment
+    /// because that editor is shared with the save-as prompt, which has no language to pick.
+    pub add_project_language: crate::chips::Input,
+    /// Highlight within the language candidates for the current filter (Alt-j/k cycles it).
+    pub add_project_language_selected: usize,
+    /// The language segment has focus, rather than the path editor's own two.
+    pub on_add_project_language: bool,
+    /// The language segment's current text was filled in by `workspace/infer_language` rather than
+    /// typed — so a fresh inference may replace or clear it as the path moves. Any user edit drops
+    /// the flag and the field is theirs from then on (inference stops touching it).
+    pub language_inferred: bool,
+    /// The `(path_index, relative_path)` the last `workspace/infer_language` request asked about:
+    /// the staleness key its result is checked against, and the dedupe that makes re-syncing after
+    /// any key free. `None` while the path is empty (nothing to ask about).
+    pub inference_key: Option<(u32, String)>,
     /// In-dialog error from the last add/remove/rename attempt. Rendered as the bottom line of
     /// the overlay. Cleared when the user edits a field or initiates another action.
     pub error: Option<String>,
@@ -430,6 +451,55 @@ impl WorkspaceSettings {
             SettingsRow::Root(i) => self.roots.get(i),
             _ => None,
         }
+    }
+
+    /// Languages matching the add-project row's typed language filter, as indices into
+    /// [`aether_protocol::lsp::SERVER_LANGUAGES`]. Prefix-matched exactly like the root typeahead —
+    /// the whole list on an empty filter.
+    pub fn language_candidates(&self) -> Vec<usize> {
+        let all: Vec<String> = aether_protocol::lsp::SERVER_LANGUAGES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        crate::chips::root_candidates(&all, &self.add_project_language.text)
+    }
+
+    /// The highlighted language, if the filter matches anything.
+    pub fn highlighted_language(&self) -> Option<&'static str> {
+        let candidates = self.language_candidates();
+        let i = *candidates.get(
+            self.add_project_language_selected
+                .min(candidates.len().saturating_sub(1)),
+        )?;
+        aether_protocol::lsp::SERVER_LANGUAGES.get(i).copied()
+    }
+
+    /// The inline completion beyond what's typed, for the ghost. `None` on an empty field: nothing
+    /// is being completed there, and ghosting the first language would read as a default.
+    pub fn language_ghost(&self) -> Option<String> {
+        if self.add_project_language.text.is_empty() {
+            return None;
+        }
+        let full = self.highlighted_language()?;
+        full.len()
+            .checked_sub(self.add_project_language.text.len())
+            .map(|_| full[self.add_project_language.text.len()..].to_string())
+    }
+
+    /// The typed filter matches no supported language — rendered red, and refused on commit. Empty
+    /// is fine: that's "infer it".
+    pub fn language_invalid(&self) -> bool {
+        !self.add_project_language.text.is_empty() && self.highlighted_language().is_none()
+    }
+
+    /// The language to send with `workspace/add_project`: `None` when the field is empty (infer
+    /// server-side). Always a real supported language, never the raw typed text — the field only
+    /// accepts one of ours.
+    pub fn chosen_language(&self) -> Option<String> {
+        if self.add_project_language.text.is_empty() {
+            return None;
+        }
+        self.highlighted_language().map(str::to_string)
     }
 
     /// The project under the current selection, when a project row is focused.
@@ -563,7 +633,7 @@ pub enum ConfirmKind {
     /// Removing a root from the workspace-settings overlay.
     RemoveRoot { path: String },
     /// Undeclaring a project from the workspace-settings overlay. Only the declaration goes — the
-    /// marker file and everything around it are untouched.
+    /// directory and everything in it are untouched.
     RemoveProject { path: String },
     /// Deleting a workspace (its config) from the workspace switcher. Forgets the definition, not the
     /// files under its roots.

@@ -1141,6 +1141,10 @@ fn draw_settings_rows(
 /// optional root typeahead (multi-root workspaces only), then the root-relative marker path with a
 /// dim ghost suggestion. Neither segment carries a selection highlight; the caret marks the focus,
 /// exactly as the add-root row does.
+/// The gap between the path and language segments — wide enough to read as a separate field
+/// without a glyph, and the width the caret math adds when the language segment has focus.
+const SEGMENT_GAP: &str = "   ";
+
 fn project_editor_line<'a>(
     ed: &'a crate::app::ProjectEditorState,
     base_style: Style,
@@ -1187,8 +1191,31 @@ fn project_editor_line<'a>(
             text_style
         };
         spans.push(Span::styled(ed.path_input.text.clone(), style));
-        if let Some(ghost) = &ed.path_ghost {
-            spans.push(Span::styled(ghost.clone(), ghost_style));
+        // A ghost is a completion aid for the segment you're *editing*. Left showing while another
+        // segment has focus it reads as part of the value — `databricks/` with a trailing
+        // `.databricks/` looks like the path you're about to commit, which it isn't.
+        if ed.on_path() {
+            if let Some(ghost) = &ed.path_ghost {
+                spans.push(Span::styled(ghost.clone(), ghost_style));
+            }
+        }
+    }
+    // The optional language override, after the path. Only drawn once there's something to say:
+    // typed text, or the segment having focus (so you can see where the caret went).
+    if ed.on_language || !ed.language_input.text.is_empty() {
+        spans.push(Span::styled(SEGMENT_GAP, ghost_style));
+        let style = if ed.language_invalid {
+            text_style.fg(NORD11)
+        } else {
+            text_style.fg(NORD8)
+        };
+        if ed.language_input.text.is_empty() {
+            spans.push(Span::styled("language…".to_string(), placeholder_style));
+        } else {
+            spans.push(Span::styled(ed.language_input.text.clone(), style));
+            if let Some(ghost) = &ed.language_ghost {
+                spans.push(Span::styled(ghost.clone(), ghost_style));
+            }
         }
     }
     Line::from(spans)
@@ -1255,17 +1282,20 @@ fn place_settings_input_cursor(
     // add-project row is a two-segment editor: on its path segment the caret sits past the
     // rendered `root: ` prefix.
     let ed = &settings.add_project;
+    let root_w = if ed.multi_root {
+        (ed.root_display.width() + 2) as u16 // "label" + ": "
+    } else {
+        0
+    };
     let (input, prefix_w) = match settings.focused() {
         Some(crate::app::SettingsRowView::AddRoot) => (&settings.add_input, 0),
         Some(crate::app::SettingsRowView::AddProject) if ed.on_root => (&ed.root_input, 0),
-        Some(crate::app::SettingsRowView::AddProject) => (
-            &ed.path_input,
-            if ed.multi_root {
-                (ed.root_display.width() + 2) as u16 // "label" + ": "
-            } else {
-                0
-            },
+        // The language segment is drawn after the path plus its two-space gap.
+        Some(crate::app::SettingsRowView::AddProject) if ed.on_language => (
+            &ed.language_input,
+            root_w + ed.path_input.text.width() as u16 + SEGMENT_GAP.len() as u16,
         ),
+        Some(crate::app::SettingsRowView::AddProject) => (&ed.path_input, root_w),
         _ => return,
     };
     let row_y = rows.y + (input_idx - start) as u16;
@@ -1426,13 +1456,15 @@ fn picker_empty_message(picker: &crate::picker::PickerState) -> Option<&str> {
     }
     let async_kind = matches!(
         picker.kind,
-        Some(PickerKind::References | PickerKind::DocumentSymbols)
+        Some(PickerKind::References | PickerKind::DocumentSymbols | PickerKind::WorkspaceSymbols)
     );
     if picker.ticking && async_kind {
-        return Some(if picker.kind == Some(PickerKind::DocumentSymbols) {
-            "Finding symbols…"
-        } else {
-            "Finding references…"
+        return Some(match picker.kind {
+            Some(PickerKind::DocumentSymbols) => "Finding symbols…",
+            // Plural servers, and slow enough to be worth naming what's happening: pinned project
+            // servers answer one at a time and a cold one can take seconds.
+            Some(PickerKind::WorkspaceSymbols) => "Searching projects…",
+            _ => "Finding references…",
         });
     }
     // `empty_note` is already `None` while ticking (non-async) or for an unqueried Grep.
@@ -2372,6 +2404,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
         Some(aether_protocol::picker::PickerKind::References) => "List references…",
         Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
+        Some(aether_protocol::picker::PickerKind::WorkspaceSymbols) => "Go to symbol in workspace…",
         Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
         Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",

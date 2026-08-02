@@ -338,6 +338,22 @@ pub struct ProjectEditorState {
     pub path_ghost: Option<String>,
     /// The typed path's *parent* directory doesn't exist — advisory, rendered red.
     pub path_invalid: bool,
+    /// The optional language override. Empty means "infer from the directory's manifests".
+    pub language_input: crate::text_input::TextInput,
+    /// Inline typeahead completion for the language filter.
+    pub language_ghost: Option<String>,
+    /// The typed filter matches no supported language — rendered red, refused on commit.
+    pub language_invalid: bool,
+    /// The language segment has focus.
+    pub on_language: bool,
+}
+
+impl ProjectEditorState {
+    /// The *path* segment has focus — neither of the two that flank it. Only then does its ghost
+    /// belong on screen.
+    pub fn on_path(&self) -> bool {
+        self.focused && !self.on_root && !self.on_language
+    }
 }
 
 /// One row of the settings overlay's list area, paired with the selection index it answers to.
