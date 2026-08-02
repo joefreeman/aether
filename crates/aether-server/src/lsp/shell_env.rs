@@ -85,13 +85,42 @@ pub async fn resolve(root: &Path) -> Option<HashMap<String, String>> {
     resolved
 }
 
+/// Put the captured shell in its own session, so it has no controlling terminal.
+///
+/// `-i` makes the shell *interactive*, which makes it set up job control — it calls `tcsetpgrp` on
+/// whatever controlling terminal it inherited. From a background process group that raises
+/// `SIGTTOU`, which stops the whole job: run the server in a foreground terminal
+/// (`cargo run -- server` rather than the usual detached daemon) and the first environment capture
+/// suspends it, with the shell reporting a bare `[1]+ Stopped` and no clue as to why.
+///
+/// The daemon itself is normally `setsid`-detached (see `aether-ae`'s `detach`), which is why this
+/// only bites when running the server attached to a tty — so give the capture the same treatment
+/// and the two paths behave identically.
+#[cfg(unix)]
+fn detach_from_terminal(cmd: &mut Command) {
+    // `tokio::process::Command` exposes `pre_exec` directly (no `CommandExt` import needed).
+    // SAFETY: `setsid` is async-signal-safe and is the only thing we run in the forked child
+    // before `exec`; we touch no shared state, allocate nothing, and return on its result.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_from_terminal(_cmd: &mut Command) {}
+
 /// Run `<shell> -l -i -c` in `root`, dumping its environment between sentinels, and parse it back.
 async fn capture(shell: &OsStr, root: &Path) -> Option<HashMap<String, String>> {
     // `env -0` gives NUL-delimited `KEY=VALUE` records (robust to a newline inside a value). The
     // sentinels let us discard whatever the shell's rc files printed to stdout during init.
     let script = format!("printf %s {BEGIN}; env -0; printf %s {END}");
-    let run = Command::new(shell)
-        .arg("-l")
+    let mut cmd = Command::new(shell);
+    cmd.arg("-l")
         .arg("-i")
         .arg("-c")
         .arg(&script)
@@ -100,8 +129,9 @@ async fn capture(shell: &OsStr, root: &Path) -> Option<HashMap<String, String>> 
         // shells emit job-control chatter there that isn't ours to surface.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+        .stderr(Stdio::null());
+    detach_from_terminal(&mut cmd);
+    let run = cmd.output();
 
     match tokio::time::timeout(CAPTURE_TIMEOUT, run).await {
         Ok(Ok(out)) => parse_env_dump(&out.stdout),

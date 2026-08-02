@@ -11,8 +11,8 @@
 //! exposed as `has_picker`/`has_prompt` flags for now; their full DTOs land in the next slice.
 
 use aether_client::chips::{ChipEditor, ChipEditorField};
+use aether_client::path_editor::PathEditor;
 use aether_client::picker::PickerState;
-use aether_client::save_as::SaveAsEditor;
 use aether_client::session::{ConfirmKind, ConnState, Mode, Pending, Prompt, Session};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -96,8 +96,11 @@ fn app_settings(s: &Session) -> Value {
 
 /// The workspace-settings overlay (`Space ,`), when open. Core-owned state + key handling
 /// (`on_workspace_settings_key`); the shell renders this projection and routes keys through the
-/// global keydown → `on_key`. Selection model: 0 = name field, `1..=roots.len()` = root rows,
-/// `roots.len() + 1` = the add-root input row.
+/// global keydown → `on_key`.
+///
+/// Selection model: 0 = name field, then the roots, the add-root input, the projects
+/// (`docs/projects.md`), and the add-project input. The two input indices ride along so the shell
+/// can tell which row is focused without re-deriving the arithmetic.
 fn workspace_settings(s: &Session) -> Value {
     let Some(ps) = &s.workspace_settings else {
         return Value::Null;
@@ -106,10 +109,16 @@ fn workspace_settings(s: &Session) -> Value {
     json!({
         "name": field(&ps.name),
         "roots": ps.roots,
+        "projects": ps.projects,
         "selected": ps.selected,
-        // Selection index of the add-root input row, so the shell knows which row is focused.
+        // Selection index of the add-root input row.
         "input_index": ps.input_index(),
+        // ...and of the add-project input row (the last row).
+        "add_project_index": ps.add_project_index(),
+        // Where the projects list starts, so the shell can place its section heading.
+        "first_project_index": ps.input_index() + 1,
         "add": field(&ps.add),
+        "add_project": path_editor(&ps.add_project, &s.workspace_paths),
         "error": ps.error,
     })
 }
@@ -199,14 +208,23 @@ fn chip_editor(ce: &Option<ChipEditor>, workspace_paths: &[String]) -> Value {
     })
 }
 
-/// The save-as path editor's projection — same shape as [`chip_editor`]'s dir half, since the UX
-/// mirrors it. The core owns the editing/ghost/validity logic; the shell renders this and syncs
-/// text via `save_as_set_input` / `save_as_set_root_filter`.
-fn save_as(ed: &SaveAsEditor, workspace_paths: &[String]) -> Value {
+/// The save-as prompt's projection — [`path_editor`] under its own `kind` tag.
+fn save_as(ed: &PathEditor, workspace_paths: &[String]) -> Value {
+    let mut v = path_editor(ed, workspace_paths);
+    v["kind"] = json!("saveas");
+    v
+}
+
+/// A [`PathEditor`]'s projection — same shape as [`chip_editor`]'s dir half, since the UX mirrors
+/// it. The core owns the editing/ghost/validity logic; the shell renders this and syncs text back
+/// through the matching `*_set_input` / `*_set_root_filter` pair.
+///
+/// Shared by the save-as prompt and the settings overlay's add-project row, which use the same
+/// editor (`docs/projects.md`).
+fn path_editor(ed: &PathEditor, workspace_paths: &[String]) -> Value {
     let labels = aether_client::labels::root_labels(workspace_paths);
     let multi_root = workspace_paths.len() > 1;
     json!({
-        "kind": "saveas",
         "field": match ed.field {
             ChipEditorField::Root => "root",
             ChipEditorField::Path => "path",
@@ -272,6 +290,7 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }
         ConfirmKind::RemoveRoot { path } => json!({ "kind": "remove_root", "path": path }),
+        ConfirmKind::RemoveProject { path } => json!({ "kind": "remove_project", "path": path }),
         ConfirmKind::DeleteWorkspace { name } => {
             json!({ "kind": "delete_workspace", "name": name })
         }

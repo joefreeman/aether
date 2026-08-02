@@ -239,6 +239,7 @@ type ConfirmKind =
   | { kind: "discard_close"; label: string }
   | { kind: "delete"; noun: string; name: string }
   | { kind: "remove_root"; path: string }
+  | { kind: "remove_project"; path: string }
   | { kind: "delete_workspace"; name: string };
 
 type PromptView =
@@ -291,6 +292,8 @@ function confirmMessage(c: ConfirmKind): string {
       return `Delete ${c.noun} "${c.name}"?`;
     case "remove_root":
       return `Remove root "${c.path}"?`;
+    case "remove_project":
+      return `Stop pinning project "${c.path}"?`;
     case "delete_workspace":
       return `Delete workspace "${c.name}"?`;
   }
@@ -429,14 +432,40 @@ interface CoreView {
 
 /** The workspace-settings overlay (`Space ,`), when open (view.rs `workspace_settings`). Core-owned
  *  state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys through
- *  the global keydown → `on_key`. Selection: 0 = name field, `1..=roots.length` = root rows,
- *  `input_index` = the add-root input row. */
+ *  the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index` (the
+ *  add-root input), the projects (docs/projects.md), and `add_project_index` (the add-project
+ *  input). */
+interface WorkspaceProjectView {
+  path_index: number;
+  relative_path: string;
+  language: string;
+  error?: string | null;
+}
+
+/** The add-project row's two-segment path editor — the same projection the save-as prompt gets,
+ *  since they share the component (docs/projects.md). */
+interface PathEditorView {
+  field: "root" | "path";
+  input: string;
+  root_filter: string;
+  multi_root: boolean;
+  root_ghost: string | null;
+  root_invalid: boolean;
+  root_display: string | null;
+  path_ghost: string | null;
+  path_invalid: boolean;
+}
+
 interface WorkspaceSettingsView {
   name: EditorInput;
   roots: string[];
+  projects: WorkspaceProjectView[];
   selected: number;
   input_index: number;
+  add_project_index: number;
+  first_project_index: number;
   add: EditorInput;
+  add_project: PathEditorView;
   error: string | null;
 }
 
@@ -925,8 +954,17 @@ export class Shell {
   private readonly psModalEl: HTMLElement;
   /** The `<ul>` of existing roots — rebuilt each render. */
   private readonly psRootsEl: HTMLElement;
+  private readonly psProjectsEl: HTMLElement;
   private readonly psNameInput: HTMLInputElement;
   private readonly psAddInput: HTMLInputElement;
+  private readonly psAddProjectInput: HTMLInputElement;
+  private readonly psAddProjectRootInput: HTMLInputElement;
+  /** The add-project row's field area, rebuilt per render like save-as's. */
+  private readonly psAddProjectFieldEl: HTMLElement;
+  private psAddProjectGhost: HTMLElement | null = null;
+  private psAddProjectRootGhost: HTMLElement | null = null;
+  private psAddProjectRootSpan: HTMLElement | null = null;
+  private psAddProjectSepEl: HTMLElement | null = null;
   /** The in-dialog error line — persistent, shown/hidden per render. */
   private readonly psErrorEl: HTMLElement;
   /** The currently-open workspace-settings selection, so `focusTarget` knows what to focus: the name
@@ -1331,6 +1369,46 @@ export class Shell {
     psAddBullet.className = "ps-bullet";
     psAddBullet.textContent = "•";
     psAddRow.append(psAddBullet, this.psAddInput);
+    // The Projects group (docs/projects.md), the same shape as Roots: a rebuilt `<ul>` plus a
+    // persistent add row outside it, so a list rebuild never steals the input's caret mid-type.
+    const psProjectsLabel = document.createElement("div");
+    psProjectsLabel.className = "ps-label";
+    psProjectsLabel.textContent = "Projects";
+    this.psProjectsEl = document.createElement("ul");
+    this.psProjectsEl.className = "ps-roots";
+    // The add-project row is a two-segment path editor (the same component as save-as), so it uses
+    // the same `picker-editor-*` ghost-stacking DOM: the ghost is *layered* under a transparent
+    // input, never a sibling in flow. Laying them side by side (as this first did) lets a flexible
+    // empty input claim the row's width and shove its ghost to the far edge.
+    const projectInput = (onInput: (v: string) => void): HTMLInputElement => {
+      const input = document.createElement("input");
+      input.className = "picker-editor-input";
+      input.spellcheck = false;
+      input.autocapitalize = "off";
+      input.setAttribute("autocomplete", "off");
+      input.addEventListener("input", () => onInput(input.value));
+      input.addEventListener("keydown", (e) => this.onWorkspaceSettingsInputKey(e));
+      return input;
+    };
+    this.psAddProjectRootInput = projectInput((v) => {
+      if (this.session)
+        this.runEffects(this.session.workspace_settings_set_add_project_root(v) as CoreEffect[]);
+    });
+    this.psAddProjectInput = projectInput((v) => {
+      if (this.session)
+        this.runEffects(this.session.workspace_settings_set_add_project(v) as CoreEffect[]);
+    });
+    // Rebuilt per render (which segment is an input vs. static text changes with focus).
+    this.psAddProjectFieldEl = document.createElement("span");
+    this.psAddProjectFieldEl.className = "picker-editor-field";
+
+    const psAddProjectRow = document.createElement("div");
+    psAddProjectRow.className = "ps-root ps-add";
+    const psAddProjectBullet = document.createElement("span");
+    psAddProjectBullet.className = "ps-bullet";
+    psAddProjectBullet.textContent = "•";
+    psAddProjectRow.append(psAddProjectBullet, this.psAddProjectFieldEl);
+
     this.psErrorEl = document.createElement("div");
     this.psErrorEl.className = "ps-error";
     this.psErrorEl.style.display = "none";
@@ -1341,6 +1419,9 @@ export class Shell {
       psRootsLabel,
       this.psRootsEl,
       psAddRow,
+      psProjectsLabel,
+      this.psProjectsEl,
+      psAddProjectRow,
       this.psErrorEl,
     );
     this.workspaceSettingsEl.append(this.psModalEl);
@@ -1487,7 +1568,7 @@ export class Shell {
         open = activated.opened ?? (await lastOrScratch());
       }
 
-      this.session = WasmSession.bootstrap(activated.workspace.name, activated.workspace.paths, open);
+      this.session = WasmSession.bootstrap(activated.workspace, open);
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
@@ -1554,6 +1635,10 @@ export class Shell {
       const ps = v.workspace_settings;
       if (ps.selected === 0) return this.psNameInput;
       if (ps.selected === ps.input_index) return this.psAddInput;
+      if (ps.selected === ps.add_project_index)
+        return ps.add_project.multi_root && ps.add_project.field === "root"
+          ? this.psAddProjectRootInput
+          : this.psAddProjectInput;
       return this.capture;
     }
     return this.capture;
@@ -1569,22 +1654,33 @@ export class Shell {
     if (document.activeElement !== target) target.focus();
   }
 
+  /** Every overlay `<input>` that owns its own keydown handler. The global handler must not also
+   *  process their keys — see [`onKeyDown`]. */
+  private overlayInputs(): Set<HTMLElement> {
+    return new Set<HTMLElement>([
+      this.pickerInput,
+      this.editorPathInput,
+      this.editorRootInput,
+      this.searchInput,
+      this.saveAsRootInput,
+      this.saveAsPathInput,
+      this.openPathInput,
+      this.psNameInput,
+      this.psAddInput,
+      this.psAddProjectInput,
+      this.psAddProjectRootInput,
+    ]);
+  }
+
   private onKeyDown(e: KeyboardEvent): void {
     // Overlay inputs (picker query, chip editor, search, save-as) have their own keydown handlers;
     // ignore events they already handled so the same keypress isn't re-processed here once an overlay
     // closes mid-event (e.g. Enter on the LSP-servers picker → LSP-info dialog, which the bubbled
     // event would otherwise immediately close). preventDefault doesn't stop propagation; this does.
-    const t = e.target;
-    if (
-      t === this.pickerInput ||
-      t === this.editorPathInput ||
-      t === this.editorRootInput ||
-      t === this.searchInput ||
-      t === this.saveAsRootInput ||
-      t === this.saveAsPathInput ||
-      t === this.psNameInput ||
-      t === this.psAddInput
-    ) {
+    // Membership in a set rather than a chain of `===`: the old chain had to be extended by hand
+    // for every new overlay input, and forgetting one is invisible until you try to type in it
+    // (the key bubbles here and gets consumed as a global binding instead of inserted).
+    if (e.target instanceof HTMLElement && this.overlayInputs().has(e.target)) {
       return;
     }
     // While a hover popover is open, it reuses the editor's own Copy / Scroll bindings — resolved
@@ -1796,7 +1892,7 @@ export class Shell {
           relanded.opened ??
           (await this.client.rpc<BufferOpenResult>("buffer/open", { transient: true }));
       }
-      this.session = WasmSession.bootstrap(activated.workspace.name, activated.workspace.paths, open);
+      this.session = WasmSession.bootstrap(activated.workspace, open);
       this.connBanner.style.display = "none";
       await this.subscribe();
       // The session was rebuilt on the fresh connection — re-fetch the persisted app settings.
@@ -2868,8 +2964,17 @@ export class Shell {
 
     // The name + add inputs are persistent native fields; only sync their value (never on every
     // keystroke — that would reset the caret while the user types).
-    if (this.psNameInput.value !== ps.name.text) this.psNameInput.value = ps.name.text;
-    if (this.psAddInput.value !== ps.add.text) this.psAddInput.value = ps.add.text;
+    // `setInputValue` parks the caret at the end of a core-driven rewrite — which is what an
+    // `Alt-l` accept is. A plain `.value =` leaves the caret at its old index, mid-string.
+    if (this.psNameInput.value !== ps.name.text) this.setInputValue(this.psNameInput, ps.name.text);
+    if (this.psAddInput.value !== ps.add.text) this.setInputValue(this.psAddInput, ps.add.text);
+    // Placeholders only while the row is unfocused: once focused the caret is the cue, and the
+    // ghost carries any suggestion. Matches the native clients.
+    const onAddRoot = ps.selected === ps.input_index;
+    this.psAddInput.placeholder = onAddRoot ? "" : "Add root...";
+    if (this.psNameInput.value !== ps.name.text) this.setInputValue(this.psNameInput, ps.name.text);
+    if (this.psAddInput.value !== ps.add.text) this.setInputValue(this.psAddInput, ps.add.text);
+    this.renderAddProjectField(ps);
     this.psNameInput.classList.toggle("focused", ps.selected === 0);
 
     // Rebuild the root list `<li>`s (the persistent add-input + error elements are untouched). Each
@@ -2905,6 +3010,43 @@ export class Shell {
       items.push(li);
     });
     this.psRootsEl.replaceChildren(...items);
+
+    // Projects: the same row shape as roots, plus a trailing tag carrying the language the pinned
+    // server speaks — or, when the declaration is broken (deleted marker, unrecognised name), the
+    // reason in red.
+    const projectItems: HTMLElement[] = [];
+    ps.projects.forEach((project, i) => {
+      const highlighted = ps.selected === ps.first_project_index + i;
+      const li = document.createElement("li");
+      li.className = "ps-root";
+      const bullet = document.createElement("span");
+      bullet.className = "ps-bullet";
+      bullet.textContent = "•";
+      const path = document.createElement("span");
+      path.className = "ps-root-path" + (highlighted ? " selected" : "");
+      // The canonical `[root]: [path]` format, so a project reads like any other file reference.
+      const rootLabel = rootLabels(this.snapshot?.workspace_paths ?? [])[project.path_index] ?? "";
+      path.textContent = rootLabel
+        ? `${rootLabel}: ${project.relative_path}`
+        : project.relative_path;
+      const tag = document.createElement("span");
+      tag.className = project.error ? "ps-project-error" : "ps-project-language";
+      tag.textContent = project.error ?? project.language;
+      const del = document.createElement("button");
+      del.className = "ps-root-delete";
+      del.type = "button";
+      del.textContent = "✕";
+      del.title = "Stop pinning this project";
+      del.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // keep focus where it is until the prompt re-targets it
+        if (this.session)
+          this.runEffects(this.session.workspace_settings_remove_project(i) as CoreEffect[]);
+      });
+      li.append(bullet, path, tag, del);
+      projectItems.push(li);
+    });
+    this.psProjectsEl.replaceChildren(...projectItems);
+
     this.psErrorEl.textContent = ps.error ?? "";
     this.psErrorEl.style.display = ps.error ? "" : "none";
 
@@ -2912,6 +3054,89 @@ export class Shell {
     // confirm prompt is up — it owns the keyboard via `capture` (focusTarget yields to it).
     const target = this.focusTarget();
     if (document.activeElement !== target) target.focus();
+  }
+
+  /** The add-project row's field: whichever segment has focus is a ghost-stacked `<input>`, the
+   *  other is static text — the same shape (and the same `picker-editor-*` DOM) as the save-as
+   *  prompt, so the two read and behave identically. Rebuilt per render because which segment is an
+   *  input changes with focus; the inputs themselves are persistent, so a rebuild never steals a
+   *  caret mid-type. */
+  private renderAddProjectField(ps: WorkspaceSettingsView): void {
+    const ed = ps.add_project;
+    const focused = ps.selected === ps.add_project_index;
+    // Unfocused and empty, the row collapses to its affordance — as the add-root row does.
+    if (!focused && ed.input.length === 0) {
+      const hint = document.createElement("span");
+      hint.className = "ps-placeholder";
+      hint.textContent = "Add project...";
+      this.psAddProjectFieldEl.replaceChildren(hint);
+      this.psAddProjectGhost = null;
+      this.psAddProjectRootGhost = null;
+      this.psAddProjectRootSpan = null;
+      this.psAddProjectSepEl = null;
+      return;
+    }
+    const onRoot = focused && ed.multi_root && ed.field === "root";
+    this.psAddProjectGhost = null;
+    this.psAddProjectRootGhost = null;
+    this.psAddProjectRootSpan = null;
+    this.psAddProjectSepEl = null;
+    const parts: HTMLElement[] = [];
+    if (ed.multi_root) {
+      if (onRoot) {
+        parts.push(this.projectWrap(this.psAddProjectRootInput, true));
+      } else {
+        const span = document.createElement("span");
+        span.className = ed.root_invalid
+          ? "picker-editor-seg invalid"
+          : "picker-editor-seg root";
+        span.textContent = ed.root_invalid ? ed.root_filter : (ed.root_display ?? "");
+        this.psAddProjectRootSpan = span;
+        parts.push(span);
+      }
+      const sep = document.createElement("span");
+      sep.className = "picker-editor-sep";
+      sep.textContent = ":";
+      this.psAddProjectSepEl = sep;
+      parts.push(sep);
+    }
+    if (focused && !onRoot) {
+      parts.push(this.projectWrap(this.psAddProjectInput, false));
+    } else {
+      const span = document.createElement("span");
+      span.className = "picker-editor-seg";
+      span.textContent = ed.input;
+      parts.push(span);
+    }
+    this.psAddProjectFieldEl.replaceChildren(...parts);
+
+    if (onRoot) {
+      if (this.psAddProjectRootInput.value !== ed.root_filter) {
+        this.setInputValue(this.psAddProjectRootInput, ed.root_filter);
+      }
+      this.psAddProjectRootInput.classList.toggle("invalid", ed.root_invalid);
+      this.fillGhost(this.psAddProjectRootGhost, ed.root_filter, ed.root_ghost);
+    }
+    if (focused && !onRoot) {
+      if (this.psAddProjectInput.value !== ed.input) {
+        this.setInputValue(this.psAddProjectInput, ed.input);
+      }
+      this.psAddProjectInput.classList.toggle("invalid", ed.path_invalid);
+      this.fillGhost(this.psAddProjectGhost, ed.input, ed.path_ghost);
+    }
+  }
+
+  /** Add-project analog of `saveAsWrap`: a ghost-overlay wrap for the focused segment. */
+  private projectWrap(input: HTMLInputElement, hug: boolean): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = hug ? "picker-editor-rootwrap hug" : "picker-editor-rootwrap";
+    const ghost = document.createElement("span");
+    ghost.className = "picker-editor-ghost";
+    input.classList.add("picker-editor-root");
+    wrap.append(ghost, input);
+    if (hug) this.psAddProjectRootGhost = ghost;
+    else this.psAddProjectGhost = ghost;
+    return wrap;
   }
 
   /** Render the application-settings overlay (`Space .`) from `view.app_settings`: grouped rows,

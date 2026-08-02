@@ -101,8 +101,10 @@ pub struct SessionBootstrap {
     /// it to tell "same daemon, connection blipped" from "daemon restarted" (where unsaved buffer
     /// state died with it).
     pub server_started_at: u64,
-    pub workspace: String,
-    pub workspace_paths: Vec<String>,
+    /// The activation's `WorkspaceInfo` — name, roots and declared projects. Carried whole rather
+    /// than field-by-field: boot is the one path that seeds a session without a
+    /// `sync_workspace_info`, so anything dropped here stays missing for the client's lifetime.
+    pub workspace: aether_protocol::workspace::WorkspaceInfo,
     pub buffer: BufferInfo,
     /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
@@ -203,6 +205,8 @@ enum PromptMsg {
 enum WorkspaceSettingsMsg {
     /// The delete button on root row `index` (0-based) was clicked.
     RemoveRoot(usize),
+    /// The delete button on project row `index` (0-based) was clicked.
+    RemoveProject(usize),
 }
 
 /// Which overlay text field an [`Message::OverlayInput`] targets. Each maps to a core `*_set_*`
@@ -224,6 +228,10 @@ pub enum OverlayField {
     WorkspaceName,
     /// The workspace-settings add-root input.
     WorkspaceAddRoot,
+    /// The workspace-settings add-project path segment.
+    WorkspaceAddProject,
+    /// Its leading root-typeahead segment (multi-root workspaces).
+    WorkspaceAddProjectRoot,
     /// The chip editor's root-filter input (multi-root dir editor).
     ChipRoot,
     /// The chip editor's path/glob input.
@@ -241,6 +249,8 @@ impl OverlayField {
             OverlayField::OpenPath => "overlay-openpath",
             OverlayField::WorkspaceName => "overlay-workspace-name",
             OverlayField::WorkspaceAddRoot => "overlay-workspace-addroot",
+            OverlayField::WorkspaceAddProject => "overlay-workspace-addproject",
+            OverlayField::WorkspaceAddProjectRoot => "overlay-workspace-addproject-root",
             OverlayField::ChipRoot => "overlay-chip-root",
             OverlayField::ChipPath => "overlay-chip-path",
         })
@@ -484,7 +494,7 @@ impl App {
             }
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
-                let mut session = Session::new(b.workspace, b.workspace_paths, b.buffer);
+                let mut session = Session::new(b.workspace, b.buffer);
                 session.launched_with_file = b.launched_with_file;
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
@@ -553,6 +563,8 @@ impl App {
                 // bindings against the unmodified base key so they still match. See
                 // `input::keycode_for_binding`.
                 let code = crate::input::keycode_for_binding(&key, &modified_key, mods.alt)?;
+                // Shift-Tab arrives as Tab + Shift here; the core wants it as its own key.
+                let code = aether_client::keymap::apply_backtab(code, mods);
                 // Forward to the core when no focused widget consumed the key (`Ignored`), PLUS two
                 // forced exceptions a focused `text_input` would otherwise swallow:
                 //   - `Escape` (the input captures it to unfocus itself), and
@@ -561,8 +573,16 @@ impl App {
                 //     so force it through. (The `alt_filter::alt_passthrough` wrapper around each
                 //     overlay input also drops the `Alt` press before the input can insert it as
                 //     text, which some platforms' winit delivers — so the field stays clean.)
-                let forward =
-                    status == iced::event::Status::Ignored || code == KeyCode::Esc || mods.alt;
+                //   - `Tab` / `Shift-Tab`, which are field traversal (the settings dialogs, the
+                //     path editor's segments). A focused `text_input` captures them and iced then
+                //     moves *widget* focus on its own — which drifts away from the core's idea of
+                //     the focused row and leaves keys landing on a field the dialog doesn't think
+                //     is selected. Forcing them through keeps the core authoritative.
+                let forward = status == iced::event::Status::Ignored
+                    || code == KeyCode::Esc
+                    || code == KeyCode::Tab
+                    || code == KeyCode::BackTab
+                    || mods.alt;
                 forward.then(|| Message::Key {
                     code,
                     mods,
@@ -669,15 +689,23 @@ impl App {
                 .then_some(OverlayField::PickerQuery);
         }
         if let Some(s) = &self.session.workspace_settings {
-            // Name field (selection 0) or add-root input (last row) — a highlighted root row in
-            // between has no text field, so nothing to focus there.
-            if s.on_name() {
-                return Some(OverlayField::WorkspaceName);
-            }
-            if s.on_input() {
-                return Some(OverlayField::WorkspaceAddRoot);
-            }
-            return None;
+            // The name field or one of the two add inputs — a highlighted root/project row is a
+            // selection, not a text field, so there's nothing to focus there.
+            return match s.row() {
+                SettingsRow::Name => Some(OverlayField::WorkspaceName),
+                SettingsRow::AddRoot => Some(OverlayField::WorkspaceAddRoot),
+                // Two segments — focus follows whichever the editor has active.
+                SettingsRow::AddProject => Some(
+                    if self.session.workspace_paths.len() > 1
+                        && s.add_project.field == aether_client::chips::ChipEditorField::Root
+                    {
+                        OverlayField::WorkspaceAddProjectRoot
+                    } else {
+                        OverlayField::WorkspaceAddProject
+                    },
+                ),
+                SettingsRow::Root(_) | SettingsRow::Project(_) => None,
+            };
         }
         if self.session.mode == Mode::Search {
             // No focus target when an option chip is selected — its row keys (Left/Right/
@@ -740,7 +768,7 @@ impl App {
                 self.server_started_at = b.server_started_at;
                 self.handle = b.handle;
                 self.notifications = b.notifications.clone();
-                self.session = Session::new(b.workspace, b.workspace_paths, b.buffer);
+                self.session = Session::new(b.workspace, b.buffer);
                 self.session.launched_with_file = b.launched_with_file;
                 // The connecting editor already laid out (recording cell metrics) without
                 // subscribing, so its Layout may not fire again — subscribe explicitly now that
@@ -1397,6 +1425,27 @@ impl App {
     /// are the same controlled-input-over-ghost shape as the chip editor, so they get the same
     /// caret-to-end treatment when the core rewrites them (Tab-complete, cycle, root↔path switch).
     fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
+        // The workspace-settings add-project row is the same path editor, so it needs the same
+        // caret snap: `Alt-l` rewrites the value under the controlled `text_input`, which otherwise
+        // leaves its caret at the old index — mid-string, right after an accept.
+        if let Some(ps) = &self.session.workspace_settings {
+            if ps.row() == SettingsRow::AddProject {
+                let multi_root = self.session.workspace_paths.len() > 1;
+                return Some(
+                    if multi_root && ps.add_project.field == crate::chips::ChipEditorField::Root {
+                        (
+                            OverlayField::WorkspaceAddProjectRoot,
+                            ps.add_project.root_filter.text.clone(),
+                        )
+                    } else {
+                        (
+                            OverlayField::WorkspaceAddProject,
+                            ps.add_project.input.text.clone(),
+                        )
+                    },
+                );
+            }
+        }
         if let Some(Prompt::SaveAs(ed)) = &self.session.prompt {
             let multi_root = self.session.workspace_paths.len() > 1;
             return Some(
@@ -1426,6 +1475,12 @@ impl App {
             OverlayField::OpenPath => self.session.open_path_set_input(value),
             OverlayField::WorkspaceName => self.session.workspace_settings_set_name(value),
             OverlayField::WorkspaceAddRoot => self.session.workspace_settings_set_add(value),
+            OverlayField::WorkspaceAddProject => {
+                self.session.workspace_settings_set_add_project(value)
+            }
+            OverlayField::WorkspaceAddProjectRoot => {
+                self.session.workspace_settings_set_add_project_root(value)
+            }
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
         }
@@ -2117,11 +2172,19 @@ impl App {
     fn hint_corner(&self, hint: aether_client::hints::HintView) -> Element<'_, Message> {
         let ui = self.ui();
         let (before, keys, after) = hint.parts();
-        let dim = |s: &'static str| text(s).size(ui.small()).font(SANS).color(theme::NORD3_BRIGHT);
+        let dim = |s: &'static str| {
+            text(s)
+                .size(ui.small())
+                .font(SANS)
+                .color(theme::NORD3_BRIGHT)
+        };
         let body = iced::widget::row![
             dim("Hint: "),
             dim(before),
-            text(keys).size(ui.small()).font(SANS_BOLD_UI).color(theme::NORD8),
+            text(keys)
+                .size(ui.small())
+                .font(SANS_BOLD_UI)
+                .color(theme::NORD8),
             dim(after),
         ];
         let chip = container(body)
@@ -2280,9 +2343,12 @@ impl App {
         // No row box — selection tints only the path text (see below).
         fn bulleted<'a>(inner: Element<'a, Message>, ui: theme::Ui) -> Element<'a, Message> {
             container(
-                row![text("•").size(ui.body()).font(SANS).color(theme::NORD6), inner]
-                    .align_y(iced::Alignment::Center)
-                    .spacing(6),
+                row![
+                    text("•").size(ui.body()).font(SANS).color(theme::NORD6),
+                    inner
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(6),
             )
             .padding(iced::Padding {
                 top: 0.0,
@@ -2294,45 +2360,53 @@ impl App {
         }
 
         for (i, root) in s.roots.iter().enumerate() {
-            let highlighted = s.selected == i + 1;
-            let delete = iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
-                .padding([2, 8])
-                .style(|_, status| iced::widget::button::Style {
-                    background: Some(
-                        if matches!(status, iced::widget::button::Status::Hovered) {
-                            theme::NORD11
-                        } else {
-                            theme::NORD3
-                        }
-                        .into(),
-                    ),
-                    text_color: theme::NORD6,
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..iced::widget::button::Style::default()
-                })
-                .on_press(WorkspaceSettingsMsg::RemoveRoot(i));
+            let highlighted = s.row() == SettingsRow::Root(i);
+            let delete =
+                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
+                    .padding([2, 8])
+                    .style(|_, status| iced::widget::button::Style {
+                        background: Some(
+                            if matches!(status, iced::widget::button::Status::Hovered) {
+                                theme::NORD11
+                            } else {
+                                theme::NORD3
+                            }
+                            .into(),
+                        ),
+                        text_color: theme::NORD6,
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..iced::widget::button::Style::default()
+                    })
+                    .on_press(WorkspaceSettingsMsg::RemoveRoot(i));
             // The delete button is the only `WorkspaceSettingsMsg` source; map it inline so this row
             // joins the `Message`-typed tree (the input fields already produce `Message`).
             let delete = Element::from(delete).map(|m| match m {
                 WorkspaceSettingsMsg::RemoveRoot(i) => {
                     Message::Core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
                 }
+                WorkspaceSettingsMsg::RemoveProject(i) => {
+                    Message::Core(CoreEvent::WorkspaceSettingsRemoveProject(i))
+                }
             });
             // Selection tints just the path text (web/terminal parity), so the background hugs the
             // text — no padding, so the text lines up with the borderless add-root input below.
-            let path = container(text(root.clone()).size(ui.body()).font(SANS).color(theme::NORD6)).style(
-                move |_| container::Style {
-                    background: highlighted.then(|| theme::NORD2.into()),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..container::Style::default()
+            let path = container(
+                text(root.clone())
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(theme::NORD6),
+            )
+            .style(move |_| container::Style {
+                background: highlighted.then(|| theme::NORD2.into()),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..iced::Border::default()
                 },
-            );
+                ..container::Style::default()
+            });
             let inner = row![path, iced::widget::Space::new().width(Length::Fill), delete,]
                 .align_y(iced::Alignment::Center)
                 .spacing(6);
@@ -2341,14 +2415,194 @@ impl App {
 
         // The always-present add-root input row — a borderless input after its bullet, so the caret
         // is the focus cue (web/terminal parity), not a box.
+        // Placeholder only while unfocused — once you're typing here the caret is the cue, and a
+        // greyed prompt sitting under it is noise. Same rule as the add-project row.
+        let add_root_placeholder = if s.row() == SettingsRow::AddRoot {
+            ""
+        } else {
+            "Add root..."
+        };
         roots_col = roots_col.push(bulleted(
-            field(OverlayField::WorkspaceAddRoot, &s.add.text, "Add root..."),
+            field(
+                OverlayField::WorkspaceAddRoot,
+                &s.add.text,
+                add_root_placeholder,
+            ),
             ui,
         ));
         col = col.push(roots_col);
 
+        // The Projects group (docs/projects.md): declared marker files whose language servers stay
+        // pinned while the workspace is active. Same shape as Roots — bulleted rows with a delete
+        // button, then an always-present add input — with a trailing tag per row carrying either the
+        // language it pins or, in red, why it can't be used.
+        let mut projects_col = column![label("Projects")].spacing(2);
+        for (i, project) in s.projects.iter().enumerate() {
+            let highlighted = s.row() == SettingsRow::Project(i);
+            let delete =
+                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
+                    .padding([2, 8])
+                    .style(|_, status| iced::widget::button::Style {
+                        background: Some(
+                            if matches!(status, iced::widget::button::Status::Hovered) {
+                                theme::NORD11
+                            } else {
+                                theme::NORD3
+                            }
+                            .into(),
+                        ),
+                        text_color: theme::NORD6,
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..iced::widget::button::Style::default()
+                    })
+                    .on_press(WorkspaceSettingsMsg::RemoveProject(i));
+            let delete = Element::from(delete).map(|m| match m {
+                WorkspaceSettingsMsg::RemoveRoot(i) => {
+                    Message::Core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
+                }
+                WorkspaceSettingsMsg::RemoveProject(i) => {
+                    Message::Core(CoreEvent::WorkspaceSettingsRemoveProject(i))
+                }
+            });
+            let path = container(
+                text(aether_client::labels::root_relative_display(
+                    &self.session.workspace_paths,
+                    project.path_index,
+                    &project.relative_path,
+                ))
+                .size(ui.body())
+                .font(SANS)
+                .color(theme::NORD6),
+            )
+            .style(move |_| container::Style {
+                background: highlighted.then(|| theme::NORD2.into()),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            });
+            let (tag_text, tag_color) = match &project.error {
+                Some(e) => (e.clone(), theme::NORD11),
+                None => (project.language.clone(), theme::NORD3_BRIGHT),
+            };
+            let tag = text(tag_text).size(ui.small()).font(SANS).color(tag_color);
+            let inner = row![
+                path,
+                iced::widget::Space::new().width(Length::Fill),
+                tag,
+                delete,
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(6);
+            projects_col = projects_col.push(bulleted(inner.into(), ui));
+        }
+        // The add-project row is the save-as path editor, rendered the same way while it has focus:
+        // the root segment shows its inline typeahead ghost, the path segment its completion ghost.
+        // Rendering the ghosts is what makes `Alt-j/k` cycling *visible* — without them the
+        // candidate changes underneath and the row looks inert.
+        //
+        // Unfocused and empty, it collapses to a plain "Add project..." label instead. That's the
+        // same affordance the add-root row gives, and it sidesteps a sizing trap: `field_with_ghost`
+        // stacks the input over a ghost layer and takes its width from that layer, so an empty field
+        // has almost no width and a placeholder inside it renders clipped to a glyph or two.
+        use crate::picker::{field_with_ghost, Boundary, PickerMsg};
+        let ed = &s.add_project;
+        let roots = &self.session.workspace_paths;
+        let labels = crate::labels::root_labels(roots);
+        let multi_root = roots.len() > 1;
+        let focused = s.row() == SettingsRow::AddProject;
+        let project_row: Element<'_, Message> = if !focused && ed.input.text.is_empty() {
+            text("Add project...")
+                .size(ui.body())
+                .font(SANS)
+                .color(theme::NORD3_BRIGHT)
+                .into()
+        } else {
+            let mut project_row = row![].align_y(iced::Alignment::Center);
+            if multi_root {
+                let invalid = ed.root_invalid(&labels);
+                let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
+                // A live input only while this row *and* the root segment have focus; otherwise the
+                // settled label, so an unfocused row never shows a stray caret.
+                if focused && ed.field == crate::chips::ChipEditorField::Root {
+                    root_group = root_group.push(field_with_ghost(
+                        &ed.root_filter,
+                        ed.root_ghost(&labels).map(|(_, suffix)| suffix),
+                        invalid,
+                        OverlayField::WorkspaceAddProjectRoot.id(),
+                        "",
+                        ":",
+                        PickerMsg::EditorRoot,
+                        true,
+                        Boundary::ConfirmRoot,
+                        ui,
+                    ));
+                } else {
+                    let display = if invalid {
+                        ed.root_filter.text.clone()
+                    } else {
+                        labels
+                            .get(ed.chosen_root(&labels) as usize)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    let color = if invalid { theme::NORD11 } else { theme::NORD8 };
+                    root_group =
+                        root_group.push(text(display).size(ui.body()).font(SANS).color(color));
+                    // Only the settled label needs its separator pushed; the focused segment draws
+                    // its own (flush against the text — see `field_with_ghost`'s `trailing`).
+                    root_group = root_group.push(
+                        text(":")
+                            .size(ui.body())
+                            .font(SANS)
+                            .color(theme::NORD3_BRIGHT),
+                    );
+                }
+                project_row = project_row.push(root_group).spacing(6);
+            }
+            // Placeholder is always empty here: the ghost layer behind the input is what shows
+            // suggestions, and a placeholder drawn on top of it would overlap.
+            project_row = project_row.push(field_with_ghost(
+                &ed.input,
+                ed.path_ghost(),
+                ed.path_invalid(),
+                OverlayField::WorkspaceAddProject.id(),
+                "",
+                "",
+                PickerMsg::EditorPath,
+                false,
+                if multi_root {
+                    Boundary::PathToRoot
+                } else {
+                    Boundary::None
+                },
+                ui,
+            ));
+            Element::from(project_row).map(|m| match m {
+                PickerMsg::EditorRoot(s) => {
+                    Message::OverlayInput(OverlayField::WorkspaceAddProjectRoot, s)
+                }
+                PickerMsg::EditorPath(s) => {
+                    Message::OverlayInput(OverlayField::WorkspaceAddProject, s)
+                }
+                PickerMsg::CoreKey(code) => core_key_message(code),
+                _ => Message::Noop,
+            })
+        };
+        projects_col = projects_col.push(bulleted(project_row, ui));
+        col = col.push(projects_col);
+
         if let Some(err) = &s.error {
-            col = col.push(text(err.clone()).size(ui.small()).font(SANS).color(theme::NORD11));
+            col = col.push(
+                text(err.clone())
+                    .size(ui.small())
+                    .font(SANS)
+                    .color(theme::NORD11),
+            );
         }
 
         let boxed = container(col.spacing(8))
@@ -2427,7 +2681,10 @@ impl App {
                         // button carries the row index (a `usize`) and we map it to `Message` — the
                         // same pattern as the workspace-settings delete button.
                         let btn = iced::widget::button(
-                            text(v.to_string()).size(ui.body()).font(SANS).color(theme::NORD6),
+                            text(v.to_string())
+                                .size(ui.body())
+                                .font(SANS)
+                                .color(theme::NORD6),
                         )
                         .padding([2, 8])
                         .style(|_, status| iced::widget::button::Style {
@@ -2786,7 +3043,10 @@ impl App {
                         rows = rows.push(
                             row![
                                 container(
-                                    text(r.label).size(ui.body()).font(SANS).color(theme::NORD3_BRIGHT)
+                                    text(r.label)
+                                        .size(ui.body())
+                                        .font(SANS)
+                                        .color(theme::NORD3_BRIGHT)
                                 )
                                 .width(ui.at(84.0)),
                                 text(r.value).size(ui.body()).font(SANS).color(value_color),
@@ -2840,10 +3100,11 @@ impl App {
                             invalid,
                             OverlayField::SaveAsRoot.id(),
                             "",
+                            ":",
                             PickerMsg::EditorRoot,
                             true,
                             Boundary::ConfirmRoot,
-                        ui,
+                            ui,
                         ));
                     } else {
                         // Unfocused root: the chosen label in breadcrumb blue — or the raw filter
@@ -2859,9 +3120,14 @@ impl App {
                         let color = if invalid { theme::NORD11 } else { theme::NORD8 };
                         root_group =
                             root_group.push(text(display).size(ui.body()).font(SANS).color(color));
+                        // The focused segment draws its own separator flush against the text.
+                        root_group = root_group.push(
+                            text(":")
+                                .size(ui.body())
+                                .font(SANS)
+                                .color(theme::NORD3_BRIGHT),
+                        );
                     }
-                    root_group =
-                        root_group.push(text(":").size(ui.body()).font(SANS).color(theme::NORD3_BRIGHT));
                     field = field.push(root_group).spacing(6);
                 }
                 // The path field: typed value plus the gray `path_ghost` suffix, red on invalid
@@ -2877,10 +3143,11 @@ impl App {
                     ed.path_invalid(),
                     OverlayField::SaveAs.id(),
                     "",
+                    "",
                     PickerMsg::EditorPath,
                     false,
                     path_boundary,
-                ui,
+                    ui,
                 ));
                 let field: Element<'_, Message> = Element::from(field).map(|m| match m {
                     PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::SaveAsRoot, s),
@@ -2890,7 +3157,10 @@ impl App {
                     _ => Message::Noop,
                 });
                 column![
-                    text("Save as").size(ui.body()).font(SANS).color(theme::NORD6),
+                    text("Save as")
+                        .size(ui.body())
+                        .font(SANS)
+                        .color(theme::NORD6),
                     container(field)
                         .padding([5, 8])
                         .width(Length::Fill)
@@ -2940,7 +3210,10 @@ impl App {
                 let input: Element<'_, Message> = Element::from(inner)
                     .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
                 column![
-                    text("Open file").size(ui.body()).font(SANS).color(theme::NORD6),
+                    text("Open file")
+                        .size(ui.body())
+                        .font(SANS)
+                        .color(theme::NORD6),
                     container(input)
                         .padding([5, 8])
                         .width(Length::Fill)
@@ -3048,7 +3321,11 @@ impl App {
                         .spacing(6)
                         .align_y(iced::Alignment::Start)
                         .into(),
-                        None => text(b.text.clone()).size(ui.body()).font(SANS).color(color).into(),
+                        None => text(b.text.clone())
+                            .size(ui.body())
+                            .font(SANS)
+                            .color(color)
+                            .into(),
                     };
                     col = col.push(line);
                 }
@@ -3468,7 +3745,11 @@ impl App {
 /// (`picker::chip_el`): compact label on a raised NORD2 background, NORD8 text, the whole-word chip
 /// underlined; the keyboard-selected chip inverts (NORD8 background, NORD0 text). Chips are
 /// keyboard-driven (Left/Right select, Backspace removes, Enter cycles), so this is non-interactive.
-fn option_chip<'a>(chip: &crate::chips::Chip, selected: bool, ui: theme::Ui) -> Element<'a, Message> {
+fn option_chip<'a>(
+    chip: &crate::chips::Chip,
+    selected: bool,
+    ui: theme::Ui,
+) -> Element<'a, Message> {
     let underline = matches!(chip.id, crate::chips::ChipId::Word);
     let (bg, fg) = if selected {
         (theme::NORD8, theme::NORD0)
@@ -4026,6 +4307,7 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
+        ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
     }
 }
@@ -4093,9 +4375,8 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                 client_version: args.client_version,
                 server_url: args.server_url,
                 server_started_at: opened.server_started_at,
-                workspace: opened.workspace.name,
                 buffer: buffer_info(open, &workspace_paths),
-                workspace_paths,
+                workspace: opened.workspace,
                 explorer_dir: None,
                 launched_with_file: true,
             })));
@@ -4208,9 +4489,8 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         client_version: args.client_version,
         server_url: args.server_url,
         server_started_at,
-        workspace: activated.workspace.name,
         buffer: buffer_info(open, &workspace_paths),
-        workspace_paths,
+        workspace: activated.workspace,
         explorer_dir,
         launched_with_file: false,
     })))

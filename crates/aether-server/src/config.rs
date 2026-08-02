@@ -234,6 +234,208 @@ fn list_profiles_at(dir: &Path) -> anyhow::Result<Vec<ProfileEntry>> {
 
 pub use aether_protocol::settings::AppSettings;
 
+/// A declared project: the marker file identifying a buildable unit — a `Cargo.toml`, a `go.mod`, a
+/// `package.json` — whose language server is pinned open while the workspace is active
+/// (`docs/projects.md`).
+///
+/// The path is **relative to the root it's declared under** ([`RootConfig`]), so relocating a
+/// workspace means editing one `path` line and every project beneath it follows. Its final
+/// component selects the server via [`crate::lsp::config::language_for_marker`]; its parent
+/// directory is the root the server is launched at.
+///
+/// Two forms, so the common case stays a bare string:
+///
+/// ```toml
+/// [[roots]]
+/// path = "/src/aether"
+/// projects = ["Cargo.toml", { path = "web/package.json", language = "typescript" }]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProjectEntry {
+    /// Bare marker path; the language is inferred from its file name.
+    Path(PathBuf),
+    /// Marker path with an explicit language, for a marker whose name doesn't imply one (or implies
+    /// the wrong one) — `package.json` could be either TypeScript or JavaScript.
+    Detailed {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+}
+
+impl ProjectEntry {
+    /// The marker path, relative to the root this entry is declared under.
+    pub fn path(&self) -> &Path {
+        match self {
+            ProjectEntry::Path(p) => p,
+            ProjectEntry::Detailed { path, .. } => path,
+        }
+    }
+
+    /// The explicitly declared language, if the entry carries one.
+    pub fn declared_language(&self) -> Option<&str> {
+        match self {
+            ProjectEntry::Path(_) => None,
+            ProjectEntry::Detailed { language, .. } => language.as_deref(),
+        }
+    }
+}
+
+/// One workspace root and the projects declared under it.
+///
+/// Projects nest inside their root rather than referring to one, so there is no index or name to
+/// keep in sync: reordering roots can't silently re-point a project, and removing a root removes
+/// its projects with it. A dangling reference is unrepresentable rather than merely rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootConfig {
+    pub path: PathBuf,
+    /// Marker paths relative to `path`. Absent from the file when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectEntry>,
+}
+
+/// A project as the server holds it in memory: flattened out of the nested config so
+/// [`crate::state::WorkspaceEntry`] can keep its `paths` list unchanged.
+///
+/// `root_index` is a position in that list — safe here because it's derived at load and rebuilt on
+/// every config write, never persisted. The one place it has to be maintained by hand is
+/// `workspace/remove_root`, which drops the removed root's projects and shifts the indices above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRef {
+    pub root_index: u32,
+    /// Marker path relative to `roots[root_index]`.
+    pub relative_path: PathBuf,
+    pub language: Option<String>,
+}
+
+impl ProjectRef {
+    /// The file form of this project, for writing back out under its root.
+    pub fn to_entry(&self) -> ProjectEntry {
+        match &self.language {
+            Some(language) => ProjectEntry::Detailed {
+                path: self.relative_path.clone(),
+                language: Some(language.clone()),
+            },
+            None => ProjectEntry::Path(self.relative_path.clone()),
+        }
+    }
+}
+
+/// Repair a flat project list after the root at `removed` is dropped from a workspace.
+///
+/// Projects under that root go with it — they have no root left to live in, and their markers are
+/// outside the workspace now. Everything above shifts down one.
+///
+/// This is the one place a root *index* has to be maintained by hand. The config file nests projects
+/// under their root specifically so the on-disk form can't drift; in memory they're flat (so
+/// `WorkspaceEntry::paths` stays untouched), which buys that fragility back for exactly this
+/// function — hence the direct test.
+pub fn drop_root_from_projects(projects: &mut Vec<ProjectRef>, removed: u32) {
+    projects.retain(|p| p.root_index != removed);
+    for project in projects.iter_mut() {
+        if project.root_index > removed {
+            project.root_index -= 1;
+        }
+    }
+}
+
+/// A [`ProjectRef`] checked against the workspace and resolved to the server it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProject {
+    /// Absolute path to the marker file.
+    pub path: PathBuf,
+    /// The marker's parent directory — the root the language server is launched at.
+    pub root: PathBuf,
+    /// The language whose [`crate::lsp::config::server_spec`] to launch. Not yet canonicalized;
+    /// `LspServerKey::new` does that when the key is built.
+    pub language: String,
+}
+
+/// Resolve a declared project against the workspace's roots.
+///
+/// Every failure here is the config disagreeing with the world — a deleted crate, a typo, a marker
+/// we don't recognise — so each returns a human-readable message for display rather than aborting
+/// anything. Activation surfaces them and carries on with the projects that did resolve.
+pub fn resolve_project(
+    project: &ProjectRef,
+    workspace_roots: &[PathBuf],
+) -> Result<ResolvedProject, String> {
+    let rel = &project.relative_path;
+    let root = workspace_roots
+        .get(project.root_index as usize)
+        .ok_or_else(|| {
+            format!(
+                "project refers to root {} which is gone",
+                project.root_index
+            )
+        })?;
+    if rel.as_os_str().is_empty() {
+        return Err("project path is empty".to_string());
+    }
+    if rel.is_absolute() {
+        return Err(format!(
+            "project path must be relative to its root: {}",
+            rel.display()
+        ));
+    }
+    let path = root.join(rel);
+    let display = path.display();
+    // Nesting makes containment structural, but `..` can still climb out of the root — and a
+    // project outside every root is exactly what `buffer/open` refuses to start a server for (the
+    // workspace-trust boundary), so it stays rejected.
+    if rel
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(format!("project path escapes its root: {}", rel.display()));
+    }
+    // The common drift: a branch switch or a deleted crate leaves the config pointing at nothing.
+    // Checked here rather than at launch so the settings overlay can show it without starting
+    // anything.
+    if !path.exists() {
+        return Err(format!("project marker does not exist: {display}"));
+    }
+    let lsp_root = path
+        .parent()
+        .ok_or_else(|| format!("project path has no parent directory: {display}"))?
+        .to_path_buf();
+
+    let language = match project.language.as_deref() {
+        Some(l) => l.to_string(),
+        None => {
+            let file_name = rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| format!("project path has no file name: {display}"))?;
+            crate::lsp::config::language_for_marker(file_name)
+                .ok_or_else(|| {
+                    format!("don't recognise {file_name} as a project marker; set `language` explicitly")
+                })?
+                .to_string()
+        }
+    };
+    if crate::lsp::config::server_spec(&language).is_none() {
+        return Err(format!("no language server configured for {language}"));
+    }
+    Ok(ResolvedProject {
+        path,
+        root: lsp_root,
+        language,
+    })
+}
+
+/// A workspace's on-disk definition: its roots, each with the projects declared under it.
+///
+/// ```toml
+/// [[roots]]
+/// path = "/src/aether"
+/// projects = ["Cargo.toml"]
+/// ```
+///
+/// `roots` is deliberately **required** — no `#[serde(default)]`. A missing or misspelled key is a
+/// broken config, and failing to parse says so; defaulting would activate a workspace with no roots
+/// and leave you wondering where your files went.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     /// Workspace name. Derived from the config *filename* (`<name>.toml`), which is authoritative —
@@ -241,15 +443,91 @@ pub struct WorkspaceConfig {
     /// `load_workspace` injects it after parsing.
     #[serde(skip)]
     pub name: String,
-    pub paths: Vec<PathBuf>,
+    pub roots: Vec<RootConfig>,
 }
 
-pub fn load_workspace(name: &str) -> anyhow::Result<WorkspaceConfig> {
-    let path = workspace_config_path(name)?;
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading workspace config at {}", path.display()))?;
-    let mut config: WorkspaceConfig = toml::from_str(&content)
-        .with_context(|| format!("parsing workspace config at {}", path.display()))?;
+impl WorkspaceConfig {
+    /// The root paths alone, in declaration order — the form [`crate::state::WorkspaceEntry`] holds.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().map(|r| r.path.clone()).collect()
+    }
+
+    /// The declared projects, flattened to root-index references (see [`ProjectRef`]).
+    pub fn project_refs(&self) -> Vec<ProjectRef> {
+        self.roots
+            .iter()
+            .enumerate()
+            .flat_map(|(i, root)| {
+                root.projects.iter().map(move |p| ProjectRef {
+                    root_index: i as u32,
+                    relative_path: p.path().to_path_buf(),
+                    language: p.declared_language().map(str::to_string),
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the nested form from the flat one the server keeps in memory. Projects whose
+    /// `root_index` is out of range are dropped — they have no root to nest under, and writing them
+    /// anywhere else would silently re-point them.
+    pub fn from_parts(name: String, paths: &[PathBuf], projects: &[ProjectRef]) -> Self {
+        let roots = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| RootConfig {
+                path: path.clone(),
+                projects: projects
+                    .iter()
+                    .filter(|p| p.root_index as usize == i)
+                    .map(ProjectRef::to_entry)
+                    .collect(),
+            })
+            .collect();
+        WorkspaceConfig { name, roots }
+    }
+}
+
+/// Why [`load_workspace`] couldn't produce a config. The two cases need different words: a config
+/// that isn't there is a wrong workspace name, while one that won't parse is a broken (or stale)
+/// file the user needs pointing at.
+#[derive(Debug)]
+pub enum LoadWorkspaceError {
+    /// No config file of that name.
+    NotFound,
+    /// The file exists but couldn't be read or parsed; carries the underlying message.
+    Invalid(String),
+}
+
+impl std::fmt::Display for LoadWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadWorkspaceError::NotFound => write!(f, "no such workspace"),
+            LoadWorkspaceError::Invalid(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+pub fn load_workspace(name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError> {
+    let path = workspace_config_path(name)
+        .map_err(|e| LoadWorkspaceError::Invalid(format!("resolving config path: {e}")))?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LoadWorkspaceError::NotFound)
+        }
+        Err(e) => {
+            return Err(LoadWorkspaceError::Invalid(format!(
+                "reading workspace config at {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut config: WorkspaceConfig = toml::from_str(&content).map_err(|e| {
+        LoadWorkspaceError::Invalid(format!(
+            "parsing workspace config at {}: {e}",
+            path.display()
+        ))
+    })?;
     // The filename is the source of truth for the workspace name; the file body doesn't carry it.
     config.name = name.to_string();
     Ok(config)
@@ -703,7 +981,7 @@ pub fn infer_workspace_for_path(path: &Path) -> anyhow::Result<WorkspaceMatch> {
             continue;
         };
         let roots = config
-            .paths
+            .paths()
             .iter()
             .filter_map(|root| canonicalize_workspace_path(root).ok())
             .collect();
@@ -1271,5 +1549,216 @@ mod tests {
         h.retired.insert("insert-mode".into());
         write_hints_at(&path, &h).unwrap();
         assert_eq!(load_hints_at(&path).unwrap(), h);
+    }
+
+    /// Both project forms parse, nested under their root.
+    #[test]
+    fn project_entries_parse_in_both_forms() {
+        let cfg: WorkspaceConfig = toml::from_str(
+            r#"
+            [[roots]]
+            path = "/src/aether"
+            projects = ["Cargo.toml", { path = "web/package.json", language = "typescript" }]
+
+            [[roots]]
+            path = "/src/other"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.paths(),
+            vec![PathBuf::from("/src/aether"), PathBuf::from("/src/other")]
+        );
+
+        // Flattened, each carrying the index of the root it was nested under.
+        let refs = cfg.project_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].root_index, 0);
+        assert_eq!(refs[0].relative_path, PathBuf::from("Cargo.toml"));
+        assert_eq!(refs[0].language, None);
+        assert_eq!(refs[1].root_index, 0);
+        assert_eq!(refs[1].language.as_deref(), Some("typescript"));
+
+        // A root with no projects is fine; `roots` itself is not.
+        let bare: WorkspaceConfig = toml::from_str("[[roots]]\npath = \"/src/aether\"\n").unwrap();
+        assert!(bare.project_refs().is_empty());
+        assert!(
+            toml::from_str::<WorkspaceConfig>("paths = [\"/src/aether\"]").is_err(),
+            "a missing `roots` key is a broken config, not an empty workspace",
+        );
+    }
+
+    /// A bare path stays a bare string on the way back out, and projects re-nest under the root
+    /// their index names — so a round-trip through memory is lossless.
+    #[test]
+    fn project_entries_round_trip_through_toml() {
+        let paths = vec![PathBuf::from("/src/aether"), PathBuf::from("/src/other")];
+        let projects = vec![
+            ProjectRef {
+                root_index: 0,
+                relative_path: PathBuf::from("Cargo.toml"),
+                language: None,
+            },
+            ProjectRef {
+                root_index: 1,
+                relative_path: PathBuf::from("web/package.json"),
+                language: Some("typescript".into()),
+            },
+        ];
+        let cfg = WorkspaceConfig::from_parts("aether".into(), &paths, &projects);
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            body.contains(r#""Cargo.toml""#),
+            "a language-less entry stays a bare string:\n{body}"
+        );
+        let back: WorkspaceConfig = toml::from_str(&body).unwrap();
+        assert_eq!(back.paths(), paths);
+        assert_eq!(back.project_refs(), projects);
+
+        // A workspace with no projects keeps a file free of empty scaffolding.
+        let bare = WorkspaceConfig::from_parts("aether".into(), &paths, &[]);
+        assert!(!toml::to_string_pretty(&bare).unwrap().contains("projects"));
+    }
+
+    /// A project whose root index is out of range has nowhere to nest, so it's dropped rather than
+    /// silently re-homed under a root it was never declared in.
+    #[test]
+    fn from_parts_drops_projects_with_no_root() {
+        let paths = vec![PathBuf::from("/src/aether")];
+        let projects = vec![ProjectRef {
+            root_index: 7,
+            relative_path: PathBuf::from("Cargo.toml"),
+            language: None,
+        }];
+        let cfg = WorkspaceConfig::from_parts("aether".into(), &paths, &projects);
+        assert!(cfg.project_refs().is_empty());
+    }
+
+    /// A marker file in a temp root, for resolution tests.
+    fn project_fixture(marker: &str) -> (tempfile::TempDir, ProjectRef, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(marker);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "").unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let project = ProjectRef {
+            root_index: 0,
+            relative_path: PathBuf::from(marker),
+            language: None,
+        };
+        (dir, project, roots)
+    }
+
+    #[test]
+    fn resolve_derives_root_and_language_from_the_marker() {
+        let (dir, project, roots) = project_fixture("Cargo.toml");
+        let resolved = resolve_project(&project, &roots).unwrap();
+        assert_eq!(resolved.language, "rust");
+        assert_eq!(resolved.root, dir.path(), "root is the marker's parent");
+        assert_eq!(resolved.path, dir.path().join("Cargo.toml"));
+
+        // A marker nested below the root roots the server at *its* directory, not the workspace's.
+        let (dir, project, roots) = project_fixture("crates/inner/Cargo.toml");
+        let resolved = resolve_project(&project, &roots).unwrap();
+        assert_eq!(resolved.root, dir.path().join("crates/inner"));
+    }
+
+    /// `package.json` can't tell TS from JS, so the explicit language wins over the inferred one.
+    #[test]
+    fn declared_language_overrides_the_marker() {
+        let (_dir, mut project, roots) = project_fixture("package.json");
+        assert_eq!(
+            resolve_project(&project, &roots).unwrap().language,
+            "typescript"
+        );
+        project.language = Some("javascript".into());
+        assert_eq!(
+            resolve_project(&project, &roots).unwrap().language,
+            "javascript"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_the_config_being_wrong_about_the_world() {
+        let (dir, project, roots) = project_fixture("Cargo.toml");
+
+        let rel = |p: &str| ProjectRef {
+            root_index: 0,
+            relative_path: PathBuf::from(p),
+            language: None,
+        };
+
+        // An absolute path has no root to be relative to.
+        assert!(rel("/elsewhere/Cargo.toml")
+            .pipe_resolve(&roots)
+            .unwrap_err()
+            .contains("must be relative"));
+
+        // `..` climbs out of the root — the workspace-trust boundary still applies.
+        assert!(rel("../Cargo.toml")
+            .pipe_resolve(&roots)
+            .unwrap_err()
+            .contains("escapes its root"));
+
+        // A root that no longer exists (removed while the project referred to it).
+        assert!(resolve_project(&rel("Cargo.toml"), &[])
+            .unwrap_err()
+            .contains("root 0 which is gone"));
+
+        // A marker we don't know, with no explicit language to fall back on.
+        assert!(rel("Makefile")
+            .pipe_resolve(&roots)
+            .unwrap_err()
+            .contains("project marker"));
+
+        // A language with no configured server.
+        let mut bad_lang = project.clone();
+        bad_lang.language = Some("brainfuck".into());
+        assert!(resolve_project(&bad_lang, &roots)
+            .unwrap_err()
+            .contains("no language server"));
+
+        // Deleted underneath us (branch switch) — the common drift.
+        std::fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
+        assert!(resolve_project(&project, &roots)
+            .unwrap_err()
+            .contains("does not exist"));
+    }
+
+    /// Removing a root takes its projects with it and shifts the ones above down — the one place a
+    /// root index is maintained by hand, and where getting it wrong silently re-points a project.
+    #[test]
+    fn dropping_a_root_repairs_project_indices() {
+        let p = |root_index: u32, name: &str| ProjectRef {
+            root_index,
+            relative_path: PathBuf::from(name),
+            language: None,
+        };
+        let mut projects = vec![p(0, "a"), p(1, "b"), p(1, "c"), p(2, "d")];
+
+        crate::config::drop_root_from_projects(&mut projects, 1);
+
+        // Root 1's two projects are gone; root 2's has slid down to 1. Root 0's is untouched.
+        assert_eq!(
+            projects,
+            vec![p(0, "a"), p(1, "d")],
+            "projects under the removed root go with it; those above shift down",
+        );
+
+        // Removing the last root leaves the rest alone.
+        crate::config::drop_root_from_projects(&mut projects, 1);
+        assert_eq!(projects, vec![p(0, "a")]);
+    }
+
+    /// Test-only sugar so the rejection cases above read as one line each.
+    trait PipeResolve {
+        fn pipe_resolve(&self, roots: &[PathBuf]) -> Result<ResolvedProject, String>;
+    }
+    impl PipeResolve for ProjectRef {
+        fn pipe_resolve(&self, roots: &[PathBuf]) -> Result<ResolvedProject, String> {
+            resolve_project(self, roots)
+        }
     }
 }

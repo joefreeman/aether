@@ -1,6 +1,6 @@
 //! Save-as prompt view model (`Alt-s`).
 //!
-//! A render-side mirror of the core [`aether_client::save_as::SaveAsEditor`], shaped exactly like
+//! A render-side mirror of the core [`aether_client::path_editor::PathEditor`], shaped exactly like
 //! the picker's dir [`crate::picker::ChipEditor`] so the two share their look and muscle memory:
 //! a multi-root workspaces' leading **root** field (smartcase typeahead, `:` separator) ahead of a
 //! `directory/list`-backed **path** field with ghost suggestions, `Tab`/`Alt-l` accept, `Alt-j`/`k`
@@ -26,7 +26,7 @@ use crate::picker::{ChipEditorField, DirListingState};
 use crate::text_input::TextInput;
 use aether_protocol::directory::DirectoryEntry;
 
-/// One save-prompt instance — the render mirror of [`aether_client::save_as::SaveAsEditor`].
+/// One save-prompt instance — the render mirror of [`aether_client::path_editor::PathEditor`].
 #[derive(Debug, Clone)]
 pub struct SavePromptState {
     /// Which segment has focus. Always `Path` in single-root workspaces.

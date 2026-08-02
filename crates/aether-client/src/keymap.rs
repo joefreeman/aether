@@ -23,6 +23,10 @@ pub enum KeyCode {
     Esc,
     Enter,
     Tab,
+    /// Shift-Tab (`CSI Z` in a terminal). Distinct from `Tab` because the two are opposite
+    /// directions of the same gesture — "next field" / "previous field" — and folding them
+    /// together (as the TUI once did) makes reverse traversal unexpressible.
+    BackTab,
     Backspace,
     Delete,
     Home,
@@ -33,6 +37,19 @@ pub enum KeyCode {
     Right,
     Up,
     Down,
+}
+
+/// Fold Shift-Tab onto [`KeyCode::BackTab`].
+///
+/// Terminals send a distinct `BackTab` (`CSI Z`), while GUI and browser report a plain `Tab` with
+/// Shift held. Each shell calls this at its input boundary so the core sees one key either way, and
+/// "previous field" doesn't have to be spelled differently per client.
+pub fn apply_backtab(code: KeyCode, mods: Mods) -> KeyCode {
+    if code == KeyCode::Tab && mods.shift {
+        KeyCode::BackTab
+    } else {
+        code
+    }
 }
 
 /// Pick which normalised key a binding lookup should resolve against.
@@ -527,6 +544,7 @@ fn code_label(code: KeyCode) -> String {
         KeyCode::Esc => "Esc".into(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Tab => "Tab".into(),
+        KeyCode::BackTab => "Shift-Tab".into(),
         KeyCode::Backspace => "Backspace".into(),
         KeyCode::Delete => "Delete".into(),
         KeyCode::Home => "Home".into(),

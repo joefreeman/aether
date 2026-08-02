@@ -11,13 +11,13 @@ use super::hints::{
     ContextId as HintCtx, HintFacts, HintView, PickerCmd, WireEvent as HintWireEvent,
 };
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
+use super::path_editor::PathEditor;
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
-use super::save_as::SaveAsEditor;
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AppSettingId,
     AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
     HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
-    SearchState, Session, SneakState, TextField, WorkspaceSettings,
+    SearchState, Session, SettingsRow, SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -27,7 +27,6 @@ use aether_protocol::buffer::{
     BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferSetTransient,
     BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
 };
-use aether_protocol::cursor::{Direction, VerticalDirection};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
     CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
@@ -35,6 +34,7 @@ use aether_protocol::cursor::{
     CursorTreeSelectParams, CursorUndo, CursorUndoParams, CursorUndoResult, Granularity, Motion,
     SelectionEdge, TreeSelectDirection,
 };
+use aether_protocol::cursor::{Direction, VerticalDirection};
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryList,
     DirectoryListParams, DirectoryListResult,
@@ -101,11 +101,13 @@ use aether_protocol::viewport::{
     ViewportWindowResult, Window, WrapMode,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRoot,
-    WorkspaceAddRootParams, WorkspaceCreate, WorkspaceCreateParams, WorkspaceDelete,
-    WorkspaceDeleteParams, WorkspaceInfo, WorkspaceOpenPath, WorkspaceOpenPathParams,
-    WorkspaceRemoveRoot, WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRename,
-    WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams,
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
+    WorkspaceAddProjectParams, WorkspaceAddRoot, WorkspaceAddRootParams, WorkspaceCreate,
+    WorkspaceCreateParams, WorkspaceDelete, WorkspaceDeleteParams, WorkspaceInfo,
+    WorkspaceOpenPath, WorkspaceOpenPathParams, WorkspaceRemoveProject,
+    WorkspaceRemoveProjectParams, WorkspaceRemoveRoot, WorkspaceRemoveRootParams,
+    WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams, WorkspaceRenamed,
+    WorkspaceRenamedParams,
 };
 use aether_protocol::{BufferId, LogicalPosition};
 
@@ -200,6 +202,9 @@ pub enum Event {
     /// A root row's delete button was clicked in the workspace-settings overlay — open the shared
     /// confirm prompt for that root (same path as the Delete key → [`Session::request_remove_root`]).
     WorkspaceSettingsRemoveRoot(usize),
+    /// A shell-driven remove of project row `index` (the iced overlay's delete button), the
+    /// pointer-driven sibling of the `Delete` / `Ctrl-d` chord.
+    WorkspaceSettingsRemoveProject(usize),
     /// A setting's checkbox was clicked in the app-settings overlay (flat row index) — toggle it.
     /// The keyboard path (Enter/Space) doesn't use this; it toggles the focused row directly.
     AppSettingToggle(usize),
@@ -210,6 +215,12 @@ pub enum Event {
     },
     /// `directory/list` for the save-as path editor resolved; `abs` is the staleness key.
     SaveAsListing {
+        abs: String,
+        result: Result<DirectoryListResult, String>,
+    },
+    /// `directory/list` for the settings overlay's add-project row, keyed by the absolute directory
+    /// it was requested for so a stale reply (the editor moved on) is dropped.
+    AddProjectListing {
         abs: String,
         result: Result<DirectoryListResult, String>,
     },
@@ -240,6 +251,10 @@ pub enum Event {
     WorkspaceRenamed(Result<WorkspaceInfo, String>),
     /// `workspace/add_root` (from the settings overlay) resolved: refresh the roots or set the error.
     WorkspaceRootAdded(Result<WorkspaceInfo, String>),
+    /// `workspace/add_project` landed — the workspace's projects (and its pinned servers) changed.
+    WorkspaceProjectAdded(Result<WorkspaceInfo, String>),
+    /// `workspace/remove_project` landed.
+    WorkspaceProjectRemoved(Result<WorkspaceInfo, String>),
     /// `workspace/remove_root` (from the settings overlay) resolved: refresh the roots and, when the
     /// active buffer was closed, switch to the next one.
     WorkspaceRootRemoved(Result<WorkspaceRemoveRootResult, String>),
@@ -876,6 +891,7 @@ impl Session {
             Event::WorkspaceActivated(Ok((workspace, open))) => {
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
+                self.workspace_projects = workspace.projects;
                 // A deliberate switch means we're no longer in the launch context, so closing the
                 // last buffer of an ephemeral context reached this way returns to the chooser
                 // rather than quitting (see `leave_ephemeral_workspace`).
@@ -895,6 +911,7 @@ impl Session {
                 } = activate;
                 self.workspace = workspace.name.clone();
                 self.workspace_paths = workspace.paths;
+                self.workspace_projects = workspace.projects;
                 self.launched_with_file = false;
                 // Workspace-scoped recall lists — empty for a brand-new workspace, but the fetch
                 // is what *clears* the previous workspace's (see `WorkspaceActivated`).
@@ -974,6 +991,34 @@ impl Session {
                 }
             }
 
+            Event::WorkspaceProjectAdded(result) | Event::WorkspaceProjectRemoved(result) => {
+                // One arm for both: each returns the updated `WorkspaceInfo`, and the overlay
+                // reconciles the same way — re-sync, clear the input, keep focus on the add row.
+                match result {
+                    Ok(info) => {
+                        let name = info.name.clone();
+                        let count = info.projects.len();
+                        self.sync_workspace_info(info);
+                        if let Some(s) = self.workspace_settings.as_mut() {
+                            s.add_project.input.clear();
+                            s.add_project.suggestion_idx = 0;
+                            s.error = None;
+                            s.selected = s.add_project_index();
+                        }
+                        Effects::toast(
+                            format!("{name} now has {count} project(s)"),
+                            ToastKind::Success,
+                        )
+                    }
+                    Err(e) => {
+                        if let Some(s) = self.workspace_settings.as_mut() {
+                            s.error = Some(e);
+                        }
+                        Effects::none()
+                    }
+                }
+            }
+
             Event::WorkspaceRootRemoved(result) => match result {
                 Ok(r) => {
                     let name = r.workspace.name.clone();
@@ -1041,6 +1086,7 @@ impl Session {
             }
 
             Event::WorkspaceSettingsRemoveRoot(index) => self.request_remove_root(index),
+            Event::WorkspaceSettingsRemoveProject(index) => self.request_remove_project(index),
 
             Event::AppSettingToggle(index) => self.app_settings_toggle(index),
 
@@ -1111,6 +1157,19 @@ impl Session {
                         match result {
                             Ok(r) => ed.set_dir_listing(r.entries),
                             Err(_) => ed.set_dir_listing_failed(),
+                        }
+                    }
+                }
+                Effects::none()
+            }
+
+            Event::AddProjectListing { abs, result } => {
+                // Same staleness rule as `SaveAsListing`, against the settings overlay's editor.
+                if let Some(st) = self.workspace_settings.as_mut() {
+                    if st.add_project.listing_dir_abs == abs {
+                        match result {
+                            Ok(r) => st.add_project.set_dir_listing(r.entries),
+                            Err(_) => st.add_project.set_dir_listing_failed(),
                         }
                     }
                 }
@@ -1268,6 +1327,7 @@ impl Session {
                 let old_cursor = self.buffer.cursor;
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
+                self.workspace_projects = workspace.projects;
                 let same_file = open.path == self.buffer.path;
                 self.buffer = buffer_info(open, &self.workspace_paths);
                 self.conn = ConnState::Connected;
@@ -2287,15 +2347,17 @@ impl Session {
 
     /// Tab in the Explorer: adopt the common-prefix completion ghost into the query (extending the
     /// filter part), then re-query. No-op when there's no completion to apply.
-    fn apply_explorer_completion(&mut self) -> Effects {
+    /// `None` when the query has no completion ghost to adopt, so a caller that folds this together
+    /// with another action (Explorer's Alt-l, which otherwise descends) can tell the two apart.
+    fn apply_explorer_completion(&mut self) -> Option<Effects> {
         let suffix = match self.picker.as_ref().and_then(|p| p.explorer_completion()) {
             Some(s) if !s.is_empty() => s,
-            _ => return Effects::none(),
+            _ => return None,
         };
         if let Some(p) = self.picker.as_mut() {
             p.query.push_str(&suffix);
         }
-        self.picker_query_changed()
+        Some(self.picker_query_changed())
     }
 
     /// Move the picker highlight, refetching when it leaves the fetched window and revealing
@@ -2537,6 +2599,65 @@ impl Session {
             }
         }
         Effects::none()
+    }
+
+    /// Replace the add-project row's path-segment text wholesale (native `<input>` parity, as
+    /// above), refreshing its completion listing if the directory portion moved.
+    pub fn workspace_settings_set_add_project(&mut self, text: String) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return Effects::none();
+        };
+        if s.add_project.input.text == text {
+            return Effects::none();
+        }
+        s.add_project.input.set(text);
+        s.error = None;
+        if s.add_project.path_edited(&workspace_paths) {
+            self.refresh_add_project_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Replace the add-project row's *root* segment filter (multi-root workspaces only).
+    pub fn workspace_settings_set_add_project_root(&mut self, text: String) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return Effects::none();
+        };
+        if s.add_project.root_filter.text == text {
+            return Effects::none();
+        }
+        s.add_project.root_filter.set(text);
+        s.add_project.root_selected = 0;
+        s.error = None;
+        if s.add_project.sync_dir_listing(&workspace_paths) {
+            self.refresh_add_project_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Fire `directory/list` for the add-project editor's current (root, dir-portion) pair. Mirrors
+    /// [`Self::refresh_save_as_listing`]; the requested path rides on the result event so a stale
+    /// response (the editor moved on) can be discarded.
+    fn refresh_add_project_listing(&mut self) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let path = self
+            .workspace_settings
+            .as_ref()
+            .and_then(|s| s.add_project.dir_listing_path(&workspace_paths));
+        let Some(path) = path else {
+            return Effects::none();
+        };
+        let abs = path.clone();
+        self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
+            Event::AddProjectListing {
+                abs,
+                result: __r.map_err(|e| e.to_string()),
+            }
+        })
     }
 
     /// Replace the chip editor's path-field text wholesale (the web client's native `<input>` owns
@@ -3232,13 +3353,12 @@ impl Session {
             }
             _ => Effects::none(),
         };
-        fx = fx.and(self.request::<PickerHide>(
-            PickerHideParams { kind: p.kind },
-            move |__r| {
+        fx = fx.and(
+            self.request::<PickerHide>(PickerHideParams { kind: p.kind }, move |__r| {
                 let _ = __r;
                 Event::Noop
-            },
-        ));
+            }),
+        );
         fx
     }
 
@@ -3419,7 +3539,14 @@ impl Session {
             // diagnostics) jumps the selection to the next / previous group's first row;
             // DocumentSymbols jumps to the next / previous top-level unit; elsewhere Alt-h
             // clears (via picker_back).
+            // Alt-l is the accept/advance gesture: adopt the common-prefix completion ghost if the
+            // query has one, otherwise descend into the highlighted directory. Both are "go
+            // deeper", and folding them keeps Alt-l meaning "accept the suggestion" here as it does
+            // in every other completing field — which is what freed Tab for field traversal.
             KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
+                if let Some(fx) = self.apply_explorer_completion() {
+                    return fx;
+                }
                 return self.explorer_enter_selected();
             }
             KeyCode::Char('l')
@@ -3510,10 +3637,6 @@ impl Session {
                 }
                 return Effects::none();
             }
-            // Tab: adopt the Explorer's common-prefix completion ghost into the query.
-            KeyCode::Tab if no_chord && p.kind == PickerKind::Explorer => {
-                return self.apply_explorer_completion();
-            }
             // `Left` / `Backspace` step into the chip row (rightmost first) — the browser
             // tag-input gesture. In-query caret moves and deletes are owned by each shell's input
             // (which only forwards these from the query start), so reaching the core *is* the
@@ -3566,16 +3689,18 @@ impl Session {
             KeyCode::Esc => {
                 p.chip_editor = None;
             }
-            // Tab / Alt-l: accept the focused segment's suggestion. Root — adopt the ghost
-            // completion and continue right into the path; path — absorb the ghost directory
-            // segment (repeated presses walk down the tree).
-            KeyCode::Tab if no_chord && is_dir => {
-                if in_root {
-                    refresh = ed.commit_root_field(&labels, &workspace_paths);
-                } else {
-                    refresh = ed.accept_path_suggestion(&workspace_paths);
-                }
+            // Tab / Shift-Tab traverse the editor's segments, as they do in every other field
+            // (the workspace-settings dialog, the save-as prompt). Traversal only — accepting a
+            // suggestion is Alt-l.
+            KeyCode::Tab if no_chord && is_dir && in_root => {
+                refresh = ed.advance_to_path(&workspace_paths);
             }
+            KeyCode::BackTab if multi_root_dir && !in_root => {
+                ed.field = ChipEditorField::Root;
+            }
+            // Alt-l accepts the focused segment's suggestion. Root — adopt the ghost completion and
+            // continue right into the path; path — absorb the ghost directory segment (repeated
+            // presses walk down the tree).
             KeyCode::Char('l') if mods.alt && !mods.ctrl && is_dir => {
                 if in_root {
                     refresh = ed.commit_root_field(&labels, &workspace_paths);
@@ -3703,106 +3828,22 @@ impl Session {
     /// confirms the root and moves on); Esc cancels.
     fn on_save_as_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
-        let labels = super::labels::root_labels(&workspace_paths);
         let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
             return Effects::none();
         };
-        let multi_root = workspace_paths.len() > 1;
-        let in_root = multi_root && ed.field == ChipEditorField::Root;
-        let no_chord = !mods.ctrl && !mods.alt;
-        // Whether the path field's suggestion listing went stale and needs a directory/list.
-        let mut refresh = false;
-        match code {
-            // Enter in the path field saves; in the root field it confirms the root and advances.
-            KeyCode::Enter if no_chord && !in_root => return self.commit_save_as(),
-            KeyCode::Enter if no_chord => {
-                refresh = ed.commit_root_field(&labels, &workspace_paths);
-            }
-            KeyCode::Esc => {
+        match path_editor_key(ed, &workspace_paths, code, mods, text) {
+            PathEditorKey::Commit => self.commit_save_as(),
+            PathEditorKey::Cancel => {
                 self.prompt = None;
-                return Effects::none();
+                Effects::none()
             }
-            // Tab / Alt-l: accept the focused segment's suggestion (root — adopt + advance; path —
-            // absorb the next directory segment, repeated presses walk down the tree).
-            KeyCode::Tab if no_chord => {
-                if in_root {
-                    refresh = ed.commit_root_field(&labels, &workspace_paths);
-                } else {
-                    refresh = ed.accept_path_suggestion(&workspace_paths);
-                }
-            }
-            KeyCode::Char('l') if mods.alt && !mods.ctrl => {
-                if in_root {
-                    refresh = ed.commit_root_field(&labels, &workspace_paths);
-                } else {
-                    refresh = ed.accept_path_suggestion(&workspace_paths);
-                }
-            }
-            KeyCode::Char('h') if mods.alt && !mods.ctrl && multi_root => {
-                ed.field = ChipEditorField::Root;
-            }
-            // `:` on a completed root value confirms it and moves into the path.
-            KeyCode::Char(':') if no_chord && in_root => {
-                if ed.root_complete(&labels) {
-                    refresh = ed.commit_root_field(&labels, &workspace_paths);
-                }
-            }
-            // Alt-Backspace: in the path it deletes the rightmost segment, fish-style; at an empty
-            // path it clears the root selection. In the root field it clears the filter.
-            KeyCode::Backspace if mods.alt && !mods.ctrl => {
-                if ed.field == ChipEditorField::Path {
-                    if ed.input.text.is_empty() {
-                        if multi_root {
-                            ed.field = ChipEditorField::Root;
-                            ed.root_filter.clear();
-                            ed.root_selected = 0;
-                        }
-                    } else {
-                        refresh = ed.pop_path_segment(&workspace_paths);
-                    }
-                } else {
-                    ed.root_filter.clear();
-                    ed.root_selected = 0;
-                }
-            }
-            // Backspace at an empty path steps back into the root field.
-            KeyCode::Backspace
-                if no_chord
-                    && multi_root
-                    && ed.field == ChipEditorField::Path
-                    && ed.input.text.is_empty() =>
-            {
-                ed.field = ChipEditorField::Root;
-            }
-            // Cycle the focused segment's matches: root typeahead (wrapping) or path suggestions
-            // (clamped).
-            KeyCode::Char(c @ ('j' | 'k')) if mods.alt && !mods.ctrl => {
-                let down = c == 'j';
-                if in_root {
-                    let n = chips::root_candidates(&labels, &ed.root_filter.text).len();
-                    if n > 0 {
-                        let sel = ed.root_selected.min(n - 1);
-                        ed.root_selected = if down {
-                            (sel + 1) % n
-                        } else {
-                            (sel + n - 1) % n
-                        };
-                        refresh = ed.sync_dir_listing(&workspace_paths);
-                    }
-                } else {
-                    ed.cycle_path_suggestion(down);
-                }
-            }
-            // In-field text entry (chars, plain Backspace, caret) is owned by each shell's input,
-            // synced via `save_as_set_input` / `save_as_set_root_filter`. Anything else is a no-op.
-            _ => {
-                let _ = text;
-            }
-        }
-        if refresh {
-            self.refresh_save_as_listing()
-        } else {
-            Effects::none()
+            PathEditorKey::Handled { refresh: true } => self.refresh_save_as_listing(),
+            // The prompt *is* the editor — there's no enclosing form, so a Tab off either end has
+            // nowhere to go and simply stops.
+            PathEditorKey::Handled { refresh: false }
+            | PathEditorKey::NextField
+            | PathEditorKey::PrevField
+            | PathEditorKey::Ignored => Effects::none(),
         }
     }
 
@@ -4743,10 +4784,12 @@ impl Session {
     fn sync_workspace_info(&mut self, info: WorkspaceInfo) {
         if self.workspace == info.name {
             self.workspace_paths = info.paths.clone();
+            self.workspace_projects = info.projects.clone();
         }
         if let Some(s) = self.workspace_settings.as_mut() {
             if s.workspace_name == info.name {
                 s.roots = info.paths;
+                s.projects = info.projects;
             }
         }
     }
@@ -4757,13 +4800,26 @@ impl Session {
     /// above the roots and reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
     pub fn open_workspace_settings(&mut self) {
         let roots = self.workspace_paths.clone();
+        let projects = self.workspace_projects.clone();
         let workspace_name = self.workspace.clone();
         self.workspace_settings = Some(WorkspaceSettings {
             workspace_name: workspace_name.clone(),
             name: TextField::new(workspace_name),
             roots,
+            projects,
             selected: 0, // the workspace-name field
             add: TextField::default(),
+            // Multi-root workspaces open on the root segment (there's a choice to make); a
+            // single-root one skips straight to the path, where its only root is implied.
+            add_project: Box::new(PathEditor::new(
+                String::new(),
+                if self.workspace_paths.len() > 1 {
+                    ChipEditorField::Root
+                } else {
+                    ChipEditorField::Path
+                },
+                0,
+            )),
             error: None,
         });
     }
@@ -4785,19 +4841,15 @@ impl Session {
         mods: Mods,
         text: Option<String>,
     ) -> Effects {
-        // Ctrl-d is accepted alongside Delete to remove the selected root.
+        // Ctrl-d is accepted alongside Delete to remove the selected root or project.
         let is_delete_chord =
             code == KeyCode::Delete || (code == KeyCode::Char('d') && mods.ctrl && !mods.alt);
 
-        let Some((selected, roots_len)) = self
-            .workspace_settings
-            .as_ref()
-            .map(|s| (s.selected, s.roots.len()))
-        else {
+        let Some(row) = self.workspace_settings.as_ref().map(|s| s.row()) else {
             return Effects::none();
         };
-        let on_name = selected == 0;
-        let on_input = selected == roots_len + 1;
+        let on_name = row == SettingsRow::Name;
+        let no_chord = !mods.ctrl && !mods.alt;
 
         if code == KeyCode::Esc {
             // Closing blurs the name field — commit any pending rename, then close. Unlike the TUI,
@@ -4812,49 +4864,129 @@ impl Session {
             return rename;
         }
 
-        // Alt-j / Alt-k navigation. Moving down off the name field blurs it → commit the rename.
-        if mods.alt && !mods.ctrl {
-            match code {
-                KeyCode::Char('k') => {
-                    if let Some(s) = self.workspace_settings.as_mut() {
-                        s.selected = s.selected.saturating_sub(1);
-                    }
+        // The add-project row is a full path editor. Give it the key first: it owns the chords that
+        // act *within* a field (Alt-j/k cycle candidates, Alt-l accepts, Alt-h/Backspace step back),
+        // and hands `Tab`/`Shift-Tab` back once it runs out of segments so traversal continues
+        // through the dialog. Anything it ignores falls through to the dialog keys below.
+        if row == SettingsRow::AddProject {
+            let workspace_paths = self.workspace_paths.clone();
+            let outcome = self.workspace_settings.as_mut().map(|s| {
+                path_editor_key(
+                    &mut s.add_project,
+                    &workspace_paths,
+                    code,
+                    mods,
+                    text.clone(),
+                )
+            });
+            match outcome {
+                Some(PathEditorKey::Commit) => return self.commit_add_project(),
+                // Esc closes the whole dialog, as it does from any row — the editor is a field
+                // here, not a prompt of its own.
+                Some(PathEditorKey::Cancel) => {
+                    self.workspace_settings = None;
                     return Effects::none();
                 }
-                KeyCode::Char('j') => {
-                    let rename = if on_name {
-                        self.commit_rename_if_changed()
-                    } else {
-                        Effects::none()
-                    };
-                    if let Some(s) = self.workspace_settings.as_mut() {
-                        s.selected = (s.selected + 1).min(s.roots.len() + 1);
-                    }
-                    return rename;
+                Some(PathEditorKey::Handled { refresh: true }) => {
+                    return self.refresh_add_project_listing()
                 }
+                Some(PathEditorKey::Handled { refresh: false }) => return Effects::none(),
+                // Off the end of the editor's segments — carry on through the dialog. It's the
+                // last row, so forward wraps round to the name field; backward steps to the row
+                // above.
+                Some(PathEditorKey::NextField) => return self.settings_step_field(true),
+                Some(PathEditorKey::PrevField) => return self.settings_step_field(false),
+                Some(PathEditorKey::Ignored) | None => {}
+            }
+        }
+
+        // Tab / Shift-Tab traverse the dialog's fields — the form convention, and the reason the
+        // editor above no longer claims Tab for completion.
+        if code == KeyCode::Tab || code == KeyCode::BackTab {
+            return self.settings_step_field(code == KeyCode::Tab);
+        }
+
+        // Up / Down traverse too, as a non-chord alternative to Tab. Deliberately *not* Alt-j/k:
+        // those act inside the focused field (cycling the path editor's candidates), and a key that
+        // sometimes traverses and sometimes doesn't — depending on which field you happen to be on —
+        // is exactly the ambiguity Tab was introduced to remove. No field here uses the arrows
+        // (neither name nor path input has history recall), so they're free.
+        if no_chord && matches!(code, KeyCode::Up | KeyCode::Down) {
+            let rename = if on_name && code == KeyCode::Down {
+                self.commit_rename_if_changed()
+            } else {
+                Effects::none()
+            };
+            if let Some(s) = self.workspace_settings.as_mut() {
+                s.selected = if code == KeyCode::Down {
+                    (s.selected + 1).min(s.row_count() - 1)
+                } else {
+                    s.selected.saturating_sub(1)
+                };
+            }
+            return rename;
+        }
+
+        if is_delete_chord {
+            match row {
+                SettingsRow::Root(i) => return self.request_remove_root(i),
+                SettingsRow::Project(i) => return self.request_remove_project(i),
                 _ => {}
             }
         }
 
-        if is_delete_chord && !on_name && !on_input {
-            // Open the shared confirm prompt for the selected root (index `selected - 1`).
-            return self.request_remove_root(selected - 1);
-        }
-
         if code == KeyCode::Enter {
-            if on_name {
-                return self.commit_rename_if_changed();
-            } else if on_input {
-                return self.commit_add_root();
+            match row {
+                SettingsRow::Name => return self.commit_rename_if_changed(),
+                SettingsRow::AddRoot => return self.commit_add_root(),
+                SettingsRow::AddProject => return self.commit_add_project(),
+                _ => return Effects::none(),
             }
-            return Effects::none();
         }
 
-        // Text editing for the focused field (name / add-root) is owned by each shell's input,
-        // which syncs the value via `workspace_settings_set_name` / `_set_add`. The core handles only
-        // the command keys above; any other key here is a no-op.
+        // Text editing for the focused field (name / add-root / add-project) is owned by each
+        // shell's input, which syncs the value via `workspace_settings_set_name` / `_set_add` /
+        // `_set_add_project`. The core handles only the command keys above; any other key here is a
+        // no-op.
         let _ = text;
         Effects::none()
+    }
+
+    /// Move the workspace-settings focus one field forward or back, **wrapping** at either end — a
+    /// form that traps you at the last field is worse than one you can cycle, and Tab is expected to
+    /// cycle.
+    ///
+    /// Landing on the add-project row enters its composite editor at the end you arrived from: the
+    /// root segment going forwards, the path segment coming back. That's how Tab behaves into any
+    /// multi-part widget, and it makes reverse traversal actually retrace the forward path.
+    fn settings_step_field(&mut self, forward: bool) -> Effects {
+        let Some(s) = self.workspace_settings.as_ref() else {
+            return Effects::none();
+        };
+        // Leaving the name field commits any pending rename, exactly as blurring it does.
+        let rename = if s.row() == SettingsRow::Name && forward {
+            self.commit_rename_if_changed()
+        } else {
+            Effects::none()
+        };
+        let multi_root = self.workspace_paths.len() > 1;
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return rename;
+        };
+        let count = s.row_count();
+        s.selected = if forward {
+            (s.selected + 1) % count
+        } else {
+            (s.selected + count - 1) % count
+        };
+        if s.row() == SettingsRow::AddProject && multi_root {
+            s.add_project.field = if forward {
+                ChipEditorField::Root
+            } else {
+                ChipEditorField::Path
+            };
+        }
+        rename
     }
 
     /// Commit a pending workspace rename if the name field differs from the committed name. Emits a
@@ -4907,7 +5039,66 @@ impl Session {
         )
     }
 
-    /// Open the shared confirm prompt for removing root `index` (the `selected - 1` root row, or a
+    /// Commit the add-project row: emit `workspace/add_project` for the editor's (root, path) pair.
+    ///
+    /// No language is sent — the server infers it from the marker's file name, which covers every
+    /// marker but `package.json`. Declaring that one as JavaScript rather than TypeScript means
+    /// editing the TOML; it's a rare enough distinction not to earn a third segment in the row.
+    fn commit_add_project(&mut self) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(s) = self.workspace_settings.as_ref() else {
+            return Effects::none();
+        };
+        let workspace = s.workspace_name.clone();
+        // `save_target` yields the literal typed path under the chosen root — no snapping to the
+        // highlighted suggestion (that's what Tab is for), which matters here too: you may be
+        // naming a marker the completion listing hasn't caught up with.
+        let Some((path_index, relative_path)) = s.add_project.save_target(&workspace_paths) else {
+            return Effects::none();
+        };
+        if relative_path.trim().is_empty() {
+            return Effects::none();
+        }
+        if let Some(s) = self.workspace_settings.as_mut() {
+            s.error = None;
+        }
+        self.request_str::<WorkspaceAddProject>(
+            WorkspaceAddProjectParams {
+                workspace,
+                path_index,
+                relative_path,
+                language: None,
+            },
+            Event::WorkspaceProjectAdded,
+        )
+    }
+
+    /// Open the shared confirm prompt for removing project `index`. Mirrors
+    /// [`Self::request_remove_root`]: the request is self-contained, so the overlay's selection
+    /// moving (or the overlay closing) before the confirm resolves can't misfire it.
+    pub fn request_remove_project(&mut self, index: usize) -> Effects {
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return Effects::none();
+        };
+        let Some(project) = s.projects.get(index).cloned() else {
+            return Effects::none();
+        };
+        let workspace = s.workspace_name.clone();
+        s.error = None;
+        self.prompt = Some(Prompt::Confirm {
+            kind: ConfirmKind::RemoveProject {
+                path: project.relative_path.clone(),
+            },
+            action: ConfirmAction::RemoveWorkspaceProject {
+                workspace,
+                path_index: project.path_index,
+                relative_path: project.relative_path,
+            },
+        });
+        Effects::none()
+    }
+
+    /// Open the shared confirm prompt for removing root `index` (the selected root row, or a
     /// clicked delete button). The actual `workspace/remove_root` request fires when the prompt is
     /// accepted ([`ConfirmAction::RemoveWorkspaceRoot`] → [`Self::run_confirm`]); the result lands as
     /// [`Event::WorkspaceRootRemoved`]. No-op if the overlay is closed or the index is out of range.
@@ -4935,7 +5126,8 @@ impl Session {
         let fx = self.request_str::<SettingsGet>(SettingsGetParams {}, Event::AppSettingsLoaded);
         // The hint learning snapshot rides the same connect sequence; re-fetched after a
         // reconnect too, which reconciles the local mirror against the server's counters.
-        let fx = fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded));
+        let fx =
+            fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded));
         // So do the input-history lists (docs/input-history.md). Empty at a boot chooser — no
         // workspace is active yet — and refetched by the switch that activates one.
         fx.and(self.fetch_history())
@@ -5069,15 +5261,30 @@ impl Session {
             return Effects::none();
         }
 
-        let up = code == KeyCode::Up || (mods.alt && code == KeyCode::Char('k'));
-        let down = code == KeyCode::Down || (mods.alt && code == KeyCode::Char('j'));
-        if up {
+        // Tab / Shift-Tab and the arrows traverse, matching the workspace-settings dialog. Alt-j/k
+        // is deliberately absent for the same reason it is there: it belongs to the focused field,
+        // and a key that traverses only when the field doesn't want it is unpredictable. Every row
+        // here is a toggle with nothing to cycle, so Alt-j/k simply does nothing.
+        //
+        // Tab wraps at either end (as in the workspace dialog); the arrows clamp, which is what an
+        // arrow key does in every list in the app.
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) && row_count > 0 {
+            if let Some(s) = self.app_settings.as_mut() {
+                s.selected = if code == KeyCode::Tab {
+                    (s.selected + 1) % row_count
+                } else {
+                    (s.selected + row_count - 1) % row_count
+                };
+            }
+            return Effects::none();
+        }
+        if code == KeyCode::Up {
             if let Some(s) = self.app_settings.as_mut() {
                 s.selected = s.selected.saturating_sub(1);
             }
             return Effects::none();
         }
-        if down {
+        if code == KeyCode::Down {
             if let Some(s) = self.app_settings.as_mut() {
                 s.selected = (s.selected + 1).min(row_count.saturating_sub(1));
             }
@@ -5426,6 +5633,18 @@ impl Session {
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }
                 }),
+            ConfirmAction::RemoveWorkspaceProject {
+                workspace,
+                path_index,
+                relative_path,
+            } => self.request_str::<WorkspaceRemoveProject>(
+                WorkspaceRemoveProjectParams {
+                    workspace,
+                    path_index,
+                    relative_path,
+                },
+                Event::WorkspaceProjectRemoved,
+            ),
             ConfirmAction::RemoveWorkspaceRoot { workspace, path } => self
                 .request_str::<WorkspaceRemoveRoot>(
                     WorkspaceRemoveRootParams { workspace, path },
@@ -5463,7 +5682,7 @@ impl Session {
         } else {
             ChipEditorField::Path
         };
-        let mut ed = SaveAsEditor::new(input, field, path_index);
+        let mut ed = PathEditor::new(input, field, path_index);
         ed.sync_dir_listing(&workspace_paths);
         self.prompt = Some(Prompt::SaveAs(Box::new(ed)));
         self.refresh_save_as_listing()
@@ -6796,4 +7015,145 @@ mod tests {
             "a directory Ctrl-click must not spawn a window"
         );
     }
+}
+
+/// What feeding a key to a [`PathEditor`] means for its owner.
+///
+/// The editor itself is shared: the save-as prompt and the workspace-settings add-project row want
+/// identical completion behaviour (root typeahead, ghost suggestions, `Tab` accept, fish-style
+/// `Alt-Backspace`) but commit to entirely different places. So the key *mechanics* live here and
+/// the two callers interpret [`Self::Commit`] / [`Self::Cancel`] their own way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathEditorKey {
+    /// Consumed by the editor. `refresh` means its directory listing went stale and the owner
+    /// should refetch (`directory/list`).
+    Handled { refresh: bool },
+    /// Enter in the path field — the owner commits whatever the editor now holds.
+    Commit,
+    /// Esc — the owner closes or cancels.
+    Cancel,
+    /// `Tab` past the editor's last segment: the owner should move to whatever follows it.
+    NextField,
+    /// `Shift-Tab` before its first segment: the owner should move to whatever precedes it.
+    PrevField,
+    /// Not a key the editor acts on. The owner may handle it.
+    Ignored,
+}
+
+/// Drive a [`PathEditor`] from one key. See [`PathEditorKey`]; in-field text entry (characters,
+/// plain Backspace, caret movement) is owned by each shell's native input and synced separately, so
+/// anything not listed here is a no-op.
+pub(crate) fn path_editor_key(
+    ed: &mut PathEditor,
+    workspace_paths: &[String],
+    code: KeyCode,
+    mods: Mods,
+    text: Option<String>,
+) -> PathEditorKey {
+    let labels = super::labels::root_labels(workspace_paths);
+    let multi_root = workspace_paths.len() > 1;
+    let in_root = multi_root && ed.field == ChipEditorField::Root;
+    let no_chord = !mods.ctrl && !mods.alt;
+    // Whether the path field's suggestion listing went stale and needs a directory/list.
+    let mut refresh = false;
+    match code {
+        // Enter in the path field commits; in the root field it confirms the root and advances.
+        KeyCode::Enter if no_chord && !in_root => return PathEditorKey::Commit,
+        KeyCode::Enter if no_chord => {
+            refresh = ed.commit_root_field(&labels, workspace_paths);
+        }
+        KeyCode::Esc => return PathEditorKey::Cancel,
+        // Tab / Shift-Tab traverse — the editor's segments are fields like any other, so they step
+        // root → path and back, and hand off past either end. Accepting a suggestion is Alt-l
+        // (below), never Tab: one key, one meaning, everywhere.
+        KeyCode::Tab if no_chord => {
+            if in_root {
+                // Traversal only — the root ghost is *not* adopted. Accepting a suggestion is
+                // Alt-l, here as everywhere; Tab that quietly completed on its way past would be
+                // the same overloading this scheme exists to remove.
+                refresh = ed.advance_to_path(workspace_paths);
+            } else {
+                return PathEditorKey::NextField;
+            }
+        }
+        KeyCode::BackTab => {
+            if in_root {
+                return PathEditorKey::PrevField;
+            }
+            if multi_root {
+                ed.field = ChipEditorField::Root;
+            } else {
+                return PathEditorKey::PrevField;
+            }
+        }
+        // Alt-l accepts the focused segment's suggestion (root — adopt + advance; path — absorb the
+        // next directory segment, repeated presses walk down the tree).
+        KeyCode::Char('l') if mods.alt && !mods.ctrl => {
+            if in_root {
+                refresh = ed.commit_root_field(&labels, workspace_paths);
+            } else {
+                refresh = ed.accept_path_suggestion(workspace_paths);
+            }
+        }
+        KeyCode::Char('h') if mods.alt && !mods.ctrl && multi_root => {
+            ed.field = ChipEditorField::Root;
+        }
+        // `:` on a completed root value confirms it and moves into the path.
+        KeyCode::Char(':') if no_chord && in_root => {
+            if ed.root_complete(&labels) {
+                refresh = ed.commit_root_field(&labels, workspace_paths);
+            }
+        }
+        // Alt-Backspace: in the path it deletes the rightmost segment, fish-style; at an empty
+        // path it clears the root selection. In the root field it clears the filter.
+        KeyCode::Backspace if mods.alt && !mods.ctrl => {
+            if ed.field == ChipEditorField::Path {
+                if ed.input.text.is_empty() {
+                    if multi_root {
+                        ed.field = ChipEditorField::Root;
+                        ed.root_filter.clear();
+                        ed.root_selected = 0;
+                    }
+                } else {
+                    refresh = ed.pop_path_segment(workspace_paths);
+                }
+            } else {
+                ed.root_filter.clear();
+                ed.root_selected = 0;
+            }
+        }
+        // Backspace at an empty path steps back into the root field.
+        KeyCode::Backspace
+            if no_chord
+                && multi_root
+                && ed.field == ChipEditorField::Path
+                && ed.input.text.is_empty() =>
+        {
+            ed.field = ChipEditorField::Root;
+        }
+        // Cycle the focused segment's matches: root typeahead (wrapping) or path suggestions
+        // (clamped).
+        KeyCode::Char(c @ ('j' | 'k')) if mods.alt && !mods.ctrl => {
+            let down = c == 'j';
+            if in_root {
+                let n = chips::root_candidates(&labels, &ed.root_filter.text).len();
+                if n > 0 {
+                    let sel = ed.root_selected.min(n - 1);
+                    ed.root_selected = if down {
+                        (sel + 1) % n
+                    } else {
+                        (sel + n - 1) % n
+                    };
+                    refresh = ed.sync_dir_listing(workspace_paths);
+                }
+            } else {
+                ed.cycle_path_suggestion(down);
+            }
+        }
+        _ => {
+            let _ = text;
+            return PathEditorKey::Ignored;
+        }
+    }
+    PathEditorKey::Handled { refresh }
 }

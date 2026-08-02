@@ -662,6 +662,22 @@ html, body, #app {
 }
 /* Selection tints just the text (terminal-client parity), not the whole row. */
 .ps-root-path.selected { background: var(--nord2); }
+/* A project row's trailing tag: the language whose server it pins, dim — or, when the declaration
+   is broken (deleted marker, unrecognised name), the reason in red. Pushed right by the delete
+   button's `margin-left: auto`, so it sits just left of the ✕. */
+.ps-project-language, .ps-project-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85em;
+}
+.ps-project-language { color: var(--nord3-brighter); }
+.ps-project-error { color: var(--nord11); }
+/* With a tag present the delete button no longer needs to claim the free space itself. */
+.ps-project-language ~ .ps-root-delete, .ps-project-error ~ .ps-root-delete { margin-left: 6px; }
 .ps-root-delete {
   flex: 0 0 auto;
   margin-left: auto; /* the path hugs its text now, so push the delete to the right edge */
@@ -688,6 +704,13 @@ html, body, #app {
   font: inherit;
 }
 .ps-add-input::placeholder { color: var(--nord3-brighter); font-style: italic; }
+.ps-add-input.invalid { color: var(--nord11); }
+/* The add-project row's field. It reuses the dir/save-as editor's `picker-editor-*` ghost-stacking
+   DOM wholesale, so only the flex container is defined here: the segments size themselves (the root
+   hugs its content, the path takes the rest) exactly as they do in the picker. */
+/* `gap` matches the picker's own editor row (6px): `.picker-editor-sep` cancels it with a -6px
+   pull so the `:` sits flush against the root, leaving the gap between the colon and the path. */
+.picker-editor-field { display: flex; align-items: baseline; gap: 6px; flex: 1 1 auto; min-width: 0; }
 .ps-error { color: var(--nord11); font-size: var(--ui-small); margin-top: 8px; }
 
 /* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,

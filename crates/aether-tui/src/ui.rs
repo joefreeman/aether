@@ -1033,61 +1033,165 @@ fn draw_settings_rows(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    use crate::app::SettingsRowView;
     let base_style = Style::default().fg(NORD4).bg(NORD0);
-    let total_items = settings.roots.len() + 1;
+    let total_items = settings.rows.len();
     let max = (area.height as usize).max(1);
-    // `selected` is dialog-global (0 = name field, in the header); within this rows area item `i`
-    // maps to global index `i + 1`. Drop one level to scroll relative to the rows.
-    let rows_selected = settings.selected.saturating_sub(1);
-    let start = rows_selected
+    // `selected` is dialog-global (0 = name field, drawn in the header). Scroll on the *display*
+    // position of the focused row, which the section heading shifts down by one.
+    let focused_display = settings.focused_display_index().unwrap_or(0);
+    let start = focused_display
         .saturating_sub(max.saturating_sub(1))
         .min(total_items.saturating_sub(max));
     let area_w = area.width as usize;
+    let placeholder_style = Style::default()
+        .fg(NORD3)
+        .bg(NORD0)
+        .add_modifier(Modifier::ITALIC);
     let mut lines: Vec<Line> = Vec::new();
-    for i in start..(start + max).min(total_items) {
-        let highlighted = settings.selected == i + 1;
+    for row in settings.rows.iter().skip(start).take(max) {
+        let highlighted = row.select.is_some() && row.select == Some(settings.selected);
         // 1-col indent so list items sit visually under the section label.
         let leading = Span::styled(" ", base_style);
         let text_budget = area_w.saturating_sub(1);
-        if i < settings.roots.len() {
-            let root = &settings.roots[i];
-            // A colour-coded dot when the active buffer under this root is dirty / changed on
-            // disk (` •`), reserving its width so the path truncates to leave room.
-            let status = root_buffer_status(state, root);
-            let dot_w = if status.is_some() { 2 } else { 0 };
-            let truncated = truncate_middle(root, text_budget.saturating_sub(dot_w));
-            let bg = picker_row_bg(highlighted);
-            let path_style = Style::default().fg(NORD4).bg(bg);
-            let mut spans = vec![leading, Span::styled(truncated, path_style)];
-            if let Some(kind) = status {
-                spans.push(Span::styled(" ".to_string(), path_style));
-                spans.push(Span::styled(
-                    BUFFER_STATUS_DOT.to_string(),
-                    path_style.fg(buffer_status_color(kind)),
+        // Input row placeholder / typed text: never highlighted, since the caret marks the focus.
+        let input_line = |text: &str, placeholder: &str| {
+            let (text, style) = if text.is_empty() {
+                (placeholder.to_string(), placeholder_style)
+            } else {
+                (text.to_string(), Style::default().fg(NORD4).bg(NORD0))
+            };
+            Line::from(vec![
+                Span::styled(" ", base_style),
+                Span::styled(text, style),
+            ])
+        };
+        match &row.view {
+            SettingsRowView::Root(root) => {
+                // A colour-coded dot when the active buffer under this root is dirty / changed on
+                // disk (` •`), reserving its width so the path truncates to leave room.
+                let status = root_buffer_status(state, root);
+                let dot_w = if status.is_some() { 2 } else { 0 };
+                let truncated = truncate_middle(root, text_budget.saturating_sub(dot_w));
+                let bg = picker_row_bg(highlighted);
+                let path_style = Style::default().fg(NORD4).bg(bg);
+                let mut spans = vec![leading, Span::styled(truncated, path_style)];
+                if let Some(kind) = status {
+                    spans.push(Span::styled(" ".to_string(), path_style));
+                    spans.push(Span::styled(
+                        BUFFER_STATUS_DOT.to_string(),
+                        path_style.fg(buffer_status_color(kind)),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            SettingsRowView::AddRoot => {
+                let placeholder = if highlighted { "" } else { "Add root..." };
+                lines.push(input_line(&settings.add_input.text, placeholder));
+            }
+            SettingsRowView::Section(label) => {
+                // Flush left (no indent) so it reads as a heading over the rows beneath it, and
+                // styled exactly like the header's `Workspace roots:` label.
+                lines.push(Line::from(Span::styled(
+                    truncate_right(label, area_w),
+                    Style::default()
+                        .fg(NORD4)
+                        .bg(NORD0)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            SettingsRowView::Blank => lines.push(Line::from("")),
+            SettingsRowView::Project {
+                path,
+                language,
+                error,
+            } => {
+                // Trailing tag: the language whose server this pins, or — when the declaration is
+                // broken — the reason, in red. The tag is reserved first so the path truncates
+                // around it rather than pushing it off the edge.
+                let (tag, tag_fg) = match error {
+                    Some(e) => (e.clone(), NORD11),
+                    None => (language.clone(), NORD3),
+                };
+                let tag = truncate_right(&tag, text_budget.saturating_sub(4).min(40));
+                let tag_w = tag.chars().count();
+                let truncated =
+                    truncate_middle(path, text_budget.saturating_sub(tag_w.saturating_add(1)));
+                let bg = picker_row_bg(highlighted);
+                lines.push(Line::from(vec![
+                    leading,
+                    Span::styled(truncated, Style::default().fg(NORD4).bg(bg)),
+                    Span::styled(" ".to_string(), Style::default().bg(bg)),
+                    Span::styled(tag, Style::default().fg(tag_fg).bg(bg)),
+                ]));
+            }
+            SettingsRowView::AddProject => {
+                lines.push(project_editor_line(
+                    &settings.add_project,
+                    base_style,
+                    placeholder_style,
                 ));
             }
-            lines.push(Line::from(spans));
-        } else {
-            // Input row: no highlight regardless of selection. Placeholder when empty, plain
-            // text otherwise; ratatui clips past the right edge for very long inputs.
-            let (text, style) = if settings.add_input.text.is_empty() {
-                (
-                    "Add root...".to_string(),
-                    Style::default()
-                        .fg(NORD3)
-                        .bg(NORD0)
-                        .add_modifier(Modifier::ITALIC),
-                )
-            } else {
-                (
-                    settings.add_input.text.clone(),
-                    Style::default().fg(NORD4).bg(NORD0),
-                )
-            };
-            lines.push(Line::from(vec![leading, Span::styled(text, style)]));
         }
     }
     f.render_widget(Paragraph::new(lines).style(base_style), area);
+}
+
+/// Render the add-project row: a bulleted two-segment path editor mirroring the save prompt — an
+/// optional root typeahead (multi-root workspaces only), then the root-relative marker path with a
+/// dim ghost suggestion. Neither segment carries a selection highlight; the caret marks the focus,
+/// exactly as the add-root row does.
+fn project_editor_line<'a>(
+    ed: &'a crate::app::ProjectEditorState,
+    base_style: Style,
+    placeholder_style: Style,
+) -> Line<'a> {
+    // Unfocused and empty, the row collapses to its affordance — the same shape the add-root row
+    // has. Focused, the caret is the cue and the ghost carries the suggestion.
+    if !ed.focused && ed.path_input.text.is_empty() {
+        return Line::from(vec![
+            Span::styled(" ", base_style),
+            Span::styled("Add project...".to_string(), placeholder_style),
+        ]);
+    }
+    let mut spans = vec![Span::styled(" ", base_style)];
+    let text_style = Style::default().fg(NORD4).bg(NORD0);
+    // Same ghost tone as the chip editor's suggestion text.
+    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    if ed.multi_root {
+        // While the root segment is focused it shows the typed filter plus its inline completion;
+        // otherwise the settled root label.
+        if ed.on_root {
+            let style = if ed.root_invalid {
+                text_style.fg(NORD11)
+            } else {
+                text_style
+            };
+            spans.push(Span::styled(ed.root_input.text.clone(), style));
+            if let Some(ghost) = &ed.root_ghost {
+                spans.push(Span::styled(ghost.clone(), ghost_style));
+            }
+        } else {
+            // The committed-prefix blue the dir chip editor and status bar use for a settled root.
+            spans.push(Span::styled(
+                ed.root_display.clone(),
+                Style::default().fg(NORD8).bg(NORD0),
+            ));
+        }
+        spans.push(Span::styled(": ", ghost_style));
+    }
+    {
+        let style = if ed.path_invalid {
+            text_style.fg(NORD11)
+        } else {
+            text_style
+        };
+        spans.push(Span::styled(ed.path_input.text.clone(), style));
+        if let Some(ghost) = &ed.path_ghost {
+            spans.push(Span::styled(ghost.clone(), ghost_style));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Place the terminal caret on the settings overlay's name value (header line 3 — below the
@@ -1134,21 +1238,39 @@ fn place_settings_input_cursor(
     if rows.height == 0 || rows.width == 0 {
         return;
     }
-    let total_items = settings.roots.len() + 1;
+    let total_items = settings.rows.len();
     let max = (rows.height as usize).max(1);
-    // See `draw_settings_rows`: `selected` is dialog-global (0 = name field); shift to a rows-area
-    // index for the scroll math.
-    let rows_selected = settings.selected.saturating_sub(1);
-    let start = rows_selected
+    // See `draw_settings_rows`: scroll on the focused row's *display* position, which the section
+    // heading shifts relative to the selection index.
+    let Some(input_idx) = settings.focused_display_index() else {
+        return;
+    };
+    let start = input_idx
         .saturating_sub(max.saturating_sub(1))
         .min(total_items.saturating_sub(max));
-    let input_idx = settings.roots.len();
     if input_idx < start || input_idx >= start + max {
         return;
     }
+    // Which input owns the caret, and how far the row's own prefix pushes it right. The
+    // add-project row is a two-segment editor: on its path segment the caret sits past the
+    // rendered `root: ` prefix.
+    let ed = &settings.add_project;
+    let (input, prefix_w) = match settings.focused() {
+        Some(crate::app::SettingsRowView::AddRoot) => (&settings.add_input, 0),
+        Some(crate::app::SettingsRowView::AddProject) if ed.on_root => (&ed.root_input, 0),
+        Some(crate::app::SettingsRowView::AddProject) => (
+            &ed.path_input,
+            if ed.multi_root {
+                (ed.root_display.width() + 2) as u16 // "label" + ": "
+            } else {
+                0
+            },
+        ),
+        _ => return,
+    };
     let row_y = rows.y + (input_idx - start) as u16;
     // +1 for the leading " " indent each list item carries.
-    let typed_w = settings.add_input.width_to_cursor() as u16;
+    let typed_w = input.width_to_cursor() as u16 + prefix_w;
     let max_x = rows.x + rows.width.saturating_sub(1);
     let col = rows.x.saturating_add(1).saturating_add(typed_w).min(max_x);
     f.set_cursor_position((col, row_y));
@@ -5555,13 +5677,17 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
 
 fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, status_area: Rect) {
     // Settings overlay takes precedence over every other cursor target. We only place the caret
-    // when a text field is focused — the name field (index 0) or the add-root input row (last
-    // index); on a root row the cursor is hidden (no `set_cursor_position` call → ratatui hides
-    // it for this frame).
+    // when a text field is focused — the name field (index 0) or either input row; on a root or
+    // project row the cursor is hidden (no `set_cursor_position` call → ratatui hides it for this
+    // frame).
     if let Some(settings) = state.workspace_settings.as_ref() {
+        use crate::app::SettingsRowView;
         if settings.selected == 0 {
             place_settings_name_cursor(f, settings, buffer_area);
-        } else if settings.selected == settings.roots.len() + 1 {
+        } else if matches!(
+            settings.focused(),
+            Some(SettingsRowView::AddRoot | SettingsRowView::AddProject)
+        ) {
             place_settings_input_cursor(f, settings, buffer_area);
         }
         return;

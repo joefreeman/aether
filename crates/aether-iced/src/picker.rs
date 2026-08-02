@@ -264,7 +264,12 @@ pub fn overlay<'a>(
     }
     let prefix = explorer_prefix(state, roots);
     if let Some(pfx) = &prefix {
-        input = input.push(text(pfx.clone()).size(ui.body()).font(SANS).color(theme::NORD8));
+        input = input.push(
+            text(pfx.clone())
+                .size(ui.body())
+                .font(SANS)
+                .color(theme::NORD8),
+        );
     }
     // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
     // placeholder is suppressed there.
@@ -364,7 +369,12 @@ pub fn overlay<'a>(
     } else {
         format!("{}", state.total_matches)
     };
-    input = input.push(text(counts).size(ui.small()).font(SANS).color(theme::NORD3_BRIGHT));
+    input = input.push(
+        text(counts)
+            .size(ui.small())
+            .font(SANS)
+            .color(theme::NORD3_BRIGHT),
+    );
     // The settled empty-state line (or none) — wording + when-to-show are owned by the core so all
     // shells agree (e.g. "No diagnostics" for an unfiltered empty list, "No matches" under a query).
     let empty_note = state.empty_note();
@@ -422,10 +432,10 @@ pub fn overlay<'a>(
     let window_base = state.window_base();
     let in_window_gaps = state.groups.len().saturating_sub(1) as u32;
     let mut list = column![];
-    list = list.push(
-        iced::widget::Space::new()
-            .height(window_base as f32 * ui.row_h() + state.gaps_above_window() as f32 * GROUP_GAP),
-    );
+    list = list
+        .push(iced::widget::Space::new().height(
+            window_base as f32 * ui.row_h() + state.gaps_above_window() as f32 * GROUP_GAP,
+        ));
     for (i, r) in rows.into_iter().enumerate() {
         // The gap precedes every header except the window's leading row (the governing header
         // of a mid-group window sits flush at the top).
@@ -505,7 +515,8 @@ pub fn overlay<'a>(
         .total_gap_count()
         .saturating_sub(state.gaps_above_window() + in_window_gaps);
     list = list.push(
-        iced::widget::Space::new().height(below as f32 * ui.row_h() + gaps_below as f32 * GROUP_GAP),
+        iced::widget::Space::new()
+            .height(below as f32 * ui.row_h() + gaps_below as f32 * GROUP_GAP),
     );
 
     let scroll = iced::widget::scrollable(list)
@@ -716,6 +727,9 @@ pub(crate) fn field_with_ghost<'a>(
     invalid: bool,
     id: iced::advanced::widget::Id,
     placeholder: &str,
+    // `trailing`: static text drawn immediately after the ghost, in the ghost's colour — the root
+    // segment's `:` separator. See the note above the ghost layer for why it rides inside it.
+    trailing: &str,
     on_input: fn(String) -> PickerMsg,
     hug: bool,
     boundary: Boundary,
@@ -725,11 +739,17 @@ pub(crate) fn field_with_ghost<'a>(
     // The gray layer behind: the typed text (its prefix is covered by the opaque input value)
     // followed by the suggestion suffix (the only part that shows through).
     let suffix = ghost.filter(|g| !g.is_empty()).unwrap_or_default();
+    // `trailing` (the root segment's `:`) rides *inside* this layer rather than being pushed after
+    // the widget, so it sits flush against the text. The layer also carries a trailing
+    // `CARET_SLACK` spacer, and in `hug` mode the segment sizes to the whole layer — so a separator
+    // pushed outside would sit `CARET_SLACK` px adrift, which is visible as a gap before the colon
+    // while the segment has focus (and absent once it settles to a plain label).
+    //
     // `text_input` hardcodes `Shaping::Advanced`; the bare `text` widget defaults to `Basic`. The
     // two shapers give different glyph advances, so without matching this the layers drift apart
     // character by character and the gray prefix leaks out from under the opaque value (and the
     // suffix lands in the wrong place). Match the shaper so the layers stay glyph-aligned.
-    let ghost_text = text(format!("{}{}", input.text, suffix))
+    let ghost_text = text(format!("{}{}{}", input.text, suffix, trailing))
         .size(ui.body())
         .font(SANS)
         .color(theme::NORD3_BRIGHT)
@@ -800,7 +820,11 @@ pub(crate) fn field_with_ghost<'a>(
 /// exist — see the call site). Mirrors the web's `.picker-editor-row`: `glob:`/`path:`/`dir:` label,
 /// then for multi-root dir editors a root typeahead segment, a `:` separator (shown once the
 /// path is in play), and the root-relative path with directory ghost suggestions.
-fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn editor_line<'a>(
+    state: &'a PickerState,
+    roots: &'a [String],
+    ui: theme::Ui,
+) -> Element<'a, PickerMsg> {
     let Some(ed) = &state.chip_editor else {
         return iced::widget::Space::new().width(0).height(0).into();
     };
@@ -815,6 +839,9 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
         // against the root rather than inheriting the row's 6px gap (the web's `margin-left: -6px`).
         // The row gap then still separates this group from the path that follows.
         let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
+        // The separator appears once the path is in play (focused, or already holding text) — a
+        // fresh root prompt doesn't dangle a `:` off an unentered field.
+        let show_sep = ed.field == ChipEditorField::Path || !ed.input.text.is_empty();
         if ed.field == ChipEditorField::Root {
             let ghost = ed.root_ghost(&labels).map(|(_, suffix)| suffix);
             root_group = root_group.push(field_with_ghost(
@@ -823,10 +850,12 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
                 invalid,
                 editor_root_id(),
                 "",
+                // Drawn inside the segment so it sits flush against the typed text.
+                if show_sep { ":" } else { "" },
                 PickerMsg::EditorRoot,
                 true,
                 Boundary::ConfirmRoot,
-            ui,
+                ui,
             ));
         } else {
             // Unfocused root: the chosen label in the breadcrumb blue — or the raw filter
@@ -841,11 +870,14 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
             };
             let color = if invalid { theme::NORD11 } else { theme::NORD8 };
             root_group = root_group.push(text(display).size(ui.body()).font(SANS).color(color));
-        }
-        // The separator appears once the path is in play (focused, or already holding text) —
-        // a fresh root prompt doesn't dangle a `:` off an unentered field.
-        if ed.field == ChipEditorField::Path || !ed.input.text.is_empty() {
-            root_group = root_group.push(text(":").size(ui.body()).font(SANS).color(theme::NORD3_BRIGHT));
+            if show_sep {
+                root_group = root_group.push(
+                    text(":")
+                        .size(ui.body())
+                        .font(SANS)
+                        .color(theme::NORD3_BRIGHT),
+                );
+            }
         }
         line = line.push(root_group);
     }
@@ -867,10 +899,11 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
                 false,
                 editor_path_id(),
                 "*.rs · !*_test.rs · src/**",
+                "",
                 PickerMsg::EditorPath,
                 false,
                 Boundary::None,
-            ui,
+                ui,
             ));
         } else {
             line = line.push(field_with_ghost(
@@ -879,10 +912,11 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
                 ed.path_invalid(),
                 editor_path_id(),
                 "",
+                "",
                 PickerMsg::EditorPath,
                 false,
                 path_boundary,
-            ui,
+                ui,
             ));
         }
     } else if !ed.input.text.is_empty() {
@@ -892,7 +926,12 @@ fn editor_line<'a>(state: &'a PickerState, roots: &'a [String], ui: theme::Ui) -
         } else {
             theme::NORD6
         };
-        line = line.push(text(ed.input.text.clone()).size(ui.body()).font(SANS).color(color));
+        line = line.push(
+            text(ed.input.text.clone())
+                .size(ui.body())
+                .font(SANS)
+                .color(color),
+        );
     }
     container(line)
         .width(Length::Fill)
@@ -982,7 +1021,11 @@ fn dot_cell<'a>(color: Option<iced::Color>, ui: theme::Ui) -> Element<'a, Picker
 
 /// A fixed-width leading cell holding a severity glyph (diagnostics picker) — same footprint as
 /// [`dot_cell`] so rows stay aligned, and the same glyph the status-bar count shows.
-fn glyph_cell<'a>(glyph: &'static str, color: iced::Color, ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn glyph_cell<'a>(
+    glyph: &'static str,
+    color: iced::Color,
+    ui: theme::Ui,
+) -> Element<'a, PickerMsg> {
     container(text(glyph).size(ui.body()).font(SANS).color(color))
         .width(ui.at(14.0))
         .align_x(iced::alignment::Horizontal::Center)
@@ -1022,7 +1065,12 @@ fn git_change_summary<'a>(
         theme::GIT_DELETED
     };
     let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::new();
-    let count = |text: String, color| iced::widget::span(text).size(ui.small()).font(SANS).color(color);
+    let count = |text: String, color| {
+        iced::widget::span(text)
+            .size(ui.small())
+            .font(SANS)
+            .color(color)
+    };
     // `-R` then `+A`, so additions sit flush against the right edge (diffstat-style).
     if removed > 0 {
         spans.push(count(format!("-{removed}"), removed_color));

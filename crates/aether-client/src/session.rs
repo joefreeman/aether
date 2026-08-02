@@ -14,6 +14,7 @@ use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
+use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 
 /// A parked RPC result mapping (see [`Session::pending`]).
@@ -281,8 +282,8 @@ pub enum Prompt {
     /// editor's directory-completion UX (ghost suggestions, `Tab`/`Alt-l` accept, multi-root inline
     /// root field). Text editing is owned by each shell's input, which syncs the value via
     /// [`super::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps the value
-    /// and the command keys. See [`crate::save_as::SaveAsEditor`].
-    SaveAs(Box<crate::save_as::SaveAsEditor>),
+    /// and the command keys. See [`crate::path_editor::PathEditor`].
+    SaveAs(Box<crate::path_editor::PathEditor>),
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
     /// Application info & diagnostics (`Space ?`): build identity, live instance, on-disk paths.
@@ -327,43 +328,116 @@ impl TextField {
 /// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field.
 ///
-/// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows
-/// (root `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is
-/// always reachable, which is why we focus it on open — most overlay opens are to add a root.
-#[derive(Debug, Clone, Default)]
+/// Row layout, top to bottom: the name field, the roots, the add-root input, the projects, the
+/// add-project input. [`WorkspaceSettings::row_at`] owns the mapping from `selected` to a
+/// [`SettingsRow`] — with two lists each carrying a trailing input, open-coded index arithmetic
+/// ("`selected - 1` is a root") stopped being tractable.
+///
+/// Both input rows are always reachable, which is why the overlay focuses one on open — most opens
+/// are to add something.
+// Neither `Clone` nor `Default` is derived: the overlay owns a `PathEditor` (which holds a cached
+// directory listing), and there is exactly one of these at a time — nothing needs to copy it or
+// conjure an empty one.
+#[derive(Debug)]
 pub struct WorkspaceSettings {
-    /// The workspace's *committed* name — the key used for root RPCs and the rename source.
+    /// The workspace's *committed* name — the key used for root/project RPCs and the rename source.
     /// Updated only when a rename succeeds; `name` holds the in-progress edit.
     pub workspace_name: String,
     /// Editable buffer for the name field (index 0). Seeded from `workspace_name` on open;
     /// committed on blur (focus leaving the field) via `workspace/rename`.
     pub name: TextField,
     pub roots: Vec<String>,
+    /// Declared projects (`docs/projects.md`), server-resolved. Each carries the language its
+    /// pinned server speaks, or the reason it can't be used.
+    pub projects: Vec<WorkspaceProject>,
     pub selected: usize,
     /// Text being typed into the add-root input row.
     pub add: TextField,
+    /// The add-project row's path editor (`docs/projects.md`) — the same component the save-as
+    /// prompt uses, so declaring a project reuses the muscle memory of saving somewhere: a root
+    /// typeahead segment in multi-root workspaces, then a directory-completing path field. A
+    /// project is stored relative to its root, so the root genuinely isn't in the path and has to
+    /// be chosen; that's exactly what this editor's root field is for.
+    pub add_project: Box<crate::path_editor::PathEditor>,
     /// In-dialog error from the last add/remove/rename attempt. Rendered as the bottom line of
     /// the overlay. Cleared when the user edits a field or initiates another action.
     pub error: Option<String>,
 }
 
+/// A focusable row of the workspace-settings overlay. See [`WorkspaceSettings`] for the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    /// The workspace-name field — always index 0.
+    Name,
+    /// The root at this index within [`WorkspaceSettings::roots`].
+    Root(usize),
+    /// The add-root input.
+    AddRoot,
+    /// The project at this index within [`WorkspaceSettings::projects`].
+    Project(usize),
+    /// The add-project input.
+    AddProject,
+}
+
 impl WorkspaceSettings {
-    /// Selection index of the add-root input row (one past the last root).
+    /// The row at selection index `index`, clamping anything past the end onto the last row.
+    pub fn row_at(&self, index: usize) -> SettingsRow {
+        let add_root = self.roots.len() + 1;
+        let first_project = add_root + 1;
+        let add_project = first_project + self.projects.len();
+        match index {
+            0 => SettingsRow::Name,
+            i if i < add_root => SettingsRow::Root(i - 1),
+            i if i == add_root => SettingsRow::AddRoot,
+            i if i < add_project => SettingsRow::Project(i - first_project),
+            _ => SettingsRow::AddProject,
+        }
+    }
+
+    /// The focused row.
+    pub fn row(&self) -> SettingsRow {
+        self.row_at(self.selected)
+    }
+
+    /// Total focusable rows: the name field, both lists, and both input rows.
+    pub fn row_count(&self) -> usize {
+        self.roots.len() + self.projects.len() + 3
+    }
+
+    /// Selection index of the add-root input row.
     pub fn input_index(&self) -> usize {
         self.roots.len() + 1
     }
 
-    pub fn on_name(&self) -> bool {
-        self.selected == 0
+    /// Selection index of the add-project input row — the last row.
+    pub fn add_project_index(&self) -> usize {
+        self.row_count() - 1
     }
 
+    pub fn on_name(&self) -> bool {
+        self.row() == SettingsRow::Name
+    }
+
+    /// Whether an input row (either one) has focus — the shells use this to decide when to hand
+    /// keystrokes to a text field rather than treat them as commands.
     pub fn on_input(&self) -> bool {
-        self.selected == self.input_index()
+        matches!(self.row(), SettingsRow::AddRoot | SettingsRow::AddProject)
     }
 
     /// The root under the current selection, when a root row is focused.
     pub fn selected_root(&self) -> Option<&String> {
-        self.selected.checked_sub(1).and_then(|i| self.roots.get(i))
+        match self.row() {
+            SettingsRow::Root(i) => self.roots.get(i),
+            _ => None,
+        }
+    }
+
+    /// The project under the current selection, when a project row is focused.
+    pub fn selected_project(&self) -> Option<&WorkspaceProject> {
+        match self.row() {
+            SettingsRow::Project(i) => self.projects.get(i),
+            _ => None,
+        }
     }
 }
 
@@ -488,6 +562,9 @@ pub enum ConfirmKind {
     Delete { noun: &'static str, name: String },
     /// Removing a root from the workspace-settings overlay.
     RemoveRoot { path: String },
+    /// Undeclaring a project from the workspace-settings overlay. Only the declaration goes — the
+    /// marker file and everything around it are untouched.
+    RemoveProject { path: String },
     /// Deleting a workspace (its config) from the workspace switcher. Forgets the definition, not the
     /// files under its roots.
     DeleteWorkspace { name: String },
@@ -519,6 +596,14 @@ pub enum ConfirmAction {
     /// committed workspace name and the root path so the request is self-contained — the overlay's
     /// selection may have moved (or the overlay closed) by the time the confirm resolves.
     RemoveWorkspaceRoot { workspace: String, path: String },
+    /// Undeclare a project (`workspace/remove_project`), unpinning its language server. Carries the
+    /// workspace and the project's (root, path) pair so the request is self-contained, like
+    /// [`Self::RemoveWorkspaceRoot`].
+    RemoveWorkspaceProject {
+        workspace: String,
+        path_index: u32,
+        relative_path: String,
+    },
     /// Delete a workspace (`workspace/delete`) from the switcher. The server refuses if it's active
     /// anywhere or has dirty buffers; the refreshed picker list rides a `picker/update` push.
     DeleteWorkspace { name: String },
@@ -595,6 +680,10 @@ pub struct Session {
 
     pub workspace: String,
     pub workspace_paths: Vec<String>,
+    /// The active workspace's declared projects (`docs/projects.md`), mirrored from every
+    /// `WorkspaceInfo` the server sends. Read by the settings overlay when it opens; kept on the
+    /// session rather than fetched on demand so opening the overlay stays a keystroke, like roots.
+    pub workspace_projects: Vec<WorkspaceProject>,
     /// True when this session was launched directly to view a file outside any workspace (`ae
     /// /path`), landing it in an ephemeral context, and it hasn't switched workspaces since. It's
     /// the signal for what to do when the last buffer of an ephemeral context closes: a
@@ -690,12 +779,20 @@ pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
 pub const TAB_WIDTH: u32 = 4;
 
 impl Session {
-    pub fn new(workspace: String, workspace_paths: Vec<String>, buffer: BufferInfo) -> Self {
+    /// Build a session for a workspace the shell has just activated.
+    ///
+    /// Takes the whole [`WorkspaceInfo`] rather than picking fields out of it: boot is the one
+    /// place a session is seeded *without* going through `sync_workspace_info`, so anything the
+    /// shell forgets to carry across is simply missing until the next workspace event — which for a
+    /// freshly booted client is never. (That's exactly how `projects` came to be empty in the
+    /// settings overlay after a restart.) Passing the struct makes new fields flow automatically.
+    pub fn new(workspace: WorkspaceInfo, buffer: BufferInfo) -> Self {
         Session {
             pending_rpcs: std::collections::HashMap::new(),
             next_token: 0,
-            workspace,
-            workspace_paths,
+            workspace: workspace.name,
+            workspace_paths: workspace.paths,
+            workspace_projects: workspace.projects,
             launched_with_file: false,
             buffer,
             mode: Mode::Normal,
@@ -825,8 +922,11 @@ impl Session {
     /// a workspace activates it and the session adopts in place.
     pub fn placeholder() -> Self {
         Session::new(
-            String::new(),
-            Vec::new(),
+            WorkspaceInfo {
+                name: String::new(),
+                paths: Vec::new(),
+                projects: Vec::new(),
+            },
             BufferInfo {
                 buffer_id: 0,
                 label: String::new(),

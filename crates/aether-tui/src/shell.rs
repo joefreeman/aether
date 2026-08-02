@@ -808,12 +808,25 @@ impl Shell {
             return None;
         }
         if let Some(ps) = &self.session.workspace_settings {
-            if ps.on_name() {
-                return Some(OverlayField::WorkspaceName);
-            }
-            if ps.on_input() {
-                return Some(OverlayField::WorkspaceAddRoot);
-            }
+            use aether_client::chips::ChipEditorField;
+            use aether_client::session::SettingsRow;
+            return match ps.row() {
+                SettingsRow::Name => Some(OverlayField::WorkspaceName),
+                SettingsRow::AddRoot => Some(OverlayField::WorkspaceAddRoot),
+                // The add-project row is a two-segment path editor; focus follows whichever
+                // segment it has active (the root typeahead only exists in multi-root workspaces).
+                SettingsRow::AddProject => Some(
+                    if self.session.workspace_paths.len() > 1
+                        && ps.add_project.field == ChipEditorField::Root
+                    {
+                        OverlayField::WorkspaceAddProjectRoot
+                    } else {
+                        OverlayField::WorkspaceAddProject
+                    },
+                ),
+                // A root/project row is a selection, not a text field.
+                SettingsRow::Root(_) | SettingsRow::Project(_) => None,
+            };
         }
         None
     }
@@ -840,6 +853,18 @@ impl Shell {
                 .workspace_settings
                 .as_ref()
                 .map(|s| s.name.text.clone())
+                .unwrap_or_default(),
+            OverlayField::WorkspaceAddProject => self
+                .session
+                .workspace_settings
+                .as_ref()
+                .map(|s| s.add_project.input.text.clone())
+                .unwrap_or_default(),
+            OverlayField::WorkspaceAddProjectRoot => self
+                .session
+                .workspace_settings
+                .as_ref()
+                .map(|s| s.add_project.root_filter.text.clone())
                 .unwrap_or_default(),
             OverlayField::WorkspaceAddRoot => self
                 .session
@@ -885,6 +910,12 @@ impl Shell {
             OverlayField::Search => self.session.search_set_query(value),
             OverlayField::WorkspaceName => self.session.workspace_settings_set_name(value),
             OverlayField::WorkspaceAddRoot => self.session.workspace_settings_set_add(value),
+            OverlayField::WorkspaceAddProject => {
+                self.session.workspace_settings_set_add_project(value)
+            }
+            OverlayField::WorkspaceAddProjectRoot => {
+                self.session.workspace_settings_set_add_project_root(value)
+            }
             OverlayField::PickerQuery => self.session.picker_set_query(value),
             OverlayField::ChipRoot => self.session.chip_editor_set_root_filter(value),
             OverlayField::ChipPath => self.session.chip_editor_set_input(value),
@@ -1601,11 +1632,99 @@ impl Shell {
         let mut add_input = crate::text_input::TextInput::default();
         add_input.set(core.add.text.clone());
         add_input.cursor = field_cursor(OverlayField::WorkspaceAddRoot, core.add.text.len());
+        // The add-project row is a path editor: project its two segments (plus the ghosts and
+        // validity the core computes) the way the save prompt does.
+        let labels = aether_client::labels::root_labels(&self.session.workspace_paths);
+        let multi_root = self.session.workspace_paths.len() > 1;
+        let ed = &core.add_project;
+        let mut add_project_input = crate::text_input::TextInput::default();
+        add_project_input.set(ed.input.text.clone());
+        add_project_input.cursor =
+            field_cursor(OverlayField::WorkspaceAddProject, ed.input.text.len());
+        let mut add_project_root_input = crate::text_input::TextInput::default();
+        add_project_root_input.set(ed.root_filter.text.clone());
+        add_project_root_input.cursor = field_cursor(
+            OverlayField::WorkspaceAddProjectRoot,
+            ed.root_filter.text.len(),
+        );
+        let add_project = crate::app::ProjectEditorState {
+            root_input: add_project_root_input,
+            root_display: labels
+                .get(ed.chosen_root(&labels) as usize)
+                .cloned()
+                .unwrap_or_default(),
+            root_ghost: multi_root
+                .then(|| ed.root_ghost(&labels).map(|(_, s)| s))
+                .flatten(),
+            root_invalid: multi_root && ed.root_invalid(&labels),
+            on_root: multi_root && ed.field == aether_client::chips::ChipEditorField::Root,
+            focused: core.row() == SettingsRow::AddProject,
+            multi_root,
+            path_input: add_project_input,
+            path_ghost: ed.path_ghost(),
+            path_invalid: ed.path_invalid(),
+        };
+
+        // Flatten the core's row model into display order, carrying each row's selection index so
+        // the renderer never re-derives it. Index 0 (the name field) lives in the header, not here.
+        use crate::app::{SettingsListRow, SettingsRowView};
+        use aether_client::session::SettingsRow;
+        let mut rows: Vec<SettingsListRow> = Vec::new();
+        for i in 1..core.row_count() {
+            let view = match core.row_at(i) {
+                SettingsRow::Name => continue,
+                SettingsRow::Root(r) => match core.roots.get(r) {
+                    Some(path) => SettingsRowView::Root(path.clone()),
+                    None => continue,
+                },
+                SettingsRow::AddRoot => SettingsRowView::AddRoot,
+                SettingsRow::Project(p) => match core.projects.get(p) {
+                    Some(project) => SettingsRowView::Project {
+                        // The canonical `[root]: [path]` buffer-location format, so a project row
+                        // reads like every other file reference in the editor.
+                        path: aether_client::labels::root_relative_display(
+                            &self.session.workspace_paths,
+                            project.path_index,
+                            &project.relative_path,
+                        ),
+                        language: project.language.clone(),
+                        error: project.error.clone(),
+                    },
+                    None => continue,
+                },
+                SettingsRow::AddProject => SettingsRowView::AddProject,
+            };
+            // The heading goes above the projects list — before the first project, or before the
+            // add-project row when nothing is declared yet.
+            let starts_projects =
+                matches!(
+                    core.row_at(i),
+                    SettingsRow::Project(0) | SettingsRow::AddProject
+                ) && !matches!(core.row_at(i.saturating_sub(1)), SettingsRow::Project(_));
+            if starts_projects {
+                // A blank line so the two sections read as separate groups, then the heading —
+                // styled like the header's `Workspace roots:` label.
+                rows.push(SettingsListRow {
+                    select: None,
+                    view: SettingsRowView::Blank,
+                });
+                rows.push(SettingsListRow {
+                    select: None,
+                    view: SettingsRowView::Section("Projects:"),
+                });
+            }
+            rows.push(SettingsListRow {
+                select: Some(i),
+                view,
+            });
+        }
+
         self.state.workspace_settings = Some(crate::app::WorkspaceSettingsState {
             name_input,
-            roots: core.roots.clone(),
+            rows,
             selected: core.selected,
             add_input,
+            add_project,
             error: core.error.clone(),
         });
     }
@@ -1930,6 +2049,7 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
+        ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
     }
 }
@@ -1997,7 +2117,7 @@ fn chip_editor_view(
 /// [`chip_editor_view`]. `root_cursor` / `path_cursor` carry the shell-owned caret for whichever
 /// segment is focused (`None` → that field's caret at end, the unfocused convention).
 fn save_as_view(
-    e: &aether_client::save_as::SaveAsEditor,
+    e: &aether_client::path_editor::PathEditor,
     multi_root: bool,
     root_cursor: Option<usize>,
     path_cursor: Option<usize>,
@@ -2084,7 +2204,7 @@ fn translate_key(k: &KeyEvent) -> Option<(KeyCode, Mods, Option<String>)> {
         CK::Esc => KeyCode::Esc,
         CK::Enter => KeyCode::Enter,
         CK::Tab => KeyCode::Tab,
-        CK::BackTab => KeyCode::Tab,
+        CK::BackTab => KeyCode::BackTab,
         CK::Backspace => KeyCode::Backspace,
         CK::Delete => KeyCode::Delete,
         CK::Home => KeyCode::Home,
@@ -2297,20 +2417,13 @@ pub async fn bootstrap(
                     let open = opened
                         .opened
                         .ok_or_else(|| anyhow::anyhow!("workspace/open_path returned no buffer"))?;
-                    let mut session = Session::new(
-                        opened.workspace.name.clone(),
-                        workspace_paths.clone(),
-                        buffer_info(open, &workspace_paths),
-                    );
+                    let buffer = buffer_info(open, &workspace_paths);
+                    let workspace_name = opened.workspace.name.clone();
+                    let mut session = Session::new(opened.workspace, buffer);
                     // Launched to view this file in an ephemeral context: closing it should quit
                     // (see `leave_ephemeral_workspace`), not drop to the chooser.
                     session.launched_with_file = true;
-                    (
-                        session,
-                        opened.workspace.name,
-                        workspace_paths,
-                        Effects::none(),
-                    )
+                    (session, workspace_name, workspace_paths, Effects::none())
                 }
                 _ => {
                     let mut session = Session::placeholder();
@@ -2381,11 +2494,9 @@ pub async fn bootstrap(
                 })?,
             };
 
-            let mut session = Session::new(
-                activated.workspace.name.clone(),
-                workspace_paths.clone(),
-                buffer_info(open, &workspace_paths),
-            );
+            let buffer = buffer_info(open, &workspace_paths);
+            let workspace_name = activated.workspace.name.clone();
+            let mut session = Session::new(activated.workspace, buffer);
             let startup = match &resolved {
                 Some(abs) if abs.is_dir() => session.open_picker(
                     PickerKind::Explorer,
@@ -2396,7 +2507,7 @@ pub async fn bootstrap(
                 ),
                 _ => Effects::none(),
             };
-            (session, activated.workspace.name, workspace_paths, startup)
+            (session, workspace_name, workspace_paths, startup)
         }
     };
 

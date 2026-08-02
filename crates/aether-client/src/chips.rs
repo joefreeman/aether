@@ -662,6 +662,15 @@ impl ChipEditor {
         self.sync_dir_listing(workspace_paths)
     }
 
+    /// Move to the path segment *without* adopting the root ghost — `Tab` traversal, as opposed to
+    /// `Alt-l`'s accept-and-advance ([`Self::commit_root_field`]). The typed filter stands;
+    /// [`Self::chosen_root`] already resolves a partial-but-matching prefix. Returns whether the
+    /// directory listing needs refetching.
+    pub fn advance_to_path(&mut self, workspace_paths: &[String]) -> bool {
+        self.field = ChipEditorField::Path;
+        self.sync_dir_listing(workspace_paths)
+    }
+
     /// The absolute directory the path field's suggestions should list: the dir portion of the
     /// typed path, resolved under the chosen root. `None` for glob editors — and under an
     /// *invalid* root (suggestions beneath the fallback root would read as silently defaulting

@@ -444,12 +444,12 @@ fn goto_definition_into_the_same_buffer_glides_not_resubscribes() {
 #[test]
 fn save_as_prompt_is_value_synced_not_keycode_edited() {
     use aether_client::chips::ChipEditorField;
-    use aether_client::save_as::SaveAsEditor;
+    use aether_client::path_editor::PathEditor;
     use aether_client::session::Prompt;
     let mut s = session();
     // The save-as prompt's text is owned by each shell's input; the core only stores the value
     // and handles command keys. A typed char reaching the core must NOT edit the value.
-    s.prompt = Some(Prompt::SaveAs(Box::new(SaveAsEditor::new(
+    s.prompt = Some(Prompt::SaveAs(Box::new(PathEditor::new(
         "notes".into(),
         ChipEditorField::Path,
         0,
@@ -2372,7 +2372,7 @@ fn jumplist_step_adopts_the_opened_entry() {
     };
     let _ = s.on_event(Event::JumplistStepped(
         Ok(JumplistStepResult::Moved(JumplistStepTarget {
-            path: "/proj/b.rs".into(),
+            path: "/b.rs".into(),
             position: LogicalPosition { line: 4, col: 9 },
             anchor: Some(LogicalPosition { line: 4, col: 2 }),
             index: 3,
@@ -2924,7 +2924,7 @@ fn written_clipboard(fx: &Effects) -> Option<String> {
 }
 
 #[test]
-fn explorer_tab_applies_common_prefix_completion() {
+fn explorer_alt_l_applies_common_prefix_completion() {
     use aether_client::keymap::Mods;
     use aether_protocol::picker::{PickerItem, PickerKind};
 
@@ -2951,11 +2951,23 @@ fn explorer_tab_applies_common_prefix_completion() {
         p.total_matches = 2;
         p.offset = 0;
     }
-    // Tab extends the query by the shared remainder (`her-`), then re-queries.
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    // Alt-l — the accept/advance gesture everywhere — extends the query by the shared remainder
+    // (`her-`), then re-queries. Tab no longer completes anywhere in the app; it traverses fields.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
     assert_eq!(s.picker.as_ref().unwrap().query, "aether-");
-    let requery = find_request(&fx, "picker/query").expect("tab re-queries");
+    let requery = find_request(&fx, "picker/query").expect("alt-l re-queries");
     assert_eq!(requery["query"], json!("aether-"));
+
+    // With no ghost left to adopt, the same chord falls through to descending into the selection —
+    // which re-lists the new directory from an empty query.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let requery = find_request(&fx, "picker/query").expect("descending re-lists");
+    assert_eq!(
+        requery["query"],
+        json!(""),
+        "nothing left to complete — Alt-l descended instead of extending the query",
+    );
+    assert_eq!(s.picker.as_ref().unwrap().query, "");
 }
 
 #[test]
@@ -4191,6 +4203,7 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
         workspace: WorkspaceInfo {
             name: "fresh".into(),
             paths: vec![],
+            projects: Vec::new(),
         },
         last_buffer_id: None,
         opened: None,
@@ -4201,14 +4214,13 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
     // with no buffer_id/path) so the user lands in some editor in the new workspace. The new
     // workspace's (empty) input-history lists are fetched alongside — the old ones were another
     // workspace's.
-    let methods: Vec<&str> = fx
-        .0
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Request { method, .. } => Some(*method),
-            _ => None,
-        })
-        .collect();
+    let methods: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
     assert_eq!(
         methods,
         vec!["history/state", "buffer/open"],
@@ -4255,9 +4267,9 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     s.workspace = "aether".into();
     s.workspace_paths = vec!["/a".into()];
     s.open_workspace_settings();
-    // Open focuses the name field; move down to the add-root input (Alt-j past the single root).
-    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
-    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    // Open focuses the name field; Tab down to the add-root input (past the single root).
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     assert!(s.workspace_settings.as_ref().unwrap().on_input());
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
     let _ = s.workspace_settings_set_add("/b".into());
@@ -4269,6 +4281,7 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     let _ = s.on_event(Event::WorkspaceRootAdded(Ok(WorkspaceInfo {
         name: "aether".into(),
         paths: vec!["/a".into(), "/b".into()],
+        projects: Vec::new(),
     })));
     assert_eq!(s.workspace_paths, vec!["/a".to_string(), "/b".to_string()]);
     let ps = s.workspace_settings.as_ref().unwrap();
@@ -4277,6 +4290,342 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
         ps.add.text.is_empty(),
         "the input clears after a successful add"
     );
+}
+
+/// Boot seeds a session straight from the activation result, without going through
+/// `sync_workspace_info` — so `Session::new` has to carry *everything* the server sent. Regression
+/// test: it dropped the declared projects, and a freshly launched client showed an empty Projects
+/// section (with no later workspace event to fix it) even though the server knew about them.
+#[test]
+fn a_booted_session_carries_the_workspace_declared_projects() {
+    use aether_client::session::BufferInfo;
+    use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
+
+    let mut s = Session::new(
+        WorkspaceInfo {
+            name: "aether".into(),
+            paths: vec!["/a".into()],
+            projects: vec![WorkspaceProject {
+                path_index: 0,
+                relative_path: "Cargo.toml".into(),
+                language: "rust".into(),
+                error: None,
+            }],
+        },
+        BufferInfo {
+            buffer_id: 1,
+            label: "a.rs".into(),
+            path: Some("/a/a.rs".into()),
+            language: None,
+            revision: 0,
+            saved_revision: 0,
+            cursor: aether_protocol::cursor::CursorState::default(),
+            scroll: None,
+            transient: false,
+            lsp_server: None,
+        },
+    );
+    assert_eq!(s.workspace_projects.len(), 1);
+
+    // ...and the settings overlay shows them without needing a workspace event first.
+    s.open_workspace_settings();
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.projects.len(), 1);
+    assert_eq!(ps.projects[0].relative_path, "Cargo.toml");
+}
+
+/// Tab/Shift-Tab traverse the dialog's fields, and step *through* the add-project row's two
+/// segments on the way — the form convention, and why the editor no longer claims Tab.
+#[test]
+fn settings_tab_traverses_fields_including_the_editor_segments() {
+    use aether_client::chips::ChipEditorField;
+    use aether_client::session::SettingsRow;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    // Multi-root, so the add-project row has a root segment as well as a path one. Labels that are
+    // longer than a one-character prefix, so "typed" and "adopted" are distinguishable.
+    s.workspace_paths = vec!["/alpha".into(), "/beta".into()];
+    s.open_workspace_settings();
+
+    // name → root(0) → root(1) → add-root → add-project.
+    for expected in [
+        SettingsRow::Root(0),
+        SettingsRow::Root(1),
+        SettingsRow::AddRoot,
+        SettingsRow::AddProject,
+    ] {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        assert_eq!(s.workspace_settings.as_ref().unwrap().row(), expected);
+    }
+
+    // Inside the editor, Tab steps root → path rather than leaving the row — and *without*
+    // adopting the root ghost, which is Alt-l's job. A partly-typed filter stays as typed.
+    let _ = s.workspace_settings_set_add_project_root("be".into());
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project.field, ChipEditorField::Root);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.row(), SettingsRow::AddProject);
+    assert_eq!(ps.add_project.field, ChipEditorField::Path);
+    assert_eq!(
+        ps.add_project.root_filter.text, "be",
+        "Tab traverses; it does not complete the root to its full label",
+    );
+
+    // Alt-l is what adopts the ghost — same traversal, but the filter becomes the full label.
+    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project.root_filter.text, "beta");
+    assert_eq!(ps.add_project.field, ChipEditorField::Path);
+
+    // ...and Shift-Tab walks back out the same way.
+    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.add_project.field, ChipEditorField::Root);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::AddRoot,
+    );
+
+    // Wrapping backwards into the row lands on its *last* segment, so reverse traversal retraces
+    // the forward path rather than skipping a field. From add-root (index 3) that's four steps:
+    // root(1), root(0), name, then round to add-project.
+    for _ in 0..4 {
+        s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    }
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.row(), SettingsRow::AddProject);
+    assert_eq!(ps.add_project.field, ChipEditorField::Path);
+}
+
+/// The bug this replaced: on a multi-root workspace, Alt-j on the add-project row cycled root
+/// candidates *and* was the only way out of the row, so it got stuck. Now the editor keeps Alt-j/k
+/// for its candidates and Tab is how you leave.
+#[test]
+fn settings_alt_j_cycles_candidates_without_leaving_the_editor() {
+    use aether_client::session::SettingsRow;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    s.open_workspace_settings();
+    for _ in 0..4 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::AddProject,
+    );
+
+    let before = s
+        .workspace_settings
+        .as_ref()
+        .unwrap()
+        .add_project
+        .root_selected;
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.row(), SettingsRow::AddProject, "still on the editor row");
+    assert_ne!(
+        ps.add_project.root_selected, before,
+        "Alt-j cycled the root candidates rather than moving the row",
+    );
+}
+
+/// Alt-j/k no longer traverse the dialog at all — they belong to the focused field. A key that
+/// moved rows *except* when the field wanted it was the ambiguity Tab was introduced to remove.
+#[test]
+fn settings_alt_j_does_not_traverse_fields() {
+    use aether_client::session::SettingsRow;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::Name,
+        "Alt-j is the focused field's key, not the dialog's",
+    );
+
+    // The arrows are the non-chord alternative to Tab for people who want one.
+    s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::Root(0),
+    );
+    s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::Name,
+    );
+}
+
+/// The overlay is two lists, each with a trailing input. This pins the whole index→row mapping,
+/// which every shell's rendering and focus routing depends on.
+#[test]
+fn settings_selection_model_spans_both_lists() {
+    use aether_client::session::SettingsRow;
+    use aether_protocol::workspace::WorkspaceProject;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    s.workspace_projects = vec![
+        WorkspaceProject {
+            path_index: 0,
+            relative_path: "Cargo.toml".into(),
+            language: "rust".into(),
+            error: None,
+        },
+        WorkspaceProject {
+            path_index: 1,
+            relative_path: "go.mod".into(),
+            language: "go".into(),
+            error: None,
+        },
+    ];
+    s.open_workspace_settings();
+    let ps = s.workspace_settings.as_ref().unwrap();
+
+    // name, root, root, add-root, project, project, add-project
+    assert_eq!(ps.row_count(), 7);
+    let rows: Vec<SettingsRow> = (0..ps.row_count()).map(|i| ps.row_at(i)).collect();
+    assert_eq!(
+        rows,
+        vec![
+            SettingsRow::Name,
+            SettingsRow::Root(0),
+            SettingsRow::Root(1),
+            SettingsRow::AddRoot,
+            SettingsRow::Project(0),
+            SettingsRow::Project(1),
+            SettingsRow::AddProject,
+        ]
+    );
+    assert_eq!(ps.input_index(), 3);
+    assert_eq!(ps.add_project_index(), 6);
+    // Past the end clamps onto the last row rather than panicking or wrapping.
+    assert_eq!(ps.row_at(99), SettingsRow::AddProject);
+}
+
+/// With no projects declared the add-project row is still reachable — it's how you declare the
+/// first one — so Alt-j must not stop at the add-root row the way it used to.
+#[test]
+fn settings_navigation_reaches_the_add_project_row() {
+    use aether_client::session::SettingsRow;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    // name → root → add-root → add-project.
+    for _ in 0..3 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.row(), SettingsRow::AddProject);
+    assert!(ps.on_input(), "both add rows count as text inputs");
+
+    // Past the last field, Tab cycles round to the first rather than trapping you at the bottom.
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::Name,
+    );
+    // ...and Shift-Tab off the first wraps back to the last.
+    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().row(),
+        SettingsRow::AddProject,
+    );
+}
+
+#[test]
+fn settings_add_project_emits_request_and_its_result_updates_state() {
+    use aether_client::update::Event;
+    use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+    // name → root → add-root → add-project.
+    for _ in 0..3 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    let _ = s.workspace_settings_set_add_project("Cargo.toml".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let add = find_request(&fx, "workspace/add_project").expect("workspace/add_project fired");
+    assert_eq!(add["workspace"], json!("aether"));
+    assert_eq!(add["path_index"], json!(0));
+    assert_eq!(add["relative_path"], json!("Cargo.toml"));
+    assert!(
+        add.get("language").is_none(),
+        "no language sent — the server infers it from the marker"
+    );
+
+    let _ = s.on_event(Event::WorkspaceProjectAdded(Ok(WorkspaceInfo {
+        name: "aether".into(),
+        paths: vec!["/a".into()],
+        projects: vec![WorkspaceProject {
+            path_index: 0,
+            relative_path: "Cargo.toml".into(),
+            language: "rust".into(),
+            error: None,
+        }],
+    })));
+    assert_eq!(s.workspace_projects.len(), 1);
+    let ps = s.workspace_settings.as_ref().unwrap();
+    assert_eq!(ps.projects.len(), 1);
+    assert!(
+        ps.add_project.input.text.is_empty(),
+        "the input clears after a successful add"
+    );
+}
+
+/// Delete on a project row opens the shared confirm, and accepting it fires the remove — the same
+/// two-step the root rows use, so a project can't vanish on a stray keypress.
+#[test]
+fn settings_delete_on_a_project_row_confirms_then_removes() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_protocol::workspace::WorkspaceProject;
+
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.workspace_projects = vec![WorkspaceProject {
+        path_index: 0,
+        relative_path: "Cargo.toml".into(),
+        language: "rust".into(),
+        error: None,
+    }];
+    s.open_workspace_settings();
+    // name → root → add-root → project(0).
+    for _ in 0..3 {
+        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    }
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "workspace/remove_project").is_none(),
+        "delete confirms first, it doesn't fire straight away"
+    );
+    assert!(matches!(
+        s.prompt,
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::RemoveProject { .. },
+            ..
+        })
+    ));
+
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None, ROWS);
+    let req = find_request(&fx, "workspace/remove_project").expect("remove fired on accept");
+    assert_eq!(req["path_index"], json!(0));
+    assert_eq!(req["relative_path"], json!("Cargo.toml"));
 }
 
 #[test]
@@ -4288,9 +4637,7 @@ fn settings_rename_emits_request_and_its_result_updates_the_name() {
     s.workspace = "old".into();
     s.workspace_paths = vec!["/a".into()];
     s.open_workspace_settings();
-    // Move up to the name field (Alt-k from the input row to the single root to the name).
-    s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
-    s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    // The overlay opens focused on the name field.
     assert!(s.workspace_settings.as_ref().unwrap().on_name());
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
     let _ = s.workspace_settings_set_name("oldx".into());
@@ -4303,6 +4650,7 @@ fn settings_rename_emits_request_and_its_result_updates_the_name() {
     let _ = s.on_event(Event::WorkspaceRenamed(Ok(WorkspaceInfo {
         name: "oldx".into(),
         paths: vec!["/a".into()],
+        projects: Vec::new(),
     })));
     assert_eq!(s.workspace, "oldx");
     let ps = s.workspace_settings.as_ref().unwrap();
@@ -4320,8 +4668,8 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
     s.workspace = "aether".into();
     s.workspace_paths = vec!["/a".into(), "/b".into()];
     s.open_workspace_settings();
-    // Open focuses the name field (index 0); Alt-j down to the first root row (index 1).
-    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    // Open focuses the name field (index 0); Tab down to the first root row (index 1).
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     assert_eq!(s.workspace_settings.as_ref().unwrap().selected, 1);
     // Delete opens the shared confirm prompt for the highlighted root (no request yet).
     let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
@@ -4352,6 +4700,7 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
         workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/b".into()],
+            projects: Vec::new(),
         },
         closed_buffer_ids: vec![],
         next_buffer_id: None,
@@ -4451,7 +4800,7 @@ fn symbol_push_center_on_lands_the_highlight() {
         p.offset = 0;
     }
     let sym = |line: u32, name: &str| PickerItem::Symbol {
-        path: "/p/a.rs".into(),
+        path: "/a.rs".into(),
         line,
         col: 0,
         name: name.into(),
@@ -4507,7 +4856,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
         p.offset = 0; // the picker opened at the top
     }
     let sym = |line: u32, name: &str| PickerItem::Symbol {
-        path: "/p/a.rs".into(),
+        path: "/a.rs".into(),
         line,
         col: 0,
         name: name.into(),
@@ -4689,6 +5038,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
         workspace: WorkspaceInfo {
             name: "proj".into(),
             paths: vec![],
+            projects: Vec::new(),
         },
         last_buffer_id: None,
         opened: Some(opened),
@@ -4867,8 +5217,11 @@ fn space_alt_x_asks_the_shell_to_open_a_new_window() {
 fn hint_session() -> Session {
     use aether_client::session::BufferInfo;
     Session::new(
-        "w".into(),
-        vec!["/tmp/w".into()],
+        aether_protocol::workspace::WorkspaceInfo {
+            name: "w".into(),
+            paths: vec!["/tmp/w".into()],
+            projects: Vec::new(),
+        },
         BufferInfo {
             buffer_id: 1,
             label: "a.rs".into(),
@@ -5367,7 +5720,11 @@ fn hints_boot_chooser_drives_the_corner() {
 
 /// The plain values of one recall list — most assertions don't care about the carried filters.
 fn hist(s: &Session, kind: aether_protocol::history::HistoryKind) -> Vec<&str> {
-    s.history.list(kind).iter().map(|e| e.value.as_str()).collect()
+    s.history
+        .list(kind)
+        .iter()
+        .map(|e| e.value.as_str())
+        .collect()
 }
 
 /// Adopt a canned set of recall lists, as `history/state` would at boot. Entries may be written as

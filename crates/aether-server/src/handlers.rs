@@ -80,11 +80,11 @@ use aether_protocol::viewport::{
     ViewportSubscribeResult, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddRootParams,
-    WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceInfo, WorkspaceListParams,
-    WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceRemoveRootParams,
-    WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams,
-    WorkspaceSummary,
+    WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
+    WorkspaceAddRootParams, WorkspaceCreateParams, WorkspaceDeleteParams, WorkspaceInfo,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceProject,
+    WorkspaceRemoveProjectParams, WorkspaceRemoveRootParams, WorkspaceRemoveRootResult,
+    WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams, WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
@@ -314,6 +314,123 @@ pub(crate) async fn flush_history(state: &SharedState) {
 /// client's per-buffer state for the prior workspace before switching. Returns the resolved
 /// workspace info (name + canonical paths) so the client can present buffers relative to those
 /// roots.
+/// The client-facing view of a workspace's declared projects (`docs/projects.md`), re-resolved
+/// against its roots on every read.
+///
+/// Deliberately not cached: resolution depends on the filesystem, so a project whose marker was
+/// deleted by a branch switch starts reporting an error, and one that comes back stops — with no
+/// reactivation and no invalidation to remember. An entry that fails still appears, carrying its
+/// reason, because a broken declaration the user can see and fix beats one that silently vanishes.
+fn workspace_project_views(entry: &crate::state::WorkspaceEntry) -> Vec<WorkspaceProject> {
+    entry
+        .projects
+        .iter()
+        .map(|p| {
+            let (path_index, relative_path) = (p.root_index, p.relative_path.display().to_string());
+            match crate::config::resolve_project(p, &entry.paths) {
+                Ok(r) => WorkspaceProject {
+                    path_index,
+                    relative_path,
+                    language: r.language,
+                    error: None,
+                },
+                Err(error) => WorkspaceProject {
+                    path_index,
+                    relative_path,
+                    language: p.language.clone().unwrap_or_default(),
+                    error: Some(error),
+                },
+            }
+        })
+        .collect()
+}
+
+/// A language server to start: its key, how to launch it, and the generation the handle was created
+/// with. Collected under the state lock and spawned after it drops.
+pub(crate) type PinnedLaunch = (
+    crate::lsp::manager::LspServerKey,
+    crate::lsp::config::LspServerSpec,
+    u64,
+);
+
+/// Reconcile a workspace's pinned language servers with the projects it currently declares.
+///
+/// Pins every declared project's server — creating the handle if it isn't running — and drops the
+/// pin from any server the workspace no longer declares, reaping it unless buffers are open against
+/// it. Projects that fail to resolve are logged and skipped; a broken declaration must not stop the
+/// rest from starting.
+///
+/// Idempotent, which is what lets activation, `add_project` and `remove_project` all just call it
+/// and let it work out the difference. Returns the launches for the caller to spawn once the lock
+/// is released — a handshake plus initial indexing takes seconds and must not be held under it.
+pub(crate) fn reconcile_workspace_pins(
+    s: &mut ServerState,
+    workspace_id: &str,
+) -> Vec<PinnedLaunch> {
+    let Some(entry) = s.workspaces.get(workspace_id) else {
+        return Vec::new();
+    };
+    let roots = entry.paths.clone();
+    let declared = entry.projects.clone();
+
+    let mut launches = Vec::new();
+    let mut wanted: std::collections::HashSet<crate::lsp::manager::LspServerKey> =
+        std::collections::HashSet::new();
+    for e in &declared {
+        let resolved = match crate::config::resolve_project(e, &roots) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(workspace = %workspace_id, error = %err, "skipping project");
+                continue;
+            }
+        };
+        // `resolve_project` already established the language has a spec.
+        let Some(spec) = crate::lsp::config::server_spec(&resolved.language) else {
+            continue;
+        };
+        let key = crate::lsp::manager::LspServerKey::new(
+            workspace_id.to_string(),
+            resolved.root,
+            &resolved.language,
+        );
+        // `ensure` yields a generation only for a *fresh* handle; one already running (lazily
+        // launched by a buffer, or shared with a sibling project in the same root) just needs the
+        // pin.
+        if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+            launches.push((key.clone(), spec, generation));
+        }
+        s.lsp.pin(&key);
+        wanted.insert(key);
+    }
+
+    // Anything pinned by this workspace but no longer declared reverts to the ordinary
+    // reap-on-last-buffer lifetime, and goes now if it has no buffers.
+    let stale: Vec<crate::lsp::manager::LspServerKey> = s
+        .lsp
+        .servers
+        .iter()
+        .filter(|(k, h)| k.workspace == workspace_id && h.pinned && !wanted.contains(*k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in stale {
+        if let Some(h) = s.lsp.servers.get_mut(&key) {
+            h.pinned = false;
+            if h.open_buffers.is_empty() && h.registered_buffers.is_empty() {
+                s.lsp.servers.remove(&key);
+            }
+        }
+    }
+    launches
+}
+
+/// [`workspace_project_views`] for a workspace by id, or empty when it isn't loaded.
+fn workspace_project_views_by_id(s: &ServerState, workspace_id: &str) -> Vec<WorkspaceProject> {
+    s.workspaces
+        .get(workspace_id)
+        .map(workspace_project_views)
+        .unwrap_or_default()
+}
+
 pub async fn workspace_activate(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -329,23 +446,35 @@ pub async fn workspace_activate(
     // Cold path: read the workspace's config from disk *outside* the state lock — file I/O and
     // canonicalization can be slow on cold caches, and we hold the lock for many concurrent
     // operations.
-    let cold_load: Option<(String, Vec<std::path::PathBuf>)> = if already_loaded {
+    let cold_load: Option<(
+        String,
+        Vec<std::path::PathBuf>,
+        Vec<crate::config::ProjectRef>,
+    )> = if already_loaded {
         None
     } else {
         let cfg = match crate::config::load_workspace(&params.name) {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(name = %params.name, error = %e, "workspace/activate: workspace not found");
+            // A config that isn't there and one that won't parse are different problems: the first
+            // is a wrong name, the second a broken (or stale-format) file the user has to go and
+            // fix. Reporting both as "unknown workspace" sends them hunting for a missing file.
+            Err(crate::config::LoadWorkspaceError::NotFound) => {
+                tracing::warn!(name = %params.name, "workspace/activate: no such workspace");
                 return Err(RpcError::unknown_workspace(&params.name));
+            }
+            Err(crate::config::LoadWorkspaceError::Invalid(e)) => {
+                tracing::warn!(name = %params.name, error = %e, "workspace/activate: unreadable config");
+                return Err(RpcError::invalid_params(e));
             }
         };
         let canonical_paths: Vec<std::path::PathBuf> = cfg
-            .paths
+            .paths()
             .iter()
             .map(|p| crate::config::canonicalize_workspace_path(p))
             .collect::<Result<_, _>>()
             .map_err(|e| RpcError::invalid_path(format!("canonicalizing workspace path: {e}")))?;
-        Some((cfg.name, canonical_paths))
+        let projects = cfg.project_refs();
+        Some((cfg.name, canonical_paths, projects))
     };
 
     let mut s = state.lock().await;
@@ -371,7 +500,7 @@ pub async fn workspace_activate(
 
     // Install the workspace entry on the cold path. Reuse the existing entry (and its shared
     // `WorkspaceIndex`) on the hot path.
-    if let Some((name, canonical_paths)) = cold_load {
+    if let Some((name, canonical_paths, projects)) = cold_load {
         let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
             canonical_paths.clone(),
         ));
@@ -384,6 +513,7 @@ pub async fn workspace_activate(
                 workspace_index,
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                projects,
             },
         );
         // Hand the new roots to the watcher so its events flow for this workspace too — but only
@@ -442,11 +572,22 @@ pub async fn workspace_activate(
         }
     }
 
+    // Start (or re-start) the workspace's declared projects. Deliberately on *every* activation,
+    // not just the cold load: the daemon outlives its clients, so a client quitting released the
+    // pins (`unpin_workspace_if_unused`) while leaving the workspace loaded — and the next
+    // activation would then take the already-loaded path and never bring them back. Reconcile is
+    // idempotent (`ensure` no-ops for a running server), so an activation that changes nothing
+    // costs nothing.
+    // Handles are created (and pinned) under the lock; the handshakes are spawned after it drops,
+    // so activation never waits on N server startups.
+    let pinned_launches: Vec<PinnedLaunch> = reconcile_workspace_pins(&mut s, &params.name);
+
     let entry_paths: Vec<String> = s
         .workspaces
         .get(&params.name)
         .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
         .unwrap_or_default();
+    let entry_projects = workspace_project_views_by_id(&s, &params.name);
     let server_started_at = s.started_at_unix_ms;
 
     if let Some(session) = s.clients.get_mut(&client_id) {
@@ -456,9 +597,13 @@ pub async fn workspace_activate(
     // Switching away from an ephemeral workspace can leave it empty (its transient buffers were
     // closed by the teardown above; any permanent ones keep it alive). Retire it now that this
     // client no longer holds it active, so a throwaway "(no workspace)" context doesn't linger.
+    let mut unpin_pushes = Vec::new();
     if let Some(prior_id) = &prior {
         if prior_id != &params.name {
             s.prune_ephemeral_if_empty(prior_id);
+            // This client left the old workspace; if it was the last one there, its pinned project
+            // servers have no reason to stay up.
+            unpin_pushes = unpin_workspace_if_unused(&mut s, prior_id);
         }
     }
 
@@ -488,8 +633,24 @@ pub async fn workspace_activate(
     );
     drop(s);
 
+    for (sender, notif) in unpin_pushes {
+        let _ = sender.send(notif).await;
+    }
+
     if let Some((w, roots)) = watch_after {
         tokio::task::spawn_blocking(move || crate::watcher::watch_workspace_paths(&w, &roots));
+    }
+
+    // Start the declared projects' servers. Detached, like the watcher registration above: a
+    // rust-analyzer handshake plus its initial indexing takes seconds, and the point of pinning is
+    // that it happens *while* you read code, not before you can.
+    for (key, spec, generation) in pinned_launches {
+        tokio::spawn(crate::lsp::manager::launch(
+            state.clone(),
+            key,
+            spec,
+            generation,
+        ));
     }
 
     // Composite post-step (docs/protocol-composites.md, C): open the landing buffer — the
@@ -545,6 +706,7 @@ pub async fn workspace_activate(
         workspace: WorkspaceInfo {
             name: params.name,
             paths: entry_paths,
+            projects: entry_projects,
         },
         last_buffer_id,
         opened,
@@ -799,7 +961,7 @@ pub async fn workspace_create(
     // Write the TOML outside the state lock — file I/O.
     crate::config::write_workspace_config(&crate::config::WorkspaceConfig {
         name: name.clone(),
-        paths: Vec::new(),
+        roots: Vec::new(),
     })
     .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
 
@@ -828,21 +990,27 @@ pub async fn workspace_create(
             workspace_index,
             mru_buffers: std::collections::VecDeque::new(),
             dormant_buffers: Vec::new(),
+            projects: Vec::new(),
         },
     );
     if let Some(session) = s.clients.get_mut(&client_id) {
         session.active_workspace = Some(name.clone());
     }
     // Creating a workspace while parked in an ephemeral one retires the ephemeral if now empty.
+    let mut unpin_pushes = Vec::new();
     if let Some(prior_id) = &prior {
         if prior_id != &name {
             s.prune_ephemeral_if_empty(prior_id);
+            // ...and, as in `workspace_activate`, releases the old workspace's project pins if this
+            // was the last client there.
+            unpin_pushes = unpin_workspace_if_unused(&mut s, prior_id);
         }
     }
     let server_started_at = s.started_at_unix_ms;
 
     // Another client's open chooser should gain the new workspace.
-    let pushes = refresh_workspace_pickers(&mut s);
+    let mut pushes = unpin_pushes;
+    pushes.extend(refresh_workspace_pickers(&mut s));
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -853,6 +1021,7 @@ pub async fn workspace_create(
         workspace: WorkspaceInfo {
             name,
             paths: Vec::new(),
+            projects: Vec::new(),
         },
         last_buffer_id: None,
         opened: None,
@@ -935,10 +1104,15 @@ pub async fn workspace_open_path(
         }
     }
 
+    let projects = {
+        let s = state.lock().await;
+        workspace_project_views_by_id(&s, &workspace_id)
+    };
     Ok(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
             name: workspace_id,
             paths: workspace_paths,
+            projects,
         },
         last_buffer_id: None,
         opened: Some(opened),
@@ -974,15 +1148,19 @@ pub async fn workspace_add_root(
     workspace.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
         workspace.paths.clone(),
     ));
-    let updated = crate::config::WorkspaceConfig {
-        name: workspace.id.clone(),
-        paths: workspace.paths.clone(),
-    };
+    // This rewrites the whole config file, so every field the workspace owns has to be carried
+    // through — `projects` included, or editing a root would quietly delete them.
+    let updated = crate::config::WorkspaceConfig::from_parts(
+        workspace.id.clone(),
+        &workspace.paths,
+        &workspace.projects,
+    );
     let entry_paths: Vec<String> = workspace
         .paths
         .iter()
         .map(|p| p.display().to_string())
         .collect();
+    let entry_projects = workspace_project_views(workspace);
     let watcher = s.watcher.clone();
     drop(s);
 
@@ -998,7 +1176,147 @@ pub async fn workspace_add_root(
     Ok(WorkspaceInfo {
         name: params.workspace,
         paths: entry_paths,
+        projects: entry_projects,
     })
+}
+
+/// Declare a project (`docs/projects.md`) and pin its language server straight away.
+///
+/// Unlike activation — which skips entries that don't resolve so one stale project can't stop a
+/// workspace loading — a *new* declaration fails loudly. The user is looking at the dialog, so
+/// "that marker doesn't exist" is far more useful now than a silently ignored row later.
+pub async fn workspace_add_project(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: WorkspaceAddProjectParams,
+) -> Result<WorkspaceInfo, RpcError> {
+    // Canonicalized, like a root: the stored path has to be comparable against the workspace's
+    // canonical roots for the in-a-root check, and this is also where a marker that doesn't exist
+    // is caught.
+    let project = crate::config::ProjectRef {
+        root_index: params.path_index,
+        relative_path: std::path::PathBuf::from(&params.relative_path),
+        language: params.language,
+    };
+
+    let mut s = state.lock().await;
+    let workspace = s
+        .workspaces
+        .get_mut(&params.workspace)
+        .ok_or_else(|| RpcError::unknown_workspace(&params.workspace))?;
+    if workspace
+        .projects
+        .iter()
+        .any(|p| p.root_index == project.root_index && p.relative_path == project.relative_path)
+    {
+        return Err(RpcError::invalid_params(format!(
+            "{} is already a project of workspace {}",
+            params.relative_path, params.workspace
+        )));
+    }
+    // Validate before committing anything — the message is the whole value of failing here.
+    crate::config::resolve_project(&project, &workspace.paths).map_err(RpcError::invalid_params)?;
+
+    workspace.projects.push(project);
+    let updated = crate::config::WorkspaceConfig::from_parts(
+        workspace.id.clone(),
+        &workspace.paths,
+        &workspace.projects,
+    );
+    let entry_paths: Vec<String> = workspace
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    // Start it now rather than at the next activation — the point of a pin is that indexing is
+    // already under way by the time you want it.
+    let launches = reconcile_workspace_pins(&mut s, &params.workspace);
+    let pushes = refresh_lsp_server_pickers(&mut s);
+    let entry_projects = workspace_project_views_by_id(&s, &params.workspace);
+    drop(s);
+
+    crate::config::write_workspace_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
+    spawn_pinned_launches(state, launches);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(WorkspaceInfo {
+        name: params.workspace,
+        paths: entry_paths,
+        projects: entry_projects,
+    })
+}
+
+/// Undeclare a project, unpinning its server (which then reaps unless buffers hold it up).
+pub async fn workspace_remove_project(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: WorkspaceRemoveProjectParams,
+) -> Result<WorkspaceInfo, RpcError> {
+    // Matched as stored, not resolved: the entries most worth removing are the ones whose marker no
+    // longer exists, so anything that touches the filesystem would fail on exactly those. Clients
+    // send back the pair they were shown.
+    let relative_path = std::path::PathBuf::from(&params.relative_path);
+
+    let mut s = state.lock().await;
+    let workspace = s
+        .workspaces
+        .get_mut(&params.workspace)
+        .ok_or_else(|| RpcError::unknown_workspace(&params.workspace))?;
+    let before = workspace.projects.len();
+    workspace
+        .projects
+        .retain(|p| !(p.root_index == params.path_index && p.relative_path == relative_path));
+    if workspace.projects.len() == before {
+        return Err(RpcError::invalid_params(format!(
+            "{} is not a project of workspace {}",
+            params.relative_path, params.workspace
+        )));
+    }
+    let updated = crate::config::WorkspaceConfig::from_parts(
+        workspace.id.clone(),
+        &workspace.paths,
+        &workspace.projects,
+    );
+    let entry_paths: Vec<String> = workspace
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    // Reconcile drops the pin this project was holding; a server another project still wants, or
+    // that has buffers open, stays up.
+    let launches = reconcile_workspace_pins(&mut s, &params.workspace);
+    let pushes = refresh_lsp_server_pickers(&mut s);
+    let entry_projects = workspace_project_views_by_id(&s, &params.workspace);
+    drop(s);
+
+    crate::config::write_workspace_config(&updated)
+        .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
+    spawn_pinned_launches(state, launches);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(WorkspaceInfo {
+        name: params.workspace,
+        paths: entry_paths,
+        projects: entry_projects,
+    })
+}
+
+/// Spawn the handshakes for servers [`reconcile_workspace_pins`] created. Detached: a handshake plus
+/// initial indexing takes seconds, and pinning exists precisely so that happens in the background.
+fn spawn_pinned_launches(state: &SharedState, launches: Vec<PinnedLaunch>) {
+    for (key, spec, generation) in launches {
+        tokio::spawn(crate::lsp::manager::launch(
+            state.clone(),
+            key,
+            spec,
+            generation,
+        ));
+    }
 }
 
 /// Remove a root path from a workspace. Closes any file-backed buffers under this root that
@@ -1089,19 +1407,30 @@ pub async fn workspace_remove_root(
         .workspaces
         .get_mut(&params.workspace)
         .expect("workspace still loaded — we held it above");
+    // Drop the root, then repair the projects that referred to it *by position*. The config file
+    // nests projects under their root precisely so this can't go wrong on disk; in memory they're
+    // flat, so this is the one place the index has to be maintained by hand — and getting it wrong
+    // silently re-points a project at a different root.
+    let removed_index = workspace.paths.iter().position(|p| *p == canonical);
     workspace.paths.retain(|p| *p != canonical);
+    if let Some(removed) = removed_index.map(|i| i as u32) {
+        crate::config::drop_root_from_projects(&mut workspace.projects, removed);
+    }
     workspace.workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
         workspace.paths.clone(),
     ));
-    let updated = crate::config::WorkspaceConfig {
-        name: workspace.id.clone(),
-        paths: workspace.paths.clone(),
-    };
+    // Full-file rewrite — carry `projects` through (see `workspace_add_root`).
+    let updated = crate::config::WorkspaceConfig::from_parts(
+        workspace.id.clone(),
+        &workspace.paths,
+        &workspace.projects,
+    );
     let entry_paths: Vec<String> = workspace
         .paths
         .iter()
         .map(|p| p.display().to_string())
         .collect();
+    let entry_projects = workspace_project_views(workspace);
 
     // Next buffer for the requesting client: top of workspace MRU, else any remaining buffer in
     // the workspace. Mirrors buffer/close.
@@ -1132,6 +1461,7 @@ pub async fn workspace_remove_root(
         workspace: WorkspaceInfo {
             name: params.workspace,
             paths: entry_paths,
+            projects: entry_projects,
         },
         closed_buffer_ids: affected,
         next_buffer_id,
@@ -1169,6 +1499,7 @@ pub async fn workspace_rename(
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect(),
+                projects: workspace_project_views(entry),
             });
         }
     }
@@ -1239,6 +1570,8 @@ pub async fn workspace_rename(
         .collect();
     // ...and any open chooser elsewhere should show the new name in its list.
     pushes.extend(refresh_workspace_pickers(&mut s));
+    // Re-keyed above, so the projects come from the *new* name.
+    let entry_projects = workspace_project_views_by_id(&s, &new_name);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -1248,6 +1581,7 @@ pub async fn workspace_rename(
     Ok(WorkspaceInfo {
         name: new_name,
         paths: entry_paths,
+        projects: entry_projects,
     })
 }
 
@@ -1956,11 +2290,11 @@ async fn buffer_open_inner(
                     crate::lsp::config::workspace_marker(&language),
                     &roots,
                 );
-                let key = crate::lsp::manager::LspServerKey {
-                    workspace: active_workspace_name.clone(),
+                let key = crate::lsp::manager::LspServerKey::new(
+                    active_workspace_name.clone(),
                     root,
-                    language: language.clone(),
-                };
+                    &language,
+                );
                 if let Some(generation) = s.lsp.ensure(&key, spec.command) {
                     lsp_launch = Some((key.clone(), spec, generation));
                 }
@@ -11212,6 +11546,24 @@ pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
 /// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
 /// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
 /// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
+/// Drop `workspace_id`'s project pins once no client has it active, reaping the servers that only
+/// the pins were keeping alive (`docs/projects.md`).
+///
+/// A pin belongs to the workspace, not to a client, so this fires only when the *last* client
+/// leaves: switching away in one window while another still shows the workspace must not tear its
+/// servers down. A pinned server that has buffers open survives either way — `unpin_workspace`
+/// hands it back to the ordinary reap-on-last-buffer lifetime.
+pub fn unpin_workspace_if_unused(s: &mut ServerState, workspace_id: &str) -> PendingPushes {
+    let still_active = s
+        .clients
+        .values()
+        .any(|c| c.active_workspace.as_deref() == Some(workspace_id));
+    if still_active || s.lsp.unpin_workspace(workspace_id).is_empty() {
+        return Vec::new();
+    }
+    refresh_lsp_server_pickers(s)
+}
+
 pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
@@ -13305,6 +13657,7 @@ mod next_buffer_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                projects: Vec::new(),
             },
         );
         let client_id = uuid::Uuid::new_v4();
@@ -13561,6 +13914,7 @@ mod subscribe_snapshot_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                projects: Vec::new(),
             },
         );
         let client_id = uuid::Uuid::new_v4();
@@ -13647,6 +14001,7 @@ mod subscribe_snapshot_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                projects: Vec::new(),
             },
         );
         let client_id = uuid::Uuid::new_v4();

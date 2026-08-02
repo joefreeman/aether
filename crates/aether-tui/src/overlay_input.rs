@@ -31,6 +31,10 @@ pub enum OverlayField {
     WorkspaceName,
     /// The workspace-settings overlay's add-root input row.
     WorkspaceAddRoot,
+    /// The workspace-settings overlay's add-project path segment.
+    WorkspaceAddProject,
+    /// Its leading root-typeahead segment (multi-root workspaces only).
+    WorkspaceAddProjectRoot,
     /// A picker's query input (Files/Buffers/Grep/Explorer/…).
     PickerQuery,
     /// The filter chip editor's root-typeahead segment (multi-root dir filters).

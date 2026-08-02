@@ -49,8 +49,8 @@ use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete, WorkspaceList,
-    WorkspaceOpenPath, WorkspaceRemoveRoot, WorkspaceRename,
+    WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete,
+    WorkspaceList, WorkspaceOpenPath, WorkspaceRemoveProject, WorkspaceRemoveRoot, WorkspaceRename,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;
@@ -302,6 +302,14 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         if pruned_ephemeral {
             pushes.extend(crate::handlers::refresh_workspace_pickers(&mut s));
         }
+        // Last client out of a workspace releases its pinned project servers (`docs/projects.md`).
+        // Runs after `clients.remove` above, so this client no longer counts as holding it active.
+        if let Some(workspace_id) = disconnecting_workspace.as_deref() {
+            pushes.extend(crate::handlers::unpin_workspace_if_unused(
+                &mut s,
+                workspace_id,
+            ));
+        }
         pushes
     };
     for (sender, notif) in pushes {
@@ -392,6 +400,10 @@ async fn dispatch(
         WorkspaceOpenPath::NAME => run!(WorkspaceOpenPath, handlers::workspace_open_path),
         WorkspaceAddRoot::NAME => run!(WorkspaceAddRoot, handlers::workspace_add_root),
         WorkspaceRemoveRoot::NAME => run!(WorkspaceRemoveRoot, handlers::workspace_remove_root),
+        WorkspaceAddProject::NAME => run!(WorkspaceAddProject, handlers::workspace_add_project),
+        WorkspaceRemoveProject::NAME => {
+            run!(WorkspaceRemoveProject, handlers::workspace_remove_project)
+        }
         WorkspaceRename::NAME => run!(WorkspaceRename, handlers::workspace_rename),
         WorkspaceDelete::NAME => run!(WorkspaceDelete, handlers::workspace_delete),
         PathDelete::NAME => run!(PathDelete, handlers::path_delete),

@@ -277,20 +277,100 @@ impl HoverPopup {
 /// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field. Populated each frame by `Shell::sync_workspace_settings`.
 ///
-/// Selection model: `selected == 0` is the name field; `1..=roots.len()` are the root rows (root
-/// `i` at index `i + 1`); `roots.len() + 1` is the add-root input row. The input row is always
-/// reachable, which is why we focus it on open — most overlay opens are to add a root.
+/// Selection model: index 0 is the name field (drawn in the header); everything below it comes
+/// pre-flattened in `rows`, each carrying the selection index it answers to — the shell does not
+/// re-derive the core's arithmetic (see `aether_client::session::SettingsRow`).
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceSettingsState {
     /// Editable buffer for the name field (index 0), mirrored from the core's in-progress edit.
     pub name_input: crate::text_input::TextInput,
-    pub roots: Vec<String>,
+    /// The list area's rows in display order: the roots, the add-root input, a section heading,
+    /// the projects, the add-project input.
+    pub rows: Vec<SettingsListRow>,
     pub selected: usize,
     /// Text being typed into the add-root input row.
     pub add_input: crate::text_input::TextInput,
+    /// The add-project row's path editor, projected for rendering.
+    pub add_project: ProjectEditorState,
     /// In-dialog error from the last add or remove attempt. Rendered as the bottom line of the
-    /// overlay. Cleared when the user edits `add_input` or initiates another action.
+    /// overlay. Cleared when the user edits an input or initiates another action.
     pub error: Option<String>,
+}
+
+impl WorkspaceSettingsState {
+    /// The focused row's view, when the focus is in the list area (i.e. not on the name field).
+    pub fn focused(&self) -> Option<&SettingsRowView> {
+        self.rows
+            .iter()
+            .find(|r| r.select == Some(self.selected))
+            .map(|r| &r.view)
+    }
+
+    /// The focused row's position in display order, which the section heading shifts relative to
+    /// the selection index. Drives both the scroll window and the caret placement.
+    pub fn focused_display_index(&self) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| r.select == Some(self.selected))
+    }
+}
+
+/// The add-project row's two-segment path editor, projected from the core's `PathEditor` — the same
+/// component (and so the same UX) as the save-as prompt. In a single-root workspace only the path
+/// segment is drawn; `multi_root` gates the leading root typeahead.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectEditorState {
+    pub root_input: crate::text_input::TextInput,
+    /// The chosen root's display label, shown when the root segment isn't being edited.
+    pub root_display: String,
+    /// Inline typeahead completion for the root filter, if any.
+    pub root_ghost: Option<String>,
+    /// The typed root filter matches nothing — rendered red.
+    pub root_invalid: bool,
+    /// The root segment has focus (multi-root only).
+    pub on_root: bool,
+    /// The add-project row itself has focus. Gates the placeholder: unfocused shows
+    /// "Add project...", focused shows the typed text and its ghost (or nothing but the caret).
+    pub focused: bool,
+    pub multi_root: bool,
+    pub path_input: crate::text_input::TextInput,
+    /// Ghost suggestion for the path's trailing partial segment.
+    pub path_ghost: Option<String>,
+    /// The typed path's *parent* directory doesn't exist — advisory, rendered red.
+    pub path_invalid: bool,
+}
+
+/// One row of the settings overlay's list area, paired with the selection index it answers to.
+#[derive(Debug, Clone)]
+pub struct SettingsListRow {
+    /// The dialog-global selection index this row is focused at, or `None` for the non-focusable
+    /// section heading.
+    pub select: Option<usize>,
+    pub view: SettingsRowView,
+}
+
+/// What a [`SettingsListRow`] draws. Projected from the core's `SettingsRow` by
+/// `Shell::sync_workspace_settings`.
+#[derive(Debug, Clone)]
+pub enum SettingsRowView {
+    /// A workspace root path.
+    Root(String),
+    /// The add-root input.
+    AddRoot,
+    /// A non-focusable heading separating the two lists.
+    Section(&'static str),
+    /// A non-focusable spacer, so the sections breathe. Counted as a row so the scroll math and
+    /// the renderer agree on how many lines the list occupies.
+    Blank,
+    /// A declared project: its marker path, the language it pins a server for, and the reason it
+    /// can't be used (rendered red in place of the language).
+    Project {
+        path: String,
+        language: String,
+        error: Option<String>,
+    },
+    /// The add-project input.
+    AddProject,
 }
 
 /// Application-settings overlay view model. A render-only projection of the core's

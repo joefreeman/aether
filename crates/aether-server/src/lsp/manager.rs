@@ -41,7 +41,26 @@ pub struct LspServerKey {
     /// The owning workspace's id (`ServerState` workspace key).
     pub workspace: String,
     pub root: PathBuf,
+    /// Always a [`config::canonical_language`] — see [`LspServerKey::new`].
     pub language: String,
+}
+
+impl LspServerKey {
+    /// Build a key, collapsing languages that share one [`LspServerSpec`] onto a single
+    /// [`config::canonical_language`].
+    ///
+    /// This is the only way keys should be built outside tests. `typescript`, `javascript` and
+    /// `tsx` are one server invocation, so a key built from the raw language would miss the handle
+    /// its siblings share — opening `a.ts` and `b.js` in one root would spawn two identical
+    /// `typescript-language-server` processes, and a pinned project server (`docs/projects.md`)
+    /// would go unused by half the buffers it exists to serve.
+    pub fn new(workspace: String, root: PathBuf, language: &str) -> Self {
+        LspServerKey {
+            workspace,
+            root,
+            language: config::canonical_language(language).to_string(),
+        }
+    }
 }
 
 /// A language server and the buffers synced against it.
@@ -60,6 +79,11 @@ pub struct LspHandle {
     pub document_formatting: bool,
     /// Buffers we've sent `didOpen` for (and not yet `didClose`).
     pub open_buffers: HashSet<BufferId>,
+    /// Kept alive by a declared project rather than by an open buffer (`docs/projects.md`). A
+    /// pinned server survives losing its last buffer — indeed it usually never has one — because
+    /// its job is to have the workspace indexed *before* anything is opened. Cleared, and the
+    /// server reaped if nothing else wants it, by [`LspManager::unpin_workspace`].
+    pub pinned: bool,
     /// Buffers that want this server but were registered before it became `Ready`; opened in bulk
     /// once the handshake lands.
     pub registered_buffers: HashSet<BufferId>,
@@ -109,12 +133,47 @@ impl LspManager {
                 document_formatting: false,
                 open_buffers: HashSet::new(),
                 registered_buffers: HashSet::new(),
+                pinned: false,
                 progress: HashMap::new(),
                 last_progress_push: None,
                 child: None,
             },
         );
         Some(generation)
+    }
+
+    /// Mark `key`'s server as project-pinned, so losing its last buffer won't reap it.
+    ///
+    /// Separate from [`Self::ensure`] because the two orders both happen: a project usually creates
+    /// the handle and pins it in one go, but a server lazily launched by an earlier `buffer/open`
+    /// is already there and just needs the flag. A no-op if the handle is gone.
+    pub fn pin(&mut self, key: &LspServerKey) {
+        if let Some(h) = self.servers.get_mut(key) {
+            h.pinned = true;
+        }
+    }
+
+    /// Drop every pin held by `workspace_id` and tear down the servers that were only alive because
+    /// of one, returning their keys so the caller can refresh status views.
+    ///
+    /// A pinned server that also has buffers open (someone edited a file in the project) is
+    /// unpinned but kept — it reverts to the ordinary lifetime and reaps when its last buffer
+    /// closes.
+    pub fn unpin_workspace(&mut self, workspace_id: &str) -> Vec<LspServerKey> {
+        let mut removed = Vec::new();
+        self.servers.retain(|key, h| {
+            if key.workspace != workspace_id || !h.pinned {
+                return true;
+            }
+            h.pinned = false;
+            if h.open_buffers.is_empty() && h.registered_buffers.is_empty() {
+                removed.push(key.clone());
+                false // dropping the handle kills the process (`kill_on_drop`)
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Record that `buffer_id` belongs to `key`'s server (for later routing).
@@ -165,9 +224,14 @@ impl LspManager {
         }
     }
 
-    /// Send `didClose` and forget the buffer. If that was the server's last buffer, tear the
-    /// server down — drop its handle (killing the process via `kill_on_drop`) — and return its key
-    /// so the caller can refresh any open status views. Returns `None` when the server stays up.
+    /// Send `didClose` and forget the buffer. If that was the server's last buffer *and* nothing
+    /// else is holding it open, tear the server down — drop its handle (killing the process via
+    /// `kill_on_drop`) — and return its key so the caller can refresh any open status views.
+    /// Returns `None` when the server stays up.
+    ///
+    /// A project-pinned server never reaps here: it's kept alive by the workspace, not by buffers
+    /// (see [`LspHandle::pinned`]), and closing the file you happened to open in it must not undo
+    /// the indexing the pin exists to guarantee.
     pub fn notify_close(&mut self, buffer_id: BufferId, uri: &str) -> Option<LspServerKey> {
         let key = self.doc_server.remove(&buffer_id)?;
         let idle = {
@@ -178,7 +242,7 @@ impl LspManager {
                     let _ = lifecycle::did_close(client, uri);
                 }
             }
-            h.open_buffers.is_empty() && h.registered_buffers.is_empty()
+            !h.pinned && h.open_buffers.is_empty() && h.registered_buffers.is_empty()
         };
         if idle {
             // Last buffer gone → shut the server down. Dropping the handle drops its `Child`
@@ -415,7 +479,13 @@ async fn bring_up(
             let doc_uri = uri::path_to_uri(path);
             let text = buf.text.to_string();
             let version = buf.revision as i64;
-            if lifecycle::did_open(&client, &doc_uri, &key.language, version, &text).is_ok() {
+            // The buffer's *own* language, not the key's: keys carry a canonical language shared by
+            // a whole spec group (`javascript` and `tsx` key as `typescript`), but `languageId` tells
+            // the server how to parse this specific file — announcing a `.js` file as `typescript`
+            // would change how tsserver treats it. Fall back to the key only for the (impossible in
+            // practice) case of a registered buffer with no detected language.
+            let language_id = buf.language.as_deref().unwrap_or(&key.language);
+            if lifecycle::did_open(&client, &doc_uri, language_id, version, &text).is_ok() {
                 s.lsp
                     .servers
                     .get_mut(&key)
@@ -699,6 +769,10 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
 /// relaunch, re-registering the documents that were open against it so they reopen once the new
 /// process is ready. Workspace-keyed, so it never disturbs a sibling workspace's server.
 pub async fn restart(state: &SharedState, language: &str, workspace_id: &str) {
+    // Keys store the canonical language, so a request naming a sibling (`javascript` for a server
+    // keyed `typescript`) has to be canonicalized to match. Clients send back the language they
+    // were shown, which is already canonical — this is belt-and-braces for any other caller.
+    let language = config::canonical_language(language);
     let keys: Vec<LspServerKey> = {
         let guard = state.lock().await;
         guard
@@ -994,6 +1068,7 @@ mod tests {
             document_formatting: true,
             open_buffers: HashSet::new(),
             registered_buffers: HashSet::new(),
+            pinned: false,
             progress: HashMap::new(),
             last_progress_push: None,
             child: None,
@@ -1022,6 +1097,7 @@ mod tests {
             document_formatting: false,
             open_buffers: HashSet::new(),
             registered_buffers: HashSet::new(),
+            pinned: false,
             progress: HashMap::new(),
             last_progress_push: None,
             child: None,
@@ -1338,5 +1414,97 @@ mod tests {
             server_request_response("workspace/applyEdit", &json!({})),
             json!(null)
         );
+    }
+
+    /// The whole point of canonicalization: `.ts` and `.js` in one root are one server, so the
+    /// second `ensure` must find the first's handle rather than minting a fresh generation.
+    #[test]
+    fn sibling_languages_share_one_server_handle() {
+        let mut mgr = LspManager::default();
+        let root = PathBuf::from("/proj/web");
+
+        let ts = LspServerKey::new("proj".into(), root.clone(), "typescript");
+        let js = LspServerKey::new("proj".into(), root.clone(), "javascript");
+        let tsx = LspServerKey::new("proj".into(), root.clone(), "tsx");
+        assert_eq!(ts, js);
+        assert_eq!(ts, tsx);
+
+        assert!(
+            mgr.ensure(&ts, "typescript-language-server").is_some(),
+            "first ensure creates the handle"
+        );
+        assert!(
+            mgr.ensure(&js, "typescript-language-server").is_none(),
+            "sibling language must reuse it, not spawn a second process"
+        );
+        assert_eq!(mgr.servers.len(), 1);
+
+        // A genuinely different language in the same root is still its own server.
+        let rust = LspServerKey::new("proj".into(), root, "rust");
+        assert!(mgr.ensure(&rust, "rust-analyzer").is_some());
+        assert_eq!(mgr.servers.len(), 2);
+    }
+
+    /// A manager with one `rust` server for workspace `proj`, pinned or not.
+    fn mgr_with_server(pinned: bool) -> (LspManager, LspServerKey) {
+        let mut mgr = LspManager::default();
+        let key = LspServerKey::new("proj".into(), PathBuf::from("/proj"), "rust");
+        mgr.ensure(&key, "rust-analyzer");
+        if pinned {
+            mgr.pin(&key);
+        }
+        (mgr, key)
+    }
+
+    /// The pin's whole job: the server outlives the buffer that happened to be open in it. The
+    /// unpinned control is the existing reap behaviour, unchanged.
+    #[test]
+    fn pinned_server_survives_its_last_buffer_closing() {
+        for pinned in [true, false] {
+            let (mut mgr, key) = mgr_with_server(pinned);
+            mgr.register_doc(7, &key);
+
+            let reaped = mgr.notify_close(7, "file:///proj/src/main.rs");
+            assert_eq!(
+                reaped.is_none(),
+                pinned,
+                "pinned={pinned}: reap should be suppressed only by the pin",
+            );
+            assert_eq!(mgr.servers.contains_key(&key), pinned);
+        }
+    }
+
+    /// Deactivating a workspace drops its pins and reaps what only the pin was holding up.
+    #[test]
+    fn unpin_workspace_reaps_only_buffer_less_pinned_servers() {
+        let (mut mgr, key) = mgr_with_server(true);
+
+        // A pinned server in a *different* workspace is untouched.
+        let other = LspServerKey::new("other".into(), PathBuf::from("/other"), "rust");
+        mgr.ensure(&other, "rust-analyzer");
+        mgr.pin(&other);
+
+        let removed = mgr.unpin_workspace("proj");
+        assert_eq!(removed, vec![key.clone()]);
+        assert!(!mgr.servers.contains_key(&key));
+        assert!(
+            mgr.servers[&other].pinned,
+            "sibling workspace keeps its pin"
+        );
+    }
+
+    /// A pinned server that also has buffers open reverts to the ordinary lifetime rather than
+    /// being killed out from under them.
+    #[test]
+    fn unpin_workspace_keeps_a_pinned_server_that_has_buffers() {
+        let (mut mgr, key) = mgr_with_server(true);
+        mgr.register_doc(7, &key);
+
+        assert!(mgr.unpin_workspace("proj").is_empty());
+        assert!(mgr.servers.contains_key(&key));
+        assert!(!mgr.servers[&key].pinned);
+
+        // ...and now that the pin is gone, closing its last buffer reaps it as usual.
+        assert_eq!(mgr.notify_close(7, "file:///proj/src/main.rs"), Some(key));
     }
 }

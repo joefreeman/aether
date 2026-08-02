@@ -29,7 +29,7 @@ use aether_protocol::directory::DirectoryEntry;
 /// The save-as path editor. In single-root workspaces only the path field exists (`field` is always
 /// `Path`); multi-root workspaces add the leading root field.
 #[derive(Debug)]
-pub struct SaveAsEditor {
+pub struct PathEditor {
     /// Which segment has focus. Always `Path` in single-root workspaces.
     pub field: ChipEditorField,
     /// The root-relative path being typed (directory portion + filename leaf).
@@ -50,13 +50,13 @@ pub struct SaveAsEditor {
     pub suggestion_idx: usize,
 }
 
-impl SaveAsEditor {
+impl PathEditor {
     /// Open the editor pre-filled with `path` under root `root_index`. `field` is the initially
     /// focused segment (callers focus the root field for a brand-new buffer in a multi-root
     /// workspace, the path field otherwise). `listing_dir_abs` starts empty so the caller's first
-    /// [`SaveAsEditor::sync_dir_listing`] always reports a refetch is due.
+    /// [`PathEditor::sync_dir_listing`] always reports a refetch is due.
     pub fn new(path: String, field: ChipEditorField, root_index: u32) -> Self {
-        SaveAsEditor {
+        PathEditor {
             field,
             input: Input::new(path),
             root_filter: Input::default(),
@@ -124,6 +124,18 @@ impl SaveAsEditor {
         self.sync_dir_listing(workspace_paths)
     }
 
+    /// Move to the path segment *without* adopting the root ghost — `Tab` traversal, as opposed to
+    /// `Alt-l`'s accept-and-advance ([`Self::commit_root_field`]).
+    ///
+    /// The typed filter stands as it is: [`chosen_root`](crate::chips::ChipEditor::chosen_root)
+    /// already resolves a partial-but-matching prefix to a real root, and the unfocused segment
+    /// renders that root's settled label — so nothing is lost by not rewriting the text. Returns
+    /// whether the directory listing needs refetching.
+    pub fn advance_to_path(&mut self, workspace_paths: &[String]) -> bool {
+        self.field = ChipEditorField::Path;
+        self.sync_dir_listing(workspace_paths)
+    }
+
     // ---- directory listing ---------------------------------------------------------------------
 
     /// The absolute directory the path field's suggestions should list: the dir portion of the
@@ -164,7 +176,7 @@ impl SaveAsEditor {
 
     /// Reconcile the listing key with the current (root, dir-portion) pair. Returns `true` when
     /// they diverged — the listing was cleared and the caller should fire a fresh `directory/list`
-    /// for [`SaveAsEditor::dir_listing_path`].
+    /// for [`PathEditor::dir_listing_path`].
     pub fn sync_dir_listing(&mut self, workspace_paths: &[String]) -> bool {
         let Some(abs) = self.dir_listing_path(workspace_paths) else {
             return false;
@@ -278,7 +290,7 @@ mod tests {
     #[test]
     fn single_root_path_listing_and_ghost() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = SaveAsEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
         // First sync establishes the listing key and asks for a refetch.
         assert!(ed.sync_dir_listing(&roots));
         assert_eq!(ed.listing_dir_abs, "/tmp/root");
@@ -295,7 +307,7 @@ mod tests {
     #[test]
     fn accepting_a_dir_refetches_but_a_file_does_not() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = SaveAsEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing(vec![entry("src", true), entry("main.rs", false)]);
 
@@ -314,7 +326,7 @@ mod tests {
     #[test]
     fn save_target_is_literal_input_not_the_suggestion() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = SaveAsEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing(vec![entry("macros", true)]);
         // Typing `ma` highlights `macros/` as a ghost, but Enter saves the literal `ma`.
@@ -328,7 +340,7 @@ mod tests {
     #[test]
     fn missing_parent_dir_is_advisory_invalid() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = SaveAsEditor::new("nope/file.rs".into(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new("nope/file.rs".into(), ChipEditorField::Path, 0);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing_failed();
         assert!(ed.path_invalid());
@@ -340,7 +352,7 @@ mod tests {
     fn multi_root_field_resolves_chosen_root() {
         let roots = vec!["/work/api".to_string(), "/personal/web".to_string()];
         let labels = root_labels(&roots);
-        let mut ed = SaveAsEditor::new(String::new(), ChipEditorField::Root, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Root, 0);
         // Filter to the second root, then commit the root field → focus moves to the path.
         ed.root_filter.set("web".into());
         ed.root_selected = 0;

@@ -65,18 +65,19 @@ impl WasmSession {
         to_js(&view::build_view(&self.inner))
     }
 
-    /// Build a real session from the bootstrap landing buffer. `workspace_paths` is a JSON string
-    /// array; `open` is the `buffer/open` result JSON. (The `new()` placeholder is for tests.)
-    pub fn bootstrap(
-        workspace: String,
-        workspace_paths: JsValue,
-        open: JsValue,
-    ) -> Result<WasmSession, JsValue> {
-        let paths: Vec<String> = from_js(workspace_paths)?;
+    /// Build a real session from the bootstrap landing buffer. `workspace` is the activation's
+    /// `WorkspaceInfo` JSON (name + roots + declared projects); `open` is the `buffer/open` result
+    /// JSON. (The `new()` placeholder is for tests.)
+    ///
+    /// The whole `WorkspaceInfo` crosses the boundary, not just the name and roots: boot is the one
+    /// path that seeds a session without a `sync_workspace_info`, so anything left behind here stays
+    /// missing for the life of the client.
+    pub fn bootstrap(workspace: JsValue, open: JsValue) -> Result<WasmSession, JsValue> {
+        let workspace: aether_protocol::workspace::WorkspaceInfo = from_js(workspace)?;
         let open: BufferOpenResult = from_js(open)?;
-        let buffer = buffer_info(open, &paths);
+        let buffer = buffer_info(open, &workspace.paths);
         Ok(WasmSession {
-            inner: Session::new(workspace, paths, buffer),
+            inner: Session::new(workspace, buffer),
         })
     }
 
@@ -294,6 +295,31 @@ impl WasmSession {
         ))
     }
 
+    /// Replace the add-project row's path segment (`docs/projects.md`). Returns `Effect[]`.
+    pub fn workspace_settings_set_add_project(&mut self, text: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(
+            self.inner.workspace_settings_set_add_project(text),
+        ))
+    }
+
+    /// Replace the add-project row's root-typeahead segment (multi-root). Returns `Effect[]`.
+    pub fn workspace_settings_set_add_project_root(
+        &mut self,
+        text: String,
+    ) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(
+            self.inner.workspace_settings_set_add_project_root(text),
+        ))
+    }
+
+    /// A project row's delete button was clicked (0-based index): open the shared confirm prompt
+    /// for undeclaring it. Returns `Effect[]`.
+    pub fn workspace_settings_remove_project(&mut self, index: u32) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.on_event(
+            Event::WorkspaceSettingsRemoveProject(index as usize),
+        )))
+    }
+
     /// Replace the chip editor's path-field text (native `<input>` owns editing). Returns `Effect[]`.
     pub fn chip_editor_set_input(&mut self, text: String) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.chip_editor_set_input(text)))
@@ -414,6 +440,8 @@ impl WasmSession {
             return Vec::new();
         };
         let mods = Mods { ctrl, alt, shift };
+        // The browser reports Shift-Tab as Tab + Shift; the core wants it as its own key.
+        let keycode = aether_client::keymap::apply_backtab(keycode, mods);
         let text = key_text(key, &mods);
         let fx = self.inner.on_key(keycode, mods, text, visible_rows);
         effects_to_json(fx)

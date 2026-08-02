@@ -1485,9 +1485,101 @@ fn workspace_info_shape() {
     let p = WorkspaceInfo {
         name: "aether".into(),
         paths: vec!["/home/joe/x".into()],
+        projects: Vec::new(),
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v, json!({"name": "aether", "paths": ["/home/joe/x"]}));
+}
+
+/// Projects ride on `WorkspaceInfo` but are absent entirely when none are declared, so workspaces
+/// predating them keep the exact wire shape asserted above.
+#[test]
+fn workspace_info_carries_projects() {
+    use aether_protocol::workspace::WorkspaceProject;
+    let p = WorkspaceInfo {
+        name: "aether".into(),
+        paths: vec!["/src/aether".into()],
+        projects: vec![
+            WorkspaceProject {
+                path_index: 0,
+                relative_path: "Cargo.toml".into(),
+                language: "rust".into(),
+                error: None,
+            },
+            WorkspaceProject {
+                path_index: 0,
+                relative_path: "gone/go.mod".into(),
+                language: "go".into(),
+                error: Some("project marker does not exist: /src/aether/gone/go.mod".into()),
+            },
+        ],
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(
+        v["projects"],
+        json!([
+            {"path_index": 0, "relative_path": "Cargo.toml", "language": "rust"},
+            {
+                "path_index": 0,
+                "relative_path": "gone/go.mod",
+                "language": "go",
+                "error": "project marker does not exist: /src/aether/gone/go.mod",
+            },
+        ]),
+        "a resolving project carries no `error` key",
+    );
+    let back: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(back.projects, p.projects);
+}
+
+#[test]
+fn workspace_add_project_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceAddProject, WorkspaceAddProjectParams};
+    assert_eq!(WorkspaceAddProject::NAME, "workspace/add_project");
+
+    // Bare form: the language is inferred from the marker's file name.
+    let p = WorkspaceAddProjectParams {
+        workspace: "aether".into(),
+        path_index: 0,
+        relative_path: "Cargo.toml".into(),
+        language: None,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"workspace": "aether", "path_index": 0, "relative_path": "Cargo.toml"}),
+    );
+
+    // Explicit form, for a marker that can't imply one, under a second root.
+    let p = WorkspaceAddProjectParams {
+        workspace: "aether".into(),
+        path_index: 1,
+        relative_path: "web/package.json".into(),
+        language: Some("typescript".into()),
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({
+            "workspace": "aether",
+            "path_index": 1,
+            "relative_path": "web/package.json",
+            "language": "typescript",
+        }),
+    );
+}
+
+#[test]
+fn workspace_remove_project_params_round_trip() {
+    use aether_protocol::workspace::{WorkspaceRemoveProject, WorkspaceRemoveProjectParams};
+    assert_eq!(WorkspaceRemoveProject::NAME, "workspace/remove_project");
+    let p = WorkspaceRemoveProjectParams {
+        workspace: "aether".into(),
+        path_index: 0,
+        relative_path: "Cargo.toml".into(),
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"workspace": "aether", "path_index": 0, "relative_path": "Cargo.toml"}),
+    );
 }
 
 #[test]
@@ -1510,6 +1602,7 @@ fn workspace_activate_result_wraps_info() {
         workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
+            projects: Vec::new(),
         },
         last_buffer_id: None,
         opened: None,
@@ -1561,6 +1654,7 @@ fn workspace_rename_params_round_trip() {
     let info = WorkspaceInfo {
         name: "aether-next".into(),
         paths: vec!["/p".into()],
+        projects: Vec::new(),
     };
     assert_eq!(to_value(&info).unwrap()["name"], "aether-next");
 }
@@ -1642,6 +1736,7 @@ fn workspace_remove_root_result_shape() {
         workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
+            projects: Vec::new(),
         },
         closed_buffer_ids: vec![3, 5],
         next_buffer_id: Some(7),
@@ -1659,6 +1754,7 @@ fn workspace_remove_root_result_skips_none_next_buffer() {
         workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec![],
+            projects: Vec::new(),
         },
         closed_buffer_ids: vec![],
         next_buffer_id: None,
@@ -1674,6 +1770,7 @@ fn workspace_activate_result_includes_last_buffer_id_when_set() {
         workspace: WorkspaceInfo {
             name: "aether".into(),
             paths: vec!["/p".into()],
+            projects: Vec::new(),
         },
         last_buffer_id: Some(7),
         opened: None,

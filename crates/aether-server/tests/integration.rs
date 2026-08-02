@@ -10863,7 +10863,12 @@ async fn keybindings_picker_reviews_preserve_the_shipped_rows() {
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
     // Re-view without rows (what a scroll refetch sends): the candidate set survives.
-    let view = send_request::<PickerView>(&mut ws, 11, &keybindings_view_params(PickerReset::Keep, None)).await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        11,
+        &keybindings_view_params(PickerReset::Keep, None),
+    )
+    .await;
     assert_eq!(view.total_candidates, 3, "re-view keeps the shipped rows");
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.total_matches, 3);
@@ -17878,7 +17883,10 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
         push.range.start_logical_line,
         push.range.end_logical_line_exclusive,
     );
-    assert!(start < end, "pushed window must be non-empty, got {start}..{end}");
+    assert!(
+        start < end,
+        "pushed window must be non-empty, got {start}..{end}"
+    );
     assert!(end <= new_line_count);
     assert_eq!((start, end), (0, new_line_count));
     assert_eq!(push.replacement_lines.len(), (end - start) as usize);
@@ -21144,6 +21152,253 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, id_base: u64,
     panic!("buffer diagnostics present={want} never reached");
 }
 
+// ---- declared projects & pinned language servers (docs/projects.md) -------------------------
+
+/// A project declared under the workspace's first (and only) root. Projects are stored relative to
+/// their root, so the fixtures name markers the way the config file does.
+fn project_ref(relative_path: &str) -> aether_server::ProjectRef {
+    aether_server::ProjectRef {
+        root_index: 0,
+        relative_path: std::path::PathBuf::from(relative_path),
+        language: None,
+    }
+}
+
+/// Poll until `f` holds against the server's LSP state, or fail after ~2s. Server startup is a
+/// spawned handshake, so every project assertion has to wait for it rather than assume it landed.
+async fn await_lsp_state(
+    server: &aether_server::ServerHandle,
+    what: &str,
+    f: impl Fn(&aether_server::LspManagerView) -> bool,
+) {
+    for _ in 0..200 {
+        {
+            let s = server.state.lock().await;
+            if f(&aether_server::lsp_view(&s)) {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let s = server.state.lock().await;
+    panic!(
+        "timed out waiting for {what}; servers = {:?}",
+        aether_server::lsp_view(&s)
+    );
+}
+
+/// A workspace declaring one Cargo project brings its server up **with no buffer open** — the whole
+/// point of pinning, and what makes a cold `workspace/symbol` possible.
+#[tokio::test]
+async fn declared_project_starts_a_server_with_no_buffer_open() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("main.rs", "fn main() {}\n"),
+    ]);
+    let server = aether_server::spawn_for_test_with_projects(
+        "pinned",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref("Cargo.toml")],
+        vec![("rust".into(), DummyLspConfig::default())],
+    )
+    .await
+    .unwrap();
+
+    await_lsp_state(&server, "the pinned server to be ready", |v| {
+        v.len() == 1 && v[0].ready && v[0].pinned && v[0].open_buffers == 0
+    })
+    .await;
+}
+
+/// A buffer opened inside a pinned project's root attaches to the *existing* server rather than
+/// spawning a second one, and closing it again leaves the pin holding the server up.
+#[tokio::test]
+async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("main.rs", "fn main() {}\n"),
+    ]);
+    let server = aether_server::spawn_for_test_with_projects(
+        "pinned-open",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref("Cargo.toml")],
+        vec![("rust".into(), DummyLspConfig::default())],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server to be ready", |v| {
+        v.len() == 1 && v[0].ready
+    })
+    .await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "pinned-open".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Still exactly one server — the buffer joined the pinned one instead of starting its own.
+    await_lsp_state(&server, "the buffer to join the pinned server", |v| {
+        v.len() == 1 && v[0].open_buffers == 1
+    })
+    .await;
+
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        3,
+        &BufferCloseParams {
+            buffer_id: open.buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+
+    // The pin outlives the buffer: an unpinned server would have been reaped here.
+    await_lsp_state(&server, "the pinned server to survive the close", |v| {
+        v.len() == 1 && v[0].pinned && v[0].open_buffers == 0
+    })
+    .await;
+}
+
+/// The daemon outlives its clients, so quitting and relaunching the client must bring the pinned
+/// servers back. The last client leaving releases the pins (and reaps the servers), but the
+/// workspace stays *loaded* — so the next activation takes the already-loaded path, and only an
+/// unconditional reconcile restores them. Regression test for exactly that: after a restart the LSP
+/// picker was empty until the daemon itself was restarted.
+#[tokio::test]
+async fn reactivating_after_the_last_client_leaves_restores_the_pins() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("main.rs", "fn main() {}\n"),
+    ]);
+    let server = aether_server::spawn_for_test_with_projects(
+        "restart",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref("Cargo.toml")],
+        vec![("rust".into(), DummyLspConfig::default())],
+    )
+    .await
+    .unwrap();
+
+    {
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
+        let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            &mut ws,
+            1,
+            &WorkspaceActivateParams {
+                name: "restart".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        await_lsp_state(&server, "the pinned server to be ready", |v| {
+            v.len() == 1 && v[0].ready && v[0].pinned
+        })
+        .await;
+    } // client quits — its socket drops here
+
+    // The pin goes with the last client, so the server is reaped...
+    await_lsp_state(&server, "the pins to be released on disconnect", |v| {
+        v.is_empty()
+    })
+    .await;
+
+    // ...and comes back when a client returns, even though the workspace never unloaded.
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "restart".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    await_lsp_state(&server, "the pinned server to come back", |v| {
+        v.len() == 1 && v[0].ready && v[0].pinned && v[0].open_buffers == 0
+    })
+    .await;
+}
+
+/// `.ts` and `.js` in one root are one `typescript-language-server`, not two. Without key
+/// canonicalization they key differently and spawn duplicate processes — and a project pinned as
+/// `typescript` would go unused by the `.js` buffer it exists to serve.
+#[tokio::test]
+async fn sibling_language_buffers_share_one_server() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("package.json", "{}\n"),
+        ("a.ts", "export const a = 1;\n"),
+        ("b.js", "export const b = 2;\n"),
+    ]);
+    let server = aether_server::spawn_for_test_with_projects(
+        "ts-js",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref("package.json")],
+        vec![("typescript".into(), DummyLspConfig::default())],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned typescript server", |v| {
+        v.len() == 1 && v[0].ready
+    })
+    .await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "ts-js".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    for (i, file) in ["a.ts", "b.js"].iter().enumerate() {
+        let _: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            2 + i as u64,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some((*file).into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    await_lsp_state(&server, "both buffers on one server", |v| {
+        v.len() == 1 && v[0].open_buffers == 2
+    })
+    .await;
+}
+
 /// Regression test: undo must send `didChange` so the server re-analyzes and clears a diagnostic for
 /// an error that was undone. Without the fix, undo bypassed `notify_change` and the squiggle stuck.
 #[tokio::test]
@@ -23236,7 +23491,10 @@ async fn grep_keep_view_echoes_filters_and_all_wipes_them() {
         },
     )
     .await;
-    assert!(reset.filters.is_default(), "an `all` reset wipes filters too");
+    assert!(
+        reset.filters.is_default(),
+        "an `all` reset wipes filters too"
+    );
     assert_eq!(reset.query, "");
     drop(server);
 }

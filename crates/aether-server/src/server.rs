@@ -250,6 +250,9 @@ async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify
 pub struct ServerHandle {
     pub port: u16,
     pub workspace_name: String,
+    /// The running server's state, so a test seam can install fixtures (declared projects, say)
+    /// that no RPC can set without writing to the real config dir.
+    pub state: SharedState,
     join: tokio::task::JoinHandle<()>,
 }
 
@@ -312,7 +315,15 @@ pub async fn spawn_for_test_multi_with_persistence(
     sessions_path: Option<PathBuf>,
     backups_dir: Option<PathBuf>,
 ) -> anyhow::Result<ServerHandle> {
-    spawn_for_test_full(workspaces, sessions_path, backups_dir, None, None, Vec::new()).await
+    spawn_for_test_full(
+        workspaces,
+        sessions_path,
+        backups_dir,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await
 }
 
 /// As [`spawn_for_test`], but registers in-process **dummy language servers** (see
@@ -333,6 +344,42 @@ pub async fn spawn_for_test_with_lsp(
         dummy_lsp,
     )
     .await
+}
+
+/// **Test seam.** As [`spawn_for_test_with_lsp`], but the workspace also *declares projects*
+/// (`docs/projects.md`), so their language servers come up pinned at registration.
+///
+/// The other seams pre-register workspaces in memory, which means `workspace/activate` takes its
+/// already-loaded path and never runs the cold-load reconcile that starts pinned servers in
+/// production. This runs the same [`crate::handlers::reconcile_workspace_pins`] the cold path does,
+/// so the resulting state is what a real activation would have produced. (Going through
+/// `workspace/add_project` instead would write a TOML into the *real* config dir, which is why
+/// none of the `workspace/*` config-mutating RPCs are integration-tested.)
+pub async fn spawn_for_test_with_projects(
+    workspace_name: impl Into<String>,
+    workspace_paths: Vec<PathBuf>,
+    projects: Vec<crate::config::ProjectRef>,
+    dummy_lsp: Vec<(String, crate::lsp::dummy::DummyLspConfig)>,
+) -> anyhow::Result<ServerHandle> {
+    let workspace_name = workspace_name.into();
+    let handle =
+        spawn_for_test_with_lsp(workspace_name.clone(), workspace_paths, dummy_lsp).await?;
+    let launches = {
+        let mut s = handle.state.lock().await;
+        if let Some(entry) = s.workspaces.get_mut(&workspace_name) {
+            entry.projects = projects;
+        }
+        crate::handlers::reconcile_workspace_pins(&mut s, &workspace_name)
+    };
+    for (key, spec, generation) in launches {
+        tokio::spawn(crate::lsp::manager::launch(
+            handle.state.clone(),
+            key,
+            spec,
+            generation,
+        ));
+    }
+    Ok(handle)
 }
 
 /// As [`spawn_for_test_multi_with_persistence`], but also points the server at the two
@@ -387,6 +434,7 @@ pub async fn spawn_for_test_full(
                     workspace_index,
                     mru_buffers: std::collections::VecDeque::new(),
                     dormant_buffers: Vec::new(),
+                    projects: Vec::new(),
                 },
             );
         }
@@ -405,12 +453,16 @@ pub async fn spawn_for_test_full(
         }
     }
 
-    let join = tokio::spawn(async move {
-        let _ = run_with_listener(listener, state, None).await;
+    let join = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let _ = run_with_listener(listener, state, None).await;
+        }
     });
     Ok(ServerHandle {
         port,
         workspace_name,
+        state,
         join,
     })
 }

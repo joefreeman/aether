@@ -345,6 +345,14 @@ pub struct WorkspaceEntry {
     /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
     /// live buffer in this workspace — promotion removes it.
     pub dormant_buffers: Vec<DormantBuffer>,
+    /// Projects declared by this workspace's config (`docs/projects.md`), whose language servers are
+    /// pinned open while it's active. Flattened out of the config's nested `[[roots]]` form, so each
+    /// carries the index of the root it was declared under.
+    ///
+    /// Held in memory — not re-read from disk when needed — because `workspace/add_root` and
+    /// `remove_root` rewrite the config file wholesale from this entry. Anything they don't carry
+    /// is silently erased on the next root edit.
+    pub projects: Vec<crate::config::ProjectRef>,
 }
 
 /// A session-restored buffer that hasn't been loaded yet. See [`WorkspaceEntry::dormant_buffers`].
@@ -546,6 +554,8 @@ impl ServerState {
                 workspace_index,
                 mru_buffers: VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                // An ephemeral workspace has no config file, so nothing can declare a project in it.
+                projects: Vec::new(),
             },
         );
         id
@@ -1713,6 +1723,7 @@ mod workspace_state_tests {
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
             mru_buffers: VecDeque::new(),
             dormant_buffers: Vec::new(),
+            projects: Vec::new(),
         }
     }
 

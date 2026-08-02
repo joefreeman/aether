@@ -81,6 +81,35 @@ pub struct WorkspaceActivateResult {
 pub struct WorkspaceInfo {
     pub name: String,
     pub paths: Vec<String>,
+    /// Projects declared by this workspace, resolved for display. Absent on the wire when empty, so
+    /// a workspace that declares none costs nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<WorkspaceProject>,
+}
+
+/// One declared project — a marker file whose language server is pinned open while the workspace is
+/// active (`docs/projects.md`).
+///
+/// Rendered as the canonical `[root]: [path]` buffer-location format (`aether-client/labels.rs`),
+/// like every other in-workspace file reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProject {
+    /// Index into [`WorkspaceInfo::paths`] of the root this project is declared under. Derived per
+    /// response and matched against the `paths` in the same message — never persisted, where a
+    /// positional reference would be fragile (the config file nests projects under their root
+    /// instead, so it has no index at all).
+    pub path_index: u32,
+    /// Marker path relative to that root (`Cargo.toml`, `web/package.json`).
+    pub relative_path: String,
+    /// The language whose server this project pins — inferred from the marker's file name, or
+    /// declared explicitly for markers that don't imply one. Empty when the entry doesn't resolve.
+    #[serde(default)]
+    pub language: String,
+    /// Why this project is unusable, when it is: a deleted marker (branch switch), an unrecognised
+    /// file name, a path outside every root. Recomputed on every read rather than cached, so a
+    /// project that comes back stops erroring without reactivating the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Create a fresh workspace with no roots. The client uses the workspace picker's "create new" row
@@ -196,6 +225,54 @@ pub struct WorkspaceRemoveRootResult {
     /// closed ones. `None` means "no buffers left for you in this workspace — spawn a scratch."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<crate::BufferId>,
+}
+
+/// Declare a project in a workspace (`docs/projects.md`): a marker file whose language server is
+/// pinned open while the workspace is active. The server validates the path (relative, inside its
+/// root, existing, a marker it recognises or one with an explicit `language`), appends it to the
+/// TOML under that root, and launches the server straight away rather than waiting for the next
+/// activation.
+///
+/// Refuses duplicates and anything that fails to resolve — unlike activation, which skips bad
+/// entries and carries on, a *new* declaration should fail loudly while the user is looking at it.
+pub struct WorkspaceAddProject;
+impl RpcMethod for WorkspaceAddProject {
+    const NAME: &'static str = "workspace/add_project";
+    type Params = WorkspaceAddProjectParams;
+    type Result = WorkspaceInfo;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceAddProjectParams {
+    pub workspace: String,
+    /// Which root to declare the project under — an index into the workspace's root list. Chosen by
+    /// the user in multi-root workspaces (the path editor's root field); always `0` when there's
+    /// only one root.
+    pub path_index: u32,
+    /// Marker path relative to that root.
+    pub relative_path: String,
+    /// Overrides the language inferred from the marker's name. Needed for markers that don't imply
+    /// one on their own — `package.json` could be either TypeScript or JavaScript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Undeclare a project. Drops it from the TOML and unpins its server, which then reaps unless
+/// buffers are open against it (in which case it reverts to the ordinary reap-on-last-buffer
+/// lifetime). A no-op error if the workspace doesn't declare that path.
+pub struct WorkspaceRemoveProject;
+impl RpcMethod for WorkspaceRemoveProject {
+    const NAME: &'static str = "workspace/remove_project";
+    type Params = WorkspaceRemoveProjectParams;
+    type Result = WorkspaceInfo;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceRemoveProjectParams {
+    pub workspace: String,
+    /// The project to drop, as it appears in [`WorkspaceProject`].
+    pub path_index: u32,
+    pub relative_path: String,
 }
 
 /// Rename a workspace. Moves the on-disk config (`<old>.toml` → `<new>.toml`) and re-keys the
