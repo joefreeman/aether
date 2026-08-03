@@ -16,7 +16,7 @@ pub const READ_MEASURE: u16 = 92;
 
 /// Content width and left margin for a viewport `area_cols` wide.
 pub fn measure(area_cols: u16) -> (u16, u16) {
-    let content = area_cols.min(READ_MEASURE).max(10);
+    let content = area_cols.clamp(10, READ_MEASURE);
     let margin = area_cols.saturating_sub(content) / 2;
     (content, margin)
 }
@@ -115,15 +115,11 @@ pub fn layout(
 ) -> Vec<ReadRow> {
     let mut out = Vec::new();
     let cols = cols.max(10) as usize;
-    layout_blocks(
-        blocks,
+    let ctx = Ctx {
         elements,
-        None,
-        cols,
-        code_highlights,
-        false,
-        &mut out,
-    );
+        code_hl: code_highlights,
+    };
+    layout_blocks(blocks, ctx, None, cols, false, &mut out);
     // Trim the trailing separator so the document ends on content.
     while out.last().is_some_and(|r| r.spans.is_empty()) {
         out.pop();
@@ -166,6 +162,14 @@ pub fn hscroll_content_width(rows: &[ReadRow], element: usize) -> usize {
 
 // ---- internals ----------------------------------------------------------------------------------
 
+/// Per-document context threaded unchanged through every layout step: the element list rows
+/// index into, and the fenced-code highlights.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    elements: &'a [Element],
+    code_hl: &'a CodeHighlights,
+}
+
 /// Exact-span lookup into the element list (both lists derive from the same parse, so a block
 /// that *is* an element matches exactly).
 fn element_index(elements: &[Element], span: Span) -> Option<usize> {
@@ -177,10 +181,9 @@ fn element_index(elements: &[Element], span: Span) -> Option<usize> {
 /// the item ending); paragraphs of a loose item keep their separation.
 fn layout_blocks(
     blocks: &[Block],
-    elements: &[Element],
+    ctx: Ctx,
     inherit: Option<usize>,
     cols: usize,
-    code_hl: &CodeHighlights,
     in_item: bool,
     out: &mut Vec<ReadRow>,
 ) {
@@ -189,8 +192,8 @@ fn layout_blocks(
         if !tight && !out.is_empty() && !out.last().is_some_and(|r| r.spans.is_empty()) {
             out.push(ReadRow::blank());
         }
-        let own = element_index(elements, block_span(block)).or(inherit);
-        layout_block(block, elements, own, cols, code_hl, out);
+        let own = element_index(ctx.elements, block_span(block)).or(inherit);
+        layout_block(block, ctx, own, cols, out);
     }
 }
 
@@ -210,14 +213,7 @@ fn block_span(block: &Block) -> Span {
     }
 }
 
-fn layout_block(
-    block: &Block,
-    elements: &[Element],
-    own: Option<usize>,
-    cols: usize,
-    code_hl: &CodeHighlights,
-    out: &mut Vec<ReadRow>,
-) {
+fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &mut Vec<ReadRow>) {
     match block {
         Block::Heading { level, content, .. } => {
             // Top- and second-level headings get an extra blank row above (two total, with
@@ -230,7 +226,7 @@ fn layout_block(
                 bold: true,
                 ..SpanStyle::plain(SpanKind::Text)
             };
-            for line in wrap_segments(&flatten(content, style, elements), cols) {
+            for line in wrap_segments(&flatten(content, style, ctx.elements), cols) {
                 out.push(ReadRow {
                     spans: line,
                     element: own,
@@ -252,7 +248,7 @@ fn layout_block(
         }
         Block::Paragraph { content, .. } => {
             let base = SpanStyle::plain(SpanKind::Text);
-            for line in wrap_segments(&flatten(content, base, elements), cols) {
+            for line in wrap_segments(&flatten(content, base, ctx.elements), cols) {
                 out.push(ReadRow {
                     spans: line,
                     element: own,
@@ -302,7 +298,11 @@ fn layout_block(
             // fence — split each source line into styled runs. One row per logical line, NOT
             // width-chunked: rows may exceed the measure, and the shell clips them to its
             // per-block horizontal scroll ([`clip_spans`]).
-            let hls = code_hl.get(&span.start).map(Vec::as_slice).unwrap_or(&[]);
+            let hls = ctx
+                .code_hl
+                .get(&span.start)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let mut line_start = 0usize;
             let mut widest = 0usize;
             for raw in code.split('\n') {
@@ -341,7 +341,7 @@ fn layout_block(
             start,
             items,
             ..
-        } => layout_list(*ordered, *start, items, elements, own, cols, code_hl, out),
+        } => layout_list(*ordered, *start, items, ctx, own, cols, out),
         Block::Quote { alert, content, .. } => {
             let bar = ReadSpan {
                 text: "┃ ".into(),
@@ -376,10 +376,9 @@ fn layout_block(
             let mut inner = Vec::new();
             layout_blocks(
                 content,
-                elements,
+                ctx,
                 own,
                 cols.saturating_sub(2).max(8),
-                code_hl,
                 false,
                 &mut inner,
             );
@@ -406,7 +405,7 @@ fn layout_block(
             head,
             rows,
             ..
-        } => layout_table(alignments, head, rows, elements, own, cols, out),
+        } => layout_table(alignments, head, rows, ctx.elements, own, cols, out),
         Block::Image {
             alt, inner_span, ..
         } => {
@@ -419,7 +418,7 @@ fn layout_block(
                 spans: vec![ReadSpan {
                     text: format!("▨ [{label}]"),
                     style: SpanStyle::plain(SpanKind::Dim),
-                    element: element_index(elements, *inner_span),
+                    element: element_index(ctx.elements, *inner_span),
                     syntax: None,
                 }],
                 element: own,
@@ -454,10 +453,9 @@ fn layout_block(
             let mut inner = Vec::new();
             layout_blocks(
                 content,
-                elements,
+                ctx,
                 own,
                 cols.saturating_sub(2).max(8),
-                code_hl,
                 false,
                 &mut inner,
             );
@@ -497,10 +495,9 @@ fn layout_list(
     ordered: bool,
     start: u64,
     items: &[ListItem],
-    elements: &[Element],
+    ctx: Ctx,
     inherit: Option<usize>,
     cols: usize,
-    code_hl: &CodeHighlights,
     out: &mut Vec<ReadRow>,
 ) {
     for (i, item) in items.iter().enumerate() {
@@ -512,19 +509,11 @@ fn layout_list(
         if let Some(done) = item.checked {
             marker.push_str(if done { "☑ " } else { "☐ " });
         }
-        let own = element_index(elements, item.span).or(inherit);
+        let own = element_index(ctx.elements, item.span).or(inherit);
         let indent = " ".repeat(marker.width());
         let inner_cols = cols.saturating_sub(marker.width()).max(8);
         let mut inner = Vec::new();
-        layout_blocks(
-            &item.blocks,
-            elements,
-            own,
-            inner_cols,
-            code_hl,
-            true,
-            &mut inner,
-        );
+        layout_blocks(&item.blocks, ctx, own, inner_cols, true, &mut inner);
         let mut first_content = true;
         for mut row in inner {
             // Items are tight by default: skip the blank separators between an item's blocks
@@ -952,7 +941,7 @@ pub fn clip_spans(spans: &[ReadSpan], skip: usize, width: usize) -> Vec<ReadSpan
             }
             if start < skip || stop > end {
                 let visible = stop.min(end) - start.max(skip);
-                piece.extend(std::iter::repeat(' ').take(visible));
+                piece.extend(std::iter::repeat_n(' ', visible));
             } else {
                 piece.push(c);
             }

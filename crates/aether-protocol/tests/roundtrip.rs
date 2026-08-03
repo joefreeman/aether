@@ -3695,7 +3695,7 @@ fn jumplist_wire_shapes() {
         total: 17,
         opened: None,
     };
-    let v = to_value(JumplistStepResult::Moved(t)).unwrap();
+    let v = to_value(JumplistStepResult::Moved(Box::new(t))).unwrap();
     assert_eq!(
         v,
         json!({

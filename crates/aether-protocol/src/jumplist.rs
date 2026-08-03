@@ -122,8 +122,9 @@ impl JumplistStepScope {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JumplistStepResult {
-    /// Stepped to (and, with `open`, opened) the target entry.
-    Moved(JumplistStepTarget),
+    /// Stepped to (and, with `open`, opened) the target entry. Boxed so the tag-only outcomes
+    /// below don't each carry the target's footprint (the wire shape is unchanged).
+    Moved(Box<JumplistStepTarget>),
     /// A list is captured but the cursor is already at the boundary in the step direction — no
     /// move. Which end is implied by the requested `direction` (forward = last, backward = first),
     /// so the client picks the toast without extra payload.
@@ -140,7 +141,7 @@ impl JumplistStepResult {
     /// The moved target, or `None` for the boundary/empty outcomes — the shape most callers want.
     pub fn moved(self) -> Option<JumplistStepTarget> {
         match self {
-            JumplistStepResult::Moved(t) => Some(t),
+            JumplistStepResult::Moved(t) => Some(*t),
             JumplistStepResult::AtEnd
             | JumplistStepResult::NoneInFile
             | JumplistStepResult::Empty => None,

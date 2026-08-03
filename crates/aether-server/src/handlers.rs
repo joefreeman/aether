@@ -11383,6 +11383,7 @@ fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
     Some(wrap_for_response(s, vp.client_id, vp.buffer_id, cursor))
 }
 
+#[allow(clippy::too_many_arguments)] // one notification builder, 12 call sites
 fn build_lines_changed_notif(
     buffer: &Buffer,
     vp: &Viewport,
@@ -12431,6 +12432,19 @@ fn build_git_change_candidates(
     out
 }
 
+/// Cursor context for cursor-anchored picker centering (Grep / GitChanges / Jumplist) —
+/// resolved before `pickers` is borrowed out of the state.
+struct CursorCentering {
+    /// Leading edge of the selection: the position "nearest candidate" is measured from.
+    leading_edge: LogicalPosition,
+    /// Workspace-relative `(root_index, path)` of the buffer — what the grouped kinds key on.
+    /// `None` for a buffer outside every root.
+    workspace_key: Option<(u32, String)>,
+    /// The buffer's absolute path — the jumplist keys entries by it, since its files can sit
+    /// outside every root.
+    abs_path: Option<String>,
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -12694,10 +12708,8 @@ pub async fn picker_view(
 
     // Pre-resolve cursor info if we'll use it for cursor-anchored centering (Grep / GitChanges /
     // Jumplist). Done before borrowing `pickers` out of `s` so we don't juggle conflicting
-    // borrows after the split. The third element is the buffer's absolute path — the jumplist
-    // keys entries by it (its files can sit outside every root); the grouped kinds use the
-    // workspace-relative pair.
-    let cursor_centering_info: Option<(LogicalPosition, Option<(u32, String)>, Option<String>)> =
+    // borrows after the split.
+    let cursor_centering_info: Option<CursorCentering> =
         match (params.kind, params.center_on_cursor) {
             (kind, Some(buffer_id)) if kind.centers_on_cursor() => {
                 let cursor = s
@@ -12726,7 +12738,11 @@ pub async fn picker_view(
                         )
                     })
                 });
-                Some((leading_edge, current_key, current_abs))
+                Some(CursorCentering {
+                    leading_edge,
+                    workspace_key: current_key,
+                    abs_path: current_abs,
+                })
             }
             _ => None,
         };
@@ -12912,7 +12928,11 @@ pub async fn picker_view(
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
             (
-                Some((leading_edge, Some(current_key), _)),
+                Some(CursorCentering {
+                    leading_edge,
+                    workspace_key: Some(current_key),
+                    ..
+                }),
                 picker_state::PickerCandidates::GitChanges(c),
             ) if !c.is_empty() => find_nearest_git_change(
                 c,
@@ -12924,11 +12944,15 @@ pub async fn picker_view(
             // "where you are in the cycle" the `]`/`[` stepping derives, inclusive so the
             // just-jumped-to entry counts as current (`crate::jumplist::nearest_index`).
             (
-                Some((leading_edge, _, current_abs)),
+                Some(CursorCentering {
+                    leading_edge,
+                    abs_path,
+                    ..
+                }),
                 picker_state::PickerCandidates::Jumplist(entries),
             ) if !entries.is_empty() => {
                 let idx =
-                    crate::jumplist::nearest_index(entries, current_abs.as_deref(), *leading_edge);
+                    crate::jumplist::nearest_index(entries, abs_path.as_deref(), *leading_edge);
                 Some(picker.candidates.make_item(idx, Vec::new()))
             }
             _ => None,
@@ -13478,7 +13502,7 @@ pub async fn jumplist_step(
     if let Some(open_params) = open_params {
         target.opened = Some(buffer_open(state, ctx, open_params).await?);
     }
-    Ok(JumplistStepResult::Moved(target))
+    Ok(JumplistStepResult::Moved(Box::new(target)))
 }
 
 /// Move a picker's selection to the next / previous *section* — the header-grouped kinds jump

@@ -250,7 +250,7 @@ pub fn parse(md: &str) -> Vec<Block> {
 
 /// Replace any paragraph whose content is exactly one image with [`Block::Image`], recursively —
 /// a display image rather than a run of text (docs/markdown-view.md §2.2).
-fn promote_lone_images(blocks: &mut Vec<Block>) {
+fn promote_lone_images(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         match block {
             Block::Paragraph { content, span } => {

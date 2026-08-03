@@ -549,7 +549,7 @@ async fn bring_up(
     // A pinned server arriving late must not leave an already-typed workspace-symbols query
     // permanently missing its results (`docs/workspace-symbols.md` § Re-query when a server becomes
     // ready).
-    crate::symbols::requery_ready_server(&state, &key).await;
+    crate::symbols::requery_ready_server(state, &key).await;
 
     inbound_loop(state.clone(), key, generation, inbound).await;
 }

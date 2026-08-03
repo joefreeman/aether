@@ -5004,8 +5004,8 @@ impl App {
         let mut col = column![];
         if !head.is_empty() {
             let mut r = row![];
-            for ci in 0..ncols {
-                r = r.push(cell(head.get(ci).unwrap_or(&empty), true, widths[ci]));
+            for (ci, w) in widths.iter().enumerate() {
+                r = r.push(cell(head.get(ci).unwrap_or(&empty), true, *w));
             }
             col = col.push(container(r).style(|_| container::Style {
                 background: Some(theme::NORD1.into()),
@@ -5014,9 +5014,9 @@ impl App {
         }
         for (ri, row_cells) in rows.iter().enumerate() {
             let mut r = row![];
-            for ci in 0..ncols {
+            for (ci, w) in widths.iter().enumerate() {
                 let c = row_cells.get(ci).unwrap_or(&empty);
-                r = r.push(cell(c, false, widths[ci]));
+                r = r.push(cell(c, false, *w));
             }
             let striped = ri % 2 == 1;
             col = col.push(container(r).style(move |_| container::Style {
@@ -5226,6 +5226,7 @@ fn md_rich<M: 'static>(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // same styling-parameter family as `md_spans` below
 fn md_rich_in<M: 'static>(
     inlines: &[MdInline],
     bold: bool,

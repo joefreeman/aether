@@ -2349,13 +2349,15 @@ fn jumplist_step_adopts_the_opened_entry() {
     use aether_protocol::LogicalPosition;
 
     let mut s = session();
-    let mut cursor = aether_protocol::cursor::CursorState::default();
-    cursor.position = LogicalPosition { line: 4, col: 9 };
-    cursor.anchor = LogicalPosition { line: 4, col: 2 };
-    cursor.jumplist_position = Some(JumplistPosition {
-        current: 3,
-        total: 17,
-    });
+    let cursor = aether_protocol::cursor::CursorState {
+        position: LogicalPosition { line: 4, col: 9 },
+        anchor: LogicalPosition { line: 4, col: 2 },
+        jumplist_position: Some(JumplistPosition {
+            current: 3,
+            total: 17,
+        }),
+        ..Default::default()
+    };
     let open = BufferOpenResult {
         buffer_id: 7,
         language: None,
@@ -2371,14 +2373,14 @@ fn jumplist_step_adopts_the_opened_entry() {
         transient: true,
     };
     let _ = s.on_event(Event::JumplistStepped(
-        Ok(JumplistStepResult::Moved(JumplistStepTarget {
+        Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
             path: "/b.rs".into(),
             position: LogicalPosition { line: 4, col: 9 },
             anchor: Some(LogicalPosition { line: 4, col: 2 }),
             index: 3,
             total: 17,
             opened: Some(open),
-        })),
+        }))),
         Direction::Forward,
         aether_protocol::jumplist::JumplistStepScope::Full,
     ));
