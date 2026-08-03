@@ -26,7 +26,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-ae"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-client",
  "aether-iced",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "aether-client"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-protocol",
  "pulldown-cmark",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aether-iced"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-client",
  "aether-protocol",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "aether-protocol"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "aether-server"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-protocol",
  "anyhow",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tui"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-client",
  "aether-protocol",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "aether-web"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 dependencies = [
  "aether-client",
  "aether-protocol",
