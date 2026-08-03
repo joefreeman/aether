@@ -45,8 +45,8 @@ use aether_protocol::picker::{
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
-use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
+use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
 };

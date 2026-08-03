@@ -462,7 +462,9 @@ pub enum Action {
     /// `o`/`Alt-o` — next/previous heading (AST-resolved; the reading sibling of symbol nav).
     ReadStepHeading(Direction),
     /// `g`/`Alt-g` — first/last element (the reading form of the editor's buffer-start/end pair).
-    ReadEnds { last: bool },
+    ReadEnds {
+        last: bool,
+    },
     /// `Enter` — follow the focused element: open a link, an image, or jump to a footnote's
     /// definition. No-op on non-interactive blocks.
     ReadActivate,

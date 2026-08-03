@@ -24656,7 +24656,9 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
 
     // Client 1: the editor (no viewport — edits don't need one).
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
@@ -24671,7 +24673,9 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     let buffer_id = open.buffer_id;
 
     // Client 2: the reader, viewport pinned to the top 10 rows.
-    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws2,
         1,
@@ -24712,7 +24716,11 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     )
     .await;
     let (method, params) = next_change_signal(&mut ws2).await;
-    assert_eq!(method, BufferChanged::NAME, "out-of-window edit → buffer/changed");
+    assert_eq!(
+        method,
+        BufferChanged::NAME,
+        "out-of-window edit → buffer/changed"
+    );
     let changed: BufferChangedParams = serde_json::from_value(params).unwrap();
     assert_eq!(changed.buffer_id, buffer_id);
     assert_eq!(changed.revision, r.revision);
@@ -24765,7 +24773,9 @@ async fn http_get(ws_url: &str, path: &str) -> (String, String, Vec<u8>) {
         .split('/')
         .next()
         .expect("authority");
-    let mut stream = tokio::net::TcpStream::connect(authority).await.expect("connect");
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .expect("connect");
     let req = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
@@ -24791,15 +24801,22 @@ async fn buffer_asset_route_serves_and_confines() {
     std::fs::write(dir.path().join("img.png"), b"PNGDATA").unwrap();
     std::fs::write(outside.path().join("secret.png"), b"SECRET").unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.path().join("secret.png"), dir.path().join("leak.png"))
-        .unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.png"),
+        dir.path().join("leak.png"),
+    )
+    .unwrap();
     let dir_path = dir.path().to_path_buf();
     let outside_path = outside.path().to_path_buf();
     std::mem::forget(dir);
     std::mem::forget(outside);
 
-    let server = spawn_for_test("test-proj", vec![dir_path.clone()]).await.unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws,
         1,
@@ -24837,7 +24854,10 @@ async fn buffer_asset_route_serves_and_confines() {
         send_request::<BufferOpen>(&mut ws, 3, &file_open_params("docs/nested.md", None)).await;
     let (status, _, body) =
         http_get(&url, &format!("/asset/{}/..%2Fimg.png", nested.buffer_id)).await;
-    assert!(status.contains("200"), "in-root ..%2F must serve, got {status}");
+    assert!(
+        status.contains("200"),
+        "in-root ..%2F must serve, got {status}"
+    );
     assert_eq!(body, b"PNGDATA");
 
     // `..` traversal out of the root → 404 (canonical-prefix check).
@@ -24861,7 +24881,10 @@ async fn buffer_asset_route_serves_and_confines() {
 
     // Unknown buffer and non-image extensions → 404.
     let (status, _, _) = http_get(&url, "/asset/9999/img.png").await;
-    assert!(status.contains("404"), "unknown buffer must 404, got {status}");
+    assert!(
+        status.contains("404"),
+        "unknown buffer must 404, got {status}"
+    );
     let (status, _, _) = http_get(&url, &format!("/asset/{id}/doc.md")).await;
     assert!(status.contains("404"), "non-image must 404, got {status}");
 

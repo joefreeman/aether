@@ -21,8 +21,8 @@ pub mod path;
 pub mod picker;
 pub mod search;
 pub mod settings;
-pub mod syntax;
 pub mod sneak;
+pub mod syntax;
 pub mod viewport;
 pub mod workspace;
 

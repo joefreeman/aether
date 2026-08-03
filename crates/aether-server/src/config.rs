@@ -412,7 +412,10 @@ fn project_dir(project: &ProjectRef, workspace_roots: &[PathBuf]) -> Result<Path
     // Checked here rather than at launch so the settings overlay can show it without starting
     // anything.
     if !dir.is_dir() {
-        return Err(format!("project directory does not exist: {}", dir.display()));
+        return Err(format!(
+            "project directory does not exist: {}",
+            dir.display()
+        ));
     }
     Ok(dir)
 }
@@ -1922,12 +1925,20 @@ mod tests {
         );
         // Both declared → nothing left to suggest.
         assert_eq!(
-            infer_project_language(&project, &roots, &[declared("python"), declared("typescript")]),
+            infer_project_language(
+                &project,
+                &roots,
+                &[declared("python"), declared("typescript")]
+            ),
             None
         );
         // Exclusion is canonical: a `javascript` declaration owns the TypeScript-family candidate.
         assert_eq!(
-            infer_project_language(&project, &roots, &[declared("python"), declared("javascript")]),
+            infer_project_language(
+                &project,
+                &roots,
+                &[declared("python"), declared("javascript")]
+            ),
             None
         );
         // A declaration for a *different* directory excludes nothing here.

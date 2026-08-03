@@ -693,10 +693,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                             .collect::<String>()
                     })
                     .collect();
-                Line::from(Span::styled(
-                    cells.join(" | "),
-                    Style::default().fg(NORD4),
-                ))
+                Line::from(Span::styled(cells.join(" | "), Style::default().fg(NORD4)))
             })
             .collect(),
         MdBlock::Image { alt, .. } => vec![Line::from(Span::styled(
@@ -4070,10 +4067,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
     };
     // Fill the whole area (margins included) with the editor's base background, so the reading
     // view sits on the same canvas as the buffer.
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(NORD0)),
-        area,
-    );
+    f.render_widget(Paragraph::new("").style(Style::default().bg(NORD0)), area);
     if rv.rows.is_empty() {
         if rv.loading {
             let msg = Paragraph::new(Line::from(Span::styled(
@@ -4168,8 +4162,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             // The block's bottom pad row hosts a horizontal scrollbar when the block
             // overflows — the horizontal twin of the page bar (`─` track, bolder `━` thumb),
             // sized/positioned by the same shared thumb math.
-            let is_block_end =
-                rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
+            let is_block_end = rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
             let bar = (total == 0 && is_block_end)
                 .then(|| {
                     // Only code rows count toward overflow — the pinned tag row is chrome
@@ -4236,8 +4229,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             let indicator = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
             spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
             let clipped = aether_client::read_layout::clip_spans(table_part, off, window);
-            let is_block_end =
-                rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
+            let is_block_end = rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
             let is_bottom_border = is_block_end
                 && clipped.len() == 1
                 && table_part.len() == 1
@@ -4246,9 +4238,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 .then(|| {
                     let widest = row
                         .element
-                        .map(|e| {
-                            aether_client::read_layout::hscroll_content_width(&rv.rows, e)
-                        })
+                        .map(|e| aether_client::read_layout::hscroll_content_width(&rv.rows, e))
                         .unwrap_or(0);
                     aether_client::scrollbar::thumb(
                         window as f64,
@@ -4271,10 +4261,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 let base = read_span_style(clipped[0].style);
                 let thumb = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
                 spans.push(Span::styled(seg(0..tx), base));
-                spans.push(Span::styled(
-                    seg(tx..tx + tw).replace('─', "━"),
-                    thumb,
-                ));
+                spans.push(Span::styled(seg(tx..tx + tw).replace('─', "━"), thumb));
                 spans.push(Span::styled(seg(tx + tw..chars.len()), base));
             } else {
                 for rs in &clipped {

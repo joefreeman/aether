@@ -351,7 +351,10 @@ pub enum Message {
     ReadRevealMeasured(Option<f32>),
     /// The read scrollable scrolled (any cause — our glide ticks or the user's wheel): its
     /// new offset and scroll range, mirrored for targeting/clamping.
-    ReadScrolled { y: f32, max: f32 },
+    ReadScrolled {
+        y: f32,
+        max: f32,
+    },
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
@@ -652,9 +655,8 @@ impl App {
         // only while one of those is actually animating — and never while disconnected, where a
         // picker throbber stuck mid-search (the server stopped answering) would otherwise pin the
         // 60fps redraw loop for the whole reconnect window.
-        let animating = self.scroll_anim.is_some()
-            || self.read_scroll_anim.is_some()
-            || self.picker_ticking();
+        let animating =
+            self.scroll_anim.is_some() || self.read_scroll_anim.is_some() || self.picker_ticking();
         if animating && self.session.conn == ConnState::Connected {
             subs.push(iced::window::frames().map(Message::AnimTick));
         }
@@ -1059,12 +1061,14 @@ impl App {
                         // SVG is a document, not a raster — it rides `widget::svg`. Sniff the
                         // payload (servers get extensions wrong): XML/SVG starts with `<`,
                         // optionally after whitespace/BOM.
-                        let looks_svg = url.split('?').next().is_some_and(|p| {
-                            p.to_ascii_lowercase().ends_with(".svg")
-                        }) || bytes
-                            .iter()
-                            .find(|b| !b.is_ascii_whitespace())
-                            .is_some_and(|b| *b == b'<');
+                        let looks_svg = url
+                            .split('?')
+                            .next()
+                            .is_some_and(|p| p.to_ascii_lowercase().ends_with(".svg"))
+                            || bytes
+                                .iter()
+                                .find(|b| !b.is_ascii_whitespace())
+                                .is_some_and(|b| *b == b'<');
                         if looks_svg {
                             RemoteImage::Svg(iced::widget::svg::Handle::from_memory(bytes))
                         } else {
@@ -1110,8 +1114,7 @@ impl App {
                 // widget by absolute `scroll_to` per frame).
                 let mut tasks: Vec<Task<Message>> = Vec::new();
                 if let Some(anim) = self.scroll_anim {
-                    let t =
-                        ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
+                    let t = ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
                     let eased = 1.0 - (1.0 - t).powi(3); // cubic ease-out
                     self.scroll_px = anim.from + (anim.to - anim.from) * eased;
                     if t >= 1.0 {
@@ -1121,8 +1124,7 @@ impl App {
                     tasks.push(self.maybe_fetch());
                 }
                 if let Some(anim) = self.read_scroll_anim {
-                    let t =
-                        ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
+                    let t = ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
                     let eased = 1.0 - (1.0 - t).powi(3);
                     let y = anim.from + (anim.to - anim.from) * eased;
                     if t >= 1.0 {
@@ -1724,7 +1726,11 @@ impl App {
                             ScrollUnit::Half => 160.0,
                             ScrollUnit::Page => 320.0,
                         };
-                        let dx = if matches!(dir, ScrollDir::Left) { -step } else { step };
+                        let dx = if matches!(dir, ScrollDir::Left) {
+                            -step
+                        } else {
+                            step
+                        };
                         return iced::widget::operation::scroll_by(
                             read_code_scroll_id(),
                             iced::widget::scrollable::AbsoluteOffset { x: dx, y: 0.0 },
@@ -4279,7 +4285,11 @@ fn md_doc<M: 'static>(
     col.into()
 }
 
-fn md_block<M: 'static>(b: &MdBlock, ui: theme::Ui, on_link: fn(String) -> M) -> Element<'static, M> {
+fn md_block<M: 'static>(
+    b: &MdBlock,
+    ui: theme::Ui,
+    on_link: fn(String) -> M,
+) -> Element<'static, M> {
     match b {
         MdBlock::Heading { level, content, .. } => {
             let size = match level {
@@ -4337,9 +4347,9 @@ fn md_block<M: 'static>(b: &MdBlock, ui: theme::Ui, on_link: fn(String) -> M) ->
             }
             col.into()
         }
-        MdBlock::Quote { content, .. } => {
-            row![md_bar(), md_doc(content, ui, on_link)].spacing(8).into()
-        }
+        MdBlock::Quote { content, .. } => row![md_bar(), md_doc(content, ui, on_link)]
+            .spacing(8)
+            .into(),
         MdBlock::Rule { .. } => container(iced::widget::Space::new())
             .width(Length::Fill)
             .height(1)
@@ -4368,7 +4378,9 @@ fn md_block<M: 'static>(b: &MdBlock, ui: theme::Ui, on_link: fn(String) -> M) ->
             .into(),
         MdBlock::FrontMatter { .. } => iced::widget::Space::new().into(),
         MdBlock::FootnoteDef { label, content, .. } => row![
-            text(format!("[{label}]:")).size(ui.at(MD_TEXT)).color(theme::NORD3),
+            text(format!("[{label}]:"))
+                .size(ui.at(MD_TEXT))
+                .color(theme::NORD3),
             md_doc(content, ui, on_link),
         ]
         .spacing(6)
@@ -4406,13 +4418,7 @@ fn cell_text_width(inlines: &[MdInline], size: f32) -> (f32, f32) {
             *natural += w;
         }
     }
-    fn walk(
-        inlines: &[MdInline],
-        size: f32,
-        natural: &mut f32,
-        word: &mut f32,
-        minimum: &mut f32,
-    ) {
+    fn walk(inlines: &[MdInline], size: f32, natural: &mut f32, word: &mut f32, minimum: &mut f32) {
         for inl in inlines {
             match inl {
                 MdInline::Text { text } => chars(text, false, size, natural, word, minimum),
@@ -4420,9 +4426,7 @@ fn cell_text_width(inlines: &[MdInline], size: f32) -> (f32, f32) {
                 MdInline::Emphasis { content }
                 | MdInline::Strong { content }
                 | MdInline::Strikethrough { content }
-                | MdInline::Link { content, .. } => {
-                    walk(content, size, natural, word, minimum)
-                }
+                | MdInline::Link { content, .. } => walk(content, size, natural, word, minimum),
                 MdInline::Image { alt, .. } => {
                     chars(&format!("▨ [{alt}]"), false, size, natural, word, minimum)
                 }
@@ -4537,8 +4541,7 @@ impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
 
     fn finish(&self) -> iced::advanced::widget::operation::Outcome<Option<f32>> {
         use iced::advanced::widget::operation::Outcome;
-        let (Some((view, translation, content)), Some(focus)) = (self.viewport, self.focus)
-        else {
+        let (Some((view, translation, content)), Some(focus)) = (self.viewport, self.focus) else {
             return Outcome::Some(None);
         };
         let y = focus.y - content.y; // the block's y in content space
@@ -4758,19 +4761,14 @@ impl App {
                     let item_focused = block == Some(item.span);
                     let area = iced::widget::mouse_area(read_focus_wrap(
                         item_focused,
-                        row![
-                            text(marker).size(body).color(theme::NORD4),
-                            inner,
-                        ]
-                        .spacing(8)
-                        .into(),
+                        row![text(marker).size(body).color(theme::NORD4), inner,]
+                            .spacing(8)
+                            .into(),
                     ))
                     .on_press(ReadMsg::Click(item.span.start));
                     // The focused item anchors the reveal probe (item grain, not the list).
                     col = col.push(if item_focused {
-                        Element::from(
-                            container(area).width(Length::Fill).id(read_focus_id()),
-                        )
+                        Element::from(container(area).width(Length::Fill).id(read_focus_id()))
                     } else {
                         area.into()
                     });
@@ -4783,16 +4781,12 @@ impl App {
                     // The alert's label row: the capitalized kind in its colour, semibold —
                     // the web's `.md-alert-label`, the terminal's AlertLabel span.
                     let (label, color) = alert_style(*kind);
-                    inner = inner.push(
-                        text(label)
-                            .size(body * 0.95)
-                            .color(color)
-                            .font(iced::Font {
-                                family: READ_FONT_FAMILY,
-                                weight: iced::font::Weight::Semibold,
-                                ..iced::Font::DEFAULT
-                            }),
-                    );
+                    inner =
+                        inner.push(text(label).size(body * 0.95).color(color).font(iced::Font {
+                            family: READ_FONT_FAMILY,
+                            weight: iced::font::Weight::Semibold,
+                            ..iced::Font::DEFAULT
+                        }));
                 }
                 for cb in content {
                     inner = inner.push(self.read_block(cb, body, ui, block, target));
@@ -4875,8 +4869,7 @@ impl App {
                             let s = (h.start as usize).min(code.len());
                             let e = (h.end as usize).clamp(s, code.len());
                             push(&code[pos..s], theme::NORD4);
-                            let color =
-                                theme::highlight_color(&h.kind).unwrap_or(theme::NORD4);
+                            let color = theme::highlight_color(&h.kind).unwrap_or(theme::NORD4);
                             push(&code[s..e], color);
                             pos = e;
                         }
@@ -5071,46 +5064,45 @@ impl App {
                 .into()
         };
         let lower = src.to_ascii_lowercase();
-        let el: Element<'static, ReadMsg> = if lower.starts_with("http://")
-            || lower.starts_with("https://")
-        {
-            match self.remote_images.get(src) {
-                Some(RemoteImage::Raster(h)) => {
-                    iced::widget::image(h.clone()).width(Length::Fill).into()
-                }
-                Some(RemoteImage::Svg(h)) => iced::widget::svg(h.clone())
-                    .width(Length::Fill)
-                    .height(Length::Shrink)
-                    .into(),
-                Some(RemoteImage::Loading) => placeholder("loading…"),
-                Some(RemoteImage::Failed) | None => placeholder(src),
-            }
-        } else {
-            let external = src.contains("://") || src.starts_with('/');
-            let resolved = (!external)
-                .then(|| {
-                    self.session
-                        .buffer
-                        .path
-                        .as_deref()
-                        .and_then(|p| std::path::Path::new(p).parent())
-                        .map(|dir| dir.join(src))
-                })
-                .flatten()
-                .filter(|p| p.exists());
-            match resolved {
-                Some(path) if lower.ends_with(".svg") => {
-                    iced::widget::svg(iced::widget::svg::Handle::from_path(path))
+        let el: Element<'static, ReadMsg> =
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                match self.remote_images.get(src) {
+                    Some(RemoteImage::Raster(h)) => {
+                        iced::widget::image(h.clone()).width(Length::Fill).into()
+                    }
+                    Some(RemoteImage::Svg(h)) => iced::widget::svg(h.clone())
                         .width(Length::Fill)
                         .height(Length::Shrink)
-                        .into()
+                        .into(),
+                    Some(RemoteImage::Loading) => placeholder("loading…"),
+                    Some(RemoteImage::Failed) | None => placeholder(src),
                 }
-                Some(path) => iced::widget::image(iced::widget::image::Handle::from_path(path))
-                    .width(Length::Fill)
-                    .into(),
-                None => placeholder(src),
-            }
-        };
+            } else {
+                let external = src.contains("://") || src.starts_with('/');
+                let resolved = (!external)
+                    .then(|| {
+                        self.session
+                            .buffer
+                            .path
+                            .as_deref()
+                            .and_then(|p| std::path::Path::new(p).parent())
+                            .map(|dir| dir.join(src))
+                    })
+                    .flatten()
+                    .filter(|p| p.exists());
+                match resolved {
+                    Some(path) if lower.ends_with(".svg") => {
+                        iced::widget::svg(iced::widget::svg::Handle::from_path(path))
+                            .width(Length::Fill)
+                            .height(Length::Shrink)
+                            .into()
+                    }
+                    Some(path) => iced::widget::image(iced::widget::image::Handle::from_path(path))
+                        .width(Length::Fill)
+                        .into(),
+                    None => placeholder(src),
+                }
+            };
         // The ring frame is ALWAYS present (transparent border when unarmed) so arming is a
         // paint-only change: a wrapper that appears on arm would inset the image, shrinking
         // it and forcing a relayout + re-scale — the same reserve-the-space trick as the
@@ -5245,7 +5237,9 @@ fn md_rich_in<M: 'static>(
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     let mut spans = Vec::new();
-    md_spans(inlines, bold, false, None, base_color, size, family, target, &mut spans);
+    md_spans(
+        inlines, bold, false, None, base_color, size, family, target, &mut spans,
+    );
     iced::widget::rich_text(spans)
         .size(size)
         .line_height(iced::widget::text::LineHeight::Relative(line_height))
@@ -5344,7 +5338,11 @@ fn md_spans(
             MdInline::Emphasis { content } => {
                 md_spans(content, bold, true, link, base, size, family, target, out)
             }
-            MdInline::Link { href, content, span } => {
+            MdInline::Link {
+                href,
+                content,
+                span,
+            } => {
                 // External hrefs are real link payloads (click opens); internal targets
                 // (relative paths, anchors) can't open externally — their clicks *arm*
                 // instead, via the [`READ_ARM_PREFIX`] sentinel the read view intercepts.
@@ -5359,23 +5357,53 @@ fn md_spans(
                 if target == Some(*span) {
                     // The targeted link: invert its whole run (background pill, canvas text).
                     let mut inner = Vec::new();
-                    md_spans(content, bold, italic, Some(&value), base, size, family, None, &mut inner);
+                    md_spans(
+                        content,
+                        bold,
+                        italic,
+                        Some(&value),
+                        base,
+                        size,
+                        family,
+                        None,
+                        &mut inner,
+                    );
                     out.extend(inner.into_iter().map(|s| read_pill(s, size)));
                 } else {
-                    md_spans(content, bold, italic, Some(&value), base, size, family, target, out)
+                    md_spans(
+                        content,
+                        bold,
+                        italic,
+                        Some(&value),
+                        base,
+                        size,
+                        family,
+                        target,
+                        out,
+                    )
                 }
             }
             MdInline::Strikethrough { content } => {
                 let mut inner = Vec::new();
-                md_spans(content, bold, italic, link, base, size, family, target, &mut inner);
+                md_spans(
+                    content, bold, italic, link, base, size, family, target, &mut inner,
+                );
                 out.extend(inner.into_iter().map(|s| s.strikethrough(true)));
             }
             MdInline::Image { alt, span, .. } => {
                 // A text chip — iced's rich_text is text-runs-only, so a real inline image
                 // can't ride a paragraph. ▨ marks it as an image (matching the TUI); the arm
                 // sentinel makes it clickable (click focuses it, like the web/TUI).
-                let s = md_span(&format!("▨ [{alt}]"), bold, italic, false, None, theme::NORD3, family)
-                    .link(format!("{READ_ARM_PREFIX}{}", span.start));
+                let s = md_span(
+                    &format!("▨ [{alt}]"),
+                    bold,
+                    italic,
+                    false,
+                    None,
+                    theme::NORD3,
+                    family,
+                )
+                .link(format!("{READ_ARM_PREFIX}{}", span.start));
                 out.push(if target == Some(*span) {
                     read_pill(s, size)
                 } else {
@@ -5383,8 +5411,16 @@ fn md_spans(
                 });
             }
             MdInline::FootnoteRef { label, span } => {
-                let s = md_span(&format!("[{label}]"), bold, italic, false, None, theme::NORD3, family)
-                    .link(format!("{READ_ARM_PREFIX}{}", span.start));
+                let s = md_span(
+                    &format!("[{label}]"),
+                    bold,
+                    italic,
+                    false,
+                    None,
+                    theme::NORD3,
+                    family,
+                )
+                .link(format!("{READ_ARM_PREFIX}{}", span.start));
                 out.push(if target == Some(*span) {
                     read_pill(s, size)
                 } else {

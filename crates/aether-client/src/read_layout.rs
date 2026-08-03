@@ -115,7 +115,15 @@ pub fn layout(
 ) -> Vec<ReadRow> {
     let mut out = Vec::new();
     let cols = cols.max(10) as usize;
-    layout_blocks(blocks, elements, None, cols, code_highlights, false, &mut out);
+    layout_blocks(
+        blocks,
+        elements,
+        None,
+        cols,
+        code_highlights,
+        false,
+        &mut out,
+    );
     // Trim the trailing separator so the document ends on content.
     while out.last().is_some_and(|r| r.spans.is_empty()) {
         out.pop();
@@ -508,7 +516,15 @@ fn layout_list(
         let indent = " ".repeat(marker.width());
         let inner_cols = cols.saturating_sub(marker.width()).max(8);
         let mut inner = Vec::new();
-        layout_blocks(&item.blocks, elements, own, inner_cols, code_hl, true, &mut inner);
+        layout_blocks(
+            &item.blocks,
+            elements,
+            own,
+            inner_cols,
+            code_hl,
+            true,
+            &mut inner,
+        );
         let mut first_content = true;
         for mut row in inner {
             // Items are tight by default: skip the blank separators between an item's blocks
@@ -1042,7 +1058,11 @@ mod tests {
         let text = rows_text(&rows);
         // No shrink-to-fit: the table renders at its natural width (wider than the measure)
         // as single-line cells, and the shell pans it like a code block.
-        assert!(text[0].width() > 16, "table overflows the measure: {}", text[0]);
+        assert!(
+            text[0].width() > 16,
+            "table overflows the measure: {}",
+            text[0]
+        );
         assert_eq!(text.len(), 5, "cells stay single rows");
         let element = rows[0].element.expect("table rows carry their element");
         assert_eq!(hscroll_content_width(&rows, element), text[0].width());
@@ -1255,7 +1275,10 @@ mod tests {
         let rows2 = layout(&blocks2, &els2, 40, &Default::default());
         let text2 = rows_text(&rows2);
         assert_eq!(text2[0], "• first");
-        assert!(text2[1].trim().is_empty(), "loose paragraphs stay separated");
+        assert!(
+            text2[1].trim().is_empty(),
+            "loose paragraphs stay separated"
+        );
         assert_eq!(text2[2], "  second para");
     }
 

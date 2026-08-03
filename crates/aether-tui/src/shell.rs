@@ -1239,20 +1239,23 @@ impl Shell {
                         ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
                         ScrollDir::Down => self.read_scroll_by(delta as i32),
                         ScrollDir::Left | ScrollDir::Right => {
-                            let (content_cols, _) = aether_client::read_layout::measure(
-                                self.term.0.max(10),
-                            );
+                            let (content_cols, _) =
+                                aether_client::read_layout::measure(self.term.0.max(10));
                             let window = content_cols.saturating_sub(2).max(1) as i32;
                             let step = match unit {
                                 ScrollUnit::Line => 6,
                                 ScrollUnit::Half => (window / 2).max(1),
                                 ScrollUnit::Page => window,
                             };
-                            let focused = self.session.read.as_ref().and_then(|r| {
-                                r.block_focus(self.session.buffer.cursor.position)
-                            });
-                            let signed =
-                                if matches!(dir, ScrollDir::Left) { -step } else { step };
+                            let focused =
+                                self.session.read.as_ref().and_then(|r| {
+                                    r.block_focus(self.session.buffer.cursor.position)
+                                });
+                            let signed = if matches!(dir, ScrollDir::Left) {
+                                -step
+                            } else {
+                                step
+                            };
                             self.read_hscroll_by(focused, signed);
                         }
                     }
@@ -1950,8 +1953,7 @@ impl Shell {
             }
             // Horizontal offsets are keyed by element index, which shifts with the parse —
             // drop them on content change (highlight arrivals and width changes keep them).
-            if self.read_cache.as_ref().map(|c| (c.0, c.1))
-                != Some((read.buffer_id, read.revision))
+            if self.read_cache.as_ref().map(|c| (c.0, c.1)) != Some((read.buffer_id, read.revision))
             {
                 self.read_hscroll.clear();
             }
@@ -1997,20 +1999,17 @@ impl Shell {
         let reveal = target_focus.or(block_focus);
         if reveal != self.read_last_focus {
             self.read_last_focus = reveal;
-            if let Some(row) = reveal
-                .and_then(|f| aether_client::read_layout::first_row_of_element(&rows, f))
+            if let Some(row) =
+                reveal.and_then(|f| aether_client::read_layout::first_row_of_element(&rows, f))
             {
                 let padded = row as u16 + crate::ui::READ_PAD_TOP;
-                if padded < self.read_scroll
-                    || padded >= self.read_scroll.saturating_add(visible)
-                {
+                if padded < self.read_scroll || padded >= self.read_scroll.saturating_add(visible) {
                     // Rest the element ~20% down, matching the editor's jump reveals.
                     self.read_scroll = padded.saturating_sub(visible / 5);
                 }
             }
         }
-        let total =
-            rows.len() as u16 + crate::ui::READ_PAD_TOP + crate::ui::READ_PAD_BOTTOM;
+        let total = rows.len() as u16 + crate::ui::READ_PAD_TOP + crate::ui::READ_PAD_BOTTOM;
         let max_scroll = total.saturating_sub(visible);
         self.read_scroll = self.read_scroll.min(max_scroll);
         Some(crate::app::ReadViewState {

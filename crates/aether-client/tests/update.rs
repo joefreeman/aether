@@ -4716,7 +4716,10 @@ fn a_typed_language_beats_inference_but_an_inferred_one_follows_the_path() {
     let (token, _) = request_with_token(&fx, "workspace/infer_language").unwrap();
     let _ = s.on_rpc_result(token, Ok(json!({})));
     let ps = s.workspace_settings.as_ref().unwrap();
-    assert_eq!(ps.add_project_language.text, "", "nothing inferred any more");
+    assert_eq!(
+        ps.add_project_language.text, "",
+        "nothing inferred any more"
+    );
     assert!(!ps.language_inferred);
 
     // And emptying the path clears an inferred suggestion without waiting on the server.
@@ -6585,7 +6588,10 @@ fn read_tab_shows_the_focused_target_without_following() {
     let mut s = read_session();
     // On a plain block: quiet no-op.
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    assert!(fx.0.is_empty(), "Tab on a non-interactive block does nothing");
+    assert!(
+        fx.0.is_empty(),
+        "Tab on a non-interactive block does nothing"
+    );
     // On a focused link: the URL in the hover popover (whose own keys then apply — Ctrl-c
     // copies it via `keymap::hover_action`), no open, no cursor move.
     focus_the_link(&mut s);
@@ -6599,7 +6605,9 @@ fn read_tab_shows_the_focused_target_without_following() {
         "Tab reveals the link target in the popover"
     );
     assert!(
-        !fx.0.iter().any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
+        !fx.0
+            .iter()
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
         "Tab must not follow the link"
     );
 }
@@ -6840,7 +6848,10 @@ fn read_click_activate_on_an_image_arms_only() {
     s.buffer.path = Some("/ws/docs/doc.md".into());
     let fx = leader(&mut s, 'v');
     let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })));
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })),
+    );
     let fx = s.read_click_activate(0);
     let (_t, method, _params) = the_request(&fx);
     assert_eq!(method, "cursor/move");
@@ -6859,7 +6870,10 @@ fn read_click_new_window_opens_relative_links() {
     s.buffer.path = Some("/ws/docs/doc.md".into());
     let fx = leader(&mut s, 'v');
     let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })));
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })),
+    );
     let fx = s.read_click_new_window(0);
     assert!(
         fx.0.iter().any(|e| matches!(
@@ -6907,7 +6921,10 @@ fn read_k_steps_past_a_lone_link_paragraph() {
         let fx = key(&mut s, 'j');
         let (t, m, params) = the_request(&fx);
         assert_eq!(m, "cursor/move");
-        assert_eq!(params["motion"]["position"], json!({"line": line, "col": col}));
+        assert_eq!(
+            params["motion"]["position"],
+            json!({"line": line, "col": col})
+        );
         let _ = s.on_rpc_result(
             t,
             Ok(json!({
@@ -6928,7 +6945,10 @@ fn read_k_steps_past_a_lone_link_paragraph() {
         let read = s.read.as_ref().unwrap();
         let cursor = s.buffer.cursor.position;
         assert_eq!(read.target_focus(cursor), None, "no auto-selected link");
-        assert!(read.block_focus(cursor).is_some(), "the bar marks the paragraph");
+        assert!(
+            read.block_focus(cursor).is_some(),
+            "the bar marks the paragraph"
+        );
     }
     // …and past it.
     let fx = key(&mut s, 'k');
@@ -6973,9 +6993,13 @@ fn focus_projections_compose_block_bar_and_link_target() {
     focus_the_link(&mut s);
     let cursor = s.buffer.cursor.position;
     let read = s.read.as_ref().unwrap();
-    let target = read.target_focus(cursor).expect("cursor sits inside the link");
+    let target = read
+        .target_focus(cursor)
+        .expect("cursor sits inside the link");
     assert!(matches!(read.elements[target], Element::Link { .. }));
-    let block = read.block_focus(cursor).expect("block position always present");
+    let block = read
+        .block_focus(cursor)
+        .expect("block position always present");
     assert!(matches!(read.elements[block], Element::Block { .. }));
     assert!(
         read.elements[block]
@@ -6992,7 +7016,11 @@ fn focus_projections_compose_block_bar_and_link_target() {
     );
     let cursor = s.buffer.cursor.position;
     let read = s.read.as_ref().unwrap();
-    assert_eq!(read.target_focus(cursor), None, "target vanished with the cursor");
+    assert_eq!(
+        read.target_focus(cursor),
+        None,
+        "target vanished with the cursor"
+    );
     assert!(read.block_focus(cursor).is_some(), "the bar never vanishes");
 }
 

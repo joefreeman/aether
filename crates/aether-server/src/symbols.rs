@@ -384,13 +384,25 @@ mod tests {
     #[test]
     fn markdown_symbol_names_drop_inline_markup() {
         assert_eq!(
-            clean_symbol_name("Styled `heading` with a [link](https://example.com)", "/w/d.md"),
+            clean_symbol_name(
+                "Styled `heading` with a [link](https://example.com)",
+                "/w/d.md"
+            ),
             "Styled heading with a link"
         );
-        assert_eq!(clean_symbol_name("**Bold** and *em* and ~~gone~~", "/w/d.md"), "Bold and em and gone");
+        assert_eq!(
+            clean_symbol_name("**Bold** and *em* and ~~gone~~", "/w/d.md"),
+            "Bold and em and gone"
+        );
         // Inline context: a numbered heading must not parse as an ordered list.
-        assert_eq!(clean_symbol_name("1. Introduction", "/w/d.md"), "1. Introduction");
-        assert_eq!(clean_symbol_name("__init__ and `*ptr`", "/w/mod.rs"), "__init__ and `*ptr`");
+        assert_eq!(
+            clean_symbol_name("1. Introduction", "/w/d.md"),
+            "1. Introduction"
+        );
+        assert_eq!(
+            clean_symbol_name("__init__ and `*ptr`", "/w/mod.rs"),
+            "__init__ and `*ptr`"
+        );
     }
 
     /// A 3.17 `WorkspaceSymbol` may carry a location with no range; there's nowhere to jump, so it's

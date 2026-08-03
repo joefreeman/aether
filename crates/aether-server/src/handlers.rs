@@ -15,10 +15,10 @@ use crate::wrap;
 use aether_protocol::app::{AppInfo, AppInfoParams};
 use aether_protocol::buffer::{
     BufferChanged, BufferChangedParams, BufferCloseParams, BufferClosed, BufferClosedParams,
-    BufferContentParams, BufferContentResult, BufferCopyParams, BufferCopyResult,
-    BufferCutResult, BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult,
-    BufferSaveParams, BufferSaveResult, BufferSetTransientParams, BufferSetTransientResult,
-    BufferState, BufferStateParams, CopyScope,
+    BufferContentParams, BufferContentResult, BufferCopyParams, BufferCopyResult, BufferCutResult,
+    BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams,
+    BufferSaveResult, BufferSetTransientParams, BufferSetTransientResult, BufferState,
+    BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
@@ -83,10 +83,10 @@ use aether_protocol::viewport::{
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
     WorkspaceAddRootParams, WorkspaceCreateParams, WorkspaceDeleteParams,
-    WorkspaceInferLanguageParams, WorkspaceInferLanguageResult, WorkspaceInfo,
-    WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceProject,
-    WorkspaceRemoveProjectParams, WorkspaceRemoveRootParams, WorkspaceRemoveRootResult,
-    WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams, WorkspaceSummary,
+    WorkspaceInferLanguageParams, WorkspaceInferLanguageResult, WorkspaceInfo, WorkspaceListParams,
+    WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceProject, WorkspaceRemoveProjectParams,
+    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed,
+    WorkspaceRenamedParams, WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};

@@ -94,7 +94,9 @@ impl WasmSession {
     /// param, recorded by the shell so a refresh restores the presentation on screen (the
     /// `#line:col` cursor restore in the same URL must not read as a jump). Returns `Effect[]`.
     pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.boot_read_presentation_explicit(read)))
+        to_js(&effects_to_json(
+            self.inner.boot_read_presentation_explicit(read),
+        ))
     }
 
     /// A click on a reading-view element: the shell resolves the clicked node's `data-espan`

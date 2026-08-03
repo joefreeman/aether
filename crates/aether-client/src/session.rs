@@ -881,8 +881,7 @@ pub struct ReadView {
     /// Fenced-code tree-sitter highlights, keyed by the code block's span start — filled
     /// asynchronously from `syntax/highlight_snippet` results (docs/markdown-view.md §2.8);
     /// offsets index the block's `code` string. Fences render monochrome until theirs arrive.
-    pub code_highlights:
-        std::collections::HashMap<u32, Vec<aether_protocol::viewport::Highlight>>,
+    pub code_highlights: std::collections::HashMap<u32, Vec<aether_protocol::viewport::Highlight>>,
     /// Bumped whenever `code_highlights` grows — the shells' layout-cache invalidation key
     /// (revision alone doesn't move when highlights land).
     pub hl_gen: u64,
@@ -910,9 +909,10 @@ impl ReadView {
         self.blocks = crate::markdown::parse(&text);
         self.elements = crate::markdown::elements(&self.blocks);
         self.line_starts = std::iter::once(0)
-            .chain(text.char_indices().filter_map(|(i, c)| {
-                (c == '\n').then_some(i as u32 + 1)
-            }))
+            .chain(
+                text.char_indices()
+                    .filter_map(|(i, c)| (c == '\n').then_some(i as u32 + 1)),
+            )
             .collect();
         self.text = text;
         self.revision = revision;
@@ -976,7 +976,10 @@ impl ReadView {
 
     /// The source text of an element's span, for `y` copies.
     pub fn slice(&self, span: crate::markdown::Span) -> &str {
-        let (s, e) = (span.start as usize, (span.end as usize).min(self.text.len()));
+        let (s, e) = (
+            span.start as usize,
+            (span.end as usize).min(self.text.len()),
+        );
         self.text.get(s..e).unwrap_or("")
     }
 }

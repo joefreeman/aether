@@ -93,11 +93,11 @@ use aether_protocol::search::{
 use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
-use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
+use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::viewport::{
     DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
     ViewportWindowResult, Window, WrapMode,
@@ -6982,12 +6982,12 @@ impl Session {
 
             // ---- markdown reading view (docs/markdown-view.md) ----
             A::ToggleReadView => self.toggle_read_view(),
-            A::ReadStep(dir) => {
-                self.read_step(dir == Direction::Forward, count, crate::markdown::Element::is_block)
-            }
-            A::ReadStepLink(dir) => {
-                self.read_step_link_in_block(dir == Direction::Forward, count)
-            }
+            A::ReadStep(dir) => self.read_step(
+                dir == Direction::Forward,
+                count,
+                crate::markdown::Element::is_block,
+            ),
+            A::ReadStepLink(dir) => self.read_step_link_in_block(dir == Direction::Forward, count),
             A::ReadShowTarget => self.read_show_target(),
             A::ReadStepHeading(dir) => self.read_step(dir == Direction::Forward, count, |e| {
                 matches!(e, crate::markdown::Element::Heading { .. })
@@ -7045,8 +7045,7 @@ impl Session {
             // stepping back from the link finds its own containing paragraph, forever.
             if !pred(&read.elements[idx]) {
                 let byte = read.byte_of(self.buffer.cursor.position);
-                if let Some(c) = crate::markdown::containing_element(&read.elements, byte, &pred)
-                {
+                if let Some(c) = crate::markdown::containing_element(&read.elements, byte, &pred) {
                     idx = c;
                 }
             }
@@ -7084,10 +7083,8 @@ impl Session {
             let Some(block) = read.block_focus(cursor) else {
                 return Effects::none();
             };
-            let ring = crate::markdown::interactive_within(
-                &read.elements,
-                read.elements[block].span(),
-            );
+            let ring =
+                crate::markdown::interactive_within(&read.elements, read.elements[block].span());
             let Some(last) = ring.len().checked_sub(1) else {
                 return Effects::none();
             };
@@ -7223,7 +7220,11 @@ impl Session {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.is_block());
-            let el = if last { blocks.next_back() } else { blocks.next() };
+            let el = if last {
+                blocks.next_back()
+            } else {
+                blocks.next()
+            };
             let Some((idx, _)) = el else {
                 return Effects::none();
             };
@@ -7264,8 +7265,7 @@ impl Session {
                 crate::markdown::Element::Link { href, .. } => Act::Link(href.clone()),
                 crate::markdown::Element::Image { src, .. } => Act::Image(src.clone()),
                 crate::markdown::Element::FootnoteRef { label, .. } => {
-                    let Some(span) = crate::markdown::footnote_def_span(&read.blocks, label)
-                    else {
+                    let Some(span) = crate::markdown::footnote_def_span(&read.blocks, label) else {
                         return Effects::toast_grouped(
                             format!("No definition for footnote [{label}]"),
                             ToastKind::Warning,
@@ -7362,7 +7362,9 @@ impl Session {
     /// Follow a link target from the reading view (docs/markdown-view.md §2.4).
     fn read_follow_link(&mut self, href: &str) -> Effects {
         let lower = href.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("mailto:")
         {
             return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(href.to_string())));
         }
@@ -7428,17 +7430,17 @@ impl Session {
             };
             match &read.elements[idx] {
                 crate::markdown::Element::Link { href, .. } => (href.clone(), "link URL"),
-                el => (read.slice(el.span()).trim_end().to_string(), "element source"),
+                el => (
+                    read.slice(el.span()).trim_end().to_string(),
+                    "element source",
+                ),
             }
         };
         if text.is_empty() {
             return Effects::none();
         }
-        let mut fx = Effects::toast_grouped(
-            format!("Copied {what}"),
-            ToastKind::Success,
-            "read-copy",
-        );
+        let mut fx =
+            Effects::toast_grouped(format!("Copied {what}"), ToastKind::Success, "read-copy");
         fx.push(Effect::WriteClipboard(text));
         fx
     }

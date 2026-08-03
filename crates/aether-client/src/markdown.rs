@@ -167,14 +167,35 @@ pub enum ColAlign {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Inline {
-    Text { text: String },
-    Code { text: String },
-    Emphasis { content: Vec<Inline> },
-    Strong { content: Vec<Inline> },
-    Strikethrough { content: Vec<Inline> },
-    Link { href: String, content: Vec<Inline>, span: Span },
-    Image { src: String, alt: String, span: Span },
-    FootnoteRef { label: String, span: Span },
+    Text {
+        text: String,
+    },
+    Code {
+        text: String,
+    },
+    Emphasis {
+        content: Vec<Inline>,
+    },
+    Strong {
+        content: Vec<Inline>,
+    },
+    Strikethrough {
+        content: Vec<Inline>,
+    },
+    Link {
+        href: String,
+        content: Vec<Inline>,
+        span: Span,
+    },
+    Image {
+        src: String,
+        alt: String,
+        span: Span,
+    },
+    FootnoteRef {
+        label: String,
+        span: Span,
+    },
     /// An explicit line break (trailing `  ` or `\`). Soft breaks flow as spaces.
     HardBreak,
 }
@@ -611,7 +632,9 @@ fn inlines_text(inlines: &[Inline]) -> String {
 pub enum Element {
     /// A non-heading block-grain stop: paragraph, code block, rule, table, quote, footnote
     /// definition, front matter, HTML block.
-    Block { span: Span },
+    Block {
+        span: Span,
+    },
     Heading {
         span: Span,
         level: u8,
@@ -625,12 +648,21 @@ pub enum Element {
         #[serde(skip_serializing_if = "Option::is_none")]
         checked: Option<bool>,
     },
-    Link { span: Span, href: String },
+    Link {
+        span: Span,
+        href: String,
+    },
     /// An image target — always interactive-grain, never a `j`/`k` stop: a *display* image's
     /// block identity is a separate [`Element::Block`] over the paragraph span, so `l` opts
     /// into the image exactly like it opts into a link.
-    Image { span: Span, src: String },
-    FootnoteRef { span: Span, label: String },
+    Image {
+        span: Span,
+        src: String,
+    },
+    FootnoteRef {
+        span: Span,
+        label: String,
+    },
 }
 
 impl Element {
@@ -675,7 +707,12 @@ pub fn elements(blocks: &[Block]) -> Vec<Element> {
 /// nested items always are (the reading grain of a list is the item); a container's inner
 /// paragraphs are not (the container is the grain) — but their interactive inlines always
 /// collect, so a link inside a quote stays a `Tab` stop.
-fn walk_blocks(blocks: &[Block], top: bool, out: &mut Vec<Element>, slugs: &mut HashMap<String, u32>) {
+fn walk_blocks(
+    blocks: &[Block],
+    top: bool,
+    out: &mut Vec<Element>,
+    slugs: &mut HashMap<String, u32>,
+) {
     for block in blocks {
         match block {
             Block::Heading {
@@ -982,9 +1019,7 @@ fn collect_fences(blocks: &[Block], out: &mut Vec<(Span, String, String)>) {
 pub fn footnote_def_span(blocks: &[Block], label: &str) -> Option<Span> {
     for block in blocks {
         match block {
-            Block::FootnoteDef {
-                label: l, span, ..
-            } if l == label => return Some(*span),
+            Block::FootnoteDef { label: l, span, .. } if l == label => return Some(*span),
             Block::Quote { content, .. } | Block::FootnoteDef { content, .. } => {
                 if let Some(s) = footnote_def_span(content, label) {
                     return Some(s);
@@ -1200,7 +1235,10 @@ mod tests {
                 span: items[0].span,
             }]
         );
-        assert_eq!(items[0].span, span_of(md, "- first item that is\n  wrapped\n"));
+        assert_eq!(
+            items[0].span,
+            span_of(md, "- first item that is\n  wrapped\n")
+        );
     }
 
     #[test]
@@ -1268,10 +1306,13 @@ mod tests {
         };
         assert_eq!(items[0].checked, Some(true));
         assert_eq!(items[1].checked, Some(false));
-        assert_eq!(items[0].blocks[0], Block::Paragraph {
-            content: vec![text("done item")],
-            span: items[0].span,
-        });
+        assert_eq!(
+            items[0].blocks[0],
+            Block::Paragraph {
+                content: vec![text("done item")],
+                span: items[0].span,
+            }
+        );
     }
 
     #[test]
@@ -1372,9 +1413,9 @@ mod tests {
         };
         assert_eq!(content[0], text("line one"));
         assert_eq!(content[1], Inline::HardBreak);
-        assert!(content
-            .iter()
-            .any(|i| matches!(i, Inline::Strikethrough { content } if content == &vec![text("gone")])));
+        assert!(content.iter().any(
+            |i| matches!(i, Inline::Strikethrough { content } if content == &vec![text("gone")])
+        ));
     }
 
     #[test]
@@ -1477,7 +1518,10 @@ mod tests {
         };
         assert_eq!((ha.as_str(), hb.as_str()), ("https://a.a", "https://b.b"));
         // Stepping back from link b lands on link a; no interactive before the first link.
-        assert_eq!(step_element(&els, b, false, Element::is_interactive), Some(a));
+        assert_eq!(
+            step_element(&els, b, false, Element::is_interactive),
+            Some(a)
+        );
         assert_eq!(step_element(&els, a, false, Element::is_interactive), None);
     }
 
@@ -1517,7 +1561,10 @@ mod tests {
             .unwrap();
         let rest = block_rest_byte(&els, lone);
         assert_eq!(rest, "[docs](https://x.y)".len() as u32);
-        assert!(element_at(&els, rest) == Some(lone), "rest byte derives the block itself");
+        assert!(
+            element_at(&els, rest) == Some(lone),
+            "rest byte derives the block itself"
+        );
         // An ordinary paragraph: the rest byte is simply its start.
         let para = els
             .iter()
@@ -1592,7 +1639,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(slugs, vec!["hello-world", "hello-world-1", "with-code--more"]);
+        assert_eq!(
+            slugs,
+            vec!["hello-world", "hello-world-1", "with-code--more"]
+        );
         assert_eq!(heading_by_slug(&els, "hello-world-1"), Some(1));
         assert_eq!(heading_by_slug(&els, "missing"), None);
     }
