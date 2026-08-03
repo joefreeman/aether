@@ -292,6 +292,49 @@ pub struct BufferCutResult {
     pub cursor: CursorState,
 }
 
+// ---- buffer/content -----------------------------------------------------------------------------
+
+pub struct BufferContent;
+impl RpcMethod for BufferContent {
+    const NAME: &'static str = "buffer/content";
+    type Params = BufferContentParams;
+    type Result = BufferContentResult;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferContentParams {
+    pub buffer_id: BufferId,
+}
+
+/// The buffer's full text at `revision`. The markdown reading view renders from the whole
+/// document (fences, tables and link reference definitions span arbitrarily, so a windowed view
+/// of the source can't drive the parse — docs/markdown-view.md §1.5); it re-fetches whenever a
+/// change notification carries a revision newer than the one it parsed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BufferContentResult {
+    pub revision: Revision,
+    pub text: String,
+}
+
+// ---- buffer/changed (notification) --------------------------------------------------------------
+
+pub struct BufferChanged;
+impl NotificationMethod for BufferChanged {
+    const NAME: &'static str = "buffer/changed";
+    type Params = BufferChangedParams;
+}
+
+/// Revision-only change signal for viewports the edit-push range gate skips. Typed edits push
+/// `viewport/lines_changed` only to viewports whose pushed range intersects the edited lines;
+/// a client rendering the whole document (the markdown reading view) still needs to hear about
+/// every mutation, so the skip branch sends this instead. No window render rides it — clients
+/// that draw the pushed window can ignore it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BufferChangedParams {
+    pub buffer_id: BufferId,
+    pub revision: Revision,
+}
+
 // ---- buffer/state (notification) ----------------------------------------------------------------
 
 pub struct BufferState;

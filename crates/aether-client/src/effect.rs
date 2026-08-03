@@ -20,6 +20,22 @@ pub enum ShellAction {
     PlaceCursor(ViewportPlace),
     /// Flip soft-wrap and re-render the viewport (paired with [`Effect::SaveContentAnchor`]).
     ToggleWrap,
+    /// Open a URL — or an absolute file path — with the system handler (the reading view's
+    /// `Enter` on an external link or image; docs/markdown-view.md §2.4). The GUI reuses its
+    /// hover-link opener (allow-listed schemes + spawn), the TUI spawns the same system opener,
+    /// the web shell opens a new tab. Never a relative path: the core resolves against the
+    /// buffer's directory before emitting.
+    OpenUrl(String),
+    /// Open a file that lives beside the buffer — a *local* image's `Enter`
+    /// (docs/markdown-view.md §2.4). Native shells open `absolute` with the system handler; a
+    /// browser can't touch local paths, so the web shell opens the server's confined
+    /// `/asset/{buffer_id}/{relative}` route in a new tab instead (the same route its
+    /// `<img>` tags already load from).
+    OpenBufferFile {
+        absolute: String,
+        buffer_id: BufferId,
+        relative: String,
+    },
     /// Open a [`WindowTarget`] in a *new* window. Two entry points build the target in the core:
     /// `Space Alt-x` ([`crate::keymap::Action::NewWindow`]) duplicates the current view, and
     /// `Ctrl-Enter` in a picker opens the highlighted item (the native sibling of the web client's

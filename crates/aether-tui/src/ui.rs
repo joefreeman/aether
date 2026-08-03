@@ -145,7 +145,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .constraints(constraints)
         .split(f.area());
     if state.has_editor() {
-        draw_buffer(f, state, chunks[0]);
+        // The markdown reading view replaces the editor window wholesale while active
+        // (docs/markdown-view.md); all overlays/toasts/status draw over either the same way.
+        if state.read.is_some() {
+            draw_read_view(f, state, chunks[0]);
+        } else {
+            draw_buffer(f, state, chunks[0]);
+        }
     } else {
         draw_no_workspace_view(f, state, chunks[0]);
     }
@@ -597,7 +603,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                 .map(Line::from)
                 .collect()
         }
-        MdBlock::Paragraph { content } => {
+        MdBlock::Paragraph { content, .. } => {
             let segs = md_inline_segs(content, Style::default().fg(NORD4));
             wrap_styled(&segs, width)
                 .into_iter()
@@ -619,17 +625,26 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                 })
                 .collect()
         }
-        MdBlock::List { ordered, items } => {
+        MdBlock::List {
+            ordered,
+            start,
+            items,
+            ..
+        } => {
             let mut out = Vec::new();
             for (i, item) in items.iter().enumerate() {
-                let marker = if *ordered {
-                    format!("{}. ", i + 1)
+                let mut marker = if *ordered {
+                    format!("{}. ", start + i as u64)
                 } else {
                     "• ".to_string()
                 };
+                // Task-list items carry their checkbox on the marker.
+                if let Some(done) = item.checked {
+                    marker.push_str(if done { "☑ " } else { "☐ " });
+                }
                 let indent = " ".repeat(marker.width());
                 let inner_w = width.saturating_sub(marker.width());
-                let item_lines = md_hover_lines(item, inner_w);
+                let item_lines = md_hover_lines(&item.blocks, inner_w);
                 for (j, line) in item_lines.into_iter().enumerate() {
                     // First line of the item carries the bullet/number; continuation lines hang under
                     // the text with a matching indent.
@@ -645,7 +660,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
             }
             out
         }
-        MdBlock::Quote { content } => {
+        MdBlock::Quote { content, .. } => {
             let bar = Span::styled("│ ", Style::default().fg(NORD3));
             let inner = md_hover_lines(content, width.saturating_sub(2));
             inner
@@ -657,12 +672,50 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                 })
                 .collect()
         }
-        MdBlock::Rule => {
+        MdBlock::Rule { .. } => {
             vec![Line::from(Span::styled(
                 "─".repeat(width),
                 Style::default().fg(NORD3),
             ))]
         }
+        // The remaining kinds only occur in document (reading-view) parses; hover content never
+        // produces them, but a fallback keeps hover total. The reading view has its own renderer.
+        MdBlock::Table { head, rows, .. } => std::iter::once(head)
+            .chain(rows.iter())
+            .filter(|row| !row.is_empty())
+            .map(|row| {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|c| {
+                        md_inline_segs(c, Style::default())
+                            .into_iter()
+                            .map(|(t, _)| t)
+                            .collect::<String>()
+                    })
+                    .collect();
+                Line::from(Span::styled(
+                    cells.join(" | "),
+                    Style::default().fg(NORD4),
+                ))
+            })
+            .collect(),
+        MdBlock::Image { alt, .. } => vec![Line::from(Span::styled(
+            format!("[image: {alt}]"),
+            Style::default().fg(NORD3),
+        ))],
+        MdBlock::FrontMatter { .. } => Vec::new(),
+        MdBlock::FootnoteDef { label, content, .. } => {
+            let mut lines = vec![Line::from(Span::styled(
+                format!("[{label}]:"),
+                Style::default().fg(NORD3),
+            ))];
+            lines.extend(md_hover_lines(content, width));
+            lines
+        }
+        MdBlock::Html { raw, .. } => raw
+            .split('\n')
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(NORD3))))
+            .collect(),
     }
 }
 
@@ -695,6 +748,16 @@ fn md_collect_segs(inlines: &[MdInline], base: Style, out: &mut Vec<(String, Sty
                     out,
                 );
             }
+            MdInline::Strikethrough { content } => {
+                md_collect_segs(content, base.add_modifier(Modifier::CROSSED_OUT), out);
+            }
+            MdInline::Image { alt, .. } => out.push((format!("[{alt}]"), base.fg(NORD3))),
+            MdInline::FootnoteRef { label, .. } => {
+                out.push((format!("[{label}]"), base.fg(NORD3)));
+            }
+            // Segment flow has no line-break primitive; a hard break degrades to a space in
+            // hover popovers (the reading view renders breaks properly).
+            MdInline::HardBreak => out.push((" ".to_string(), base)),
         }
     }
 }
@@ -3990,6 +4053,332 @@ fn truncate_path_with_indices(
     (truncated, new_indices)
 }
 
+/// Paint the markdown reading view (docs/markdown-view.md §2.8): the core's laid-out rows at the
+/// shell's scroll, the content column centered to the reading measure, the focused element
+/// row-tinted (a focused link inverts its own span instead).
+fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
+    use aether_client::read_layout::{measure, SpanKind};
+    let Some(rv) = state.read.as_ref() else {
+        return;
+    };
+    let (content_cols, margin) = measure(area.width.max(10));
+    let content = Rect {
+        x: area.x.saturating_add(margin),
+        y: area.y,
+        width: content_cols.min(area.width),
+        height: area.height,
+    };
+    // Fill the whole area (margins included) with the editor's base background, so the reading
+    // view sits on the same canvas as the buffer.
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(NORD0)),
+        area,
+    );
+    if rv.rows.is_empty() {
+        if rv.loading {
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "Loading…",
+                Style::default().fg(NORD3).bg(NORD0),
+            )));
+            f.render_widget(msg, content);
+        }
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    // The scroll runs over *padded* rows: READ_PAD_TOP blank rows above the document and
+    // READ_PAD_BOTTOM below, so the text doesn't sit flush against the chrome.
+    for screen_row in 0..area.height {
+        let padded = rv.scroll as usize + screen_row as usize;
+        let Some((idx, row)) = padded
+            .checked_sub(READ_PAD_TOP as usize)
+            .and_then(|i| rv.rows.get(i).map(|r| (i, r)))
+        else {
+            lines.push(Line::default());
+            continue;
+        };
+        // The reading position (block grain) is a frost bar in a 2-column gutter (settled on
+        // after trying background tints and full-width bands); every row carries the prefix so
+        // nothing shifts as focus moves. Always present — even when the cursor sits inside a
+        // link, the link's containing block keeps its bar (two projections of one cursor).
+        // `bar_rows` is the focused block's whole subtree (nested items included).
+        let row_focused = rv.bar_rows.is_some_and(|(a, b)| idx >= a && idx <= b);
+        let mut spans: Vec<Span> = vec![if row_focused {
+            Span::styled("▎ ", Style::default().fg(NORD8).bg(NORD0))
+        } else {
+            Span::styled("  ", Style::default().bg(NORD0))
+        }];
+        // The language-tag row renders as a small "tab": panel background only under
+        // ` json ` (the tag plus a space either side), the rest of the row on the page
+        // background — so the panel proper opens on the row below, with the tag perched on
+        // top. Any leading prefix spans (a quote bar) stay as-is.
+        if let Some(t) = row
+            .spans
+            .iter()
+            .position(|s| matches!(s.style.kind, SpanKind::CodeFrame))
+        {
+            for rs in &row.spans[..t] {
+                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+            }
+            let tag = &row.spans[t];
+            spans.push(Span::styled(
+                format!("{} ", tag.text),
+                read_span_style(tag.style),
+            ));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        // Code rows are unchunked — they may exceed the measure — and render through a
+        // horizontal window: pad/indicator column, clipped runs, background fill to the
+        // measure, pad/indicator column. Leading non-code spans (a quote bar, a list indent)
+        // stay put; only the code part pans. `…` at either edge marks clipped content.
+        let code_at = row
+            .spans
+            .iter()
+            .position(|s| matches!(s.style.kind, SpanKind::CodeBlock));
+        if let Some(split) = code_at {
+            let (prefix, code_part) = row.spans.split_at(split);
+            let mut used = 2usize;
+            for rs in prefix {
+                used += rs.text.width();
+                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+            }
+            let off = row
+                .element
+                .and_then(|e| rv.hscroll.get(&e))
+                .copied()
+                .unwrap_or(0) as usize;
+            let window = (content.width as usize).saturating_sub(used + 2).max(1);
+            let total: usize = code_part.iter().map(|s| s.text.width()).sum();
+            let indicator = Style::default().fg(NORD3_BRIGHT).bg(MD_CODE_BG);
+            spans.push(Span::styled(
+                if off > 0 && total > 0 { "…" } else { " " },
+                indicator,
+            ));
+            let clipped = aether_client::read_layout::clip_spans(code_part, off, window);
+            let mut shown = 0usize;
+            for rs in &clipped {
+                let style = match &rs.syntax {
+                    // A fenced-code token: the editor's own tree-sitter theme, on the panel.
+                    Some(kind) => theme_for(kind).bg(MD_CODE_BG),
+                    None => read_span_style(rs.style),
+                };
+                shown += rs.text.width();
+                spans.push(Span::styled(rs.text.clone(), style));
+            }
+            // The block's bottom pad row hosts a horizontal scrollbar when the block
+            // overflows — the horizontal twin of the page bar (`─` track, bolder `━` thumb),
+            // sized/positioned by the same shared thumb math.
+            let is_block_end =
+                rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
+            let bar = (total == 0 && is_block_end)
+                .then(|| {
+                    // Only code rows count toward overflow — the pinned tag row is chrome
+                    // (counting it once made every tagged panel "overflow").
+                    let widest = row
+                        .element
+                        .map(|e| aether_client::read_layout::hscroll_content_width(&rv.rows, e))
+                        .unwrap_or(0);
+                    aether_client::scrollbar::thumb(
+                        window as f64,
+                        widest as f64,
+                        window as f64,
+                        off as f64,
+                        1.0,
+                    )
+                })
+                .flatten();
+            if let Some((thumb_x, thumb_w)) = bar {
+                let tx = (thumb_x.round() as usize).min(window.saturating_sub(1));
+                let tw = (thumb_w.round() as usize).max(1).min(window - tx);
+                let track = Style::default().fg(NORD2).bg(MD_CODE_BG);
+                let thumb = Style::default().fg(NORD3_BRIGHT).bg(MD_CODE_BG);
+                spans.push(Span::styled("─".repeat(tx), track));
+                spans.push(Span::styled("━".repeat(tw), thumb));
+                spans.push(Span::styled("─".repeat(window - tx - tw), track));
+            } else {
+                let fill = window.saturating_sub(shown);
+                if fill > 0 {
+                    spans.push(Span::styled(
+                        " ".repeat(fill),
+                        Style::default().bg(MD_CODE_BG),
+                    ));
+                }
+            }
+            spans.push(Span::styled(
+                if total > off + window { "…" } else { " " },
+                indicator,
+            ));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        // Table rows are unchunked too — natural column widths may exceed the measure — and
+        // pan through the same horizontal window, but on the page background (no panel
+        // fill). Instead of a chrome row, the bottom border doubles as the scroll track:
+        // the thumb range of `└──┴──┘` brightens and bolds (`─` → `━`).
+        let table_at = row
+            .spans
+            .iter()
+            .position(|s| matches!(s.style.kind, SpanKind::TableBorder));
+        if let Some(split) = table_at {
+            let (prefix, table_part) = row.spans.split_at(split);
+            let mut used = 2usize;
+            for rs in prefix {
+                used += rs.text.width();
+                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+            }
+            let off = row
+                .element
+                .and_then(|e| rv.hscroll.get(&e))
+                .copied()
+                .unwrap_or(0) as usize;
+            let window = (content.width as usize).saturating_sub(used + 2).max(1);
+            let total: usize = table_part.iter().map(|s| s.text.width()).sum();
+            let indicator = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+            spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
+            let clipped = aether_client::read_layout::clip_spans(table_part, off, window);
+            let is_block_end =
+                rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
+            let is_bottom_border = is_block_end
+                && clipped.len() == 1
+                && table_part.len() == 1
+                && table_part[0].text.starts_with('└');
+            let bar = is_bottom_border
+                .then(|| {
+                    let widest = row
+                        .element
+                        .map(|e| {
+                            aether_client::read_layout::hscroll_content_width(&rv.rows, e)
+                        })
+                        .unwrap_or(0);
+                    aether_client::scrollbar::thumb(
+                        window as f64,
+                        widest as f64,
+                        window as f64,
+                        off as f64,
+                        1.0,
+                    )
+                })
+                .flatten();
+            if let Some((thumb_x, thumb_w)) = bar {
+                let tx = (thumb_x.round() as usize).min(window.saturating_sub(1));
+                let tw = (thumb_w.round() as usize).max(1).min(window - tx);
+                let chars: Vec<char> = clipped[0].text.chars().collect();
+                let seg = |r: std::ops::Range<usize>| -> String {
+                    chars[r.start.min(chars.len())..r.end.min(chars.len())]
+                        .iter()
+                        .collect()
+                };
+                let base = read_span_style(clipped[0].style);
+                let thumb = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+                spans.push(Span::styled(seg(0..tx), base));
+                spans.push(Span::styled(
+                    seg(tx..tx + tw).replace('─', "━"),
+                    thumb,
+                ));
+                spans.push(Span::styled(seg(tx + tw..chars.len()), base));
+            } else {
+                for rs in &clipped {
+                    let mut style = read_span_style(rs.style);
+                    if rs.element.is_some() && rs.element == rv.target_focus {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    spans.push(Span::styled(rs.text.clone(), style));
+                }
+            }
+            let shown: usize = clipped.iter().map(|s| s.text.width()).sum();
+            let fill = window.saturating_sub(shown);
+            if fill > 0 {
+                spans.push(Span::styled(" ".repeat(fill), Style::default().bg(NORD0)));
+            }
+            spans.push(Span::styled(
+                if total > off + window { "…" } else { " " },
+                indicator,
+            ));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        for rs in &row.spans {
+            let mut style = read_span_style(rs.style);
+            // The Enter target (the interactive span the cursor sits inside) inverts on top.
+            if rs.element.is_some() && rs.element == rv.target_focus {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(Span::styled(rs.text.clone(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        content,
+    );
+    // The same scrollbar the editor pane draws, in the area's rightmost column (over the
+    // padded height, so the thumb geometry matches what scrolling actually covers).
+    let total = rv.rows.len() as u64 + u64::from(READ_PAD_TOP) + u64::from(READ_PAD_BOTTOM);
+    if total > u64::from(area.height) {
+        let track = Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        render_scrollbar(f, track, rv.scroll as u64, total, area.height as u64);
+    }
+}
+
+/// Blank rows padding the reading view above and below the document.
+pub const READ_PAD_TOP: u16 = 2;
+pub const READ_PAD_BOTTOM: u16 = 2;
+
+/// Map a core reading-view [`aether_client::read_layout::SpanStyle`] to the terminal theme.
+fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
+    use aether_client::markdown::AlertKind;
+    use aether_client::read_layout::SpanKind as K;
+    let alert_color = |k: AlertKind| match k {
+        AlertKind::Note => NORD8,
+        AlertKind::Tip => NORD14,
+        AlertKind::Important => NORD15,
+        AlertKind::Warning => NORD13,
+        AlertKind::Caution => NORD11,
+    };
+    let mut st = match s.kind {
+        K::Text => Style::default().fg(NORD4),
+        // The heading colour ladder (shared with web/iced): frost blue for the majors, teal
+        // for H3, white for H4, and body-grey for H5/H6 — bold (from the span style) still
+        // sets the minor levels off from prose.
+        K::Heading(1 | 2) => Style::default().fg(NORD8),
+        K::Heading(3) => Style::default().fg(NORD7),
+        K::Heading(4) => Style::default().fg(NORD6),
+        K::Heading(_) => Style::default().fg(NORD4),
+        // Inline code: body-coloured text on the panel shade (matches the web chip).
+        K::Code => Style::default().fg(NORD4).bg(MD_CODE_BG),
+        K::CodeBlock => Style::default().fg(NORD4).bg(MD_CODE_BG),
+        // The pinned language tag on the panel: the web tag's `--nord3-brighter`, over the
+        // panel background so the pad row reads as one solid strip.
+        K::CodeFrame => Style::default().fg(OVERLAY_BORDER_FG).bg(MD_CODE_BG),
+        K::Rule | K::TableBorder | K::Dim => Style::default().fg(NORD3),
+        K::Link => Style::default().fg(NORD9),
+        // Bullets/numbers/checkboxes read as body text (uniform with the web/native markers).
+        K::Marker => Style::default().fg(NORD4),
+        K::QuoteBar(None) => Style::default().fg(NORD3),
+        K::QuoteBar(Some(k)) => Style::default().fg(alert_color(k)),
+        K::AlertLabel(k) => Style::default().fg(alert_color(k)),
+        K::TableHead => Style::default().fg(NORD6),
+    };
+    if s.bold {
+        st = st.add_modifier(Modifier::BOLD);
+    }
+    if s.italic {
+        st = st.add_modifier(Modifier::ITALIC);
+    }
+    if s.strike {
+        st = st.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if s.underline {
+        st = st.add_modifier(Modifier::UNDERLINED);
+    }
+    st
+}
+
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // When the buffer is taller than the viewport, carve the rightmost column for a scrollbar
     // (drawn last, below). The decision uses the whole-buffer `total_visual_rows` from the
@@ -5829,6 +6218,11 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         f.set_cursor_position((col, status_area.y));
         return;
     }
+    // The reading view has no text caret — focus highlighting is the cursor's rendering; not
+    // calling `set_cursor_position` leaves the terminal cursor hidden for this frame.
+    if state.read.is_some() {
+        return;
+    }
     let Some((visual_row, visual_col)) = cursor_visual_position(state, buffer_area.height as u32)
     else {
         return; // cursor off-screen
@@ -6311,6 +6705,7 @@ mod tests {
             confirm_prompt: None,
             app_info: None,
             editor: None,
+            read: None,
             workspace_settings: None,
             app_settings: None,
             lsp_status: std::collections::HashMap::new(),

@@ -128,6 +128,8 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
             "text/html; charset=utf-8",
             index_html().as_bytes(),
         )
+    } else if let Some(rest) = path.strip_prefix("/asset/") {
+        buffer_asset_response(&state, rest).await
     } else if let Some((bytes, content_type)) = path.strip_prefix('/').and_then(load_asset) {
         http_response("200 OK", content_type, &bytes)
     } else {
@@ -136,6 +138,106 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
     stream.write_all(&response).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Serve a file referenced from a markdown buffer's document — images in the web reading view
+/// (docs/markdown-view.md §3). `rest` is `{buffer_id}/{relative-path}` (URL-encoded); the path
+/// resolves against the buffer's parent directory and is **confined post-canonicalization** to
+/// the workspace root containing the buffer (or, for a buffer outside every root, to its own
+/// directory tree) — so `..` and symlink escapes 404 rather than leaking files. Images only;
+/// unknown extensions are refused rather than octet-streamed.
+async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
+    fn not_found() -> Vec<u8> {
+        http_response("404 Not Found", "text/plain; charset=utf-8", b"not found")
+    }
+    let Some((id_str, rel_enc)) = rest.split_once('/') else {
+        return not_found();
+    };
+    let Ok(buffer_id) = id_str.parse::<u64>() else {
+        return not_found();
+    };
+    let rel = percent_decode(rel_enc);
+    if rel.is_empty() || rel.starts_with('/') {
+        return not_found();
+    }
+    // Image types the reading view renders; anything else is refused.
+    let content_type = match rel.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
+        Some(e) if e == "png" => "image/png",
+        Some(e) if e == "jpg" || e == "jpeg" => "image/jpeg",
+        Some(e) if e == "gif" => "image/gif",
+        Some(e) if e == "webp" => "image/webp",
+        Some(e) if e == "svg" => "image/svg+xml",
+        Some(e) if e == "bmp" => "image/bmp",
+        Some(e) if e == "ico" => "image/x-icon",
+        _ => return not_found(),
+    };
+    let (parent, roots) = {
+        let s = state.lock().await;
+        let Some(parent) = s
+            .buffers
+            .get(&buffer_id)
+            .and_then(|b| b.canonical_path.as_ref())
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+        else {
+            return not_found();
+        };
+        let roots: Vec<std::path::PathBuf> = s
+            .workspaces
+            .values()
+            .flat_map(|w| w.paths.iter().cloned())
+            .collect();
+        (parent, roots)
+    };
+    // Canonicalize, then require the result to stay under the confinement root. The buffer's
+    // parent derives from a canonical path; roots are canonicalized here for the comparison —
+    // a configured-but-not-canonical root (a symlinked home, say) would otherwise silently
+    // narrow confinement to the buffer's own directory and 404 legitimate `../` images.
+    let confine = roots
+        .iter()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+        .find(|r| parent.starts_with(r))
+        .unwrap_or_else(|| parent.clone());
+    let Ok(canon) = parent.join(&rel).canonicalize() else {
+        return not_found();
+    };
+    if !canon.starts_with(&confine) {
+        return not_found();
+    }
+    let Ok(bytes) = std::fs::read(&canon) else {
+        return not_found();
+    };
+    // `sandbox` neuters scripts when an asset (an SVG — a full document context when navigated
+    // to directly) is opened as a page: same-origin script execution here would reach the
+    // editor's WebSocket API. `nosniff` pins the declared type. <img> rendering is unaffected.
+    http_response_with(
+        "200 OK",
+        content_type,
+        "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox\r\n",
+        &bytes,
+    )
+}
+
+/// Minimal percent-decoding for asset paths (`%20` etc.). Invalid escapes pass through verbatim.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Some(v) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Serialize the [`aether_protocol::app::AppInfo`] snapshot as JSON — the same payload the
@@ -212,6 +314,67 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
             )),
             "application/wasm",
         ),
+        // Bundled fonts (JetBrains Mono for code, Source Serif 4 for the reading view; both
+        // OFL). The stylesheet references them by stable name — `assetFileNames` in
+        // web/vite.config.ts keeps font filenames unhashed. The JetBrains faces were missing
+        // from this arm before the Source Serif addition: release builds silently fell back to
+        // the system monospace.
+        "assets/JetBrainsMono-Regular.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/JetBrainsMono-Regular.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/JetBrainsMono-Bold.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/JetBrainsMono-Bold.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/JetBrainsMono-Italic.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/JetBrainsMono-Italic.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/JetBrainsMono-BoldItalic.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/JetBrainsMono-BoldItalic.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/SourceSerif4-Regular.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/SourceSerif4-Regular.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/SourceSerif4-It.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/SourceSerif4-It.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/SourceSerif4-Semibold.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/SourceSerif4-Semibold.woff2"
+            )),
+            "font/woff2",
+        ),
+        "assets/SourceSerif4-Bold.woff2" => (
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../web/dist/assets/SourceSerif4-Bold.woff2"
+            )),
+            "font/woff2",
+        ),
         _ => return None,
     };
     Some((Cow::Borrowed(bytes), content_type))
@@ -249,11 +412,18 @@ fn request_host(request: &str) -> Option<&str> {
 }
 
 fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    http_response_with(status, content_type, "", body)
+}
+
+/// [`http_response`] with extra header lines (each `\r\n`-terminated) — the asset route's
+/// hardening headers ride here.
+fn http_response_with(status: &str, content_type: &str, extra: &str, body: &[u8]) -> Vec<u8> {
     let header = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         {extra}\
          Connection: close\r\n\
          \r\n",
         body.len()

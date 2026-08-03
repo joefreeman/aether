@@ -14,7 +14,8 @@ use crate::surround;
 use crate::wrap;
 use aether_protocol::app::{AppInfo, AppInfoParams};
 use aether_protocol::buffer::{
-    BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopyParams, BufferCopyResult,
+    BufferChanged, BufferChangedParams, BufferCloseParams, BufferClosed, BufferClosedParams,
+    BufferContentParams, BufferContentResult, BufferCopyParams, BufferCopyResult,
     BufferCutResult, BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult,
     BufferSaveParams, BufferSaveResult, BufferSetTransientParams, BufferSetTransientResult,
     BufferState, BufferStateParams, CopyScope,
@@ -3902,7 +3903,7 @@ fn push_symbol(
         abs_path: abs_path.to_string(),
         start: name_pos,
         end: name_end,
-        name: name.to_string(),
+        name: crate::symbols::clean_symbol_name(name, abs_path),
         symbol_kind,
         detail,
         depth,
@@ -5266,6 +5267,56 @@ pub async fn buffer_copy(
     Ok(BufferCopyResult { text })
 }
 
+/// Highlight a standalone snippet with the tree-sitter registry — the markdown reading view's
+/// fenced code blocks (docs/markdown-view.md §2.8). Stateless: a fresh parse per call (snippets
+/// are fence-sized), the fence alias table resolving the language, injections included (a
+/// heredoc inside a snippet still highlights). Unknown language → empty, never an error.
+pub async fn syntax_highlight_snippet(
+    _state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: aether_protocol::syntax::SyntaxHighlightSnippetParams,
+) -> Result<aether_protocol::syntax::SyntaxHighlightSnippetResult, RpcError> {
+    let empty = || aether_protocol::syntax::SyntaxHighlightSnippetResult {
+        highlights: Vec::new(),
+    };
+    let Some(config) = crate::syntax::get_config(&params.language) else {
+        return Ok(empty());
+    };
+    let mut parser = crate::syntax::make_parser(config);
+    let Some(tree) = parser.parse(&params.text, None) else {
+        return Ok(empty());
+    };
+    let injections = crate::syntax::compute_injections(config, &tree, &params.text);
+    let highlights = crate::syntax::highlights_for_range(
+        config,
+        &tree,
+        &injections,
+        &params.text,
+        0,
+        params.text.len(),
+    );
+    Ok(aether_protocol::syntax::SyntaxHighlightSnippetResult { highlights })
+}
+
+/// Full buffer text at its current revision — the markdown reading view's content fetch. The
+/// whole rope is materialized; markdown documents are small, and the reading view is the only
+/// caller (docs/markdown-view.md §3).
+pub async fn buffer_content(
+    state: &SharedState,
+    _ctx: &mut ConnectionCtx,
+    params: BufferContentParams,
+) -> Result<BufferContentResult, RpcError> {
+    let s = state.lock().await;
+    let buf = s
+        .buffers
+        .get(&params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    Ok(BufferContentResult {
+        revision: buf.revision,
+        text: buf.text.to_string(),
+    })
+}
+
 pub async fn buffer_cut(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -5344,6 +5395,9 @@ pub async fn buffer_cut(
                 old_last_line_excl,
             )
         {
+            // Out-of-window edit: nothing to render for this viewport, but a whole-document
+            // consumer still needs the change signal (docs/markdown-view.md §3).
+            push_buffer_changed(&s, vp, params.buffer_id, revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -9369,6 +9423,9 @@ async fn apply_toggle_comment(
                 edit_last_excl,
             )
         {
+            // Out-of-window edit: nothing to render for this viewport, but a whole-document
+            // consumer still needs the change signal (docs/markdown-view.md §3).
+            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -9942,6 +9999,9 @@ async fn apply_indent_or_dedent(
                 edit_last_excl,
             )
         {
+            // Out-of-window edit: nothing to render for this viewport, but a whole-document
+            // consumer still needs the change signal (docs/markdown-view.md §3).
+            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -10147,6 +10207,9 @@ async fn input_move_lines_once(
                 edit_last_excl,
             )
         {
+            // Out-of-window edit: nothing to render for this viewport, but a whole-document
+            // consumer still needs the change signal (docs/markdown-view.md §3).
+            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -11189,6 +11252,9 @@ async fn apply_edit(
                 edit_last_excl,
             )
         {
+            // Out-of-window edit: nothing to render for this viewport, but a whole-document
+            // consumer still needs the change signal (docs/markdown-view.md §3).
+            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -11238,6 +11304,34 @@ async fn apply_edit(
 
 fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) -> bool {
     a_start < b_end_excl && b_start < a_end_excl
+}
+
+/// The edit-push range gate's alternative: queue a revision-only `buffer/changed` for a viewport
+/// the edit didn't intersect, so a whole-document consumer (the markdown reading view) still
+/// hears about every mutation without a window render (docs/markdown-view.md §3). Clients that
+/// draw the pushed window ignore the notification.
+fn push_buffer_changed(
+    s: &ServerState,
+    vp: &Viewport,
+    buffer_id: BufferId,
+    revision: Revision,
+    pushes: &mut PendingPushes,
+) {
+    let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+        return;
+    };
+    pushes.push((
+        sender,
+        Notification {
+            jsonrpc: JsonRpc,
+            method: BufferChanged::NAME.into(),
+            params: serde_json::to_value(BufferChangedParams {
+                buffer_id,
+                revision,
+            })
+            .expect("infallible"),
+        },
+    ));
 }
 
 /// Workspace-switcher candidates: every persisted workspace (`names`, read from disk by the caller)

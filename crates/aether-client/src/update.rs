@@ -16,16 +16,17 @@ use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AppSettingId,
     AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
-    HoverText, Mode, PasteKind, Pending, Prompt, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot,
-    SearchState, Session, SettingsRow, SneakState, TextField, WorkspaceSettings,
+    HoverText, Mode, PasteKind, Pending, Prompt, ReadView, ReloadTry, RepeatTarget, SaveTry,
+    SearchSnapshot, SearchState, Session, SettingsRow, SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
 use aether_protocol::buffer::{
-    BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferCopy, BufferCopyParams,
-    BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams, BufferOpenResult,
-    BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferSetTransient,
-    BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
+    BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferClosed,
+    BufferClosedParams, BufferContent, BufferContentParams, BufferContentResult, BufferCopy,
+    BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams,
+    BufferOpenResult, BufferReload, BufferReloadParams, BufferSave, BufferSaveParams,
+    BufferSetTransient, BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
@@ -92,6 +93,7 @@ use aether_protocol::search::{
 use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
+use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
@@ -132,6 +134,18 @@ pub enum Event {
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
     /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
+    /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt
+    /// (docs/markdown-view.md §3.1). Guarded against staleness — the buffer may have switched, or
+    /// moved to a newer revision, while the fetch was in flight.
+    ReadContent(Result<BufferContentResult, String>),
+    /// A `syntax/highlight_snippet` result for one fenced code block of the reading view, keyed
+    /// by the fence's span start at `(buffer, revision)` parse time — stale results are dropped.
+    ReadHighlights {
+        buffer_id: BufferId,
+        revision: u64,
+        block_start: u32,
+        result: Result<aether_protocol::syntax::SyntaxHighlightSnippetResult, String>,
+    },
     /// A `jumplist/capture` resolved (picker `Ctrl-j`): the list is snapshotted server-side and
     /// the source picker swaps to the Jumplist picker. `Ok(None)` = nothing to capture (the
     /// picker's filtered set was empty); any previously captured list survives. The source
@@ -456,7 +470,58 @@ impl Session {
             }
 
             Event::Switched(Ok(open)) => self.adopt_navigation(open),
-            Event::Switched(Err(e)) => Effects::error(e),
+            Event::Switched(Err(e)) => {
+                // A failed jump-shaped open must not leave its flag armed for the next
+                // (unrelated) switch — it would wrongly land a markdown file in the editor.
+                self.open_route_jumped = false;
+                Effects::error(e)
+            }
+
+            Event::ReadContent(Ok(c)) => {
+                let Some(read) = self.read.as_mut() else {
+                    return Effects::none(); // reading view was left while the fetch was in flight
+                };
+                if read.buffer_id != self.buffer.buffer_id {
+                    return Effects::none(); // buffer switched under the fetch
+                }
+                read.adopt(c.revision, c.text);
+                // The buffer moved on while the fetch was in flight — chase the newer revision.
+                if self.buffer.revision > c.revision {
+                    return self.refetch_read_content();
+                }
+                self.read_fence_requests()
+            }
+            Event::ReadContent(Err(e)) => {
+                // Fall back to the editor rather than showing an empty page.
+                if self.read.take().is_some() && self.mode == Mode::Read {
+                    self.mode = Mode::Normal;
+                }
+                Effects::error(format!("Reading view failed to load: {e}"))
+            }
+
+            Event::ReadHighlights {
+                buffer_id,
+                revision,
+                block_start,
+                result,
+            } => {
+                // Best-effort colour: a failed/absent result leaves the fence monochrome.
+                let Ok(r) = result else {
+                    return Effects::none();
+                };
+                let Some(read) = self.read.as_mut() else {
+                    return Effects::none();
+                };
+                if read.buffer_id != buffer_id
+                    || read.revision != revision
+                    || r.highlights.is_empty()
+                {
+                    return Effects::none();
+                }
+                read.code_highlights.insert(block_start, r.highlights);
+                read.hl_gen += 1;
+                Effects::none()
+            }
 
             // Last/only buffer of an ephemeral context closed (no scratch was spawned).
             Event::EphemeralClosed(Ok(Some(next))) => {
@@ -508,7 +573,12 @@ impl Session {
             Event::JumplistCaptured(Err(e), _) => Effects::error(format!("Capture failed: {e}")),
 
             Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
-                Some(open) => self.adopt_navigation(open),
+                Some(open) => {
+                    // Jumplist steps are jump-shaped: a markdown target opens in the editor
+                    // (docs/markdown-view.md §1.6).
+                    self.open_route_jumped = true;
+                    self.adopt_navigation(open)
+                }
                 None => Effects::none(), // open:true is always sent; defensive
             },
             // At the boundary — no wrap. Name the end reached (and, when file-scoped, that the
@@ -1325,8 +1395,9 @@ impl Session {
                 // Drop out of Insert: edits can't reach the server while down, and a live insert
                 // cursor with vanishing keystrokes reads as a freeze. We don't restore it on
                 // reconnect (the buffer may have changed under us, or the daemon restarted and lost
-                // it) — the user re-enters insert deliberately.
-                self.mode = Mode::Normal;
+                // it) — the user re-enters insert deliberately. A reading view stays a reading
+                // view (it's client-rendered; only its refreshes need the server).
+                self.mode = self.search_return_mode();
                 tracing::warn!(buffer = %self.buffer.label, "connection lost; reconnecting");
                 // Grouped "connection": the matching "Reconnected" toast replaces this one in place.
                 let mut fx = Effects::toast_grouped(
@@ -1725,6 +1796,9 @@ impl Session {
     /// always land on a different `buffer_id`, so routing them here is just a switch.
     pub fn adopt_navigation(&mut self, open: BufferOpenResult) -> Effects {
         if open.buffer_id == self.buffer.buffer_id {
+            // Same buffer — the open-route flag (a cross-buffer concern) must not leak into the
+            // next genuine switch.
+            self.open_route_jumped = false;
             self.jump_to_cursor(open.cursor)
         } else {
             self.adopt_switch(open)
@@ -1757,7 +1831,122 @@ impl Session {
         self.prompt = None;
         self.search = SearchState::default();
         self.buffer = buffer_info(open, &self.workspace_paths);
-        Effects::one(Effect::Resubscribe)
+        let read_fx = self.sync_read_on_switch();
+        Effects::one(Effect::Resubscribe).and(read_fx)
+    }
+
+    /// Decide the freshly adopted buffer's read/edit presentation (docs/markdown-view.md §1.6):
+    /// markdown buffers follow this session's per-buffer choice when one was made, else the
+    /// app-wide default — except jump-shaped opens (grep hits, references, jumplist steps), which
+    /// land in the editor. Everything else opens in the editor as always.
+    fn sync_read_on_switch(&mut self) -> Effects {
+        let jumped = std::mem::replace(&mut self.open_route_jumped, false);
+        self.read = None;
+        let is_md = self.buffer.language.as_deref() == Some("markdown");
+        let want = is_md
+            && match self.read_pref.get(&self.buffer.buffer_id) {
+                Some(explicit) => *explicit,
+                None => self.markdown_read_default && !jumped,
+            };
+        if want {
+            self.begin_read()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Apply the open-route presentation rules (docs/markdown-view.md §1.6) to a freshly
+    /// *booted* session: `ae file.md` launches install the session directly, never passing
+    /// through `adopt_switch`, so the shells call this once after boot. `jumped` = the launch
+    /// carried a jump target (`ae file:line`), which lands in the editor like any other jump.
+    pub fn boot_read_presentation(&mut self, jumped: bool) -> Effects {
+        self.open_route_jumped = jumped;
+        self.sync_read_on_switch()
+    }
+
+    /// [`Self::boot_read_presentation`] with an explicit read/source choice, overriding the
+    /// open-route rules: the web shell records the current presentation in the URL (`view=`),
+    /// so a refresh restores exactly what was on screen — the `#line:col` cursor restore in the
+    /// same URL must not read as a jump-shaped open (docs/markdown-view.md §1.6).
+    pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Effects {
+        self.read_pref.insert(self.buffer.buffer_id, read);
+        self.boot_read_presentation(false)
+    }
+
+    /// Enter the reading view on the current buffer: flip the mode and fetch the full content
+    /// (the parse adopts via [`Event::ReadContent`]).
+    fn begin_read(&mut self) -> Effects {
+        self.mode = Mode::Read;
+        self.pending = Pending::None;
+        self.count = None;
+        self.sneak = None;
+        self.read = Some(ReadView::loading(self.buffer.buffer_id));
+        let buffer_id = self.buffer.buffer_id;
+        self.request_str::<BufferContent>(BufferContentParams { buffer_id }, Event::ReadContent)
+    }
+
+    /// Ask the server to highlight every fenced code block of the freshly parsed document —
+    /// tree-sitter lives server-side, so this is the reading view's route to editor-grade code
+    /// colour (docs/markdown-view.md §2.8). One request per fence; results adopt via
+    /// [`Event::ReadHighlights`] and paint in as they land.
+    fn read_fence_requests(&mut self) -> Effects {
+        let fences = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let mut fences = crate::markdown::fenced_code_blocks(&read.blocks);
+            // Sanity cap — no real document has hundreds of fences, but a pathological one
+            // shouldn't turn into a request storm.
+            fences.truncate(200);
+            fences
+        };
+        let (buffer_id, revision) = {
+            let read = self.read.as_ref().expect("checked above");
+            (read.buffer_id, read.revision)
+        };
+        let mut fx = Effects::none();
+        for (span, language, text) in fences {
+            let block_start = span.start;
+            fx = fx.and(self.request_str::<SyntaxHighlightSnippet>(
+                SyntaxHighlightSnippetParams { language, text },
+                move |result| Event::ReadHighlights {
+                    buffer_id,
+                    revision,
+                    block_start,
+                    result,
+                },
+            ));
+        }
+        fx
+    }
+
+    /// Re-fetch the reading view's content (an external change notified a newer revision). The
+    /// `loading` flag debounces: a fetch already in flight will chase the newest revision itself
+    /// when it adopts.
+    fn refetch_read_content(&mut self) -> Effects {
+        let Some(read) = self.read.as_mut() else {
+            return Effects::none();
+        };
+        if read.loading {
+            return Effects::none();
+        }
+        read.loading = true;
+        let buffer_id = read.buffer_id;
+        self.request_str::<BufferContent>(BufferContentParams { buffer_id }, Event::ReadContent)
+    }
+
+    /// React to a change signal for `buffer_id` at `revision`: when the reading view shows that
+    /// buffer at an older revision, re-fetch (docs/markdown-view.md §3.1).
+    fn maybe_refresh_read(&mut self, buffer_id: BufferId, revision: u64) -> Effects {
+        let stale = self
+            .read
+            .as_ref()
+            .is_some_and(|r| r.buffer_id == buffer_id && revision > r.revision);
+        if stale {
+            self.refetch_read_content()
+        } else {
+            Effects::none()
+        }
     }
 
     /// Adopt the result of a `viewport/subscribe` the shell issued: install the viewport binding
@@ -1895,6 +2084,9 @@ impl Session {
                 Some((idx, rel)) => (Some(idx), Some(rel), None),
                 None => (None, None, Some(path)),
             };
+        // A jump-shaped open (a grep hit, a reference) is a working context — it lands in the
+        // editor even when the target is markdown (docs/markdown-view.md §1.6).
+        self.open_route_jumped = jump_to.is_some();
         self.request_str::<BufferOpen>(
             BufferOpenParams {
                 path_index,
@@ -4074,7 +4266,21 @@ impl Session {
                     git_status: p.git_status,
                     lines: p.replacement_lines,
                 });
-                Effects::one(Effect::WindowAdopted)
+                // An in-window edit is also a change signal for the reading view.
+                let read_fx = self.maybe_refresh_read(self.buffer.buffer_id, p.revision);
+                Effects::one(Effect::WindowAdopted).and(read_fx)
+            }
+            BufferChanged::NAME => {
+                // The revision-only change signal for edits outside the pushed window — the
+                // reading view's cue to re-fetch (docs/markdown-view.md §3). Editor rendering
+                // ignores it (the window on screen is untouched by an out-of-window edit).
+                let Ok(p) = serde_json::from_value::<BufferChangedParams>(n.params) else {
+                    return Effects::none();
+                };
+                if p.buffer_id == self.buffer.buffer_id {
+                    self.buffer.revision = p.revision;
+                }
+                self.maybe_refresh_read(p.buffer_id, p.revision)
             }
             BufferState::NAME => {
                 let Ok(p) = serde_json::from_value::<BufferStateParams>(n.params) else {
@@ -4460,7 +4666,7 @@ impl Session {
     /// Esc in the prompt: restore the pre-prompt search (query + server state), cursor, and
     /// (via the effect) the shell's scroll anchor.
     pub fn abort_search(&mut self) -> Effects {
-        self.mode = Mode::Normal;
+        self.mode = self.search_return_mode();
         self.search.extend_to_cursor = false;
         self.history.reset();
         self.search.chip_selected = None;
@@ -4522,8 +4728,18 @@ impl Session {
         self.history.reset();
         self.search.extend_to_cursor = false;
         self.search.chip_selected = None;
-        self.mode = Mode::Normal;
+        self.mode = self.search_return_mode();
         fx
+    }
+
+    /// The mode leaving the search prompt returns to: Read when the buffer is displayed as a
+    /// reading view (search entered from Read returns to Read), Normal otherwise.
+    fn search_return_mode(&self) -> Mode {
+        if self.read.is_some() {
+            Mode::Read
+        } else {
+            Mode::Normal
+        }
     }
 
     /// `n`/`Alt-n`: step match-to-match; with no active search, revive the most recent
@@ -5376,6 +5592,9 @@ impl Session {
             Mode::Normal => Some(HintCtx::Normal),
             Mode::Insert => Some(HintCtx::Insert),
             Mode::Search => Some(HintCtx::Search),
+            // No Read-context hints yet (a curriculum entry is reading-view polish); the corner
+            // stays quiet while reading.
+            Mode::Read => None,
         }
     }
 
@@ -5554,6 +5773,9 @@ impl Session {
         // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
         // rendering the corner hint when it's off.
         self.hints_enabled = settings.hints;
+        // The markdown-read default only affects future opens; the current buffer's presentation
+        // isn't retroactively flipped.
+        self.markdown_read_default = settings.markdown_read;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
@@ -5608,6 +5830,12 @@ impl Session {
             }
             // Hints: same flip (and toast) as `Space Alt-h`.
             AppSettingId::Hints => self.toggle_hints(),
+            // Markdown reading view default: applies to future opens (`Space v` flips the
+            // current buffer); flip + persist.
+            AppSettingId::MarkdownRead => {
+                self.markdown_read_default = !self.markdown_read_default;
+                self.persist_app_settings()
+            }
         }
     }
 
@@ -5635,6 +5863,7 @@ impl Session {
             buffer_font_size: self.buffer_font_size,
             ui_font_size: self.ui_font_size,
             hints: self.hints_enabled,
+            markdown_read: self.markdown_read_default,
         }
     }
 
@@ -6084,9 +6313,9 @@ impl Session {
             Pending::None => {}
         }
 
-        // Count lexer (Normal mode): digits accumulate; `0` only continues a count (it's
-        // line-start otherwise).
-        if self.mode == Mode::Normal && !mods.ctrl && !mods.alt {
+        // Count lexer (Normal and Read modes): digits accumulate; `0` only continues a count
+        // (it's line-start otherwise).
+        if matches!(self.mode, Mode::Normal | Mode::Read) && !mods.ctrl && !mods.alt {
             if let KeyCode::Char(c) = code {
                 if c.is_ascii_digit() && (c != '0' || self.count.is_some()) {
                     let d = c.to_digit(10).unwrap();
@@ -6100,14 +6329,21 @@ impl Session {
         // bindings match any modifier). It just moves the caret.
         let extend = mods.shift && self.mode != Mode::Insert;
 
-        // Global table first (mode-identical Ctrl shortcuts), then the mode's own.
+        // Global table first (mode-identical Ctrl shortcuts), then the mode's own. Read mode
+        // skips Global entirely — its chords are edits (undo, indent, move lines), and the
+        // reading view is read-only by construction (docs/markdown-view.md §1.4).
         let ctx = match self.mode {
             Mode::Normal => KeyContext::Normal,
             Mode::Insert => KeyContext::Insert,
+            Mode::Read => KeyContext::Read,
             Mode::Search => return Effects::none(), // handled above
         };
-        if let Some(b) = lookup(KeyContext::Global, code, mods).or_else(|| lookup(ctx, code, mods))
-        {
+        let global = if self.mode == Mode::Read {
+            None
+        } else {
+            lookup(KeyContext::Global, code, mods)
+        };
+        if let Some(b) = global.or_else(|| lookup(ctx, code, mods)) {
             return self.run_action(b.action, count, extend, visible_rows);
         }
 
@@ -6743,7 +6979,468 @@ impl Session {
                     Event::DiagNav,
                 )
             }
+
+            // ---- markdown reading view (docs/markdown-view.md) ----
+            A::ToggleReadView => self.toggle_read_view(),
+            A::ReadStep(dir) => {
+                self.read_step(dir == Direction::Forward, count, crate::markdown::Element::is_block)
+            }
+            A::ReadStepLink(dir) => {
+                self.read_step_link_in_block(dir == Direction::Forward, count)
+            }
+            A::ReadShowTarget => self.read_show_target(),
+            A::ReadStepHeading(dir) => self.read_step(dir == Direction::Forward, count, |e| {
+                matches!(e, crate::markdown::Element::Heading { .. })
+            }),
+            A::ReadEnds { last } => self.read_ends(last),
+            A::ReadActivate => self.read_activate(),
+            A::ReadActivateNewWindow => self.read_activate_new_window(),
+            A::ReadCopy => self.read_copy(),
         }
+    }
+
+    /// Toggle the reading view on the current buffer (`Space v`). The choice is remembered per
+    /// buffer for the session; non-markdown buffers toast instead.
+    fn toggle_read_view(&mut self) -> Effects {
+        if self.read.is_some() {
+            self.read_pref.insert(self.buffer.buffer_id, false);
+            self.read = None;
+            if self.mode == Mode::Read {
+                self.mode = Mode::Normal;
+            }
+            // The editor window stayed subscribed throughout — just frame the reading position.
+            return Effects::one(Effect::RevealCursor(RevealStyle::Jump));
+        }
+        if self.buffer.language.as_deref() != Some("markdown") {
+            return Effects::toast_grouped(
+                "Reading view is for Markdown buffers",
+                ToastKind::Info,
+                "read-view",
+            );
+        }
+        self.read_pref.insert(self.buffer.buffer_id, true);
+        self.begin_read()
+    }
+
+    /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
+    /// move the server cursor to the landed element's start: focus is derived from the cursor, so
+    /// the `Goto` *is* the focus change (docs/markdown-view.md §1.3). Quiet no-op at the ends.
+    fn read_step(
+        &mut self,
+        forward: bool,
+        count: u32,
+        pred: impl Fn(&crate::markdown::Element) -> bool,
+    ) -> Effects {
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(mut idx) = read.focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            // Stepping is class-relative: when the derived focus doesn't match the predicate (a
+            // focused link while stepping blocks), anchor at the innermost *matching* element
+            // containing the cursor. Without this a lone-link paragraph traps `k`: the Goto to
+            // the paragraph start re-derives focus to the link (innermost at that byte), and
+            // stepping back from the link finds its own containing paragraph, forever.
+            if !pred(&read.elements[idx]) {
+                let byte = read.byte_of(self.buffer.cursor.position);
+                if let Some(c) = crate::markdown::containing_element(&read.elements, byte, &pred)
+                {
+                    idx = c;
+                }
+            }
+            let mut moved = None;
+            for _ in 0..count.max(1) {
+                match crate::markdown::step_element(&read.elements, idx, forward, &pred) {
+                    Some(next) => {
+                        idx = next;
+                        moved = Some(next);
+                    }
+                    None => break,
+                }
+            }
+            let Some(idx) = moved else {
+                return Effects::none();
+            };
+            // Land outside any leading interactive span, so the step selects the block alone
+            // (the bar) — `l` opts into its links (docs/markdown-view.md §2.3).
+            read.pos_of(crate::markdown::block_rest_byte(&read.elements, idx))
+        };
+        self.move_motion(Motion::Goto { position: target }, false)
+    }
+
+    /// `h`/`l`: step the Enter target among the interactive elements *inside the focused
+    /// block* (docs/markdown-view.md §2.3). `l` with no target selects the block's first
+    /// interactive; `h` from the first steps back *out* — the cursor returns to the block's
+    /// rest byte, so the bar stands alone again. Past the last link, and `h` with nothing
+    /// selected, are quiet no-ops, like `j`/`k` at the document's ends.
+    fn read_step_link_in_block(&mut self, forward: bool, count: u32) -> Effects {
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let cursor = self.buffer.cursor.position;
+            let Some(block) = read.block_focus(cursor) else {
+                return Effects::none();
+            };
+            let ring = crate::markdown::interactive_within(
+                &read.elements,
+                read.elements[block].span(),
+            );
+            let Some(last) = ring.len().checked_sub(1) else {
+                return Effects::none();
+            };
+            let current = read
+                .target_focus(cursor)
+                .and_then(|t| ring.iter().position(|&i| i == t));
+            let steps = count.max(1) as usize;
+            let next = if forward {
+                match current {
+                    Some(p) if p >= last => return Effects::none(),
+                    Some(p) => Some((p + steps).min(last)),
+                    None => Some((steps - 1).min(last)),
+                }
+            } else {
+                match current {
+                    None => return Effects::none(),
+                    // Stepping back past the first element deselects: the block alone.
+                    Some(p) if p < steps => None,
+                    Some(p) => Some(p - steps),
+                }
+            };
+            let byte = match next {
+                Some(i) => read.elements[ring[i]].span().start,
+                None => crate::markdown::block_rest_byte(&read.elements, block),
+            };
+            read.pos_of(byte)
+        };
+        self.move_motion(Motion::Goto { position: target }, false)
+    }
+
+    /// `Tab`: show the focused element's target without following it — a link's URL, an
+    /// image's source, a footnote's definition text — in the hover popover (the editor's
+    /// Tab-reveals-hover at reading grain; the popover's own keys apply, so `Ctrl-c` copies
+    /// the shown target via `keymap::hover_action`). Quiet no-op on plain blocks, like
+    /// `Enter`.
+    fn read_show_target(&mut self) -> Effects {
+        let text = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            match &read.elements[idx] {
+                crate::markdown::Element::Link { href, .. } => href.clone(),
+                crate::markdown::Element::Image { src, .. } => src.clone(),
+                crate::markdown::Element::FootnoteRef { label, .. } => {
+                    match crate::markdown::footnote_def_span(&read.blocks, label) {
+                        Some(span) => read.slice(span).trim_end().to_string(),
+                        None => format!("No definition for footnote [{label}]"),
+                    }
+                }
+                _ => return Effects::none(),
+            }
+        };
+        Effects::one(Effect::ShowHover(HoverText::Blocks(vec![HoverBlock {
+            severity: None,
+            text,
+        }])))
+    }
+
+    /// A pointer press on the reading view: the shell hit-tests its own rendering to a source
+    /// byte (an element's span start) and the core moves the server cursor there — focus then
+    /// derives from the cursor exactly like a keyboard step (docs/markdown-view.md §1.3), so
+    /// clicking a block sets the reading selection in every shell through one path.
+    pub fn read_click(&mut self, byte: u32) -> Effects {
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            if read.loading && read.text.is_empty() {
+                return Effects::none();
+            }
+            read.pos_of(byte)
+        };
+        self.move_motion(Motion::Goto { position: target }, false)
+    }
+
+    /// A pointer press that landed ON an interactive element — the shells route clicks on
+    /// their rendered link/image/footnote nodes here, so `byte` is that element's span start:
+    /// focus it like [`Self::read_click`], then follow links and footnote references like
+    /// `Enter` — pointing at a target and clicking should act. Images stay arm-only (`Enter`
+    /// opens them externally, which a stray click shouldn't).
+    pub fn read_click_activate(&mut self, byte: u32) -> Effects {
+        let follow = self.read.as_ref().and_then(|read| {
+            read.elements.iter().position(|e| {
+                e.span().start == byte
+                    && matches!(
+                        e,
+                        crate::markdown::Element::Link { .. }
+                            | crate::markdown::Element::FootnoteRef { .. }
+                    )
+            })
+        });
+        let fx = self.read_click(byte);
+        match follow {
+            Some(idx) => fx.and(self.read_activate_element(idx)),
+            None => fx,
+        }
+    }
+
+    /// Ctrl-click on a link — the pointer sibling of `Ctrl-Enter`: a *relative-path* link
+    /// opens in a new window (GUI) / app tab (web); anything else falls back to the plain
+    /// click-follow.
+    pub fn read_click_new_window(&mut self, byte: u32) -> Effects {
+        let href = self.read.as_ref().and_then(|read| {
+            read.elements.iter().find_map(|e| match e {
+                crate::markdown::Element::Link { span, href }
+                    if span.start == byte && !href.starts_with('#') && !has_url_scheme(href) =>
+                {
+                    Some(href.clone())
+                }
+                _ => None,
+            })
+        });
+        match href {
+            Some(href) => {
+                let fx = self.read_click(byte);
+                fx.and(self.read_open_link_new_window(&href))
+            }
+            None => self.read_click_activate(byte),
+        }
+    }
+
+    /// `g` / `Alt-g`: the first / last block-grain element.
+    fn read_ends(&mut self, last: bool) -> Effects {
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let mut blocks = read
+                .elements
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.is_block());
+            let el = if last { blocks.next_back() } else { blocks.next() };
+            let Some((idx, _)) = el else {
+                return Effects::none();
+            };
+            read.pos_of(crate::markdown::block_rest_byte(&read.elements, idx))
+        };
+        self.move_motion(Motion::Goto { position: target }, false)
+    }
+
+    /// `Enter`: follow the focused element — open a link (external → system handler, `#anchor` →
+    /// the heading, relative path → open in Aether), open an image externally, or jump to a
+    /// footnote's definition. No-op on non-interactive blocks (docs/markdown-view.md §2.3).
+    fn read_activate(&mut self) -> Effects {
+        let idx = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            idx
+        };
+        self.read_activate_element(idx)
+    }
+
+    /// Follow element `idx` — the shared body of `Enter` and a pointer click on a link or
+    /// footnote reference.
+    fn read_activate_element(&mut self, idx: usize) -> Effects {
+        enum Act {
+            Link(String),
+            Image(String),
+            Footnote(LogicalPosition),
+        }
+        let act = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            match &read.elements[idx] {
+                crate::markdown::Element::Link { href, .. } => Act::Link(href.clone()),
+                crate::markdown::Element::Image { src, .. } => Act::Image(src.clone()),
+                crate::markdown::Element::FootnoteRef { label, .. } => {
+                    let Some(span) = crate::markdown::footnote_def_span(&read.blocks, label)
+                    else {
+                        return Effects::toast_grouped(
+                            format!("No definition for footnote [{label}]"),
+                            ToastKind::Warning,
+                            "read-view",
+                        );
+                    };
+                    Act::Footnote(read.pos_of(span.start))
+                }
+                _ => return Effects::none(),
+            }
+        };
+        match act {
+            Act::Link(href) => self.read_follow_link(&href),
+            Act::Image(src) => {
+                // A remote image opens as the URL itself — resolving it against the buffer's
+                // directory would fabricate a path like `/docs/https:/…`.
+                let lower = src.to_ascii_lowercase();
+                if lower.starts_with("http://") || lower.starts_with("https://") {
+                    return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(src)));
+                }
+                if has_url_scheme(&src) {
+                    return Effects::toast_grouped(
+                        format!("Can't open image source {src}"),
+                        ToastKind::Warning,
+                        "read-view",
+                    );
+                }
+                // An absolute source can't ride the asset route (it's relative-only);
+                // the natives still open it, the web no-ops like its placeholder rendering.
+                if src.starts_with('/') {
+                    return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(src)));
+                }
+                match self.read_resolve_path(&src) {
+                    Some(absolute) => {
+                        Effects::one(Effect::ShellAction(ShellAction::OpenBufferFile {
+                            absolute,
+                            buffer_id: self.buffer.buffer_id,
+                            relative: src,
+                        }))
+                    }
+                    None => Effects::toast_grouped(
+                        "Can't resolve the image path",
+                        ToastKind::Warning,
+                        "read-view",
+                    ),
+                }
+            }
+            Act::Footnote(pos) => self.move_motion(Motion::Goto { position: pos }, false),
+        }
+    }
+
+    /// `Ctrl-Enter`: the picker's open-in-new-window at reading grain — a *relative-path*
+    /// link opens in a new window (GUI) / app tab (web) via [`ShellAction::NewWindow`];
+    /// everything else (external links, anchors, images, plain blocks) behaves like `Enter`.
+    fn read_activate_new_window(&mut self) -> Effects {
+        let href = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            match &read.elements[idx] {
+                crate::markdown::Element::Link { href, .. }
+                    if !href.starts_with('#') && !has_url_scheme(href) =>
+                {
+                    href.clone()
+                }
+                _ => return self.read_activate(),
+            }
+        };
+        self.read_open_link_new_window(&href)
+    }
+
+    /// Open a relative-path link target in a new window/tab (the tail of `Ctrl-Enter` and
+    /// Ctrl-click). Callers have already filtered anchors and schemed URLs out.
+    fn read_open_link_new_window(&mut self, href: &str) -> Effects {
+        let path_part = href.split('#').next().unwrap_or(href);
+        let Some(path) = self.read_resolve_path(path_part) else {
+            return Effects::toast_grouped(
+                "Can't resolve the link target",
+                ToastKind::Warning,
+                "read-view",
+            );
+        };
+        let workspace = (!aether_protocol::is_ephemeral_workspace_id(&self.workspace))
+            .then(|| self.workspace.clone());
+        Effects::one(Effect::ShellAction(ShellAction::NewWindow(WindowTarget {
+            workspace,
+            open: WindowOpen::Path { path, at: None },
+        })))
+    }
+
+    /// Follow a link target from the reading view (docs/markdown-view.md §2.4).
+    fn read_follow_link(&mut self, href: &str) -> Effects {
+        let lower = href.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+        {
+            return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(href.to_string())));
+        }
+        if let Some(slug) = href.strip_prefix('#') {
+            // In-document anchor: focus the heading (GitHub slug rules).
+            let target = {
+                let Some(read) = self.read.as_ref() else {
+                    return Effects::none();
+                };
+                let Some(idx) = crate::markdown::heading_by_slug(&read.elements, slug) else {
+                    return Effects::toast_grouped(
+                        format!("No heading matches #{slug}"),
+                        ToastKind::Warning,
+                        "read-view",
+                    );
+                };
+                read.pos_of(read.elements[idx].span().start)
+            };
+            return self.move_motion(Motion::Goto { position: target }, false);
+        }
+        // An unhandled scheme (`ftp:`, `tel:`, …): say so rather than treating it as a relative
+        // path and opening a bogus buffer named after the URL.
+        if has_url_scheme(href) {
+            return Effects::toast_grouped(
+                format!("Can't open {href}"),
+                ToastKind::Warning,
+                "read-view",
+            );
+        }
+        // A path, possibly with a `#fragment` (dropped in v1 — cross-file anchors are a polish
+        // item). File-shaped, so a markdown target opens as a reading view: a doc tree browses
+        // like a wiki, and `Alt-Left`/Backspace walks back (nav-recorded like any preview open).
+        let path_part = href.split('#').next().unwrap_or(href);
+        match self.read_resolve_path(path_part) {
+            Some(path) => self.open_path_at(path, None, None),
+            None => Effects::toast_grouped(
+                "Can't resolve the link target",
+                ToastKind::Warning,
+                "read-view",
+            ),
+        }
+    }
+
+    /// Resolve a (possibly relative) link/image target against the buffer's directory. `None`
+    /// for a scratch buffer with a relative target. Callers scheme-check first — a URL joined
+    /// onto the buffer directory is never meaningful.
+    fn read_resolve_path(&self, target: &str) -> Option<String> {
+        if target.starts_with('/') {
+            return Some(target.to_string());
+        }
+        let parent = std::path::Path::new(self.buffer.path.as_deref()?).parent()?;
+        Some(parent.join(target).to_string_lossy().into_owned())
+    }
+
+    /// `y`: copy the focused element — a link's URL, otherwise its markdown source.
+    fn read_copy(&mut self) -> Effects {
+        let (text, what) = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            match &read.elements[idx] {
+                crate::markdown::Element::Link { href, .. } => (href.clone(), "link URL"),
+                el => (read.slice(el.span()).trim_end().to_string(), "element source"),
+            }
+        };
+        if text.is_empty() {
+            return Effects::none();
+        }
+        let mut fx = Effects::toast_grouped(
+            format!("Copied {what}"),
+            ToastKind::Success,
+            "read-copy",
+        );
+        fx.push(Effect::WriteClipboard(text));
+        fx
     }
 
     fn move_motion(&mut self, motion: Motion, extend: bool) -> Effects {
@@ -6984,6 +7681,23 @@ fn seeded_filters_for_switch(
 /// Ask the shell for the system clipboard; the text comes back as `ClipboardRead`.
 fn read_clipboard_fx(kind: PasteKind) -> Effects {
     Effects::one(Effect::ReadClipboard(kind))
+}
+
+/// True when a markdown link/image target starts with a URL scheme (RFC 3986: a letter, then
+/// letters/digits/`+`/`.`/`-`, then `:`) — anything schemed is *not* a buffer-relative path.
+fn has_url_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    for c in chars {
+        match c {
+            ':' => return true,
+            c if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The toast to show when a cursor-relative LSP request (hover / goto-definition) couldn't run

@@ -55,7 +55,7 @@ const HL_CLASS: Record<string, string> = {
   "text.strong": "strong",
 };
 
-function highlightClass(kind: string): string | null {
+export function highlightClass(kind: string): string | null {
   let k = kind;
   while (k.length > 0) {
     const cls = HL_CLASS[k];

@@ -13,7 +13,8 @@ use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
 use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{
-    BufferClose, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave, BufferSetTransient,
+    BufferClose, BufferContent, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave,
+    BufferSetTransient,
 };
 use aether_protocol::cursor::{
     CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine, CursorSelectWord, CursorSet,
@@ -44,6 +45,7 @@ use aether_protocol::picker::{
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
+use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
@@ -416,6 +418,10 @@ async fn dispatch(
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
         BufferSetTransient::NAME => run!(BufferSetTransient, handlers::buffer_set_transient),
         BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
+        BufferContent::NAME => run!(BufferContent, handlers::buffer_content),
+        SyntaxHighlightSnippet::NAME => {
+            run!(SyntaxHighlightSnippet, handlers::syntax_highlight_snippet)
+        }
         NavStep::NAME => run!(NavStep, handlers::nav_step),
         NavGoto::NAME => run!(NavGoto, handlers::nav_goto),
         SearchSet::NAME => run!(SearchSet, handlers::search_set),

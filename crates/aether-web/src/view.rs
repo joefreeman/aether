@@ -59,6 +59,45 @@ pub fn build_view(s: &Session) -> Value {
             let (before, keys, after) = h.parts();
             json!({ "before": before, "keys": keys, "after": after })
         }),
+        "read": read_view(s),
+    })
+}
+
+/// The markdown reading view (docs/markdown-view.md), when active. The shell renders `blocks`
+/// (the shared markdown AST, same shape hover uses) and marks the node whose source span equals
+/// `focus_span` with the position bar and the `target_span` node with the target pill — both
+/// derived core-side from the one server cursor, so the shell carries no focus state of its
+/// own. `focus_span` is block-grain (always present for a non-empty document); `target_span`
+/// is the interactive span the cursor sits inside, absent otherwise.
+fn read_view(s: &Session) -> Value {
+    let Some(read) = &s.read else {
+        return Value::Null;
+    };
+    let span_json = |sp: aether_client::markdown::Span| json!({ "start": sp.start, "end": sp.end });
+    let block = read
+        .block_focus(s.buffer.cursor.position)
+        .map(|i| read.elements[i].span());
+    let target = read
+        .target_focus(s.buffer.cursor.position)
+        .map(|i| read.elements[i].span());
+    json!({
+        "loading": read.loading,
+        "blocks": jv(&read.blocks),
+        "focus_span": block.map(span_json),
+        "target_span": target.map(span_json),
+        "buffer_id": read.buffer_id,
+        // Rebuild keys for the shell: the DOM is rebuilt only when the parsed content or the
+        // fence highlights change (focus changes just re-mark), so images aren't re-fetched on
+        // unrelated re-renders.
+        "revision": read.revision,
+        "hl_gen": read.hl_gen,
+        // Fenced-code tree-sitter runs, keyed by the fence's span start (as a string — JSON
+        // object keys). The shell styles them with the editor's own `hl-*` classes.
+        "code_highlights": read
+            .code_highlights
+            .iter()
+            .map(|(k, v)| (k.to_string(), jv(v)))
+            .collect::<serde_json::Map<String, Value>>(),
     })
 }
 
@@ -310,6 +349,7 @@ fn mode(m: Mode) -> &'static str {
         Mode::Normal => "normal",
         Mode::Insert => "insert",
         Mode::Search => "search",
+        Mode::Read => "read",
     }
 }
 

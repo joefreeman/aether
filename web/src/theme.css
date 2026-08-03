@@ -111,6 +111,38 @@ html, body, #app {
   font-display: swap;
 }
 
+/* Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body face
+   (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold (600) for headings, Bold for
+   strong runs — all bundled so reading looks the same on every machine. */
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("./fonts/SourceSerif4-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("./fonts/SourceSerif4-It.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("./fonts/SourceSerif4-Semibold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("./fonts/SourceSerif4-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 #buffer {
   flex: 1 1 auto;
   overflow-y: auto; /* native vertical scrolling over the full-height spacer (virtual scroll) */
@@ -322,6 +354,13 @@ html, body, #app {
 /* Markdown hover (LSP). A flex column with a uniform `gap` matches the native client's markdown
    inter-element spacing; heading/base/code sizes match it too, and headings are white (not tinted)
    like native. */
+/* Reading-view placement (`Tab` target reveal): fixed bottom-left over the document — no
+   spacer/sticky machinery; left/bottom are set inline from the buffer rect. */
+#hover.hover-read {
+  position: fixed;
+  top: auto;
+}
+
 #hover.markdown {
   white-space: normal;
   display: flex;
@@ -1099,3 +1138,216 @@ a.picker-row:not(.selected):hover .picker-main {
 .hl-reference { color: var(--nord8); }
 .hl-emphasis { font-style: italic; }
 .hl-strong { font-weight: bold; }
+
+/* ---- markdown reading view (docs/markdown-view.md §2.8) --------------------------------------- */
+
+/* The buffer element hosts a typographic document instead of the row grid while reading. The
+   grid's `white-space: pre` must not leak in (it would kill paragraph wrapping), and native text
+   selection is deliberately re-enabled — reading is where select-to-copy belongs. */
+#buffer.md-read-host {
+  font-family: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
+  /* No font-size of its own: the document renders at the *editor* text size (the buffer
+     font-size set on #app), so the buffer-font-size setting governs reading too. */
+  line-height: 1.65;
+  white-space: normal;
+  cursor: default;
+  user-select: text;
+}
+
+.md-read {
+  /* Relative to the buffer font size (inherited — the host sets none of its own), so a bigger
+     type setting keeps the same ~characters-per-line. Matches the native READ_MEASURE_EM;
+     42.5 × the 16px default = the original 680px. */
+  max-width: 42.5em;
+  margin: 0 auto;
+  padding: 1.5rem 1rem;
+  color: var(--nord4);
+}
+
+.md-read-loading {
+  color: var(--nord3-bright);
+  font-style: italic;
+}
+
+.md-read h1,
+.md-read h2,
+.md-read h3,
+.md-read h4,
+.md-read h5,
+.md-read h6 {
+  line-height: 1.25;
+  margin: 1.6em 0 0.5em;
+  font-weight: 600; /* the bundled Semibold face */
+}
+/* The terminal's heading colour ladder: frost blue majors, teal H3, white H4, body-grey
+   H5/H6 — colour distinguishes the minor levels, which share the 1.1em size. */
+.md-read h1, .md-read h2 { color: var(--nord8); }
+.md-read h3 { color: var(--nord7); }
+.md-read h4 { color: var(--nord6); }
+.md-read h5, .md-read h6 { color: var(--nord4); }
+.md-read h1 { font-size: 1.75em; }
+.md-read h2 { font-size: 1.45em; border-bottom: 1px solid var(--nord2); padding-bottom: 0.2em; }
+.md-read h3 { font-size: 1.25em; }
+.md-read h4, .md-read h5, .md-read h6 { font-size: 1.1em; }
+.md-read > :first-child { margin-top: 0; }
+
+.md-read p { margin: 0.7em 0; }
+.md-read ul, .md-read ol { margin: 0.7em 0; padding-left: 1.6em; }
+.md-read li::marker { color: var(--nord4); }
+.md-read li { margin: 0.25em 0; }
+.md-read li.md-task { list-style: none; margin-left: -1.3em; }
+.md-read li.md-task > p { display: inline; } /* checkbox and text share the line */
+.md-read .md-task-box { color: var(--nord4); margin-right: 0.45em; }
+.md-read li.md-task-done { color: var(--nord3-brighter); }
+
+.md-read code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.85em;
+  background: var(--nord1);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+}
+
+.md-read .md-codeblock {
+  background: var(--nord1);
+  border-radius: 6px;
+  margin: 0.9em 0;
+  /* no overflow clip: the focus bar renders outside the box; the <pre> scrolls itself */
+}
+.md-read .md-codeblock-lang {
+  color: var(--nord3-brighter);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.75em;
+  padding: 0.4em 0.9em 0;
+}
+.md-read .md-codeblock pre {
+  margin: 0;
+  padding: 0.6em 0.9em 0.7em;
+  overflow-x: auto;
+}
+.md-read .md-codeblock code {
+  background: none;
+  padding: 0;
+  font-size: 0.85em;
+}
+.md-read .md-rawhtml,
+.md-read .md-front-matter {
+  color: var(--nord3-bright);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.8em;
+  background: none;
+  border-left: 2px solid var(--nord2);
+  padding: 0.2em 0 0.2em 0.8em;
+  margin: 0.9em 0;
+  white-space: pre-wrap;
+}
+
+.md-read blockquote {
+  margin: 0.9em 0;
+  padding: 0.4em 0.9em;
+  border-left: 3px solid var(--nord3);
+  color: var(--nord4);
+}
+.md-read blockquote > :first-child { margin-top: 0.2em; }
+.md-read blockquote > :last-child { margin-bottom: 0.2em; }
+.md-read blockquote.md-alert { border-left-width: 3px; }
+.md-read .md-alert-label { font-weight: 650; margin-top: 0.4em; }
+.md-read .md-alert-note { border-left-color: var(--nord8); }
+.md-read .md-alert-note .md-alert-label { color: var(--nord8); }
+.md-read .md-alert-tip { border-left-color: var(--nord14); }
+.md-read .md-alert-tip .md-alert-label { color: var(--nord14); }
+.md-read .md-alert-important { border-left-color: var(--nord15); }
+.md-read .md-alert-important .md-alert-label { color: var(--nord15); }
+.md-read .md-alert-warning { border-left-color: var(--nord13); }
+.md-read .md-alert-warning .md-alert-label { color: var(--nord13); }
+.md-read .md-alert-caution { border-left-color: var(--nord11); }
+.md-read .md-alert-caution .md-alert-label { color: var(--nord11); }
+
+/* The rule sits in a stamped, padded wrapper so the focus bar has height to stand next to
+   (top/bottom-inset ::before on a bare 1px <hr> collapses to nothing). */
+.md-read .md-rule {
+  padding: 0.55em 0;
+  margin: 0.85em 0;
+}
+.md-read hr {
+  border: none;
+  border-top: 1px solid var(--nord2);
+  margin: 0;
+}
+
+.md-read .md-table-outer { margin: 0.9em 0; }
+.md-read .md-table-scroll { overflow-x: auto; }
+.md-read table { border-collapse: collapse; font-size: 0.95em; }
+.md-read th, .md-read td {
+  border: 1px solid var(--nord2);
+  padding: 0.35em 0.75em;
+  text-align: left;
+}
+.md-read th { color: var(--nord6); background: var(--nord1); }
+.md-read tbody tr:nth-child(even) { background: color-mix(in srgb, var(--nord1) 40%, transparent); }
+
+.md-read a.md-link { color: var(--nord8); text-decoration: underline; text-underline-offset: 2px; }
+.md-read a.md-link:hover { color: var(--nord7); }
+.md-read a.md-link-internal { color: var(--nord9); cursor: default; }
+/* Cross-file targets carry a real app href (picker-row treatment) — read as clickable. */
+/* Every link and footnote ref acts on click (follows like Enter), href or not — so they all
+   read as clickable. The refs stay <sup>, not <a>: they don't carry URL state. */
+.md-read a.md-link,
+.md-read sup.md-footnote-ref { cursor: pointer; }
+
+.md-read .md-image { max-width: 100%; border-radius: 4px; margin: 0; display: block; }
+.md-read .md-image-inline { display: inline; margin: 0; vertical-align: middle; max-height: 1.5em; }
+.md-read .md-image-alt { color: var(--nord3-bright); }
+/* Display images live in a stamped wrapper (the bar/ring host — ::before can't render on a
+   replaced element); it shrinks to the image so the target ring hugs it. */
+.md-read .md-image-block { width: fit-content; max-width: 100%; margin: 0.9em 0; }
+
+.md-read .md-footnote-def { color: var(--nord3-brighter); font-size: 0.9em; margin: 0.5em 0; }
+.md-read .md-footnote-def p { display: inline; margin: 0; }
+.md-read .md-footnote-label { color: var(--nord9); }
+.md-read sup.md-footnote-ref { color: var(--nord9); font-size: 0.75em; }
+
+/* The reading cursor: a frost bar down the focused element's left edge (settled on after
+   trying background tints and full-window bands — the bar marks position without recolouring
+   the text or fighting the code/quote panels). */
+.md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
+    .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-focus {
+  position: relative;
+}
+.md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
+    .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-focus::before {
+  content: "";
+  position: absolute;
+  left: -0.9rem;
+  top: 0.15em;
+  bottom: 0.15em;
+  width: 3px;
+  background: var(--nord8);
+}
+/* List items: clear the list's indent plus the shared gutter, so top-level item bars line
+   up exactly with block bars (nested items step right one list-indent per level). */
+.md-read li.md-focus::before {
+  left: calc(-1.6em - 0.9rem);
+}
+/* The Enter target — the interactive span (link, footnote ref, image) the cursor sits inside —
+   inverts *on top of* the block bar: the bar says "you are reading here", the pill says "Enter
+   acts here". Two projections of the one server cursor; they usually differ (bar on the
+   paragraph, pill on its link) and coincide on a block image, which is both. */
+.md-read a.md-link.md-target,
+.md-read sup.md-target {
+  background: var(--nord8);
+  color: var(--nord0);
+  /* A 1px halo, not a padded lozenge: the pill hugs the text (outline is draw-only, so
+     arming shifts nothing). */
+  outline: 1px solid var(--nord8);
+  border-radius: 2px;
+  text-decoration: none;
+}
+/* An armed inline image keeps the full-weight ring — a 1px line vanishes against
+   image content. */
+.md-read img.md-target {
+  outline: 3px solid var(--nord8);
+  border-radius: 2px;
+}
+/* A targeted display image shows NO ring: block-grain selection is the position bar's job
+   (the wrapper hosts it); the pill/ring stays an inline-image affair. */

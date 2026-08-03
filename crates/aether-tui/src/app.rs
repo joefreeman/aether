@@ -209,6 +209,10 @@ pub struct AppState {
     /// early-return without touching state in that case; the no-workspace view (workspace picker)
     /// is rendered instead by `ui::draw`.
     pub editor: Option<EditorState>,
+    /// The markdown reading view (docs/markdown-view.md): when `Some`, `ui::draw` paints the
+    /// laid-out document instead of the editor window. Synced from the session each frame; the
+    /// layout itself is cached shell-side by `(buffer, revision, cols)`.
+    pub read: Option<ReadViewState>,
     /// Active workspace-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
     /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub workspace_settings: Option<WorkspaceSettingsState>,
@@ -225,6 +229,27 @@ pub struct AppState {
     pub hover: Option<HoverPopup>,
     /// Per-buffer diagnostic counts from `lsp/diagnostics_changed`, for the status-bar summary.
     pub diagnostic_counts: std::collections::HashMap<BufferId, DiagnosticCounts>,
+}
+
+/// The reading view's render model (docs/markdown-view.md §2.8): rows from the core's
+/// [`aether_client::read_layout`], plus focus/scroll geometry. The shell owns the scroll and the
+/// layout cache; `ui::draw_read_view` just paints.
+pub struct ReadViewState {
+    pub rows: std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
+    /// The reading position's bar as an inclusive layout-row range: the focused block's whole
+    /// subtree (a parent item's bar covers its nested items, matching the GUI/web wrappers).
+    /// `None` only while loading/empty.
+    pub bar_rows: Option<(usize, usize)>,
+    /// The Enter target (interactive-grain): the link/image/footnote-ref span the cursor sits
+    /// inside, inverted on top of the block tint. `None` unless the cursor is inside one.
+    pub target_focus: Option<usize>,
+    /// First visible layout row.
+    pub scroll: u16,
+    /// Per-code-block horizontal offsets by element index — code rows are unchunked and the
+    /// painter clips them to this window (docs/markdown-view.md §2.8).
+    pub hscroll: std::collections::HashMap<usize, u16>,
+    /// True while the first content fetch is still in flight (an empty page briefly).
+    pub loading: bool,
 }
 
 /// One block of hover-popup content. `severity` colors the block to match the gutter dot (for
@@ -891,6 +916,7 @@ mod tests {
             confirm_prompt: None,
             app_info: None,
             editor: None,
+            read: None,
             workspace_settings: None,
             app_settings: None,
             lsp_status: std::collections::HashMap::new(),
@@ -922,6 +948,7 @@ mod tests {
             confirm_prompt: None,
             app_info: None,
             editor: None,
+            read: None,
             workspace_settings: None,
             app_settings: None,
             lsp_status: std::collections::HashMap::new(),
@@ -956,6 +983,7 @@ mod tests {
             confirm_prompt: None,
             app_info: None,
             editor: Some(stub_editor_state("src/main.rs")),
+            read: None,
             workspace_settings: None,
             app_settings: None,
             lsp_status: std::collections::HashMap::new(),

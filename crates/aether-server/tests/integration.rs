@@ -2,7 +2,8 @@
 //! handshake and `buffer/open`.
 
 use aether_protocol::buffer::{
-    BufferClose, BufferCloseParams, BufferCloseResult, BufferClosed, BufferClosedParams,
+    BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferCloseResult,
+    BufferClosed, BufferClosedParams, BufferContent, BufferContentParams, BufferContentResult,
     BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
     BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
     BufferSetTransient, BufferSetTransientParams, BufferSetTransientResult, BufferState,
@@ -24522,6 +24523,351 @@ async fn setup_transient_workspace() -> (
 }
 
 /// `buffer/open` params for a file in the transient-workspace workspace.
+// ---- buffer/content + buffer/changed (markdown reading view support) ----------------------------
+
+#[tokio::test]
+async fn buffer_content_returns_full_text_and_tracks_revision() {
+    let (_server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\ngamma\n").await;
+
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 10, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "alpha\nbeta\ngamma\n");
+
+    // An edit bumps the revision; the next fetch reports it alongside the new text.
+    let r: EditResult = send_request::<InputText>(
+        &mut ws,
+        11,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: Some(SelectionEdge::Start),
+        },
+    )
+    .await;
+    let c2: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c2.revision, r.revision);
+    assert!(c2.revision > c.revision);
+    assert_eq!(c2.text, "Xalpha\nbeta\ngamma\n");
+}
+
+#[tokio::test]
+async fn buffer_content_unknown_buffer_errors() {
+    let (_server, mut ws, _buffer_id) = setup_with_buffer("x\n").await;
+    let msg = send_request_expect_err::<BufferContent>(
+        &mut ws,
+        10,
+        &BufferContentParams { buffer_id: 9999 },
+    )
+    .await;
+    assert!(
+        msg.to_lowercase().contains("buffer"),
+        "unexpected error message: {msg}"
+    );
+}
+
+/// `syntax/highlight_snippet`: stateless tree-sitter over a snippet — real captures for a known
+/// language, the fence alias table resolving short names, and an empty (not error) result for an
+/// unknown language (docs/markdown-view.md §2.8).
+#[tokio::test]
+async fn highlight_snippet_uses_registry_and_aliases() {
+    use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
+    let (_server, mut ws, _buffer_id) = setup_with_buffer("x\n").await;
+
+    let r = send_request::<SyntaxHighlightSnippet>(
+        &mut ws,
+        10,
+        &SyntaxHighlightSnippetParams {
+            language: "rust".into(),
+            text: "fn main() { let s = \"hi\"; }".into(),
+        },
+    )
+    .await;
+    assert!(
+        r.highlights.iter().any(|h| h.kind == "keyword"),
+        "rust snippet yields keyword captures, got {:?}",
+        r.highlights
+    );
+    assert!(
+        r.highlights.iter().any(|h| h.kind.starts_with("string")),
+        "rust snippet yields string captures"
+    );
+
+    // Fence short names resolve through the same alias table (`rs` → rust).
+    let r = send_request::<SyntaxHighlightSnippet>(
+        &mut ws,
+        11,
+        &SyntaxHighlightSnippetParams {
+            language: "rs".into(),
+            text: "fn x() {}".into(),
+        },
+    )
+    .await;
+    assert!(!r.highlights.is_empty(), "alias resolves");
+
+    // Unknown language: empty, not an error — callers fire-and-adopt.
+    let r = send_request::<SyntaxHighlightSnippet>(
+        &mut ws,
+        12,
+        &SyntaxHighlightSnippetParams {
+            language: "no-such-lang".into(),
+            text: "whatever".into(),
+        },
+    )
+    .await;
+    assert!(r.highlights.is_empty());
+}
+
+/// Read frames until a change signal (`buffer/changed` or `viewport/lines_changed`) arrives;
+/// returns which one, plus its params. Used to pin *which* branch of the edit-push range gate
+/// fired, which `expect_notification`'s skip-unrelated behaviour can't distinguish.
+async fn next_change_signal(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> (String, serde_json::Value) {
+    loop {
+        let text = next_text(ws).await;
+        let inbound: ClientInbound = serde_json::from_str(&text).expect("parseable");
+        if let ClientInbound::Notification(n) = inbound {
+            if n.method == BufferChanged::NAME
+                || n.method == aether_protocol::viewport::ViewportLinesChanged::NAME
+            {
+                return (n.method, n.params);
+            }
+        }
+    }
+}
+
+/// A typed edit outside another client's pushed window sends that client the revision-only
+/// `buffer/changed` — the `viewport/lines_changed` range gate would otherwise leave a
+/// whole-document consumer (the markdown reading view) unaware of the mutation. An edit inside
+/// the window still sends the full `viewport/lines_changed`.
+#[tokio::test]
+async fn out_of_window_edit_pushes_buffer_changed() {
+    // 40 lines, so a 10-row viewport at the top leaves plenty of buffer outside its range.
+    let content: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("doc.md"), &content).unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+
+    // Client 1: the editor (no viewport — edits don't need one).
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("doc.md", None)).await;
+    let buffer_id = open.buffer_id;
+
+    // Client 2: the reader, viewport pinned to the top 10 rows.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws2, 2, &attach_open_params(buffer_id, None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, 3, &transient_sub_params(buffer_id)).await;
+
+    // Client 1 edits far below client 2's window → client 2 gets the revision-only signal.
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition { line: 35, col: 0 },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputText>(
+        &mut ws,
+        5,
+        &InputTextParams {
+            buffer_id,
+            text: "!".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: Some(SelectionEdge::Start),
+        },
+    )
+    .await;
+    let (method, params) = next_change_signal(&mut ws2).await;
+    assert_eq!(method, BufferChanged::NAME, "out-of-window edit → buffer/changed");
+    let changed: BufferChangedParams = serde_json::from_value(params).unwrap();
+    assert_eq!(changed.buffer_id, buffer_id);
+    assert_eq!(changed.revision, r.revision);
+
+    // Client 1 edits inside client 2's window → the full window render as before.
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        6,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition { line: 0, col: 0 },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    let r2: EditResult = send_request::<InputText>(
+        &mut ws,
+        7,
+        &InputTextParams {
+            buffer_id,
+            text: "!".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: Some(SelectionEdge::Start),
+        },
+    )
+    .await;
+    let (method, params) = next_change_signal(&mut ws2).await;
+    assert_eq!(
+        method,
+        aether_protocol::viewport::ViewportLinesChanged::NAME,
+        "in-window edit → viewport/lines_changed"
+    );
+    let lc: aether_protocol::viewport::ViewportLinesChangedParams =
+        serde_json::from_value(params).unwrap();
+    assert_eq!(lc.revision, r2.revision);
+
+    drop(server);
+}
+
+/// Plain HTTP GET against the test server (the ws port doubles as the HTTP port), returning
+/// `(status_line, headers, body)`. Carries a loopback `Host` header — the server's rebinding
+/// defense rejects requests without one.
+async fn http_get(ws_url: &str, path: &str) -> (String, String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let authority = ws_url
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .expect("authority");
+    let mut stream = tokio::net::TcpStream::connect(authority).await.expect("connect");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..buf.len().min(header_end)]).to_string();
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, head, buf[header_end..].to_vec())
+}
+
+/// The web reading view's image route: serves files relative to a buffer's directory, confined
+/// to the buffer's workspace root after canonicalization (docs/markdown-view.md §3) — `..` and
+/// symlink escapes 404, as do unknown buffers and non-image extensions.
+#[tokio::test]
+async fn buffer_asset_route_serves_and_confines() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("doc.md"), "![d](img.png)\n").unwrap();
+    std::fs::write(dir.path().join("img.png"), b"PNGDATA").unwrap();
+    std::fs::write(outside.path().join("secret.png"), b"SECRET").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path().join("secret.png"), dir.path().join("leak.png"))
+        .unwrap();
+    let dir_path = dir.path().to_path_buf();
+    let outside_path = outside.path().to_path_buf();
+    std::mem::forget(dir);
+    std::mem::forget(outside);
+
+    let server = spawn_for_test("test-proj", vec![dir_path.clone()]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url()).await.unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 2, &file_open_params("doc.md", None)).await;
+    let id = open.buffer_id;
+    let url = server.ws_url();
+
+    // The happy path: an image beside the document — with the hardening headers (nosniff pins
+    // the type; `sandbox` neuters scripts when an SVG asset is opened as a page, which would
+    // otherwise execute same-origin with the editor client).
+    let (status, head, body) = http_get(&url, &format!("/asset/{id}/img.png")).await;
+    assert!(status.contains("200"), "got {status}");
+    assert_eq!(body, b"PNGDATA");
+    assert!(
+        head.contains("X-Content-Type-Options: nosniff"),
+        "asset responses carry nosniff, got:\n{head}"
+    );
+    assert!(
+        head.contains("Content-Security-Policy: sandbox"),
+        "asset responses carry CSP sandbox, got:\n{head}"
+    );
+
+    // A parent-relative path that stays inside the root is legitimate (the web shell encodes
+    // the whole relative path as one segment, so the `..` reaches the server un-collapsed).
+    std::fs::create_dir_all(dir_path.join("docs")).unwrap();
+    std::fs::write(dir_path.join("docs/nested.md"), "![up](../img.png)\n").unwrap();
+    let nested: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, 3, &file_open_params("docs/nested.md", None)).await;
+    let (status, _, body) =
+        http_get(&url, &format!("/asset/{}/..%2Fimg.png", nested.buffer_id)).await;
+    assert!(status.contains("200"), "in-root ..%2F must serve, got {status}");
+    assert_eq!(body, b"PNGDATA");
+
+    // `..` traversal out of the root → 404 (canonical-prefix check).
+    let rel_escape = format!(
+        "/asset/{id}/..%2F{}%2Fsecret.png",
+        outside_path.file_name().unwrap().to_string_lossy()
+    );
+    let (status, _, _) = http_get(&url, &rel_escape).await;
+    assert!(status.contains("404"), "traversal must 404, got {status}");
+
+    // A symlink pointing outside the root → 404 after canonicalization.
+    #[cfg(unix)]
+    {
+        let (status, _, body) = http_get(&url, &format!("/asset/{id}/leak.png")).await;
+        assert!(
+            status.contains("404"),
+            "symlink escape must 404, got {status} ({:?})",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    // Unknown buffer and non-image extensions → 404.
+    let (status, _, _) = http_get(&url, "/asset/9999/img.png").await;
+    assert!(status.contains("404"), "unknown buffer must 404, got {status}");
+    let (status, _, _) = http_get(&url, &format!("/asset/{id}/doc.md")).await;
+    assert!(status.contains("404"), "non-image must 404, got {status}");
+
+    drop(server);
+}
+
 fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams {
     BufferOpenParams {
         buffer_id: None,

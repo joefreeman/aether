@@ -1868,6 +1868,57 @@ fn buffer_set_transient_shape() {
 }
 
 #[test]
+fn buffer_content_shape() {
+    use aether_protocol::buffer::{BufferContentParams, BufferContentResult};
+    let p = to_value(BufferContentParams { buffer_id: 4 }).unwrap();
+    assert_eq!(p, json!({"buffer_id": 4}));
+    let r = to_value(BufferContentResult {
+        revision: 7,
+        text: "# Title\n".into(),
+    })
+    .unwrap();
+    assert_eq!(r, json!({"revision": 7, "text": "# Title\n"}));
+}
+
+#[test]
+fn syntax_highlight_snippet_shape() {
+    use aether_protocol::syntax::{SyntaxHighlightSnippetParams, SyntaxHighlightSnippetResult};
+    use aether_protocol::viewport::Highlight;
+    let p = to_value(SyntaxHighlightSnippetParams {
+        language: "rust".into(),
+        text: "fn x() {}".into(),
+    })
+    .unwrap();
+    assert_eq!(p, json!({"language": "rust", "text": "fn x() {}"}));
+    let r = to_value(SyntaxHighlightSnippetResult {
+        highlights: vec![Highlight {
+            start: 0,
+            end: 2,
+            kind: "keyword".into(),
+        }],
+    })
+    .unwrap();
+    assert_eq!(
+        r,
+        json!({"highlights": [{"start": 0, "end": 2, "kind": "keyword"}]})
+    );
+}
+
+#[test]
+fn buffer_changed_notification_shape() {
+    use aether_protocol::buffer::BufferChangedParams;
+    let p = to_value(BufferChangedParams {
+        buffer_id: 4,
+        revision: 9,
+    })
+    .unwrap();
+    assert_eq!(p, json!({"buffer_id": 4, "revision": 9}));
+    let parsed: BufferChangedParams = from_value(json!({"buffer_id": 2, "revision": 3})).unwrap();
+    assert_eq!(parsed.buffer_id, 2);
+    assert_eq!(parsed.revision, 3);
+}
+
+#[test]
 fn nav_goto_params_shape() {
     use aether_protocol::cursor::CursorState;
     use aether_protocol::nav::NavGotoParams;
@@ -3384,6 +3435,7 @@ fn app_settings_wire_shape_and_defaults() {
         buffer_font_size: 16,
         ui_font_size: 12,
         hints: false,
+        markdown_read: false,
     };
     assert_eq!(
         to_value(s).unwrap(),
@@ -3393,6 +3445,7 @@ fn app_settings_wire_shape_and_defaults() {
             "buffer_font_size": 16,
             "ui_font_size": 12,
             "hints": false,
+            "markdown_read": false,
         })
     );
 
@@ -3410,6 +3463,7 @@ fn app_settings_wire_shape_and_defaults() {
         aether_protocol::settings::default_ui_font_size()
     );
     assert!(parsed.hints, "hints default on");
+    assert!(parsed.markdown_read, "markdown reading view defaults on");
 
     // The pre-split `font_size` key is not read back as either size — it's gone, and a file still
     // carrying it lands on the defaults rather than silently applying the old value to one of them.

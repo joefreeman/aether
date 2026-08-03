@@ -40,6 +40,11 @@ pub struct AppSettings {
     /// (docs/hints.md). The off-switch only — learning state lives in `hints.json`, not here.
     #[serde(default = "default_hints")]
     pub hints: bool,
+    /// Open markdown buffers as the reading view by default (docs/markdown-view.md §1.6):
+    /// file-shaped opens land in Read mode, jump-shaped opens (grep hits, diagnostics) land in
+    /// the editor either way. Client-side behaviour the server only stores.
+    #[serde(default = "default_markdown_read")]
+    pub markdown_read: bool,
 }
 
 fn default_wrap() -> WrapMode {
@@ -64,6 +69,10 @@ fn default_hints() -> bool {
     true
 }
 
+fn default_markdown_read() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
@@ -72,6 +81,7 @@ impl Default for AppSettings {
             buffer_font_size: default_buffer_font_size(),
             ui_font_size: default_ui_font_size(),
             hints: default_hints(),
+            markdown_read: default_markdown_read(),
         }
     }
 }

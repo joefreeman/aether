@@ -6378,3 +6378,707 @@ fn re_recording_a_term_updates_its_filters_in_place() {
         "the newest configuration wins"
     );
 }
+
+// ---- markdown reading view (docs/markdown-view.md) ----------------------------------------------
+
+fn md_session() -> Session {
+    let mut s = session();
+    s.buffer.language = Some("markdown".into());
+    s
+}
+
+fn leader(s: &mut Session, c: char) -> Effects {
+    let _ = key(s, ' ');
+    key(s, c)
+}
+
+/// A canned reading-view setup: `Space v` on a markdown buffer, content fetched and parsed.
+/// Layout: heading (line 0), paragraph (line 2), paragraph with a link (line 4).
+fn read_session() -> Session {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "revision": 1,
+            "text": "# Title\n\nFirst para.\n\nSee [docs](https://x.y) here.\n",
+        })),
+    );
+    s
+}
+
+#[test]
+fn space_v_enters_reading_view_and_fetches_content() {
+    use aether_client::session::Mode;
+    let s = read_session();
+    assert_eq!(s.mode, Mode::Read);
+    let read = s.read.as_ref().expect("reading view active");
+    assert_eq!(read.revision, 1);
+    assert!(!read.loading);
+    // heading + 2 paragraphs + the link, in document order.
+    assert_eq!(read.elements.len(), 4);
+}
+
+#[test]
+fn space_v_on_non_markdown_toasts_and_stays_normal() {
+    use aether_client::session::Mode;
+    let mut s = session(); // language: None
+    let fx = leader(&mut s, 'v');
+    assert_eq!(s.mode, Mode::Normal);
+    assert!(s.read.is_none());
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
+}
+
+#[test]
+fn read_j_steps_focus_via_goto_to_next_block() {
+    let mut s = read_session();
+    // Cursor at 0,0 → focus is the heading; `j` lands on the first paragraph's start (line 2).
+    let fx = key(&mut s, 'j');
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["kind"], json!("goto"));
+    assert_eq!(params["motion"]["position"], json!({"line": 2, "col": 0}));
+    assert_eq!(params["extend_selection"], json!(false));
+}
+
+#[test]
+fn read_count_applies_to_element_steps() {
+    let mut s = read_session();
+    // `2j` from the heading skips to the second paragraph (line 4).
+    let _ = key(&mut s, '2');
+    let fx = key(&mut s, 'j');
+    let (_t, _m, params) = the_request(&fx);
+    assert_eq!(params["motion"]["position"], json!({"line": 4, "col": 0}));
+}
+
+/// Walk `read_session` to the link paragraph and step into its link: `j` `j` (blocks), then
+/// `l` (the within-block link ring). Adopts each Goto's cursor so focus derives.
+fn focus_the_link(s: &mut Session) {
+    for line in [2u32, 4] {
+        let fx = key(s, 'j');
+        let (t, m, _p) = the_request(&fx);
+        assert_eq!(m, "cursor/move");
+        let _ = s.on_rpc_result(
+            t,
+            Ok(json!({
+                "position": {"line": line, "col": 0},
+                "anchor": {"line": line, "col": 0},
+            })),
+        );
+    }
+    // `l` enters the block's link ring at its first link (line 4, col 4 — "See " precedes).
+    let fx = key(s, 'l');
+    let (t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["position"], json!({"line": 4, "col": 4}));
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({
+            "position": {"line": 4, "col": 4},
+            "anchor": {"line": 4, "col": 4},
+        })),
+    );
+}
+
+#[test]
+fn read_l_focuses_the_link_in_block_and_enter_opens_it() {
+    let mut s = read_session();
+    focus_the_link(&mut s);
+    // Enter follows the focused link with the system opener.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y"
+        )),
+        "Enter on a link opens it externally"
+    );
+    // At the ring's end, another `l` is a quiet no-op (single-link block).
+    let fx = key(&mut s, 'l');
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "no Goto past the last link in the block"
+    );
+}
+
+/// `v`/`Alt-v`: the editor's half-page cursor motion, verbatim — the server resolves it in
+/// editor wrap geometry and the returned cursor derives focus (best-effort distance, framed
+/// landing — docs/markdown-view.md §2.3).
+#[test]
+fn read_v_rides_the_editor_half_page_motion() {
+    let mut s = read_session();
+    // The viewport subscription stays alive in Read (§1.5); the motion needs its id for the
+    // editor wrap geometry.
+    s.viewport_id = Some(7);
+    let fx = key(&mut s, 'v');
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["kind"], json!("visual_line"));
+    assert_eq!(params["motion"]["direction"], json!("down"));
+    assert_eq!(params["motion"]["count"], json!(ROWS / 2));
+}
+
+/// `z`/`Alt-z`: the server's cursor-motion history, verbatim — the returned cursor derives
+/// focus, so this is "step back/forward through reading positions".
+#[test]
+fn read_z_walks_the_reading_position_history() {
+    let mut s = read_session();
+    let fx = key(&mut s, 'z');
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "cursor/undo");
+    let fx = s.on_key(KeyCode::Char('z'), Mods::ALT, None, ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "cursor/redo");
+}
+
+/// `;`/`Alt-;`: the editor's place-cursor keys — in Read each shell places the *focused
+/// element* at the fraction (read scroll is shell-owned).
+#[test]
+fn read_semicolon_emits_place_cursor() {
+    use aether_client::keymap::ViewportPlace;
+    let mut s = read_session();
+    let fx = key(&mut s, ';');
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::PlaceCursor(ViewportPlace::Upper))
+        )),
+        "; places the focused element near the top"
+    );
+}
+
+/// `h` from the first element steps back OUT: the cursor returns to the block's rest byte, so
+/// the target clears and the bar stands alone; `h` with nothing selected is a quiet no-op.
+#[test]
+fn read_h_deselects_back_to_the_block() {
+    let mut s = read_session();
+    focus_the_link(&mut s);
+    // `h` from the (first) link: Goto the paragraph's rest byte — its start, since "See "
+    // precedes the link.
+    let fx = key(&mut s, 'h');
+    let (t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["position"], json!({"line": 4, "col": 0}));
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({"position": {"line": 4, "col": 0}, "anchor": {"line": 4, "col": 0}})),
+    );
+    {
+        let read = s.read.as_ref().unwrap();
+        let cursor = s.buffer.cursor.position;
+        assert_eq!(read.target_focus(cursor), None, "deselected — bar alone");
+        assert!(read.block_focus(cursor).is_some());
+    }
+    // Another `h`: nothing selected → quiet no-op.
+    let fx = key(&mut s, 'h');
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "h with no target does nothing"
+    );
+}
+
+#[test]
+fn read_tab_shows_the_focused_target_without_following() {
+    use aether_client::session::HoverText;
+    let mut s = read_session();
+    // On a plain block: quiet no-op.
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert!(fx.0.is_empty(), "Tab on a non-interactive block does nothing");
+    // On a focused link: the URL in the hover popover (whose own keys then apply — Ctrl-c
+    // copies it via `keymap::hover_action`), no open, no cursor move.
+    focus_the_link(&mut s);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShowHover(HoverText::Blocks(b))
+                if b.len() == 1 && b[0].text == "https://x.y" && b[0].severity.is_none()
+        )),
+        "Tab reveals the link target in the popover"
+    );
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
+        "Tab must not follow the link"
+    );
+}
+
+#[test]
+fn read_y_copies_the_focused_elements_source() {
+    let mut s = read_session();
+    // Cursor on the heading: `y` copies its markdown source.
+    let fx = key(&mut s, 'y');
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::WriteClipboard(text) if text == "# Title"
+        )),
+        "y copies the element source"
+    );
+}
+
+#[test]
+fn space_v_toggles_back_to_the_editor() {
+    use aether_client::session::Mode;
+    let mut s = read_session();
+    let fx = leader(&mut s, 'v');
+    assert_eq!(s.mode, Mode::Normal);
+    assert!(s.read.is_none());
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::RevealCursor(_))),
+        "leaving the reading view frames the reading position"
+    );
+    // The choice is remembered: `Space v` again re-enters without consulting the default.
+    s.markdown_read_default = false;
+    let fx = leader(&mut s, 'v');
+    assert_eq!(s.mode, Mode::Read);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+}
+
+#[test]
+fn read_table_contains_no_editing_action() {
+    use aether_client::keymap::{table, Action, KeyContext};
+    for b in table(KeyContext::Read) {
+        assert!(
+            matches!(
+                b.action,
+                Action::ReadStep(_)
+                    | Action::ReadStepLink(_)
+                    | Action::ReadShowTarget
+                    | Action::ReadActivateNewWindow
+                    | Action::ReadStepHeading(_)
+                    | Action::PageMotion { .. }
+                    | Action::PlaceCursor(_)
+                    | Action::MotionUndo
+                    | Action::MotionRedo
+                    | Action::ReadEnds { .. }
+                    | Action::ReadActivate
+                    | Action::ReadCopy
+                    | Action::Scroll { .. }
+                    | Action::EnterSearch
+                    | Action::SearchCycle(_)
+                    | Action::DropSearch
+                    | Action::NavBack
+                    | Action::NavForward
+                    | Action::JumplistStep(_)
+                    | Action::JumplistStepInFile(_)
+                    | Action::BeginLeader
+            ),
+            "read-table action {:?} is not on the read-only allowlist",
+            b.action
+        );
+    }
+}
+
+#[test]
+fn buffer_changed_with_newer_revision_refetches_content() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification};
+    let mut s = read_session();
+    let fx = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: "buffer/changed".into(),
+        params: json!({"buffer_id": s.buffer.buffer_id, "revision": 2}),
+    }));
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "buffer/content", "newer revision → re-fetch");
+    // An equal (or older) revision is quiet.
+    let fx = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: "buffer/changed".into(),
+        params: json!({"buffer_id": s.buffer.buffer_id, "revision": 2}),
+    }));
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "no duplicate fetch while one is already in flight"
+    );
+}
+
+#[test]
+fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
+    use aether_client::session::Mode;
+    use aether_protocol::LogicalPosition;
+    let mut s = md_session();
+
+    // Jump-shaped (a grep hit): markdown target still opens in the editor.
+    let fx = s.open_path_at(
+        "/tmp/doc.md".into(),
+        Some(LogicalPosition { line: 3, col: 0 }),
+        None,
+    );
+    let (token, method, _p) = the_request(&fx);
+    assert_eq!(method, "buffer/open");
+    let open = json!({
+        "buffer_id": 7, "language": "markdown", "line_count": 5, "byte_count": 40,
+        "revision": 0, "saved_revision": 0, "path": "/tmp/doc.md",
+    });
+    let fx = s.on_rpc_result(token, Ok(open.clone()));
+    assert_eq!(s.mode, Mode::Normal, "jump-shaped → editor");
+    assert!(s.read.is_none());
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+
+    // File-shaped (files picker / a doc link): opens as a reading view.
+    let fx = s.open_path_at("/tmp/other.md".into(), None, None);
+    let (token, _m, _p) = the_request(&fx);
+    let other = json!({
+        "buffer_id": 8, "language": "markdown", "line_count": 5, "byte_count": 40,
+        "revision": 0, "saved_revision": 0, "path": "/tmp/other.md",
+    });
+    let fx = s.on_rpc_result(token, Ok(other));
+    assert_eq!(s.mode, Mode::Read, "file-shaped → reading view");
+    assert!(s.read.as_ref().is_some_and(|r| r.loading));
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )),
+        "the content fetch rides the switch"
+    );
+}
+
+#[test]
+fn read_adopt_requests_fence_highlights_and_adopts_them() {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "revision": 1,
+            "text": "# T\n\n```rust\nfn x() {}\n```\n",
+        })),
+    );
+    // The parse fans out one highlight request per fenced block.
+    let (hl_token, method, params) = the_request(&fx);
+    assert_eq!(method, "syntax/highlight_snippet");
+    assert_eq!(params["language"], json!("rust"));
+    assert_eq!(params["text"], json!("fn x() {}"));
+
+    // The result lands keyed by the fence's span start and bumps the layout generation.
+    let gen_before = s.read.as_ref().unwrap().hl_gen;
+    let _ = s.on_rpc_result(
+        hl_token,
+        Ok(json!({"highlights": [{"start": 0, "end": 2, "kind": "keyword"}]})),
+    );
+    let read = s.read.as_ref().unwrap();
+    assert_eq!(read.hl_gen, gen_before + 1);
+    let fence_start = "# T\n\n".len() as u32;
+    assert_eq!(
+        read.code_highlights.get(&fence_start).map(|h| h.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn read_click_focuses_via_goto_at_the_clicked_byte() {
+    let mut s = read_session();
+    // The shell hit-tests a click on the first paragraph to its span start (byte 9 → line 2).
+    let fx = s.read_click(9);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["kind"], json!("goto"));
+    assert_eq!(params["motion"]["position"], json!({"line": 2, "col": 0}));
+    assert_eq!(params["extend_selection"], json!(false));
+}
+
+/// A click that lands ON a link follows it like Enter — pointing at a target and clicking
+/// should act: the arm Goto still rides along (so `Alt-Left`/`z` return to the link), plus
+/// the link's action.
+#[test]
+fn read_click_activate_follows_a_link() {
+    let mut s = read_session();
+    // The link's span starts at byte 26 (line 4, after "See ").
+    let fx = s.read_click_activate(26);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["position"], json!({"line": 4, "col": 4}));
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y"
+        )),
+        "the external link opens like Enter"
+    );
+}
+
+/// A click on a footnote reference jumps to its definition (two Gotos: the ref arms, the
+/// definition is where reading continues — `z` steps back to the ref).
+#[test]
+fn read_click_activate_jumps_to_a_footnote_definition() {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "A claim[^1].\n\n[^1]: The definition.\n" })),
+    );
+    // The ref's span starts at byte 7.
+    let fx = s.read_click_activate(7);
+    let gotos: Vec<_> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, params, .. } if *method == "cursor/move" => {
+                    Some(params["motion"]["position"].clone())
+                }
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        gotos,
+        vec![json!({"line": 0, "col": 7}), json!({"line": 2, "col": 0})],
+        "arm the ref, then land on the definition"
+    );
+}
+
+/// A click on an image arms it and nothing more — Enter opens it externally, which a stray
+/// click shouldn't.
+#[test]
+fn read_click_activate_on_an_image_arms_only() {
+    let mut s = md_session();
+    s.buffer.path = Some("/ws/docs/doc.md".into());
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })));
+    let fx = s.read_click_activate(0);
+    let (_t, method, _params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::ShellAction(_))),
+        "no open action from a click"
+    );
+}
+
+/// Ctrl-click on a relative-path link — the pointer sibling of `Ctrl-Enter`: a `NewWindow`
+/// target for the resolved path; anything else falls back to the plain click-follow.
+#[test]
+fn read_click_new_window_opens_relative_links() {
+    use aether_client::effect::{WindowOpen, WindowTarget};
+    let mut s = md_session();
+    s.buffer.path = Some("/ws/docs/doc.md".into());
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })));
+    let fx = s.read_click_new_window(0);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::NewWindow(WindowTarget {
+                open: WindowOpen::Path { path, at: None },
+                ..
+            })) if path == "/ws/docs/./other.md"
+        )),
+        "Ctrl-click emits a new-window target for the resolved path"
+    );
+
+    // An external link falls back to the plain click-follow (open externally).
+    let mut s = read_session();
+    let fx = s.read_click_new_window(26);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y"
+        )),
+        "Ctrl-click on an external link follows like a plain click"
+    );
+}
+
+/// Regression: a lone-link paragraph must not trap `k`. The Goto to the paragraph start derives
+/// focus to the *link* (innermost element at that byte); stepping blocks anchors at the link's
+/// containing paragraph, so the next `k` reaches the block above instead of re-targeting the
+/// link's own paragraph forever.
+#[test]
+fn read_k_steps_past_a_lone_link_paragraph() {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "revision": 1,
+            "text": "# Title\n\nFirst para.\n\n[docs](https://x.y)\n\nLast para.\n",
+        })),
+    );
+    // Walk down: heading → First para (2,0) → the link paragraph, landing at its rest byte
+    // AFTER the link (4,19) so the bar shows alone — `l` opts into the link — → Last para.
+    for (line, col) in [(2u32, 0u32), (4, 19), (6, 0)] {
+        let fx = key(&mut s, 'j');
+        let (t, m, params) = the_request(&fx);
+        assert_eq!(m, "cursor/move");
+        assert_eq!(params["motion"]["position"], json!({"line": line, "col": col}));
+        let _ = s.on_rpc_result(
+            t,
+            Ok(json!({
+                "position": {"line": line, "col": col},
+                "anchor": {"line": line, "col": col},
+            })),
+        );
+    }
+    // Back up: Last para → the link paragraph (bar alone — no auto-target)…
+    let fx = key(&mut s, 'k');
+    let (t, _m, params) = the_request(&fx);
+    assert_eq!(params["motion"]["position"], json!({"line": 4, "col": 19}));
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({"position": {"line": 4, "col": 19}, "anchor": {"line": 4, "col": 19}})),
+    );
+    {
+        let read = s.read.as_ref().unwrap();
+        let cursor = s.buffer.cursor.position;
+        assert_eq!(read.target_focus(cursor), None, "no auto-selected link");
+        assert!(read.block_focus(cursor).is_some(), "the bar marks the paragraph");
+    }
+    // …and past it.
+    let fx = key(&mut s, 'k');
+    let (_t, _m, params) = the_request(&fx);
+    assert_eq!(params["motion"]["position"], json!({"line": 2, "col": 0}));
+}
+
+/// `Enter` on a remote image opens the URL itself — not a fabricated buffer-relative path like
+/// `/docs/https:/…`.
+#[test]
+fn read_enter_on_a_remote_image_opens_the_url() {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "revision": 1,
+            "text": "![logo](https://x.y/logo.svg)\n",
+        })),
+    );
+    // The lone image promotes to a block element; the boot cursor (0,0) focuses it.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y/logo.svg"
+        )),
+        "Enter on a remote image opens the URL"
+    );
+}
+
+/// The two focus projections (docs/markdown-view.md §1.3): the block-grain reading position
+/// (the bar) and the interactive-grain Enter target (the pill) both derive from the one server
+/// cursor. A Tab-focused link keeps its containing paragraph as the position, with the link as
+/// the target; stepping to a plain paragraph clears the target with no invalidation logic.
+#[test]
+fn focus_projections_compose_block_bar_and_link_target() {
+    use aether_client::markdown::Element;
+    let mut s = read_session();
+    // Step to the link paragraph and into its link (`j` `j` `l`), adopting each cursor.
+    focus_the_link(&mut s);
+    let cursor = s.buffer.cursor.position;
+    let read = s.read.as_ref().unwrap();
+    let target = read.target_focus(cursor).expect("cursor sits inside the link");
+    assert!(matches!(read.elements[target], Element::Link { .. }));
+    let block = read.block_focus(cursor).expect("block position always present");
+    assert!(matches!(read.elements[block], Element::Block { .. }));
+    assert!(
+        read.elements[block]
+            .span()
+            .contains(read.elements[target].span().start),
+        "the bar sits on the link's containing paragraph"
+    );
+    // `k` to the first paragraph: the target clears (the cursor left the link's span).
+    let fx = key(&mut s, 'k');
+    let (t, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({"position": {"line": 2, "col": 0}, "anchor": {"line": 2, "col": 0}})),
+    );
+    let cursor = s.buffer.cursor.position;
+    let read = s.read.as_ref().unwrap();
+    assert_eq!(read.target_focus(cursor), None, "target vanished with the cursor");
+    assert!(read.block_focus(cursor).is_some(), "the bar never vanishes");
+}
+
+/// `Ctrl-Enter` on a relative-path link: the picker's open-in-new-window at reading grain —
+/// a `NewWindow` target carrying the resolved path (GUI spawns a window on it, the web opens
+/// an app tab). On anything else (an external link here) it behaves exactly like `Enter`.
+#[test]
+fn read_ctrl_enter_opens_relative_links_in_a_new_window() {
+    use aether_client::effect::{WindowOpen, WindowTarget};
+    let mut s = md_session();
+    s.buffer.path = Some("/ws/docs/doc.md".into());
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })),
+    );
+    // The boot cursor (0,0) sits inside the link — Ctrl-Enter opens it in a new window.
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::NewWindow(WindowTarget {
+                open: WindowOpen::Path { path, at: None },
+                ..
+            })) if path == "/ws/docs/./other.md"
+        )),
+        "Ctrl-Enter emits a new-window target for the resolved path"
+    );
+
+    // An external link falls back to Enter behaviour (open externally).
+    let mut s = read_session();
+    focus_the_link(&mut s);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y"
+        )),
+        "Ctrl-Enter on an external link opens it like Enter"
+    );
+}
+
+/// `Enter` on a *local* image emits the buffer-file action: native shells open the absolute
+/// path with the system handler; the web opens the confined `/asset/` route built
+/// from `(buffer_id, relative)` — a browser can't open local paths.
+#[test]
+fn read_enter_on_a_local_image_emits_open_buffer_file() {
+    let mut s = md_session();
+    s.buffer.path = Some("/ws/docs/doc.md".into());
+    let fx = leader(&mut s, 'v');
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })),
+    );
+    let id = s.buffer.buffer_id;
+    // The boot cursor (0,0) sits inside the image markup — armed; Enter opens.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ShellAction(ShellAction::OpenBufferFile { absolute, buffer_id, relative })
+                if absolute == "/ws/docs/../img.png"
+                    && *buffer_id == id
+                    && relative == "../img.png"
+        )),
+        "local image Enter carries the absolute path and the asset-route pieces"
+    );
+}
+
+/// The web shell's `view=read|source` URL param: an explicit boot presentation overrides both
+/// the jump rules and the app default, so a refresh restores exactly what was on screen.
+#[test]
+fn explicit_boot_presentation_overrides_default_and_jump_rules() {
+    use aether_client::session::Mode;
+    let mut s = md_session();
+    // view=source lands in the editor even though the read default is on.
+    let fx = s.boot_read_presentation_explicit(false);
+    assert_eq!(s.mode, Mode::Normal);
+    assert!(s.read.is_none());
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+    // view=read opens the reading view even with the default off.
+    s.markdown_read_default = false;
+    let fx = s.boot_read_presentation_explicit(true);
+    assert_eq!(s.mode, Mode::Read);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+}

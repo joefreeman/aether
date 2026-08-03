@@ -205,6 +205,26 @@ pub struct Shell {
     fatal: Option<String>,
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
     server_url: String,
+    /// Reading-view scroll: first visible row of the laid-out document — the reading sibling of
+    /// `top_visual_row` (docs/markdown-view.md: read-mode scroll is shell-owned).
+    read_scroll: u16,
+    /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
+    /// scrolling doesn't fight the reveal).
+    read_last_focus: Option<usize>,
+    /// Reading-view layout cache, keyed by `(buffer, revision, hl_gen, content_cols)` —
+    /// `hl_gen` moves when fence highlights land, which revision alone doesn't capture.
+    #[allow(clippy::type_complexity)]
+    read_cache: Option<(
+        u64,
+        u64,
+        u64,
+        u16,
+        std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
+    )>,
+    /// Per-code-block horizontal scroll (docs/markdown-view.md §2.8), keyed by the block's
+    /// element index: code rows are laid out unchunked and the painter clips them to this
+    /// offset. Cleared when the parse changes (element indices shift with the content).
+    read_hscroll: std::collections::HashMap<usize, u16>,
 }
 
 pub async fn run(
@@ -268,6 +288,10 @@ pub async fn run(
         boot_attempt: 0,
         fatal: None,
         server_url,
+        read_scroll: 0,
+        read_last_focus: None,
+        read_cache: None,
+        read_hscroll: std::collections::HashMap::new(),
     };
 
     // Kick the boot dial; no subscribe yet (no buffer until it lands).
@@ -604,15 +628,21 @@ impl Shell {
                     // The dial landed: swap the dummy transport for the real one and install the
                     // bootstrapped session over the connecting placeholder, then subscribe + fire
                     // startup effects — the same setup the old synchronous boot did inline.
+                    let jumped = self.boot.as_ref().is_some_and(|s| s.jump.is_some());
                     self.boot = None;
                     self.boot_attempt = 0;
                     self.handle = b.handle;
                     self.notifications = b.notifications;
                     self.session = b.session;
                     self.state = b.state;
+                    // Boot installs the session directly (no `adopt_switch`), so the markdown
+                    // reading-view default is applied here (docs/markdown-view.md §1.6); an
+                    // `ae file:line` launch is jump-shaped and lands in the editor.
+                    let read_fx = self.session.boot_read_presentation(jumped);
                     self.sent_grid = Some(self.grid());
                     self.subscribe();
                     self.run_effects(b.startup);
+                    self.run_effects(read_fx);
                 }
                 // Daemon not up yet — keep dialing (the whole point of launching first).
                 Err(ReconnectError::NotUp) => {
@@ -1019,6 +1049,45 @@ impl Shell {
                 _ => {}
             }
         }
+        // The reading view owns the mouse while active: the wheel scrolls the document,
+        // horizontal wheel (or shift+wheel) pans the code block under the pointer, a left
+        // press focuses the element under it (docs/markdown-view.md §2.3).
+        if self.session.read.is_some() {
+            match m.kind {
+                MouseEventKind::ScrollLeft => {
+                    let e = self.read_element_at_row(m.row);
+                    self.read_hscroll_by(e, -6);
+                }
+                MouseEventKind::ScrollRight => {
+                    let e = self.read_element_at_row(m.row);
+                    self.read_hscroll_by(e, 6);
+                }
+                MouseEventKind::ScrollUp if m.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let e = self.read_element_at_row(m.row);
+                    self.read_hscroll_by(e, -6);
+                }
+                MouseEventKind::ScrollDown if m.modifiers.contains(KeyModifiers::SHIFT) => {
+                    let e = self.read_element_at_row(m.row);
+                    self.read_hscroll_by(e, 6);
+                }
+                MouseEventKind::ScrollUp => self.read_scroll_by(-3),
+                MouseEventKind::ScrollDown => self.read_scroll_by(3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some((byte, interactive)) = self.read_hit(m.row, m.column) {
+                        // A click ON a link/footnote-ref span follows it like Enter (the
+                        // core keeps images arm-only); elsewhere it just focuses.
+                        let fx = if interactive {
+                            self.session.read_click_activate(byte)
+                        } else {
+                            self.session.read_click(byte)
+                        };
+                        self.run_effects(fx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-3),
             MouseEventKind::ScrollDown => self.scroll_by(3),
@@ -1125,6 +1194,36 @@ impl Shell {
 
     fn run_shell_action(&mut self, action: ShellAction) {
         match action {
+            // A local image beside the buffer: the TUI opens the absolute path (the web half
+            // of this action rides the asset route instead).
+            ShellAction::OpenBufferFile { absolute, .. } => {
+                self.run_shell_action(ShellAction::OpenUrl(absolute));
+            }
+            // Reading-view Enter on an external link or image. The TUI is a local process, so
+            // the same allow-listed system opener the GUI uses works here; bare absolute paths
+            // ride the `file:` scheme. Best-effort — a spawn failure is silent.
+            ShellAction::OpenUrl(url) => {
+                let target = match url.strip_prefix('/') {
+                    Some(p) => format!("file:///{p}"),
+                    None => url,
+                };
+                if ["http://", "https://", "mailto:", "file:"]
+                    .iter()
+                    .any(|s| target.starts_with(s))
+                {
+                    let program = if cfg!(target_os = "macos") {
+                        "open"
+                    } else {
+                        "xdg-open"
+                    };
+                    let _ = std::process::Command::new(program)
+                        .arg(&target)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
             ShellAction::Scroll { dir, unit } => {
                 let rows = self.visible_rows() as i64;
                 let delta = match unit {
@@ -1132,6 +1231,33 @@ impl Shell {
                     ScrollUnit::Half => (rows / 2).max(1),
                     ScrollUnit::Page => rows.max(1),
                 };
+                // In the reading view the vertical scroll is the document's; Left/Right pan
+                // the *focused* block's horizontal window (only code rows can overflow, so
+                // this is a clamped no-op anywhere else).
+                if self.session.read.is_some() {
+                    match dir {
+                        ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
+                        ScrollDir::Down => self.read_scroll_by(delta as i32),
+                        ScrollDir::Left | ScrollDir::Right => {
+                            let (content_cols, _) = aether_client::read_layout::measure(
+                                self.term.0.max(10),
+                            );
+                            let window = content_cols.saturating_sub(2).max(1) as i32;
+                            let step = match unit {
+                                ScrollUnit::Line => 6,
+                                ScrollUnit::Half => (window / 2).max(1),
+                                ScrollUnit::Page => window,
+                            };
+                            let focused = self.session.read.as_ref().and_then(|r| {
+                                r.block_focus(self.session.buffer.cursor.position)
+                            });
+                            let signed =
+                                if matches!(dir, ScrollDir::Left) { -step } else { step };
+                            self.read_hscroll_by(focused, signed);
+                        }
+                    }
+                    return;
+                }
                 match dir {
                     ScrollDir::Up => self.scroll_by(-delta),
                     ScrollDir::Down => self.scroll_by(delta),
@@ -1388,6 +1514,44 @@ impl Shell {
     }
 
     fn place_cursor(&mut self, place: ViewportPlace) {
+        // Reading view: edge-matched placement of the focused *block* (the bar'd subtree —
+        // docs/markdown-view.md §2.3): `;` leaves READ_GAP between the view top and the
+        // block's top, `Alt-;` between the view bottom and the block's bottom. Read scroll is
+        // shell-owned rows (§3.1); the document-end clamp happens in `read_view`.
+        if let Some(read) = self.session.read.as_ref() {
+            let cursor = self.session.buffer.cursor.position;
+            let Some(focus) = read.block_focus(cursor) else {
+                return;
+            };
+            let Some(rows) = self.read_cache.as_ref().map(|c| c.4.clone()) else {
+                return;
+            };
+            let span = read.elements[focus].span();
+            let mut first = None;
+            let mut last = 0usize;
+            for (i, row) in rows.iter().enumerate() {
+                let inside = row.element.is_some_and(|e| {
+                    let s = read.elements[e].span();
+                    s.start >= span.start && s.end <= span.end
+                });
+                if inside {
+                    if first.is_none() {
+                        first = Some(i);
+                    }
+                    last = i;
+                }
+            }
+            let Some(first) = first else { return };
+            let pad = f32::from(crate::ui::READ_PAD_TOP);
+            let visible = self.visible_rows().max(1) as f32;
+            let gap = visible * ViewportPlace::READ_GAP;
+            let target = match place {
+                ViewportPlace::Upper => first as f32 + pad - gap,
+                ViewportPlace::Lower => (last + 1) as f32 + pad - (visible - gap),
+            };
+            self.read_scroll = target.max(0.0) as u16;
+            return;
+        }
         let line = self.session.buffer.cursor.position.line;
         let loaded = self
             .session
@@ -1560,6 +1724,7 @@ impl Shell {
         // No editor until a workspace is picked: the placeholder session renders the no-workspace
         // view, not a buffer behind the chooser.
         let editor = (!self.session.is_placeholder()).then(|| self.editor_view());
+        let read = self.read_view();
         let s = &self.session;
         let st = &mut self.state;
         st.workspace_name = s.workspace.clone();
@@ -1597,6 +1762,7 @@ impl Shell {
         };
 
         st.editor = editor;
+        st.read = read;
         self.sync_picker();
         self.sync_prompts();
         self.sync_workspace_settings();
@@ -1750,6 +1916,194 @@ impl Shell {
         });
     }
 
+    /// Build the reading-view render model (docs/markdown-view.md §2.8): lay the document out at
+    /// the current width (cached by `(buffer, revision, cols)`), derive the focused element from
+    /// the server cursor, reveal it when the focus changed, and clamp the scroll.
+    fn read_view(&mut self) -> Option<crate::app::ReadViewState> {
+        let read = self.session.read.as_ref()?;
+        // First fetch still in flight: show the loading page WITHOUT touching the layout cache —
+        // the adopt often lands at the same revision (an unedited buffer stays at rev 0), so a
+        // cached empty layout would otherwise mask the parsed document.
+        if read.loading && read.blocks.is_empty() {
+            return Some(crate::app::ReadViewState {
+                rows: std::sync::Arc::new(Vec::new()),
+                bar_rows: None,
+                target_focus: None,
+                scroll: 0,
+                hscroll: std::collections::HashMap::new(),
+                loading: true,
+            });
+        }
+        let (area_cols, _) = self.term;
+        let (content_cols, _margin) = aether_client::read_layout::measure(area_cols.max(10));
+        let key = (read.buffer_id, read.revision, read.hl_gen, content_cols);
+        let stale = self
+            .read_cache
+            .as_ref()
+            .map(|c| (c.0, c.1, c.2, c.3) != key)
+            .unwrap_or(true);
+        if stale {
+            // A buffer switch resets the scroll; a re-parse of the same buffer keeps it.
+            if self.read_cache.as_ref().map(|c| c.0) != Some(read.buffer_id) {
+                self.read_scroll = 0;
+                self.read_last_focus = None;
+            }
+            // Horizontal offsets are keyed by element index, which shifts with the parse —
+            // drop them on content change (highlight arrivals and width changes keep them).
+            if self.read_cache.as_ref().map(|c| (c.0, c.1))
+                != Some((read.buffer_id, read.revision))
+            {
+                self.read_hscroll.clear();
+            }
+            let rows = aether_client::read_layout::layout(
+                &read.blocks,
+                &read.elements,
+                content_cols,
+                &read.code_highlights,
+            );
+            self.read_cache = Some((key.0, key.1, key.2, key.3, std::sync::Arc::new(rows)));
+        }
+        let rows = self.read_cache.as_ref().expect("just filled").4.clone();
+        // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
+        // always marks the reading position; the interactive target inverts on top of it.
+        let cursor = self.session.buffer.cursor.position;
+        let block_focus = read.block_focus(cursor);
+        let target_focus = read.target_focus(cursor);
+        // The bar spans the focused block's whole *subtree* — first..=last row whose element's
+        // span nests inside the focused span, gaps (separator blanks) riding along — so a
+        // parent item's bar covers its nested items, exactly like the GUI/web item wrappers.
+        let bar_rows = block_focus.and_then(|f| {
+            let fs = read.elements[f].span();
+            let mut range: Option<(usize, usize)> = None;
+            for (i, row) in rows.iter().enumerate() {
+                let inside = row.element.is_some_and(|e| {
+                    let s = read.elements[e].span();
+                    s.start >= fs.start && s.end <= fs.end
+                });
+                if inside {
+                    range = Some(match range {
+                        Some((a, _)) => (a, i),
+                        None => (i, i),
+                    });
+                }
+            }
+            range
+        });
+        let loading = read.loading;
+        let visible = self.visible_rows().max(1) as u16;
+        // Reveal on focus *changes* only, so manual scrolling isn't fought — keyed to the
+        // target when the cursor is inside one (a Tab step must reveal the link, not just its
+        // paragraph). Coordinates are padded rows (READ_PAD_TOP blanks precede the document).
+        let reveal = target_focus.or(block_focus);
+        if reveal != self.read_last_focus {
+            self.read_last_focus = reveal;
+            if let Some(row) = reveal
+                .and_then(|f| aether_client::read_layout::first_row_of_element(&rows, f))
+            {
+                let padded = row as u16 + crate::ui::READ_PAD_TOP;
+                if padded < self.read_scroll
+                    || padded >= self.read_scroll.saturating_add(visible)
+                {
+                    // Rest the element ~20% down, matching the editor's jump reveals.
+                    self.read_scroll = padded.saturating_sub(visible / 5);
+                }
+            }
+        }
+        let total =
+            rows.len() as u16 + crate::ui::READ_PAD_TOP + crate::ui::READ_PAD_BOTTOM;
+        let max_scroll = total.saturating_sub(visible);
+        self.read_scroll = self.read_scroll.min(max_scroll);
+        Some(crate::app::ReadViewState {
+            rows,
+            bar_rows,
+            target_focus,
+            scroll: self.read_scroll,
+            hscroll: self.read_hscroll.clone(),
+            loading,
+        })
+    }
+
+    /// Scroll the reading view by `delta` rows (keys and wheel; clamped in `read_view`).
+    fn read_scroll_by(&mut self, delta: i32) {
+        let cur = self.read_scroll as i32;
+        self.read_scroll = cur.saturating_add(delta).max(0) as u16;
+    }
+
+    /// Pan `element`'s horizontal scroll by `delta` columns (docs/markdown-view.md §2.8):
+    /// clamped so the block's widest row just reaches the window's right edge, and a no-op on
+    /// anything without overflowing rows — only unchunked code rows can overflow, so panning a
+    /// paragraph clamps straight to zero.
+    fn read_hscroll_by(&mut self, element: Option<usize>, delta: i32) {
+        let Some(e) = element else { return };
+        let Some(rows) = self.read_cache.as_ref().map(|c| c.4.clone()) else {
+            return;
+        };
+        let (content_cols, _) = aether_client::read_layout::measure(self.term.0.max(10));
+        // The painter's code window: the measure minus the 2-column gutter and the two
+        // pad/indicator columns (rows with extra prefixes — quoted code — over-clamp a bit,
+        // which only allows a few surplus columns of scroll).
+        let window = content_cols.saturating_sub(4) as usize;
+        let widest = aether_client::read_layout::hscroll_content_width(&rows, e);
+        let max_off = widest.saturating_sub(window) as i32;
+        let cur = self.read_hscroll.get(&e).copied().unwrap_or(0) as i32;
+        let next = cur.saturating_add(delta).clamp(0, max_off.max(0)) as u16;
+        if next == 0 {
+            self.read_hscroll.remove(&e);
+        } else {
+            self.read_hscroll.insert(e, next);
+        }
+    }
+
+    /// The block-grain element on the layout row under screen row `row`, for wheel-driven
+    /// panning of the code block under the pointer.
+    fn read_element_at_row(&self, row: u16) -> Option<usize> {
+        if u32::from(row) >= self.visible_rows() {
+            return None; // the status row (or below)
+        }
+        let rows = &self.read_cache.as_ref()?.4;
+        (self.read_scroll as usize + row as usize)
+            .checked_sub(crate::ui::READ_PAD_TOP as usize)
+            .and_then(|i| rows.get(i))
+            .and_then(|r| r.element)
+    }
+
+    /// Hit-test a reading-view click to a source byte: the layout row under the pointer gives
+    /// the block-grain element; a span carrying its own (interactive) element — a link — wins
+    /// when the column lands inside it. Mirrors the geometry `draw_read_view` paints: the
+    /// centered measure plus the 2-column focus gutter.
+    /// Hit-test a click to `(span start byte, landed on an interactive span)` — the flag
+    /// selects click-follow (`read_click_activate`) over plain focusing.
+    fn read_hit(&self, row: u16, col: u16) -> Option<(u32, bool)> {
+        use unicode_width::UnicodeWidthStr;
+        let read = self.session.read.as_ref()?;
+        let rows = &self.read_cache.as_ref()?.4;
+        if u32::from(row) >= self.visible_rows() {
+            return None; // the status row (or below)
+        }
+        let r = (self.read_scroll as usize + row as usize)
+            .checked_sub(crate::ui::READ_PAD_TOP as usize)
+            .and_then(|i| rows.get(i))?;
+        let (_, margin) = aether_client::read_layout::measure(self.term.0.max(10));
+        let mut element = r.element;
+        let mut interactive = false;
+        let col_in_content = i32::from(col) - i32::from(margin) - 2;
+        if col_in_content >= 0 {
+            let mut acc = 0i32;
+            for sp in &r.spans {
+                let w = sp.text.width() as i32;
+                if col_in_content < acc + w {
+                    if sp.element.is_some() {
+                        element = sp.element;
+                        interactive = true;
+                    }
+                    break;
+                }
+                acc += w;
+            }
+        }
+        Some((read.elements.get(element?)?.span().start, interactive))
+    }
+
     fn editor_view(&self) -> EditorState {
         let s = &self.session;
         let window = s.window.as_ref();
@@ -1768,6 +2122,9 @@ impl Shell {
                 Mode::Normal => EditorMode::Normal,
                 Mode::Insert => EditorMode::Insert,
                 Mode::Search => EditorMode::Search,
+                // Interim until the reading-view renderer lands: Read draws like Normal (block
+                // cursor over the editor window).
+                Mode::Read => EditorMode::Normal,
             },
             buffer_id: s.buffer.buffer_id,
             viewport_id: s.viewport_id.unwrap_or(0),
@@ -2575,6 +2932,7 @@ fn make_state(
         confirm_prompt: None,
         app_info: None,
         editor: None,
+        read: None,
         workspace_settings: None,
         app_settings: None,
         lsp_status: Default::default(),

@@ -123,6 +123,10 @@ pub enum KeyContext {
     Normal,
     Insert,
     Search,
+    /// The markdown reading view (docs/markdown-view.md §2.3). Read-only by construction: this
+    /// table contains no editing action, and the `Global` edit chords are not consulted in Read
+    /// mode — the read-only invariant is the table itself.
+    Read,
     Leader,
     Global,
 }
@@ -200,6 +204,14 @@ impl ViewportPlace {
             ViewportPlace::Lower => 1.0 - CURSOR_REST_FRACTION,
         }
     }
+
+    /// Reading-view placement gap (docs/markdown-view.md §2.3): the space between the view's
+    /// edge and the focused *block's* matching edge — `Upper` leaves this above the block's
+    /// top, `Lower` leaves it below the block's bottom. Edge-matched (unlike the editor's
+    /// top-anchored line placement) so a tall block placed "near the bottom" actually ends
+    /// there instead of hanging mostly off-screen. The gap is the editor's rest fraction, so
+    /// `;` feels identical in both views (a cursor line is its own top *and* bottom edge).
+    pub const READ_GAP: f32 = CURSOR_REST_FRACTION;
 }
 
 /// Abstract intent, mirroring the TUI's `Action` (subset). `count`/`extend` are execution
@@ -432,6 +444,33 @@ pub enum Action {
     /// `Space Alt-h` — toggle hints on/off (the same switch as the settings-overlay row),
     /// persisted app-wide.
     ToggleHints,
+
+    // ---- markdown reading view (docs/markdown-view.md) ----
+    /// `Space v` — toggle the markdown reading view on the current buffer (markdown only;
+    /// remembered per buffer for the session).
+    ToggleReadView,
+    /// `j`/`k` — focus the next/previous block-grain element (the reading cursor; sends a
+    /// `Goto` to the element's source start, so the server cursor *is* the reading position).
+    ReadStep(Direction),
+    /// `h`/`l` — step the Enter target among the links/images *inside the focused block* (the
+    /// fine-grain axis to `j`/`k`'s coarse one, mirroring the editor's split).
+    ReadStepLink(Direction),
+    /// `Tab` — show the focused element's target without following it: a link's URL, an
+    /// image's source, a footnote's definition text (the editor's Tab-reveals-hover, at
+    /// reading grain).
+    ReadShowTarget,
+    /// `o`/`Alt-o` — next/previous heading (AST-resolved; the reading sibling of symbol nav).
+    ReadStepHeading(Direction),
+    /// `g`/`Alt-g` — first/last element (the reading form of the editor's buffer-start/end pair).
+    ReadEnds { last: bool },
+    /// `Enter` — follow the focused element: open a link, an image, or jump to a footnote's
+    /// definition. No-op on non-interactive blocks.
+    ReadActivate,
+    /// `Ctrl-Enter` — the picker's open-in-new-window, at reading grain: a relative-path link
+    /// opens in a new window (GUI) / tab (web); anything else behaves like `Enter`.
+    ReadActivateNewWindow,
+    /// `y` — copy the focused element: a link's URL, otherwise its markdown source.
+    ReadCopy,
 }
 
 impl Action {
@@ -565,6 +604,7 @@ pub fn all() -> impl Iterator<Item = &'static Binding> {
         KeyContext::Global,
         KeyContext::Insert,
         KeyContext::Search,
+        KeyContext::Read,
         KeyContext::Leader,
     ]
     .into_iter()
@@ -578,6 +618,7 @@ pub fn table(ctx: KeyContext) -> &'static [Binding] {
         KeyContext::Normal => NORMAL,
         KeyContext::Insert => INSERT,
         KeyContext::Search => SEARCH,
+        KeyContext::Read => READ,
         KeyContext::Leader => LEADER,
         KeyContext::Global => GLOBAL,
     }
@@ -599,6 +640,7 @@ const GROUP_ORDER: &[&str] = &[
     "Scroll", // getting around
     "Selection",
     "Mode",
+    "Read", // the markdown reading view
     "Edit",
     "Clipboard", // changing text
     "Search",    // finding
@@ -618,11 +660,12 @@ const GROUP_ORDER: &[&str] = &[
 /// are omitted. Built straight from the binding tables and shipped on `picker/view`, so every
 /// client's picker shows exactly its own keymap.
 pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
-    const MODES: [(&str, KeyContext); 5] = [
+    const MODES: [(&str, KeyContext); 6] = [
         ("Normal", KeyContext::Normal),
         ("Any", KeyContext::Global),
         ("Insert", KeyContext::Insert),
         ("Search", KeyContext::Search),
+        ("Read", KeyContext::Read),
         ("Application", KeyContext::Leader),
     ];
     // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
@@ -684,7 +727,7 @@ pub fn hover_action(code: KeyCode, mods: Mods) -> Option<HoverAction> {
 }
 
 use Action as A;
-use KeyContext::{Global as G, Insert as I, Leader as L, Normal as N};
+use KeyContext::{Global as G, Insert as I, Leader as L, Normal as N, Read as R};
 use ModPattern::{Any, Exact, IgnoreShift};
 
 const fn ch(c: char) -> KeyCode {
@@ -906,6 +949,68 @@ static SEARCH: &[Binding] = &[
     // syncs the value via `search_set_query`; only the command keys above live in this table.
 ];
 
+/// The markdown reading view's keys (docs/markdown-view.md §2.3). Where the editor already has a
+/// key for the concept, Read reuses it — `o` heading-steps like symbol nav, `g`/`Alt-g` are the
+/// ends pair, `j`/`k` move the (reading) cursor while the arrows scroll, search and jumplist keys
+/// are verbatim. Deliberately contains no editing action (see [`KeyContext::Read`]).
+#[rustfmt::skip]
+static READ: &[Binding] = &[
+    bind!(R, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
+
+    // ---- the reading cursor ----
+    bind!(R, ch('j'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Forward), "Read", "Focus next element"),
+    bind!(R, ch('k'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Backward), "Read", "Focus previous element"),
+    bind!(R, ch('l'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Forward), "Read", "Focus next link in block"),
+    bind!(R, ch('h'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Backward), "Read", "Focus previous link in block"),
+    bind!(R, KeyCode::Tab, Exact(Mods::NONE), A::ReadShowTarget, "Read", "Show link/image target"),
+    bind!(R, ch('o'), IgnoreShift(Mods::NONE), A::ReadStepHeading(Direction::Forward), "Read", "Next heading"),
+    bind!(R, ch('o'), IgnoreShift(Mods::ALT), A::ReadStepHeading(Direction::Backward), "Read", "Previous heading"),
+    bind!(R, ch('g'), IgnoreShift(Mods::NONE), A::ReadEnds { last: false }, "Read", "First element"),
+    bind!(R, ch('g'), IgnoreShift(Mods::ALT), A::ReadEnds { last: true }, "Read", "Last element"),
+    bind!(R, KeyCode::Enter, Exact(Mods::NONE), A::ReadActivate, "Read", "Follow link / open image / jump to footnote"),
+    bind!(R, KeyCode::Enter, Exact(Mods::CTRL), A::ReadActivateNewWindow, "Read", "Open link in a new window/tab"),
+    bind!(R, ch('y'), Exact(Mods::NONE), A::ReadCopy, "Read", "Copy link URL or element source"),
+
+    // ---- coarse reading-position jumps + view placement (the editor's own keys) ----
+    // `v` rides the editor's visual-line page motion: the jump distance is measured in the
+    // *editor's* wrap geometry (best-effort in read space — §2.7's contract), but the landing
+    // is always framed by the focus reveal.
+    bind!(R, ch('v'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Down, half: true }, "Motion", "Reading position down half a page"),
+    bind!(R, ch('v'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Reading position up half a page"),
+    bind!(R, ch(';'), Exact(Mods::NONE), A::PlaceCursor(ViewportPlace::Upper), "Scroll", "Focused element near top"),
+    bind!(R, ch(';'), Exact(Mods::ALT), A::PlaceCursor(ViewportPlace::Lower), "Scroll", "Focused element near bottom"),
+
+    // ---- scroll (without moving focus; mirrors the editor's scroll rows) ----
+    bind!(R, KeyCode::PageDown, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Page }, "Scroll", "Scroll page down"),
+    bind!(R, KeyCode::PageUp, Any, A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Page }, "Scroll", "Scroll page up"),
+    bind!(R, KeyCode::Up, Exact(Mods::ALT), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Half }, "Scroll", "Scroll half page up"),
+    bind!(R, KeyCode::Down, Exact(Mods::ALT), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Half }, "Scroll", "Scroll half page down"),
+    bind!(R, KeyCode::Up, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Up, unit: ScrollUnit::Line }, "Scroll", "Scroll up one line"),
+    bind!(R, KeyCode::Down, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Line }, "Scroll", "Scroll down one line"),
+    bind!(R, KeyCode::Left, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Left, unit: ScrollUnit::Line }, "Scroll", "Scroll focused code block left"),
+    bind!(R, KeyCode::Right, Exact(Mods::NONE), A::Scroll { dir: ScrollDir::Right, unit: ScrollUnit::Line }, "Scroll", "Scroll focused code block right"),
+
+    // Reading-position history: after following an anchor, a `g`, or an outline jump, `z`
+    // returns to where you were (the in-file complement to Backspace's cross-file history).
+    // The server's cursor-motion history, verbatim — the returned cursor derives focus.
+    bind!(R, ch('z'), IgnoreShift(Mods::NONE), A::MotionUndo, "Navigation", "Undo reading-position move"),
+    bind!(R, ch('z'), IgnoreShift(Mods::ALT), A::MotionRedo, "Navigation", "Redo reading-position move"),
+
+    // ---- search / navigation, verbatim from Normal ----
+    bind!(R, ch('/'), IgnoreShift(Mods::NONE), A::EnterSearch, "Search", "Search"),
+    bind!(R, ch('n'), IgnoreShift(Mods::ALT), A::SearchCycle(Direction::Backward), "Search", "Previous match"),
+    bind!(R, ch('n'), IgnoreShift(Mods::NONE), A::SearchCycle(Direction::Forward), "Search", "Next match"),
+    bind!(R, KeyCode::Backspace, Exact(Mods::NONE), A::NavBack, "Navigation", "Jump back (history)"),
+    bind!(R, KeyCode::Backspace, Exact(Mods::ALT), A::NavForward, "Navigation", "Jump forward (history)"),
+    bind!(R, ch(']'), Exact(Mods::NONE), A::JumplistStep(Direction::Forward), "", ""),
+    bind!(R, ch('['), Exact(Mods::NONE), A::JumplistStep(Direction::Backward), "", ""),
+    bind!(R, ch('}'), IgnoreShift(Mods::NONE), A::JumplistStepInFile(Direction::Forward), "", ""),
+    bind!(R, ch('{'), IgnoreShift(Mods::NONE), A::JumplistStepInFile(Direction::Backward), "", ""),
+
+    // ---- leader ----
+    bind!(R, ch(' '), Exact(Mods::NONE), A::BeginLeader, "Leader", "Space leader chord"),
+];
+
 #[rustfmt::skip]
 static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
@@ -949,6 +1054,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(L, ch('a'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(L, ch('v'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reading view"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
 ];

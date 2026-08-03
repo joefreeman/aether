@@ -98,4 +98,7 @@ arboard = "3"
 unicode-width = "0.2"
 
 # iced-client-only
-iced = { version = "0.14", features = ["tokio", "advanced", "markdown"] }
+iced = { version = "0.14", features = ["tokio", "advanced", "markdown", "image", "svg"] }
+# Remote images in the markdown reading view (docs/markdown-view.md §2.8): a small blocking
+# HTTP client (rustls), run under spawn_blocking from the fetch task.
+ureq = "2"

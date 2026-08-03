@@ -11,7 +11,7 @@ use crate::connection::NotifRx;
 pub use crate::core::effect::{
     Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget,
 };
-use crate::core::markdown::{Block as MdBlock, Inline as MdInline};
+use crate::core::markdown::{AlertKind, Block as MdBlock, Inline as MdInline, Span as MdSpan};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
@@ -293,6 +293,7 @@ impl HoverContent {
 /// [`SCROLL_ANIM_MS`], driven by frame ticks. Mirrors the web client's `scrollTopTo`:
 /// only near jumps animate (≤ ~1.5 viewports — long glides would sail over unloaded
 /// rows and storm the server with window fetches), wheel input snaps it off.
+#[derive(Clone, Copy)]
 struct ScrollAnim {
     from: f32,
     to: f32,
@@ -333,6 +334,24 @@ pub enum Message {
     RpcResult(u64, Result<serde_json::Value, crate::connection::RpcError>),
     /// A Markdown link in the hover popover was clicked — open it in the OS handler.
     OpenLink(String),
+    /// A click on a reading-view block/item: focus it — the source byte is the clicked
+    /// element's span start, and the core turns it into the cursor move focus derives from
+    /// (docs/markdown-view.md §2.3).
+    ReadClick(u32),
+    /// A click that landed on a rendered link / footnote-ref / image chip (the
+    /// [`READ_ARM_PREFIX`] sentinel): focus it AND follow it like `Enter` — the core keeps
+    /// images arm-only. Ctrl-click opens a relative link in a new window (the pointer
+    /// sibling of `Ctrl-Enter`, matching the picker rows).
+    ReadClickActivate(u32),
+    /// A remote reading-view image download resolved: raw bytes (sniffed raster-vs-SVG on
+    /// receipt) or an error, keyed by URL (docs/markdown-view.md §2.8).
+    RemoteImageFetched(String, Result<Vec<u8>, String>),
+    /// The [`ReadRevealProbe`] measured the focused block: `Some(offset)` = scroll the read
+    /// view there; `None` = already comfortably visible.
+    ReadRevealMeasured(Option<f32>),
+    /// The read scrollable scrolled (any cause — our glide ticks or the user's wheel): its
+    /// new offset and scroll range, mirrored for targeting/clamping.
+    ReadScrolled { y: f32, max: f32 },
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
@@ -406,6 +425,27 @@ pub struct App {
     /// The picker jumplist's scroll offset in px. The core tracks rows, not pixels; resets
     /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
+    /// The reading-view focus last revealed (`(buffer, span.start, span.end)`), so the document
+    /// scrolls only when the focus *changes* (docs/markdown-view.md §2.8).
+    read_last_focus: Option<(u64, u32, u32)>,
+    /// A pending click-focus target (span start): when the focus change lands on it, the reveal
+    /// snap is skipped — the clicked element was visible, so scrolling would only jolt.
+    read_click_target: Option<u32>,
+    /// The read scrollable's current offset (mirrored from its `on_scroll` — the widget owns
+    /// the truth) and the scroll range, for smooth-scroll targeting and clamping.
+    read_scroll_px: f32,
+    read_scroll_max: Option<f32>,
+    /// The read view's glide (the editor's [`ScrollAnim`], driving `scroll_to` per tick).
+    read_scroll_anim: Option<ScrollAnim>,
+    /// The offset the read glide last emitted — an `on_scroll` that deviates is user input
+    /// (wheel/drag), which snaps the glide off, like the editor.
+    read_anim_last: f32,
+    /// Remote (http/https) reading-view images by URL, fetched once per session
+    /// (docs/markdown-view.md §2.8). `Loading`/`Failed` render placeholders.
+    remote_images: std::collections::HashMap<String, RemoteImage>,
+    /// The `(buffer, revision)` last scanned for remote images, so the fetch fan-out runs once
+    /// per parse rather than per frame.
+    read_remote_scan: Option<(u64, u64)>,
     /// The picker search throbber's rotation (radians), advanced from frame ticks while a search is
     /// in progress, with the time of the last tick so the step is frame-rate independent.
     spinner_phase: f32,
@@ -466,6 +506,14 @@ impl App {
             reveal_after_fetch: None,
             place_after_fetch: None,
             picker_scroll_y: 0.0,
+            read_last_focus: None,
+            read_click_target: None,
+            read_scroll_px: 0.0,
+            read_scroll_max: None,
+            read_scroll_anim: None,
+            read_anim_last: 0.0,
+            remote_images: std::collections::HashMap::new(),
+            read_remote_scan: None,
             spinner_phase: 0.0,
             last_anim_tick: None,
             hover: None,
@@ -604,7 +652,9 @@ impl App {
         // only while one of those is actually animating — and never while disconnected, where a
         // picker throbber stuck mid-search (the server stopped answering) would otherwise pin the
         // 60fps redraw loop for the whole reconnect window.
-        let animating = self.scroll_anim.is_some() || self.picker_ticking();
+        let animating = self.scroll_anim.is_some()
+            || self.read_scroll_anim.is_some()
+            || self.picker_ticking();
         if animating && self.session.conn == ConnState::Connected {
             subs.push(iced::window::frames().map(Message::AnimTick));
         }
@@ -766,6 +816,7 @@ impl App {
     fn update_connecting(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Booted(Ok(Bootstrap::Session(b))) => {
+                let jump_boot = self.boot_args.as_ref().is_some_and(|a| a.jump_to.is_some());
                 self.boot_args = None;
                 self.boot_attempt = 0;
                 self.server_started_at = b.server_started_at;
@@ -788,6 +839,11 @@ impl App {
                 };
                 // Fetch the persisted app settings (e.g. the soft-wrap default) on this connection.
                 let startup = startup.and(self.session.startup());
+                // Boot installs the session directly (no `adopt_switch`), so the markdown
+                // reading-view default is applied here (docs/markdown-view.md §1.6); an
+                // `ae file:line` launch is jump-shaped and lands in the editor.
+                let jumped = jump_boot;
+                let startup = startup.and(self.session.boot_read_presentation(jumped));
                 Task::batch([
                     pump(b.notifications),
                     self.subscribe_task(),
@@ -979,6 +1035,63 @@ impl App {
                 open_link(&url);
                 Task::none()
             }
+            Message::ReadClick(byte) => {
+                // The clicked element is on screen by definition — remember the target so the
+                // focus-reveal snap skips this landing instead of jolting the scroll.
+                self.read_click_target = Some(byte);
+                let fx = self.session.read_click(byte);
+                self.run_core(fx)
+            }
+            Message::ReadClickActivate(byte) => {
+                self.read_click_target = Some(byte);
+                // `mouse_area` hands over no modifiers — consult the tracked state, as the
+                // picker rows do: Ctrl-click opens a relative link in a new window.
+                let fx = if self.modifiers.control() {
+                    self.session.read_click_new_window(byte)
+                } else {
+                    self.session.read_click_activate(byte)
+                };
+                self.run_core(fx)
+            }
+            Message::RemoteImageFetched(url, result) => {
+                let entry = match result {
+                    Ok(bytes) => {
+                        // SVG is a document, not a raster — it rides `widget::svg`. Sniff the
+                        // payload (servers get extensions wrong): XML/SVG starts with `<`,
+                        // optionally after whitespace/BOM.
+                        let looks_svg = url.split('?').next().is_some_and(|p| {
+                            p.to_ascii_lowercase().ends_with(".svg")
+                        }) || bytes
+                            .iter()
+                            .find(|b| !b.is_ascii_whitespace())
+                            .is_some_and(|b| *b == b'<');
+                        if looks_svg {
+                            RemoteImage::Svg(iced::widget::svg::Handle::from_memory(bytes))
+                        } else {
+                            RemoteImage::Raster(iced::widget::image::Handle::from_bytes(bytes))
+                        }
+                    }
+                    Err(_) => RemoteImage::Failed,
+                };
+                self.remote_images.insert(url, entry);
+                Task::none()
+            }
+            Message::ReadRevealMeasured(offset) => match offset {
+                // Through the read glide: smooth when short, snap when far — the editor's
+                // reveal feel.
+                Some(y) => self.read_scroll_to(y, true),
+                None => Task::none(),
+            },
+            Message::ReadScrolled { y, max } => {
+                // An offset the glide didn't emit is user input (wheel/drag): snap the glide
+                // off rather than fighting it — the editor's wheel behaviour.
+                if self.read_scroll_anim.is_some() && (y - self.read_anim_last).abs() > 1.0 {
+                    self.read_scroll_anim = None;
+                }
+                self.read_scroll_px = y;
+                self.read_scroll_max = Some(max);
+                Task::none()
+            }
             Message::Noop => Task::none(),
 
             Message::AnimTick(now) => {
@@ -992,18 +1105,36 @@ impl App {
                         (self.spinner_phase + dt * std::f32::consts::TAU) % std::f32::consts::TAU;
                 }
                 self.last_anim_tick = Some(now);
-                // Scroll easing (independent of the throbber).
-                let Some(anim) = &self.scroll_anim else {
-                    return Task::none();
-                };
-                let t = ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
-                let eased = 1.0 - (1.0 - t).powi(3); // cubic ease-out
-                self.scroll_px = anim.from + (anim.to - anim.from) * eased;
-                if t >= 1.0 {
-                    self.scroll_anim = None;
+                // Scroll easing (independent of the throbber) — the editor's own pixel
+                // scroll, and the read view's glide (same curve, driving the scrollable
+                // widget by absolute `scroll_to` per frame).
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(anim) = self.scroll_anim {
+                    let t =
+                        ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
+                    let eased = 1.0 - (1.0 - t).powi(3); // cubic ease-out
+                    self.scroll_px = anim.from + (anim.to - anim.from) * eased;
+                    if t >= 1.0 {
+                        self.scroll_anim = None;
+                    }
+                    self.clamp_scroll();
+                    tasks.push(self.maybe_fetch());
                 }
-                self.clamp_scroll();
-                self.maybe_fetch()
+                if let Some(anim) = self.read_scroll_anim {
+                    let t =
+                        ((now - anim.started).as_secs_f32() * 1000.0 / SCROLL_ANIM_MS).min(1.0);
+                    let eased = 1.0 - (1.0 - t).powi(3);
+                    let y = anim.from + (anim.to - anim.from) * eased;
+                    if t >= 1.0 {
+                        self.read_scroll_anim = None;
+                    }
+                    self.read_anim_last = y;
+                    tasks.push(iced::widget::operation::scroll_to(
+                        read_scroll_id(),
+                        iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    ));
+                }
+                Task::batch(tasks)
             }
 
             Message::Notified(Some(n)) => {
@@ -1201,6 +1332,73 @@ impl App {
                 Effect::RestoreScrollAnchor => {
                     if let Some(px) = self.scroll_anchor.take() {
                         self.scroll_to_px(px, false);
+                    }
+                }
+            }
+        }
+        // Reading-view focus reveal: when the focused element changed (a `j`/`k` step, an
+        // outline jump, search `n`), glide the document toward it. Widget layout heights aren't
+        // knowable here, so position approximates as the focus span's fraction of the source —
+        // the §2.7 best-effort contract.
+        if let Some(read) = self.session.read.as_ref() {
+            // Keyed to the Enter target when the cursor sits inside one (a Tab step must
+            // reveal the link, not just its paragraph), else the block-grain position.
+            let cursor = self.session.buffer.cursor.position;
+            let focus = read
+                .target_focus(cursor)
+                .or_else(|| read.block_focus(cursor))
+                .map(|i| {
+                    let sp = read.elements[i].span();
+                    (read.buffer_id, sp.start, sp.end)
+                });
+            if focus != self.read_last_focus {
+                self.read_last_focus = focus;
+                if let Some((_, start, _)) = focus {
+                    // A click-focus landing skips the reveal (the element was under the
+                    // pointer).
+                    if self.read_click_target.take() == Some(start) {
+                        // consumed
+                    } else {
+                        // Measure the focused block's real position, then scroll to it via
+                        // `ReadRevealMeasured` — block heights vary wildly (images, code
+                        // panels), so no source-derived approximation survives contact.
+                        tasks.push(
+                            iced::advanced::widget::operate(ReadRevealProbe::default())
+                                .map(Message::ReadRevealMeasured),
+                        );
+                    }
+                }
+            }
+        } else {
+            self.read_last_focus = None;
+            // The read scrollable is gone with its widget state — drop the glide + mirrors.
+            self.read_scroll_anim = None;
+            self.read_scroll_px = 0.0;
+            self.read_scroll_max = None;
+        }
+        // Remote-image fetch fan-out (docs/markdown-view.md §2.8): once per parse, download any
+        // http(s) display image the document references; results land as `RemoteImageFetched`
+        // and paint in as they arrive. The cache is URL-keyed and session-lived, so revisits and
+        // re-parses are free.
+        let scan_key = self
+            .session
+            .read
+            .as_ref()
+            .filter(|r| !r.blocks.is_empty())
+            .map(|r| (r.buffer_id, r.revision));
+        if let Some(key) = scan_key {
+            if self.read_remote_scan != Some(key) {
+                self.read_remote_scan = Some(key);
+                let urls = remote_image_sources(
+                    &self.session.read.as_ref().expect("scanned above").blocks,
+                );
+                for url in urls {
+                    if !self.remote_images.contains_key(&url) {
+                        self.remote_images.insert(url.clone(), RemoteImage::Loading);
+                        let for_message = url.clone();
+                        tasks.push(Task::perform(fetch_remote_image(url), move |r| {
+                            Message::RemoteImageFetched(for_message.clone(), r)
+                        }));
                     }
                 }
             }
@@ -1496,7 +1694,60 @@ impl App {
     fn run_shell_action(&mut self, action: ShellAction) -> Task<Message> {
         use ShellAction as A;
         match action {
+            // The reading view's Enter on an external link or image. The core sends either a
+            // URL or an absolute path; paths ride the `file:` scheme through the same
+            // allow-listed opener hover links use.
+            A::OpenUrl(url) => {
+                if let Some(path) = url.strip_prefix('/') {
+                    open_link(&format!("file:///{path}"));
+                } else {
+                    open_link(&url);
+                }
+                Task::none()
+            }
+            // A local image beside the buffer: open the absolute path with the system handler
+            // (the web half of this action rides the asset route instead).
+            A::OpenBufferFile { absolute, .. } => {
+                if let Some(path) = absolute.strip_prefix('/') {
+                    open_link(&format!("file:///{path}"));
+                }
+                Task::none()
+            }
             A::Scroll { dir, unit } => {
+                // In the reading view the vertical scroll is the document scrollable's;
+                // Left/Right pan the *focused* code panel (its scrollable carries
+                // `read_code_scroll_id` only while focused, so this no-ops elsewhere).
+                if self.session.read.is_some() {
+                    if matches!(dir, ScrollDir::Left | ScrollDir::Right) {
+                        let step = match unit {
+                            ScrollUnit::Line => 48.0,
+                            ScrollUnit::Half => 160.0,
+                            ScrollUnit::Page => 320.0,
+                        };
+                        let dx = if matches!(dir, ScrollDir::Left) { -step } else { step };
+                        return iced::widget::operation::scroll_by(
+                            read_code_scroll_id(),
+                            iced::widget::scrollable::AbsoluteOffset { x: dx, y: 0.0 },
+                        );
+                    }
+                    let line = self.session.buffer_font_size as f32 * 1.6;
+                    let vh = (self.visible_rows() as f32).max(1.0)
+                        * self.cell.map(|c| c.height).unwrap_or(line);
+                    let mag = match unit {
+                        ScrollUnit::Line => line,
+                        ScrollUnit::Half => (vh * 0.5).max(line),
+                        ScrollUnit::Page => vh.max(line),
+                    };
+                    let dy = match dir {
+                        ScrollDir::Up => -mag,
+                        ScrollDir::Down => mag,
+                        ScrollDir::Left | ScrollDir::Right => unreachable!("handled above"),
+                    };
+                    // The same glide as the editor's keys: accumulate on the target so key
+                    // repeat extends the motion instead of restarting it.
+                    let target = self.read_scroll_target() + dy;
+                    return self.read_scroll_to(target, true);
+                }
                 let Some(cell) = self.cell else {
                     return Task::none();
                 };
@@ -1519,6 +1770,15 @@ impl App {
                 self.maybe_fetch()
             }
             A::PlaceCursor(place) => {
+                // Reading view: edge-matched placement of the focused block — measured
+                // against real widget geometry by the reveal probe, in explicit mode.
+                if self.session.read.is_some() {
+                    return iced::advanced::widget::operate(ReadRevealProbe {
+                        place: Some(place),
+                        ..Default::default()
+                    })
+                    .map(Message::ReadRevealMeasured);
+                }
                 let task = self.place_cursor(place);
                 Task::batch([task, self.maybe_fetch()])
             }
@@ -1837,6 +2097,43 @@ impl App {
             .unwrap_or(self.scroll_px)
     }
 
+    /// The read view's [`Self::scroll_to_px`]: glide when the move is short (≤ ~1.5 views),
+    /// snap when far — driving the scrollable widget by per-tick `scroll_to` operations,
+    /// against the `on_scroll`-mirrored offset. Clamped once the mirror has seen the range
+    /// (before any scroll event the range is unknown; `scroll_to` clamps on apply anyway).
+    fn read_scroll_to(&mut self, target: f32, smooth: bool) -> Task<Message> {
+        let target = match self.read_scroll_max {
+            Some(max) => target.clamp(0.0, max),
+            None => target.max(0.0),
+        };
+        let delta = (target - self.read_scroll_px).abs();
+        let max_smooth = self.view_size.height * 1.5;
+        if smooth && delta > 0.0 && delta <= max_smooth {
+            self.read_scroll_anim = Some(ScrollAnim {
+                from: self.read_scroll_px,
+                to: target,
+                started: std::time::Instant::now(),
+            });
+            Task::none() // the AnimTick frames drive it
+        } else {
+            self.read_scroll_anim = None;
+            self.read_anim_last = target;
+            iced::widget::operation::scroll_to(
+                read_scroll_id(),
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
+            )
+        }
+    }
+
+    /// [`Self::scroll_target`] for the read view: keypress repeat accumulates on the glide's
+    /// destination.
+    fn read_scroll_target(&self) -> f32 {
+        self.read_scroll_anim
+            .as_ref()
+            .map(|a| a.to)
+            .unwrap_or(self.read_scroll_px)
+    }
+
     /// Fetch a new window when the view nears the loaded range's edge (web's `onScroll`).
     fn maybe_fetch(&mut self) -> Task<Message> {
         // No window fetches while the socket is down — the RPC would fail instantly and (on the
@@ -2088,6 +2385,10 @@ impl App {
                         ..container::Style::default()
                     })
                     .into()
+            } else if self.session.read.is_some() {
+                // The markdown reading view replaces the editor wholesale while active
+                // (docs/markdown-view.md §2.8) — the same status bar and overlays around it.
+                column![self.read_view(), self.status_bar()].into()
             } else {
                 let editor = editor::editor(
                     editor::Content {
@@ -3404,7 +3705,7 @@ impl App {
                 est_lines: n,
             } => {
                 est_lines = *n;
-                md_doc(blocks, ui)
+                md_doc(blocks, ui, Message::OpenLink)
             }
         };
         // Anchor at the cursor cell. Pick below/above by the room each side has for the
@@ -3417,7 +3718,14 @@ impl App {
         let est_h = est_lines as f32 * ui.line_height() + 20.0;
         let mut anchor = None;
         let mut max_h = MAX_H;
-        if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
+        if self.session.read.is_some() {
+            // Reading view: there's no cursor cell to hang from — park bottom-left over the
+            // document (the terminal's bottom-anchored popover placement), where the read
+            // target reveal (`Tab`) expects it.
+            let view_h = self.view_size.height;
+            max_h = MAX_H.min((view_h - 2.0 * MARGIN).max(40.0));
+            anchor = Some((MARGIN + 4.0, HoverPlace::Bottom(view_h - MARGIN)));
+        } else if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
             let pc = grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH);
             // Horizontal anchor: refreshed while the cursor is in the loaded window, and retained
             // when it scrolls out of range so the popover keeps its column instead of jumping left.
@@ -3959,26 +4267,32 @@ const MD_SPACING: f32 = 11.0;
 
 /// Render the hover Markdown AST: a column of block elements. Everything is cloned, so the result
 /// doesn't borrow the AST (`'static`).
-fn md_doc(blocks: &[MdBlock], ui: theme::Ui) -> Element<'static, Message> {
+fn md_doc<M: 'static>(
+    blocks: &[MdBlock],
+    ui: theme::Ui,
+    on_link: fn(String) -> M,
+) -> Element<'static, M> {
     let mut col = column![].spacing(ui.at(MD_SPACING));
     for b in blocks {
-        col = col.push(md_block(b, ui));
+        col = col.push(md_block(b, ui, on_link));
     }
     col.into()
 }
 
-fn md_block(b: &MdBlock, ui: theme::Ui) -> Element<'static, Message> {
+fn md_block<M: 'static>(b: &MdBlock, ui: theme::Ui, on_link: fn(String) -> M) -> Element<'static, M> {
     match b {
-        MdBlock::Heading { level, content } => {
+        MdBlock::Heading { level, content, .. } => {
             let size = match level {
                 1 => 16.0,
                 2 => 15.0,
                 3 => 14.0,
                 _ => MD_TEXT,
             };
-            md_rich(content, true, theme::NORD6, ui.at(size))
+            md_rich(content, true, theme::NORD6, ui.at(size), on_link)
         }
-        MdBlock::Paragraph { content } => md_rich(content, false, theme::NORD4, ui.at(MD_TEXT)),
+        MdBlock::Paragraph { content, .. } => {
+            md_rich(content, false, theme::NORD4, ui.at(MD_TEXT), on_link)
+        }
         MdBlock::Code { code, .. } => container(
             text(code.clone())
                 .font(iced::Font::MONOSPACE)
@@ -3996,35 +4310,893 @@ fn md_block(b: &MdBlock, ui: theme::Ui) -> Element<'static, Message> {
             ..container::Style::default()
         })
         .into(),
-        MdBlock::List { ordered, items } => {
+        MdBlock::List {
+            ordered,
+            start,
+            items,
+            ..
+        } => {
             let mut col = column![].spacing(ui.at(MD_SPACING) * 0.5);
             for (i, item) in items.iter().enumerate() {
-                let marker = if *ordered {
-                    format!("{}.", i + 1)
+                let mut marker = if *ordered {
+                    format!("{}.", start + i as u64)
                 } else {
                     "•".to_string()
                 };
+                // Task-list items carry their checkbox on the marker.
+                if let Some(done) = item.checked {
+                    marker = format!("{} {}", marker, if done { "☑" } else { "☐" });
+                }
                 col = col.push(
                     row![
                         text(marker).size(ui.at(MD_TEXT)).color(theme::NORD4),
-                        md_doc(item, ui),
+                        md_doc(&item.blocks, ui, on_link),
                     ]
                     .spacing(6),
                 );
             }
             col.into()
         }
-        MdBlock::Quote { content } => row![md_bar(), md_doc(content, ui)].spacing(8).into(),
-        MdBlock::Rule => container(iced::widget::Space::new())
+        MdBlock::Quote { content, .. } => {
+            row![md_bar(), md_doc(content, ui, on_link)].spacing(8).into()
+        }
+        MdBlock::Rule { .. } => container(iced::widget::Space::new())
             .width(Length::Fill)
             .height(1)
             .style(md_bar_style)
             .into(),
+        // The remaining kinds only occur in document (reading-view) parses; hover content never
+        // produces them, but a fallback keeps hover total. The reading view has its own renderer.
+        MdBlock::Table { head, rows, .. } => {
+            let mut col = column![].spacing(ui.at(MD_SPACING) * 0.5);
+            for row_cells in std::iter::once(head).chain(rows.iter()) {
+                if row_cells.is_empty() {
+                    continue;
+                }
+                let joined = row_cells
+                    .iter()
+                    .map(|c| md_plain(c))
+                    .collect::<Vec<_>>()
+                    .join("  |  ");
+                col = col.push(text(joined).size(ui.at(MD_TEXT)).color(theme::NORD4));
+            }
+            col.into()
+        }
+        MdBlock::Image { alt, .. } => text(format!("[image: {alt}]"))
+            .size(ui.at(MD_TEXT))
+            .color(theme::NORD3)
+            .into(),
+        MdBlock::FrontMatter { .. } => iced::widget::Space::new().into(),
+        MdBlock::FootnoteDef { label, content, .. } => row![
+            text(format!("[{label}]:")).size(ui.at(MD_TEXT)).color(theme::NORD3),
+            md_doc(content, ui, on_link),
+        ]
+        .spacing(6)
+        .into(),
+        MdBlock::Html { raw, .. } => text(raw.clone())
+            .font(iced::Font::MONOSPACE)
+            .size(ui.at(MD_CODE))
+            .color(theme::NORD3)
+            .into(),
     }
 }
 
+/// `(natural, minimum)` estimated pixel widths of a table cell's inline run at `size`: the
+/// whole run on one line, and the widest whitespace-unbreakable token (the cell can't wrap
+/// below it). Serif glyphs average ~0.52 em; the monospace code face advances exactly 0.6 em,
+/// padded to 0.62. Estimates only — real shaping happens at draw time, so column widths carry
+/// padding slack on top.
+fn cell_text_width(inlines: &[MdInline], size: f32) -> (f32, f32) {
+    fn chars(
+        text: &str,
+        code: bool,
+        size: f32,
+        natural: &mut f32,
+        word: &mut f32,
+        minimum: &mut f32,
+    ) {
+        let w = if code { size * 0.62 } else { size * 0.52 };
+        for c in text.chars() {
+            if c.is_whitespace() {
+                *word = 0.0;
+            } else {
+                *word += w;
+                *minimum = minimum.max(*word);
+            }
+            *natural += w;
+        }
+    }
+    fn walk(
+        inlines: &[MdInline],
+        size: f32,
+        natural: &mut f32,
+        word: &mut f32,
+        minimum: &mut f32,
+    ) {
+        for inl in inlines {
+            match inl {
+                MdInline::Text { text } => chars(text, false, size, natural, word, minimum),
+                MdInline::Code { text } => chars(text, true, size, natural, word, minimum),
+                MdInline::Emphasis { content }
+                | MdInline::Strong { content }
+                | MdInline::Strikethrough { content }
+                | MdInline::Link { content, .. } => {
+                    walk(content, size, natural, word, minimum)
+                }
+                MdInline::Image { alt, .. } => {
+                    chars(&format!("▨ [{alt}]"), false, size, natural, word, minimum)
+                }
+                MdInline::FootnoteRef { label, .. } => {
+                    chars(&format!("[{label}]"), false, size, natural, word, minimum)
+                }
+                MdInline::HardBreak => *word = 0.0,
+            }
+        }
+    }
+    let (mut natural, mut word, mut minimum) = (0f32, 0f32, 0f32);
+    walk(inlines, size, &mut natural, &mut word, &mut minimum);
+    (natural, minimum)
+}
+
+/// Flatten inlines to plain text (hover fallbacks for table cells).
+fn md_plain(inlines: &[MdInline]) -> String {
+    let mut out = String::new();
+    for inl in inlines {
+        match inl {
+            MdInline::Text { text } | MdInline::Code { text } => out.push_str(text),
+            MdInline::Strong { content }
+            | MdInline::Emphasis { content }
+            | MdInline::Strikethrough { content }
+            | MdInline::Link { content, .. } => out.push_str(&md_plain(content)),
+            MdInline::Image { alt, .. } => out.push_str(alt),
+            MdInline::FootnoteRef { label, .. } => out.push_str(&format!("[{label}]")),
+            MdInline::HardBreak => out.push(' '),
+        }
+    }
+    out
+}
+
+// ---- the markdown reading view (docs/markdown-view.md §2.8, iced) -------------------------------
+
+/// The reading measure in ems of the body size — the column tracks the buffer font size (a
+/// bigger type setting keeps the same ~characters-per-line), like the web's `max-width: 42.5em`.
+/// 42.5 × the 16px default = the original 680px.
+const READ_MEASURE_EM: f32 = 42.5;
+
+fn read_scroll_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("read-view")
+}
+
+/// The container wrapping the block that carries the reading-position bar this frame — the
+/// [`ReadRevealProbe`]'s measurement anchor. Exactly one per view (the focused band, or the
+/// focused list item's wrapper).
+fn read_focus_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("read-focus")
+}
+
+/// The *focused* code panel's horizontal scrollable — Left/Right pan it
+/// (docs/markdown-view.md §2.3); at most one panel carries the id per frame, and the
+/// `scroll_by` no-ops when the focus isn't a code block.
+fn read_code_scroll_id() -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::new("read-code-scroll")
+}
+
+/// Sentinel link payload (`{prefix}{span.start}`) for rich-text runs whose click should
+/// *arm* (focus) rather than open: internal links, inline-image chips, footnote refs — the
+/// web's click-to-arm, for runs that live inside `rich_text` where only links are clickable.
+/// The read view's message map intercepts it; hover popovers route it to `OpenLink`, whose
+/// scheme allow-list drops it.
+const READ_ARM_PREFIX: &str = "aether-arm:";
+
+/// Measure-then-reveal for the reading view (docs/markdown-view.md §2.7): captures the read
+/// scrollable's viewport + current offset and the [`read_focus_id`] container's real bounds
+/// (scrollable children operate in untranslated content coordinates), and finishes with the
+/// absolute offset that rests the block ~20% down the viewport — `None` when it's already
+/// comfortably visible. Replaces the source-byte-fraction snap, which drifted off screen as
+/// soon as images and code panels made block heights non-uniform. Safe to run from the reveal
+/// task: the winit runtime executes widget operations *after* rebuilding the view, so the
+/// probe always measures the freshly focused block.
+#[derive(Default)]
+struct ReadRevealProbe {
+    /// The read scrollable's `(viewport, current translation, content bounds)`.
+    viewport: Option<(iced::Rectangle, iced::Vector, iced::Rectangle)>,
+    focus: Option<iced::Rectangle>,
+    /// `None` = reveal (skip when comfortably visible, rest ~20% down); `Some(place)` =
+    /// explicit edge-matched placement (`;`/`Alt-;`): always reposition, leaving
+    /// [`ViewportPlace::READ_GAP`] between the view's edge and the block's matching edge
+    /// (top-to-top for `Upper`, bottom-to-bottom for `Lower`).
+    place: Option<ViewportPlace>,
+}
+
+impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<Option<f32>>),
+    ) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
+        if id == Some(&read_focus_id()) {
+            self.focus = Some(bounds);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&iced::advanced::widget::Id>,
+        bounds: iced::Rectangle,
+        content_bounds: iced::Rectangle,
+        translation: iced::Vector,
+        _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id == Some(&read_scroll_id()) {
+            self.viewport = Some((bounds, translation, content_bounds));
+        }
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<Option<f32>> {
+        use iced::advanced::widget::operation::Outcome;
+        let (Some((view, translation, content)), Some(focus)) = (self.viewport, self.focus)
+        else {
+            return Outcome::Some(None);
+        };
+        let y = focus.y - content.y; // the block's y in content space
+        let top = y - translation.y; // …relative to the viewport
+        let margin = 48.0_f32.min(view.height * 0.08);
+        if let Some(place) = self.place {
+            // Explicit edge-matched placement: READ_GAP between the view edge and the block's
+            // matching edge — a tall block placed "near the bottom" really ends there.
+            let gap = view.height * ViewportPlace::READ_GAP;
+            let raw = match place {
+                ViewportPlace::Upper => y - gap,
+                ViewportPlace::Lower => (y + focus.height) - (view.height - gap),
+            };
+            let offset = raw.clamp(0.0, (content.height - view.height).max(0.0));
+            return Outcome::Some(Some(offset));
+        }
+        if top >= margin && top + focus.height <= view.height - margin {
+            return Outcome::Some(None); // comfortably visible — don't fight manual scrolling
+        }
+        // Rest ~20% down (the editor's jump placement); an element taller than the viewport
+        // pins nearer the top. Mirrors the web shell's revealFocus math.
+        let rest = (view.height * 0.2).min((view.height - focus.height - margin).max(margin));
+        let offset = (y - rest).clamp(0.0, (content.height - view.height).max(0.0));
+        Outcome::Some(Some(offset))
+    }
+}
+
+impl App {
+    /// The reading-view document: a centered, measure-capped column of typographic blocks in a
+    /// scrollable. The focused element's top-level block is tinted (focus is derived from the
+    /// server cursor; per-span focus painting is renderer polish).
+    fn read_view(&self) -> Element<'_, Message> {
+        let ui = self.ui();
+        let Some(read) = self.session.read.as_ref() else {
+            return iced::widget::Space::new().into();
+        };
+        let body = self.session.buffer_font_size as f32;
+        // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
+        // always marks the reading position; the target pill inverts the interactive span the
+        // cursor sits inside, on top of it.
+        let cursor = self.session.buffer.cursor.position;
+        let block_span = read.block_focus(cursor).map(|i| read.elements[i].span());
+        let target_span = read.target_focus(cursor).map(|i| read.elements[i].span());
+        // Full-width rows: each block is a window-wide band (the selection tint fills it)
+        // that centers its own measure-capped content column.
+        let mut col = column![].spacing(body * 0.8);
+        if read.loading && read.blocks.is_empty() {
+            col = col.push(
+                container(text("Loading…").size(body).color(theme::NORD3))
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center),
+            );
+        }
+        for b in &read.blocks {
+            // The position bar sits on the block — except lists, whose items bar individually
+            // inside `read_block` (item-grain position).
+            let focused = !matches!(b, MdBlock::List { .. }) && block_span == Some(b.span());
+            let block = self.read_block(b, body, ui, block_span, target_span);
+            // Clicking a block focuses it (list items carry their own inner mouse areas, which
+            // capture the press first — see `read_block`'s List arm).
+            let block: Element<'_, ReadMsg> = iced::widget::mouse_area(block)
+                .on_press(ReadMsg::Click(b.span().start))
+                .into();
+            // The reading cursor is a frost bar down the block's left edge (settled on after
+            // trying tints and full-width bands). Lists skip the block-level wrap — their items
+            // carry their own (see the List arm), and nesting the two would indent item bars a
+            // wrapper-inset right of every other bar.
+            let wrapped: Element<'_, ReadMsg> = if matches!(b, MdBlock::List { .. }) {
+                block
+            } else {
+                read_focus_wrap(focused, block)
+            };
+            let inner = container(wrapped)
+                .width(Length::Fill)
+                .max_width(body * READ_MEASURE_EM)
+                .padding([3, 16]);
+            let outer = container(inner)
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center);
+            // The focused band anchors the reveal probe (lists anchor their focused item
+            // inside `read_block` instead).
+            let outer = if focused {
+                outer.id(read_focus_id())
+            } else {
+                outer
+            };
+            col = col.push(outer);
+        }
+        Element::from(
+            iced::widget::scrollable(container(col).width(Length::Fill).padding([24, 0]))
+                .id(read_scroll_id())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .on_scroll(|vp| {
+                    let max = (vp.content_bounds().height - vp.bounds().height).max(0.0);
+                    ReadMsg::Scrolled(vp.absolute_offset().y, max)
+                }),
+        )
+        .map(|m| match m {
+            ReadMsg::Click(byte) => Message::ReadClick(byte),
+            // A click on an internal link / inline-image chip / footnote ref — the sentinel
+            // carries the span start; the core follows links/refs like Enter (images arm).
+            ReadMsg::Link(url) => match url
+                .strip_prefix(READ_ARM_PREFIX)
+                .and_then(|b| b.parse::<u32>().ok())
+            {
+                Some(byte) => Message::ReadClickActivate(byte),
+                None => Message::OpenLink(url),
+            },
+            ReadMsg::Scrolled(y, max) => Message::ReadScrolled { y, max },
+        })
+    }
+
+    /// One reading-view block. Reuses the hover renderers for inline runs; headings, tables and
+    /// images get document-scale treatment. `block`/`target` are the two focus projections
+    /// (position bar / Enter-target pill) — see `read_view`.
+    fn read_block(
+        &self,
+        b: &MdBlock,
+        body: f32,
+        ui: theme::Ui,
+        block: Option<MdSpan>,
+        target: Option<MdSpan>,
+    ) -> Element<'static, ReadMsg> {
+        match b {
+            MdBlock::Heading { level, content, .. } => {
+                let size = match level {
+                    1 => body * 1.75,
+                    2 => body * 1.45,
+                    3 => body * 1.25,
+                    _ => body * 1.1,
+                };
+                // The terminal's heading colour ladder: frost blue majors, teal H3, white
+                // H4, body-grey H5/H6 — colour distinguishes the minor levels, which share
+                // the smallest size.
+                let color = match level {
+                    1 | 2 => theme::NORD8,
+                    3 => theme::NORD7,
+                    4 => theme::NORD6,
+                    _ => theme::NORD4,
+                };
+                let h = md_rich_in(
+                    content,
+                    true,
+                    color,
+                    size,
+                    READ_FONT_FAMILY,
+                    1.3, // headings stay tight; the body carries the airiness
+                    target,
+                    ReadMsg::Link,
+                );
+                if *level == 2 {
+                    // Second-level headings carry an underline rule (matches the web's h2
+                    // border and the terminal's `─` row).
+                    column![
+                        h,
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(1)
+                            .style(|_| container::Style {
+                                background: Some(theme::NORD2.into()),
+                                ..container::Style::default()
+                            }),
+                    ]
+                    .spacing(6)
+                    .into()
+                } else {
+                    h
+                }
+            }
+            MdBlock::Paragraph { content, .. } => md_rich_in(
+                content,
+                false,
+                theme::NORD4,
+                body,
+                READ_FONT_FAMILY,
+                READ_LINE_HEIGHT,
+                target,
+                ReadMsg::Link,
+            ),
+            MdBlock::Table {
+                alignments,
+                head,
+                rows,
+                ..
+            } => self.read_table(alignments, head, rows, body, target),
+            MdBlock::Image {
+                src,
+                alt,
+                inner_span,
+                ..
+            } => self.read_image(src, alt, *inner_span, body, target),
+            MdBlock::List {
+                ordered,
+                start,
+                items,
+                ..
+            } => {
+                let mut col = column![].spacing(body * 0.35);
+                for (i, item) in items.iter().enumerate() {
+                    let mut marker = if *ordered {
+                        format!("{}.", start + i as u64)
+                    } else {
+                        "•".to_string()
+                    };
+                    if let Some(done) = item.checked {
+                        marker = if done { "☑".into() } else { "☐".into() };
+                    }
+                    let mut inner = column![].spacing(body * 0.35);
+                    for ib in &item.blocks {
+                        inner = inner.push(self.read_block(ib, body, ui, block, target));
+                    }
+                    // Item-grain click focus: this inner area captures the press before the
+                    // whole-block area the outer loop wraps the list in. The position bar
+                    // rides the same wrapper, so focusing an item marks *it*, not the list —
+                    // and equality (not containment) keeps a nested item's bar off its parents.
+                    let item_focused = block == Some(item.span);
+                    let area = iced::widget::mouse_area(read_focus_wrap(
+                        item_focused,
+                        row![
+                            text(marker).size(body).color(theme::NORD4),
+                            inner,
+                        ]
+                        .spacing(8)
+                        .into(),
+                    ))
+                    .on_press(ReadMsg::Click(item.span.start));
+                    // The focused item anchors the reveal probe (item grain, not the list).
+                    col = col.push(if item_focused {
+                        Element::from(
+                            container(area).width(Length::Fill).id(read_focus_id()),
+                        )
+                    } else {
+                        area.into()
+                    });
+                }
+                col.into()
+            }
+            MdBlock::Quote { alert, content, .. } => {
+                let mut inner = column![].spacing(body * 0.5);
+                if let Some(kind) = alert {
+                    // The alert's label row: the capitalized kind in its colour, semibold —
+                    // the web's `.md-alert-label`, the terminal's AlertLabel span.
+                    let (label, color) = alert_style(*kind);
+                    inner = inner.push(
+                        text(label)
+                            .size(body * 0.95)
+                            .color(color)
+                            .font(iced::Font {
+                                family: READ_FONT_FAMILY,
+                                weight: iced::font::Weight::Semibold,
+                                ..iced::Font::DEFAULT
+                            }),
+                    );
+                }
+                for cb in content {
+                    inner = inner.push(self.read_block(cb, body, ui, block, target));
+                }
+                // A left bar, no panel shade (Joe's call: quotes read fine as bar + indent).
+                // Same nested-container construction as `read_focus_wrap` — `md_bar()`'s Fill
+                // height would blow up under the read scrollable's unbounded limits (the bug
+                // that blanked lists): the outer paints the bar colour, the inner repaints the
+                // canvas over everything but the 3px strip. Square corners, matching the
+                // position bar. Alerts colour the bar by kind, matching their label.
+                let bar = alert.map(|k| alert_style(k).1).unwrap_or(theme::NORD3);
+                let panel = container(inner)
+                    .width(Length::Fill)
+                    .padding([8, 10])
+                    .style(|_| container::Style {
+                        background: Some(theme::NORD0.into()),
+                        ..container::Style::default()
+                    });
+                container(panel)
+                    .width(Length::Fill)
+                    .padding(iced::Padding {
+                        left: 3.0,
+                        ..iced::Padding::ZERO
+                    })
+                    .style(move |_| container::Style {
+                        background: Some(bar.into()),
+                        ..container::Style::default()
+                    })
+                    .into()
+            }
+            MdBlock::Code {
+                language,
+                code,
+                span,
+            } => {
+                // The panel's inset lives on the tag and the *scrollable content*, not the
+                // panel container — the scrollable then spans the panel edge-to-edge, so its
+                // bar sits flush with the block instead of floating inside the padding (and
+                // the content's bottom inset gives the overlay bar a text-free strip).
+                let mut panel = column![].spacing(4.0);
+                if let Some(lang) = language {
+                    panel = panel.push(
+                        container(
+                            text(lang.clone())
+                                .font(iced::Font::MONOSPACE)
+                                .size(body * 0.65)
+                                .color(theme::NORD3_BRIGHT),
+                        )
+                        .padding(iced::Padding {
+                            top: 10.0,
+                            right: 12.0,
+                            bottom: 0.0,
+                            left: 12.0,
+                        }),
+                    );
+                }
+                // Tree-sitter runs when the server's snippet highlights have landed for this
+                // fence (docs/markdown-view.md §2.8) — the editor's own token colours; plain
+                // NORD4 monospace until then.
+                let hls = self
+                    .session
+                    .read
+                    .as_ref()
+                    .and_then(|r| r.code_highlights.get(&span.start))
+                    .filter(|h| !h.is_empty());
+                let code_el: Element<'static, ReadMsg> = match hls {
+                    Some(hls) => {
+                        let mono = iced::Font::MONOSPACE;
+                        let mut spans: Vec<iced::advanced::text::Span<'static, String>> =
+                            Vec::new();
+                        let mut push = |s: &str, color: iced::Color| {
+                            if !s.is_empty() {
+                                spans.push(
+                                    iced::widget::span(s.to_string()).font(mono).color(color),
+                                );
+                            }
+                        };
+                        let mut pos = 0usize;
+                        for h in hls {
+                            let s = (h.start as usize).min(code.len());
+                            let e = (h.end as usize).clamp(s, code.len());
+                            push(&code[pos..s], theme::NORD4);
+                            let color =
+                                theme::highlight_color(&h.kind).unwrap_or(theme::NORD4);
+                            push(&code[s..e], color);
+                            pos = e;
+                        }
+                        push(&code[pos..], theme::NORD4);
+                        iced::widget::rich_text(spans)
+                            .size(body * 0.85)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into()
+                    }
+                    None => text(code.clone())
+                        .font(iced::Font::MONOSPACE)
+                        .size(body * 0.85)
+                        .color(theme::NORD4)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                };
+                // Long lines don't wrap — the panel scrolls horizontally, like the web's
+                // `<pre>`. A vertical wheel passes through: a scrollable only captures events
+                // that actually scrolled it. The code's inset rides *inside* the scroll
+                // content (Shrink — Fill under the unbounded horizontal limits is the layout
+                // landmine), so text leads in/out by 12px at either scroll end.
+                let code_padded = container(code_el).padding(iced::Padding {
+                    top: if language.is_some() { 0.0 } else { 10.0 },
+                    right: 12.0,
+                    bottom: 10.0,
+                    left: 12.0,
+                });
+                let scroll = iced::widget::scrollable(code_padded)
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::new()
+                            .width(6)
+                            .scroller_width(6),
+                    ))
+                    .width(Length::Fill);
+                // The focused panel is Left/Right's pan target (see `read_code_scroll_id`).
+                let scroll = if block == Some(*span) {
+                    scroll.id(read_code_scroll_id())
+                } else {
+                    scroll
+                };
+                panel = panel.push(scroll);
+                container(panel)
+                    .width(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(theme::NORD1.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..iced::Border::default()
+                        },
+                        ..container::Style::default()
+                    })
+                    .into()
+            }
+            // Document-scale rule: the 1px line alone gives the focus bar nothing to stand
+            // next to (a ~1px bar is invisible), so it sits in vertical padding.
+            MdBlock::Rule { .. } => container(
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(1)
+                    .style(md_bar_style),
+            )
+            .width(Length::Fill)
+            .padding([body * 0.5, 0.0])
+            .into(),
+            // The remaining kinds read fine at hover scale.
+            other => md_block(other, ui, ReadMsg::Link),
+        }
+    }
+
+    /// A real table: header row bold on a panel, body rows striped, columns at fixed
+    /// pixel-estimated widths — natural content width capped at ~22 em, never below the widest
+    /// unbreakable token (a cell can't wrap inside a word, and iced doesn't clip overflow, so
+    /// underestimating painted cells over their neighbours — the old char-count weighting also
+    /// undercounted monospace code chips). A table wider than the measure scrolls horizontally
+    /// (the web's `.md-table-scroll` behaviour). Everything inside the scrollable sizes Shrink:
+    /// `Fill` under its unbounded horizontal limits is the layout landmine.
+    fn read_table(
+        &self,
+        _alignments: &[aether_client::markdown::ColAlign],
+        head: &[Vec<MdInline>],
+        rows: &[Vec<Vec<MdInline>>],
+        body: f32,
+        target: Option<MdSpan>,
+    ) -> Element<'static, ReadMsg> {
+        let ncols = rows
+            .iter()
+            .map(|r| r.len())
+            .chain(std::iter::once(head.len()))
+            .max()
+            .unwrap_or(0);
+        if ncols == 0 {
+            return iced::widget::Space::new().into();
+        }
+        let cell_size = body * 0.92;
+        let empty = Vec::new();
+        let mut widths = vec![0f32; ncols];
+        for (ci, w) in widths.iter_mut().enumerate() {
+            let mut natural = 0f32;
+            let mut minimum = 0f32;
+            if let Some(c) = head.get(ci) {
+                // Headers run bold — a nudge wider.
+                let (n, m) = cell_text_width(c, cell_size * 1.05);
+                natural = natural.max(n);
+                minimum = minimum.max(m);
+            }
+            for r in rows {
+                if let Some(c) = r.get(ci) {
+                    let (n, m) = cell_text_width(c, cell_size);
+                    natural = natural.max(n);
+                    minimum = minimum.max(m);
+                }
+            }
+            // 18px of cell padding plus estimate slack.
+            *w = natural.min(body * 22.0).max(minimum) + 22.0;
+        }
+        let cell = |content: &[MdInline], header: bool, w: f32| -> Element<'static, ReadMsg> {
+            let color = if header { theme::NORD6 } else { theme::NORD4 };
+            container(md_rich_in(
+                content,
+                header,
+                color,
+                cell_size,
+                READ_FONT_FAMILY,
+                1.4,
+                target,
+                ReadMsg::Link,
+            ))
+            .width(Length::Fixed(w))
+            .padding([5, 9])
+            .into()
+        };
+        let mut col = column![];
+        if !head.is_empty() {
+            let mut r = row![];
+            for ci in 0..ncols {
+                r = r.push(cell(head.get(ci).unwrap_or(&empty), true, widths[ci]));
+            }
+            col = col.push(container(r).style(|_| container::Style {
+                background: Some(theme::NORD1.into()),
+                ..container::Style::default()
+            }));
+        }
+        for (ri, row_cells) in rows.iter().enumerate() {
+            let mut r = row![];
+            for ci in 0..ncols {
+                let c = row_cells.get(ci).unwrap_or(&empty);
+                r = r.push(cell(c, false, widths[ci]));
+            }
+            let striped = ri % 2 == 1;
+            col = col.push(container(r).style(move |_| container::Style {
+                background: striped.then(|| theme::NORD1.scale_alpha(0.4).into()),
+                ..container::Style::default()
+            }));
+        }
+        let framed = container(col).style(|_| container::Style {
+            border: iced::Border {
+                color: theme::NORD3,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        });
+        iced::widget::scrollable(framed)
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::new()
+                    .width(6)
+                    .scroller_width(6),
+            ))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// A display image: relative sources resolve against the buffer's directory and load from
+    /// disk; remote http(s) sources come from the session fetch cache ([`RemoteImage`], filled
+    /// by the fan-out in `run_core`); anything else renders as a placeholder. SVGs — local or
+    /// remote — ride `widget::svg` (the raster decoder doesn't read them). The frost ring
+    /// appears only when the image is *armed* (`l` — its inner markup span is the target):
+    /// display images join the opt-in model, so the ring means "Enter acts here".
+    fn read_image(
+        &self,
+        src: &str,
+        alt: &str,
+        inner: MdSpan,
+        body: f32,
+        target: Option<MdSpan>,
+    ) -> Element<'static, ReadMsg> {
+        let label = if alt.is_empty() { "image" } else { alt };
+        let placeholder = |note: &str| -> Element<'static, ReadMsg> {
+            text(format!("▨ [{label}]  ({note})"))
+                .size(body * 0.9)
+                .color(theme::NORD3)
+                .into()
+        };
+        let lower = src.to_ascii_lowercase();
+        let el: Element<'static, ReadMsg> = if lower.starts_with("http://")
+            || lower.starts_with("https://")
+        {
+            match self.remote_images.get(src) {
+                Some(RemoteImage::Raster(h)) => {
+                    iced::widget::image(h.clone()).width(Length::Fill).into()
+                }
+                Some(RemoteImage::Svg(h)) => iced::widget::svg(h.clone())
+                    .width(Length::Fill)
+                    .height(Length::Shrink)
+                    .into(),
+                Some(RemoteImage::Loading) => placeholder("loading…"),
+                Some(RemoteImage::Failed) | None => placeholder(src),
+            }
+        } else {
+            let external = src.contains("://") || src.starts_with('/');
+            let resolved = (!external)
+                .then(|| {
+                    self.session
+                        .buffer
+                        .path
+                        .as_deref()
+                        .and_then(|p| std::path::Path::new(p).parent())
+                        .map(|dir| dir.join(src))
+                })
+                .flatten()
+                .filter(|p| p.exists());
+            match resolved {
+                Some(path) if lower.ends_with(".svg") => {
+                    iced::widget::svg(iced::widget::svg::Handle::from_path(path))
+                        .width(Length::Fill)
+                        .height(Length::Shrink)
+                        .into()
+                }
+                Some(path) => iced::widget::image(iced::widget::image::Handle::from_path(path))
+                    .width(Length::Fill)
+                    .into(),
+                None => placeholder(src),
+            }
+        };
+        // The ring frame is ALWAYS present (transparent border when unarmed) so arming is a
+        // paint-only change: a wrapper that appears on arm would inset the image, shrinking
+        // it and forcing a relayout + re-scale — the same reserve-the-space trick as the
+        // focus bar. Padding ≥ border width keeps the ring off the image's edge.
+        let armed = target == Some(inner);
+        container(el)
+            .width(Length::Fill)
+            .padding(3)
+            .style(move |_| container::Style {
+                border: iced::Border {
+                    color: if armed {
+                        theme::NORD8
+                    } else {
+                        iced::Color::TRANSPARENT
+                    },
+                    width: 3.0,
+                    radius: 2.0.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    }
+}
+
+/// A fetched remote reading-view image (docs/markdown-view.md §2.8), keyed by URL in
+/// [`App::remote_images`].
+enum RemoteImage {
+    Loading,
+    Raster(iced::widget::image::Handle),
+    Svg(iced::widget::svg::Handle),
+    Failed,
+}
+
+/// Every remote (http/https) display-image source in the document, deduplicated, recursively —
+/// the reading view's fetch fan-out (inline images render as text, so only block images count).
+fn remote_image_sources(blocks: &[MdBlock]) -> Vec<String> {
+    fn walk(blocks: &[MdBlock], out: &mut Vec<String>) {
+        for b in blocks {
+            match b {
+                MdBlock::Image { src, .. } => {
+                    let lower = src.to_ascii_lowercase();
+                    if (lower.starts_with("http://") || lower.starts_with("https://"))
+                        && !out.contains(src)
+                    {
+                        out.push(src.clone());
+                    }
+                }
+                MdBlock::Quote { content, .. } | MdBlock::FootnoteDef { content, .. } => {
+                    walk(content, out)
+                }
+                MdBlock::List { items, .. } => {
+                    for item in items {
+                        walk(&item.blocks, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
+}
+
+/// Download a remote reading-view image on the blocking pool: 15s timeout, 20 MB cap — a hung
+/// or huge download must not wedge anything.
+async fn fetch_remote_image(url: String) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let agent = ureq::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build();
+        let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .take(20 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// A thin Nord3 bar (the blockquote rule / horizontal rule fill).
-fn md_bar() -> Element<'static, Message> {
+fn md_bar<M: 'static>() -> Element<'static, M> {
     container(iced::widget::Space::new())
         .width(2)
         .height(Length::Fill)
@@ -4041,39 +5213,207 @@ fn md_bar_style(_: &iced::Theme) -> container::Style {
 
 /// A `rich_text` of the inline AST. `bold`/`base_color` seed the styling (headings pass bold +
 /// white); code and link spans override colour, and links also get an underline + click handler.
-fn md_rich(
+/// Hover popovers render sans (the UI face); the reading view passes serif via [`md_rich_in`].
+fn md_rich<M: 'static>(
     inlines: &[MdInline],
     bold: bool,
     base_color: iced::Color,
     size: f32,
-) -> Element<'static, Message> {
+    on_link: fn(String) -> M,
+) -> Element<'static, M> {
+    // Hover density: iced's default line height.
+    md_rich_in(
+        inlines,
+        bold,
+        base_color,
+        size,
+        iced::font::Family::SansSerif,
+        1.3,
+        None, // hover has no reading target
+        on_link,
+    )
+}
+
+fn md_rich_in<M: 'static>(
+    inlines: &[MdInline],
+    bold: bool,
+    base_color: iced::Color,
+    size: f32,
+    family: iced::font::Family,
+    line_height: f32,
+    target: Option<MdSpan>,
+    on_link: fn(String) -> M,
+) -> Element<'static, M> {
     let mut spans = Vec::new();
-    md_spans(inlines, bold, false, None, base_color, &mut spans);
+    md_spans(inlines, bold, false, None, base_color, size, family, target, &mut spans);
     iced::widget::rich_text(spans)
         .size(size)
-        .on_link_click(Message::OpenLink)
+        .line_height(iced::widget::text::LineHeight::Relative(line_height))
+        .on_link_click(on_link)
         .into()
 }
 
+/// The reading view's body line height — matches the web reading view's 1.65.
+const READ_LINE_HEIGHT: f32 = 1.65;
+
+/// The reading view's body face — bundled Source Serif 4 (loaded with the JetBrains Mono
+/// faces at boot; OFL, see fonts/OFL-SourceSerif4.txt).
+const READ_FONT_FAMILY: iced::font::Family = iced::font::Family::Name("Source Serif 4");
+
+/// Alert kind → (label, colour) — the ladder shared with the terminal's `alert_color` and
+/// the web's `.md-alert-*` rules.
+fn alert_style(kind: AlertKind) -> (&'static str, iced::Color) {
+    match kind {
+        AlertKind::Note => ("Note", theme::NORD8),
+        AlertKind::Tip => ("Tip", theme::NORD14),
+        AlertKind::Important => ("Important", theme::NORD15),
+        AlertKind::Warning => ("Warning", theme::NORD13),
+        AlertKind::Caution => ("Caution", theme::NORD11),
+    }
+}
+
+/// The reading cursor: a 3px frost bar down the content's left edge. Built as two nested
+/// containers — the outer paints the bar colour and insets the content by 3px, the inner
+/// repaints the canvas over everything but that strip — because a `Fill`-height sibling
+/// resolves against the scrollable's *unbounded* vertical limits and destroys the layout
+/// (list rows collapsed to nothing). The strip is always reserved, so focus moves shift
+/// nothing.
+fn read_focus_wrap(on: bool, content: Element<'static, ReadMsg>) -> Element<'static, ReadMsg> {
+    let inner = container(content)
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            left: 10.0,
+            ..iced::Padding::ZERO
+        })
+        .style(|_| container::Style {
+            background: Some(theme::NORD0.into()),
+            ..container::Style::default()
+        });
+    container(inner)
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            left: 3.0,
+            ..iced::Padding::ZERO
+        })
+        .style(move |_| container::Style {
+            background: on.then(|| theme::NORD8.into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Reading-view widget messages — a tiny `Clone` type so `mouse_area`/link spans can ride the
+/// widget tree ([`Message`] itself can't be `Clone`: boot variants carry channels). `read_view`
+/// maps them into [`Message`] at its boundary.
+#[derive(Debug, Clone)]
+enum ReadMsg {
+    /// Focus the element whose source span starts here.
+    Click(u32),
+    /// Open a link href (external schemes only; the handler allow-lists).
+    Link(String),
+    /// The document scrollable scrolled: `(offset_y, max_scroll)` for the shell's mirror.
+    Scrolled(f32, f32),
+}
+
+/// `target` is the reading view's Enter-target span (docs/markdown-view.md §1.3): the link,
+/// inline image or footnote ref whose span matches renders as an inverted pill on top of the
+/// block bar. Hover popovers pass `None`.
+#[allow(clippy::too_many_arguments)]
 fn md_spans(
     inlines: &[MdInline],
     bold: bool,
     italic: bool,
     link: Option<&str>,
     base: iced::Color,
+    size: f32,
+    family: iced::font::Family,
+    target: Option<MdSpan>,
     out: &mut Vec<iced::advanced::text::Span<'static, String>>,
 ) {
     for inl in inlines {
         match inl {
-            MdInline::Text { text } => out.push(md_span(text, bold, italic, false, link, base)),
-            MdInline::Code { text } => out.push(md_span(text, bold, italic, true, link, base)),
-            MdInline::Strong { content } => md_spans(content, true, italic, link, base, out),
-            MdInline::Emphasis { content } => md_spans(content, bold, true, link, base, out),
-            MdInline::Link { href, content } => {
-                md_spans(content, bold, italic, Some(href), base, out)
+            MdInline::Text { text } => {
+                out.push(md_span(text, bold, italic, false, link, base, family))
             }
+            MdInline::Code { text } => {
+                out.push(md_span(text, bold, italic, true, link, base, family))
+            }
+            MdInline::Strong { content } => {
+                md_spans(content, true, italic, link, base, size, family, target, out)
+            }
+            MdInline::Emphasis { content } => {
+                md_spans(content, bold, true, link, base, size, family, target, out)
+            }
+            MdInline::Link { href, content, span } => {
+                // External hrefs are real link payloads (click opens); internal targets
+                // (relative paths, anchors) can't open externally — their clicks *arm*
+                // instead, via the [`READ_ARM_PREFIX`] sentinel the read view intercepts.
+                let external = ["http://", "https://", "mailto:"]
+                    .iter()
+                    .any(|p| href.len() >= p.len() && href[..p.len()].eq_ignore_ascii_case(p));
+                let value = if external {
+                    href.clone()
+                } else {
+                    format!("{READ_ARM_PREFIX}{}", span.start)
+                };
+                if target == Some(*span) {
+                    // The targeted link: invert its whole run (background pill, canvas text).
+                    let mut inner = Vec::new();
+                    md_spans(content, bold, italic, Some(&value), base, size, family, None, &mut inner);
+                    out.extend(inner.into_iter().map(|s| read_pill(s, size)));
+                } else {
+                    md_spans(content, bold, italic, Some(&value), base, size, family, target, out)
+                }
+            }
+            MdInline::Strikethrough { content } => {
+                let mut inner = Vec::new();
+                md_spans(content, bold, italic, link, base, size, family, target, &mut inner);
+                out.extend(inner.into_iter().map(|s| s.strikethrough(true)));
+            }
+            MdInline::Image { alt, span, .. } => {
+                // A text chip — iced's rich_text is text-runs-only, so a real inline image
+                // can't ride a paragraph. ▨ marks it as an image (matching the TUI); the arm
+                // sentinel makes it clickable (click focuses it, like the web/TUI).
+                let s = md_span(&format!("▨ [{alt}]"), bold, italic, false, None, theme::NORD3, family)
+                    .link(format!("{READ_ARM_PREFIX}{}", span.start));
+                out.push(if target == Some(*span) {
+                    read_pill(s, size)
+                } else {
+                    s
+                });
+            }
+            MdInline::FootnoteRef { label, span } => {
+                let s = md_span(&format!("[{label}]"), bold, italic, false, None, theme::NORD3, family)
+                    .link(format!("{READ_ARM_PREFIX}{}", span.start));
+                out.push(if target == Some(*span) {
+                    read_pill(s, size)
+                } else {
+                    s
+                });
+            }
+            MdInline::HardBreak => out.push(md_span("\n", bold, italic, false, link, base, family)),
         }
     }
+}
+
+/// The armed-target pill (inverted run) hugged to its text. iced draws a span highlight
+/// over the full line-box region — 1.65 line-height in the read body, which read as a
+/// chunky lozenge — so negative vertical padding shaves it back toward the em box, and a
+/// 1px horizontal pad gives the glyphs the same hair of breathing as the web pill's
+/// 1px outline. Padding is draw-only (span bounds are unchanged), so arming shifts nothing.
+fn read_pill(
+    s: iced::advanced::text::Span<'static, String>,
+    size: f32,
+) -> iced::advanced::text::Span<'static, String> {
+    s.background(theme::NORD8)
+        .color(theme::NORD0)
+        .border(iced::border::rounded(2))
+        .padding(iced::Padding {
+            top: -0.2 * size,
+            bottom: -0.2 * size,
+            left: 1.0,
+            right: 1.0,
+        })
 }
 
 fn md_span(
@@ -4083,6 +5423,7 @@ fn md_span(
     code: bool,
     link: Option<&str>,
     base: iced::Color,
+    family: iced::font::Family,
 ) -> iced::advanced::text::Span<'static, String> {
     let font = if code {
         iced::Font::MONOSPACE
@@ -4098,17 +5439,22 @@ fn md_span(
             } else {
                 iced::font::Style::Normal
             },
+            family,
             ..iced::Font::default()
         }
     };
     let color = if link.is_some() {
         theme::NORD9
     } else if code {
-        theme::NORD8
+        theme::NORD4
     } else {
         base
     };
-    let s = iced::widget::span(text.to_string()).font(font).color(color);
+    let mut s = iced::widget::span(text.to_string()).font(font).color(color);
+    if code {
+        // The web reading view's inline-code chip: body-coloured text on the panel shade.
+        s = s.background(theme::NORD1);
+    }
     match link {
         Some(href) => s.link(href.to_string()).underline(true),
         None => s.link_maybe(None::<String>),
@@ -4122,13 +5468,23 @@ fn md_estimate(blocks: &[MdBlock]) -> usize {
 
 fn md_estimate_block(b: &MdBlock) -> usize {
     match b {
-        MdBlock::Heading { content, .. } | MdBlock::Paragraph { content } => {
+        MdBlock::Heading { content, .. } | MdBlock::Paragraph { content, .. } => {
             1 + md_text_len(content) / 80
         }
-        MdBlock::Code { code, .. } => code.lines().count().max(1) + 1,
-        MdBlock::List { items, .. } => items.iter().map(|it| md_estimate(it)).sum::<usize>().max(1),
-        MdBlock::Quote { content } => md_estimate(content),
-        MdBlock::Rule => 1,
+        MdBlock::Code { code, .. } | MdBlock::Html { raw: code, .. } => {
+            code.lines().count().max(1) + 1
+        }
+        MdBlock::List { items, .. } => items
+            .iter()
+            .map(|it| md_estimate(&it.blocks))
+            .sum::<usize>()
+            .max(1),
+        MdBlock::Quote { content, .. } | MdBlock::FootnoteDef { content, .. } => {
+            md_estimate(content)
+        }
+        MdBlock::Rule { .. } | MdBlock::Image { .. } => 1,
+        MdBlock::Table { rows, .. } => rows.len() + 1,
+        MdBlock::FrontMatter { .. } => 0,
     }
 }
 
@@ -4139,7 +5495,11 @@ fn md_text_len(inlines: &[MdInline]) -> usize {
             MdInline::Text { text } | MdInline::Code { text } => text.len(),
             MdInline::Strong { content }
             | MdInline::Emphasis { content }
+            | MdInline::Strikethrough { content }
             | MdInline::Link { content, .. } => md_text_len(content),
+            MdInline::Image { alt, .. } => alt.len(),
+            MdInline::FootnoteRef { label, .. } => label.len() + 2,
+            MdInline::HardBreak => 1,
         })
         .sum()
 }
@@ -4172,7 +5532,11 @@ fn open_link(url: &str) {
 /// so buffers are shared server-side. Best-effort: a spawn failure is logged, not surfaced (the user
 /// simply gets no new window).
 fn spawn_target(target: &WindowTarget) {
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(exe) = window_spawn_exe(
+        std::env::current_exe().ok(),
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    ) else {
         tracing::warn!("cannot open a new window: current exe path is unavailable");
         return;
     };
@@ -4205,6 +5569,33 @@ fn spawn_target(target: &WindowTarget) {
     if let Err(e) = cmd.spawn() {
         tracing::warn!("failed to spawn new window: {e}");
     }
+}
+
+/// The executable to spawn a sibling window from. Three cases:
+/// - **AppImage** (`current` inside `$APPDIR`): the image itself, not the transient FUSE mount
+///   that belongs to *this* launch — the sibling gets its own mount and lifetime (mirrors the
+///   `ae` binary's `server_spawn_exe`; the `starts_with` guard keeps an APPIMAGE var merely
+///   inherited from some other AppImage'd parent from hijacking the spawn).
+/// - **Linux**: `/proc/self/exe` — the binary we are *running*, not its (possibly stale) path.
+///   `current_exe()` reads that link textually, and once a `cargo build` has replaced the
+///   on-disk file it yields `…/ae (deleted)`, which ENOENTs on spawn — the "new window
+///   silently does nothing after a rebuild" bug. Exec'ing the link itself resolves to the
+///   live inode, so the sibling is the *same build* as this window.
+/// - **Elsewhere**: `current_exe()`, unchanged.
+fn window_spawn_exe(
+    current: Option<std::path::PathBuf>,
+    appimage: Option<std::ffi::OsString>,
+    appdir: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let (Some(image), Some(dir)) = (appimage, appdir) {
+        if current.as_ref().is_some_and(|c| c.starts_with(&dir)) {
+            return Some(image.into());
+        }
+    }
+    if cfg!(target_os = "linux") {
+        return Some("/proc/self/exe".into());
+    }
+    current
 }
 
 /// Put a spawned window in its own process group, so a signal sent to *our* foreground group (a
@@ -4606,6 +5997,21 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
                 include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")
                     .as_slice()
                     .into(),
+                // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body
+                // face (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold+Bold so
+                // heading and strong runs resolve inside the family rather than falling back.
+                include_bytes!("../fonts/SourceSerif4-Regular.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/SourceSerif4-It.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/SourceSerif4-Semibold.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../fonts/SourceSerif4-Bold.ttf")
+                    .as_slice()
+                    .into(),
             ],
             default_font: iced::Font::MONOSPACE,
             default_text_size: iced::Pixels(14.0),
@@ -4875,5 +6281,43 @@ mod tests {
     fn chip_editor_ids_match_focus_targets() {
         assert_eq!(crate::picker::editor_root_id(), OverlayField::ChipRoot.id());
         assert_eq!(crate::picker::editor_path_id(), OverlayField::ChipPath.id());
+    }
+
+    /// The new-window spawn must survive the running binary being rebuilt: on Linux it execs
+    /// `/proc/self/exe` (the live inode), never the textual `current_exe()` path — which reads
+    /// `…/ae (deleted)` after a `cargo build` and ENOENTs. AppImage launches spawn the image.
+    #[test]
+    fn window_spawn_exe_survives_rebuilds_and_prefers_the_appimage() {
+        let current = Some(std::path::PathBuf::from("/tmp/.mount_ae123/usr/bin/ae"));
+        // Inside the AppImage mount: spawn the image (its own mount + lifetime).
+        assert_eq!(
+            window_spawn_exe(
+                current.clone(),
+                Some("/home/u/Applications/aether.AppImage".into()),
+                Some("/tmp/.mount_ae123".into()),
+            ),
+            Some("/home/u/Applications/aether.AppImage".into())
+        );
+        // An inherited APPIMAGE var from some other AppImage'd parent doesn't hijack the spawn.
+        let plain = Some(std::path::PathBuf::from("/home/u/.cargo/bin/ae"));
+        let via_proc = window_spawn_exe(
+            plain.clone(),
+            Some("/somewhere/other.AppImage".into()),
+            Some("/tmp/.mount_other".into()),
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(via_proc, Some("/proc/self/exe".into()));
+            // The stale-path trap: even a "(deleted)" current_exe is irrelevant on Linux.
+            assert_eq!(
+                window_spawn_exe(
+                    Some("/home/u/proj/target/debug/ae (deleted)".into()),
+                    None,
+                    None
+                ),
+                Some("/proc/self/exe".into())
+            );
+        } else {
+            assert_eq!(via_proc, plain);
+        }
     }
 }

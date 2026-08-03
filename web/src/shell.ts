@@ -19,6 +19,7 @@ import "./theme.css";
 import init, { WasmSession, hover_key } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
+import { applyFenceHighlights, markFocus, renderReadView, revealFocus, type ReadDoc } from "./read";
 import { decodeRow } from "./text";
 import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
@@ -146,10 +147,23 @@ function measureCell(buffer: HTMLElement): Cell {
 type ToastLevel = "info" | "error" | "warning" | "success";
 
 interface ShellActionDesc {
-  name: "scroll" | "place_cursor" | "toggle_wrap" | "new_window";
+  name: "scroll" | "place_cursor" | "toggle_wrap" | "new_window" | "open_url" | "open_buffer_file";
   dir?: string;
   unit?: string;
   fraction?: number;
+  /** place_cursor only: which placement (`upper`/`lower`) — the reading view anchors the
+   *  focused block's matching edge (mirrors `ViewportPlace`). */
+  place?: string;
+  url?: string;
+  /** open_buffer_file only: the confined asset route's ingredients (a local image's Enter). */
+  buffer_id?: number;
+  relative?: string;
+  /** new_window only: a concrete file target (reading-view Ctrl-Enter) — absent for the
+   *  duplicate-this-tab form. */
+  path?: string;
+  workspace?: string;
+  line?: number;
+  col?: number;
 }
 
 /** Every effect tag the core can emit (mirrors `effects_to_json` in crates/aether-web/src/lib.rs).
@@ -390,7 +404,7 @@ interface RowDesc {
 
 /** The render projection from `WasmSession.view()` (the editor/status/search/prompt slice; view.rs). */
 interface CoreView {
-  mode: "normal" | "insert" | "search";
+  mode: "normal" | "insert" | "search" | "read";
   wrap: WrapMode;
   diff_view: boolean;
   ligatures: boolean;
@@ -405,6 +419,7 @@ interface CoreView {
     buffer_id: number;
     path: string | null;
     label: string;
+    language: string | null;
     cursor: CursorState;
     scroll: ScrollPosition | null;
     revision: number;
@@ -429,6 +444,9 @@ interface CoreView {
   /** The hint for the top-right corner (docs/hints.md): the display text split around its
    *  emphasized key label. null = empty corner. */
   hint: { before: string; keys: string; after: string } | null;
+  /** The markdown reading view, when active (docs/markdown-view.md): the parsed document plus
+   *  the focused element's source span (focus derives from the server cursor core-side). */
+  read: ReadDoc | null;
 }
 
 /** The workspace-settings overlay (`Space ,`), when open (view.rs `workspace_settings`). Core-owned
@@ -999,6 +1017,12 @@ export class Shell {
    *  buffer id because the core (and our blame state) reset on a buffer switch, which the TUI/iced
    *  shells get for free by sharing the core's `blame_requested`. */
   private blameRequested: { bufferId: number; line: number; revision: number } | null = null;
+  /** True while the markdown reading view owns the buffer element (docs/markdown-view.md). */
+  private readActive = false;
+  /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
+  private lastReadFocus: string | null = null;
+  /** The document last rendered (`buffer:revision:loading`) — the DOM-rebuild key. */
+  private lastReadDoc: string | null = null;
   /** Socket up? Gates scroll-driven window prefetches — while down, a smooth-scroll animation fires
    *  ~60 scroll events/sec and each `viewport/scroll_to_row` rejects instantly, spinning the CPU. */
   private connected = true;
@@ -1476,6 +1500,10 @@ export class Shell {
 
     this.bufferEl.addEventListener("scroll", () => this.onScroll(), { passive: true });
     this.bufferEl.addEventListener("mousedown", (e) => this.onBufferMouseDown(e));
+    // Reading view: a click on a rendered element sets the reading selection (focus). A `click`
+    // rather than mousedown, so a text-selection drag (native selection is enabled in read
+    // mode) isn't mistaken for a focus click — a non-collapsed selection skips it.
+    this.bufferEl.addEventListener("click", (e) => this.onReadClick(e));
     window.addEventListener("mousemove", (e) => this.onMouseMove(e));
     window.addEventListener("mouseup", () => this.onMouseUp());
     window.addEventListener("resize", () => this.onResize());
@@ -1588,6 +1616,20 @@ export class Shell {
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
+      // Boot installs the session directly (no adopt_switch), so the markdown reading-view
+      // decision runs here (docs/markdown-view.md §1.6). A `view=read|source` param is the
+      // presentation this URL was captured in (a refresh, a shared reading link) and wins
+      // outright; without one, a `#line:col` link is jump-shaped and lands in the editor.
+      // (Only honored for a URL-directed open — on a fallback landing the param describes a
+      // buffer we didn't open.)
+      const urlView = directed ? sp.get("view") : null;
+      if (urlView === "read" || urlView === "source") {
+        this.runEffects(
+          this.session.boot_read_presentation_explicit(urlView === "read") as CoreEffect[],
+        );
+      } else {
+        this.runEffects(this.session.boot_read_presentation(Boolean(urlFile && jump)) as CoreEffect[]);
+      }
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
       this.toast(`Bootstrap failed: ${String(e)}`, "error");
@@ -2085,19 +2127,74 @@ export class Shell {
       case "scroll":
         this.scrollView(a.dir ?? "down", a.unit ?? "line");
         break;
-      case "place_cursor":
+      case "place_cursor": {
+        // Reading view: edge-matched placement of the focused *block* (the bar'd node) —
+        // `upper` leaves the gap between the view top and the block's top, `lower` between
+        // the view bottom and the block's bottom, so a tall block placed "near the bottom"
+        // really ends there. The gap is the editor's rest fraction (mirrors
+        // `ViewportPlace::READ_GAP = CURSOR_REST_FRACTION`), so `;` feels identical in both
+        // views.
+        if (this.readActive) {
+          const READ_GAP = CURSOR_REST_FRACTION;
+          const node = this.bufferEl.querySelector(".md-focus");
+          if (node instanceof HTMLElement) {
+            const c = this.bufferEl.getBoundingClientRect();
+            const t = node.getBoundingClientRect();
+            const gap = c.height * READ_GAP;
+            const delta =
+              a.place === "lower" ? t.bottom - c.bottom + gap : t.top - c.top - gap;
+            this.scrollTopTo(this.bufferEl.scrollTop + delta, true);
+          }
+          break;
+        }
         void this.placeCursor(a.fraction ?? CURSOR_REST_FRACTION);
         break;
+      }
       case "toggle_wrap":
         this.session.toggle_wrap(); // flip core wrap state (no effects); then re-render the viewport
         void this.setWrap();
         break;
-      case "new_window":
-        // Open another tab/window onto the same server URL (which carries the workspace): it
-        // connects with its own client_id and lands on the workspace's MRU buffer — the browser
-        // analogue of the native client's "open another window". Keypress-initiated, so it's a
-        // user gesture and isn't popup-blocked.
+      case "new_window": {
+        // With a concrete file target (reading-view Ctrl-Enter): open the app on that file in
+        // a new tab — the picker-row treatment. Without one: another tab on the same URL (the
+        // `Space Alt-x` duplicate). Keypress-initiated, so it's a user gesture and isn't
+        // popup-blocked.
+        if (a.path) {
+          const v = this.view();
+          const r = this.resolvePath(a.path, v.workspace_paths);
+          if (r) {
+            const params = new URLSearchParams();
+            const ws = a.workspace ?? v.workspace;
+            if (ws) params.set("workspace", ws);
+            if (r.path_index) params.set("root", String(r.path_index));
+            params.set("file", r.relative_path);
+            const frag =
+              a.line !== undefined && a.col !== undefined ? `#${a.line + 1}:${a.col + 1}` : "";
+            window.open(`${location.pathname}?${params.toString()}${frag}`, "_blank", "noopener");
+            break;
+          }
+        }
         window.open(location.href, "_blank");
+        break;
+      }
+      case "open_url":
+        // Reading-view Enter on an external link (docs/markdown-view.md §2.4). Scheme-checked
+        // like hover links; the browser can't open local file paths, so those no-op here.
+        if (a.url && /^(https?|mailto):/i.test(a.url)) {
+          window.open(a.url, "_blank", "noopener");
+        }
+        break;
+      case "open_buffer_file":
+        // A local image's Enter: the browser can't open the filesystem path, but the server's
+        // confined asset route serves the same file — open it in a new tab (the relative path
+        // encoded as ONE segment, like the <img> sources, so `../` survives normalization).
+        if (a.buffer_id !== undefined && a.relative) {
+          window.open(
+            `/asset/${a.buffer_id}/${encodeURIComponent(a.relative)}`,
+            "_blank",
+            "noopener",
+          );
+        }
         break;
       default: {
         // Exhaustiveness: a new shell-action name fails to build here until it's handled.
@@ -2216,6 +2313,11 @@ export class Shell {
   /** After a cursor-moving action: load around the cursor if it left the loaded window, paint, then
    *  reveal it — `follow` scrolls the minimum, `jump` rests it near the top (animating if short). */
   private async ensureCursorVisible(style: "follow" | "jump"): Promise<void> {
+    // The reading view owns its scroll: `revealFocus` positions the focused element from the
+    // *rendered* layout. This editor-grid math (rows × cell.h) is meaningless there and was
+    // fighting it — every cursor move fires `RevealCursor`, and in code-heavy documents the
+    // grid estimate diverges linearly from the real layout, dragging focus off screen.
+    if (this.readActive) return;
     const v = this.view();
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
@@ -2251,7 +2353,53 @@ export class Shell {
   }
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
+  /** A click in the reading view: focus the clicked element (docs/markdown-view.md §2.3). The
+   *  shell's whole job is resolving the nearest stamped node to its source-span start; the core
+   *  turns that into the cursor move focus derives from. */
+  private onReadClick(e: MouseEvent): void {
+    if (!this.readActive || !this.session) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return; // a select-to-copy drag, not a focus click
+    const el = e.target instanceof Element ? e.target : null;
+    // Modified clicks on real links are the browser's (open the href in a new tab) — no arm.
+    const link = el?.closest("a.md-link");
+    if (link && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
+    // Plain clicks on a link are the core's: `read_click_activate` follows it like Enter
+    // (open the file/URL, jump to the anchor or footnote definition) — so the href must not
+    // also navigate this tab; it exists for the modified/middle-click affordances.
+    if (link instanceof HTMLAnchorElement) e.preventDefault();
+    const target = el ? el.closest("[data-espan]") : null;
+    const start = target ? Number(target.getAttribute("data-espan")?.split(":")[0]) : NaN;
+    if (!Number.isFinite(start)) return;
+    // A click on a link or footnote reference acts (like Enter); anywhere else just focuses.
+    const follow = el?.closest("a.md-link, sup.md-footnote-ref");
+    const fx = follow
+      ? this.session.read_click_activate(start)
+      : this.session.read_click(start);
+    this.runEffects(fx as CoreEffect[]);
+  }
+
+  /** App URL for a reading-view relative link (real `<a href>`s — the picker-row treatment):
+   *  the target resolved against the buffer's directory, expressed as `?workspace&root&file`.
+   *  `null` for anchors, scratch buffers, or targets outside every workspace root. */
+  private readLinkUrl(href: string, v: CoreView): string | null {
+    const base = v.buffer.path;
+    if (!base || href.startsWith("#")) return null;
+    const path = href.split("#")[0];
+    if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("/")) return null;
+    const dir = base.slice(0, base.lastIndexOf("/") + 1);
+    const r = this.resolvePath(dir + path, v.workspace_paths);
+    if (!r) return null;
+    const params = new URLSearchParams();
+    if (v.workspace) params.set("workspace", v.workspace);
+    if (r.path_index) params.set("root", String(r.path_index));
+    params.set("file", r.relative_path);
+    return `${location.pathname}?${params.toString()}`;
+  }
+
   private onScroll(): void {
+    // The reading view scrolls natively — no window prefetch (the whole document is local).
+    if (this.readActive) return;
     // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
     // scrolling needs no repositioning here — just the window prefetch below.
     // Skip the prefetch while disconnected: the RPC would reject instantly, and a smooth-scroll
@@ -2293,6 +2441,27 @@ export class Shell {
   }
 
   private scrollView(dir: string, unit: string): void {
+    // Reading view: instant, pixel-based steps. Smooth scrolling stutters under key repeat —
+    // each press restarts the animation from the current position — and the reading document
+    // has no row grid to align to anyway. Left/Right pan the *focused* code panel
+    // (docs/markdown-view.md §2.3) — a no-op when the focus isn't a code block.
+    if (this.readActive) {
+      if (dir === "left" || dir === "right") {
+        const pre = this.bufferEl.querySelector(".md-codeblock.md-focus pre");
+        if (pre instanceof HTMLElement) {
+          const dx = Math.max(48, this.cell.w * 8);
+          pre.scrollLeft += dir === "right" ? dx : -dx;
+        }
+        return;
+      }
+      const h = this.bufferEl.clientHeight;
+      const line = Math.max(24, this.cell.h * 1.2);
+      const px = unit === "page" ? h * 0.9 : unit === "half" ? h * 0.45 : line;
+      // Through the editor's scroll helper, for the same smooth-when-short glide.
+      if (dir === "up") this.scrollTopTo(this.bufferEl.scrollTop - px, true);
+      else if (dir === "down") this.scrollTopTo(this.bufferEl.scrollTop + px, true);
+      return;
+    }
     const page = this.visibleRows();
     const delta = unit === "page" ? page : unit === "half" ? Math.max(1, Math.floor(page / 2)) : 1;
     if (dir === "up") this.scrollTopTo(this.bufferEl.scrollTop - delta * this.cell.h, true);
@@ -2508,6 +2677,49 @@ export class Shell {
     }
     this.syncUrl(v); // keep the address bar in sync with the current buffer + cursor
     this.renderStatus(v);
+    // The markdown reading view replaces the buffer rendering wholesale while active
+    // (docs/markdown-view.md): the same scrollable hosts a typographic document instead of the
+    // row grid; native browser scrolling applies, and the focused element (derived core-side
+    // from the server cursor) is revealed when it changes.
+    const readActive = v.read !== null;
+    if (readActive !== this.readActive) {
+      this.readActive = readActive;
+      this.bufferEl.classList.toggle("md-read-host", readActive);
+      if (!readActive) {
+        this.lastReadFocus = null;
+        this.lastReadDoc = null;
+      }
+    }
+    if (v.read) {
+      // Rebuild the DOM only when the parsed content changes — a focus move or an unrelated
+      // re-render (hint tick, toast) just re-marks focus, so <img> elements aren't re-fetched.
+      // Rebuild only when the *content* changes; arriving fence highlights patch in place
+      // (a rebuild per fence result made code-heavy documents take seconds to settle).
+      const docKey = `${v.read.buffer_id}:${v.read.revision}:${v.read.loading}`;
+      if (docKey !== this.lastReadDoc) {
+        this.lastReadDoc = docKey;
+        // Relative doc links render as real `<a href>`s onto the app itself (the picker-row
+        // treatment): native new-tab affordances for modified/middle clicks.
+        v.read.internalHref = (href) => this.readLinkUrl(href, v);
+        renderReadView(this.bufferEl, v.read);
+      } else {
+        applyFenceHighlights(this.bufferEl, v.read);
+        markFocus(this.bufferEl, v.read.focus_span, v.read.target_span);
+      }
+      // Reveal keyed on the target when the cursor sits inside one (a Tab step must reveal
+      // the link, not just its paragraph), else the block bar.
+      const revealSpan = v.read.target_span ?? v.read.focus_span;
+      const focusKey = revealSpan
+        ? `${v.read.buffer_id}:${revealSpan.start}:${revealSpan.end}`
+        : null;
+      if (focusKey !== this.lastReadFocus) {
+        this.lastReadFocus = focusKey;
+        // Applied through the editor's own scroll helper: smooth when short, snap when far.
+        const target = revealFocus(this.bufferEl, revealSpan);
+        if (target !== null) this.scrollTopTo(target, true);
+      }
+      return;
+    }
     if (!v.window) return;
     this.maybeBlame(v); // fire-and-forget; updates the core + re-renders when the label lands
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
@@ -3688,8 +3900,11 @@ export class Shell {
   /** Keep the address bar reflecting the current buffer + cursor, the way the boot URL reader consumes
    *  it (`?workspace=&root=&file=#L:C`, or `?workspace=&buffer=<id>` for a scratch), so a reload or a copied
    *  link reopens where you are. `replaceState`, not `push` — browser back/forward isn't a second nav
-   *  system; in-file/cross-file nav is the core's job (Alt-←/→). Debounced so a burst of cursor moves is
-   *  one URL write; skipped when unchanged. */
+   *  system; in-file/cross-file nav is the core's job (Alt-←/→). A pushState experiment (2026-08-03)
+   *  was reverted: the browser stack and the editor's nav history each turned the other's "back" into
+   *  forward garbage — if revisited, the fix is mirroring one onto the other, not two parallel stacks
+   *  (docs/markdown-view.md). Debounced so a burst of cursor moves is one URL write; skipped when
+   *  unchanged. */
   private syncUrl(v: CoreView): void {
     const url = this.buildUrl(v);
     if (url === this.lastUrl) return;
@@ -3711,6 +3926,11 @@ export class Shell {
     } else {
       params.set("buffer", String(v.buffer.buffer_id)); // scratch buffer: key on the session id
     }
+    // Record the presentation for markdown buffers, so a refresh restores what's on screen —
+    // without this the `#line:col` cursor restore below reads as a jump-shaped open and a
+    // reading view reloads as source (docs/markdown-view.md §1.6).
+    if (v.read) params.set("view", "read");
+    else if (v.buffer.language === "markdown") params.set("view", "source");
     const qs = params.toString();
     return `${location.pathname}${qs ? `?${qs}` : ""}${this.cursorFragment(v.buffer.cursor)}`;
   }
@@ -3756,11 +3976,29 @@ export class Shell {
    *  fits, flipped above otherwise; clamped into the viewport so it never spills off-screen. The body
    *  scrolls within its max-height (theme.css #hover). Mirrors the old web client + iced. */
   private placeHover(): void {
+    const el = this.hoverEl;
+    if (this.readActive) {
+      // Reading view: no cursor cell or spacer to hang from — park the popover bottom-left
+      // over the document (the terminal's bottom-anchored placement), where the read target
+      // reveal (`Tab`) expects it. Fixed positioning, sized off the buffer area.
+      el.scrollTop = 0;
+      this.hoverOpen = true;
+      el.classList.add("hover-read");
+      const r = this.bufferEl.getBoundingClientRect();
+      el.style.left = `${Math.round(r.left + 8)}px`;
+      el.style.bottom = `${Math.round(window.innerHeight - r.bottom + 8)}px`;
+      el.style.marginLeft = "0";
+      if (el.parentElement !== document.body) document.body.appendChild(el);
+      return;
+    }
     const spacer = this.bufferEl.querySelector(".buffer-spacer") as HTMLElement | null;
     if (!spacer) return;
-    const el = this.hoverEl;
     el.scrollTop = 0;
     this.hoverOpen = true;
+    // Clear any reading-view placement so the sticky spacer math applies cleanly.
+    el.classList.remove("hover-read");
+    el.style.left = "";
+    el.style.bottom = "";
     // Park the popover (preceded by its offset strut) in the spacer's coordinate space; CSS
     // `position: sticky` then keeps it glued to its line and clamped to the editor edges as the
     // buffer scrolls — no JS on scroll.

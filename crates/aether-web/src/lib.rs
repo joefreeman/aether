@@ -81,6 +81,34 @@ impl WasmSession {
         })
     }
 
+    /// Apply the markdown reading-view boot rules (docs/markdown-view.md §1.6) — call once after
+    /// [`Self::bootstrap`]: boot installs the session directly, never passing through
+    /// `adopt_switch`, so the read-vs-edit decision runs here. `jumped` = the URL carried a
+    /// `#line:col` jump (jump-shaped opens land in the editor). Returns `Effect[]` (the content
+    /// fetch when the buffer opens as a reading view).
+    pub fn boot_read_presentation(&mut self, jumped: bool) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.boot_read_presentation(jumped)))
+    }
+
+    /// [`Self::boot_read_presentation`] with an explicit choice — the URL's `view=read|source`
+    /// param, recorded by the shell so a refresh restores the presentation on screen (the
+    /// `#line:col` cursor restore in the same URL must not read as a jump). Returns `Effect[]`.
+    pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.boot_read_presentation_explicit(read)))
+    }
+
+    /// A click on a reading-view element: the shell resolves the clicked node's `data-espan`
+    /// start and the core moves the cursor there (focus derives). Returns `Effect[]`.
+    pub fn read_click(&mut self, byte: u32) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.read_click(byte)))
+    }
+
+    /// A click that landed on a rendered link/footnote-ref node: focus it AND follow it like
+    /// `Enter` (images stay arm-only). Returns `Effect[]`.
+    pub fn read_click_activate(&mut self, byte: u32) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.read_click_activate(byte)))
+    }
+
     /// The periodic hint tick (docs/hints.md): the shell's wall clock in Unix ms,
     /// stamped into the core's hint engine. Returns `Effect[]` (Shown records, at most).
     pub fn on_hint_tick(&mut self, now_ms: f64) -> Result<JsValue, JsValue> {
@@ -722,14 +750,39 @@ fn action_value(a: &ShellAction) -> Value {
             json!({ "name": "scroll", "dir": dbg(dir), "unit": dbg(unit) })
         }
         ShellAction::PlaceCursor(place) => {
-            json!({ "name": "place_cursor", "fraction": place.fraction() })
+            // `fraction` drives the editor's line placement; `place` the reading view's
+            // edge-matched block placement (shell.ts pairs it with READ_GAP).
+            json!({ "name": "place_cursor", "fraction": place.fraction(), "place": dbg(place) })
         }
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
-        // The web shell opens a new browser tab on the same URL (`window.open`). The target payload
-        // is ignored: `Space Alt-x` duplicates the current tab, and the picker's Ctrl-Enter is
-        // handled shell-side on the web (rows are `<a>` links, `onPickerInputKey` intercepts it), so
-        // the picker path never reaches here.
-        ShellAction::NewWindow(_) => json!({ "name": "new_window" }),
+        // The shell opens a new tab: with a concrete file target (the reading view's
+        // Ctrl-Enter) it builds a same-app URL for that file; without one it duplicates the
+        // current tab (`Space Alt-x`). The picker's Ctrl-Enter never reaches here (rows are
+        // `<a>` links, handled shell-side by `onPickerInputKey`).
+        ShellAction::NewWindow(target) => {
+            let mut v = json!({ "name": "new_window" });
+            if let aether_client::effect::WindowOpen::Path { path, at } = &target.open {
+                v["path"] = json!(path);
+                if let Some((line, col)) = at {
+                    v["line"] = json!(line);
+                    v["col"] = json!(col);
+                }
+            }
+            if let Some(ws) = &target.workspace {
+                v["workspace"] = json!(ws);
+            }
+            v
+        }
+        // The reading view's Enter on an external link/image: the shell opens a new tab
+        // (scheme-checked TS-side, like hover links).
+        ShellAction::OpenUrl(url) => json!({ "name": "open_url", "url": url }),
+        // A local image beside the buffer: the shell opens the confined asset route
+        // (a browser can't open local paths; `absolute` is for the native shells).
+        ShellAction::OpenBufferFile {
+            buffer_id,
+            relative,
+            ..
+        } => json!({ "name": "open_buffer_file", "buffer_id": buffer_id, "relative": relative }),
     }
 }
 

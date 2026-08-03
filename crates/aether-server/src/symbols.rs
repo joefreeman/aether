@@ -110,10 +110,10 @@ pub fn parse_symbols(
 
         out.push(WorkspaceSymbolCandidate {
             display_path: display_path(&path, roots),
-            abs_path,
+            abs_path: abs_path.clone(),
             line,
             col,
-            name: name.to_string(),
+            name: clean_symbol_name(name, &abs_path),
             symbol_kind: symbol_kind(item.get("kind").and_then(Value::as_u64).unwrap_or(0) as u8),
             container: item
                 .get("containerName")
@@ -129,6 +129,44 @@ fn read_lines(path: &Path) -> Option<Vec<String>> {
     std::fs::read_to_string(path)
         .ok()
         .map(|c| c.lines().map(str::to_string).collect())
+}
+
+/// Tidy an LSP symbol name for a one-row picker label (and haystack). Servers send names
+/// verbatim from source: marksman reports a setext heading as `Heading\n=======` (the
+/// underline included — verified against marksman 2026-02-08), and any embedded newline
+/// breaks the row layout, so every name is cut to its first line. For markdown files the
+/// name is also raw *markup* (`` `code` ``, `**strong**`, `[text](url)`), which the picker
+/// shouldn't show — strip it down to the rendered text.
+pub fn clean_symbol_name(name: &str, abs_path: &str) -> String {
+    let first = name.lines().next().unwrap_or("").trim();
+    let markdown = std::path::Path::new(abs_path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+    if !markdown {
+        return first.to_string();
+    }
+    let stripped = strip_markdown_inline(first);
+    if stripped.is_empty() {
+        first.to_string()
+    } else {
+        stripped
+    }
+}
+
+/// Render a single line of markdown down to its plain text. The line is parsed as a heading
+/// (`# {line}`) so its content stays in *inline* context — parsed as a bare document,
+/// a heading named "1. Introduction" would become an ordered list and lose its number.
+fn strip_markdown_inline(line: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser};
+    let doc = format!("# {line}");
+    let mut out = String::new();
+    for ev in Parser::new_ext(&doc, Options::ENABLE_STRIKETHROUGH) {
+        match ev {
+            Event::Text(t) | Event::Code(t) => out.push_str(&t),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Workspace-relative when the file lives inside a root, else the absolute path — symbols can come
@@ -327,6 +365,32 @@ mod tests {
 
         let utf8 = parse_symbols(&reply, PositionEncoding::Utf8, &[dir.path().to_path_buf()]);
         assert_eq!(utf8[0].col, 8, "already a byte offset");
+    }
+
+    /// Marksman names a setext heading with its underline included (`text\n====`); the first
+    /// line is the label — an embedded newline breaks the picker row.
+    #[test]
+    fn setext_symbol_names_are_cut_to_the_first_line() {
+        assert_eq!(
+            clean_symbol_name("Setext Heading (H1)\n===================", "/w/doc.md"),
+            "Setext Heading (H1)"
+        );
+        // Not markdown-specific: any server's multi-line name gets one row.
+        assert_eq!(clean_symbol_name("fn f(\n  x: u32)", "/w/a.rs"), "fn f(");
+    }
+
+    /// Markdown symbol names arrive as raw markup; the label shows the rendered text. Other
+    /// languages pass through untouched — `a__b` is an identifier, not emphasis.
+    #[test]
+    fn markdown_symbol_names_drop_inline_markup() {
+        assert_eq!(
+            clean_symbol_name("Styled `heading` with a [link](https://example.com)", "/w/d.md"),
+            "Styled heading with a link"
+        );
+        assert_eq!(clean_symbol_name("**Bold** and *em* and ~~gone~~", "/w/d.md"), "Bold and em and gone");
+        // Inline context: a numbered heading must not parse as an ordered list.
+        assert_eq!(clean_symbol_name("1. Introduction", "/w/d.md"), "1. Introduction");
+        assert_eq!(clean_symbol_name("__init__ and `*ptr`", "/w/mod.rs"), "__init__ and `*ptr`");
     }
 
     /// A 3.17 `WorkspaceSymbol` may carry a location with no range; there's nowhere to jump, so it's

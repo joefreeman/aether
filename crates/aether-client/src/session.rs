@@ -92,6 +92,10 @@ pub enum Mode {
     Normal,
     Insert,
     Search,
+    /// The markdown reading view (docs/markdown-view.md). Key dispatch goes through
+    /// [`crate::keymap::KeyContext::Read`]; the rendered document itself lives in
+    /// [`Session::read`]. Search entered from Read returns to Read.
+    Read,
 }
 
 /// Client-side search-prompt state; the query/match list itself is server-owned.
@@ -537,6 +541,8 @@ pub enum AppSettingId {
     /// Size of everything around it — status bar, pickers, dialogs.
     UiFontSize,
     Hints,
+    /// Open markdown buffers as the reading view (docs/markdown-view.md §1.6).
+    MarkdownRead,
 }
 
 /// Font-size presets the two font-size rows step through (px). Both defaults
@@ -803,6 +809,19 @@ pub struct Session {
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
+    /// The markdown reading view of the current buffer, when active (docs/markdown-view.md).
+    pub read: Option<ReadView>,
+    /// Per-buffer read/edit choice for this session: an explicit `Space v` toggle is remembered,
+    /// so switching back to a buffer restores how you left it. Buffers with no entry follow
+    /// [`Self::markdown_read_default`] (and the open-route rules, §1.6).
+    pub(crate) read_pref: std::collections::HashMap<BufferId, bool>,
+    /// App-wide "open markdown as reading view" setting (`Space .`), seeded from `settings/get`
+    /// and synced via `settings/changed`.
+    pub markdown_read_default: bool,
+    /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and
+    /// consumed by `adopt_switch`: jump-shaped opens land in the editor, not the reading view
+    /// (docs/markdown-view.md §1.6).
+    pub(crate) open_route_jumped: bool,
     pub diagnostics: DiagnosticCounts,
     pub lsp: Option<LspServerStatus>,
     pub externally_modified: bool,
@@ -835,6 +854,131 @@ pub struct Session {
     /// [`Self::hints_enabled`]. Shells read [`crate::update`]'s `hint_view()` and drive
     /// `on_hint_tick()`.
     pub hints: crate::hints::HintEngine,
+}
+
+/// The markdown reading view of the current buffer (docs/markdown-view.md): the parsed document,
+/// its navigable element list, and the source text they were parsed from. Present iff the buffer
+/// is displayed as a reading view — [`Session::mode`] is `Read` whenever this is `Some`, except
+/// while a search prompt entered *from* Read holds the keyboard.
+///
+/// There is no focus field: the focused element is a pure function of the server cursor
+/// ([`Self::focus`]), so outline jumps, jumplist steps and search all land correctly with no
+/// extra sync (docs/markdown-view.md §1.3).
+pub struct ReadView {
+    pub buffer_id: BufferId,
+    /// Content revision the document was parsed at; a change notification with a newer revision
+    /// triggers a re-fetch.
+    pub revision: u64,
+    /// The source text (for span → text slices and byte ↔ position conversion).
+    pub text: String,
+    pub blocks: Vec<crate::markdown::Block>,
+    pub elements: Vec<crate::markdown::Element>,
+    /// Byte offset of each line start in `text`, for byte ↔ `LogicalPosition` conversion.
+    line_starts: Vec<u32>,
+    /// A content fetch is in flight (`true` until the first parse adopts, and again during a
+    /// re-fetch after an external change).
+    pub loading: bool,
+    /// Fenced-code tree-sitter highlights, keyed by the code block's span start — filled
+    /// asynchronously from `syntax/highlight_snippet` results (docs/markdown-view.md §2.8);
+    /// offsets index the block's `code` string. Fences render monochrome until theirs arrive.
+    pub code_highlights:
+        std::collections::HashMap<u32, Vec<aether_protocol::viewport::Highlight>>,
+    /// Bumped whenever `code_highlights` grows — the shells' layout-cache invalidation key
+    /// (revision alone doesn't move when highlights land).
+    pub hl_gen: u64,
+}
+
+impl ReadView {
+    /// An empty view awaiting its first `buffer/content` result.
+    pub fn loading(buffer_id: BufferId) -> Self {
+        ReadView {
+            buffer_id,
+            revision: 0,
+            text: String::new(),
+            blocks: Vec::new(),
+            elements: Vec::new(),
+            line_starts: Vec::new(),
+            loading: true,
+            code_highlights: std::collections::HashMap::new(),
+            hl_gen: 0,
+        }
+    }
+
+    /// Adopt fetched content: parse and index it. Fence highlights reset — the spans they were
+    /// keyed to may have moved — and re-request via the update loop.
+    pub fn adopt(&mut self, revision: u64, text: String) {
+        self.blocks = crate::markdown::parse(&text);
+        self.elements = crate::markdown::elements(&self.blocks);
+        self.line_starts = std::iter::once(0)
+            .chain(text.char_indices().filter_map(|(i, c)| {
+                (c == '\n').then_some(i as u32 + 1)
+            }))
+            .collect();
+        self.text = text;
+        self.revision = revision;
+        self.loading = false;
+        self.code_highlights.clear();
+        self.hl_gen += 1;
+    }
+
+    /// The byte offset of a cursor position (clamped to the text).
+    pub fn byte_of(&self, pos: LogicalPosition) -> u32 {
+        let line = (pos.line as usize).min(self.line_starts.len().saturating_sub(1));
+        let start = self.line_starts.get(line).copied().unwrap_or(0);
+        (start + pos.col).min(self.text.len() as u32)
+    }
+
+    /// The `LogicalPosition` of a byte offset (line via binary search; col is a byte col).
+    pub fn pos_of(&self, byte: u32) -> LogicalPosition {
+        let line = match self.line_starts.binary_search(&byte) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        let start = self.line_starts.get(line).copied().unwrap_or(0);
+        LogicalPosition {
+            line: line as u32,
+            col: byte.saturating_sub(start),
+        }
+    }
+
+    /// The focused element for a cursor: innermost containing, else next after, else last
+    /// (docs/markdown-view.md §1.3). `None` only for an empty/unloaded document. This is the
+    /// *action* focus (`Enter`, `y`); rendering splits it into two projections of the same
+    /// cursor — [`Self::block_focus`] and [`Self::target_focus`].
+    pub fn focus(&self, cursor: LogicalPosition) -> Option<usize> {
+        crate::markdown::element_at(&self.elements, self.byte_of(cursor))
+    }
+
+    /// The reading position: the innermost *block-grain* element at the cursor, falling
+    /// forward/back like [`Self::focus`]. Always rendered (the left bar), for every cursor
+    /// position — including ones whose innermost element is a link, so the position marker
+    /// never changes shape mid-`j`/`k` walk.
+    pub fn block_focus(&self, cursor: LogicalPosition) -> Option<usize> {
+        crate::markdown::element_at_matching(
+            &self.elements,
+            self.byte_of(cursor),
+            crate::markdown::Element::is_block,
+        )
+    }
+
+    /// The Enter target: the innermost *interactive* element (link, image, footnote ref) whose
+    /// span actually contains the cursor — `None` otherwise, with no fallback. Rendered as the
+    /// pill/invert *alongside* the block bar; it appears when `Tab`/click/search put the cursor
+    /// inside an interactive span and vanishes as soon as the cursor leaves. Both projections
+    /// derive from the one server cursor — there is still no separate selection state.
+    pub fn target_focus(&self, cursor: LogicalPosition) -> Option<usize> {
+        crate::markdown::containing_element(
+            &self.elements,
+            self.byte_of(cursor),
+            crate::markdown::Element::is_interactive,
+        )
+    }
+
+    /// The source text of an element's span, for `y` copies.
+    pub fn slice(&self, span: crate::markdown::Span) -> &str {
+        let (s, e) = (span.start as usize, (span.end as usize).min(self.text.len()));
+        self.text.get(s..e).unwrap_or("")
+    }
 }
 
 /// The toast group key identifying one LSP *server instance* — `language` + its `workspace_root`,
@@ -881,6 +1025,10 @@ impl Session {
             ui_font_size: aether_protocol::settings::default_ui_font_size(),
             hints_enabled: true,
             diff_view: false,
+            read: None,
+            read_pref: std::collections::HashMap::new(),
+            markdown_read_default: true,
+            open_route_jumped: false,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
             externally_modified: false,
@@ -936,6 +1084,12 @@ impl Session {
                     label: "Hints",
                     control: AppSettingControl::Toggle(self.hints_enabled),
                     hint: "Suggest things to try in the corner (Space h dismisses one, Space Alt-h toggles)",
+                },
+                AppSettingRow {
+                    id: AppSettingId::MarkdownRead,
+                    label: "Markdown reading view",
+                    control: AppSettingControl::Toggle(self.markdown_read_default),
+                    hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
                 },
             ],
         }]
