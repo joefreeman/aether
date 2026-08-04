@@ -3573,10 +3573,6 @@ fn app_info_wire_shapes() {
         paths: AppPaths {
             config_dir: Some("/c".into()),
             state_dir: Some("/s".into()),
-            settings: Some("/c/settings.toml".into()),
-            sessions: Some("/s/sessions.json".into()),
-            hints: Some("/s/hints.json".into()),
-            backups: Some("/s/backups".into()),
         },
     };
     let v = to_value(&info).unwrap();

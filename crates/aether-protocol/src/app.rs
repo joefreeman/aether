@@ -97,22 +97,16 @@ pub struct AppInfo {
 /// absent row is itself the diagnostic. Rendered in the dialog and by `ae server status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPaths {
-    /// `<config>/aether/profiles/<name>/` — user-authored durable config.
+    /// `<config>/aether/profiles/<name>/` — user-authored durable config: `settings.toml`
+    /// (app-wide preferences, `Space .`) and the `workspaces/*.toml` definitions.
+    ///
+    /// Only the two profile dirs travel: everything inside them sits at a fixed name joined onto
+    /// one of these bases and resolves iff its base does, so per-file paths would carry no extra
+    /// information (they were dropped from the wire for exactly that reason).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<String>,
-    /// `<state>/aether/profiles/<name>/` — machine-managed state (sessions, backups).
+    /// `<state>/aether/profiles/<name>/` — machine-managed state: `sessions.json` (workspace
+    /// recency + dormant restore), `hints.json` (hint learning), `backups/` (unsaved buffers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<String>,
-    /// `settings.toml` (app-wide preferences, `Space .`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<String>,
-    /// `sessions.json` — workspace recency + dormant buffer restore.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sessions: Option<String>,
-    /// `hints.json` — hint learning state (docs/hints.md).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hints: Option<String>,
-    /// `backups/` — unsaved-buffer backups (docs/unsaved-persistence.md).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backups: Option<String>,
 }

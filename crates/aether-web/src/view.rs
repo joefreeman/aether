@@ -51,7 +51,7 @@ pub fn build_view(s: &Session) -> Value {
         "pending": pending(&s.pending),
         "sneak_active": s.sneak.is_some(),
         "search": search(s),
-        "prompt": prompt(&s.prompt, &s.workspace_paths),
+        "prompt": prompt(&s.prompt, &s.workspace_paths, &s.conn),
         "picker": picker(&s.picker, &s.workspace_paths),
         "workspace_settings": workspace_settings(s),
         "app_settings": app_settings(s),
@@ -293,7 +293,11 @@ fn path_editor(ed: &PathEditor, workspace_paths: &[String]) -> Value {
 
 /// The modal prompt overlay, when one is open (confirm / save-as / LSP info). Keys flow through the
 /// core's `on_prompt_key` (the shell only renders this); see docs/web-core.md.
-fn prompt(p: &Option<Prompt>, workspace_paths: &[String]) -> Value {
+fn prompt(
+    p: &Option<Prompt>,
+    workspace_paths: &[String],
+    conn: &aether_client::session::ConnState,
+) -> Value {
     match p {
         None => Value::Null,
         Some(Prompt::Confirm { kind, .. }) => {
@@ -306,7 +310,7 @@ fn prompt(p: &Option<Prompt>, workspace_paths: &[String]) -> Value {
         // it can't drift from what the TUI and GUI show.
         Some(Prompt::AppInfo(info)) => json!({
             "kind": "appinfo",
-            "sections": aether_client::app_info::sections(info)
+            "sections": aether_client::app_info::sections(info.as_deref(), conn)
                 .into_iter()
                 .map(|s| json!({
                     "title": s.title,

@@ -2397,9 +2397,13 @@ impl Shell {
             Some(Prompt::AppInfo(info)) => {
                 // Rows come from the core so all three shells agree; the TUI adds only scroll.
                 // Recomposed each sync — cheap — but the scroll carries over from the previous
-                // sync so wheel position sticks while the dialog stays open.
+                // sync so wheel position sticks while the dialog stays open. `None` info is the
+                // disconnected open: client-side rows only.
                 st.app_info = Some(crate::app::AppInfoView {
-                    sections: aether_client::app_info::sections(info),
+                    sections: aether_client::app_info::sections(
+                        info.as_deref(),
+                        &self.session.conn,
+                    ),
                     scroll: prev_app_info.map(|v| v.scroll).unwrap_or_default(),
                 });
             }

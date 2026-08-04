@@ -42,18 +42,16 @@ pub fn app_info(s: &crate::state::ServerState) -> AppInfo {
     }
 }
 
-/// Resolve the active profile's on-disk locations. Each is independently fallible (no XDG base
-/// dirs), and a failure here mirrors the feature being disabled server-side — so an absent row in
-/// the dialog is itself the diagnostic, not a rendering gap.
+/// Resolve the active profile's two on-disk roots. Everything the profile persists lives at a
+/// fixed name under one of them (`settings.toml`, `workspaces/` under config; `sessions.json`,
+/// `hints.json`, `backups/` under state) and resolves iff its base does, so only the bases
+/// travel. A failure here (no XDG base dirs) mirrors the features being disabled server-side —
+/// an absent row in the dialog is itself the diagnostic, not a rendering gap.
 fn paths() -> AppPaths {
     let show = |p: anyhow::Result<std::path::PathBuf>| p.ok().map(|p| p.display().to_string());
     AppPaths {
         config_dir: show(crate::config::profile_config_dir()),
         state_dir: show(crate::config::profile_state_dir()),
-        settings: show(crate::config::app_settings_path()),
-        sessions: show(crate::config::workspace_sessions_path()),
-        hints: show(crate::config::hints_state_path()),
-        backups: show(crate::config::backups_dir()),
     }
 }
 

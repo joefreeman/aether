@@ -1434,6 +1434,30 @@ fn space_question_opens_the_app_info_dialog() {
     assert!(matches!(s.prompt, Some(Prompt::AppInfo(_))), "dialog opens");
 }
 
+/// `Space ?` while disconnected opens the dialog anyway — composed from client-side facts (our
+/// build + the connection state) — instead of silently dropping the RPC. Diagnostics matter most
+/// exactly when the server is unreachable.
+#[test]
+fn space_question_opens_client_side_info_while_disconnected() {
+    use aether_client::session::{ConnState, Prompt};
+
+    let mut s = session();
+    s.conn = ConnState::Reconnecting {
+        attempt: 0,
+        had_unsaved: false,
+    };
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()), ROWS);
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "nothing to fetch while disconnected"
+    );
+    assert!(
+        matches!(s.prompt, Some(Prompt::AppInfo(None))),
+        "the client-side dialog opens immediately"
+    );
+}
+
 /// `Ctrl-c` copies the whole snapshot and *stays open* (copying isn't dismissing); any other key
 /// closes. It's the editor's own Copy chord — safe here because the dialog has no text input to
 /// claim it first, unlike a picker's query field.
@@ -1442,7 +1466,7 @@ fn app_info_ctrl_c_copies_and_keeps_the_dialog_open() {
     use aether_client::session::Prompt;
 
     let mut s = session();
-    s.prompt = Some(Prompt::AppInfo(Box::new(app_info())));
+    s.prompt = Some(Prompt::AppInfo(Some(Box::new(app_info()))));
     let fx = s.on_key(KeyCode::Char('c'), Mods::CTRL, None, ROWS);
     let copied = written_clipboard(&fx).expect("Ctrl-c copies");
     // The copied text is the rendered dialog, so a row can't exist in one and not the other.
@@ -1457,7 +1481,7 @@ fn app_info_ctrl_c_copies_and_keeps_the_dialog_open() {
     assert!(s.prompt.is_none(), "any other key closes");
     assert!(written_clipboard(&fx).is_none());
 
-    s.prompt = Some(Prompt::AppInfo(Box::new(app_info())));
+    s.prompt = Some(Prompt::AppInfo(Some(Box::new(app_info()))));
     let fx = s.on_key(KeyCode::Char('q'), Mods::NONE, Some("q".into()), ROWS);
     assert!(s.prompt.is_none(), "any other key closes");
     assert!(written_clipboard(&fx).is_none());

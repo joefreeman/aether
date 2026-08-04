@@ -11,6 +11,7 @@
 //! the payload against the client's own compiled-in build constants and emits a `Client` row only
 //! when they actually differ.
 
+use crate::session::ConnState;
 use aether_protocol::app::AppInfo;
 
 /// A labelled group of rows. Purely presentational: shells draw the title as a heading and the rows
@@ -60,7 +61,16 @@ impl InfoRow {
 /// Compose the dialog's sections from a snapshot. Pure — no clock, no environment — so the shells
 /// and the tests see identical output for identical input. Anything time-derived (uptime) is
 /// computed server-side and arrives in the payload; the sans-IO core has no clock of its own.
-pub fn sections(info: &AppInfo) -> Vec<InfoSection> {
+///
+/// `info` is `None` when the dialog was opened while disconnected (`Prompt::AppInfo(None)`) —
+/// there's no server to ask, so the composition falls back to what still exists client-side: our
+/// own build identity plus the connection state, the latter being exactly what the user opened
+/// the dialog to learn. The server-side sections (Instance, Paths) are absent rather than stale
+/// or fabricated.
+pub fn sections(info: Option<&AppInfo>, conn: &ConnState) -> Vec<InfoSection> {
+    let Some(info) = info else {
+        return disconnected_sections(conn);
+    };
     let mut out = Vec::new();
 
     // ---- Build: which binary is this? ----
@@ -119,15 +129,14 @@ pub fn sections(info: &AppInfo) -> Vec<InfoSection> {
 
     // ---- Paths: where does this profile's state live? ----
     // Profile-scoped, so not guessable from the outside — and the answer to most "reset it" and
-    // "why is it remembering that?" questions. A path that failed to resolve is omitted: the same
-    // failure disables the feature server-side, so the gap is the finding.
+    // "why is it remembering that?" questions. Just the two roots: every persisted file sits at
+    // a fixed name under one of them (settings.toml under config; sessions.json / hints.json /
+    // backups/ under state) and resolves iff its base does, so per-file rows would only repeat
+    // these. A root that failed to resolve is omitted: the same failure disables those features
+    // server-side, so the gap is the finding.
     let paths: Vec<InfoRow> = [
         ("Config", &info.paths.config_dir),
         ("State", &info.paths.state_dir),
-        ("Settings", &info.paths.settings),
-        ("Sessions", &info.paths.sessions),
-        ("Hints", &info.paths.hints),
-        ("Backups", &info.paths.backups),
     ]
     .into_iter()
     .filter_map(|(label, p)| p.as_ref().map(|p| InfoRow::new(label, p.clone())))
@@ -146,20 +155,63 @@ pub fn sections(info: &AppInfo) -> Vec<InfoSection> {
 /// travel together because individually none of them identifies a binary — `0.2.0` is shared by
 /// every build between two releases.
 fn build_line(info: &AppInfo) -> String {
-    let mut s = match &info.commit {
-        Some(c) => c.clone(),
+    format_build_line(info.commit.as_deref(), info.commit_dirty, info.debug_build)
+}
+
+/// [`build_line`]'s formatting, shared with the disconnected fallback (which reads the client's
+/// own compiled-in constants instead of a server payload).
+fn format_build_line(commit: Option<&str>, dirty: bool, debug: bool) -> String {
+    let mut s = match commit {
+        Some(c) => c.to_string(),
         // Not built from a checkout (tarball, no `git`). Say so rather than showing a blank.
         None => "unknown commit".to_string(),
     };
-    if info.commit_dirty {
+    if dirty {
         s.push_str(" (modified)");
     }
-    s.push_str(if info.debug_build {
-        " · debug"
-    } else {
-        " · release"
-    });
+    s.push_str(if debug { " · debug" } else { " · release" });
     s
+}
+
+/// The client-side fallback for a disconnected open: our build identity (the same compiled-in
+/// constants [`client_drift_row`] compares against) and the connection state, warning-toned —
+/// it's the one actionable fact, and the reason everything server-side is missing.
+fn disconnected_sections(conn: &ConnState) -> Vec<InfoSection> {
+    let build = vec![
+        InfoRow::new("Version", aether_protocol::PROTOCOL_VERSION),
+        InfoRow::new(
+            "Build",
+            format_build_line(
+                aether_protocol::BUILD_COMMIT,
+                aether_protocol::BUILD_DIRTY,
+                aether_protocol::BUILD_DEBUG,
+            ),
+        ),
+    ];
+    let status = match conn {
+        // Unreachable via `Space ?` (a connected open fetches the real snapshot), but a total
+        // match keeps this honest if a shell ever composes it directly.
+        ConnState::Connected => InfoRow::new("Status", "connected"),
+        ConnState::Connecting => InfoRow::warn("Status", "connecting…"),
+        // `attempt` counts from 0 (the dial in flight); people count from 1.
+        ConnState::Reconnecting { attempt, .. } => {
+            InfoRow::warn("Status", format!("reconnecting (attempt {})", attempt + 1))
+        }
+        ConnState::Failed => InfoRow::warn("Status", "disconnected — reconnect failed"),
+    };
+    vec![
+        InfoSection {
+            title: "Build",
+            rows: build,
+        },
+        InfoSection {
+            title: "Connection",
+            rows: vec![
+                status,
+                InfoRow::new("Server", "details unavailable until reconnected"),
+            ],
+        },
+    ]
 }
 
 /// A `Client` row naming *our* build, emitted only when it differs from the server's.
@@ -185,8 +237,8 @@ fn client_drift_row(info: &AppInfo) -> Option<InfoRow> {
 /// Render the whole snapshot as plain text, for `y` (copy). This is the paste-into-a-bug-report
 /// payload, so it's built from the same [`sections`] the dialog draws — what you copy is what you
 /// saw, and neither can gain a field the other misses.
-pub fn to_plain_text(info: &AppInfo) -> String {
-    let secs = sections(info);
+pub fn to_plain_text(info: Option<&AppInfo>, conn: &ConnState) -> String {
+    let secs = sections(info, conn);
     // Align values into a column, sized to the widest label across *all* sections so the copied
     // block reads as one table rather than three.
     let width = secs
@@ -279,9 +331,39 @@ mod tests {
             .map(|r| r.value.clone())
     }
 
+    /// The disconnected fallback (`Space ?` with no server): the client's own build identity and
+    /// a warn-toned connection row — and none of the server-side sections, fabricated or stale.
+    #[test]
+    fn disconnected_open_composes_client_side_rows() {
+        let s = sections(
+            None,
+            &ConnState::Reconnecting {
+                attempt: 2,
+                had_unsaved: false,
+            },
+        );
+        let titles: Vec<_> = s.iter().map(|s| s.title).collect();
+        assert_eq!(titles, vec!["Build", "Connection"]);
+        assert_eq!(
+            value(&s, "Version").as_deref(),
+            Some(aether_protocol::PROTOCOL_VERSION)
+        );
+        let status = s
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .find(|r| r.label == "Status")
+            .expect("a connection status row");
+        assert_eq!(status.value, "reconnecting (attempt 3)");
+        assert_eq!(status.tone, InfoTone::Warn);
+        assert!(
+            value(&s, "Profile").is_none() && value(&s, "PID").is_none(),
+            "no fabricated server rows"
+        );
+    }
+
     #[test]
     fn sections_cover_build_instance_and_paths() {
-        let s = sections(&info());
+        let s = sections(Some(&info()), &ConnState::Connected);
         let titles: Vec<_> = s.iter().map(|s| s.title).collect();
         assert_eq!(titles, vec!["Build", "Instance", "Paths"]);
         assert_eq!(value(&s, "Profile").as_deref(), Some("default"));
@@ -290,17 +372,19 @@ mod tests {
         assert_eq!(value(&s, "Buffers").as_deref(), Some("5 open, 1 unsaved"));
     }
 
-    /// A path that didn't resolve is omitted rather than rendered blank, and a Paths section with
-    /// nothing in it doesn't appear at all — so shells can render sections unconditionally.
+    /// Only the two profile roots render (per-file paths are always fixed names under them, so
+    /// they'd only repeat the roots). A root that didn't resolve is omitted rather than rendered
+    /// blank, and a Paths section with nothing in it doesn't appear at all — so shells can render
+    /// sections unconditionally.
     #[test]
     fn unresolved_paths_are_omitted() {
-        let s = sections(&info());
+        let s = sections(Some(&info()), &ConnState::Connected);
         assert!(value(&s, "Config").is_some());
-        assert!(value(&s, "Sessions").is_none());
+        assert!(value(&s, "State").is_none(), "unresolved root is omitted");
 
         let mut bare = info();
         bare.paths = AppPaths::default();
-        let s = sections(&bare);
+        let s = sections(Some(&bare), &ConnState::Connected);
         assert!(s.iter().all(|s| s.title != "Paths"));
         assert!(s.iter().all(|s| !s.rows.is_empty()));
     }
@@ -309,14 +393,14 @@ mod tests {
     /// native shell, where client and server are the same binary.
     #[test]
     fn no_client_row_when_builds_match() {
-        assert!(value(&sections(&info()), "Client").is_none());
+        assert!(value(&sections(Some(&info()), &ConnState::Connected), "Client").is_none());
     }
 
     #[test]
     fn client_row_appears_on_version_drift() {
         let mut drifted = info();
         drifted.version = "0.0.1-ancient".into();
-        let s = sections(&drifted);
+        let s = sections(Some(&drifted), &ConnState::Connected);
         let row = s
             .iter()
             .flat_map(|s| s.rows.iter())
@@ -332,7 +416,7 @@ mod tests {
     fn client_row_appears_on_commit_drift() {
         let mut drifted = info();
         drifted.commit = Some("deadbee".into());
-        assert!(value(&sections(&drifted), "Client").is_some());
+        assert!(value(&sections(Some(&drifted), &ConnState::Connected), "Client").is_some());
     }
 
     #[test]
@@ -353,12 +437,12 @@ mod tests {
     fn mode_names_the_reaper() {
         let mut i = info();
         assert_eq!(
-            value(&sections(&i), "Mode").as_deref(),
+            value(&sections(Some(&i), &ConnState::Connected), "Mode").as_deref(),
             Some("persistent (`ae server`)")
         );
         i.idle_timeout_secs = Some(300);
         assert_eq!(
-            value(&sections(&i), "Mode").as_deref(),
+            value(&sections(Some(&i), &ConnState::Connected), "Mode").as_deref(),
             Some("auto-started, reaps after 5m idle")
         );
     }
@@ -368,8 +452,11 @@ mod tests {
     #[test]
     fn plain_text_contains_every_row() {
         let i = info();
-        let text = to_plain_text(&i);
-        for row in sections(&i).iter().flat_map(|s| s.rows.iter()) {
+        let text = to_plain_text(Some(&i), &ConnState::Connected);
+        for row in sections(Some(&i), &ConnState::Connected)
+            .iter()
+            .flat_map(|s| s.rows.iter())
+        {
             assert!(
                 text.contains(row.label) && text.contains(&row.value),
                 "missing {} in:\n{text}",

@@ -6746,24 +6746,27 @@ mod tests {
     fn app_info_app() -> AppState {
         let mut st = picker_app(crate::picker::PickerState::default());
         st.app_info = Some(crate::app::AppInfoView {
-            sections: aether_client::app_info::sections(&aether_protocol::app::AppInfo {
-                version: "0.9.9".into(),
-                commit: Some("abc1234".into()),
-                commit_dirty: false,
-                debug_build: false,
-                appimage: None,
-                profile: "dev".into(),
-                port: Some(2385),
-                pid: 42,
-                started_at_unix_ms: 0,
-                uptime_secs: 90,
-                idle_timeout_secs: None,
-                clients: 1,
-                buffers_open: 2,
-                buffers_unsaved: 0,
-                workspaces_active: 1,
-                paths: Default::default(),
-            }),
+            sections: aether_client::app_info::sections(
+                Some(&aether_protocol::app::AppInfo {
+                    version: "0.9.9".into(),
+                    commit: Some("abc1234".into()),
+                    commit_dirty: false,
+                    debug_build: false,
+                    appimage: None,
+                    profile: "dev".into(),
+                    port: Some(2385),
+                    pid: 42,
+                    started_at_unix_ms: 0,
+                    uptime_secs: 90,
+                    idle_timeout_secs: None,
+                    clients: 1,
+                    buffers_open: 2,
+                    buffers_unsaved: 0,
+                    workspaces_active: 1,
+                    paths: Default::default(),
+                }),
+                &aether_client::session::ConnState::Connected,
+            ),
             scroll: Default::default(),
         });
         st

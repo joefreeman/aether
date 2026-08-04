@@ -3431,7 +3431,9 @@ impl App {
                     .font(SANS_BOLD_UI)
                     .color(theme::NORD6)]
                 .spacing(12);
-                for section in aether_client::app_info::sections(info) {
+                for section in
+                    aether_client::app_info::sections(info.as_deref(), &self.session.conn)
+                {
                     let mut rows = column![text(section.title)
                         .size(ui.small())
                         .font(SANS_BOLD_UI)

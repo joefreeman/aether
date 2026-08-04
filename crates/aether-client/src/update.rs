@@ -449,7 +449,7 @@ impl Session {
             // Opening replaces whatever prompt was up: `Space ?` is only reachable from Normal mode
             // via the leader, so nothing that owns the keyboard can be underneath it.
             Event::AppInfoLoaded(Ok(info)) => {
-                self.prompt = Some(Prompt::AppInfo(Box::new(info)));
+                self.prompt = Some(Prompt::AppInfo(Some(Box::new(info))));
                 Effects::none()
             }
             Event::AppInfoLoaded(Err(e)) => Effects::error(format!("App info failed: {e}")),
@@ -2268,7 +2268,7 @@ impl Session {
                 // docs — a *focused query input* — doesn't apply here).
                 // Any other key closes (the prompt was already taken above).
                 if code == KeyCode::Char('c') && mods.ctrl && !mods.alt {
-                    let text = crate::app_info::to_plain_text(&info);
+                    let text = crate::app_info::to_plain_text(info.as_deref(), &self.conn);
                     let mut fx = Effects::toast("Copied app info", ToastKind::Success);
                     fx.push(Effect::WriteClipboard(text));
                     // Stay open: copying isn't dismissing, and the toast confirms it landed.
@@ -6744,9 +6744,18 @@ impl Session {
             // Fetched rather than assembled client-side: the build identity, pid, port and counts
             // all describe the *server* process, and half the value of the dialog is that it
             // reports the daemon you're actually connected to rather than the one you assume.
-            A::ShowAppInfo => self.request::<AppInfoGet>(AppInfoParams {}, |r| {
-                Event::AppInfoLoaded(r.map_err(|e| e.to_string()))
-            }),
+            A::ShowAppInfo => {
+                // Disconnected is when the diagnostics dialog matters most — and the RPC would
+                // be silently dropped (the core sends nothing while not `Connected`). Open the
+                // client-side snapshot instead: our build identity + the connection state.
+                if !matches!(self.conn, ConnState::Connected) {
+                    self.prompt = Some(Prompt::AppInfo(None));
+                    return Effects::none();
+                }
+                self.request::<AppInfoGet>(AppInfoParams {}, |r| {
+                    Event::AppInfoLoaded(r.map_err(|e| e.to_string()))
+                })
+            }
             // Dismiss the corner hint (docs/hints.md): a deliberate "not now" — down-weight it
             // (heavier than a lapsed display) and rotate to another. No-op on an empty corner.
             A::DismissHint => {
