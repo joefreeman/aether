@@ -2157,7 +2157,7 @@ export class Shell {
       case "new_window": {
         // With a concrete file target (reading-view Ctrl-Enter): open the app on that file in
         // a new tab — the picker-row treatment. Without one: another tab on the same URL (the
-        // `Space Alt-x` duplicate). Keypress-initiated, so it's a user gesture and isn't
+        // `Space z` duplicate). Keypress-initiated, so it's a user gesture and isn't
         // popup-blocked.
         if (a.path) {
           const v = this.view();

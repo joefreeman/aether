@@ -14,6 +14,11 @@
 //! directory. `-w/--workspace` overrides inference, and `ae edit ...` is the explicit form for when a
 //! PATH would otherwise collide with the `server` subcommand name.
 //!
+//! A PATH *without* `-w` also tethers the client to the opened buffer (docs/tether.md): closing
+//! that buffer — `Space x`, or `Space Alt-x` to save-and-close — exits the client, giving
+//! `ae file` the `$EDITOR` contract (e.g. a git commit message: edit, `Space Alt-x`, done, and
+//! the buffer doesn't linger in the workspace's session).
+//!
 //! Server lifetime: `edit` auto-starts a server if none is listening (see [`ensure_server_running`])
 //! — a detached, idle-reapable daemon that outlives the client and shuts itself down once no client
 //! has been connected for a while (and no buffer is unsaved). `ae server` runs the same daemon but
@@ -157,6 +162,11 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
         None => None,
     };
     let workspace = resolve_workspace(&edit)?;
+    // The quick-edit invocation — a file positional without an explicit `--workspace` — tethers
+    // the client to the opened buffer (docs/tether.md): closing that buffer exits the client,
+    // giving `ae file` the `$EDITOR` contract. Naming the workspace (a deliberate session, and
+    // what window-spawns always do) opts out; the shells skip directories and `--buffer` opens.
+    let tether = edit.path.is_some() && edit.workspace.is_none();
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
     ensure_server_running(port, idle_timeout_secs);
@@ -167,13 +177,14 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
             edit.path,
             jump,
             edit.buffer,
+            tether,
             version,
             server_url,
             aether_server::active_profile().to_string(),
         )
     } else {
         // `--buffer` is a GUI-spawn internal; the terminal client has no window to seed with it.
-        run_tui(workspace, edit.path, jump, version, server_url)
+        run_tui(workspace, edit.path, jump, tether, version, server_url)
     }
 }
 
@@ -542,14 +553,18 @@ fn active_profile_port() -> anyhow::Result<Option<u16>> {
         .map(|p| p.port))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     workspace: Option<String>,
     path: Option<String>,
     jump: Option<(u32, u32)>,
+    tether: bool,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
-    runtime()?.block_on(aether_tui::run(workspace, path, jump, version, server_url))
+    runtime()?.block_on(aether_tui::run(
+        workspace, path, jump, tether, version, server_url,
+    ))
 }
 
 #[cfg(feature = "gui")]
@@ -559,13 +574,16 @@ fn run_gui(
     path: Option<String>,
     jump: Option<(u32, u32)>,
     buffer: Option<u64>,
+    tether: bool,
     version: String,
     server_url: String,
     profile: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(workspace, path, jump, buffer, version, server_url, profile)
+    aether_iced::run(
+        workspace, path, jump, buffer, tether, version, server_url, profile,
+    )
 }
 
 #[cfg(not(feature = "gui"))]
@@ -575,6 +593,7 @@ fn run_gui(
     _path: Option<String>,
     _jump: Option<(u32, u32)>,
     _buffer: Option<u64>,
+    _tether: bool,
     _version: String,
     _server_url: String,
     _profile: String,

@@ -1577,9 +1577,8 @@ mod tests {
     /// buffers.
     #[test]
     fn read_hints_are_context_local_and_sequenced() {
-        let pool_has = |e: &HintEngine, id: &str| {
-            e.pool(C::Read).iter().any(|&i| CURRICULUM[i].id == id)
-        };
+        let pool_has =
+            |e: &HintEngine, id: &str| e.pool(C::Read).iter().any(|&i| CURRICULUM[i].id == id);
         let mut e = HintEngine::default();
         e.adopt(HintsStateResult::default());
         e.set_facts(HintFacts {
@@ -1592,9 +1591,15 @@ mod tests {
         e.on_tick(Some(C::Read), T0, true);
         let first = displayed(&e, C::Read).expect("the read corner fills on a fresh profile");
         let opening = ["read-source", "read-step", "read-headings", "read-copy"];
-        assert!(opening.contains(&first), "unsequenced read hint first, got {first}");
+        assert!(
+            opening.contains(&first),
+            "unsequenced read hint first, got {first}"
+        );
         for id in ["read-target", "read-follow", "read-peek", "read-back"] {
-            assert!(!pool_has(&e, id), "{id} must wait for its predecessor's show");
+            assert!(
+                !pool_has(&e, id),
+                "{id} must wait for its predecessor's show"
+            );
         }
 
         // Each show unlocks the next rung: step → target → follow/peek → back.

@@ -2597,8 +2597,13 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         let highlighted = i == state.picker.selected;
-        let mut spans =
-            picker_item_spans(item, &state.root_labels, highlighted, text_width as usize);
+        let mut spans = picker_item_spans(
+            item,
+            &state.root_labels,
+            state.tether,
+            highlighted,
+            text_width as usize,
+        );
         // Italicise the synthetic "+ Create …" row so it reads as an action affordance rather
         // than a real entry. Applied uniformly across all spans of the row (including any
         // fuzzy-match-highlight spans), since the synthetic never has match indices anyway.
@@ -2672,6 +2677,7 @@ fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
 fn picker_item_spans(
     item: &PickerItem,
     root_labels: &[String],
+    tether: Option<aether_protocol::BufferId>,
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
@@ -2753,6 +2759,7 @@ fn picker_item_spans(
     // status bar / title and the other clients. `display` (the match haystack) is the bare
     // relative path, so the highlight lands only on the path, not the prefix.
     if let PickerItem::Buffer {
+        buffer_id,
         display,
         status,
         path_index,
@@ -2769,6 +2776,7 @@ fn picker_item_spans(
             *status,
             *transient,
             *dormant,
+            tether == Some(*buffer_id),
             root_labels,
             highlighted,
             max_width,
@@ -3117,7 +3125,8 @@ fn file_item_spans(
 /// the disambiguated root label dim after the name — same placement as the Files picker — and a
 /// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the highlight
 /// lands only on the path, never the label. Transient buffers slant; dormant (session-restored,
-/// not-yet-loaded) rows dim their foreground.
+/// not-yet-loaded) rows dim their foreground; the session's tether gets the status bar's dim ` *`
+/// after the path (docs/tether.md — closing that row exits the client).
 #[allow(clippy::too_many_arguments)]
 fn buffer_item_spans(
     path_index: Option<u32>,
@@ -3126,6 +3135,7 @@ fn buffer_item_spans(
     status: BufferDirtyState,
     transient: bool,
     dormant: bool,
+    tethered: bool,
     root_labels: &[String],
     highlighted: bool,
     max_width: usize,
@@ -3157,7 +3167,12 @@ fn buffer_item_spans(
         None => String::new(),
     };
 
-    // Reserve the dot region (` • ` = 3 cols) plus the suffix from the path's truncation budget.
+    // The tether mark (docs/tether.md): a dim ` *` after the path, before the root label —
+    // matching the status bar. Upright even on a slanted transient row.
+    let tether_mark = if tethered { " *" } else { "" };
+
+    // Reserve the dot region (` • ` = 3 cols) plus the tether mark and the suffix from the
+    // path's truncation budget.
     let dot_w = if buffer_dirty_dot_color(status).is_some() {
         3
     } else {
@@ -3165,11 +3180,15 @@ fn buffer_item_spans(
     };
     let path_budget = max_width
         .saturating_sub(dot_w)
+        .saturating_sub(tether_mark.width())
         .saturating_sub(suffix.width());
     let (path, indices) = truncate_path_with_indices(display, match_indices, path_budget);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     push_styled_with_match_indices(&mut spans, &path, &indices, base, match_style);
+    if !tether_mark.is_empty() {
+        spans.push(Span::styled(tether_mark.to_string(), label_style));
+    }
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix, label_style));
     }
@@ -5537,6 +5556,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 workspace_prefix: &workspace_prefix,
                 file_label: &state.ed().file_label,
                 transient: state.ed().transient,
+                tethered: state.ed().tethered,
             },
             status_dot,
             git_spans,
@@ -5740,12 +5760,14 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(NORD1).fg(fg)
 }
 
-/// The status row's leading label: an optional `[workspace] ` prefix, the file label, and whether
-/// the buffer is transient (which italicises the label).
+/// The status row's leading label: an optional `[workspace] ` prefix, the file label, whether
+/// the buffer is transient (which italicises the label), and whether it's the session's tether
+/// (which appends a dim ` *` — closing it exits the client, docs/tether.md).
 struct StatusLabel<'a> {
     workspace_prefix: &'a str,
     file_label: &'a str,
     transient: bool,
+    tethered: bool,
 }
 
 /// Build the spans for the default editor status row: an optional leading buffer-state dot, then
@@ -5768,6 +5790,7 @@ fn build_editor_status_spans(
         workspace_prefix,
         file_label,
         transient,
+        tethered,
     } = label;
     let base_style = Style::default().bg(NORD1).fg(NORD4);
     // A transient (preview) buffer slants the file label (root + path — not the workspace name)
@@ -5778,6 +5801,9 @@ fn build_editor_status_spans(
     } else {
         base_style
     };
+    // The tether mark (docs/tether.md): a dim ` *` after the file label — upright even on a
+    // slanted transient label (it's chrome, not part of the name). Dropped on narrow rows.
+    let tether_mark = if tethered { " *" } else { "" };
     // The right segment (counters / diagnostics / position / LSP glyph) is pre-built by the caller,
     // already including its internal gaps and the glyph's edge padding.
     let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
@@ -5797,7 +5823,7 @@ fn build_editor_status_spans(
         }
     }
     let pre_budget = left_max.saturating_sub(used);
-    if workspace_prefix.width() + file_label.width() >= pre_budget {
+    if workspace_prefix.width() + file_label.width() + tether_mark.width() >= pre_budget {
         // Even the workspace/file segment overflows. The file label is the informative part, so
         // it gets the budget first (segment elision keeps the filename end visible); the
         // workspace prefix is shown only if it still fits whole — a partially-cut `[pr…` is
@@ -5814,7 +5840,13 @@ fn build_editor_status_spans(
     } else {
         spans.push(Span::styled(workspace_prefix.to_string(), base_style));
         spans.push(Span::styled(file_label.to_string(), label_style));
-        used += workspace_prefix.width() + file_label.width();
+        if !tether_mark.is_empty() {
+            spans.push(Span::styled(
+                tether_mark.to_string(),
+                base_style.fg(NORD3_BRIGHTER),
+            ));
+        }
+        used += workspace_prefix.width() + file_label.width() + tether_mark.width();
         // Git cluster sits after the file label, set off by a 3-space gap.
         let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
         if badge_w > 0 && used + 3 + badge_w <= left_max {
@@ -6685,6 +6717,7 @@ mod tests {
             workspace_name: "demo".into(),
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
+            tether: None,
             viewport_cols: TEST_COLS as u32,
             viewport_rows: TEST_ROWS as u32,
             should_quit: false,
@@ -7709,7 +7742,7 @@ mod tests {
             display: "    helper();".into(),
             match_indices: vec![4, 5, 6],
         };
-        let spans = picker_item_spans(&item, &[], false, 40);
+        let spans = picker_item_spans(&item, &[], None, false, 40);
         let text = spans_text(&spans);
         assert!(text.starts_with("helper();"), "indent stripped: {text:?}");
         assert!(
@@ -7725,6 +7758,34 @@ mod tests {
         // Identical to the equivalent grep hit — the shared renderer guarantees consistency.
         let grep = preview_row_spans(40, "    helper();", &[4, 5, 6], false, 40);
         assert_eq!(text, spans_text(&grep));
+    }
+
+    /// The Buffers picker marks the session's tether with the status bar's dim ` *` after the
+    /// path (docs/tether.md — closing that row exits the client); other rows are unmarked.
+    #[test]
+    fn buffers_picker_marks_the_tethered_row() {
+        let item = |id: u64| PickerItem::Buffer {
+            buffer_id: id,
+            display: "notes.md".into(),
+            status: aether_protocol::picker::BufferDirtyState::Clean,
+            path_index: None,
+            relative_path: None,
+            match_indices: vec![],
+            transient: false,
+            dormant: false,
+        };
+        let spans = picker_item_spans(&item(7), &[], Some(7), false, 40);
+        assert!(
+            spans_text(&spans).starts_with("notes.md *"),
+            "tethered row carries the mark: {:?}",
+            spans_text(&spans)
+        );
+
+        let spans = picker_item_spans(&item(8), &[], Some(7), false, 40);
+        assert!(
+            !spans_text(&spans).contains('*'),
+            "a different buffer stays unmarked"
+        );
     }
 
     // ---- keybinding_item_spans ----
@@ -7818,6 +7879,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -7841,6 +7903,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: true,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -7860,6 +7923,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -7874,6 +7938,49 @@ mod tests {
         assert!(!label.style.add_modifier.contains(Modifier::ITALIC));
     }
 
+    /// The tether (docs/tether.md) appends a dim ` *` after the file label — upright even when the
+    /// transient italic is on the label — and narrow rows drop it rather than cutting the name.
+    #[test]
+    fn editor_status_spans_mark_tethered_buffer() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: true,
+                tethered: true,
+            },
+            None,
+            Vec::new(),
+            &status,
+            vec![],
+            30,
+        );
+        assert!(spans_text(&spans).contains("file.rs *"));
+        let mark = spans
+            .iter()
+            .find(|s| s.content == " *")
+            .expect("tether mark span");
+        assert_eq!(mark.style.fg, Some(NORD3_BRIGHTER));
+        assert!(!mark.style.add_modifier.contains(Modifier::ITALIC));
+
+        // Untethered: no mark.
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "[proj] ",
+                file_label: "file.rs",
+                transient: false,
+                tethered: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            vec![],
+            30,
+        );
+        assert!(!spans_text(&spans).contains('*'));
+    }
+
     #[test]
     fn editor_status_spans_renders_buffer_status_dot() {
         let status = crate::app::StatusMessage::default();
@@ -7886,6 +7993,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             Some(dot),
             Vec::new(),
@@ -7912,6 +8020,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -7945,6 +8054,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -7975,6 +8085,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),
@@ -8005,6 +8116,7 @@ mod tests {
                 workspace_prefix: "[proj] ",
                 file_label: "src/deeply/nested/module/file.rs",
                 transient: false,
+                tethered: false,
             },
             None,
             Vec::new(),

@@ -3470,6 +3470,9 @@ fn explorer_create_makes_a_file_with_create_if_missing() {
     assert_eq!(open["create_if_missing"], json!(true));
     assert_eq!(open["relative_path"], json!("src/new.rs"));
     assert_eq!(open["path_index"], json!(0));
+    // Creating a file is a terminal pick: the explorer closes rather than lingering over the
+    // freshly-opened buffer (`Event::Switched` deliberately doesn't tear pickers down).
+    assert!(s.picker.is_none(), "the explorer closes on file create");
 }
 
 #[test]
@@ -3491,6 +3494,8 @@ fn explorer_create_with_trailing_slash_makes_a_directory() {
         find_request(&fx, "buffer/open").is_none(),
         "a trailing slash creates a dir, not a file"
     );
+    // Unlike file create, dir create keeps exploring — the result steps into the new directory.
+    assert!(s.picker.is_some(), "the explorer stays open on dir create");
 }
 
 /// Selecting the synthetic "+ Create …" row (the affordance that replaced the old Ctrl-n) runs the
@@ -5191,12 +5196,14 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
 }
 
 /// Closing the last buffer of an ephemeral "(workspace N)" context doesn't spawn a scratch — it
-/// leaves the context. A session *launched* for the file (`ae /path`) quits, vim-like.
+/// leaves the context. A session *launched* for the file (`ae /path`) tethers to it
+/// (docs/tether.md), so the close quits, vim-like.
 #[test]
 fn ephemeral_last_buffer_close_when_launched_quits() {
     let mut s = session();
     s.workspace = "ephemeral/1".to_string();
-    s.launched_with_file = true;
+    s.buffer.buffer_id = 7;
+    s.tether = Some(7);
 
     let fx = s.close_buffer();
     let (token, method, params) = the_request(&fx);
@@ -5204,14 +5211,13 @@ fn ephemeral_last_buffer_close_when_launched_quits() {
     assert_eq!(
         params["open_next"],
         json!(false),
-        "no scratch successor in an ephemeral context"
+        "no successor needed when closing the tether"
     );
 
-    // Server reports nothing left in the workspace.
     let fx = s.on_rpc_result(token, Ok(json!({})));
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::Exit)),
-        "a file-launched session quits when its only buffer closes"
+        "a file-launched session quits when its tether closes"
     );
 }
 
@@ -5223,7 +5229,7 @@ fn ephemeral_last_buffer_close_when_launched_quits() {
 fn ephemeral_last_buffer_close_when_navigated_opens_chooser() {
     let mut s = session();
     s.workspace = "ephemeral/1".to_string();
-    s.launched_with_file = false;
+    s.tether = None;
 
     let fx = s.close_buffer();
     let (token, _, _) = the_request(&fx);
@@ -5261,6 +5267,272 @@ fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
         json!(5),
         "attach to the remaining sibling"
     );
+}
+
+// ---- the tether (docs/tether.md) --------------------------------------------------------------
+
+/// A quick-edit session in a *real* workspace (`ae file`, workspace inferred — the git-commit
+/// case): `Space x` on the tethered buffer exits the client instead of switching to a successor.
+#[test]
+fn closing_the_tether_in_a_workspace_context_exits() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 7;
+    s.tether = Some(7);
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/close");
+    assert_eq!(
+        params["open_next"],
+        json!(false),
+        "no successor: the close ends the client"
+    );
+
+    let fx = s.on_rpc_result(token, Ok(json!({})));
+    assert!(quits(&fx), "closing the tether exits, even mid-workspace");
+}
+
+/// Without a tether the same close switches to the server's successor — the pre-tether behavior
+/// stays for ordinary sessions.
+#[test]
+fn closing_an_untethered_buffer_switches_to_the_successor() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 7;
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/close");
+    assert_eq!(params["open_next"], json!(true), "adopt the MRU successor");
+}
+
+/// Another client closing the tether (the `buffer/closed` push) exits too — the contract the
+/// future `ae --web file` waiter rides. It holds even when the client has switched to a
+/// different buffer: the tether check runs before the current-buffer guard (and the server
+/// pushes to all workspace clients, not just viewers).
+#[test]
+fn tether_closed_by_another_client_exits() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification};
+    let push = || {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: "buffer/closed".into(),
+            params: json!({ "buffer_id": 7 }),
+        })
+    };
+
+    // Viewing the tether when it closes.
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 7;
+    s.tether = Some(7);
+    let fx = s.on_event(push());
+    assert!(quits(&fx), "the tether closed out from under us — exit");
+
+    // Browsing another buffer when the tether closes: still exit.
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 9;
+    s.tether = Some(7);
+    let fx = s.on_event(push());
+    assert!(quits(&fx), "exit even while viewing something else");
+
+    // No tether: a push for a background buffer is ignored.
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 9;
+    let fx = s.on_event(push());
+    assert!(!quits(&fx), "untethered clients ignore background closes");
+}
+
+/// Un-keeping the tethered buffer (`Space k`) releases the tether: the buffer demotes to an
+/// ordinary transient and closing it no longer exits. One-way — a later re-keep is a plain keep,
+/// not a re-arm.
+#[test]
+fn unkeep_releases_the_tether_one_way() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 7;
+    s.tether = Some(7);
+
+    // `Space k` on the (clean) tether: one set_transient request, demoting the buffer.
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/set_transient");
+    assert_eq!(
+        params["transient"],
+        json!(true),
+        "release demotes to transient"
+    );
+    assert_eq!(s.tether, Some(7), "released only once the server confirms");
+
+    let fx = s.on_rpc_result(token, Ok(json!({ "transient": true })));
+    assert_eq!(s.tether, None, "the tether is gone");
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })),
+        "the release is announced"
+    );
+
+    // Re-keep (the transient flag itself rides a push; simulate it) — a plain keep, no re-arm.
+    s.buffer.transient = true;
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/set_transient");
+    assert_eq!(params["transient"], json!(false), "plain keep");
+    assert_eq!(s.tether, None, "re-keeping does not re-arm the tether");
+
+    // And closing now behaves like any ordinary buffer: successor, no exit.
+    s.buffer.transient = false;
+    let fx = s.close_buffer();
+    let (_, _, params) = the_request(&fx);
+    assert_eq!(params["open_next"], json!(true));
+}
+
+/// Releasing a *dirty* tether is refused wholesale (the demotion would arm auto-close over
+/// unsaved edits) — audibly, unlike the plain toggle's silent no-op, since the user asked for
+/// something.
+#[test]
+fn unkeep_on_a_dirty_tether_refuses_with_a_warning() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.buffer.buffer_id = 7;
+    s.buffer.revision = 3;
+    s.buffer.saved_revision = 2;
+    s.tether = Some(7);
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "no RPC — the release is refused"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Toast {
+                kind: ToastKind::Warning,
+                ..
+            }
+        )),
+        "the refusal is surfaced"
+    );
+    assert_eq!(s.tether, Some(7), "the tether stays armed");
+}
+
+/// `Space Alt-x` (save-and-close) on the tether: save first, then close, then exit — each step
+/// deferred until the previous one lands, mirroring `Space Alt-q`.
+#[test]
+fn space_alt_x_saves_closes_and_exits_the_tethered_session() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.workspace_paths = vec!["/p".into()];
+    s.buffer.buffer_id = 7;
+    s.tether = Some(7);
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "buffer/save").expect("Space Alt-x saves first");
+    assert_eq!(params["overwrite"], json!(false));
+    assert!(!quits(&fx), "no exit before the save lands");
+    let token = save_token(&fx);
+
+    // Save lands → the close fires (tether style: no successor). Still no exit.
+    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    let close_token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, method, .. } if *method == "buffer/close" => Some(*token),
+                _ => None,
+            })
+            .expect("the landed save closes the buffer");
+    assert!(!quits(&fx), "no exit before the close lands");
+
+    // Close lands → exit.
+    let fx = s.on_rpc_result(close_token, Ok(json!({})));
+    assert!(quits(&fx), "save-close-exit completed");
+}
+
+/// `Space Alt-x` without a tether is still save-and-close — it just lands on the successor
+/// instead of exiting.
+#[test]
+fn space_alt_x_untethered_closes_to_the_successor() {
+    let mut s = session();
+    s.workspace = "proj".to_string();
+    s.workspace_paths = vec!["/p".into()];
+    s.buffer.buffer_id = 7;
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let token = save_token(&fx);
+
+    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    let close = fx.0.iter().find_map(|e| match e {
+        Effect::Request { method, params, .. } if *method == "buffer/close" => Some(params.clone()),
+        _ => None,
+    });
+    let params = close.expect("the landed save closes the buffer");
+    assert_eq!(params["open_next"], json!(true), "ordinary successor close");
+    assert!(!quits(&fx));
+}
+
+/// Buffer ids don't survive a daemon restart: reconnecting onto the same file remaps the tether
+/// to the reopened buffer's id; reconnecting onto anything else drops it (a stale id could match
+/// an unrelated new buffer and exit under the user).
+#[test]
+fn daemon_restart_remaps_the_tether_on_the_same_file_and_drops_it_otherwise() {
+    use aether_client::update::Event;
+    use aether_protocol::buffer::BufferOpenResult;
+    use aether_protocol::workspace::WorkspaceInfo;
+
+    let reopen = |path: &str, id: u64| -> BufferOpenResult {
+        serde_json::from_value(json!({
+            "buffer_id": id,
+            "language": null,
+            "line_count": 1,
+            "byte_count": 0,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": path,
+        }))
+        .unwrap()
+    };
+    let workspace = || WorkspaceInfo {
+        name: "proj".into(),
+        paths: vec!["/p".into()],
+        projects: vec![],
+    };
+
+    // Same file after a restart: the tether follows the new id.
+    let mut s = session();
+    s.buffer.buffer_id = 7;
+    s.buffer.path = Some("/p/f.txt".into());
+    s.tether = Some(7);
+    let _ = s.on_event(Event::ConnectionLost);
+    let _ = s.on_event(Event::Reestablished {
+        workspace: workspace(),
+        open: reopen("/p/f.txt", 9),
+        restarted: true,
+    });
+    assert_eq!(s.tether, Some(9), "remapped onto the reopened buffer");
+
+    // Different landing buffer after a restart: the tether is dropped, not left stale.
+    let mut s = session();
+    s.buffer.buffer_id = 7;
+    s.buffer.path = Some("/p/f.txt".into());
+    s.tether = Some(7);
+    let _ = s.on_event(Event::ConnectionLost);
+    let _ = s.on_event(Event::Reestablished {
+        workspace: workspace(),
+        open: reopen("/p/other.txt", 7),
+        restarted: true,
+    });
+    assert_eq!(s.tether, None, "a stale id must not survive the restart");
 }
 
 /// A persisted workspace is unaffected: closing its last buffer still spawns a scratch successor
@@ -5478,18 +5750,18 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
 }
 
 #[test]
-fn space_alt_x_asks_the_shell_to_open_a_new_window() {
+fn space_z_asks_the_shell_to_open_a_new_window() {
     let mut s = session();
-    // `Space Alt-x` — a leader chord distinct from `Space x` (close buffer).
+    // `Space z` — was `Space Alt-x` until that chord became save-and-close (docs/tether.md).
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('z'), Mods::NONE, Some("z".into()), ROWS);
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
-        "Space Alt-x should emit ShellAction::NewWindow"
+        "Space z should emit ShellAction::NewWindow"
     );
     // It's a pure shell hand-off — no server traffic, and crucially not a buffer/close (that's
-    // `Space x`, the un-Alted chord).
+    // `Space x`).
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "opening a window issues no RPC"

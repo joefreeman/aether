@@ -646,15 +646,29 @@ pub enum ConfirmKind {
     DeleteWorkspace { name: String },
 }
 
+/// What a successful save is followed by — threads the save-and-quit (`Space Alt-q`) and
+/// save-and-close (`Space Alt-x`) intents through any overwrite / external-change confirm, so the
+/// retry still follows through. A failed or cancelled save drops the intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterSave {
+    /// Plain `Space s` — nothing follows.
+    Nothing,
+    /// `Space Alt-q` — exit the client once the save lands.
+    Quit,
+    /// `Space Alt-x` — close the buffer once the save lands (which exits the client when the
+    /// buffer is the [tether](Session::tether)).
+    Close,
+}
+
 /// What accepting a confirmation does.
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     /// Retry `buffer/save` with `overwrite: true`; `target` carries the save-as path (None for
-    /// the in-place save). `quit_after` threads a pending save-and-quit (`Space Alt-q`) through the
-    /// confirm, so the retry still quits on success.
+    /// the in-place save). `after` threads a pending save-and-quit / save-and-close through the
+    /// confirm, so the retry still follows through on success.
     Save {
         target: Option<(u32, String)>,
-        quit_after: bool,
+        after: AfterSave,
     },
     /// Retry `buffer/reload` with `force: true`.
     ReloadDiscard,
@@ -691,8 +705,9 @@ pub enum SaveTry {
     Saved {
         result: BufferSaveResult,
         target: Option<(u32, String)>,
-        /// Quit once the save lands (`Space Alt-q`); threaded through any overwrite confirm.
-        quit_after: bool,
+        /// What follows the landed save (`Space Alt-q` quit / `Space Alt-x` close); threaded
+        /// through any overwrite confirm.
+        after: AfterSave,
     },
     NeedsConfirm {
         kind: ConfirmKind,
@@ -760,14 +775,15 @@ pub struct Session {
     /// `WorkspaceInfo` the server sends. Read by the settings overlay when it opens; kept on the
     /// session rather than fetched on demand so opening the overlay stays a keystroke, like roots.
     pub workspace_projects: Vec<WorkspaceProject>,
-    /// True when this session was launched directly to view a file outside any workspace (`ae
-    /// /path`), landing it in an ephemeral context, and it hasn't switched workspaces since. It's
-    /// the signal for what to do when the last buffer of an ephemeral context closes: a
-    /// launched-for-a-file session has nothing left to show, so native clients quit (vim-like);
-    /// a session that merely *navigated into* an ephemeral context (via the switcher) returns to
-    /// the chooser instead. Set by the shells at a file-launch bootstrap; cleared on any workspace
-    /// switch. See [`crate::update`]'s `leave_ephemeral_workspace`.
-    pub launched_with_file: bool,
+    /// The buffer this client's lifetime is *tethered* to (docs/tether.md): closing it — by us or
+    /// by another client — exits the client instead of switching to a successor, giving `ae path`
+    /// the `$EDITOR` contract (edit, close, process ends) inside the client–server model. Set by
+    /// the shells at bootstrap when a file positional was given without an explicit `--workspace`
+    /// (the quick-edit invocation; window-spawns always name the workspace, so they don't tether).
+    /// Released — one-way — by un-keeping the buffer (`Space k`), by a deliberate workspace
+    /// switch, or by a daemon restart (buffer ids don't survive it). The status bar marks the
+    /// tethered buffer with a dim `*`.
+    pub tether: Option<BufferId>,
     pub buffer: BufferInfo,
     pub mode: Mode,
     pub pending: Pending,
@@ -1026,7 +1042,7 @@ impl Session {
             workspace: workspace.name,
             workspace_paths: workspace.paths,
             workspace_projects: workspace.projects,
-            launched_with_file: false,
+            tether: None,
             buffer,
             mode: Mode::Normal,
             pending: Pending::None,
@@ -1192,6 +1208,12 @@ impl Session {
     /// [`Session::adopt_switch`](crate::update) lands the first real buffer.
     pub fn is_placeholder(&self) -> bool {
         self.buffer.buffer_id == 0
+    }
+
+    /// The active buffer is the [tether](Self::tether) — closing it exits the client. What the
+    /// shells key the status bar's dim `*` mark on.
+    pub fn tethered(&self) -> bool {
+        self.tether == Some(self.buffer.buffer_id)
     }
 }
 

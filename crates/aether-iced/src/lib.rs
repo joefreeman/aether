@@ -19,7 +19,7 @@ pub(crate) use aether_client::{chips, grid, keymap, labels};
 use anyhow::anyhow;
 
 /// The active profile name, stashed once at [`run`] so the "open another window" path
-/// (`Space Alt-x`) can spawn a sibling `ae --gui` pointed at the *same* profile — and thus the same
+/// (`Space z`) can spawn a sibling `ae --gui` pointed at the *same* profile — and thus the same
 /// daemon. Process-global because it never changes over a run; mirrors how the server holds its own
 /// active profile rather than threading it through every call.
 static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -41,6 +41,7 @@ pub fn run(
     file: Option<String>,
     jump: Option<(u32, u32)>,
     buffer_id: Option<u64>,
+    tether: bool,
     version: String,
     server_url: String,
     profile: String,
@@ -62,6 +63,7 @@ pub fn run(
         file,
         jump_to: jump.map(|(line, col)| aether_protocol::LogicalPosition { line, col }),
         buffer_id,
+        tether,
         client_version: version,
         server_url,
     }))

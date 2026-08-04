@@ -161,6 +161,9 @@ pub struct AppState {
     /// changes. Used for UI rendering (status bar, picker prefixes, explorer breadcrumb) — the
     /// protocol is unaware.
     pub root_labels: Vec<String>,
+    /// The session's [tether](aether_client::session::Session::tether), mirrored each sync so the
+    /// Buffers picker can mark the tethered row with the same dim ` *` as the status bar.
+    pub tether: Option<BufferId>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
@@ -565,6 +568,9 @@ pub struct EditorState {
     /// pushes). Shown by italicising the status-bar file label; promoted to permanent by the
     /// first edit, a save, or a reload (`Space r`).
     pub transient: bool,
+    /// The buffer is the session's [tether](aether_client::session::Session::tether) — closing it
+    /// exits the client (docs/tether.md). Shown as a dim ` *` after the status-bar file label.
+    pub tethered: bool,
 }
 
 /// Client-side cache of the cursor line's blame. `key` records the `(line, revision)` the `info`
@@ -721,8 +727,14 @@ pub fn apply_cursor_style(state: &AppState) {
 /// resolved against the *current working directory* (shell convention), then canonicalized so
 /// any `..` / symlinks line up with the workspace's canonical roots — without that, prefix
 /// matching against the roots in `strip_longest_root` would miss when the user CDs through a
-/// symlink. Errors surface verbatim (e.g. "No such file or directory") with the original arg
-/// for context — keeps the CLI's failure mode readable.
+/// symlink.
+///
+/// A path that doesn't exist still resolves — deepest existing ancestor canonicalized, missing
+/// tail kept — so `ae path/to/new-file` opens an empty buffer bound to it (the boot opens run
+/// with `create_if_missing`; the file is written at the first save, like explorer-create). The
+/// exception is a trailing `/`: that declares directory intent, which create-on-open can't
+/// satisfy, so the original error surfaces (e.g. "No such file or directory") with the arg for
+/// context.
 pub fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
     let raw = std::path::Path::new(arg);
     let joined = if raw.is_absolute() {
@@ -732,7 +744,45 @@ pub fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
             .context("could not read current directory to resolve a relative CLI path")?;
         cwd.join(raw)
     };
-    std::fs::canonicalize(&joined).with_context(|| format!("could not resolve {arg}"))
+    match std::fs::canonicalize(&joined) {
+        Ok(p) => Ok(p),
+        Err(_) if !arg.ends_with('/') => {
+            canonicalize_partial(&joined).with_context(|| format!("could not resolve {arg}"))
+        }
+        Err(e) => Err(e).with_context(|| format!("could not resolve {arg}")),
+    }
+}
+
+/// Canonicalize a path that may not fully exist: walk up to the deepest existing ancestor,
+/// canonicalize that, then re-attach the not-yet-created tail verbatim (mirrors the server's
+/// helper of the same name). Errors only on I/O other than `NotFound`, or when the walk runs
+/// out of parents.
+fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(canon) => {
+                let mut out = canon;
+                // suffix was accumulated tail-first; reverse on attach.
+                for component in suffix.iter().rev() {
+                    out.push(component);
+                }
+                return Ok(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+                    return Err(e);
+                };
+                let Some(parent) = cursor.parent().map(|p| p.to_path_buf()) else {
+                    return Err(e);
+                };
+                suffix.push(name);
+                cursor = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Strip the longest matching workspace root off `abs`. Returns `(root_index, relative_path)`,
@@ -849,14 +899,32 @@ mod tests {
         assert_eq!(resolved, std::fs::canonicalize(&file_path).unwrap());
     }
 
+    /// A missing file resolves anyway — canonical parent + missing name — so `ae new-file.txt`
+    /// can open a create-on-save buffer instead of erroring. Missing intermediate directories
+    /// resolve the same way (the deepest existing ancestor is the canonical base).
     #[test]
-    fn resolve_cli_path_errors_on_missing_file() {
+    fn resolve_cli_path_resolves_missing_files_against_the_existing_ancestor() {
         let dir = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+
         let missing = dir.path().join("no-such-file.txt");
-        let err = resolve_cli_path(missing.to_str().unwrap()).unwrap_err();
-        // The chained context should name the original arg so the CLI error is useful.
+        let resolved = resolve_cli_path(missing.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, canon.join("no-such-file.txt"));
+
+        let deep = dir.path().join("new-dir/deeper/note.md");
+        let resolved = resolve_cli_path(deep.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, canon.join("new-dir/deeper/note.md"));
+    }
+
+    /// A trailing `/` declares directory intent — create-on-open can't satisfy that, so a missing
+    /// directory keeps the readable error (naming the original arg).
+    #[test]
+    fn resolve_cli_path_errors_on_missing_directory_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/no-such-dir/", dir.path().display());
+        let err = resolve_cli_path(&missing).unwrap_err();
         assert!(
-            format!("{err:#}").contains(missing.to_str().unwrap()),
+            format!("{err:#}").contains(&missing),
             "error chain should mention the requested path: {err:#}"
         );
     }
@@ -900,6 +968,7 @@ mod tests {
             workspace_name: String::new(),
             workspace_paths: Vec::new(),
             root_labels: Vec::new(),
+            tether: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -932,6 +1001,7 @@ mod tests {
             workspace_name: "demo".into(),
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
+            tether: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -967,6 +1037,7 @@ mod tests {
             workspace_name: "demo".into(),
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
+            tether: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1010,6 +1081,7 @@ mod tests {
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
             transient: false,
+            tethered: false,
             mode: EditorMode::Normal,
             buffer_id: 1,
             viewport_id: 1,

@@ -37,7 +37,7 @@ pub enum ShellAction {
         relative: String,
     },
     /// Open a [`WindowTarget`] in a *new* window. Two entry points build the target in the core:
-    /// `Space Alt-x` ([`crate::keymap::Action::NewWindow`]) duplicates the current view, and
+    /// `Space z` ([`crate::keymap::Action::NewWindow`]) duplicates the current view, and
     /// `Ctrl-Enter` in a picker opens the highlighted item (the native sibling of the web client's
     /// Ctrl/Cmd-Enter "open in a new tab"). The GUI shell spawns a fresh detached `ae --gui` seeded
     /// from the target; the TUI ignores it (no window to spawn); the web shell opens a new browser
@@ -48,7 +48,7 @@ pub enum ShellAction {
 
 /// A resolved target for opening a *new* window ([`ShellAction::NewWindow`]). The core resolves
 /// everything the spawning shell needs into plain strings/ids — the shell only turns it into a fresh
-/// `ae` invocation. Built by [`crate::update`]'s `current_view_target` (`Space Alt-x`) or
+/// `ae` invocation. Built by [`crate::update`]'s `current_view_target` (`Space z`) or
 /// `picker_item_target` (`Ctrl-Enter`), the latter's item set mirroring the web client's `pickerItemUrl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowTarget {
@@ -74,7 +74,7 @@ pub enum WindowOpen {
     /// because buffers are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if
     /// the id is gone (the daemon restarted).
     Buffer(BufferId),
-    /// No specific file: activate the workspace and land on its MRU buffer (the `Space Alt-x`
+    /// No specific file: activate the workspace and land on its MRU buffer (the `Space z`
     /// duplicate, and the Workspaces picker's "open this workspace in a new window").
     Workspace,
 }

@@ -135,6 +135,9 @@ struct BootSpec {
     /// A 0-based `(line, col)` to jump to once `file` opens (`ae src/main.rs:42`). `None` for a bare
     /// open. Initial-boot only — reconnects restore the live cursor, not this.
     jump: Option<(u32, u32)>,
+    /// Tether the client to the buffer `file` opens (docs/tether.md): the quick-edit invocation
+    /// — a file positional without an explicit `--workspace` — where closing that buffer exits.
+    tether: bool,
     version: String,
 }
 
@@ -232,6 +235,7 @@ pub async fn run(
     workspace: Option<String>,
     file: Option<String>,
     jump: Option<(u32, u32)>,
+    tether: bool,
     version: String,
     server_url: String,
 ) -> Result<()> {
@@ -283,6 +287,7 @@ pub async fn run(
             workspace,
             file,
             jump,
+            tether,
             version,
         }),
         boot_attempt: 0,
@@ -1292,7 +1297,7 @@ impl Shell {
                 self.sent_grid = Some(self.grid());
                 self.subscribe();
             }
-            // "Open another window" (both the `Space Alt-x` duplicate and "open picker item in a
+            // "Open another window" (both the `Space z` duplicate and "open picker item in a
             // new window") is GUI-only — a new OS window makes no sense for the terminal client,
             // which owns the one terminal it was launched in. Ignore it here.
             ShellAction::NewWindow(_) => {}
@@ -1731,6 +1736,7 @@ impl Shell {
         let s = &self.session;
         let st = &mut self.state;
         st.workspace_name = s.workspace.clone();
+        st.tether = s.tether;
         if st.workspace_paths != s.workspace_paths {
             st.workspace_paths = s.workspace_paths.clone();
             st.root_labels = labels::root_labels(&st.workspace_paths);
@@ -2197,6 +2203,7 @@ impl Shell {
                 text: s.blame.as_ref().map(|(_, t)| t.clone()),
             },
             transient: s.buffer.transient,
+            tethered: s.tethered(),
             file_path: s.buffer.path.clone(),
             file_label: s.buffer.label.clone(),
             language: s.buffer.language.clone(),
@@ -2625,6 +2632,7 @@ async fn boot_dial(
         spec.workspace.as_deref(),
         spec.file.as_deref(),
         spec.jump,
+        spec.tether,
         cols,
         rows,
     )
@@ -2749,12 +2757,15 @@ fn time_ago(unix_secs: i64) -> String {
 }
 
 /// Bootstrap a session over an established connection: activate (landing on the last
-/// buffer or a named file) and build the core `Session` + the render model.
+/// buffer or a named file) and build the core `Session` + the render model. `tether` marks the
+/// quick-edit invocation (a file positional, no explicit `--workspace`): the buffer `file` opens
+/// becomes the session's [tether](Session::tether), so closing it exits the client.
 pub async fn bootstrap(
     handle: &Handle,
     workspace: Option<&str>,
     file: Option<&str>,
     jump: Option<(u32, u32)>,
+    tether: bool,
     cols: u16,
     rows: u16,
 ) -> Result<(Session, AppState, Effects)> {
@@ -2780,14 +2791,16 @@ pub async fn bootstrap(
                 None => None,
             };
             match resolved {
-                // An existing external file: open it in an ephemeral context. (A directory or a
-                // not-yet-existing path with no workspace has nowhere sensible to root, so fall
-                // through to the chooser.)
-                Some(abs) if abs.is_file() => {
+                // An external file: open it in an ephemeral context. A missing path counts as a
+                // file to create (`create_if_missing` binds an empty buffer, written at the first
+                // save — explorer-create semantics). Only a directory falls through to the
+                // chooser (nothing sensible to open).
+                Some(abs) if !abs.is_dir() => {
                     let opened = handle
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs.display().to_string(),
                             transient: None,
+                            create_if_missing: true,
                         })
                         .await?;
                     let workspace_paths = opened.workspace.paths.clone();
@@ -2797,9 +2810,11 @@ pub async fn bootstrap(
                     let buffer = buffer_info(open, &workspace_paths);
                     let workspace_name = opened.workspace.name.clone();
                     let mut session = Session::new(opened.workspace, buffer);
-                    // Launched to view this file in an ephemeral context: closing it should quit
-                    // (see `leave_ephemeral_workspace`), not drop to the chooser.
-                    session.launched_with_file = true;
+                    // Launched to edit this file: tether the client to it, so closing it quits
+                    // (docs/tether.md) rather than dropping to the chooser.
+                    if tether {
+                        session.tether = Some(session.buffer.buffer_id);
+                    }
                     (session, workspace_name, workspace_paths, Effects::none())
                 }
                 _ => {
@@ -2858,6 +2873,7 @@ pub async fn bootstrap(
                             .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                                 path: abs,
                                 transient: None,
+                                create_if_missing: true,
                             })
                             .await?
                             .opened
@@ -2874,6 +2890,14 @@ pub async fn bootstrap(
             let buffer = buffer_info(open, &workspace_paths);
             let workspace_name = activated.workspace.name.clone();
             let mut session = Session::new(activated.workspace, buffer);
+            // A quick-edit launch (`ae file`, workspace *inferred* from the path — `tether` is
+            // never set alongside an explicit `--workspace`): tether the client to the opened
+            // file, so closing it exits (docs/tether.md). A missing path is a file to create
+            // and tethers too; directory args land in the explorer over a scratch — nothing to
+            // tether to.
+            if tether && resolved.as_ref().is_some_and(|p| !p.is_dir()) {
+                session.tether = Some(session.buffer.buffer_id);
+            }
             let startup = match &resolved {
                 Some(abs) if abs.is_dir() => session.open_picker(
                     PickerKind::Explorer,
@@ -2915,6 +2939,7 @@ fn make_state(
         workspace_name,
         workspace_paths,
         root_labels,
+        tether: None,
         viewport_cols: cols as u32,
         viewport_rows: (rows as u32).saturating_sub(1),
         should_quit: false,

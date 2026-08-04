@@ -29,12 +29,15 @@ use ratatui::Terminal;
 use std::io::{stdout, Stdout};
 
 /// Run the terminal client to completion. `workspace`/`file` are the (optional) CLI positionals,
-/// `version` is the handshake version string, and `server_url` is the (profile-resolved) WebSocket
-/// address to dial; the caller (`ae`) parses these and provides the tokio runtime this is awaited on.
+/// `tether` marks the quick-edit invocation (file positional, no explicit `--workspace` — the
+/// opened buffer tethers the client, docs/tether.md), `version` is the handshake version string,
+/// and `server_url` is the (profile-resolved) WebSocket address to dial; the caller (`ae`) parses
+/// these and provides the tokio runtime this is awaited on.
 pub async fn run(
     workspace: Option<String>,
     file: Option<String>,
     jump: Option<(u32, u32)>,
+    tether: bool,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
@@ -60,7 +63,16 @@ pub async fn run(
     // (status row showing "Connecting…", client-side keys live) and `run` dials `server_url` from
     // within — so the client can start before the daemon and waits for it without leaving the
     // editor. The boot dial installs the session once it lands.
-    let run_result = shell::run(&mut terminal, workspace, file, jump, version, server_url).await;
+    let run_result = shell::run(
+        &mut terminal,
+        workspace,
+        file,
+        jump,
+        tether,
+        version,
+        server_url,
+    )
+    .await;
     restore_terminal(&mut terminal)?;
     run_result
 }

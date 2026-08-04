@@ -247,6 +247,7 @@ const SANS: iced::Font = iced::Font {
 pub fn overlay<'a>(
     state: &'a PickerState,
     roots: &'a [String],
+    tether: Option<aether_protocol::BufferId>,
     scroll_y: f32,
     spinner_phase: f32,
     ui: theme::Ui,
@@ -461,7 +462,7 @@ pub fn overlay<'a>(
             DisplayRow::Item { abs, item } => {
                 let selected = abs == state.selected;
                 let hovered = state.hovered == Some(abs);
-                let row_el = container(render_item(item, roots, hovered, ui))
+                let row_el = container(render_item(item, roots, tether, hovered, ui))
                     .width(Length::Fill)
                     .height(ui.row_h())
                     .padding([3, 12])
@@ -1109,6 +1110,7 @@ fn git_change_summary<'a>(
 fn render_item<'a>(
     item: &'a PickerItem,
     roots: &'a [String],
+    tether: Option<aether_protocol::BufferId>,
     hovered: bool,
     ui: theme::Ui,
 ) -> Element<'a, PickerMsg> {
@@ -1143,6 +1145,7 @@ fn render_item<'a>(
             r.into()
         }
         PickerItem::Buffer {
+            buffer_id,
             display,
             status,
             path_index,
@@ -1159,10 +1162,20 @@ fn render_item<'a>(
                 if *dormant { theme::NORD3_BRIGHT } else { theme::NORD4 },
                 if *transient { SANS_ITALIC } else { SANS },
                 hovered,
-            ui,
+                ui,
             )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
+            // The session's tether: the status bar's dim `*` after the path (docs/tether.md —
+            // closing this row exits the client). Upright even on a slanted transient row.
+            if tether == Some(*buffer_id) {
+                r = r.push(
+                    text("*")
+                        .size(ui.body())
+                        .font(SANS)
+                        .color(theme::NORD3_BRIGHTER),
+                );
+            }
             // Multi-root workspaces: the root's label, dim, after the name — same placement as the
             // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
             if let Some(label) = path_index.and_then(|i| root_label(roots, i)) {

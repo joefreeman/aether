@@ -162,13 +162,18 @@ impl RpcMethod for WorkspaceOpenPath {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceOpenPathParams {
     /// File to open. Must be absolute; a leading `~/` is expanded server-side and also counts as
-    /// absolute. A relative path is rejected (the server won't resolve it against its own cwd). Must
-    /// exist on disk (open-from-path is for existing files).
+    /// absolute. A relative path is rejected (the server won't resolve it against its own cwd).
+    /// Must exist on disk unless `create_if_missing` is set.
     pub path: String,
     /// Open the buffer as transient (auto-closes once hidden) — used when the open is a preview.
     /// Defaults to a permanent open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
+    /// When `path` doesn't exist, open an empty buffer bound to it instead of failing (the file
+    /// is written at the first save) — same semantics as `buffer/open`'s flag, which this
+    /// delegates to. Powers `ae path/to/new-file`; ignored for existing files.
+    #[serde(default)]
+    pub create_if_missing: bool,
 }
 
 /// Add a root path to an existing workspace. Server canonicalizes the path, refuses duplicates,

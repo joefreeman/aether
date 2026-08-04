@@ -14,10 +14,11 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::path_editor::PathEditor;
 use super::picker::{item_key, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
-    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AppSettingId,
-    AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState, HoverBlock,
-    HoverText, Mode, PasteKind, Pending, Prompt, ReadView, ReloadTry, RepeatTarget, SaveTry,
-    SearchSnapshot, SearchState, Session, SettingsRow, SneakState, TextField, WorkspaceSettings,
+    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AfterSave,
+    AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
+    HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReadView, ReloadTry, RepeatTarget,
+    SaveTry, SearchSnapshot, SearchState, Session, SettingsRow, SneakState, TextField,
+    WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -288,6 +289,13 @@ pub enum Event {
     /// attach to it; `None` → the context is empty, so leave it (quit on native, chooser on web —
     /// see [`App::leave_ephemeral_workspace`]).
     EphemeralClosed(Result<Option<BufferId>, String>),
+    /// `buffer/close` resolved for the [tether](Session::tether) (docs/tether.md): the client's
+    /// job is done, so exit. No successor to adopt — the close was issued without `open_next`.
+    TetherClosed(Result<(), String>),
+    /// `buffer/set_transient` resolved for the un-keep that *releases* the tether (`Space k` on
+    /// the tethered buffer): drop the tether — one-way — and toast the release. The transient
+    /// flag itself rides the `buffer/state` push, as with [`Event::KeepToggled`].
+    TetherReleased(Result<bool, String>),
     /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
     /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
     AppSettingsLoaded(Result<AppSettings, String>),
@@ -552,6 +560,16 @@ impl Session {
             }
             Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_workspace(),
             Event::EphemeralClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
+
+            // The tether closed cleanly — the quick edit this client was launched for is over.
+            Event::TetherClosed(Ok(())) => Effects::one(Effect::Exit),
+            Event::TetherClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
+            Event::TetherReleased(Ok(_)) => {
+                self.tether = None;
+                // Same toast group as the plain keep toggle, so repeated presses update in place.
+                Effects::toast_grouped("Tether released", ToastKind::Success, "transient")
+            }
+            Event::TetherReleased(Err(e)) => Effects::error(format!("Keep toggle failed: {e}")),
 
             // Captured: swap the source picker for the Jumplist picker, framed on the row that
             // was highlighted at capture time (its `index` in the new list) — Enter from here jumps
@@ -986,10 +1004,10 @@ impl Session {
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
                 self.workspace_projects = workspace.projects;
-                // A deliberate switch means we're no longer in the launch context, so closing the
-                // last buffer of an ephemeral context reached this way returns to the chooser
-                // rather than quitting (see `leave_ephemeral_workspace`).
-                self.launched_with_file = false;
+                // A deliberate switch means we're no longer in the launch context — release the
+                // tether, so closing the launched buffer later behaves like any other close (and
+                // an ephemeral context reached this way returns to the chooser, not quits).
+                self.tether = None;
                 // The recall lists are workspace-scoped, so the ones we hold are now the wrong
                 // workspace's — not stale, wrong. Refetch before any overlay can read them.
                 let fx = self.fetch_history();
@@ -1006,7 +1024,7 @@ impl Session {
                 self.workspace = workspace.name.clone();
                 self.workspace_paths = workspace.paths;
                 self.workspace_projects = workspace.projects;
-                self.launched_with_file = false;
+                self.tether = None;
                 // Workspace-scoped recall lists — empty for a brand-new workspace, but the fetch
                 // is what *clears* the previous workspace's (see `WorkspaceActivated`).
                 let mut fx = self.fetch_history();
@@ -1454,11 +1472,19 @@ impl Session {
                 );
                 tracing::info!(restarted, "reconnected");
                 let old_cursor = self.buffer.cursor;
+                let old_buffer_id = self.buffer.buffer_id;
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
                 self.workspace_projects = workspace.projects;
                 let same_file = open.path == self.buffer.path;
                 self.buffer = buffer_info(open, &self.workspace_paths);
+                // Buffer ids don't survive a daemon restart: remap the tether onto the reopened
+                // buffer when it's the same file we were tethered to, else drop it — a stale id
+                // could collide with an unrelated new buffer and exit under the user.
+                if restarted {
+                    self.tether = (same_file && self.tether == Some(old_buffer_id))
+                        .then_some(self.buffer.buffer_id);
+                }
                 self.conn = ConnState::Connected;
                 // Server-side per-client state died with the old connection; drop the client
                 // overlays that fronted it. The frozen window stays rendered until the
@@ -1521,7 +1547,7 @@ impl Session {
             Event::SaveTried(Ok(SaveTry::Saved {
                 result,
                 target,
-                quit_after,
+                after,
             })) => {
                 self.buffer.revision = result.revision;
                 self.buffer.saved_revision = result.revision;
@@ -1546,10 +1572,14 @@ impl Session {
                     None => format!("Saved (rev {})", result.revision),
                 };
                 let mut fx = Effects::toast(note, ToastKind::Success);
-                if quit_after {
+                match after {
+                    AfterSave::Nothing => {}
                     // Save-and-quit (`Space Alt-q`): the save landed, so close the window — the
                     // server drops per-client state on disconnect, so this is exactly `Space q`.
-                    fx.push(Effect::Exit);
+                    AfterSave::Quit => fx.push(Effect::Exit),
+                    // Save-and-close (`Space Alt-x`): the buffer is clean now, so this close
+                    // never re-prompts — and when the buffer is the tether, it exits the client.
+                    AfterSave::Close => fx = fx.and(self.close_buffer()),
                 }
                 fx
             }
@@ -1584,7 +1614,7 @@ impl Session {
         &mut self,
         target: Option<(u32, String)>,
         overwrite: bool,
-        quit_after: bool,
+        after: AfterSave,
     ) -> Effects {
         let buffer_id = self.buffer.buffer_id;
         let (path_index, relative_path) = match &target {
@@ -1604,26 +1634,26 @@ impl Session {
                     Ok(result) => Ok(SaveTry::Saved {
                         result,
                         target,
-                        quit_after,
+                        after,
                     }),
                     Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::Overwrite {
                                 path: target.as_ref().map(|(_, p)| p.clone()),
                             },
-                            action: ConfirmAction::Save { target, quit_after },
+                            action: ConfirmAction::Save { target, after },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::OverwriteModified,
-                            action: ConfirmAction::Save { target, quit_after },
+                            action: ConfirmAction::Save { target, after },
                         })
                     }
                     Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
                         Ok(SaveTry::NeedsConfirm {
                             kind: ConfirmKind::RecreateDeleted,
-                            action: ConfirmAction::Save { target, quit_after },
+                            action: ConfirmAction::Save { target, after },
                         })
                     }
                     Err(e) => Err(e.to_string()),
@@ -2009,10 +2039,21 @@ impl Session {
     }
 
     /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
-    /// scratch). In an *ephemeral* context, never replace it with a scratch — an empty ephemeral
-    /// workspace is pointless — so we close without `open_next` and either attach to a remaining
-    /// sibling buffer or leave the context entirely (see [`Self::leave_ephemeral_workspace`]).
+    /// scratch). Closing the [tether](Session::tether) instead exits the client — no successor
+    /// needed (docs/tether.md). In an *ephemeral* context, never replace it with a scratch — an
+    /// empty ephemeral workspace is pointless — so we close without `open_next` and either attach
+    /// to a remaining sibling buffer or leave the context entirely (see
+    /// [`Self::leave_ephemeral_workspace`]).
     pub fn close_buffer(&mut self) -> Effects {
+        if self.tethered() {
+            return self.request_str::<BufferClose>(
+                BufferCloseParams {
+                    buffer_id: self.buffer.buffer_id,
+                    open_next: false,
+                },
+                |r| Event::TetherClosed(r.map(|_| ())),
+            );
+        }
         if aether_protocol::is_ephemeral_workspace_id(&self.workspace) {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
@@ -2037,26 +2078,18 @@ impl Session {
         )
     }
 
-    /// Leave an ephemeral ("(workspace N)") context whose last buffer just closed.
+    /// Leave an ephemeral ("(workspace N)") context whose last buffer just closed: reset to the
+    /// workspace chooser (shell-side — see `Effect::ToChooser`). The current session's buffer is
+    /// already closed; the shell discards the session rather than leaving the stale buffer
+    /// rendered behind the picker.
     ///
-    /// If the session was *launched* to view this file (`ae /path` → [`Self::launched_with_file`]),
-    /// there's nothing left to show, so we quit — `Effect::Exit`, which native clients honour
-    /// (vim `file` → `:q`). A session that merely *navigated into* an ephemeral context (selected
-    /// it from the switcher, or a second client that joined it) instead returns to the workspace
-    /// chooser — quitting would be surprising when the app was already in use for something else.
-    ///
-    /// The web client never launches with a file and can't quit a tab anyway (it ignores
-    /// `Effect::Exit`), and its chooser is mandatory — so it always lands on the chooser, which is
-    /// exactly the non-launch branch here.
+    /// A session *launched* onto the file (`ae /path`) never reaches this — its buffer is the
+    /// [tether](Session::tether), and closing the tether exits the client before the ephemeral
+    /// checks run. This is the navigated-into case (selected from the switcher, a second client
+    /// that joined, or a released tether), where quitting would be surprising. The web client's
+    /// chooser is mandatory anyway, so landing there is exactly right for it too.
     fn leave_ephemeral_workspace(&mut self) -> Effects {
-        if self.launched_with_file {
-            Effects::one(Effect::Exit)
-        } else {
-            // Reset to the chooser (shell-side — see `Effect::ToChooser`). The current session's
-            // buffer is already closed; the shell discards the session rather than leaving the
-            // stale buffer rendered behind the picker.
-            Effects::one(Effect::ToChooser)
-        }
+        Effects::one(Effect::ToChooser)
     }
 
     /// Copy the active buffer's path to the system clipboard — `absolute` picks the canonical
@@ -3404,7 +3437,7 @@ impl Session {
 
     /// Enter / row click: act on the highlighted item. Directories and roots navigate within
     /// the open explorer; everything else closes the panel and runs `picker/select`.
-    /// The [`WindowTarget`] that duplicates the current view (`Space Alt-x`): a real workspace lands
+    /// The [`WindowTarget`] that duplicates the current view (`Space z`): a real workspace lands
     /// the sibling on its MRU buffer (`WindowOpen::Workspace`); an ephemeral file context passes the
     /// buffer's path (the ephemeral id isn't CLI-addressable); a pathless ephemeral scratch can't be
     /// reproduced, so the sibling opens the chooser.
@@ -4204,7 +4237,7 @@ impl Session {
             }
         };
         self.prompt = None;
-        self.save(Some(target), false, false)
+        self.save(Some(target), false, AfterSave::Nothing)
     }
 
     /// Sync the open-from-path field's value from the shell's input (the shell owns text entry).
@@ -4226,6 +4259,9 @@ impl Session {
             WorkspaceOpenPathParams {
                 path,
                 transient: None,
+                // The overlay stays existing-files-only (a typo'd path should error readably,
+                // not silently mint a buffer); the CLI boot is the create route.
+                create_if_missing: false,
             },
             |r| {
                 Event::WorkspaceActivated(r.and_then(|a| {
@@ -4457,6 +4493,11 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<BufferClosedParams>(n.params) else {
                     return Effects::none();
                 };
+                // The tether closed out from under us: this client's job is over, however the
+                // close happened (docs/tether.md — the future `ae --web file` waiter rides this).
+                if self.tether == Some(p.buffer_id) {
+                    return Effects::one(Effect::Exit);
+                }
                 if p.buffer_id != self.buffer.buffer_id {
                     return Effects::none();
                 }
@@ -5001,8 +5042,19 @@ impl Session {
     /// closed buffer is the editor's active one — then the server attaches the viewport to the next
     /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the editor
     /// untouched. Either way the picker stays open and re-lists from the server's refresh push (the
-    /// switch doesn't tear it down — see [`Self::adopt_switch`]).
+    /// switch doesn't tear it down — see [`Self::adopt_switch`]). Closing the
+    /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
+    /// other close path.
     fn close_picker_buffer(&mut self, buffer_id: BufferId) -> Effects {
+        if self.tether == Some(buffer_id) {
+            return self.request_str::<BufferClose>(
+                BufferCloseParams {
+                    buffer_id,
+                    open_next: false,
+                },
+                |r| Event::TetherClosed(r.map(|_| ())),
+            );
+        }
         let closing_active = buffer_id == self.buffer.buffer_id;
         self.request_str::<BufferClose>(
             BufferCloseParams {
@@ -5063,13 +5115,19 @@ impl Session {
                 Event::DirCreated,
             );
         }
-        // File: address it under a workspace root, then open with create-on-save.
+        // File: address it under a workspace root, then open with create-on-save. Creating a
+        // file is a terminal pick — you land in the new buffer — so drop the explorer first
+        // (`Event::Switched`'s adopt deliberately leaves pickers open, which is right for the
+        // Buffers picker's close-and-relist but would strand the explorer over the new file).
+        // Creating a *directory* instead steps into it and keeps exploring, and the
+        // outside-roots refusal above keeps the explorer up so the name can be fixed.
         let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.workspace_paths)
         else {
             return Effects::error("Path is outside the workspace's roots");
         };
         let from = self.buffer.buffer_id;
-        self.request_str::<BufferOpen>(
+        let hide = self.close_picker();
+        hide.and(self.request_str::<BufferOpen>(
             BufferOpenParams {
                 path_index: Some(path_index),
                 relative_path: Some(relative_path),
@@ -5078,7 +5136,7 @@ impl Session {
                 ..Default::default()
             },
             Event::Switched,
-        )
+        ))
     }
 
     /// The Workspaces picker's synthetic "+ Create workspace …" row: create a fresh workspace named by
@@ -6104,7 +6162,7 @@ impl Session {
 
     fn run_confirm(&mut self, action: ConfirmAction) -> Effects {
         match action {
-            ConfirmAction::Save { target, quit_after } => self.save(target, true, quit_after),
+            ConfirmAction::Save { target, after } => self.save(target, true, after),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
             ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
@@ -6172,8 +6230,9 @@ impl Session {
     fn decline_confirm(&mut self, action: ConfirmAction) -> Effects {
         if let ConfirmAction::Save {
             target: Some((path_index, input)),
-            // Declining discards any save-and-quit intent — a cancelled save must not quit.
-            quit_after: _,
+            // Declining discards any save-and-quit/close intent — a cancelled save must not
+            // quit or close.
+            after: _,
         } = action
         {
             return self.open_save_as(path_index, input);
@@ -6854,8 +6913,9 @@ impl Session {
             // The server tears down all per-client state on disconnect, so quitting is just
             // closing the window.
             A::Quit => Effects::one(Effect::Exit),
-            A::Save => self.save(None, false, false),
-            A::SaveAndQuit => self.save(None, false, true),
+            A::Save => self.save(None, false, AfterSave::Nothing),
+            A::SaveAndQuit => self.save(None, false, AfterSave::Quit),
+            A::SaveAndClose => self.save(None, false, AfterSave::Close),
             A::SaveAs => {
                 // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self
@@ -6884,6 +6944,25 @@ impl Session {
                 self.reload(false)
             }
             A::ToggleKeep => {
+                // Un-keeping the tether *releases* it (docs/tether.md): the buffer demotes to an
+                // ordinary transient AND the client stops exiting when it closes — one-way; a
+                // re-keep is just a plain keep. Atomic with the demotion, so it inherits the
+                // dirty guard — but audibly, since the user asked for a release.
+                if self.tethered() {
+                    if self.buffer.revision != self.buffer.saved_revision {
+                        return Effects::toast(
+                            "Unsaved changes — save before releasing",
+                            ToastKind::Warning,
+                        );
+                    }
+                    return self.request_str::<BufferSetTransient>(
+                        BufferSetTransientParams {
+                            buffer_id,
+                            transient: true,
+                        },
+                        |r| Event::TetherReleased(r.map(|res| res.transient)),
+                    );
+                }
                 let target = !self.buffer.transient;
                 // Refuse to make a buffer with unsaved edits transient — it would auto-close (and
                 // discard them) once hidden. Silent no-op; pinning permanent, or toggling a clean
@@ -7940,19 +8019,21 @@ mod tests {
             read.loading && read.blocks.is_empty(),
             "held back while the Goto flies"
         );
-        let staged = read.staged.as_deref().expect("parse staged behind the anchor");
+        let staged = read
+            .staged
+            .as_deref()
+            .expect("parse staged behind the anchor");
         let idx = crate::markdown::heading_by_slug(&staged.elements, "section-two").unwrap();
         let expected = staged.pos_of(staged.elements[idx].span().start);
-        let goto = fx
-            .0
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request { method, params, .. } if *method == "cursor/move" => {
-                    Some(params.clone())
-                }
-                _ => None,
-            })
-            .expect("the anchor lands as a cursor move");
+        let goto =
+            fx.0.iter()
+                .find_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "cursor/move" => {
+                        Some(params.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the anchor lands as a cursor move");
         assert_eq!(
             goto["motion"],
             serde_json::to_value(Motion::Goto { position: expected }).unwrap(),
@@ -8021,16 +8102,15 @@ mod tests {
             .unwrap()
             .adopt(0, "# One\n\ntext\n\n## Section Two\n\nbody\n".into());
         let fx = s.read_follow_link("#section-two");
-        let open = fx
-            .0
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request { method, params, .. } if *method == "buffer/open" => {
-                    Some(params.clone())
-                }
-                _ => None,
-            })
-            .expect("an in-document anchor rides buffer/open");
+        let open =
+            fx.0.iter()
+                .find_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "buffer/open" => {
+                        Some(params.clone())
+                    }
+                    _ => None,
+                })
+                .expect("an in-document anchor rides buffer/open");
         assert_eq!(
             open["record_nav_from"],
             serde_json::json!(s.buffer.buffer_id),
@@ -8106,7 +8186,10 @@ mod tests {
         s.read_follow_link("./other.md#section");
         assert!(s.pending_read_anchor.is_some());
         s.open_path_at("/proj/src/main.rs".into(), None, None);
-        assert_eq!(s.pending_read_anchor, None, "a fresh open disarms the anchor");
+        assert_eq!(
+            s.pending_read_anchor, None,
+            "a fresh open disarms the anchor"
+        );
 
         s.read_follow_link("./plain.md");
         assert_eq!(s.pending_read_anchor, None, "no fragment, nothing armed");

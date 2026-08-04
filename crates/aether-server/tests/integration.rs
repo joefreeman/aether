@@ -22977,6 +22977,89 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     drop(server);
 }
 
+/// A client that is *not* viewing the closed buffer — it switched to another one — still gets the
+/// `buffer/closed` push when the buffer lives in its active workspace. This is what lets a
+/// tethered client (docs/tether.md) exit when another client closes its tether out from under it,
+/// even mid-browse; clients ignore pushes for buffers that are neither current nor the tether, so
+/// the broad audience is safe.
+#[tokio::test]
+async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let activate = WorkspaceActivateParams {
+        name: "test-proj".into(),
+        open_last: false,
+    };
+    let open = |file: &str| BufferOpenParams {
+        path_index: Some(0),
+        relative_path: Some(file.into()),
+        ..Default::default()
+    };
+
+    // Client A: open a.txt, then switch to b.txt (the viewport moves with the switch — a client
+    // holds one viewport, and subscribing supersedes the previous one).
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws_a, 1, &activate).await;
+    let buf_a = send_request::<BufferOpen>(&mut ws_a, 2, &open("a.txt"))
+        .await
+        .buffer_id;
+    let buf_b = send_request::<BufferOpen>(&mut ws_a, 3, &open("b.txt"))
+        .await
+        .buffer_id;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws_a,
+        4,
+        &ViewportSubscribeParams {
+            buffer_id: buf_b,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Client B closes a.txt — which client A holds in its workspace but is not viewing.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws_b, 1, &activate).await;
+    let same = send_request::<BufferOpen>(&mut ws_b, 2, &open("a.txt"))
+        .await
+        .buffer_id;
+    assert_eq!(same, buf_a);
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws_b,
+        3,
+        &BufferCloseParams {
+            buffer_id: buf_a,
+            open_next: false,
+        },
+    )
+    .await;
+
+    // Client A hears about it despite viewing b.txt.
+    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut ws_a).await;
+    assert_eq!(pushed.buffer_id, buf_a);
+
+    drop(server);
+}
+
 // -------- nav (back/forward history) --------------------------------------------------------------
 
 /// Open + viewport-subscribe a file, returning (buffer_id, viewport_id). Mirrors a client switching
@@ -25512,6 +25595,7 @@ async fn open_path_with_no_workspace_creates_ephemeral() {
         &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -25526,6 +25610,77 @@ async fn open_path_with_no_workspace_creates_ephemeral() {
     );
     let buf = opened.opened.expect("open_path returns the opened buffer");
     assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
+    drop(server);
+}
+
+/// `ae path/to/new-file` outside any workspace: the open-from-path route accepts a missing path
+/// when `create_if_missing` is set — an empty buffer bound to the canonical target, with nothing
+/// on disk until the first save (explorer-create semantics, delegated to `buffer/open`).
+#[tokio::test]
+async fn open_path_create_if_missing_binds_a_buffer_saved_on_write() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let missing = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .join("brand-new.md");
+    let missing_str = missing.display().to_string();
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        1,
+        &WorkspaceOpenPathParams {
+            path: missing_str.clone(),
+            transient: None,
+            create_if_missing: true,
+        },
+    )
+    .await;
+    assert!(
+        aether_protocol::is_ephemeral_workspace_id(&opened.workspace.name),
+        "a no-workspace create still lands in an ephemeral context"
+    );
+    let buf = opened.opened.expect("open_path returns the created buffer");
+    assert_eq!(buf.path.as_deref(), Some(missing_str.as_str()));
+    assert!(!missing.exists(), "nothing is written until the first save");
+
+    let _saved: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        2,
+        &BufferSaveParams {
+            buffer_id: buf.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(missing.exists(), "the first save creates the file");
+    drop(server);
+}
+
+/// Without the flag, a missing path keeps erroring — the open-from-path overlay's typo
+/// protection is unchanged.
+#[tokio::test]
+async fn open_path_missing_file_without_create_flag_still_errors() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let missing = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .join("nope.md");
+    let err = send_request_expect_err::<WorkspaceOpenPath>(
+        &mut ws,
+        1,
+        &WorkspaceOpenPathParams {
+            path: missing.display().to_string(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("canonicalizing"),
+        "the readable resolve error survives, got: {err}"
+    );
     drop(server);
 }
 
@@ -25550,6 +25705,7 @@ async fn open_path_rejects_a_relative_path() {
         &WorkspaceOpenPathParams {
             path: "some/relative/file.rs".into(),
             transient: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -25579,6 +25735,7 @@ async fn open_path_external_within_active_workspace_keeps_workspace() {
         &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -25600,6 +25757,7 @@ async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
         &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
+            create_if_missing: false,
         },
     )
     .await;
@@ -25652,6 +25810,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
         &WorkspaceOpenPathParams {
             path: ext_abs.clone(),
             transient: None,
+            create_if_missing: false,
         },
     )
     .await;

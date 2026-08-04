@@ -1053,8 +1053,20 @@ pub async fn workspace_open_path(
             params.path
         )));
     }
-    let canonical = std::fs::canonicalize(&raw)
-        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
+    let canonical = match std::fs::canonicalize(&raw) {
+        Ok(c) => c,
+        // A not-yet-existing file (`ae path/to/new-file`): canonicalize the deepest existing
+        // ancestor and keep the missing tail — the delegated `buffer/open` (which gets the same
+        // `create_if_missing`) binds an empty buffer to it, written at the first save.
+        Err(_) if params.create_if_missing => canonicalize_partial(&raw)
+            .map_err(|e| RpcError::invalid_path(format!("resolving {}: {e}", raw.display())))?,
+        Err(e) => {
+            return Err(RpcError::invalid_path(format!(
+                "canonicalizing {}: {e}",
+                raw.display()
+            )))
+        }
+    };
 
     // Resolve the workspace this open lands in, activating an ephemeral one if the client has none.
     // We never re-home the file into some *other* configured workspace that happens to contain it —
@@ -1091,6 +1103,7 @@ pub async fn workspace_open_path(
         BufferOpenParams {
             absolute_path: Some(canonical.display().to_string()),
             transient: params.transient,
+            create_if_missing: params.create_if_missing,
             ..Default::default()
         },
     )
@@ -1432,7 +1445,7 @@ pub async fn workspace_remove_root(
     }
 
     // Other clients viewing any of these buffers must be told to switch — capture before teardown.
-    let other_clients = clients_viewing_buffers(&s, &affected, client_id);
+    let other_clients = clients_affected_by_close(&s, &affected, client_id);
     // Close the affected buffers (clean ones). Same teardown as buffer/close.
     for &id in &affected {
         s.close_buffer(id);
@@ -1770,7 +1783,7 @@ pub async fn path_delete(
     };
     let closed = s.buffers_under_path(&workspace_name, &canonical);
     // Other clients viewing any of these buffers must be told to switch — capture before teardown.
-    let other_clients = clients_viewing_buffers(&s, &closed, client_id);
+    let other_clients = clients_affected_by_close(&s, &closed, client_id);
     for &id in &closed {
         s.close_buffer(id);
     }
@@ -4893,26 +4906,51 @@ fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<Buffer
         })
 }
 
-/// `(client, buffer)` pairs for every client *other than* `except` that currently has a viewport
-/// on one of `buffer_ids`. Capture this BEFORE tearing the buffers down — teardown drops the very
-/// viewports this reads. One entry per affected client (the buffer of theirs that is closing).
-fn clients_viewing_buffers(
+/// `(client, buffer)` pairs for every client *other than* `except` affected by closing
+/// `buffer_ids`: clients with a viewport on one (the push hands them a successor to switch to),
+/// plus clients whose active workspace context holds one in its MRU — those may have it as their
+/// *tether* (docs/tether.md), which must exit even while the client is viewing something else.
+/// Capture this BEFORE tearing the buffers down — teardown drops the viewports and MRU entries
+/// this reads. At most one entry per `(client, buffer)` pair; non-matching pushes are ignored
+/// client-side, so the broad audience is safe.
+fn clients_affected_by_close(
     s: &ServerState,
     buffer_ids: &[BufferId],
     except: ClientId,
 ) -> Vec<(ClientId, BufferId)> {
     let targets: std::collections::HashSet<BufferId> = buffer_ids.iter().copied().collect();
-    let mut seen: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(ClientId, BufferId)> =
+        std::collections::HashSet::new();
     let mut out = Vec::new();
     for vp in s.viewports.values() {
-        if vp.client_id != except && targets.contains(&vp.buffer_id) && seen.insert(vp.client_id) {
+        if vp.client_id != except
+            && targets.contains(&vp.buffer_id)
+            && seen.insert((vp.client_id, vp.buffer_id))
+        {
             out.push((vp.client_id, vp.buffer_id));
+        }
+    }
+    for (&client_id, session) in &s.clients {
+        if client_id == except {
+            continue;
+        }
+        let Some(ws) = session
+            .active_workspace
+            .as_deref()
+            .and_then(|id| s.workspaces.get(id))
+        else {
+            continue;
+        };
+        for id in ws.mru_buffers.iter().filter(|id| targets.contains(id)) {
+            if seen.insert((client_id, *id)) {
+                out.push((client_id, *id));
+            }
         }
     }
     out
 }
 
-/// Build the `buffer/closed` pushes for the clients captured by [`clients_viewing_buffers`],
+/// Build the `buffer/closed` pushes for the clients captured by [`clients_affected_by_close`],
 /// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
 /// settled MRU. Clients that have since disconnected are skipped.
 fn buffer_closed_pushes(s: &ServerState, affected: &[(ClientId, BufferId)]) -> PendingPushes {
@@ -4992,7 +5030,7 @@ pub async fn buffer_close(
     }
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
-    let affected = clients_viewing_buffers(&s, &[params.buffer_id], client_id);
+    let affected = clients_affected_by_close(&s, &[params.buffer_id], client_id);
     // Remember the owning workspace before teardown drops the association, so we can retire an
     // ephemeral workspace once it loses its last buffer.
     let owning_workspace = s.workspace_for_buffer(params.buffer_id).map(str::to_string);

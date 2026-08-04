@@ -85,6 +85,10 @@ pub struct ConnectingBootstrap {
     /// (`--buffer <id>`). Takes precedence over `file`; the id is daemon-session scoped, so a stale
     /// one falls back to the workspace's MRU/scratch.
     pub buffer_id: Option<BufferId>,
+    /// Tether the client to the buffer `file` opens (docs/tether.md): the quick-edit invocation —
+    /// a file positional without an explicit `--workspace` — where closing that buffer exits the
+    /// window. Window-spawns ([`spawn_target`]) always name the workspace, so they never set it.
+    pub tether: bool,
     pub client_version: String,
     /// The (profile-resolved) WebSocket address every dial and reconnect targets.
     pub server_url: String,
@@ -109,9 +113,9 @@ pub struct SessionBootstrap {
     /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
     pub explorer_dir: Option<String>,
-    /// The session was launched directly onto a file outside any workspace (ephemeral context) —
-    /// closing it should quit rather than drop to the chooser (see `Session::launched_with_file`).
-    pub launched_with_file: bool,
+    /// The session was launched to quick-edit `buffer` (`ae file`): tether the client to it, so
+    /// closing that buffer exits the window (see `Session::tether`, docs/tether.md).
+    pub tethered: bool,
 }
 
 /// A bare connection for the no-args start: the workspace picker browses on it, and the picked
@@ -554,8 +558,9 @@ impl App {
             }
             Bootstrap::Session(b) => {
                 let pump = pump(b.notifications.clone());
+                let tether = b.tethered.then_some(b.buffer.buffer_id);
                 let mut session = Session::new(b.workspace, b.buffer);
-                session.launched_with_file = b.launched_with_file;
+                session.tether = tether;
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
                 let mut app = shell(
@@ -830,8 +835,9 @@ impl App {
                 self.server_started_at = b.server_started_at;
                 self.handle = b.handle;
                 self.notifications = b.notifications.clone();
+                let tether = b.tethered.then_some(b.buffer.buffer_id);
                 self.session = Session::new(b.workspace, b.buffer);
-                self.session.launched_with_file = b.launched_with_file;
+                self.session.tether = tether;
                 // The connecting editor already laid out (recording cell metrics) without
                 // subscribing, so its Layout may not fire again — subscribe explicitly now that
                 // we're Connected. `subscribe_task` is a no-op if no metrics arrived yet, and the
@@ -2454,6 +2460,7 @@ impl App {
                 Element::from(crate::picker::overlay(
                     p,
                     &self.session.workspace_paths,
+                    self.session.tether,
                     self.picker_scroll_y,
                     self.spinner_phase,
                     self.ui(),
@@ -3974,6 +3981,11 @@ impl App {
             },
         );
         left = left.push(name);
+        // The tether mark (docs/tether.md): a dim ` *` after the file label — closing this buffer
+        // exits the window. Upright even on a slanted transient label, like the terminal client.
+        if self.session.tethered() {
+            left = left.push(t(" *".into(), theme::NORD3_BRIGHTER));
+        }
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero.
         if let Some(gs) = self
@@ -5653,7 +5665,7 @@ fn open_link(url: &str) {
 }
 
 /// Spawn a detached `ae --gui` sibling seeded from a [`WindowTarget`] — the body behind
-/// [`ShellAction::NewWindow`] (both the `Space Alt-x` duplicate and "open picker item in a new
+/// [`ShellAction::NewWindow`] (both the `Space z` duplicate and "open picker item in a new
 /// window"; the core builds the target either way). The sibling dials the same daemon (`--profile`),
 /// so buffers are shared server-side. Best-effort: a spawn failure is logged, not surfaced (the user
 /// simply gets no new window).
@@ -5934,19 +5946,21 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         .map_err(BootError::from)?;
     let notifications = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
-    // No workspace on the CLI. An existing file outside any configured workspace (`ae /etc/hosts`)
-    // opens directly in an ephemeral "(no workspace)" context; otherwise hand back the bare
-    // connection so the chooser browses on it.
+    // No workspace on the CLI. A file outside any configured workspace (`ae /etc/hosts`) opens
+    // directly in an ephemeral "(no workspace)" context — a missing path counts as a file to
+    // create (`create_if_missing`: empty buffer, written at the first save). Otherwise (no file,
+    // or a directory) hand back the bare connection so the chooser browses on it.
     let Some(workspace) = args.workspace.clone() else {
         let resolved = match &args.file {
             Some(f) => Some(resolve_cli_path(f)?),
             None => None,
         };
-        if let Some(abs) = resolved.filter(|p| p.is_file()) {
+        if let Some(abs) = resolved.filter(|p| !p.is_dir()) {
             let opened = handle
                 .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                     path: abs.display().to_string(),
                     transient: None,
+                    create_if_missing: true,
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -5963,7 +5977,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                 buffer: buffer_info(open, &workspace_paths),
                 workspace: opened.workspace,
                 explorer_dir: None,
-                launched_with_file: true,
+                tethered: args.tether,
             })));
         }
         return Ok(Bootstrap::Choose(ChooseBootstrap {
@@ -6026,12 +6040,14 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
             Some(abs) => {
                 let abs_str = abs.display().to_string();
                 match strip_longest_root(&abs_str, &workspace_paths) {
-                    // Inside a workspace root: ordinary workspace-relative open. A `path:line:col`
-                    // launch (or a grep-hit "open in new window") jumps to `jump_to` here.
+                    // Inside a workspace root: ordinary workspace-relative open (creating a
+                    // missing file, like the terminal client). A `path:line:col` launch (or a
+                    // grep-hit "open in new window") jumps to `jump_to` here.
                     Some((path_index, relative_path)) => handle
                         .rpc::<BufferOpen>(BufferOpenParams {
                             path_index: Some(path_index),
                             relative_path: Some(relative_path),
+                            create_if_missing: true,
                             jump_to: args.jump_to,
                             ..Default::default()
                         })
@@ -6044,6 +6060,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs_str,
                             transient: None,
+                            create_if_missing: true,
                         })
                         .await
                         .map_err(|e| e.to_string())?
@@ -6077,7 +6094,13 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         buffer: buffer_info(open, &workspace_paths),
         workspace: activated.workspace,
         explorer_dir,
-        launched_with_file: false,
+        // Quick-edit launch (`ae file`, workspace inferred — `tether` is never set alongside an
+        // explicit `--workspace`, and window-spawns always pass one): tether to the opened file.
+        // A missing path is a file to create and tethers too; directory args (explorer over a
+        // scratch) and `--buffer` re-attaches have no file.
+        tethered: args.tether
+            && args.buffer_id.is_none()
+            && resolved.as_ref().is_some_and(|p| !p.is_dir()),
     })))
 }
 
@@ -6089,8 +6112,48 @@ fn resolve_cli_path(input: &str) -> Result<std::path::PathBuf, String> {
     } else {
         std::env::current_dir().map_err(|e| e.to_string())?.join(p)
     };
-    abs.canonicalize()
-        .map_err(|e| format!("resolving {}: {e}", abs.display()))
+    match abs.canonicalize() {
+        Ok(p) => Ok(p),
+        // A not-yet-existing file (`ae path/to/new-file`) still resolves — deepest existing
+        // ancestor canonicalized, missing tail kept — so the boot opens (which run with
+        // `create_if_missing`) bind an empty create-on-save buffer to it. A trailing `/`
+        // declares directory intent, which create-on-open can't satisfy: keep the error.
+        Err(_) if !input.ends_with('/') => {
+            canonicalize_partial(&abs).map_err(|e| format!("resolving {}: {e}", abs.display()))
+        }
+        Err(e) => Err(format!("resolving {}: {e}", abs.display())),
+    }
+}
+
+/// Canonicalize a path that may not fully exist: walk up to the deepest existing ancestor,
+/// canonicalize that, then re-attach the not-yet-created tail verbatim (mirrors the server's
+/// helper of the same name).
+fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(canon) => {
+                let mut out = canon;
+                // suffix was accumulated tail-first; reverse on attach.
+                for component in suffix.iter().rev() {
+                    out.push(component);
+                }
+                return Ok(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name().map(|n| n.to_os_string()) else {
+                    return Err(e);
+                };
+                let Some(parent) = cursor.parent().map(|p| p.to_path_buf()) else {
+                    return Err(e);
+                };
+                suffix.push(name);
+                cursor = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Run the iced application. `main` hands it a `Connecting` bootstrap — the app dials from within

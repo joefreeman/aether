@@ -1030,7 +1030,11 @@ mod tests {
         assert_eq!(text[0], "│ title: X");
         assert_eq!(text[1], "│ tags: [a, b]");
         let spans = &rows[0].spans;
-        assert_eq!(spans[0].style, SpanStyle::plain(SpanKind::Dim), "thin rule is dim, upright");
+        assert_eq!(
+            spans[0].style,
+            SpanStyle::plain(SpanKind::Dim),
+            "thin rule is dim, upright"
+        );
         assert!(spans[1].style.italic, "metadata text stays italic dim");
         assert_eq!(spans[1].style.kind, SpanKind::Dim);
     }

@@ -87,6 +87,7 @@ fn workspace_open_path_roundtrip() {
             to_value(WorkspaceOpenPathParams {
                 path: "/etc/hosts".into(),
                 transient: None,
+                create_if_missing: false,
             })
             .unwrap(),
         ),
@@ -97,6 +98,16 @@ fn workspace_open_path_roundtrip() {
     assert_eq!(v["params"]["path"], "/etc/hosts");
     // `transient: None` stays off the wire.
     assert!(v["params"].get("transient").is_none());
+    // `create_if_missing` rides the wire when set, and an old-style params object without it
+    // (or with it false — serialized either way) still parses.
+    let with: WorkspaceOpenPathParams = serde_json::from_value(
+        serde_json::json!({ "path": "/tmp/new.txt", "create_if_missing": true }),
+    )
+    .unwrap();
+    assert!(with.create_if_missing);
+    let without: WorkspaceOpenPathParams =
+        serde_json::from_value(serde_json::json!({ "path": "/etc/hosts" })).unwrap();
+    assert!(!without.create_if_missing);
 }
 
 #[test]

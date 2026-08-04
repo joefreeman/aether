@@ -759,7 +759,7 @@ fn action_value(a: &ShellAction) -> Value {
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
         // The shell opens a new tab: with a concrete file target (the reading view's
         // Ctrl-Enter) it builds a same-app URL for that file; without one it duplicates the
-        // current tab (`Space Alt-x`). The picker's Ctrl-Enter never reaches here (rows are
+        // current tab (`Space z`). The picker's Ctrl-Enter never reaches here (rows are
         // `<a>` links, handled shell-side by `onPickerInputKey`).
         ShellAction::NewWindow(target) => {
             let mut v = json!({ "name": "new_window" });

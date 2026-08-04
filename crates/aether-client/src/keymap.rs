@@ -369,6 +369,11 @@ pub enum Action {
     /// external-change confirm defers the quit until the retry lands; a failed or cancelled save
     /// doesn't quit. Sequences `Save` then `Quit`.
     SaveAndQuit,
+    /// `Space Alt-x` — save the current buffer, then close it if the save succeeds (the close
+    /// analogue of [`Action::SaveAndQuit`], with the same confirm-deferral). On the tethered
+    /// buffer (docs/tether.md) the close also exits the client — the one-chord finish for an
+    /// `ae file` quick edit (write the commit message, `Space Alt-x`, done).
+    SaveAndClose,
     /// `Space Alt-w` — open a file by typing its absolute path (a leading `~/` is fine),
     /// regardless of the active workspace. Outside any workspace root the file opens as an external
     /// buffer; with no workspace active it lands in a fresh ephemeral context. Pairs with `Space w`
@@ -377,6 +382,8 @@ pub enum Action {
     Reload,
     /// Toggle the active buffer's transient ("keep") state — pin a preview permanent, or release a
     /// permanent buffer back to transient. Refused for unsaved buffers (auto-close would discard).
+    /// On the tethered buffer (docs/tether.md), un-keeping additionally *releases* the tether —
+    /// the client stops exiting when the buffer closes; one-way, a re-keep is just a plain keep.
     ToggleKeep,
     /// Copy the active buffer's workspace-relative path to the system clipboard.
     CopyRelativePath,
@@ -384,12 +391,13 @@ pub enum Action {
     CopyAbsolutePath,
     NewScratch,
     CloseBuffer,
-    /// `Space Alt-x` — open another window onto the same workspace: the GUI spawns a fresh detached
+    /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached
     /// `ae --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
     /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it "duplicates"
     /// the current view; the two windows are independent thereafter (own cursor/selection/viewport,
     /// shared buffers server-side). The TUI has no window to spawn, so it ignores the
-    /// [`ShellAction::NewWindow`] it emits.
+    /// [`ShellAction::NewWindow`] it emits. The spawn names the workspace explicitly (`--workspace`),
+    /// so the sibling never tethers to the file it lands on (docs/tether.md).
     NewWindow,
 
     // ---- git ----
@@ -1045,7 +1053,8 @@ static LEADER: &[Binding] = &[
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
-    bind!(L, ch('x'), Exact(Mods::ALT), A::NewWindow, "App", "Open another window"),
+    bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
+    bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
