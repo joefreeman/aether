@@ -1177,7 +1177,7 @@ fn render_item<'a>(
             // Buffer-state dot floats flush-right, matching the web picker and the status bar.
             r = r.push(iced::widget::Space::new().width(Length::Fill));
             if let Some(color) = dirty_color(*status) {
-                r = r.push(text("●").size(ui.dot()).color(color));
+                r = r.push(text("●").size(ui.state_dot()).font(SANS).color(color));
             }
             r.into()
         }
@@ -1393,7 +1393,7 @@ fn render_item<'a>(
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
             if *unsaved_buffers > 0 {
-                r = r.push(text("●").size(ui.dot()).color(theme::NORD9));
+                r = r.push(text("●").size(ui.state_dot()).font(SANS).color(theme::NORD9));
             }
             r.into()
         }

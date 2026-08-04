@@ -3947,7 +3947,8 @@ impl App {
 
         let mut left = row![];
         if let Some(color) = self.buffer_state_color() {
-            left = left.push(t("● ".into(), color));
+            // Through `state_dot` (== body size), the one knob the picker rows share.
+            left = left.push(text("● ").size(ui.state_dot()).font(SANS).color(color));
         }
         // Persisted workspace → `[name] ` prefix. No workspace (boot/connecting/chooser) or an
         // ephemeral "(no workspace)" context → no prefix, so the bar shows just the file label

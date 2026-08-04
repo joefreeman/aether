@@ -207,8 +207,19 @@ html, body, #app {
 .status-left { display: flex; align-items: baseline; gap: 12px; overflow: hidden; min-width: 0; }
 .status-file { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-git-group { flex: 0 0 auto; display: flex; align-items: baseline; gap: 5px; white-space: nowrap; }
-/* Buffer-state dot (SVG circle, colour via currentColor). Shared by the status bar and picker. */
-.buffer-status-dot { flex: 0 0 auto; width: 0.7em; height: 0.7em; vertical-align: -0.06em; }
+/* Buffer-state dot — a drawn circle (background: currentColor), not a font glyph, so its size
+   is exact and identical everywhere it appears: the status bar and the buffer/workspace picker
+   rows all share this one class. The vertical-align only matters in the status bar's inline
+   flow (picker rows are center-aligned flex); eyeball-tuned against the 13px text baseline. */
+.buffer-status-dot {
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 0.65em;
+  height: 0.65em;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: -0.04em;
+}
 .status-dot { margin-right: 0.5em; } /* leads the row; a bit of space before the workspace name. Colour set inline */
 .status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
 .status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
@@ -1046,10 +1057,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--nord13); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--nord11); }
-/* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the far
-   edge. Colours match the editor status bar / favicon. Enlarged to match the status bar's `●`; the
-   `line-height: 0` keeps the bigger glyph from growing the row (same trick as `.picker-bullet`). */
-.picker-dirty-dot { margin-left: auto; font-size: 1.4em; line-height: 0; }
+/* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the
+   far edge. Colours match the editor status bar / favicon; the dot itself is the shared
+   `.buffer-status-dot` circle, so size parity with the status bar holds by construction. */
+.picker-dirty-dot { margin-left: auto; }
 .picker-dirty-unsaved { color: var(--nord9); }
 .picker-dirty-externally_modified { color: var(--nord12); }
 .picker-dirty-externally_deleted { color: var(--nord11); }

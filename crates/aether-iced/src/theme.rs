@@ -111,10 +111,17 @@ impl Ui {
         self.at(11.0)
     }
 
-    /// A `●` drawn as text inside a row (picker bullets), sized to read as a dot rather than a
-    /// glyph.
+    /// A `●` drawn as text inside a row (the git-status picker bullets), sized to read as a
+    /// dot rather than a glyph.
     pub fn dot(self) -> f32 {
         self.at(9.0)
+    }
+
+    /// The buffer-state `●` — one indicator, one size: the status bar's dirty dot and the
+    /// buffer/workspace picker rows' trailing dot all draw at this (deliberately the body
+    /// size — the glyph's ink reads as a dot at text scale), so they can't drift.
+    pub fn state_dot(self) -> f32 {
+        self.at(13.0)
     }
 
     /// Dialog titles and section headings.
@@ -253,6 +260,7 @@ mod tests {
         assert_eq!(ui.small(), 12.0);
         assert_eq!(ui.fine(), 11.0);
         assert_eq!(ui.dot(), 9.0);
+        assert_eq!(ui.state_dot(), 13.0);
         assert_eq!(ui.heading(), 14.0);
         assert_eq!(ui.control(), 16.0);
         assert_eq!(ui.row_h(), 24.0);

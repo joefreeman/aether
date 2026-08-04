@@ -4282,8 +4282,7 @@ export class Shell {
       }
       if (d.dirty) {
         const dot = document.createElement("span");
-        dot.className = `picker-dirty-dot picker-dirty-${d.dirty}`;
-        dot.textContent = "●";
+        dot.className = `buffer-status-dot picker-dirty-dot picker-dirty-${d.dirty}`;
         row.append(dot);
       }
       (section ?? win).append(row);
@@ -4369,9 +4368,8 @@ export class Shell {
     const color = bufferStateColor(v);
     if (color) {
       const dot = document.createElement("span");
-      dot.className = "status-dot";
+      dot.className = "status-dot buffer-status-dot";
       dot.style.color = color;
-      dot.textContent = "●";
       fileGroup.append(dot);
     }
     const proj = showsWorkspaceChrome(v.workspace) ? `[${v.workspace}] ` : "";
