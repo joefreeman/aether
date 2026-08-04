@@ -60,6 +60,10 @@ pub enum ContextId {
     Normal,
     Insert,
     Search,
+    /// The markdown reading view (`Mode::Read`, docs/markdown-view.md). Its hints are
+    /// context-local (being in the view is their gate) except the `reader` entry point,
+    /// which displays in Normal.
+    Read,
     Picker(PickerKind),
     Settings,
     SaveAs,
@@ -105,6 +109,12 @@ pub struct HintFacts {
     /// picker is the mandatory chooser: its Esc *exits* rather than closing the picker, so the
     /// picker-dismiss hint would mislead there and is suppressed.
     pub mandatory_chooser: bool,
+    /// The current buffer is markdown — gates the `reader` entry-point hint (`Space v` teaches
+    /// nothing on a buffer the reading view refuses).
+    pub markdown_buffer: bool,
+    /// The reading view's focused block contains interactive elements (links, footnote refs,
+    /// images) — gates the link-selection hints (`l/h`, Enter, Tab) to moments they can act.
+    pub read_block_has_targets: bool,
 }
 
 /// What marks a hint as demonstrated. Editor bindings match on the resolved [`Action`] (observed
@@ -258,6 +268,43 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "search-regex", tier: 3, contexts: &[C::Search], keys: "Alt-e",
         trigger: Trigger::Action(|a| matches!(a, Action::SearchToggleRegex)),
         text: "Use {} to toggle regex matching" },
+
+    // ---- the markdown reading view (docs/markdown-view.md) ----
+    // The entry point displays in Normal (main-track, ladder-gated) and only on markdown
+    // buffers; everything else is Read-context-local — being in the view is the gate.
+    // `read-source` shares the entry point's trigger but is deliberately a *separate* hint:
+    // merged, the ladder would gate the way OUT of a view the app can open by default
+    // (`markdown_read_default`), and each side's copy teaches a different destination.
+    // Shared learning still holds — one `Space v` press records a use on both.
+    HintDef { id: "reader", tier: 3, contexts: &[C::Normal], keys: "Space v",
+        trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
+        text: "Use {} to open the markdown reading view" },
+    HintDef { id: "read-source", tier: 3, contexts: &[C::Read], keys: "Space v",
+        trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
+        text: "Use {} to view the markdown source" },
+    HintDef { id: "read-step", tier: 3, contexts: &[C::Read], keys: "j/k",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadStep(_))),
+        text: "Use {} to step through the document" },
+    // Sequenced (`cond_holds`): the fine grain builds on the coarse one, and both only where
+    // the focused block actually has links to select.
+    HintDef { id: "read-target", tier: 3, contexts: &[C::Read], keys: "l/h",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadStepLink(_))),
+        text: "Use {} to select and deselect links in the block" },
+    HintDef { id: "read-follow", tier: 3, contexts: &[C::Read], keys: "Enter",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadActivate)),
+        text: "Use {} to follow the selected link" },
+    HintDef { id: "read-peek", tier: 3, contexts: &[C::Read], keys: "Tab",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadShowTarget)),
+        text: "Use {} to preview the selection's target" },
+    HintDef { id: "read-back", tier: 3, contexts: &[C::Read], keys: "Backspace",
+        trigger: Trigger::Action(|a| matches!(a, Action::NavBack)),
+        text: "Use {} to jump back after following a link" },
+    HintDef { id: "read-headings", tier: 3, contexts: &[C::Read], keys: "o/Alt-o",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadStepHeading(_))),
+        text: "Use {} to jump between headings" },
+    HintDef { id: "read-copy", tier: 3, contexts: &[C::Read], keys: "y",
+        trigger: Trigger::Action(|a| matches!(a, Action::ReadCopy)),
+        text: "Use {} to copy the link URL or block source" },
 
     // ---- tier 4: git, picker deep-cuts, and the off switch ----
     HintDef { id: "diff", tier: 4, contexts: &[C::Normal], keys: "Space i",
@@ -766,6 +813,17 @@ impl HintEngine {
             "picker-dismiss" => {
                 !self.facts.mandatory_chooser && self.past("help") && self.past("picker-nav")
             }
+            // The reading view's entry point only where the view can open.
+            "reader" => self.facts.markdown_buffer,
+            // The link-selection sequence: the ring only where the focused block has links,
+            // and taught coarse-to-fine — the block step first, then selecting within it,
+            // then acting on the selection.
+            "read-target" => self.facts.read_block_has_targets && self.past("read-step"),
+            "read-follow" | "read-peek" => {
+                self.facts.read_block_has_targets && self.past("read-target")
+            }
+            // The way back is taught once following has been presented — the wiki loop.
+            "read-back" => self.past("read-follow"),
             _ => true,
         }
     }
@@ -1421,6 +1479,7 @@ mod tests {
         e.set_facts(HintFacts {
             workspaces_listed: Some(1),
             mandatory_chooser: true,
+            ..Default::default()
         });
         e.on_tick(Some(ws), T0 + 1_000, true);
         assert_eq!(
@@ -1433,6 +1492,7 @@ mod tests {
         e.set_facts(HintFacts {
             workspaces_listed: Some(1),
             mandatory_chooser: false,
+            ..Default::default()
         });
         e.on_tick(Some(ws), T0 + 3_000, true);
         assert_eq!(displayed(&e, ws), Some("picker-dismiss"));
@@ -1511,6 +1571,60 @@ mod tests {
 
     /// An action that satisfies the given hint's matcher — the test-side inverse of the
     /// curriculum's matchers, so tests can "press" a hint's binding.
+    /// The reading view's hints: context-local (a fresh profile at tier frontier 0 still sees
+    /// them — the ladder gates the main track only), the link ring sequenced coarse-to-fine
+    /// behind its predecessors' *shows*, and the Normal-side entry point gated to markdown
+    /// buffers.
+    #[test]
+    fn read_hints_are_context_local_and_sequenced() {
+        let pool_has = |e: &HintEngine, id: &str| {
+            e.pool(C::Read).iter().any(|&i| CURRICULUM[i].id == id)
+        };
+        let mut e = HintEngine::default();
+        e.adopt(HintsStateResult::default());
+        e.set_facts(HintFacts {
+            markdown_buffer: true,
+            read_block_has_targets: true,
+            ..Default::default()
+        });
+
+        // Tier frontier is 0, yet the Read corner fills — and only with the unsequenced set.
+        e.on_tick(Some(C::Read), T0, true);
+        let first = displayed(&e, C::Read).expect("the read corner fills on a fresh profile");
+        let opening = ["read-source", "read-step", "read-headings", "read-copy"];
+        assert!(opening.contains(&first), "unsequenced read hint first, got {first}");
+        for id in ["read-target", "read-follow", "read-peek", "read-back"] {
+            assert!(!pool_has(&e, id), "{id} must wait for its predecessor's show");
+        }
+
+        // Each show unlocks the next rung: step → target → follow/peek → back.
+        e.records.entry("read-step").or_default().last_shown_at = T0;
+        assert!(pool_has(&e, "read-target"));
+        assert!(!pool_has(&e, "read-follow") && !pool_has(&e, "read-back"));
+        e.records.entry("read-target").or_default().last_shown_at = T0;
+        assert!(pool_has(&e, "read-follow") && pool_has(&e, "read-peek"));
+        assert!(!pool_has(&e, "read-back"));
+        e.records.entry("read-follow").or_default().last_shown_at = T0;
+        assert!(pool_has(&e, "read-back"));
+
+        // The ring hints only apply while the focused block has links; the way back
+        // (Backspace) is block-independent and stays.
+        e.set_facts(HintFacts {
+            markdown_buffer: true,
+            read_block_has_targets: false,
+            ..Default::default()
+        });
+        for id in ["read-target", "read-follow", "read-peek"] {
+            assert!(!pool_has(&e, id), "{id} needs a block with targets");
+        }
+        assert!(pool_has(&e, "read-back"));
+
+        // The Normal-side entry point teaches nothing on a non-markdown buffer.
+        assert!(e.cond_holds("reader"));
+        e.set_facts(HintFacts::default());
+        assert!(!e.cond_holds("reader"));
+    }
+
     fn trigger_action_for(id: &str) -> Action {
         use aether_protocol::cursor::Direction;
         match id {
@@ -1526,6 +1640,14 @@ mod tests {
             "picker-buffers" => Action::OpenPicker(PickerKind::Buffers),
             "search" => Action::EnterSearch,
             "undo" => Action::Undo,
+            "reader" | "read-source" => Action::ToggleReadView,
+            "read-step" => Action::ReadStep(Direction::Forward),
+            "read-target" => Action::ReadStepLink(Direction::Forward),
+            "read-follow" => Action::ReadActivate,
+            "read-peek" => Action::ReadShowTarget,
+            "read-back" => Action::NavBack,
+            "read-headings" => Action::ReadStepHeading(Direction::Forward),
+            "read-copy" => Action::ReadCopy,
             other => panic!("no test action mapped for hint {other}"),
         }
     }

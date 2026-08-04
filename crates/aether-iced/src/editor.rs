@@ -25,8 +25,9 @@ pub const PAD: f32 = 8.0;
 /// Change-bar gutter width, in cells (TUI's `GUTTER_WIDTH`).
 pub const GUTTER_COLS: u32 = 1;
 
-/// Scrollbar rail/thumb width in px — matches the picker's `SCROLLBAR_W` for a consistent look.
-const SCROLLBAR_W: f32 = 5.0;
+/// Scrollbar rail/thumb width in px — the shared buffer/chrome tier, so the editor bar matches
+/// the picker/popover bars (and stays a step heavier than the read view's inline panel bars).
+const SCROLLBAR_W: f32 = crate::theme::SCROLLBAR_W;
 /// Smallest the thumb may shrink to on very long files, so it stays grabbable.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
@@ -673,10 +674,10 @@ where
                 }
 
                 // Text, as runs of identical highlight kind. "Inside a search hit" is part
-                // of the run key: comments are themed NORD3 — the same shade as the hit
-                // fill — so a match inside one would be invisible. Lift just that text to
-                // the normal foreground (the web's `.search-hit.hl-comment` rule; every
-                // other syntax colour reads fine on NORD3).
+                // of the run key: comments are themed NORD3_BRIGHTER — only ~2:1 against
+                // the NORD3 hit fill — so a match inside one would be barely legible. Lift
+                // just that text to the normal foreground (the web's `.search-hit.hl-comment`
+                // rule; every other syntax colour reads fine on NORD3).
                 let in_hit = |dcol: u32| {
                     hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
                         || sneak_spans
@@ -702,7 +703,7 @@ where
                     let mut color = kind
                         .and_then(theme::highlight_color)
                         .unwrap_or(theme::NORD4);
-                    if hit && color == theme::NORD3 {
+                    if hit && color == theme::NORD3_BRIGHTER {
                         color = theme::NORD4;
                     }
                     draw_text_run(

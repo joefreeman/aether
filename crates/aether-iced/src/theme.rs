@@ -14,8 +14,13 @@ const fn rgb(hex: u32) -> Color {
 pub const NORD0: Color = rgb(0x2e3440); // main background
 pub const NORD1: Color = rgb(0x3b4252); // status line / panel
 pub const NORD2: Color = rgb(0x434c5e); // picker row highlight / chips
-pub const NORD3: Color = rgb(0x4c566a); // comments / dim
+pub const NORD3: Color = rgb(0x4c566a); // dim — hit/sneak fills, muted glyphs
 pub const NORD3_BRIGHT: Color = rgb(0x616e88); // lighter dim (legible secondary text on panels)
+/// Off-palette, brighter still — the syntax comment colour: NORD3 comments were ~1.4:1 against
+/// the reading view's NORD1 code panels; this reaches ~2.8:1 there (~3.5:1 on the editor) while
+/// staying below NORD9 keywords, so comments remain the dimmest rung of the ladder. Mirrors the
+/// web's `--nord3-brighter`.
+pub const NORD3_BRIGHTER: Color = rgb(0x7b88a1);
 pub const NORD4: Color = rgb(0xd8dee9); // main foreground
 pub const NORD6: Color = rgb(0xeceff4); // brightest text (search query, file label)
 pub const NORD7: Color = rgb(0x8fbcbb); // types
@@ -34,6 +39,14 @@ pub const SNEAK_PREFIX_BG: Color = rgb(0x616e88);
 
 /// Current-line tint — between NORD0 and NORD1 (see theme.css for the rationale).
 pub const CURSOR_LINE_BG: Color = rgb(0x343a48);
+
+/// Scrollbar rail/thumb width for buffer-level and chrome scrollables — the editor's drawn bar,
+/// the reading view's document scroll, pickers, dialogs, and popovers. One step heavier than
+/// [`SCROLLBAR_INLINE_W`] so the "scrolls the view" bars outrank the in-content ones.
+pub const SCROLLBAR_W: f32 = 4.0;
+/// Thinner bar for panels *inside* content — the reading view's code blocks and tables, which
+/// pan horizontally within the document rather than scrolling the view itself.
+pub const SCROLLBAR_INLINE_W: f32 = 3.0;
 
 // Gutter change-bar colours (hue says what changed; dim variants mean "staged").
 pub const GIT_ADDED: Color = NORD14;
@@ -162,7 +175,7 @@ fn lookup_exact(kind: &str) -> Option<Option<Color>> {
         "keyword" | "variable.builtin" | "operator" | "tag" => Some(NORD9),
         "string" | "text.literal" => Some(NORD14),
         "string.escape" | "string.special" => Some(NORD13),
-        "comment" => Some(NORD3),
+        "comment" => Some(NORD3_BRIGHTER),
         "number" | "boolean" | "constant" | "constant.builtin" => Some(NORD15),
         "function" | "function.call" | "text.title" | "text.uri" | "text.reference" => Some(NORD8),
         "function.macro" | "punctuation.special" | "attribute" | "label" => Some(NORD12),

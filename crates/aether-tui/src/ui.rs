@@ -60,13 +60,18 @@ fn char_display_width(c: char, current_col: u32) -> u32 {
 const NORD0: Color = Color::Rgb(46, 52, 64); // Polar Night — main background
 const NORD1: Color = Color::Rgb(59, 66, 82); // Polar Night — status line / panel
 const NORD2: Color = Color::Rgb(67, 76, 94); // Polar Night — selection background
-const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — comments / dim
+const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — dim (hit/sneak fills, muted glyphs)
 const NORD3_BRIGHT: Color = Color::Rgb(97, 110, 136); // Polar Night — lighter dim (ignored entries)
+/// Off-palette, brighter still — the syntax comment colour: NORD3 comments were ~1.4:1 against
+/// the reading view's NORD1 code panels; this reaches ~2.8:1 there (~3.5:1 on the editor) while
+/// staying below NORD9 keywords, so comments remain the dimmest rung of the ladder. Mirrors the
+/// web client's `--nord3-brighter`.
+const NORD3_BRIGHTER: Color = Color::Rgb(123, 136, 161); // #7b88a1
 /// Outline for the floating overlays' rounded frame and their input/results separator (see
 /// [`overlay_block`] / [`draw_picker_separator`]). A step brighter than `NORD3_BRIGHT` so the border
-/// reads clearly against the editor, but still muted vs the full `NORD4` foreground. Mirrors the web
-/// client's `--nord3-brighter`. The one knob to turn to make the overlay outline heavier/lighter.
-const OVERLAY_BORDER_FG: Color = Color::Rgb(123, 136, 161); // #7b88a1
+/// reads clearly against the editor, but still muted vs the full `NORD4` foreground. The one knob to
+/// turn to make the overlay outline heavier/lighter — detach it from the palette shade to do so.
+const OVERLAY_BORDER_FG: Color = NORD3_BRIGHTER;
 const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
 const NORD6: Color = Color::Rgb(236, 239, 244); // Snow Storm — brightest (headings)
 const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
@@ -5200,9 +5205,10 @@ fn build_spans(
         // sitting clearly below the more saturated NORD10 selection, which paints over it.
         if byte_in_match[byte_idx] {
             style = style.bg(NORD3);
-            // Comments are themed NORD3 too, so a match inside one would be invisible (same fg/bg).
-            // Lift just that text to the normal foreground; every other syntax color reads fine.
-            if style.fg == Some(NORD3) {
+            // Comments are themed NORD3_BRIGHTER — only ~2:1 against the NORD3 fill — so a match
+            // inside one would be barely legible (a NORD3 fg would vanish outright). Lift just
+            // that text to the normal foreground; every other syntax color reads fine.
+            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHTER) {
                 style = style.fg(NORD4);
             }
         }
@@ -5210,7 +5216,7 @@ fn build_spans(
         // is painted separately, below, in the char loop).
         if byte_in_sneak[byte_idx] {
             style = style.bg(NORD3);
-            if style.fg == Some(NORD3) {
+            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHTER) {
                 style = style.fg(NORD4);
             }
         }
@@ -5218,7 +5224,10 @@ fn build_spans(
         // the bright label cell in prominence. The label cell is painted separately in the char loop.
         if byte_sneak_chip[byte_idx] {
             style = style.bg(NORD3_BRIGHT);
-            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHT) {
+            if style.fg == Some(NORD3)
+                || style.fg == Some(NORD3_BRIGHT)
+                || style.fg == Some(NORD3_BRIGHTER)
+            {
                 style = style.fg(NORD4);
             }
         }
@@ -5382,7 +5391,7 @@ fn lookup_exact(name: &str) -> Option<Style> {
         "keyword" => s.fg(NORD9),
         "string" => s.fg(NORD14),
         "string.escape" | "string.special" => s.fg(NORD13),
-        "comment" => s.fg(NORD3).add_modifier(Modifier::ITALIC),
+        "comment" => s.fg(NORD3_BRIGHTER).add_modifier(Modifier::ITALIC),
         "number" | "boolean" | "constant" | "constant.builtin" => s.fg(NORD15),
         "function" | "function.call" => s.fg(NORD8),
         "function.macro" => s.fg(NORD12),

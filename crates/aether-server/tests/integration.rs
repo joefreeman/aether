@@ -24618,6 +24618,25 @@ async fn highlight_snippet_uses_registry_and_aliases() {
     )
     .await;
     assert!(r.highlights.is_empty());
+
+    // The client sends the fence's full info string; metadata after the language — space- or
+    // comma-separated (```rust ignore / ```rust,no_run) — doesn't defeat resolution.
+    for (id, info) in [(13, "rust ignore"), (14, "rust,no_run")] {
+        let r = send_request::<SyntaxHighlightSnippet>(
+            &mut ws,
+            id,
+            &SyntaxHighlightSnippetParams {
+                language: info.into(),
+                text: "fn x() {}".into(),
+            },
+        )
+        .await;
+        assert!(
+            r.highlights.iter().any(|h| h.kind == "keyword"),
+            "info string {info:?} should still resolve to rust, got {:?}",
+            r.highlights
+        );
+    }
 }
 
 /// Read frames until a change signal (`buffer/changed` or `viewport/lines_changed`) arrives;
@@ -24859,6 +24878,27 @@ async fn buffer_asset_route_serves_and_confines() {
         "in-root ..%2F must serve, got {status}"
     );
     assert_eq!(body, b"PNGDATA");
+
+    // A root-relative source (leading `/`, GitHub semantics — docs/markdown-view.md §2.4)
+    // resolves against the buffer's containing root, not the filesystem.
+    let (status, _, body) =
+        http_get(&url, &format!("/asset/{}/%2Fimg.png", nested.buffer_id)).await;
+    assert!(
+        status.contains("200"),
+        "root-relative %2F must serve, got {status}"
+    );
+    assert_eq!(body, b"PNGDATA");
+
+    // …and it is confined exactly like a relative path.
+    let root_escape = format!(
+        "/asset/{id}/%2F..%2F{}%2Fsecret.png",
+        outside_path.file_name().unwrap().to_string_lossy()
+    );
+    let (status, _, _) = http_get(&url, &root_escape).await;
+    assert!(
+        status.contains("404"),
+        "root-relative traversal must 404, got {status}"
+    );
 
     // `..` traversal out of the root → 404 (canonical-prefix check).
     let rel_escape = format!(

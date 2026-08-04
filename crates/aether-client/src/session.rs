@@ -822,6 +822,12 @@ pub struct Session {
     /// consumed by `adopt_switch`: jump-shaped opens land in the editor, not the reading view
     /// (docs/markdown-view.md §1.6).
     pub(crate) open_route_jumped: bool,
+    /// The `#fragment` of a followed cross-file link (`[x](./other.md#section)`), set just
+    /// before the open and consumed once the target document's reading view adopts — the
+    /// heading's position isn't knowable until the target is fetched and parsed
+    /// (docs/markdown-view.md §2.4). Cleared by any fresh `open_path_at`, by a switch that
+    /// lands in the editor, and by a failed content fetch, so a stale anchor never fires.
+    pub(crate) pending_read_anchor: Option<String>,
     pub diagnostics: DiagnosticCounts,
     pub lsp: Option<LspServerStatus>,
     pub externally_modified: bool,
@@ -885,6 +891,13 @@ pub struct ReadView {
     /// Bumped whenever `code_highlights` grows — the shells' layout-cache invalidation key
     /// (revision alone doesn't move when highlights land).
     pub hl_gen: u64,
+    /// A fully-parsed document held back while a cross-file anchor's `cursor/move` is in
+    /// flight (docs/markdown-view.md §2.4): the visible view stays `loading` so the first
+    /// paint happens with the cursor already on the heading — the editor's
+    /// paint-once-in-place property. Installed by the cursor reply
+    /// (`Session::install_staged_read`); dropped whenever the view is replaced, torn down,
+    /// or newer content adopts.
+    pub staged: Option<Box<ReadView>>,
 }
 
 impl ReadView {
@@ -900,6 +913,7 @@ impl ReadView {
             loading: true,
             code_highlights: std::collections::HashMap::new(),
             hl_gen: 0,
+            staged: None,
         }
     }
 
@@ -917,6 +931,8 @@ impl ReadView {
         self.text = text;
         self.revision = revision;
         self.loading = false;
+        // Newer content outranks a parse held back for an anchor landing.
+        self.staged = None;
         self.code_highlights.clear();
         self.hl_gen += 1;
     }
@@ -1032,6 +1048,7 @@ impl Session {
             read_pref: std::collections::HashMap::new(),
             markdown_read_default: true,
             open_route_jumped: false,
+            pending_read_anchor: None,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
             externally_modified: false,

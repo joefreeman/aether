@@ -2386,9 +2386,19 @@ export class Shell {
     const base = v.buffer.path;
     if (!base || href.startsWith("#")) return null;
     const path = href.split("#")[0];
-    if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("/")) return null;
-    const dir = base.slice(0, base.lastIndexOf("/") + 1);
-    const r = this.resolvePath(dir + path, v.workspace_paths);
+    if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("//")) return null;
+    let abs: string;
+    if (path.startsWith("/")) {
+      // Root-relative (GitHub semantics): against the buffer's own workspace root — mirror
+      // the core's read_resolve_path. No containing root (external buffer) → no app URL.
+      const home = this.resolvePath(base, v.workspace_paths);
+      if (!home) return null;
+      abs = v.workspace_paths[home.path_index] + path;
+    } else {
+      const dir = base.slice(0, base.lastIndexOf("/") + 1);
+      abs = dir + path;
+    }
+    const r = this.resolvePath(abs, v.workspace_paths);
     if (!r) return null;
     const params = new URLSearchParams();
     if (v.workspace) params.set("workspace", v.workspace);
@@ -2713,10 +2723,16 @@ export class Shell {
         ? `${v.read.buffer_id}:${revealSpan.start}:${revealSpan.end}`
         : null;
       if (focusKey !== this.lastReadFocus) {
+        // A reveal into a buffer this view hasn't revealed in yet — a cross-file landing, or
+        // the reading view just appearing — is a placement, not a motion: it snaps (the
+        // editor's cross-buffer jump contract, RevealStyle::Jump). Same-document reveals
+        // keep the scroll helper's smooth-when-short.
+        const fresh =
+          this.lastReadFocus === null ||
+          this.lastReadFocus.split(":")[0] !== String(v.read.buffer_id);
         this.lastReadFocus = focusKey;
-        // Applied through the editor's own scroll helper: smooth when short, snap when far.
         const target = revealFocus(this.bufferEl, revealSpan);
-        if (target !== null) this.scrollTopTo(target, true);
+        if (target !== null) this.scrollTopTo(target, !fresh);
       }
       return;
     }

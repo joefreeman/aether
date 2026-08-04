@@ -431,6 +431,11 @@ pub struct App {
     /// The reading-view focus last revealed (`(buffer, span.start, span.end)`), so the document
     /// scrolls only when the focus *changes* (docs/markdown-view.md §2.8).
     read_last_focus: Option<(u64, u32, u32)>,
+    /// The pending reveal is a *placement* — the first into a freshly-appeared document (a
+    /// cross-file landing, or the reading view just opening) — so it snaps instead of gliding
+    /// (the editor's cross-buffer jump contract, [`RevealStyle::Jump`]). Armed at the
+    /// focus-change trigger, consumed by `ReadRevealMeasured`.
+    read_reveal_snap: bool,
     /// A pending click-focus target (span start): when the focus change lands on it, the reveal
     /// snap is skipped — the clicked element was visible, so scrolling would only jolt.
     read_click_target: Option<u32>,
@@ -510,6 +515,7 @@ impl App {
             place_after_fetch: None,
             picker_scroll_y: 0.0,
             read_last_focus: None,
+            read_reveal_snap: false,
             read_click_target: None,
             read_scroll_px: 0.0,
             read_scroll_max: None,
@@ -1082,9 +1088,15 @@ impl App {
             }
             Message::ReadRevealMeasured(offset) => match offset {
                 // Through the read glide: smooth when short, snap when far — the editor's
-                // reveal feel.
-                Some(y) => self.read_scroll_to(y, true),
-                None => Task::none(),
+                // reveal feel. A placement (fresh document) snaps outright.
+                Some(y) => {
+                    let smooth = !std::mem::take(&mut self.read_reveal_snap);
+                    self.read_scroll_to(y, smooth)
+                }
+                None => {
+                    self.read_reveal_snap = false;
+                    Task::none()
+                }
             },
             Message::ReadScrolled { y, max } => {
                 // An offset the glide didn't emit is user input (wheel/drag): snap the glide
@@ -1354,6 +1366,15 @@ impl App {
                     (read.buffer_id, sp.start, sp.end)
                 });
             if focus != self.read_last_focus {
+                // A reveal into a buffer this view hasn't revealed in yet — a cross-file
+                // landing, or the reading view just appearing — is a placement, not a
+                // motion: it snaps (the editor's cross-buffer jump contract). Same-document
+                // reveals keep glide-when-short.
+                let fresh = match (self.read_last_focus, focus) {
+                    (Some((prev, ..)), Some((cur, ..))) => prev != cur,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
                 self.read_last_focus = focus;
                 if let Some((_, start, _)) = focus {
                     // A click-focus landing skips the reveal (the element was under the
@@ -1364,6 +1385,7 @@ impl App {
                         // Measure the focused block's real position, then scroll to it via
                         // `ReadRevealMeasured` — block heights vary wildly (images, code
                         // panels), so no source-derived approximation survives contact.
+                        self.read_reveal_snap = fresh;
                         tasks.push(
                             iced::advanced::widget::operate(ReadRevealProbe::default())
                                 .map(Message::ReadRevealMeasured),
@@ -1736,7 +1758,7 @@ impl App {
                             iced::widget::scrollable::AbsoluteOffset { x: dx, y: 0.0 },
                         );
                     }
-                    let line = self.session.buffer_font_size as f32 * 1.6;
+                    let line = self.session.buffer_font_size as f32 * READ_SCALE * 1.6;
                     let vh = (self.visible_rows() as f32).max(1.0)
                         * self.cell.map(|c| c.height).unwrap_or(line);
                     let mag = match unit {
@@ -3625,9 +3647,9 @@ impl App {
                 .width(Length::Fill)
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
-                        .width(5)
+                        .width(theme::SCROLLBAR_W)
                         .margin(0)
-                        .scroller_width(5),
+                        .scroller_width(theme::SCROLLBAR_W),
                 ))
                 .into()
         } else {
@@ -3807,9 +3829,9 @@ impl App {
                 .id(hover_scroll_id())
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
-                        .width(5)
+                        .width(theme::SCROLLBAR_W)
                         .margin(0)
-                        .scroller_width(5),
+                        .scroller_width(theme::SCROLLBAR_W),
                 )),
         )
         .max_width(640)
@@ -4462,10 +4484,25 @@ fn md_plain(inlines: &[MdInline]) -> String {
 
 // ---- the markdown reading view (docs/markdown-view.md §2.8, iced) -------------------------------
 
-/// The reading measure in ems of the body size — the column tracks the buffer font size (a
+/// The reading body size in ems of the buffer font size — one step above the editor: reading
+/// wants larger type than code. Matches the web's `#buffer.md-read-host { font-size: 1.125em }`.
+const READ_SCALE: f32 = 1.125;
+
+/// The reading measure in ems of the body size — the column tracks the reading size (a
 /// bigger type setting keeps the same ~characters-per-line), like the web's `max-width: 42.5em`.
-/// 42.5 × the 16px default = the original 680px.
+/// 42.5 × the 18px default reading size = 765px.
 const READ_MEASURE_EM: f32 = 42.5;
+
+/// Heading text size by level — the web's ladder (1.75/1.45/1.25/1.1 em). Shared by the
+/// heading arm and the view loop's air-above-headings computation.
+fn read_heading_size(level: u8, body: f32) -> f32 {
+    match level {
+        1 => body * 1.75,
+        2 => body * 1.45,
+        3 => body * 1.25,
+        _ => body * 1.1,
+    }
+}
 
 fn read_scroll_id() -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::new("read-view")
@@ -4578,7 +4615,7 @@ impl App {
         let Some(read) = self.session.read.as_ref() else {
             return iced::widget::Space::new().into();
         };
-        let body = self.session.buffer_font_size as f32;
+        let body = self.session.buffer_font_size as f32 * READ_SCALE;
         // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
         // always marks the reading position; the target pill inverts the interactive span the
         // cursor sits inside, on top of it.
@@ -4595,7 +4632,7 @@ impl App {
                     .align_x(iced::alignment::Horizontal::Center),
             );
         }
-        for b in &read.blocks {
+        for (i, b) in read.blocks.iter().enumerate() {
             // The position bar sits on the block — except lists, whose items bar individually
             // inside `read_block` (item-grain position).
             let focused = !matches!(b, MdBlock::List { .. }) && block_span == Some(b.span());
@@ -4614,10 +4651,26 @@ impl App {
             } else {
                 read_focus_wrap(focused, block)
             };
+            // Air above headings (web parity: `margin: 1.6em 0 0.5em` in the heading's own
+            // size — sections breathe): the uniform column spacing supplies 0.8 body of the
+            // gap; the rest rides the band's top padding, outside the focus wrap so the bar
+            // and the click target still hug the heading itself. The document's first block
+            // keeps the plain padding (the web strips `:first-child` margin the same way).
+            let air = match b {
+                MdBlock::Heading { level, .. } if i > 0 => {
+                    read_heading_size(*level, body) * 1.6 - body * 0.8
+                }
+                _ => 0.0,
+            };
             let inner = container(wrapped)
                 .width(Length::Fill)
                 .max_width(body * READ_MEASURE_EM)
-                .padding([3, 16]);
+                .padding(iced::Padding {
+                    top: 3.0 + air,
+                    bottom: 3.0,
+                    left: 16.0,
+                    right: 16.0,
+                });
             let outer = container(inner)
                 .width(Length::Fill)
                 .align_x(iced::alignment::Horizontal::Center);
@@ -4633,6 +4686,14 @@ impl App {
         Element::from(
             iced::widget::scrollable(container(col).width(Length::Fill).padding([24, 0]))
                 .id(read_scroll_id())
+                // Styled explicitly — the default scrollbar is 10px of chrome; the document
+                // scroll is buffer-level, so it gets the editor tier.
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::new()
+                        .width(theme::SCROLLBAR_W)
+                        .margin(0)
+                        .scroller_width(theme::SCROLLBAR_W),
+                ))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .on_scroll(|vp| {
@@ -4668,12 +4729,7 @@ impl App {
     ) -> Element<'static, ReadMsg> {
         match b {
             MdBlock::Heading { level, content, .. } => {
-                let size = match level {
-                    1 => body * 1.75,
-                    2 => body * 1.45,
-                    3 => body * 1.25,
-                    _ => body * 1.1,
-                };
+                let size = read_heading_size(*level, body);
                 // The terminal's heading colour ladder: frost blue majors, teal H3, white
                 // H4, body-grey H5/H6 — colour distinguishes the minor levels, which share
                 // the smallest size.
@@ -4900,8 +4956,8 @@ impl App {
                 let scroll = iced::widget::scrollable(code_padded)
                     .direction(iced::widget::scrollable::Direction::Horizontal(
                         iced::widget::scrollable::Scrollbar::new()
-                            .width(6)
-                            .scroller_width(6),
+                            .width(theme::SCROLLBAR_INLINE_W)
+                            .scroller_width(theme::SCROLLBAR_INLINE_W),
                     ))
                     .width(Length::Fill);
                 // The focused panel is Left/Right's pan target (see `read_code_scroll_id`).
@@ -4934,6 +4990,36 @@ impl App {
             .width(Length::Fill)
             .padding([body * 0.5, 0.0])
             .into(),
+            // Front matter: the dim literal panel (docs/markdown-view.md) — raw YAML in dim
+            // monospace behind a thin NORD2 rule, the web's `.md-front-matter`. The quote
+            // arm's nested-container bar construction, but 2px and NORD2: literal metadata,
+            // not speech. Must not fall through to `md_block`, whose hover-scale arm hides
+            // front matter entirely (right for popovers, wrong here).
+            MdBlock::FrontMatter { text: raw, .. } => {
+                let panel = container(
+                    text(raw.trim_end().to_string())
+                        .size(body * 0.8)
+                        .color(theme::NORD3_BRIGHT)
+                        .font(iced::Font::MONOSPACE),
+                )
+                .width(Length::Fill)
+                .padding([4, 10])
+                .style(|_| container::Style {
+                    background: Some(theme::NORD0.into()),
+                    ..container::Style::default()
+                });
+                container(panel)
+                    .width(Length::Fill)
+                    .padding(iced::Padding {
+                        left: 2.0,
+                        ..iced::Padding::ZERO
+                    })
+                    .style(|_| container::Style {
+                        background: Some(theme::NORD2.into()),
+                        ..container::Style::default()
+                    })
+                    .into()
+            }
             // The remaining kinds read fine at hover scale.
             other => md_block(other, ui, ReadMsg::Link),
         }
@@ -5035,8 +5121,8 @@ impl App {
         iced::widget::scrollable(framed)
             .direction(iced::widget::scrollable::Direction::Horizontal(
                 iced::widget::scrollable::Scrollbar::new()
-                    .width(6)
-                    .scroller_width(6),
+                    .width(theme::SCROLLBAR_INLINE_W)
+                    .scroller_width(theme::SCROLLBAR_INLINE_W),
             ))
             .width(Length::Fill)
             .into()
@@ -5078,15 +5164,17 @@ impl App {
                     Some(RemoteImage::Failed) | None => placeholder(src),
                 }
             } else {
-                let external = src.contains("://") || src.starts_with('/');
+                // Local sources resolve through the core's link resolution (buffer-dir for
+                // relative, workspace-root for a leading `/` — docs/markdown-view.md §2.4),
+                // so images and links can't drift. `//host` protocol-relative isn't local
+                // (no scheme, but not a path either) — it falls to the placeholder via the
+                // exists() filter after the root-join defangs it.
+                let external = src.contains("://");
                 let resolved = (!external)
                     .then(|| {
                         self.session
-                            .buffer
-                            .path
-                            .as_deref()
-                            .and_then(|p| std::path::Path::new(p).parent())
-                            .map(|dir| dir.join(src))
+                            .read_resolve_path(src)
+                            .map(std::path::PathBuf::from)
                     })
                     .flatten()
                     .filter(|p| p.exists());

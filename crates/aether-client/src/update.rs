@@ -405,9 +405,12 @@ impl Session {
         match event {
             Event::CursorMsg(Ok(cursor)) => {
                 self.buffer.cursor = cursor;
-                Effects::one(Effect::RevealCursor(RevealStyle::Follow))
+                // A staged cross-file-anchor parse installs now — the cursor is on the
+                // heading, so the first paint lands in place (§2.4).
+                self.install_staged_read()
+                    .and(Effects::one(Effect::RevealCursor(RevealStyle::Follow)))
             }
-            Event::CursorMsg(Err(e)) => Effects::error(e),
+            Event::CursorMsg(Err(e)) => self.install_staged_read().and(Effects::error(e)),
 
             // Go-to-line and other targeted motions reveal as a jump (rest a quarter down).
             Event::CursorJump(Ok(cursor)) => self.jump_to_cursor(cursor),
@@ -484,14 +487,27 @@ impl Session {
                 if read.buffer_id != self.buffer.buffer_id {
                     return Effects::none(); // buffer switched under the fetch
                 }
-                read.adopt(c.revision, c.text);
-                // The buffer moved on while the fetch was in flight — chase the newer revision.
+                // The buffer moved on while the fetch was in flight — chase the newer
+                // revision. A pending anchor stays armed for the fresh fetch, and the view
+                // stays loading meanwhile (the anchor-hold invariant: no paint before place).
                 if self.buffer.revision > c.revision {
+                    if self.pending_read_anchor.is_none() {
+                        read.adopt(c.revision, c.text);
+                    }
                     return self.refetch_read_content();
                 }
+                // A followed cross-file anchor is pending: stage the parse instead of
+                // installing it — the document paints once, already in place (§2.4).
+                if self.pending_read_anchor.is_some() {
+                    let mut staged = ReadView::loading(self.buffer.buffer_id);
+                    staged.adopt(c.revision, c.text);
+                    return self.stage_read_place(staged);
+                }
+                read.adopt(c.revision, c.text);
                 self.read_fence_requests()
             }
             Event::ReadContent(Err(e)) => {
+                self.pending_read_anchor = None;
                 // Fall back to the editor rather than showing an empty page.
                 if self.read.take().is_some() && self.mode == Mode::Read {
                     self.mode = Mode::Normal;
@@ -1799,6 +1815,12 @@ impl Session {
             // Same buffer — the open-route flag (a cross-buffer concern) must not leak into the
             // next genuine switch.
             self.open_route_jumped = false;
+            if self.pending_read_anchor.is_some() && self.read.is_some() {
+                // `[x](./this-file.md#section)`: the target is the document already on
+                // screen, so the anchor resolves against the live parse — no refetch fires.
+                return self.consume_read_anchor();
+            }
+            self.pending_read_anchor = None;
             self.jump_to_cursor(open.cursor)
         } else {
             self.adopt_switch(open)
@@ -1851,6 +1873,9 @@ impl Session {
         if want {
             self.begin_read()
         } else {
+            // A pending cross-file anchor can only land in a reading view; this switch went
+            // to the editor (non-markdown target, or a jump-shaped route), so drop it.
+            self.pending_read_anchor = None;
             Effects::none()
         }
     }
@@ -2079,6 +2104,9 @@ impl Session {
         jump_to: Option<LogicalPosition>,
         jump_to_anchor: Option<LogicalPosition>,
     ) -> Effects {
+        // Any fresh open invalidates a not-yet-landed cross-file anchor (`read_follow_link`
+        // re-arms after this call for its own open).
+        self.pending_read_anchor = None;
         let (path_index, relative_path, absolute_path) =
             match strip_longest_root(&path, &self.workspace_paths) {
                 Some((idx, rel)) => (Some(idx), Some(rel), None),
@@ -5592,9 +5620,7 @@ impl Session {
             Mode::Normal => Some(HintCtx::Normal),
             Mode::Insert => Some(HintCtx::Insert),
             Mode::Search => Some(HintCtx::Search),
-            // No Read-context hints yet (a curriculum entry is reading-view polish); the corner
-            // stays quiet while reading.
-            Mode::Read => None,
+            Mode::Read => Some(HintCtx::Read),
         }
     }
 
@@ -5604,7 +5630,22 @@ impl Session {
         HintFacts {
             workspaces_listed: self.picker.as_ref().and_then(|p| p.listed_workspaces()),
             mandatory_chooser: self.is_placeholder(),
+            markdown_buffer: self.buffer.language.as_deref() == Some("markdown"),
+            read_block_has_targets: self.read_block_has_targets(),
         }
+    }
+
+    /// Whether the reading view's focused block contains interactive elements — the fact
+    /// gating the link-selection hints (`l/h`, Enter, Tab) to moments they can act.
+    fn read_block_has_targets(&self) -> bool {
+        let Some(read) = self.read.as_ref() else {
+            return false;
+        };
+        let Some(idx) = read.block_focus(self.buffer.cursor.position) else {
+            return false;
+        };
+        let span = read.elements[idx].span();
+        !crate::markdown::interactive_within(&read.elements, span).is_empty()
     }
 
     /// The shared preamble of every hint-engine call: stamp the current facts and resolve the
@@ -7286,6 +7327,12 @@ impl Session {
                 if lower.starts_with("http://") || lower.starts_with("https://") {
                     return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(src)));
                 }
+                // Protocol-relative: a URL, like the link branch — default to https.
+                if let Some(rest) = src.strip_prefix("//") {
+                    return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(format!(
+                        "https://{rest}"
+                    ))));
+                }
                 if has_url_scheme(&src) {
                     return Effects::toast_grouped(
                         format!("Can't open image source {src}"),
@@ -7293,10 +7340,21 @@ impl Session {
                         "read-view",
                     );
                 }
-                // An absolute source can't ride the asset route (it's relative-only);
+                // A leading `/` resolves workspace-root-relative like any link target
+                // (`read_resolve_path`) and rides the asset route on the web. When it stays
+                // filesystem-absolute (buffer outside every root), it can't ride the route —
                 // the natives still open it, the web no-ops like its placeholder rendering.
                 if src.starts_with('/') {
-                    return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(src)));
+                    return match self.read_resolve_path(&src) {
+                        Some(abs) if abs != src => {
+                            Effects::one(Effect::ShellAction(ShellAction::OpenBufferFile {
+                                absolute: abs,
+                                buffer_id: self.buffer.buffer_id,
+                                relative: src,
+                            }))
+                        }
+                        _ => Effects::one(Effect::ShellAction(ShellAction::OpenUrl(src))),
+                    };
                 }
                 match self.read_resolve_path(&src) {
                     Some(absolute) => {
@@ -7313,7 +7371,22 @@ impl Session {
                     ),
                 }
             }
-            Act::Footnote(pos) => self.move_motion(Motion::Goto { position: pos }, false),
+            Act::Footnote(pos) => self.read_jump_recorded(pos),
+        }
+    }
+
+    /// Land an in-document *jump* — an anchor or footnote follow — as a nav-recorded move:
+    /// re-open the current buffer with `record_nav_from` + `jump_to`, the same `buffer/open`
+    /// composite cross-file follows and goto-definition ride, so `Backspace` returns. The
+    /// same-buffer open is "a move, not a switch": nothing is discarded client- or
+    /// server-side (see `adopt_navigation` and the handler's already-open branch), and jumps
+    /// deliberately don't feed the motion history — `z` stays the undo for *motions*
+    /// (j/k/o/g/v/search), `Backspace` the way back from *jumps*, in both modes. A pathless
+    /// (scratch) buffer can't re-open itself: plain Goto, unrecorded.
+    fn read_jump_recorded(&mut self, target: LogicalPosition) -> Effects {
+        match self.buffer.path.clone() {
+            Some(path) => self.open_path_at(path, Some(target), None),
+            None => self.move_motion(Motion::Goto { position: target }, false),
         }
     }
 
@@ -7383,7 +7456,15 @@ impl Session {
                 };
                 read.pos_of(read.elements[idx].span().start)
             };
-            return self.move_motion(Motion::Goto { position: target }, false);
+            return self.read_jump_recorded(target);
+        }
+        // Protocol-relative (`//cdn.example.com/x`): a URL, not a path — resolve it the way a
+        // browser would, defaulting to https (GitHub's reading). Without this it would fall
+        // through to the root-relative path branch and resolve to garbage.
+        if let Some(rest) = href.strip_prefix("//") {
+            return Effects::one(Effect::ShellAction(ShellAction::OpenUrl(format!(
+                "https://{rest}"
+            ))));
         }
         // An unhandled scheme (`ftp:`, `tel:`, …): say so rather than treating it as a relative
         // path and opening a bogus buffer named after the URL.
@@ -7394,12 +7475,23 @@ impl Session {
                 "read-view",
             );
         }
-        // A path, possibly with a `#fragment` (dropped in v1 — cross-file anchors are a polish
-        // item). File-shaped, so a markdown target opens as a reading view: a doc tree browses
-        // like a wiki, and `Alt-Left`/Backspace walks back (nav-recorded like any preview open).
-        let path_part = href.split('#').next().unwrap_or(href);
+        // A path, possibly with a `#fragment`: the file opens now; the fragment becomes the
+        // pending anchor, landed by [`Self::consume_read_anchor`] once the target document is
+        // parsed (heading slugs don't exist before then). File-shaped, so a markdown target
+        // opens as a reading view: a doc tree browses like a wiki, and `Alt-Left`/Backspace
+        // walks back (nav-recorded like any preview open).
+        let (path_part, fragment) = match href.split_once('#') {
+            Some((path, frag)) if !frag.is_empty() => (path, Some(frag.to_string())),
+            Some((path, _)) => (path, None),
+            None => (href, None),
+        };
         match self.read_resolve_path(path_part) {
-            Some(path) => self.open_path_at(path, None, None),
+            Some(path) => {
+                // Set *after* the open — `open_path_at` clears any stale anchor at entry.
+                let fx = self.open_path_at(path, None, None);
+                self.pending_read_anchor = fragment;
+                fx
+            }
             None => Effects::toast_grouped(
                 "Can't resolve the link target",
                 ToastKind::Warning,
@@ -7408,12 +7500,102 @@ impl Session {
         }
     }
 
-    /// Resolve a (possibly relative) link/image target against the buffer's directory. `None`
-    /// for a scratch buffer with a relative target. Callers scheme-check first — a URL joined
-    /// onto the buffer directory is never meaningful.
-    fn read_resolve_path(&self, target: &str) -> Option<String> {
+    /// The deferred half of a *cross-file* anchor at content adoption: resolve the slug
+    /// against the freshly-staged parse, send the Goto, and hold the parse back — the
+    /// visible view stays "Loading…" for the one `cursor/move` round-trip, and
+    /// [`Self::install_staged_read`] swaps it in when the cursor lands, so the document
+    /// paints exactly once, already in place (docs/markdown-view.md §2.4 — the editor's
+    /// paint-once property for cross-file goto-def). A slug with no match installs
+    /// immediately with the in-document branch's toast: nothing to place, and the hold must
+    /// never outlive its reason.
+    fn stage_read_place(&mut self, staged: ReadView) -> Effects {
+        let Some(slug) = self.pending_read_anchor.take() else {
+            return Effects::none();
+        };
+        let Some(read) = self.read.as_mut() else {
+            return Effects::none();
+        };
+        match crate::markdown::heading_by_slug(&staged.elements, &slug) {
+            Some(idx) => {
+                let target = staged.pos_of(staged.elements[idx].span().start);
+                read.staged = Some(Box::new(staged));
+                self.move_motion(Motion::Goto { position: target }, false)
+            }
+            None => {
+                *read = staged;
+                self.read_fence_requests().and(Effects::toast_grouped(
+                    format!("No heading matches #{slug}"),
+                    ToastKind::Warning,
+                    "read-view",
+                ))
+            }
+        }
+    }
+
+    /// Install a staged reading-view parse once its anchor's cursor has landed — or failed:
+    /// the hold must never wedge the view in "Loading…". No-op when nothing is staged.
+    fn install_staged_read(&mut self) -> Effects {
+        let Some(read) = self.read.as_mut() else {
+            return Effects::none();
+        };
+        match read.staged.take() {
+            Some(staged) => {
+                *read = *staged;
+                self.read_fence_requests()
+            }
+            None => Effects::none(),
+        }
+    }
+
+    /// Land a pending cross-file anchor whose target is the document already on screen
+    /// (`adopt_navigation`'s same-buffer branch): the live parse has the slugs, so this
+    /// resolves immediately — no staging, the document is already painted. The in-document
+    /// `#anchor` branch, one open later.
+    fn consume_read_anchor(&mut self) -> Effects {
+        let Some(slug) = self.pending_read_anchor.take() else {
+            return Effects::none();
+        };
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(idx) = crate::markdown::heading_by_slug(&read.elements, &slug) else {
+                return Effects::toast_grouped(
+                    format!("No heading matches #{slug}"),
+                    ToastKind::Warning,
+                    "read-view",
+                );
+            };
+            read.pos_of(read.elements[idx].span().start)
+        };
+        self.move_motion(Motion::Goto { position: target }, false)
+    }
+
+    /// Resolve a (possibly relative) link/image target against the buffer. A leading `/` is
+    /// **workspace-root-relative** (GitHub semantics, docs/markdown-view.md §2.4): it joins
+    /// the root containing the buffer (longest match, like every root computation). A buffer
+    /// outside every root has no anchor, so such a target keeps its filesystem-absolute
+    /// reading — the only sensible meaning there. Relative targets join the buffer's
+    /// directory; `None` for a scratch buffer with a relative target. Callers scheme-check
+    /// first — a URL joined onto either base is never meaningful. `pub`: the iced shell
+    /// resolves image sources through this, so links and images can't drift.
+    pub fn read_resolve_path(&self, target: &str) -> Option<String> {
         if target.starts_with('/') {
-            return Some(target.to_string());
+            let root = self
+                .buffer
+                .path
+                .as_deref()
+                .and_then(|p| strip_longest_root(p, &self.workspace_paths))
+                .map(|(idx, _)| self.workspace_paths[idx as usize].as_str());
+            return Some(match root {
+                // `trim_start_matches`, not `[1..]`: a `//host` slipping through must not
+                // re-absolutize the join (`Path::join` with a leading `/` replaces the base).
+                Some(root) => std::path::Path::new(root)
+                    .join(target.trim_start_matches('/'))
+                    .to_string_lossy()
+                    .into_owned(),
+                None => target.to_string(),
+            });
         }
         let parent = std::path::Path::new(self.buffer.path.as_deref()?).parent()?;
         Some(parent.join(target).to_string_lossy().into_owned())
@@ -7717,6 +7899,218 @@ fn lsp_readiness_message(readiness: LspReadiness) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session reading `/proj/docs/a.md`, ready to follow links.
+    fn reading_session() -> Session {
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        s.buffer.path = Some("/proj/docs/a.md".into());
+        s.mode = Mode::Read;
+        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        s
+    }
+
+    /// Cross-file anchors (docs/markdown-view.md §2.4): following `[x](./other.md#section)`
+    /// opens the file and arms the fragment; the anchor lands as a `cursor/move` Goto once
+    /// the target document's reading view adopts.
+    #[test]
+    fn cross_file_anchor_lands_after_target_adopts() {
+        let mut s = reading_session();
+        let fx = s.read_follow_link("./other.md#section-two");
+        assert!(
+            fx.0.iter()
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "buffer/open")),
+            "the link target opens"
+        );
+        assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
+
+        // The switch lands: the new buffer's reading view fetches and adopts its content.
+        s.buffer.buffer_id += 1;
+        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
+            revision: 0,
+            text: "# One\n\ntext\n\n## Section Two\n\nbody\n".into(),
+        })));
+        assert_eq!(s.pending_read_anchor, None, "the anchor is consumed");
+        // The parse is *staged*, not installed: the visible view stays "Loading…" for the
+        // cursor round-trip, so the document paints exactly once, already in place (§2.4).
+        let read = s.read.as_ref().unwrap();
+        assert!(
+            read.loading && read.blocks.is_empty(),
+            "held back while the Goto flies"
+        );
+        let staged = read.staged.as_deref().expect("parse staged behind the anchor");
+        let idx = crate::markdown::heading_by_slug(&staged.elements, "section-two").unwrap();
+        let expected = staged.pos_of(staged.elements[idx].span().start);
+        let goto = fx
+            .0
+            .iter()
+            .find_map(|e| match e {
+                Effect::Request { method, params, .. } if *method == "cursor/move" => {
+                    Some(params.clone())
+                }
+                _ => None,
+            })
+            .expect("the anchor lands as a cursor move");
+        assert_eq!(
+            goto["motion"],
+            serde_json::to_value(Motion::Goto { position: expected }).unwrap(),
+            "…to the heading's position"
+        );
+
+        // The cursor reply installs the staged parse — the first paint is in place.
+        s.on_event(Event::CursorMsg(Ok(CursorState {
+            position: expected,
+            anchor: expected,
+            match_bracket: None,
+            jumplist_position: None,
+        })));
+        let read = s.read.as_ref().unwrap();
+        assert!(
+            !read.loading && !read.blocks.is_empty(),
+            "installed on landing"
+        );
+        assert!(read.staged.is_none());
+        assert_eq!(s.buffer.cursor.position, expected);
+    }
+
+    /// A fragment naming no heading in the target document warns (same toast as the
+    /// in-document branch) instead of moving the cursor.
+    #[test]
+    fn cross_file_anchor_missing_heading_warns() {
+        let mut s = reading_session();
+        s.read_follow_link("./other.md#nope");
+        assert_eq!(s.pending_read_anchor.as_deref(), Some("nope"));
+        s.buffer.buffer_id += 1;
+        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
+            revision: 0,
+            text: "# Only Heading\n".into(),
+        })));
+        assert_eq!(s.pending_read_anchor, None);
+        assert!(
+            fx.0.iter().any(|e| matches!(
+                e,
+                Effect::Toast {
+                    kind: ToastKind::Warning,
+                    ..
+                }
+            )),
+            "a missing anchor warns"
+        );
+        assert!(
+            !fx.0
+                .iter()
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "cursor/move")),
+            "…and moves nothing"
+        );
+        // Nothing to place, so no hold: the document installs immediately.
+        let read = s.read.as_ref().unwrap();
+        assert!(!read.loading && !read.blocks.is_empty() && read.staged.is_none());
+    }
+
+    /// In-document anchors are *jumps*, not motions (docs/markdown-view.md §2.4): following
+    /// `#section` re-opens the current buffer with `record_nav_from` + `jump_to` — the same
+    /// composite cross-file follows and goto-definition ride — so `Backspace` returns.
+    #[test]
+    fn in_document_anchor_follow_is_nav_recorded() {
+        let mut s = reading_session();
+        s.read
+            .as_mut()
+            .unwrap()
+            .adopt(0, "# One\n\ntext\n\n## Section Two\n\nbody\n".into());
+        let fx = s.read_follow_link("#section-two");
+        let open = fx
+            .0
+            .iter()
+            .find_map(|e| match e {
+                Effect::Request { method, params, .. } if *method == "buffer/open" => {
+                    Some(params.clone())
+                }
+                _ => None,
+            })
+            .expect("an in-document anchor rides buffer/open");
+        assert_eq!(
+            open["record_nav_from"],
+            serde_json::json!(s.buffer.buffer_id),
+            "the origin is recorded"
+        );
+        let read = s.read.as_ref().unwrap();
+        let idx = crate::markdown::heading_by_slug(&read.elements, "section-two").unwrap();
+        let expected = read.pos_of(read.elements[idx].span().start);
+        assert_eq!(
+            open["jump_to"],
+            serde_json::to_value(expected).unwrap(),
+            "…and the jump lands on the heading"
+        );
+
+        // Missing slugs still resolve client-side: toast, no RPC, no stray nav entry.
+        let fx = s.read_follow_link("#nope");
+        assert!(fx.0.iter().all(|e| !matches!(e, Effect::Request { .. })));
+        assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
+    }
+
+    /// A leading `/` resolves workspace-root-relative (GitHub semantics, longest matching
+    /// root); a buffer outside every root keeps the filesystem-absolute reading; `//host`
+    /// targets are URLs, not paths.
+    #[test]
+    fn root_relative_targets_resolve_against_the_buffers_root() {
+        let mut s = reading_session();
+        assert_eq!(
+            s.read_resolve_path("/other.md").as_deref(),
+            Some("/proj/other.md")
+        );
+        assert_eq!(
+            s.read_resolve_path("/a/b.png").as_deref(),
+            Some("/proj/a/b.png")
+        );
+        // Buffer-dir joins are textual (the OS normalizes `./` at open) — unchanged.
+        assert_eq!(
+            s.read_resolve_path("./x.md").as_deref(),
+            Some("/proj/docs/./x.md")
+        );
+
+        // Composes with cross-file anchors: the fragment splits off before resolution.
+        let fx = s.read_follow_link("/other.md#section-two");
+        assert!(
+            fx.0.iter()
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "buffer/open")),
+            "a root-relative link opens"
+        );
+        assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
+
+        // Outside every root there is no anchor — the filesystem-absolute reading stands.
+        s.buffer.path = Some("/elsewhere/notes.md".into());
+        assert_eq!(
+            s.read_resolve_path("/etc/hosts").as_deref(),
+            Some("/etc/hosts")
+        );
+
+        // Protocol-relative is a URL: open it, https-defaulted, never root-join it.
+        let fx = s.read_follow_link("//cdn.example.com/x.png");
+        assert!(
+            fx.0.iter().any(|e| matches!(
+                e,
+                Effect::ShellAction(ShellAction::OpenUrl(u)) if u == "https://cdn.example.com/x.png"
+            )),
+            "protocol-relative opens as a URL"
+        );
+    }
+
+    /// A pending anchor is armed for exactly one open: any unrelated `open_path_at`
+    /// disarms it, and a plain (fragment-less) follow arms nothing.
+    #[test]
+    fn unrelated_open_disarms_pending_anchor() {
+        let mut s = reading_session();
+        s.read_follow_link("./other.md#section");
+        assert!(s.pending_read_anchor.is_some());
+        s.open_path_at("/proj/src/main.rs".into(), None, None);
+        assert_eq!(s.pending_read_anchor, None, "a fresh open disarms the anchor");
+
+        s.read_follow_link("./plain.md");
+        assert_eq!(s.pending_read_anchor, None, "no fragment, nothing armed");
+    }
 
     // Mirrors the TUI's seeded_filters_for_switch tests: the explorer's visibility filters
     // invert for Grep (its walk excludes what the listing shows), and Files takes only

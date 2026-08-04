@@ -425,17 +425,28 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
             });
         }
         Block::FrontMatter { text, .. } => {
+            // The dim literal panel's terminal projection: a thin light rule beside dim italic
+            // lines — lighter than the quote's heavy `┃` bar, marking literal metadata rather
+            // than speech (web/iced draw the same thin rule in NORD2).
             for line in text.lines() {
                 out.push(ReadRow {
-                    spans: vec![ReadSpan {
-                        text: line.to_string(),
-                        style: SpanStyle {
-                            italic: true,
-                            ..SpanStyle::plain(SpanKind::Dim)
+                    spans: vec![
+                        ReadSpan {
+                            text: "│ ".into(),
+                            style: SpanStyle::plain(SpanKind::Dim),
+                            element: None,
+                            syntax: None,
                         },
-                        element: None,
-                        syntax: None,
-                    }],
+                        ReadSpan {
+                            text: line.to_string(),
+                            style: SpanStyle {
+                                italic: true,
+                                ..SpanStyle::plain(SpanKind::Dim)
+                            },
+                            element: None,
+                            syntax: None,
+                        },
+                    ],
                     element: own,
                 });
             }
@@ -1007,6 +1018,21 @@ mod tests {
         assert_eq!(rows[0].element, Some(0));
         assert_eq!(rows[3].element, Some(1));
         assert_eq!(rows[4].element, Some(1));
+    }
+
+    #[test]
+    fn front_matter_renders_thin_rule_and_dim_lines() {
+        let md = "---\ntitle: X\ntags: [a, b]\n---\n\n# H\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 40, &Default::default());
+        let text = rows_text(&rows);
+        assert_eq!(text[0], "│ title: X");
+        assert_eq!(text[1], "│ tags: [a, b]");
+        let spans = &rows[0].spans;
+        assert_eq!(spans[0].style, SpanStyle::plain(SpanKind::Dim), "thin rule is dim, upright");
+        assert!(spans[1].style.italic, "metadata text stays italic dim");
+        assert_eq!(spans[1].style.kind, SpanKind::Dim);
     }
 
     #[test]

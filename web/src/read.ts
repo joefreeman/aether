@@ -301,9 +301,10 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
   }
 }
 
-/** An image node: relative sources ride the server's confined asset route; remote http(s)
- *  sources load directly (the browser fetches; an `<img>` context never runs SVG scripts).
- *  Other schemes and absolute local paths render as their alt text. A display image's wrapper
+/** An image node: relative and root-relative sources ride the server's confined asset route;
+ *  remote http(s) sources load directly (the browser fetches; an `<img>` context never runs
+ *  SVG scripts). Other schemes and protocol-relative URLs render as their alt text. A display
+ *  image's wrapper
  *  carries the block span (the bar host) while the `<img>` carries `innerSpan` — the Enter
  *  target — so the `.md-target` ring appears only once `l` arms it. */
 function renderImage(
@@ -316,8 +317,11 @@ function renderImage(
 ): Node {
   const remote = /^https?:/i.test(src);
   const external = /^[a-z][a-z0-9+.-]*:/i.test(src);
-  const absolute = src.startsWith("/");
-  if ((external && !remote) || absolute) {
+  // Root-relative sources (`/img.png`) ride the asset route like any relative source — the
+  // server resolves the leading `/` against the buffer's workspace root (GitHub semantics)
+  // and 404s for buffers outside every root, where the alt text renders. Protocol-relative
+  // (`//host/…`) and non-http schemes stay placeholders.
+  if ((external && !remote) || src.startsWith("//")) {
     const ph = document.createElement(block ? "div" : "span");
     ph.className = block ? "md-image-alt md-image-block" : "md-image-alt";
     stamp(ph, span);

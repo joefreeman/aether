@@ -5279,7 +5279,10 @@ pub async fn syntax_highlight_snippet(
     let empty = || aether_protocol::syntax::SyntaxHighlightSnippetResult {
         highlights: Vec::new(),
     };
-    let Some(config) = crate::syntax::get_config(&params.language) else {
+    // The client sends the fence's full info string (the shells display it verbatim); the
+    // first token names the grammar, the rest is fence metadata (```rust ignore).
+    let Some(config) = crate::syntax::get_config(crate::syntax::fence_language(&params.language))
+    else {
         return Ok(empty());
     };
     let mut parser = crate::syntax::make_parser(config);

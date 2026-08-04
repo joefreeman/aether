@@ -157,7 +157,7 @@ async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
         return not_found();
     };
     let rel = percent_decode(rel_enc);
-    if rel.is_empty() || rel.starts_with('/') {
+    if rel.is_empty() {
         return not_found();
     }
     // Image types the reading view renders; anything else is refused.
@@ -193,12 +193,26 @@ async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
     // parent derives from a canonical path; roots are canonicalized here for the comparison —
     // a configured-but-not-canonical root (a symlinked home, say) would otherwise silently
     // narrow confinement to the buffer's own directory and 404 legitimate `../` images.
-    let confine = roots
+    // Longest matching root, mirroring the client's `strip_longest_root` — the root-relative
+    // arm below must pick the same root the client's link resolution does for nested roots.
+    let root = roots
         .iter()
         .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
-        .find(|r| parent.starts_with(r))
-        .unwrap_or_else(|| parent.clone());
-    let Ok(canon) = parent.join(&rel).canonicalize() else {
+        .filter(|r| parent.starts_with(r))
+        .max_by_key(|r| r.as_os_str().len());
+    let confine = root.clone().unwrap_or_else(|| parent.clone());
+    // Root-relative sources (a leading `/`, GitHub semantics — docs/markdown-view.md §2.4)
+    // resolve against the buffer's containing root; that root *is* the confinement root, so
+    // the join can't widen it. A buffer outside every root has no anchor — such sources stay
+    // filesystem-absolute, which the web declines (the natives open them directly).
+    let joined = match rel.strip_prefix('/') {
+        Some(rest) => match &root {
+            Some(root) => root.join(rest.trim_start_matches('/')),
+            None => return not_found(),
+        },
+        None => parent.join(&rel),
+    };
+    let Ok(canon) = joined.canonicalize() else {
         return not_found();
     };
     if !canon.starts_with(&confine) {

@@ -160,6 +160,21 @@ fn tsx_highlights() -> &'static str {
         .as_str()
 }
 
+/// The language token of a markdown fence info string — everything up to the first whitespace
+/// or comma. CommonMark leaves the info string open ("the first word is typically used to
+/// specify the language"): trailing words are tool metadata (` ```python title="x.py" `) and
+/// rustdoc separates attributes with commas (` ```rust,no_run `). Language names contain
+/// neither, so the cut is lossless. The editing-mode injection path gets this for free —
+/// tree-sitter-md's `language` node stops at whitespace/comma — so this helper is the snippet
+/// RPC's equivalent for the raw info string the reading view sends ([`get_config`] stays
+/// strict); shells keep displaying the full string.
+pub fn fence_language(info: &str) -> &str {
+    info.trim_start()
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or_default()
+}
+
 /// Resolve a language name (canonical or alias) to its config. The alias arms below **are** the
 /// extension table: every extension we detect (`"rs"`, `"py"`, `"tfvars"`) is listed as an alias
 /// alongside the markdown-fence short names (`"sh"`, `"js"`, `"yml"`), so extension-based
@@ -1126,6 +1141,39 @@ mod tests {
             highlights.iter().any(|h| h.kind == "text.strong"),
             "standalone markdown_inline should highlight strong, got {highlights:?}"
         );
+    }
+
+    #[test]
+    fn fence_language_takes_first_token() {
+        assert_eq!(fence_language("rust"), "rust");
+        assert_eq!(fence_language("rust ignore"), "rust");
+        assert_eq!(fence_language("rust,no_run"), "rust");
+        assert_eq!(fence_language("python title=\"hello.py\""), "python");
+        assert_eq!(fence_language(" rust\t"), "rust");
+        assert_eq!(fence_language(""), "");
+    }
+
+    /// Fence info strings carry metadata after the language (```rust ignore, ```rust,no_run —
+    /// CommonMark: "the first word is typically used to specify the language"); the fence
+    /// still injects. Here the *grammar* does the splitting — tree-sitter-md's `language`
+    /// node stops at whitespace/comma — pinned so a grammar bump that changes it shows up;
+    /// the snippet-RPC path relies on [`fence_language`] instead.
+    #[test]
+    fn fence_info_string_metadata_still_resolves_injection() {
+        for source in [
+            "```rust ignore\nfn main() {}\n```\n",
+            "```rust,no_run\nfn main() {}\n```\n",
+        ] {
+            let cfg = get_config("markdown").unwrap();
+            let mut parser = make_parser(cfg);
+            let tree = parser.parse(source, None).unwrap();
+            let injections = compute_injections(cfg, &tree, source);
+            assert!(
+                injections.iter().any(|l| l.config.name == "rust"),
+                "expected a rust layer for {source:?}, got {:?}",
+                injections.iter().map(|l| l.config.name).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

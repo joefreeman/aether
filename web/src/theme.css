@@ -3,11 +3,15 @@
   --nord0: #2e3440; /* main background */
   --nord1: #3b4252; /* status line / panel */
   --nord2: #434c5e; /* selection background */
-  --nord3: #4c566a; /* comments / dim */
+  --nord3: #4c566a; /* dim — hit/sneak fills, muted glyphs */
   --nord3-bright: #616e88; /* lighter dim (the terminal's ignored-entry shade) */
   /* Off-palette, brighter still: dim-but-legible text on the picker's NORD1 panel. The picker
      sits on NORD1 (the terminal's picker rows sit on NORD0), so the terminal's dim shades read
-     too dark here — this lifts them while staying clearly subordinate to NORD4/NORD6 text. */
+     too dark here — this lifts them while staying clearly subordinate to NORD4/NORD6 text.
+     Also the syntax comment colour (.hl-comment): NORD3 comments were ~1.4:1 against the reading
+     view's NORD1 code panels; this shade reaches ~2.8:1 there (~3.5:1 on the editor) while
+     staying below NORD9 keywords — the dimmest real syntax colour — so the salience ladder
+     keeps its order. */
   --nord3-brighter: #7b88a1;
   --nord4: #d8dee9; /* main foreground */
   --nord6: #eceff4; /* Snow Storm — brightest (picker text) */
@@ -507,9 +511,10 @@ html, body, #app {
    selection paints over it in the more saturated NORD10, and the cursor over that. Precedence is
    source order (all single-class): search-hit < selection < cursor. */
 .search-hit { background: var(--nord3); }
-/* Comments are themed NORD3 too, so a match inside one would be invisible on the NORD3 fill. Lift
-   just that text to the normal foreground (the italic from .hl-comment stays); the compound selector
-   outranks .hl-comment so this wins. Every other syntax color reads fine on NORD3. */
+/* Comments are themed NORD3-BRIGHTER — only ~2:1 against the NORD3 fill — so a match inside one
+   would be barely legible. Lift just that text to the normal foreground (the italic from
+   .hl-comment stays); the compound selector outranks .hl-comment so this wins. Every other
+   syntax color reads fine on NORD3. */
 .search-hit.hl-comment { color: var(--nord4); }
 .sel { background: var(--nord10); }
 /* Selected-whitespace indicators (terminal parity): a muted NORD3 glyph over the selection blue —
@@ -546,6 +551,9 @@ html, body, #app {
 /* The rest of the typed prefix: the typed characters on a cooler, brighter band than the word tint
    (a lighter slate) — between it and the bright label cell in prominence. */
 .sneak-chip { background: #616e88; }
+/* Comment text on the chip band is ~1.5:1 — lift it like the hit/target rules above (terminal
+   parity: the TUI lifts dim foregrounds on this band too). */
+.sneak-chip.hl-comment { color: var(--nord4); }
 /* End-of-line git blame for the cursor line. */
 .blame-eol { color: var(--nord3); font-style: italic; }
 
@@ -1125,7 +1133,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .hl-keyword { color: var(--nord9); }
 .hl-string { color: var(--nord14); }
 .hl-string-special { color: var(--nord13); }
-.hl-comment { color: var(--nord3); font-style: italic; }
+.hl-comment { color: var(--nord3-brighter); font-style: italic; }
 .hl-constant { color: var(--nord15); }
 .hl-function { color: var(--nord8); }
 .hl-macro { color: var(--nord12); }
@@ -1146,8 +1154,10 @@ a.picker-row:not(.selected):hover .picker-main {
    selection is deliberately re-enabled — reading is where select-to-copy belongs. */
 #buffer.md-read-host {
   font-family: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
-  /* No font-size of its own: the document renders at the *editor* text size (the buffer
-     font-size set on #app), so the buffer-font-size setting governs reading too. */
+  /* One step above the editor text size (the buffer font-size set on #app): reading wants
+     larger type than code. Em-relative, so the buffer-font-size setting still governs reading,
+     and the em-based measure below widens with it. Matches the native READ_SCALE. */
+  font-size: 1.125em;
   line-height: 1.65;
   white-space: normal;
   cursor: default;
@@ -1155,9 +1165,9 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 
 .md-read {
-  /* Relative to the buffer font size (inherited — the host sets none of its own), so a bigger
-     type setting keeps the same ~characters-per-line. Matches the native READ_MEASURE_EM;
-     42.5 × the 16px default = the original 680px. */
+  /* Relative to the reading size (inherited from the host's scaled em), so a bigger type
+     setting keeps the same ~characters-per-line. Matches the native READ_MEASURE_EM;
+     42.5 × the 18px default reading size = 765px. */
   max-width: 42.5em;
   margin: 0 auto;
   padding: 1.5rem 1rem;
@@ -1276,10 +1286,21 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 
 .md-read .md-table-outer { margin: 0.9em 0; }
-.md-read .md-table-scroll { overflow-x: auto; }
+/* No internal grid — the NORD1 header band and the zebra stripes carry the row structure
+   (native parity: iced's read_table draws no cell borders). The one outer frame lives on the
+   scroll wrapper because a collapsed table ignores border-radius; fit-content keeps it hugging
+   a narrow table instead of spanning the measure, and the overflow clip rounds the header
+   band's corners. While an overflowing table pans, the frame stays put and content slides
+   under it (iced pans frame-and-all; the fixed frame reads better, accepted divergence). */
+.md-read .md-table-scroll {
+  overflow-x: auto;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--nord3);
+  border-radius: 4px;
+}
 .md-read table { border-collapse: collapse; font-size: 0.95em; }
 .md-read th, .md-read td {
-  border: 1px solid var(--nord2);
   padding: 0.35em 0.75em;
   text-align: left;
 }

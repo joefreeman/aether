@@ -98,8 +98,9 @@ where
     }
 }
 
-/// Scrollbar width (rail + scroller) — narrower than iced's default chrome.
-const SCROLLBAR_W: f32 = 5.0;
+/// Scrollbar width (rail + scroller) — the shared buffer/chrome tier, far narrower than iced's
+/// default chrome.
+const SCROLLBAR_W: f32 = crate::theme::SCROLLBAR_W;
 
 /// Trailing slack (px) reserved past a chip-editor ghost layer's content, so the overlaid
 /// `text_input` has headroom and won't scroll its value to keep the end-of-line caret visible
