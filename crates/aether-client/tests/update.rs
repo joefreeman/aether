@@ -3329,7 +3329,6 @@ fn buffers_picker_close_closes_in_place() {
             relative_path: None,
             match_indices: vec![],
             transient: false,
-            dormant: false,
         }
     }
 
@@ -3417,7 +3416,6 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             relative_path: None,
             match_indices: vec![],
             transient: false,
-            dormant: false,
         }
     }
 

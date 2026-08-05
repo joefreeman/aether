@@ -2426,7 +2426,6 @@ impl Session {
                 relative_path: None,
                 match_indices: Vec::new(),
                 transient: false,
-                dormant: false,
             }),
             PickerKind::Workspaces => Some(PickerItem::Workspace {
                 name: self.workspace.clone(),
@@ -8312,7 +8311,6 @@ mod tests {
                     relative_path: None,
                     match_indices: vec![],
                     transient: false,
-                    dormant: false,
                 },
                 0,
             ),

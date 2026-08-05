@@ -531,7 +531,7 @@ pub async fn workspace_activate(
         // persisted session. Clean files become *dormant* (listed in the picker, loaded lazily — a
         // reserved id, no rope/LSP until materialized). Buffers carrying unsaved content (those with
         // a backup) are instead materialized *eagerly* (below, after the lock) so they come back as
-        // live, dirty buffers rather than greyed rows. Files deleted while the server was down with no
+        // live, dirty buffers rather than clean-looking dormant rows. Files deleted while the server was down with no
         // backup are dropped. No-op when sessions aren't persisted (`sessions_path` unset).
         if let Some(path) = s.sessions_path.clone() {
             if let Ok(sessions) = crate::config::load_workspace_sessions_at(&path) {
@@ -680,7 +680,7 @@ pub async fn workspace_activate(
     };
 
     // Eagerly materialize the restored buffers that carry unsaved content, so they come back as
-    // live, dirty buffers (visible and marked unsaved in the picker) rather than greyed dormant
+    // live, dirty buffers (marked unsaved in the picker) rather than clean-looking dormant
     // rows — the hot-exit promise. Each is opened by id through the normal open path, which loads
     // the file (or rebuilds the scratch) and overlays the backup. The landing buffer above may have
     // already materialized one of them; skip it. Best-effort: a single failure mustn't abort
@@ -11525,7 +11525,7 @@ fn build_buffer_candidates(
     for id in leftovers {
         out.push(buffer_candidate(&s.buffers[&id], &roots));
     }
-    // Dormant buffers (restored from the session, not yet loaded) come last, greyed out — but only
+    // Dormant buffers (restored from the session, not yet loaded) come last — but only
     // those whose file isn't already open as a live buffer above (a stale dormant entry that was
     // never pruned shouldn't double-show). MRU order is preserved by the list's own order.
     let live_paths: std::collections::HashSet<&std::path::Path> = s
@@ -11545,10 +11545,10 @@ fn build_buffer_candidates(
 }
 
 /// Picker candidate for a dormant (session-restored, not-yet-loaded) buffer: it carries the
-/// reserved id as its picker identity and renders greyed out, but has no live buffer behind it. A
-/// file's display/path is derived from its path; a dormant scratch shows `(scratch N)` and has no
-/// opener path. The status is always `Clean` — the dormant row predates loading, so its
-/// unsaved-from-backup state only shows once it's materialized.
+/// reserved id as its picker identity, but has no live buffer behind it. The row is
+/// indistinguishable from a live one — selecting it materializes the real buffer, so the
+/// distinction never changes what the user can do. A file's display/path is derived from its path;
+/// a dormant scratch shows `(scratch N)` and has no opener path.
 fn dormant_candidate(
     d: &crate::state::DormantBuffer,
     roots: &[std::path::PathBuf],
@@ -11575,7 +11575,6 @@ fn dormant_candidate(
         status,
         path,
         transient: false,
-        dormant: true,
     }
 }
 
@@ -11600,7 +11599,6 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
         status: buffer_dirty_state(buf),
         path,
         transient: buf.transient,
-        dormant: false,
     }
 }
 

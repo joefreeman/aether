@@ -706,8 +706,6 @@ function describePickerItem(
         matches: item.match_indices,
         suffix,
         italic: item.transient,
-        // Dormant (session-restored, not-yet-loaded) buffers render dimmed, like the native clients.
-        dim: item.dormant,
         dirty: item.status && item.status !== "clean" ? item.status : undefined,
       };
     }

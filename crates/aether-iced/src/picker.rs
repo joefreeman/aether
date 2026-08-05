@@ -1151,15 +1151,12 @@ fn render_item<'a>(
             path_index,
             match_indices,
             transient,
-            dormant,
             ..
         } => {
-            // A dormant (session-restored, not-yet-loaded) buffer renders dimmed to signal it isn't
-            // live yet.
             let mut r = row![highlighted(
                 display,
                 match_indices,
-                if *dormant { theme::NORD3_BRIGHT } else { theme::NORD4 },
+                theme::NORD4,
                 if *transient { SANS_ITALIC } else { SANS },
                 hovered,
                 ui,

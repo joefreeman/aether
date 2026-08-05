@@ -2772,7 +2772,6 @@ fn picker_item_spans(
         path_index,
         match_indices,
         transient,
-        dormant,
         ..
     } = item
     {
@@ -2782,7 +2781,6 @@ fn picker_item_spans(
             match_indices,
             *status,
             *transient,
-            *dormant,
             tether == Some(*buffer_id),
             root_labels,
             highlighted,
@@ -3131,9 +3129,8 @@ fn file_item_spans(
 /// One Buffers-picker row: the buffer's path highlighted by `match_indices`, then (multi-root only)
 /// the disambiguated root label dim after the name — same placement as the Files picker — and a
 /// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the highlight
-/// lands only on the path, never the label. Transient buffers slant; dormant (session-restored,
-/// not-yet-loaded) rows dim their foreground; the session's tether gets the status bar's dim ` *`
-/// after the path (docs/tether.md — closing that row exits the client).
+/// lands only on the path, never the label. Transient buffers slant; the session's tether gets the
+/// status bar's dim ` *` after the path (docs/tether.md — closing that row exits the client).
 #[allow(clippy::too_many_arguments)]
 fn buffer_item_spans(
     path_index: Option<u32>,
@@ -3141,7 +3138,6 @@ fn buffer_item_spans(
     match_indices: &[u32],
     status: BufferDirtyState,
     transient: bool,
-    dormant: bool,
     tethered: bool,
     root_labels: &[String],
     highlighted: bool,
@@ -3153,10 +3149,6 @@ fn buffer_item_spans(
     if transient {
         base = base.add_modifier(Modifier::ITALIC);
         match_style = match_style.add_modifier(Modifier::ITALIC);
-    }
-    if dormant {
-        base = base.fg(NORD3);
-        match_style = match_style.fg(NORD3);
     }
     let label_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
 
@@ -7824,7 +7816,6 @@ mod tests {
             relative_path: None,
             match_indices: vec![],
             transient: false,
-            dormant: false,
         };
         let spans = picker_item_spans(&item(7), &[], Some(7), false, 40);
         assert!(

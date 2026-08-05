@@ -35,10 +35,6 @@ pub struct BufferCandidate {
     pub path: Option<(u32, String)>,
     /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
     pub transient: bool,
-    /// Buffer is dormant: restored from the session but not yet loaded (see
-    /// [`crate::state::DormantBuffer`]). The row renders greyed out; selecting it materializes the
-    /// real buffer. Mutually exclusive with `transient`.
-    pub dormant: bool,
 }
 
 /// One workspace-picker candidate. Built fresh per `picker/view` from
@@ -648,7 +644,6 @@ impl PickerCandidates {
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),
                     match_indices,
                     transient: c.transient,
-                    dormant: c.dormant,
                 }
             }
             PickerCandidates::Grep(v) => {

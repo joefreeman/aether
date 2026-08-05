@@ -340,8 +340,8 @@ pub struct WorkspaceEntry {
     /// Buffers restored from the persisted session ([`crate::config::WorkspaceSession`]) on
     /// activation but not yet loaded into memory — most-recently-used first, mirroring the order
     /// they were saved in. Each holds a reserved [`BufferId`] (its picker identity) and the file's
-    /// canonical path; it carries no rope/syntax/LSP. The buffer picker lists them greyed out
-    /// after the live buffers; opening one materializes a real buffer (see
+    /// canonical path; it carries no rope/syntax/LSP. The buffer picker lists them after the live
+    /// buffers, rendered identically to them; opening one materializes a real buffer (see
     /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
     /// live buffer in this workspace — promotion removes it.
     pub dormant_buffers: Vec<DormantBuffer>,
@@ -971,7 +971,7 @@ impl ServerState {
     }
 
     /// Remove the dormant entry for `canonical` from `workspace_name`, if present. Called when a live
-    /// buffer for that path opens, so the now-loaded file stops showing as a greyed dormant row.
+    /// buffer for that path opens, so the now-loaded file doesn't also show as a dormant row.
     pub fn promote_dormant(&mut self, workspace_name: &str, canonical: &Path) {
         if let Some(workspace) = self.workspaces.get_mut(workspace_name) {
             workspace
