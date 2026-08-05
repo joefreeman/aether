@@ -8,7 +8,7 @@
 //! pure function of `(blocks, elements, cols)` — shells cache it by `(buffer, revision, cols)`.
 
 use crate::markdown::{AlertKind, Block, ColAlign, Element, Inline, ListItem, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Maximum content columns — the reading measure. Wider viewports center the column
 /// (docs/markdown-view.md §2.8); the shell computes the margin via [`measure`].
@@ -75,8 +75,18 @@ pub enum SpanKind {
     AlertLabel(AlertKind),
     /// Horizontal rules and heading underlines.
     Rule,
+    /// The table frame: the border rows, and the two bars that close each row's ends. A row
+    /// band stops here — the frame reads as the frame, not as part of the banded interior.
     TableBorder,
+    /// A column divider *inside* a row (`│` between two cells) — drawn like the frame, but part
+    /// of the row's interior, so a band paints under it.
+    TableDivider,
     TableHead,
+    /// Cell padding on a banded table body row — every other row, so the eye can track one
+    /// across wide columns. The shell reads it as "band this row's interior" (spans that carry
+    /// their own background, like inline-code chips, keep it). The header row gets no band:
+    /// [`SpanKind::TableHead`] sets it apart with weight and colour instead.
+    TableStripe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +168,17 @@ pub fn hscroll_content_width(rows: &[ReadRow], element: usize) -> usize {
         .map(|r| r.spans.iter().map(|s| s.text.width()).sum())
         .max()
         .unwrap_or(0)
+}
+
+/// Whether `element` is a table rather than a code panel — the two pan through different
+/// windows: a panel always reserves the two pad/indicator columns, a table spends them only
+/// when it overflows (a fitting table sits flush with the prose, so its whole width is window).
+pub fn is_table_element(rows: &[ReadRow], element: usize) -> bool {
+    rows.iter().filter(|r| r.element == Some(element)).any(|r| {
+        r.spans
+            .iter()
+            .any(|s| matches!(s.style.kind, SpanKind::TableBorder))
+    })
 }
 
 // ---- internals ----------------------------------------------------------------------------------
@@ -571,30 +592,70 @@ fn layout_table(
     if ncols == 0 {
         return;
     }
-    // Natural column widths from cell content, capped so one huge cell wraps inside its
-    // column rather than exploding the row. No table-level shrinking: a table wider than the
-    // measure renders at full width and the shell pans it horizontally, like a code block.
-    const COL_CAP: usize = 48;
+    // Column widths fit the table to the painter's window (the measure minus the gutter and the
+    // pad/indicator columns, as in the code-block overflow test above). Three cases, in order:
+    // the whole table fits at natural widths, so nothing wraps; it doesn't, so columns shrink
+    // toward their floors — the widest word each holds — in proportion to what each can give up,
+    // wrapping only as much as the fit demands; even the floors don't fit, so the columns take
+    // them and the table renders wide and pans horizontally, like a code block.
     let cell_style = SpanStyle::plain(SpanKind::Text);
     let head_style = SpanStyle {
         bold: true,
         ..SpanStyle::plain(SpanKind::TableHead)
     };
     let cell_segments = |cell: &Vec<Inline>, style: SpanStyle| flatten(cell, style, elements);
-    let mut widths = vec![1usize; ncols];
-    for (ci, w) in widths.iter_mut().enumerate() {
-        let mut max = 1;
+    let (mut want, mut floor) = (vec![1usize; ncols], vec![1usize; ncols]);
+    for ci in 0..ncols {
+        let mut cells = Vec::new();
         if let Some(cell) = head.get(ci) {
-            max = max.max(segments_width(&cell_segments(cell, head_style)));
+            cells.push(cell_segments(cell, head_style));
         }
-        for row in rows {
-            if let Some(cell) = row.get(ci) {
-                max = max.max(segments_width(&cell_segments(cell, cell_style)));
-            }
+        cells.extend(
+            rows.iter()
+                .filter_map(|r| r.get(ci))
+                .map(|c| cell_segments(c, cell_style)),
+        );
+        for segs in &cells {
+            want[ci] = want[ci].max(segments_width(segs));
+            floor[ci] = floor[ci].max(segments_min_width(segs));
         }
-        *w = max.min(COL_CAP);
+        floor[ci] = floor[ci].min(want[ci]);
     }
-    let _ = cols; // panning replaced shrink-to-fit; the measure no longer constrains tables
+    let frame = 3 * ncols + 1; // a bar per column plus the closer, and a space either side
+                               // The painter gives a table the measure minus the 2-column focus gutter: a fitting table
+                               // sits flush with the prose. The two pan/indicator columns a code panel always reserves are
+                               // spent only when a table overflows — which is exactly when the fit below gives up.
+    let avail = cols.saturating_sub(2).saturating_sub(frame);
+    let (total_want, total_floor) = (want.iter().sum::<usize>(), floor.iter().sum::<usize>());
+    let widths = if total_want <= avail {
+        want
+    } else if total_floor >= avail {
+        floor
+    } else {
+        // Between the two: every column gives up a share of the deficit proportional to the
+        // width it *can* give up, so wide prose columns wrap before narrow key columns do.
+        let deficit = total_want - avail;
+        let givable = total_want - total_floor;
+        let mut widths: Vec<usize> = want
+            .iter()
+            .zip(&floor)
+            .map(|(w, f)| w - deficit * (w - f) / givable)
+            .collect();
+        // Integer division rounds each shrink down, leaving the row over: take the rest a cell
+        // at a time from whichever column still has the most to give.
+        let mut over = widths.iter().sum::<usize>().saturating_sub(avail);
+        while over > 0 {
+            let Some(ci) = (0..ncols)
+                .filter(|&ci| widths[ci] > floor[ci])
+                .max_by_key(|&ci| widths[ci] - floor[ci])
+            else {
+                break;
+            };
+            widths[ci] -= 1;
+            over -= 1;
+        }
+        widths
+    };
 
     let border = |l: char, m: char, r: char| -> ReadRow {
         let mut text = String::new();
@@ -613,73 +674,90 @@ fn layout_table(
             element: own,
         }
     };
-    let bar = |out: &mut Vec<ReadSpan>| {
+    // `outer` = one of the row's two frame bars, as opposed to a column divider between cells:
+    // the frame is not part of the row's interior, so a row band stops at it.
+    let bar = |out: &mut Vec<ReadSpan>, outer: bool| {
+        let kind = if outer {
+            SpanKind::TableBorder
+        } else {
+            SpanKind::TableDivider
+        };
         out.push(ReadSpan {
             text: "│".into(),
-            style: SpanStyle::plain(SpanKind::TableBorder),
+            style: SpanStyle::plain(kind),
             element: None,
             syntax: None,
         })
     };
 
-    // Lay one logical row: wrap each cell to its column, pad to the tallest.
-    let emit_row = |cells: &[Vec<Inline>], style: SpanStyle, out: &mut Vec<ReadRow>| {
-        let wrapped: Vec<Vec<Vec<ReadSpan>>> = (0..ncols)
-            .map(|ci| {
-                let segs = cells
-                    .get(ci)
-                    .map(|c| cell_segments(c, style))
-                    .unwrap_or_default();
-                let lines = wrap_segments(&segs, widths[ci].max(1));
-                if lines.is_empty() {
-                    vec![Vec::new()]
-                } else {
-                    lines
+    // Lay one logical row: wrap each cell to its column, pad to the tallest. `striped` tags the
+    // row's padding as [`SpanKind::TableStripe`], which is how the painter recognizes a banded
+    // row — every display row of one logical row carries it, wrapped continuations included.
+    let emit_row =
+        |cells: &[Vec<Inline>], style: SpanStyle, striped: bool, out: &mut Vec<ReadRow>| {
+            let pad_kind = if striped {
+                SpanKind::TableStripe
+            } else {
+                SpanKind::Text
+            };
+            let wrapped: Vec<Vec<Vec<ReadSpan>>> = (0..ncols)
+                .map(|ci| {
+                    let segs = cells
+                        .get(ci)
+                        .map(|c| cell_segments(c, style))
+                        .unwrap_or_default();
+                    let lines = wrap_segments(&segs, widths[ci].max(1));
+                    if lines.is_empty() {
+                        vec![Vec::new()]
+                    } else {
+                        lines
+                    }
+                })
+                .collect();
+            let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
+            for line_i in 0..height {
+                let mut spans = Vec::new();
+                bar(&mut spans, true);
+                for (ci, cell_lines) in wrapped.iter().enumerate() {
+                    let line = cell_lines.get(line_i).cloned().unwrap_or_default();
+                    let used: usize = line.iter().map(|s| s.text.width()).sum();
+                    let pad = widths[ci].saturating_sub(used);
+                    let (left, right) = match alignments.get(ci) {
+                        Some(ColAlign::Right) => (pad, 0),
+                        Some(ColAlign::Center) => (pad / 2, pad - pad / 2),
+                        _ => (0, pad),
+                    };
+                    spans.push(ReadSpan {
+                        text: " ".repeat(left + 1),
+                        style: SpanStyle::plain(pad_kind),
+                        element: None,
+                        syntax: None,
+                    });
+                    spans.extend(line);
+                    spans.push(ReadSpan {
+                        text: " ".repeat(right + 1),
+                        style: SpanStyle::plain(pad_kind),
+                        element: None,
+                        syntax: None,
+                    });
+                    bar(&mut spans, ci + 1 == ncols);
                 }
-            })
-            .collect();
-        let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
-        for line_i in 0..height {
-            let mut spans = Vec::new();
-            bar(&mut spans);
-            for (ci, cell_lines) in wrapped.iter().enumerate() {
-                let line = cell_lines.get(line_i).cloned().unwrap_or_default();
-                let used: usize = line.iter().map(|s| s.text.width()).sum();
-                let pad = widths[ci].saturating_sub(used);
-                let (left, right) = match alignments.get(ci) {
-                    Some(ColAlign::Right) => (pad, 0),
-                    Some(ColAlign::Center) => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                spans.push(ReadSpan {
-                    text: " ".repeat(left + 1),
-                    style: SpanStyle::plain(SpanKind::Text),
-                    element: None,
-                    syntax: None,
+                out.push(ReadRow {
+                    spans,
+                    element: own,
                 });
-                spans.extend(line);
-                spans.push(ReadSpan {
-                    text: " ".repeat(right + 1),
-                    style: SpanStyle::plain(SpanKind::Text),
-                    element: None,
-                    syntax: None,
-                });
-                bar(&mut spans);
             }
-            out.push(ReadRow {
-                spans,
-                element: own,
-            });
-        }
-    };
+        };
 
     out.push(border('┌', '┬', '┐'));
     if !head.is_empty() {
-        emit_row(head, head_style, out);
+        emit_row(head, head_style, false, out);
         out.push(border('├', '┼', '┤'));
     }
-    for row in rows {
-        emit_row(row, cell_style, out);
+    // Alternate body rows band, starting with the second — the web/iced stripe, which is what
+    // lets the eye track a row across wide columns without a rule under every cell.
+    for (ri, row) in rows.iter().enumerate() {
+        emit_row(row, cell_style, ri % 2 == 1, out);
     }
     out.push(border('└', '┴', '┘'));
 }
@@ -695,6 +773,29 @@ struct Segment {
 
 fn segments_width(segs: &[Segment]) -> usize {
     segs.iter().map(|s| s.text.width()).sum()
+}
+
+/// The narrowest width the segments wrap into without breaking a word: the widest run between
+/// whitespace, counted across segment boundaries (styling splits segments mid-word — `**bold**`
+/// inside a word — and [`wrap_segments`] tokenizes on whitespace alone). Column fitting uses it
+/// as a floor; narrower than this and cells would hard-break mid-word.
+fn segments_min_width(segs: &[Segment]) -> usize {
+    let (mut max, mut run) = (0usize, 0usize);
+    for seg in segs {
+        if seg.text == "\n" {
+            run = 0;
+            continue;
+        }
+        for ch in seg.text.chars() {
+            if ch.is_whitespace() {
+                run = 0;
+            } else {
+                run += ch.width().unwrap_or(0);
+                max = max.max(run);
+            }
+        }
+    }
+    max
 }
 
 /// Flatten inline nodes to styled segments, resolving interactive spans to element indices.
@@ -1069,40 +1170,168 @@ mod tests {
     }
 
     #[test]
-    fn wide_table_keeps_natural_width_for_panning() {
+    fn table_wraps_to_fit_before_panning() {
+        // The cells are wider than the measure but their words aren't: the column shrinks and
+        // the cell wraps, so the table fits the window instead of panning.
         let md = "| words |\n|---|\n| several words stay on one line |\n";
         let blocks = parse(md);
         let els = elements(&blocks);
         let rows = layout(&blocks, &els, 16, &Default::default());
         let text = rows_text(&rows);
-        // No shrink-to-fit: the table renders at its natural width (wider than the measure)
-        // as single-line cells, and the shell pans it like a code block.
-        assert!(
-            text[0].width() > 16,
-            "table overflows the measure: {}",
-            text[0]
-        );
-        assert_eq!(text.len(), 5, "cells stay single rows");
-        let element = rows[0].element.expect("table rows carry their element");
-        assert_eq!(hscroll_content_width(&rows, element), text[0].width());
+        let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
+        assert!(widest <= 16 - 2, "table fits the window: {text:?}");
+        assert!(text.len() > 5, "the cell wrapped: {text:?}");
     }
 
     #[test]
-    fn huge_table_cell_wraps_within_column_cap() {
-        // A single cell longer than the 48-col column cap hard-wraps inside its column
-        // instead of stretching the table without bound.
+    fn unbreakable_cell_pans_instead_of_splitting_words() {
+        // 60 unbreakable columns in a 22-column window: no amount of wrapping fits it, so the
+        // table renders at its natural width and the shell pans it, like a code block. (The
+        // floor is the column's widest word — hard-breaking mid-word would fit, but it reads
+        // worse than the pan, and the native client can't clip cells at all.)
         let long = "x".repeat(60);
         let md = format!("| head |\n|---|\n| {long} |\n");
         let blocks = parse(&md);
         let els = elements(&blocks);
         let rows = layout(&blocks, &els, 30, &Default::default());
         let text = rows_text(&rows);
-        assert!(
-            text.iter().all(|t| t.width() <= 48 + 4),
-            "column capped at 48 plus frame overhead"
+        assert_eq!(text.len(), 5, "no wrapping: {text:?}");
+        assert_eq!(
+            text[0].width(),
+            60 + 4,
+            "natural width, wider than the measure"
         );
-        // 2 borders + head + separator + 2 wrapped body rows + bottom border.
-        assert!(text.len() > 5, "long cell wrapped over multiple rows");
+        let element = rows[0].element.expect("table rows carry their element");
+        assert_eq!(hscroll_content_width(&rows, element), text[0].width());
+    }
+
+    #[test]
+    fn wide_column_takes_its_natural_width_when_it_fits() {
+        // 60 chars in a column whose neighbour is tiny: the table fits the window whole, so the
+        // long cell stays on one line rather than wrapping into a needlessly narrow column.
+        let long = "x".repeat(60);
+        let md = format!("| words | n |\n|---|---|\n| {long} | 1 |\n");
+        let blocks = parse(&md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 92, &Default::default());
+        let text = rows_text(&rows);
+        assert_eq!(text.len(), 5, "no cell wrapped: {text:?}");
+        assert!(
+            text[3].contains(&long),
+            "the long cell is one line: {text:?}"
+        );
+        let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
+        assert!(widest <= 92 - 2, "table fits the window: {widest}");
+    }
+
+    #[test]
+    fn oversized_table_shrinks_proportionally_to_fit() {
+        // 108 columns of content in a 51-column budget: both columns give up a share of the
+        // deficit proportional to what each can spare, so the wide column wraps hardest, and
+        // the table fills the window exactly rather than panning.
+        let a = ["abc"; 20].join(" "); // 79 columns
+        let b = ["xy"; 10].join(" "); // 29 columns
+        let md = format!("| one | two |\n|---|---|\n| {a} | {b} |\n");
+        let blocks = parse(&md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 60, &Default::default());
+        let text = rows_text(&rows);
+        assert_eq!(
+            text[0],
+            format!("┌{}┬{}┐", "─".repeat(38), "─".repeat(17)),
+            "36 and 15 columns wide"
+        );
+        let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
+        assert_eq!(widest, 60 - 2, "fills the window exactly");
+    }
+
+    #[test]
+    fn narrow_table_does_not_stretch() {
+        // Nothing was denied width, so nothing grows: a small table stays small rather than
+        // spreading itself across the measure.
+        let md = "| Name | N |\n|---|---|\n| Ada | 36 |\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 92, &Default::default());
+        assert_eq!(rows_text(&rows)[0], "┌──────┬────┐");
+    }
+
+    #[test]
+    fn table_stripes_alternate_body_rows() {
+        let md = "| h |\n|---|\n| one |\n| two |\n| three |\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 40, &Default::default());
+        let striped = |r: &ReadRow| {
+            r.spans
+                .iter()
+                .any(|s| s.style.kind == SpanKind::TableStripe)
+        };
+        // top border, head, separator, three body rows, bottom border
+        assert_eq!(rows.len(), 7);
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .any(|s| s.style.kind == SpanKind::TableHead),
+            "header cells carry the head kind (weight + colour, no band)"
+        );
+        assert!(!striped(&rows[1]), "the header row itself is unbanded");
+        assert!(!striped(&rows[3]), "first body row is unbanded");
+        assert!(striped(&rows[4]), "second body row stripes");
+        assert!(!striped(&rows[5]), "third is unbanded again");
+        assert!(
+            !striped(&rows[0]) && !striped(&rows[2]) && !striped(&rows[6]),
+            "border rows stay on the page background"
+        );
+    }
+
+    #[test]
+    fn row_frame_bars_are_distinct_from_column_dividers() {
+        // The band stops at the frame, so the two bars closing a row are `TableBorder` while
+        // the divider between the cells is `TableDivider`.
+        let md = "| a | b |\n|---|---|\n| one | two |\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 40, &Default::default());
+        let kinds: Vec<SpanKind> = rows[3]
+            .spans
+            .iter()
+            .filter(|s| s.text == "│")
+            .map(|s| s.style.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SpanKind::TableBorder,
+                SpanKind::TableDivider,
+                SpanKind::TableBorder
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapped_cell_keeps_its_row_band() {
+        // The banded row wraps: every display row of the one logical row bands, or the stripe
+        // would break mid-row.
+        let md = "| h |\n|---|\n| one |\n| two words wrap here |\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 18, &Default::default());
+        let striped: Vec<bool> = rows
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .any(|s| s.style.kind == SpanKind::TableStripe)
+            })
+            .collect();
+        assert_eq!(
+            striped,
+            vec![false, false, false, false, true, true, false],
+            "{:?}",
+            rows_text(&rows)
+        );
     }
 
     #[test]

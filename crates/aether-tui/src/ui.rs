@@ -565,6 +565,13 @@ fn hover_border_color(body: &crate::app::HoverBody) -> Color {
 /// Background for code (block & inline) in Markdown hovers.
 const MD_CODE_BG: Color = NORD1;
 
+/// Reading-view table stripe: alternating body rows band, so a row reads across wide columns
+/// without a rule under every cell. A custom shade ~30% of the way from NORD0 to NORD1 — enough
+/// to band the row, light enough that a NORD1 code chip still reads on top of it (Nord has
+/// nothing between the two, same reason [`CURSOR_LINE_BG`] is off-palette). The header row is
+/// deliberately unbanded: bold white plus the separator rule already set it apart.
+const MD_TABLE_STRIPE_BG: Color = Color::Rgb(50, 56, 69);
+
 /// Render a hover body to fully-styled, width-wrapped display lines. Diagnostic blocks keep their
 /// severity-icon prefix and colour; Markdown is rendered with headings, code backgrounds, inline
 /// emphasis, list indentation, and styled (non-clickable) links.
@@ -4248,10 +4255,22 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 .and_then(|e| rv.hscroll.get(&e))
                 .copied()
                 .unwrap_or(0) as usize;
-            let window = (content.width as usize).saturating_sub(used + 2).max(1);
             let total: usize = table_part.iter().map(|s| s.text.width()).sum();
+            // A table that fits sits flush with the prose — no pad columns, so its frame lines
+            // up with the text column beside it. Only an overflowing table spends a column
+            // either side on the `…` pan indicators, narrowing its window to match (which is
+            // the window `read_hscroll_by` clamps against — a fitting table never pans).
+            let avail = (content.width as usize).saturating_sub(used).max(1);
+            let overflows = total > avail;
+            let window = if overflows {
+                avail.saturating_sub(2).max(1)
+            } else {
+                avail
+            };
             let indicator = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
-            spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
+            if overflows {
+                spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
+            }
             let clipped = aether_client::read_layout::clip_spans(table_part, off, window);
             let is_block_end = rv.rows.get(idx + 1).map(|r| r.element) != Some(row.element);
             let is_bottom_border = is_block_end
@@ -4288,8 +4307,20 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 spans.push(Span::styled(seg(tx..tx + tw).replace('─', "━"), thumb));
                 spans.push(Span::styled(seg(tx + tw..chars.len()), base));
             } else {
+                // A banded row (header panel / body stripe) paints its background across the
+                // row's *interior* — cell text, padding and the column dividers, but not the
+                // two frame bars that close the row (`TableBorder`), so the box keeps its own
+                // edges. Spans with a background of their own (inline-code chips) keep it, so a
+                // chip still reads as a chip on top of the band.
+                let band = read_table_band(&row.spans);
                 for rs in &clipped {
                     let mut style = read_span_style(rs.style);
+                    if let Some(bg) = band {
+                        let frame = matches!(rs.style.kind, SpanKind::TableBorder);
+                        if style.bg.is_none() && !frame {
+                            style = style.bg(bg);
+                        }
+                    }
                     if rs.element.is_some() && rs.element == rv.target_focus {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
@@ -4301,10 +4332,12 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             if fill > 0 {
                 spans.push(Span::styled(" ".repeat(fill), Style::default().bg(NORD0)));
             }
-            spans.push(Span::styled(
-                if total > off + window { "…" } else { " " },
-                indicator,
-            ));
+            if overflows {
+                spans.push(Span::styled(
+                    if total > off + window { "…" } else { " " },
+                    indicator,
+                ));
+            }
             lines.push(Line::from(spans));
             continue;
         }
@@ -4341,6 +4374,18 @@ pub const READ_PAD_TOP: u16 = 2;
 pub const READ_PAD_BOTTOM: u16 = 2;
 
 /// Map a core reading-view [`aether_client::read_layout::SpanStyle`] to the terminal theme.
+/// The background band a table row paints under its interior, if any: the core marks a striped
+/// body row's cell padding [`SpanKind::TableStripe`], and the colour lives on that kind in
+/// [`read_span_style`]. Header and border rows carry no band — the header reads as the header
+/// through weight and colour, and the frame stays on the page background.
+fn read_table_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Color> {
+    use aether_client::read_layout::SpanKind as K;
+    spans
+        .iter()
+        .find(|s| matches!(s.style.kind, K::TableStripe))
+        .and_then(|s| read_span_style(s.style).bg)
+}
+
 fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
     use aether_client::markdown::AlertKind;
     use aether_client::read_layout::SpanKind as K;
@@ -4366,14 +4411,18 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
         // The pinned language tag on the panel: the web tag's `--nord3-brighter`, over the
         // panel background so the pad row reads as one solid strip.
         K::CodeFrame => Style::default().fg(OVERLAY_BORDER_FG).bg(MD_CODE_BG),
-        K::Rule | K::TableBorder | K::Dim => Style::default().fg(NORD3),
+        K::Rule | K::TableBorder | K::TableDivider | K::Dim => Style::default().fg(NORD3),
         K::Link => Style::default().fg(NORD9),
         // Bullets/numbers/checkboxes read as body text (uniform with the web/native markers).
         K::Marker => Style::default().fg(NORD4),
         K::QuoteBar(None) => Style::default().fg(NORD3),
         K::QuoteBar(Some(k)) => Style::default().fg(alert_color(k)),
         K::AlertLabel(k) => Style::default().fg(alert_color(k)),
+        // The header sets itself off with weight and colour alone (bold white over the body's
+        // grey, plus the separator rule) — no band. Only the body stripe carries a background,
+        // which the painter lifts onto the whole row interior (`read_table_band`).
         K::TableHead => Style::default().fg(NORD6),
+        K::TableStripe => Style::default().fg(NORD4).bg(MD_TABLE_STRIPE_BG),
     };
     if s.bold {
         st = st.add_modifier(Modifier::BOLD);

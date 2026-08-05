@@ -2044,11 +2044,19 @@ impl Shell {
             return;
         };
         let (content_cols, _) = aether_client::read_layout::measure(self.term.0.max(10));
-        // The painter's code window: the measure minus the 2-column gutter and the two
-        // pad/indicator columns (rows with extra prefixes — quoted code — over-clamp a bit,
-        // which only allows a few surplus columns of scroll).
-        let window = content_cols.saturating_sub(4) as usize;
         let widest = aether_client::read_layout::hscroll_content_width(&rows, e);
+        // The painter's window, mirrored: the measure minus the 2-column gutter, minus the two
+        // pad/indicator columns — which a code panel always reserves but a table spends only
+        // when it overflows (else a table filling the measure exactly would pan two columns off
+        // its own right edge). Rows with extra prefixes — quoted code — over-clamp a bit, which
+        // only allows a few surplus columns of scroll.
+        let avail = content_cols.saturating_sub(2) as usize;
+        let flush = aether_client::read_layout::is_table_element(&rows, e) && widest <= avail;
+        let window = if flush {
+            avail
+        } else {
+            avail.saturating_sub(2)
+        };
         let max_off = widest.saturating_sub(window) as i32;
         let cur = self.read_hscroll.get(&e).copied().unwrap_or(0) as i32;
         let next = cur.saturating_add(delta).clamp(0, max_off.max(0)) as u16;

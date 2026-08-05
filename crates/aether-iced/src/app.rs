@@ -4479,6 +4479,43 @@ fn cell_text_width(inlines: &[MdInline], size: f32) -> (f32, f32) {
     (natural, minimum)
 }
 
+/// Fixed pixel widths for a reading-view table's columns: fit the table to `avail`, and only
+/// scroll when it genuinely can't fit. Three cases, in order — the whole table fits at natural
+/// widths, so nothing wraps; it doesn't, so the columns shrink toward their floors in proportion
+/// to what each can give up, wrapping only as much as the fit demands; even the floors don't
+/// fit, so the columns take them and the table scrolls horizontally.
+///
+/// A column's floor is its widest unbreakable token (a cell can't wrap inside a word, and iced
+/// doesn't clip overflow — a narrower column would paint over its neighbour). Both bounds are
+/// [`cell_text_width`] estimates, so widths carry padding slack on top. The terminal's
+/// `read_layout::layout_table` fits tables the same way, in cells.
+fn table_column_widths(naturals: &[f32], minimums: &[f32], avail: f32) -> Vec<f32> {
+    // 18px of cell padding plus estimate slack.
+    const PAD: f32 = 22.0;
+    let want: Vec<f32> = naturals.iter().map(|n| n + PAD).collect();
+    let total_want: f32 = want.iter().sum();
+    if total_want <= avail {
+        return want;
+    }
+    let floor: Vec<f32> = minimums
+        .iter()
+        .zip(naturals)
+        .map(|(m, n)| m.min(*n) + PAD)
+        .collect();
+    let total_floor: f32 = floor.iter().sum();
+    if total_floor >= avail {
+        return floor;
+    }
+    // Between the two: every column gives up a share of the deficit proportional to the width
+    // it *can* give up, so wide prose columns wrap before narrow key columns do.
+    let deficit = total_want - avail;
+    let givable = total_want - total_floor;
+    want.iter()
+        .zip(&floor)
+        .map(|(w, f)| w - deficit * (w - f) / givable)
+        .collect()
+}
+
 /// Flatten inlines to plain text (hover fallbacks for table cells).
 fn md_plain(inlines: &[MdInline]) -> String {
     let mut out = String::new();
@@ -5040,13 +5077,27 @@ impl App {
         }
     }
 
+    /// The width a reading-view table can take before it starts scrolling: the measure-capped
+    /// block column (or the window, when that's narrower), less the document scrollbar, the
+    /// block's own horizontal padding and the focus-bar inset. An estimate like the column
+    /// widths themselves — over-shooting costs a horizontal scrollbar, not a broken layout.
+    fn read_table_avail(&self, body: f32) -> f32 {
+        let column = (self.view_size.width - theme::SCROLLBAR_W).min(body * READ_MEASURE_EM);
+        // 32px of block padding, 13px of focus-bar inset, and 4px spare: a fitted table lands
+        // exactly on this number, so a slightly optimistic estimate would show a scrollbar for
+        // a couple of stray pixels.
+        (column - 32.0 - 13.0 - 4.0).max(body * 8.0)
+    }
+
     /// A real table: header row bold on a panel, body rows striped, columns at fixed
-    /// pixel-estimated widths — natural content width capped at ~22 em, never below the widest
-    /// unbreakable token (a cell can't wrap inside a word, and iced doesn't clip overflow, so
+    /// pixel-estimated widths fitted to the measure by [`table_column_widths`] — natural width
+    /// when the table fits, shrunk toward the per-column unbreakable-token floors when it
+    /// doesn't (a cell can't wrap inside a word, and iced doesn't clip overflow, so
     /// underestimating painted cells over their neighbours — the old char-count weighting also
-    /// undercounted monospace code chips). A table wider than the measure scrolls horizontally
-    /// (the web's `.md-table-scroll` behaviour). Everything inside the scrollable sizes Shrink:
-    /// `Fill` under its unbounded horizontal limits is the layout landmine.
+    /// undercounted monospace code chips). Only a table that can't fit even at those floors
+    /// scrolls horizontally (the web's `.md-table-scroll` behaviour). Everything inside the
+    /// scrollable sizes Shrink: `Fill` under its unbounded horizontal limits is the layout
+    /// landmine.
     fn read_table(
         &self,
         _alignments: &[aether_client::markdown::ColAlign],
@@ -5066,26 +5117,24 @@ impl App {
         }
         let cell_size = body * 0.92;
         let empty = Vec::new();
-        let mut widths = vec![0f32; ncols];
-        for (ci, w) in widths.iter_mut().enumerate() {
-            let mut natural = 0f32;
-            let mut minimum = 0f32;
+        let mut naturals = vec![0f32; ncols];
+        let mut minimums = vec![0f32; ncols];
+        for ci in 0..ncols {
             if let Some(c) = head.get(ci) {
                 // Headers run bold — a nudge wider.
                 let (n, m) = cell_text_width(c, cell_size * 1.05);
-                natural = natural.max(n);
-                minimum = minimum.max(m);
+                naturals[ci] = naturals[ci].max(n);
+                minimums[ci] = minimums[ci].max(m);
             }
             for r in rows {
                 if let Some(c) = r.get(ci) {
                     let (n, m) = cell_text_width(c, cell_size);
-                    natural = natural.max(n);
-                    minimum = minimum.max(m);
+                    naturals[ci] = naturals[ci].max(n);
+                    minimums[ci] = minimums[ci].max(m);
                 }
             }
-            // 18px of cell padding plus estimate slack.
-            *w = natural.min(body * 22.0).max(minimum) + 22.0;
         }
+        let widths = table_column_widths(&naturals, &minimums, self.read_table_avail(body));
         let cell = |content: &[MdInline], header: bool, w: f32| -> Element<'static, ReadMsg> {
             let color = if header { theme::NORD6 } else { theme::NORD4 };
             container(md_rich_in(
@@ -6261,6 +6310,44 @@ mod tests {
                 b.max_h
             );
         }
+    }
+
+    /// A table that fits takes its natural widths — no wrapping, and no stretching to fill the
+    /// measure either (a two-column `| Name | N |` stays its own size).
+    #[test]
+    fn fitting_table_keeps_natural_widths() {
+        let w = table_column_widths(&[400.0, 60.0], &[40.0, 20.0], 600.0);
+        assert_eq!(w, vec![422.0, 82.0]);
+        let w = table_column_widths(&[80.0, 40.0], &[80.0, 40.0], 600.0);
+        assert_eq!(w, vec![102.0, 62.0]);
+    }
+
+    /// The README keybinding table's real measurements: 812px of natural content in a 624px
+    /// reading column used to overflow into a horizontal scroll even though the columns could
+    /// wrap down to 503px. It now fits, and the prose column gives up the most — the key column
+    /// can't wrap `Ctrl-z/Ctrl-Alt-z` at all, so it sits on its floor.
+    #[test]
+    fn oversized_table_shrinks_to_fit_instead_of_scrolling() {
+        let w = table_column_widths(&[151.3, 625.4, 248.6], &[151.3, 143.2, 143.2], 624.4);
+        assert!(
+            (w.iter().sum::<f32>() - 624.4).abs() < 0.01,
+            "fits exactly: {w:?}"
+        );
+        assert!(
+            (w[0] - 173.3).abs() < 0.01,
+            "unwrappable column keeps its floor: {w:?}"
+        );
+        assert!(w[1] > w[2], "the widest column stays widest: {w:?}");
+        assert!(w[1] > 165.2, "and stays above its own floor: {w:?}");
+    }
+
+    /// When even the floors don't fit, the columns take them and the table scrolls — shrinking
+    /// further would paint unbreakable cells over their neighbours.
+    #[test]
+    fn table_scrolls_only_when_floors_dont_fit() {
+        let w = table_column_widths(&[400.0, 400.0], &[380.0, 300.0], 400.0);
+        assert_eq!(w, vec![402.0, 322.0]);
+        assert!(w.iter().sum::<f32>() > 400.0, "overflows → scrollable");
     }
 
     /// On a very short window the cap bottoms out rather than collapsing to nothing — a small
