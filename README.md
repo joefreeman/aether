@@ -4,6 +4,8 @@
 
 A modal text editor with a client–server architecture for Linux and macOS. Native, terminal and web clients connect to a shared server process.
 
+![screenshot](./screenshot.png)
+
 ## Features
 
 - Selection-first motions, sneak, surround, transforms, motion undo/redo
