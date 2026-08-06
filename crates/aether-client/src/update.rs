@@ -60,11 +60,11 @@ use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputChangeLine,
     InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputOpenLine, InputOpenLineParams,
-    InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams, InputTab,
-    InputText, InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
-    InputUnsurround, InputUnsurroundParams, LineSide, ToggleCommentParams, UndoRedoParams,
-    UndoResult,
+    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine,
+    InputOpenLineParams, InputReplaceLine, InputReplaceLineParams, InputSurround,
+    InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
+    InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
+    ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
@@ -1770,6 +1770,38 @@ impl Session {
             PasteKind::Line => {
                 self.edit::<InputReplaceLine>(InputReplaceLineParams { buffer_id, text })
             }
+        }
+    }
+
+    /// A shell-delivered paste gesture over the buffer — the TUI's terminal bracketed paste
+    /// (later, browser paste events). The whole point is that pasted bytes are *text*, never
+    /// keystrokes: replayed as keys, a Normal-mode paste runs as commands and an Insert-mode one
+    /// auto-indents at every newline. Routed by mode like the explicit paste chords — Insert
+    /// inserts at the caret, Normal pastes before the selection. A paste while an overlay input is
+    /// focused never reaches this (the shell's own editor takes it); any other keyboard-owning
+    /// surface (prompt, picker, settings overlay, sneak, Search, read-only Read) drops it.
+    pub fn paste_text(&mut self, text: String) -> Effects {
+        // Terminals differ on pasted line endings (some translate LF to CR so apps see "Enter"):
+        // normalize to `\n`, then filter the remaining control chars as typed input would be.
+        let text: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect();
+        if text.is_empty()
+            || self.prompt.is_some()
+            || self.picker.is_some()
+            || self.workspace_settings.is_some()
+            || self.app_settings.is_some()
+            || self.sneak.is_some()
+        {
+            return Effects::none();
+        }
+        match self.mode {
+            Mode::Insert => self.paste(PasteKind::AtCursor, text),
+            Mode::Normal => self.paste(PasteKind::Before { count: 1 }, text),
+            Mode::Search | Mode::Read => Effects::none(),
         }
     }
 
@@ -6801,7 +6833,14 @@ impl Session {
 
             // ---- edits ----
             A::Backspace => self.edit::<InputBackspace>(BufferOnlyParams { buffer_id }),
-            A::NewlineIndent => self.edit::<InputNewlineAndIndent>(BufferOnlyParams { buffer_id }),
+            A::NewlineIndent => self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
+                buffer_id,
+                park_before: false,
+            }),
+            A::UnjoinLines => self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
+                buffer_id,
+                park_before: true,
+            }),
             // The whitespace itself is the server's call — it owns the buffer's indent style, so
             // `Tab` lands spaces or a tab to match what `Enter` and `Ctrl-l` already produce.
             A::InsertTab => self.edit::<InputTab>(BufferOnlyParams { buffer_id }),

@@ -17,8 +17,8 @@ mod ui;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -80,7 +80,16 @@ pub async fn run(
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste: terminal-level pastes (middle-click, the terminal's own paste shortcut)
+    // arrive as one `Event::Paste` instead of replayed keystrokes — replayed, a Normal-mode paste
+    // runs the clipboard as commands, and an Insert-mode one feeds every newline through
+    // auto-indent (the staircase). Terminals without support ignore the sequence.
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     // Best-effort: enable the kitty keyboard protocol so the terminal disambiguates things like
     // Ctrl-Shift-Z and Alt-0. Terminals that don't support it ignore the escape sequence.
     let _ = execute!(
@@ -97,6 +106,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     execute!(
         terminal.backend_mut(),
@@ -130,6 +140,7 @@ fn install_panic_hook() {
         let _ = execute!(
             stdout(),
             PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             DisableMouseCapture,
             SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen

@@ -45,9 +45,10 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditResult,
-    InputAdjustNumberParams, InputMoveLinesParams, InputOpenLineParams, InputSurroundParams,
-    InputTextParams, InputTransformCaseParams, InputUnsurroundParams, LineSide, SurroundTarget,
-    ToggleCommentParams, UndoRedoParams, UndoResult,
+    InputAdjustNumberParams, InputMoveLinesParams, InputNewlineAndIndentParams,
+    InputOpenLineParams, InputSurroundParams, InputTextParams, InputTransformCaseParams,
+    InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCaptureParams, JumplistCaptureResult, JumplistStepParams, JumplistStepResult,
@@ -8462,6 +8463,7 @@ pub async fn input_text(
             text: params.text,
             select_pasted: params.select_pasted,
             replace_selection: params.replace_selection,
+            park_before: false,
         },
     )
     .await
@@ -8790,50 +8792,37 @@ pub async fn input_open_line(
     };
     match params.side {
         LineSide::Below => {
-            // Park at the line's end, then newline + smart indent; stay there.
+            // Park at the line's end, then newline + smart indent; land on the opened line.
             cursor_set(state, ctx, park(u32::MAX)).await?;
             input_newline_and_indent(
                 state,
                 ctx,
-                BufferOnlyParams {
+                InputNewlineAndIndentParams {
                     buffer_id: params.buffer_id,
+                    park_before: false,
                 },
             )
             .await
         }
         LineSide::Above => {
-            // Park at col 0, insert "\n" (pushes the line down), step back up.
+            // Park at col 0, then insert "\n" staying *before* it — the parked coordinates
+            // address the new empty line after the insert, so the one edit both pushes the line
+            // down and lands the cursor on the opened line. (Previously a post-edit cursor_move
+            // stepped back up, but the edit's viewport pushes had already left carrying the
+            // pre-step cursor — the same push/response disagreement un-join had.)
             cursor_set(state, ctx, park(0)).await?;
-            let r = input_text(
+            apply_edit(
                 state,
-                ctx,
-                InputTextParams {
-                    buffer_id: params.buffer_id,
+                ctx.client_id,
+                params.buffer_id,
+                EditKind::ReplaceWith {
                     text: "\n".into(),
                     select_pasted: false,
                     replace_selection: false,
-                    at: None,
+                    park_before: true,
                 },
             )
-            .await?;
-            let cursor = cursor_move(
-                state,
-                ctx,
-                CursorMoveParams {
-                    buffer_id: params.buffer_id,
-                    motion: Motion::LogicalLine {
-                        direction: Direction::Backward,
-                        count: 1,
-                        preserve_col: false,
-                    },
-                    extend_selection: false,
-                },
-            )
-            .await?;
-            Ok(EditResult {
-                revision: r.revision,
-                cursor,
-            })
+            .await
         }
     }
 }
@@ -8841,7 +8830,7 @@ pub async fn input_open_line(
 pub async fn input_newline_and_indent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: BufferOnlyParams,
+    params: InputNewlineAndIndentParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
     let indent = {
@@ -8860,6 +8849,9 @@ pub async fn input_newline_and_indent(
     let mut text = String::with_capacity(indent.len() + 1);
     text.push('\n');
     text.push_str(&indent);
+    // `park_before` (the un-join gesture) rides the edit itself: `apply_edit` inserts before
+    // the block and parks the cursor at the '\n' under its one lock, so the cursor in the
+    // viewport pushes and the one in the result can't disagree.
     apply_edit(
         state,
         client_id,
@@ -8868,6 +8860,7 @@ pub async fn input_newline_and_indent(
             text,
             select_pasted: false,
             replace_selection: false,
+            park_before: params.park_before,
         },
     )
     .await
@@ -10381,9 +10374,16 @@ async fn input_join_lines_once(
     let s = state.lock().await;
     let buf = &s.buffers[&buffer_id];
 
-    // Build the full replacement: walk the lines from `first_line` to `last_line`, concatenating
-    // each line's content (stripped of trailing whitespace) plus a single space between.
+    // Build the full replacement: concatenate the lines, dropping each continuation's leading
+    // whitespace (its indent) — nothing is inserted between them. Join deletes exactly what
+    // un-join (`input/newline_and_indent`) inserts, "\n" + indent, so the pair mirrors; trailing
+    // whitespace stays (a real space before the break becomes the separator), and a wanted
+    // separator is one keystroke at the parked cursor.
     let mut joined = String::new();
+    // Offset (in chars, within `joined`) of the last seam — the first char that came from the
+    // final joined line. The cursor parks there, so un-join (newline before the cursor) reverses
+    // the join in place.
+    let mut last_seam = 0;
     for line_idx in first_line..=last_line {
         let line_slice = buf.text.line(line_idx as usize);
         let mut text: String = line_slice.chunks().collect();
@@ -10391,19 +10391,10 @@ async fn input_join_lines_once(
             text.pop();
         }
         if line_idx == first_line {
-            // Keep first line's content, drop trailing whitespace.
-            joined.push_str(text.trim_end());
+            joined.push_str(&text);
         } else {
-            joined.push(' ');
-            // Drop leading whitespace on continuation lines; keep trailing untouched until
-            // the next loop iteration trims it.
-            let trimmed_start = text.trim_start();
-            // For the last line, keep trailing whitespace as it normally appears.
-            if line_idx == last_line {
-                joined.push_str(trimmed_start);
-            } else {
-                joined.push_str(trimmed_start.trim_end());
-            }
+            last_seam = joined.chars().count();
+            joined.push_str(text.trim_start());
         }
     }
 
@@ -10443,7 +10434,10 @@ async fn input_join_lines_once(
             EditKindTag::Text,
             cursors_before,
         );
-        let new_cursor_char = first_char + joined.chars().count();
+        // Park the cursor on the (last) seam — the first char the join pulled up — not past the
+        // joined text: `Ctrl-Alt-g` (newline before the cursor) is then the exact inverse, and a
+        // separator can be typed straight in.
+        let new_cursor_char = first_char + last_seam;
         let new_pos = motion::char_to_pos(buf, new_cursor_char);
         let new_cursor = CursorState {
             position: new_pos,
@@ -10770,10 +10764,19 @@ enum EditKind {
     /// pure insert at `position` — no chars are replaced — and a range still replaces the
     /// selection (legacy paste-replace behaviour). When `select_pasted` is true and the
     /// inserted text is non-empty, the post-edit cursor selects the inserted text.
+    ///
+    /// `park_before` (the un-join gesture; open-above's "\n" insert): always a pure insert at
+    /// `position` — an extended selection collapses rather than being replaced — and the cursor
+    /// stays at the insertion point (its pre-edit coordinates, which now address the first
+    /// inserted char) instead of advancing past the text. Lives here rather than as handler
+    /// post-processing so the one `apply_edit` lock computes the final cursor before the
+    /// viewport pushes are built — a post-hoc overwrite races the cursor embedded in those
+    /// pushes.
     ReplaceWith {
         text: String,
         select_pasted: bool,
         replace_selection: bool,
+        park_before: bool,
     },
     /// Delete the current inclusive selection. For a point cursor this deletes the 1 char at
     /// `position`. Used by Normal-mode `Ctrl-d` / `Delete` / `Ctrl-c`, and by Insert-mode
@@ -10898,12 +10901,16 @@ async fn apply_edit(
     }
     let range: EditRange = match &edit {
         EditKind::ReplaceWith {
-            replace_selection, ..
+            replace_selection,
+            park_before,
+            ..
         } => {
             // Without `replace_selection`, a point cursor is a genuine caret (Insert-mode
             // typing, paste-before) — pure insert. With it, the point is the 1-char selection
             // under the Normal-mode block and falls through to the selection-replace path.
-            if cursor.is_point() && !replace_selection {
+            // `park_before` is always a pure insert: the un-join breaks *before* the block and
+            // never consumes text, so an extended selection collapses instead of being replaced.
+            if *park_before || (cursor.is_point() && !replace_selection) {
                 // Pure insert at the point — no chars replaced.
                 let c = motion::pos_to_char(buf, cursor.position);
                 EditRange {
@@ -11104,11 +11111,15 @@ async fn apply_edit(
         EditKind::ReplaceWith {
             text,
             select_pasted,
+            park_before,
             ..
         } => (
             Cow::Borrowed(text.as_str()),
             if *select_pasted {
                 PostEdit::Select { lead: 0, trail: 0 }
+            } else if *park_before {
+                // Stay at the insertion point — for the un-join, the '\n' just inserted there.
+                PostEdit::PointAt(range.start_char)
             } else {
                 PostEdit::PointAfter
             },

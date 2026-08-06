@@ -100,7 +100,7 @@ impl Mods {
         alt: false,
         shift: false,
     };
-    const CTRL_ALT: Mods = Mods {
+    pub const CTRL_ALT: Mods = Mods {
         ctrl: true,
         alt: true,
         shift: false,
@@ -296,6 +296,10 @@ pub enum Action {
     // ---- edits ----
     Backspace,
     NewlineIndent,
+    /// Join's dual: insert a line break at the cursor, cursor staying *before* it (so a
+    /// following join re-joins the same pair). Distinct from [`Action::NewlineIndent`], whose
+    /// cursor advances onto the new line (Enter's typing flow).
+    UnjoinLines,
     InsertTab,
     DeletePoint,
     DeleteSelection,
@@ -898,7 +902,12 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
     bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
     bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
+    // Join/un-join are exact mirrors on `g`: join deletes "\n"+indent parking the cursor on the
+    // seam; un-join inserts them back, cursor staying before the break — so the pair ping-pongs.
+    // `Ctrl-Alt-g` survives legacy key encoding (ESC + 0x07 — `g` is not a sequence introducer,
+    // unlike the Alt-bracket chords).
     bind!(G, ch('g'), Exact(Mods::CTRL), A::JoinLines, "Edit", "Join lines"),
+    bind!(G, ch('g'), Exact(Mods::CTRL_ALT), A::UnjoinLines, "Edit", "Un-join lines"),
     bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent, "Edit", "Indent"),
     bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent, "Edit", "Dedent"),
     // Mode-agnostic (Global so they fire in Insert too); the mode-specific Change/ChangeLine

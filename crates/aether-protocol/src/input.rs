@@ -210,8 +210,19 @@ pub struct InputAdjustNumberParams {
 pub struct InputNewlineAndIndent;
 impl RpcMethod for InputNewlineAndIndent {
     const NAME: &'static str = "input/newline_and_indent";
-    type Params = BufferOnlyParams;
+    type Params = InputNewlineAndIndentParams;
     type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputNewlineAndIndentParams {
+    pub buffer_id: BufferId,
+    /// Leave the cursor *before* the inserted break — its pre-edit coordinates, which now
+    /// address the newline — instead of advancing onto the new line. The un-join gesture
+    /// (`Ctrl-Alt-g`) sets this so a following join re-joins the same pair (the pair ping-pongs);
+    /// Enter leaves it `false` — typing continues on the new line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub park_before: bool,
 }
 
 // ---- input/open_line ----------------------------------------------------------------------------

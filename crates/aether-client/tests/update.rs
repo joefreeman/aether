@@ -22,6 +22,15 @@ fn ctrl(s: &mut Session, c: char) -> Effects {
     s.on_key(KeyCode::Char(c), Mods::CTRL, None, ROWS)
 }
 
+fn ctrl_alt(s: &mut Session, c: char) -> Effects {
+    s.on_key(KeyCode::Char(c), Mods::CTRL_ALT, None, ROWS)
+}
+
+/// No `Effect::Request` in `fx` — the input was swallowed (hint/toast effects may still ride).
+fn no_request(fx: &Effects) -> bool {
+    !fx.0.iter().any(|e| matches!(e, Effect::Request { .. }))
+}
+
 /// The single `Effect::Request` in `fx` (panics otherwise — these tests pin exact traffic).
 fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     let mut reqs = fx.0.iter().filter_map(|e| match e {
@@ -2154,6 +2163,86 @@ fn count_prefix_rides_the_request() {
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "input/join_lines");
     assert_eq!(params["count"], json!(3));
+}
+
+#[test]
+fn ctrl_alt_g_unjoins_in_both_modes() {
+    // Join's dual: `Ctrl-Alt-g` un-joins — the break lands at the cursor and the cursor stays
+    // before it (`park_before`), so a following join re-joins the same pair. From the Global
+    // table, so it works in Normal mode as well as Insert.
+    let mut s = session();
+    let fx = ctrl_alt(&mut s, 'g');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "input/newline_and_indent");
+    assert_eq!(params["park_before"], json!(true));
+
+    let _ = key(&mut s, 'i');
+    let fx = ctrl_alt(&mut s, 'g');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "input/newline_and_indent");
+    assert_eq!(params["park_before"], json!(true));
+}
+
+#[test]
+fn enter_is_newline_and_indent_in_insert() {
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "input/newline_and_indent");
+    // Enter advances onto the new line — no parking.
+    assert!(params.get("park_before").is_none());
+    assert_eq!(s.mode, aether_client::session::Mode::Insert);
+}
+
+#[test]
+fn paste_text_routes_by_mode() {
+    // Insert: plain insert at the caret, exactly like the Ctrl-v gesture.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let fx = s.paste_text("one\ntwo".into());
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "input/text");
+    assert_eq!(params["text"], json!("one\ntwo"));
+    assert_eq!(params["select_pasted"], json!(false));
+    assert!(params.get("at").is_none());
+
+    // Normal: paste before the selection, selecting the pasted text.
+    let mut s = session();
+    let fx = s.paste_text("one\ntwo".into());
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "input/text");
+    assert_eq!(params["select_pasted"], json!(true));
+    assert_eq!(params["at"], json!("start"));
+}
+
+#[test]
+fn paste_text_normalizes_line_endings_and_strips_controls() {
+    // Terminals disagree on pasted newlines (CR, CRLF, LF) — all land as `\n`; other control
+    // chars are filtered as typed input would be, tabs survive.
+    let mut s = session();
+    let _ = key(&mut s, 'i');
+    let fx = s.paste_text("a\r\nb\rc\u{7}\td".into());
+    let (_, _, params) = the_request(&fx);
+    assert_eq!(params["text"], json!("a\nb\nc\td"));
+
+    // Nothing left after filtering → no edit at all.
+    assert!(no_request(&s.paste_text("\u{7}\u{1b}".into())));
+}
+
+#[test]
+fn paste_text_dropped_while_another_surface_owns_the_keyboard() {
+    // Search mode: the query input is the shell's editor; the buffer must not see the paste.
+    let mut s = session();
+    let _ = key(&mut s, '/');
+    assert!(no_request(&s.paste_text("query".into())));
+
+    // An open picker likewise (its query is shell-owned too).
+    let mut s = session();
+    let _ = key(&mut s, ' '); // leader
+    let _ = key(&mut s, 'f');
+    assert!(s.picker.is_some(), "Space f opens the Files picker");
+    assert!(no_request(&s.paste_text("clip".into())));
 }
 
 #[test]

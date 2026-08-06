@@ -116,6 +116,7 @@ identical in both.
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
 | `Ctrl-g` | Join lines | Join lines |
+| `Ctrl-Alt-g` | Un-join lines (cursor stays before the break) | Line break at caret, caret stays |
 | `Ctrl-a`/`Ctrl-Alt-a` | Increment/decrement number | Increment/decrement number |
 | `Ctrl-y`/`Ctrl-Alt-y` | Toggle line/block comment | Toggle line/block comment |
 | `Ctrl-f` | Format document | Format document |

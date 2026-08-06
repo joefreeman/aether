@@ -26,10 +26,10 @@ use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
     InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams,
-    InputNewlineAndIndent, InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams,
-    InputTab, InputText, InputTextParams, InputToggleComment, InputTransformCase,
-    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget,
-    ToggleCommentParams, UndoRedoParams, UndoResult,
+    InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine, InputOpenLineParams,
+    InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
+    InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
+    SurroundTarget, ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
@@ -1943,7 +1943,7 @@ async fn counted_edits_run_server_side() {
     // docs/protocol-composites.md, K: the count loops live server-side — one trip each.
     let (_server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\n").await;
 
-    // 3J from line 0 joins three times: "a b c d".
+    // 3J from line 0 joins three times: "abcd" (join inserts no separator).
     let r: EditResult = send_request::<InputJoinLines>(
         &mut ws,
         10,
@@ -1953,7 +1953,7 @@ async fn counted_edits_run_server_side() {
         },
     )
     .await;
-    assert_eq!(buffer_text(&mut ws, 11, buffer_id).await, "a b c d\n");
+    assert_eq!(buffer_text(&mut ws, 11, buffer_id).await, "abcd\n");
     assert!(r.revision > 0);
 
     // Counted undo larger than the stack: stops when exhausted (applied: false comes back),
@@ -4478,7 +4478,7 @@ async fn word_end_motion_lands_on_last_char() {
 }
 
 #[tokio::test]
-async fn join_lines_collapses_lines_with_single_space() {
+async fn join_lines_deletes_break_and_indent() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello \n  world\n").await;
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
@@ -4512,12 +4512,219 @@ async fn join_lines_collapses_lines_with_single_space() {
     assert!(r.revision > 0);
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    // After join: "hello world\n" — trailing whitespace of line 0 removed, leading whitespace of
-    // line 1 removed, single space inserted.
+    // After join: "hello world\n" — the newline and line 1's leading whitespace are deleted,
+    // nothing is inserted; line 0's own trailing space is kept and is the separator here.
     assert_eq!(
         notif.replacement_lines[0].visual_rows[0].segments[0].text,
         "hello world"
     );
+    drop(server);
+}
+
+#[tokio::test]
+async fn join_lines_parks_cursor_on_seam() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("    foo\n    bar\n").await;
+    let r: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    // "    foobar" — the point parks on the seam (the pulled-up 'b', col 7), not past the
+    // joined text, so un-join (`input/newline_and_indent` — newline before the cursor) reverses
+    // the join in place, and a separator can be typed straight in.
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 7 });
+    assert_eq!(r.cursor.anchor, r.cursor.position);
+    assert_eq!(buffer_text(&mut ws, 11, buffer_id).await, "    foobar\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn counted_join_parks_cursor_on_last_seam() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\n").await;
+    let r: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 3,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 11, buffer_id).await, "abcd\n");
+    // The last press's seam: the pulled-up "d".
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 3 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn join_then_unjoin_round_trips() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("    foo\n    bar\n").await;
+    let _: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        10,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    // The join parked the point on the seam (the pulled-up "bar"); un-join inserts newline +
+    // (re-derived) indent before it, restoring the original buffer byte-for-byte. The cursor
+    // parks before the break — its pre-edit coordinates, now addressing the '\n'.
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        11,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, 12, buffer_id).await,
+        "    foo\n    bar\n"
+    );
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 7 });
+
+    // …which is exactly why the pair ping-pongs: join again re-joins the same two lines.
+    let r: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        13,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 14, buffer_id).await, "    foobar\n");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 7 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn unjoin_inserts_before_the_point_and_stays() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alphabeta\n").await;
+    // Point on the 'b': the break lands before it — the char under the block is never consumed —
+    // and the cursor parks before the break (end of the first line, on the '\n').
+    set_cursor(&mut ws, 10, buffer_id, 0, 5).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        11,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: true,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "alpha\nbeta\n");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 5 });
+    drop(server);
+}
+
+#[tokio::test]
+async fn unjoin_with_live_selection_neither_eats_it_nor_drifts() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta\n").await;
+    // Select "beta" (anchor col 6, block on the final 'a', col 9). Un-join must collapse to the
+    // block and break before it — not fall into the selection-replace path, which would swallow
+    // "beta" and land the break at the selection *start* while the cursor parked at the end
+    // (the cursor visibly ending up after the newline).
+    send_request::<CursorSet>(
+        &mut ws,
+        10,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 0, col: 9 },
+            anchor: LogicalPosition { line: 0, col: 6 },
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        11,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: true,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 12, buffer_id).await, "alpha bet\na\n");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 9 });
+    assert_eq!(r.cursor.anchor, r.cursor.position);
+    drop(server);
+}
+
+#[tokio::test]
+async fn unjoin_parked_cursor_agrees_across_push_and_response() {
+    // The client adopts the cursor from BOTH the RPC response and the `viewport/lines_changed`
+    // push, which travel independently — if they disagree, whichever is processed last wins and
+    // the cursor intermittently lands after the break (the original bug: the park was applied
+    // after `apply_edit` had already built the push). Parking rides the edit itself now, so both
+    // must carry the same parked cursor.
+    let (server, mut ws, buffer_id) = setup_with_buffer("alphabeta\n").await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        10,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    set_cursor(&mut ws, 11, buffer_id, 0, 5).await;
+
+    // Raw send: `send_request` drains notifications, and the push/response order on the wire
+    // isn't fixed — collect both frames whichever way they arrive.
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 12,
+        method: InputNewlineAndIndent::NAME.into(),
+        params: Some(
+            serde_json::to_value(InputNewlineAndIndentParams {
+                buffer_id,
+                park_before: true,
+            })
+            .unwrap(),
+        ),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    let parked = LogicalPosition { line: 0, col: 5 };
+    let (mut got_response, mut got_push) = (false, false);
+    while !(got_response && got_push) {
+        let text = next_text(&mut ws).await;
+        match serde_json::from_str::<ClientInbound>(&text).expect("parseable inbound") {
+            ClientInbound::Response(r) if r.id == 12 => {
+                let r: EditResult = serde_json::from_value(r.result).unwrap();
+                assert_eq!(r.cursor.position, parked, "response cursor");
+                assert_eq!(r.cursor.anchor, parked, "response anchor");
+                got_response = true;
+            }
+            ClientInbound::Notification(n) if n.method == ViewportLinesChanged::NAME => {
+                let p: ViewportLinesChangedParams = serde_json::from_value(n.params).unwrap();
+                let c = p.cursor.expect("push carries this client's cursor");
+                assert_eq!(c.position, parked, "push cursor");
+                assert_eq!(c.anchor, parked, "push anchor");
+                got_push = true;
+            }
+            _ => {}
+        }
+    }
     drop(server);
 }
 
@@ -7252,8 +7459,15 @@ async fn newline_and_indent_copies_leading_whitespace() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        11,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     let text = buffer_text(&mut ws, 12, buffer_id).await;
     assert_eq!(text, "    foo\n    \n");
@@ -7313,8 +7527,15 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     // Rust defaults to 4-space indent; cursor lands at col 4 on the new line.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
     let text = buffer_text(&mut ws, 5, buffer_id).await;
@@ -7374,8 +7595,15 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     let text = buffer_text(&mut ws, 5, buffer_id).await;
     assert_eq!(text, "// note {\n\n");
@@ -7386,8 +7614,15 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
 #[tokio::test]
 async fn newline_and_indent_on_empty_line_inserts_just_newline() {
     let (server, mut ws, buffer_id) = setup_with_buffer("\n").await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 10, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        10,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 0 });
     let text = buffer_text(&mut ws, 11, buffer_id).await;
     assert_eq!(text, "\n\n");
@@ -7446,8 +7681,15 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     // No indent on the new line — we just left the function body.
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 0 });
 
@@ -7506,8 +7748,15 @@ async fn newline_and_indent_engine_python_def() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     // Python defaults to 4-space indent (PEP 8); cursor lands at col 4 on the new line.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });
 
@@ -7565,8 +7814,15 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     assert_eq!(r.cursor.position, LogicalPosition { line: 3, col: 2 });
 
     drop(server);
@@ -7624,8 +7880,15 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 4, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        4,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     // One tab = col 1 (in byte columns). The opener-bonus heuristic fires because the parser
     // hasn't seen a closing brace yet; one indent level for Go is one tab character.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 1 });
@@ -7651,8 +7914,15 @@ async fn newline_and_indent_fallback_copies_previous_line() {
         },
     )
     .await;
-    let r: EditResult =
-        send_request::<InputNewlineAndIndent>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+    let r: EditResult = send_request::<InputNewlineAndIndent>(
+        &mut ws,
+        11,
+        &InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        },
+    )
+    .await;
     // Falls back to 4 spaces — the leading whitespace of line 0 — even though the line ends
     // in `{`. Plain text doesn't get the opener heuristic.
     assert_eq!(r.cursor.position, LogicalPosition { line: 1, col: 4 });

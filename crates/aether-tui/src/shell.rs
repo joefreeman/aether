@@ -671,9 +671,48 @@ impl Shell {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k).await,
             Event::Mouse(m) => self.on_mouse(m),
+            Event::Paste(text) => self.on_paste(text),
             Event::Resize(cols, rows) => self.on_resize(cols, rows),
             _ => {}
         }
+    }
+
+    /// A terminal bracketed paste: the pasted text as one event, never keystrokes — so a
+    /// Normal-mode paste can't run the clipboard as commands, and an Insert-mode one lands as
+    /// literal text instead of auto-indented Enter presses. Routed like typed text: a focused
+    /// overlay input's shell-side editor takes it; otherwise the core's mode-aware buffer paste
+    /// does.
+    fn on_paste(&mut self, text: String) {
+        // The popovers treat any input as dismissal/ownership, pastes included (mirrors `on_key`).
+        if self.state.hover.is_some() {
+            self.state.hover = None;
+            return;
+        }
+        if self.state.app_info.is_some() {
+            return;
+        }
+        self.sync_overlay_edit();
+        if let Some(edit) = self.overlay_edit.as_mut() {
+            // Overlay fields are single-line: trailing newlines drop (shell-copied paths end in
+            // one), interior ones collapse to a space, other control chars filter like typed text.
+            let flat: String = text
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .trim_end_matches('\n')
+                .chars()
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .filter(|c| !c.is_control())
+                .collect();
+            if !flat.is_empty() {
+                edit.input.insert_str(&flat);
+                let (field, value) = (edit.field, edit.input.text.clone());
+                let fx = self.set_overlay_field(field, value);
+                self.run_effects(fx);
+            }
+            return;
+        }
+        let fx = self.session.paste_text(text);
+        self.run_effects(fx);
     }
 
     async fn on_key(&mut self, k: KeyEvent) {

@@ -22,8 +22,8 @@ use aether_protocol::git::{
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
-    InputBackspace, InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams,
-    UndoRedoParams,
+    InputBackspace, InputNewlineAndIndentParams, InputSurround, InputSurroundParams, InputTab,
+    InputText, InputTextParams, UndoRedoParams,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -800,6 +800,32 @@ fn input_text_params() {
     let defaulted: InputTextParams =
         from_value(json!({"buffer_id": 1, "text": "hi", "select_pasted": false})).unwrap();
     assert!(!defaulted.replace_selection);
+}
+
+#[test]
+fn input_newline_and_indent_params_shape() {
+    // Enter's caret insert: `park_before: false` stays off the wire, so the typing path's shape
+    // is the bare buffer-only one.
+    let v = to_value(InputNewlineAndIndentParams {
+        buffer_id: 1,
+        park_before: false,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"buffer_id": 1}));
+
+    // The un-join gesture sets it; it rides the wire and round-trips.
+    let v = to_value(InputNewlineAndIndentParams {
+        buffer_id: 1,
+        park_before: true,
+    })
+    .unwrap();
+    assert_eq!(v, json!({"buffer_id": 1, "park_before": true}));
+    let back: InputNewlineAndIndentParams = from_value(v).unwrap();
+    assert!(back.park_before);
+
+    // Omitted on the wire → defaults to false.
+    let defaulted: InputNewlineAndIndentParams = from_value(json!({"buffer_id": 1})).unwrap();
+    assert!(!defaulted.park_before);
 }
 
 #[test]
