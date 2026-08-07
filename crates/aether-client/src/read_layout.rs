@@ -592,12 +592,13 @@ fn layout_table(
     if ncols == 0 {
         return;
     }
-    // Column widths fit the table to the painter's window (the measure minus the gutter and the
-    // pad/indicator columns, as in the code-block overflow test above). Three cases, in order:
-    // the whole table fits at natural widths, so nothing wraps; it doesn't, so columns shrink
-    // toward their floors — the widest word each holds — in proportion to what each can give up,
-    // wrapping only as much as the fit demands; even the floors don't fit, so the columns take
-    // them and the table renders wide and pans horizontally, like a code block.
+    // Column widths fit the table to the full text measure — a fitting table sits flush with
+    // the prose, and the painter spends its two pan/indicator columns only on a table that
+    // overflows anyway. Three cases, in order: the whole table fits at natural widths, so
+    // nothing wraps; it doesn't, so columns shrink toward their floors — the widest word each
+    // holds — in proportion to what each can give up, wrapping only as much as the fit
+    // demands; even the floors don't fit, so the columns take them and the table renders wide
+    // and pans horizontally, like a code block.
     let cell_style = SpanStyle::plain(SpanKind::Text);
     let head_style = SpanStyle {
         bold: true,
@@ -622,10 +623,7 @@ fn layout_table(
         floor[ci] = floor[ci].min(want[ci]);
     }
     let frame = 3 * ncols + 1; // a bar per column plus the closer, and a space either side
-                               // The painter gives a table the measure minus the 2-column focus gutter: a fitting table
-                               // sits flush with the prose. The two pan/indicator columns a code panel always reserves are
-                               // spent only when a table overflows — which is exactly when the fit below gives up.
-    let avail = cols.saturating_sub(2).saturating_sub(frame);
+    let avail = cols.saturating_sub(frame);
     let (total_want, total_floor) = (want.iter().sum::<usize>(), floor.iter().sum::<usize>());
     let widths = if total_want <= avail {
         want
@@ -777,8 +775,8 @@ fn segments_width(segs: &[Segment]) -> usize {
 
 /// The narrowest width the segments wrap into without breaking a word: the widest run between
 /// whitespace, counted across segment boundaries (styling splits segments mid-word — `**bold**`
-/// inside a word — and [`wrap_segments`] tokenizes on whitespace alone). Column fitting uses it
-/// as a floor; narrower than this and cells would hard-break mid-word.
+/// inside a word — and [`wrap_segments`] stitches those pieces back into one word). Column
+/// fitting uses it as a floor; narrower than this and cells would hard-break mid-word.
 fn segments_min_width(segs: &[Segment]) -> usize {
     let (mut max, mut run) = (0usize, 0usize);
     for seg in segs {
@@ -903,9 +901,50 @@ fn collect(
 }
 
 /// Greedy word-wrap over styled segments, preserving styles; words longer than `width` are
-/// hard-broken; `\n` segments (hard breaks) force a new line.
+/// hard-broken; `\n` segments (hard breaks) force a new line. A "word" is a maximal run of
+/// non-whitespace *across segment boundaries* — styling splits segments mid-word (`**bold**er`,
+/// a link's trailing punctuation), and the break decision must see the whole word or it would
+/// wrap at the style seam.
 fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
     let width = width.max(1);
+
+    // Tokenize into word/space runs, each a list of styled pieces (one per contributing
+    // segment). Within a segment words and spaces alternate, so a run only ever grows where
+    // a segment boundary cuts it.
+    type Piece = (String, SpanStyle, Option<usize>);
+    enum Run {
+        Word(Vec<Piece>),
+        Space(Vec<Piece>),
+        Break,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for seg in segs {
+        if seg.text == "\n" {
+            runs.push(Run::Break);
+            continue;
+        }
+        let mut rest = seg.text.as_str();
+        while !rest.is_empty() {
+            let is_space = rest.starts_with(char::is_whitespace);
+            let split = if is_space {
+                rest.find(|c: char| !c.is_whitespace())
+                    .unwrap_or(rest.len())
+            } else {
+                rest.find(char::is_whitespace).unwrap_or(rest.len())
+            };
+            let (token, tail) = rest.split_at(split);
+            rest = tail;
+            let piece = (token.to_string(), seg.style, seg.element);
+            match (runs.last_mut(), is_space) {
+                (Some(Run::Word(pieces)), false) | (Some(Run::Space(pieces)), true) => {
+                    pieces.push(piece)
+                }
+                (_, false) => runs.push(Run::Word(vec![piece])),
+                (_, true) => runs.push(Run::Space(vec![piece])),
+            }
+        }
+    }
+
     let mut lines: Vec<Vec<ReadSpan>> = Vec::new();
     let mut cur: Vec<ReadSpan> = Vec::new();
     let mut cur_w = 0usize;
@@ -924,67 +963,68 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
         lines.push(std::mem::take(cur));
         *cur_w = 0;
     };
+    let push = |cur: &mut Vec<ReadSpan>, cur_w: &mut usize, (text, style, element): Piece| {
+        *cur_w += text.width();
+        cur.push(ReadSpan {
+            text,
+            style,
+            element,
+            syntax: None,
+        });
+    };
 
-    for seg in segs {
-        if seg.text == "\n" {
-            flush(&mut cur, &mut cur_w, &mut lines);
-            continue;
-        }
-        // Split into words, keeping the whitespace runs as separate tokens.
-        let mut rest = seg.text.as_str();
-        while !rest.is_empty() {
-            let split = if rest.starts_with(char::is_whitespace) {
-                rest.find(|c: char| !c.is_whitespace())
-                    .unwrap_or(rest.len())
-            } else {
-                rest.find(char::is_whitespace).unwrap_or(rest.len())
-            };
-            let (token, tail) = rest.split_at(split);
-            rest = tail;
-            let is_space = token.starts_with(char::is_whitespace);
-            let mut token_w = token.width();
-            if cur_w + token_w > width && !is_space && cur_w > 0 {
-                flush(&mut cur, &mut cur_w, &mut lines);
-            }
-            // A word longer than the whole width hard-breaks.
-            let mut token = token.to_string();
-            while token_w > width {
-                let mut take = String::new();
-                let mut w = 0;
-                for c in token.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                    if w + cw > width {
-                        break;
-                    }
-                    take.push(c);
-                    w += cw;
+    for run in &runs {
+        match run {
+            Run::Break => flush(&mut cur, &mut cur_w, &mut lines),
+            Run::Space(pieces) => {
+                if cur_w == 0 {
+                    continue; // don't start any line — first or wrapped — with the separator
                 }
-                cur.push(ReadSpan {
-                    text: take.clone(),
-                    style: seg.style,
-                    element: seg.element,
-                    syntax: None,
-                });
-                flush(&mut cur, &mut cur_w, &mut lines);
-                token = token[take.len()..].to_string();
-                token_w = token.width();
+                for piece in pieces {
+                    push(&mut cur, &mut cur_w, piece.clone());
+                }
             }
-            if token.is_empty() {
-                continue;
+            Run::Word(pieces) => {
+                let w: usize = pieces.iter().map(|(t, _, _)| t.width()).sum();
+                if cur_w > 0 && cur_w + w > width {
+                    flush(&mut cur, &mut cur_w, &mut lines);
+                }
+                if w <= width {
+                    for piece in pieces {
+                        push(&mut cur, &mut cur_w, piece.clone());
+                    }
+                    continue;
+                }
+                // Longer than the whole width: hard-break at the width, chunk by chunk, each
+                // chunk keeping the style of the segment it came from.
+                for (text, style, element) in pieces {
+                    let mut chunk = String::new();
+                    let mut chunk_w = 0usize;
+                    for c in text.chars() {
+                        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+                        if cur_w + chunk_w + cw > width {
+                            if !chunk.is_empty() {
+                                push(
+                                    &mut cur,
+                                    &mut cur_w,
+                                    (std::mem::take(&mut chunk), *style, *element),
+                                );
+                                chunk_w = 0;
+                            }
+                            if !cur.is_empty() {
+                                flush(&mut cur, &mut cur_w, &mut lines);
+                            }
+                            // `c` starts the next line; a glyph wider than the whole width
+                            // still lands (overflowing beats looping forever).
+                        }
+                        chunk.push(c);
+                        chunk_w += cw;
+                    }
+                    if !chunk.is_empty() {
+                        push(&mut cur, &mut cur_w, (chunk, *style, *element));
+                    }
+                }
             }
-            if is_space && cur_w == 0 && !cur.is_empty() {
-                continue; // don't start a wrapped line with the separator
-            }
-            if is_space && cur.is_empty() {
-                continue; // nor the very first line
-            }
-            cur.push(ReadSpan {
-                text: token.clone(),
-                style: seg.style,
-                element: seg.element,
-                syntax: None,
-            });
-            cur_w += token.width();
         }
     }
     if !cur.is_empty() {
@@ -1179,7 +1219,7 @@ mod tests {
         let rows = layout(&blocks, &els, 16, &Default::default());
         let text = rows_text(&rows);
         let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
-        assert!(widest <= 16 - 2, "table fits the window: {text:?}");
+        assert!(widest <= 16, "table fits the window: {text:?}");
         assert!(text.len() > 5, "the cell wrapped: {text:?}");
     }
 
@@ -1226,7 +1266,7 @@ mod tests {
 
     #[test]
     fn oversized_table_shrinks_proportionally_to_fit() {
-        // 108 columns of content in a 51-column budget: both columns give up a share of the
+        // 108 columns of content in a 53-column budget: both columns give up a share of the
         // deficit proportional to what each can spare, so the wide column wraps hardest, and
         // the table fills the window exactly rather than panning.
         let a = ["abc"; 20].join(" "); // 79 columns
@@ -1238,11 +1278,11 @@ mod tests {
         let text = rows_text(&rows);
         assert_eq!(
             text[0],
-            format!("┌{}┬{}┐", "─".repeat(38), "─".repeat(17)),
-            "36 and 15 columns wide"
+            format!("┌{}┬{}┐", "─".repeat(40), "─".repeat(17)),
+            "38 and 15 columns wide"
         );
         let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
-        assert_eq!(widest, 60 - 2, "fills the window exactly");
+        assert_eq!(widest, 60, "fills the window exactly");
     }
 
     #[test]
@@ -1445,6 +1485,46 @@ mod tests {
         let rows = layout(&blocks, &els, 40, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text, vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn styled_word_wraps_as_one_unit() {
+        // `**bb**cc` is one word split across styled segments: the break decision must see
+        // the whole word, not wrap at the style seam when only the styled half fits.
+        let md = "aaaaaa **bb**cc\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 10, &Default::default());
+        assert_eq!(rows_text(&rows), vec!["aaaaaa", "bbcc"]);
+        // Both styles survive on the wrapped line.
+        assert_eq!(rows[1].spans[0].text, "bb");
+        assert!(rows[1].spans[0].style.bold);
+        assert_eq!(rows[1].spans[1].text, "cc");
+        assert!(!rows[1].spans[1].style.bold);
+    }
+
+    #[test]
+    fn trailing_punctuation_stays_with_its_link() {
+        // The `.` after the link is a separate plain segment glued to the link text: it must
+        // wrap along with the link, not orphan onto the next line.
+        let md = "one two three [link](https://x.example). four\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 18, &Default::default());
+        assert_eq!(rows_text(&rows), vec!["one two three", "link. four"]);
+    }
+
+    #[test]
+    fn long_styled_word_hard_breaks_with_styles_preserved() {
+        // Wider than the whole measure: hard-broken at the width, each chunk keeping the
+        // style of the segment it came from.
+        let md = "**aaaaaa**bbbbbb\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 10, &Default::default());
+        assert_eq!(rows_text(&rows), vec!["aaaaaabbbb", "bb"]);
+        assert!(rows[0].spans[0].style.bold);
+        assert!(!rows[0].spans[1].style.bold);
     }
 
     #[test]

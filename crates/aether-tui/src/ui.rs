@@ -4077,15 +4077,18 @@ fn truncate_path_with_indices(
 /// shell's scroll, the content column centered to the reading measure, the focused element
 /// row-tinted (a focused link inverts its own span instead).
 fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
-    use aether_client::read_layout::{measure, SpanKind};
+    use aether_client::read_layout::SpanKind;
     let Some(rv) = state.read.as_ref() else {
         return;
     };
-    let (content_cols, margin) = measure(area.width.max(10));
+    let (content_cols, margin) = read_measure(area.width);
+    // The rect hosts the gutter *plus* the text measure: the layout wraps rows to
+    // `content_cols` alone, so a full line just reaches the right edge instead of losing its
+    // last cells to the Paragraph clip.
     let content = Rect {
         x: area.x.saturating_add(margin),
         y: area.y,
-        width: content_cols.min(area.width),
+        width: (content_cols + READ_GUTTER).min(area.width),
         height: area.height,
     };
     // Fill the whole area (margins included) with the editor's base background, so the reading
@@ -4364,6 +4367,17 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
 /// Blank rows padding the reading view above and below the document.
 pub const READ_PAD_TOP: u16 = 2;
 pub const READ_PAD_BOTTOM: u16 = 2;
+
+/// The reading-position gutter every painted line leads with (`"▎ "` / `"  "`).
+pub const READ_GUTTER: u16 = 2;
+
+/// Text measure + centering margin for a terminal `term_cols` wide. The measure is taken over
+/// the columns left of the gutter and the margin centers gutter+text as one block, so a
+/// full-measure line plus the gutter exactly fills the painted rect — laying out at the raw
+/// terminal width instead used to clip the last [`READ_GUTTER`] cells of every full line.
+pub fn read_measure(term_cols: u16) -> (u16, u16) {
+    aether_client::read_layout::measure(term_cols.saturating_sub(READ_GUTTER).max(10))
+}
 
 /// Map a core reading-view [`aether_client::read_layout::SpanStyle`] to the terminal theme.
 /// The background band a table row paints under its interior, if any: the core marks a striped

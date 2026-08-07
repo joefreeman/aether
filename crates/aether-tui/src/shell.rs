@@ -1283,8 +1283,7 @@ impl Shell {
                         ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
                         ScrollDir::Down => self.read_scroll_by(delta as i32),
                         ScrollDir::Left | ScrollDir::Right => {
-                            let (content_cols, _) =
-                                aether_client::read_layout::measure(self.term.0.max(10));
+                            let (content_cols, _) = crate::ui::read_measure(self.term.0);
                             let window = content_cols.saturating_sub(2).max(1) as i32;
                             let step = match unit {
                                 ScrollUnit::Line => 6,
@@ -1983,7 +1982,7 @@ impl Shell {
             });
         }
         let (area_cols, _) = self.term;
-        let (content_cols, _margin) = aether_client::read_layout::measure(area_cols.max(10));
+        let (content_cols, _margin) = crate::ui::read_measure(area_cols);
         let key = (read.buffer_id, read.revision, read.hl_gen, content_cols);
         let stale = self
             .read_cache
@@ -2082,14 +2081,14 @@ impl Shell {
         let Some(rows) = self.read_cache.as_ref().map(|c| c.4.clone()) else {
             return;
         };
-        let (content_cols, _) = aether_client::read_layout::measure(self.term.0.max(10));
+        let (content_cols, _) = crate::ui::read_measure(self.term.0);
         let widest = aether_client::read_layout::hscroll_content_width(&rows, e);
-        // The painter's window, mirrored: the measure minus the 2-column gutter, minus the two
-        // pad/indicator columns — which a code panel always reserves but a table spends only
-        // when it overflows (else a table filling the measure exactly would pan two columns off
-        // its own right edge). Rows with extra prefixes — quoted code — over-clamp a bit, which
-        // only allows a few surplus columns of scroll.
-        let avail = content_cols.saturating_sub(2) as usize;
+        // The painter's window, mirrored: the text measure (already net of the gutter), minus
+        // the two pad/indicator columns — which a code panel always reserves but a table spends
+        // only when it overflows (else a table filling the measure exactly would pan two
+        // columns off its own right edge). Rows with extra prefixes — quoted code — over-clamp
+        // a bit, which only allows a few surplus columns of scroll.
+        let avail = content_cols as usize;
         let flush = aether_client::read_layout::is_table_element(&rows, e) && widest <= avail;
         let window = if flush {
             avail
@@ -2135,10 +2134,10 @@ impl Shell {
         let r = (self.read_scroll as usize + row as usize)
             .checked_sub(crate::ui::READ_PAD_TOP as usize)
             .and_then(|i| rows.get(i))?;
-        let (_, margin) = aether_client::read_layout::measure(self.term.0.max(10));
+        let (_, margin) = crate::ui::read_measure(self.term.0);
         let mut element = r.element;
         let mut interactive = false;
-        let col_in_content = i32::from(col) - i32::from(margin) - 2;
+        let col_in_content = i32::from(col) - i32::from(margin) - i32::from(crate::ui::READ_GUTTER);
         if col_in_content >= 0 {
             let mut acc = 0i32;
             for sp in &r.spans {
