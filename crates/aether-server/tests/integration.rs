@@ -27999,7 +27999,10 @@ async fn toggle_task_flips_the_checkbox_under_the_cursor() {
     assert!(r.applied);
     let c: BufferContentResult =
         send_request::<BufferContent>(&mut ws, 15, &BufferContentParams { buffer_id }).await;
-    assert_eq!(c.text, "- [ ] open\n- [x] done\n", "unchecked, neighbour untouched");
+    assert_eq!(
+        c.text, "- [ ] open\n- [x] done\n",
+        "unchecked, neighbour untouched"
+    );
     drop(server);
 }
 
@@ -28009,15 +28012,22 @@ async fn toggle_task_refuses_when_the_cursor_is_not_inside_a_task_item() {
     // `Ctrl-a` sends unconditionally, so the resolver is the only gate: from a neighbouring
     // block it must refuse quietly, not reach into the list and toggle a box the cursor never
     // touched.
-    let (server, mut ws, buffer_id) =
-        setup_with_buffer("Intro.\n\n- [ ] open\n\nOutro.\n").await;
+    let (server, mut ws, buffer_id) = setup_with_buffer("Intro.\n\n- [ ] open\n\nOutro.\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };
     let toggle = ToggleTaskParams {
         buffer_id,
         set: Some(true),
     };
     for (line, col, from) in [(0, 2, "Intro"), (4, 2, "Outro"), (3, 0, "the separator")] {
-        set_snapped(&mut ws, 10, buffer_id, p(line, col), p(line, col), Granularity::Char).await;
+        set_snapped(
+            &mut ws,
+            10,
+            buffer_id,
+            p(line, col),
+            p(line, col),
+            Granularity::Char,
+        )
+        .await;
         let r: aether_protocol::input::BlockEditResult =
             send_request::<InputToggleTask>(&mut ws, 11, &toggle).await;
         assert!(!r.applied, "no toggle from {from}");

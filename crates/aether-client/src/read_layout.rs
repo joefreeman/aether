@@ -1527,9 +1527,8 @@ mod tests {
         let blocks = parse(md);
         let els = elements(&blocks);
         let rows = layout(&blocks, &els, 60, &Default::default());
-        let kinds = |row: &ReadRow| -> Vec<SpanKind> {
-            row.spans.iter().map(|s| s.style.kind).collect()
-        };
+        let kinds =
+            |row: &ReadRow| -> Vec<SpanKind> { row.spans.iter().map(|s| s.style.kind).collect() };
         let done = &rows[0];
         assert!(
             kinds(done).contains(&SpanKind::TaskDone),

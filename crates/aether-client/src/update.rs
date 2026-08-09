@@ -64,9 +64,9 @@ use aether_protocol::input::{
     InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine,
     InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams, InputSurround,
     InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask,
-    ToggleTaskParams,
     InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
-    MoveBlockParams, PasteBlockParams, ToggleCommentParams, UndoRedoParams, UndoResult,
+    MoveBlockParams, PasteBlockParams, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,

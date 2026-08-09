@@ -1176,8 +1176,7 @@ pub fn resolve_toggle_task(
     if is_blank_line(&text[line_start(text, at)..line_end_incl(text, at)]) {
         return Err(Refusal::Quiet);
     }
-    let idx =
-        crate::containing_element(elements, at as u32, is_task).ok_or(Refusal::Quiet)?;
+    let idx = crate::containing_element(elements, at as u32, is_task).ok_or(Refusal::Quiet)?;
     let span = elements[idx].span();
     let first_line_end = line_end_incl(text, span.start as usize);
     let line = &text[span.start as usize..first_line_end];
@@ -1327,7 +1326,8 @@ mod tests {
         // first child's — so the whole quote is lit. The resolution here must agree: the
         // extent heuristics used to hand the point's line to the quote's single-line first
         // paragraph, so `Ctrl-j` shuffled that paragraph around inside the quote.
-        let doc = "Intro.\n\n> Outer.\n>\n> > Inner one\n> > and two.\n> >\n> > > Deep.\n\nOutro.\n";
+        let doc =
+            "Intro.\n\n> Outer.\n>\n> > Inner one\n> > and two.\n> >\n> > > Deep.\n\nOutro.\n";
         let (blocks, els) = fixture(doc);
         let at = doc.find("> Outer").unwrap() as u32;
         let (top, bottom) = selection_block_range(doc, &els, at, at).unwrap();
@@ -1345,7 +1345,10 @@ mod tests {
         );
         // Cut follows the same resolution: the clipboard is the whole quote.
         let (_, clip) = resolve_delete(doc, &blocks, &els, at, at).unwrap();
-        assert_eq!(clip, "> Outer.\n>\n> > Inner one\n> > and two.\n> >\n> > > Deep.\n");
+        assert_eq!(
+            clip,
+            "> Outer.\n>\n> > Inner one\n> > and two.\n> >\n> > > Deep.\n"
+        );
         // An x whole-line *selection* over just the first paragraph's line is still that
         // paragraph: for a real selection the extent is the signal — a container and the
         // child it opens with share a line, and only the extent tells them apart.
@@ -2073,7 +2076,10 @@ mod tests {
         assert_eq!(apply(doc, &e), "- [ ] open\n- [ ] done\n");
         // A plain paragraph is not a task.
         let (_, els2) = fixture(DOC);
-        assert_eq!(resolve_toggle_task(DOC, &els2, 9, None), Err(Refusal::Quiet));
+        assert_eq!(
+            resolve_toggle_task(DOC, &els2, 9, None),
+            Err(Refusal::Quiet)
+        );
     }
 
     /// Loose task items toggle too — including from the cursor sitting in a *second* paragraph,
@@ -2141,7 +2147,10 @@ mod tests {
         // the loose item's parse span swallows (separators are gaps, §12.1, so the containing
         // walk must not reach the item from there).
         assert_eq!(resolve_toggle_task(doc, &els, 7, None), Err(Refusal::Quiet));
-        assert_eq!(resolve_toggle_task(doc, &els, 19, None), Err(Refusal::Quiet));
+        assert_eq!(
+            resolve_toggle_task(doc, &els, 19, None),
+            Err(Refusal::Quiet)
+        );
         // A whole-line-selected item parks the cursor on its terminating newline: still the
         // item's own box, via the step-back.
         let nl = doc.find("open\n").unwrap() as u32 + 4;
@@ -2253,7 +2262,10 @@ mod tests {
         // empty-document branch here replaced the whole file with the clipboard.
         let doc = "[a]: https://example.com\n";
         let (blocks, els) = fixture(doc);
-        assert!(selection_block_range(doc, &els, 0, 0).is_none(), "no blocks");
+        assert!(
+            selection_block_range(doc, &els, 0, 0).is_none(),
+            "no blocks"
+        );
         let e = resolve_paste(doc, &blocks, &els, 0, 0, "New block.", false).unwrap();
         assert_eq!(apply(doc, &e), "[a]: https://example.com\n\nNew block.\n");
         // The genuinely empty document still takes the paste as its whole content.

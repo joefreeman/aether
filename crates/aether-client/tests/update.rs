@@ -7473,7 +7473,10 @@ fn j_steps_one_block_from_a_selected_fence() {
     let line = params["motion"]["position"]["line"]
         .as_u64()
         .expect("a goto line");
-    assert_eq!(line, 6, "the block right after the fence, not the one past it");
+    assert_eq!(
+        line, 6,
+        "the block right after the fence, not the one past it"
+    );
 }
 
 #[test]
@@ -8102,4 +8105,3 @@ fn explicit_boot_presentation_overrides_default_and_jump_rules() {
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "buffer/content");
 }
-

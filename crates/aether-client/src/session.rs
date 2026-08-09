@@ -1601,7 +1601,10 @@ mod tests {
         let mut read = ReadView::loading(1);
         read.adopt(1, "Alpha.\n\nCafé".to_string());
         let last = read.elements.len() - 1;
-        assert_eq!(read.block_append_byte(last) as usize, "Alpha.\n\nCafé".len());
+        assert_eq!(
+            read.block_append_byte(last) as usize,
+            "Alpha.\n\nCafé".len()
+        );
     }
 
     #[test]

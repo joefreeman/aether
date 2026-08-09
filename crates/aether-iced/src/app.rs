@@ -4843,7 +4843,11 @@ impl App {
             MdBlock::Paragraph { content, .. } => md_rich_in(
                 content,
                 false,
-                if dim { theme::NORD3_BRIGHTER } else { theme::NORD4 },
+                if dim {
+                    theme::NORD3_BRIGHTER
+                } else {
+                    theme::NORD4
+                },
                 body,
                 READ_FONT_FAMILY,
                 READ_LINE_HEIGHT,
