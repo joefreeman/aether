@@ -4306,6 +4306,11 @@ enum HoverPlace {
 /// code blocks, and the gap between blocks.
 const MD_TEXT: f32 = 13.0;
 const MD_CODE: f32 = 12.0;
+/// Task checkboxes render a size up from the prose beside them. `☑`/`☐` come from a fallback
+/// face rather than the reading serif, and at a matched point size that face draws them small — a
+/// box noticeably shorter than the x-height of the text it belongs to. Scaling the glyph, rather
+/// than the row, keeps the baseline where the item's first line already put it.
+const MD_TASK_BOX_SCALE: f32 = 1.25;
 const MD_SPACING: f32 = 11.0;
 
 /// Render the hover Markdown AST: a column of block elements. Everything is cloned, so the result
@@ -4670,10 +4675,16 @@ impl App {
         let body = self.session.buffer_font_size as f32 * READ_SCALE;
         // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
         // always marks the reading position; the target pill inverts the interactive span the
-        // cursor sits inside, on top of it.
-        let cursor = self.session.buffer.cursor.position;
-        let block_span = read.block_focus(cursor).map(|i| read.elements[i].span());
-        let target_span = read.target_focus(cursor).map(|i| read.elements[i].span());
+        // cursor sits inside, on top of it. An extended selection adds the NORD2 tint over its
+        // blocks and suppresses the pill (§12; `display_target`).
+        let cursor_state = self.session.buffer.cursor;
+        let block_span = read
+            .display_block_focus(&cursor_state)
+            .map(|i| read.elements[i].span());
+        let target_span = read
+            .display_target(&cursor_state)
+            .map(|i| read.elements[i].span());
+        let sel_range = read.display_selection(&cursor_state);
         // Full-width rows: each block is a window-wide band (the selection tint fills it)
         // that centers its own measure-capped content column.
         let mut col = column![].spacing(body * 0.8);
@@ -4688,7 +4699,8 @@ impl App {
             // The position bar sits on the block — except lists, whose items bar individually
             // inside `read_block` (item-grain position).
             let focused = !matches!(b, MdBlock::List { .. }) && block_span == Some(b.span());
-            let block = self.read_block(b, body, ui, block_span, target_span);
+            let selected = span_selected(sel_range, b.span());
+            let block = self.read_block(b, body, ui, block_span, target_span, sel_range, false);
             // Clicking a block focuses it (list items carry their own inner mouse areas, which
             // capture the press first — see `read_block`'s List arm).
             let block: Element<'_, ReadMsg> = iced::widget::mouse_area(block)
@@ -4701,7 +4713,7 @@ impl App {
             let wrapped: Element<'_, ReadMsg> = if matches!(b, MdBlock::List { .. }) {
                 block
             } else {
-                read_focus_wrap(focused, block)
+                read_focus_wrap(focused, selected, block)
             };
             // Air above headings (web parity: `margin: 1.6em 0 0.5em` in the heading's own
             // size — sections breathe): the uniform column spacing supplies 0.8 body of the
@@ -4723,17 +4735,14 @@ impl App {
                     left: 16.0,
                     right: 16.0,
                 });
-            let outer = container(inner)
-                .width(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center);
-            // The focused band anchors the reveal probe (lists anchor their focused item
-            // inside `read_block` instead).
-            let outer = if focused {
-                outer.id(read_focus_id())
-            } else {
-                outer
-            };
-            col = col.push(outer);
+            // The reveal probe's anchor is claimed by the focused *block* inside `read_block`
+            // (and by a focused list item in its List arm), so it works at any nesting depth
+            // rather than only for the top-level band.
+            col = col.push(
+                container(inner)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center),
+            );
         }
         Element::from(
             iced::widget::scrollable(container(col).width(Length::Fill).padding([24, 0]))
@@ -4771,6 +4780,10 @@ impl App {
     /// One reading-view block. Reuses the hover renderers for inline runs; headings, tables and
     /// images get document-scale treatment. `block`/`target` are the two focus projections
     /// (position bar / Enter-target pill) — see `read_view`.
+    /// `dim` renders the block's prose in the secondary tone — a completed task item's content,
+    /// inherited by everything nested inside it, matching the web client's `li.md-task-done`
+    /// colour (which cascades the same way) and the terminal client's `SpanKind::TaskDone` remap.
+    #[allow(clippy::too_many_arguments)] // the focus/selection/tone family, threaded as one
     fn read_block(
         &self,
         b: &MdBlock,
@@ -4778,8 +4791,15 @@ impl App {
         ui: theme::Ui,
         block: Option<MdSpan>,
         target: Option<MdSpan>,
+        sel: Option<(u32, u32)>,
+        dim: bool,
     ) -> Element<'static, ReadMsg> {
-        match b {
+        // Whichever block is focused claims the reveal probe's anchor, wherever it is
+        // rendered — top level, inside a quote, or as a loose list item's second paragraph.
+        // The probe measures this container's bounds, and it finding nothing is what made
+        // `;`/`Alt-;` silently do nothing for anything but a top-level block (list *items*
+        // anchor themselves in the List arm below, since an item is not a block).
+        let el = match b {
             MdBlock::Heading { level, content, .. } => {
                 let size = read_heading_size(*level, body);
                 // The terminal's heading colour ladder: frost blue majors, teal H3, white
@@ -4823,7 +4843,7 @@ impl App {
             MdBlock::Paragraph { content, .. } => md_rich_in(
                 content,
                 false,
-                theme::NORD4,
+                if dim { theme::NORD3_BRIGHTER } else { theme::NORD4 },
                 body,
                 READ_FONT_FAMILY,
                 READ_LINE_HEIGHT,
@@ -4855,23 +4875,50 @@ impl App {
                     } else {
                         "•".to_string()
                     };
+                    let task = item.checked.is_some();
                     if let Some(done) = item.checked {
                         marker = if done { "☑".into() } else { "☐".into() };
                     }
+                    // Every item states its own done-ness: the tone does *not* inherit into a
+                    // nested list, so an open item indented under a completed one reads as open.
+                    // (The incoming `dim` is deliberately ignored here — it applies to the parent
+                    // item's own blocks, which the recursion below still carries.)
+                    let dim_item = item.checked == Some(true);
                     let mut inner = column![].spacing(body * 0.35);
                     for ib in &item.blocks {
-                        inner = inner.push(self.read_block(ib, body, ui, block, target));
+                        let child = self.read_block(ib, body, ui, block, target, sel, dim_item);
+                        // A child that is a reading stop of its own carries its own bar/tint
+                        // wrapper, exactly like a quote's children — without this a focused
+                        // second paragraph or fence inside a loose item painted no bar at all
+                        // in the GUI, while the terminal and web clients marked it.
+                        inner = inner.push(if item_child_is_stop(item, ib) {
+                            read_focus_wrap_inset(
+                                block == Some(ib.span()),
+                                span_selected(sel, ib.span()),
+                                6.0,
+                                child,
+                            )
+                        } else {
+                            child
+                        });
                     }
                     // Item-grain click focus: this inner area captures the press before the
                     // whole-block area the outer loop wraps the list in. The position bar
                     // rides the same wrapper, so focusing an item marks *it*, not the list —
                     // and equality (not containment) keeps a nested item's bar off its parents.
                     let item_focused = block == Some(item.span);
+                    let item_selected = span_selected(sel, item.span);
                     let area = iced::widget::mouse_area(read_focus_wrap(
                         item_focused,
-                        row![text(marker).size(body).color(theme::NORD4), inner,]
-                            .spacing(8)
-                            .into(),
+                        item_selected,
+                        row![
+                            text(marker)
+                                .size(if task { body * MD_TASK_BOX_SCALE } else { body })
+                                .color(theme::NORD4),
+                            inner,
+                        ]
+                        .spacing(8)
+                        .into(),
                     ))
                     .on_press(ReadMsg::Click(item.span.start));
                     // The focused item anchors the reveal probe (item grain, not the list).
@@ -4897,7 +4944,22 @@ impl App {
                         }));
                 }
                 for cb in content {
-                    inner = inner.push(self.read_block(cb, body, ui, block, target));
+                    // A container's children are reading stops in their own right now
+                    // (docs/markdown-view.md §12.6), so each one carries its own bar/tint
+                    // wrapper — the outer loop only wraps top-level blocks, and without this a
+                    // focused paragraph inside a quote painted no bar at all. Lists keep
+                    // wrapping per item inside their own arm.
+                    let child = self.read_block(cb, body, ui, block, target, sel, dim);
+                    inner = inner.push(if matches!(cb, MdBlock::List { .. }) {
+                        child
+                    } else {
+                        read_focus_wrap_inset(
+                            block == Some(cb.span()),
+                            span_selected(sel, cb.span()),
+                            6.0,
+                            child,
+                        )
+                    });
                 }
                 // A left bar, no panel shade (Joe's call: quotes read fine as bar + indent).
                 // Same nested-container construction as `read_focus_wrap` — `md_bar()`'s Fill
@@ -5074,6 +5136,14 @@ impl App {
             }
             // The remaining kinds read fine at hover scale.
             other => md_block(other, ui, ReadMsg::Link),
+        };
+        // Always wrapped, only the *id* is conditional: adding a container on focus alone would
+        // reflow the block as the reading position moved past it.
+        let anchored = container(el).width(Length::Fill);
+        if block == Some(b.span()) {
+            anchored.id(read_focus_id()).into()
+        } else {
+            anchored.into()
         }
     }
 
@@ -5425,15 +5495,58 @@ fn alert_style(kind: AlertKind) -> (&'static str, iced::Color) {
 /// resolves against the scrollable's *unbounded* vertical limits and destroys the layout
 /// (list rows collapsed to nothing). The strip is always reserved, so focus moves shift
 /// nothing.
-fn read_focus_wrap(on: bool, content: Element<'static, ReadMsg>) -> Element<'static, ReadMsg> {
+/// Whether `span` falls inside the extended selection's inclusive byte range — block-grain
+/// (whole blocks select, §12), so the span must be *contained*, not merely overlapping. A list
+/// item's span contains its nested children's, so overlap would tint every ancestor of the
+/// selected item too; containment tints the item alone, and a parent selected whole still tints
+/// its whole subtree because the children are inside it.
+fn span_selected(sel: Option<(u32, u32)>, span: MdSpan) -> bool {
+    sel.is_some_and(|(min, max)| span.start >= min && span.end <= max + 1)
+}
+
+fn read_focus_wrap(
+    on: bool,
+    selected: bool,
+    content: Element<'static, ReadMsg>,
+) -> Element<'static, ReadMsg> {
+    read_focus_wrap_inset(on, selected, 10.0, content)
+}
+
+/// Whether a block inside a list item is a reading stop in its own right — and so hosts its own
+/// bar/tint wrapper instead of leaving both to the item's.
+///
+/// Mirrors `markdown::walk_blocks`' element rule (docs/markdown-view.md §12.6): every child of a
+/// container is an element, *except* a solo one, which describes the same content as the item
+/// itself; headings are listed at any depth. Spans equal to the item's are excluded whatever the
+/// shape, since a bar keyed on span equality would otherwise paint twice on the one stop. Nested
+/// lists are never stops themselves — their items wrap individually in the List arm.
+fn item_child_is_stop(item: &crate::core::markdown::ListItem, child: &MdBlock) -> bool {
+    (item.blocks.len() > 1 || matches!(child, MdBlock::Heading { .. }))
+        && child.span() != item.span
+        && !matches!(child, MdBlock::List { .. })
+}
+
+/// [`read_focus_wrap`] with the gap between the bar strip and the content spelled out. Blocks
+/// *inside* a container (a quote's paragraphs — reading stops of their own since §12.6) take a
+/// tighter one: the container already pads its contents away from its own bar, so the full
+/// top-level gap would inset quoted text twice over.
+fn read_focus_wrap_inset(
+    on: bool,
+    selected: bool,
+    gap: f32,
+    content: Element<'static, ReadMsg>,
+) -> Element<'static, ReadMsg> {
+    // The inner container's opaque background doubles as the selection tint: NORD2 (the
+    // editor's selection shade) when the block is inside the extended selection, the page
+    // NORD0 otherwise — either way it keeps the bar strip from bleeding through.
     let inner = container(content)
         .width(Length::Fill)
         .padding(iced::Padding {
-            left: 10.0,
+            left: gap,
             ..iced::Padding::ZERO
         })
-        .style(|_| container::Style {
-            background: Some(theme::NORD0.into()),
+        .style(move |_| container::Style {
+            background: Some(if selected { theme::NORD2 } else { theme::NORD0 }.into()),
             ..container::Style::default()
         });
     container(inner)
@@ -6360,6 +6473,42 @@ mod tests {
 
     /// The info dialog is the wide, picker-aligned shape; the question prompts keep the narrow,
     /// lower one.
+    /// Every block the GUI gives its own focus bar to is a block-grain *element* of the same
+    /// span, and every element inside a list item gets one — the bar and the `j`/`k` stops are
+    /// the same set. A loose item's second paragraph and its fence used to be stops the GUI
+    /// painted no bar for (the terminal keys its gutter bar off the element list, so it always
+    /// marked them); the solo item next to them still leaves its bar to the item wrapper.
+    #[test]
+    fn every_list_item_stop_hosts_its_own_bar() {
+        use crate::core::markdown;
+        let src = "- Two paragraphs. The first.\n\n  And the second.\n\n  ```json\n  {}\n  ```\n\n- A solo item\n";
+        let blocks = markdown::parse(src);
+        let stops: Vec<u32> = markdown::elements(&blocks)
+            .iter()
+            .filter(|e| e.is_block())
+            .map(|e| e.span().start)
+            .collect();
+        let MdBlock::List { items, .. } = &blocks[0] else {
+            panic!("expected a list: {blocks:?}");
+        };
+        let (loose, solo) = (&items[0], &items[1]);
+        // The loose item's own three children are stops; each is its own bar host.
+        assert_eq!(loose.blocks.len(), 3);
+        for child in &loose.blocks {
+            assert!(
+                item_child_is_stop(loose, child),
+                "child {:?} is a stop the GUI must bar",
+                child.span()
+            );
+            assert!(stops.contains(&child.span().start), "and a `j`/`k` stop");
+        }
+        // The solo item's paragraph is the item — one stop, one bar, from the item wrapper.
+        assert_eq!(solo.blocks.len(), 1);
+        assert!(!item_child_is_stop(solo, &solo.blocks[0]));
+        assert!(!stops.contains(&solo.blocks[0].span().start));
+        assert!(stops.contains(&solo.span.start));
+    }
+
     #[test]
     fn prompt_shapes_differ_by_kind() {
         let info = prompt_box(true, 1000.0, ui());

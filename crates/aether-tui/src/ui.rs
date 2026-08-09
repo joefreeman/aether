@@ -4122,6 +4122,30 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         // link, the link's containing block keeps its bar (two projections of one cursor).
         // `bar_rows` is the focused block's whole subtree (nested items included).
         let row_focused = rv.bar_rows.is_some_and(|(a, b)| idx >= a && idx <= b);
+        // An extended selection tints its blocks' rows with the editor's selection shade
+        // (docs/markdown-view.md §12): page-background cells swap to NORD2 at push time
+        // (`finish_row`); spans with their own background — code panels, chips — keep it,
+        // exactly like the table band. Blank separator rows inside the range stay on the page
+        // background (only their gutter stub would tint) — per-block bands with clean gaps,
+        // matching the GUI/web per-block tint.
+        let row_selected =
+            rv.sel_rows.is_some_and(|(a, b)| idx >= a && idx <= b) && !row.spans.is_empty();
+        let finish_row = move |spans: Vec<Span<'static>>| -> Line<'static> {
+            if !row_selected {
+                return Line::from(spans);
+            }
+            Line::from(
+                spans
+                    .into_iter()
+                    .map(|mut s| {
+                        if s.style.bg.is_none() || s.style.bg == Some(NORD0) {
+                            s.style = s.style.bg(NORD2);
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
         let mut spans: Vec<Span> = vec![if row_focused {
             Span::styled("▎ ", Style::default().fg(NORD8).bg(NORD0))
         } else {
@@ -4144,7 +4168,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 format!("{} ", tag.text),
                 read_span_style(tag.style),
             ));
-            lines.push(Line::from(spans));
+            lines.push(finish_row(spans));
             continue;
         }
         // Code rows are unchunked — they may exceed the measure — and render through a
@@ -4227,7 +4251,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 if total > off + window { "…" } else { " " },
                 indicator,
             ));
-            lines.push(Line::from(spans));
+            lines.push(finish_row(spans));
             continue;
         }
         // Table rows are unchunked too — natural column widths may exceed the measure — and
@@ -4333,7 +4357,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                     indicator,
                 ));
             }
-            lines.push(Line::from(spans));
+            lines.push(finish_row(spans));
             continue;
         }
         for rs in &row.spans {
@@ -4344,7 +4368,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             }
             spans.push(Span::styled(rs.text.clone(), style));
         }
-        lines.push(Line::from(spans));
+        lines.push(finish_row(spans));
     }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
@@ -4418,6 +4442,9 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
         // panel background so the pad row reads as one solid strip.
         K::CodeFrame => Style::default().fg(OVERLAY_BORDER_FG).bg(MD_CODE_BG),
         K::Rule | K::TableBorder | K::TableDivider | K::Dim => Style::default().fg(NORD3),
+        // A completed task item reads as done without becoming chrome: the web's
+        // `li.md-task-done` tone, which is still legible prose rather than `Dim`'s border grey.
+        K::TaskDone => Style::default().fg(NORD3_BRIGHTER),
         K::Link => Style::default().fg(NORD9),
         // Bullets/numbers/checkboxes read as body text (uniform with the web/native markers).
         K::Marker => Style::default().fg(NORD4),
@@ -6170,9 +6197,14 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
         .and_then(|r| r.segments.first())
         .map_or("", |s| s.text.as_str());
     let row_local = pos.col.saturating_sub(row.map_or(0, |r| r.byte_offset)) as usize;
-    let char_bytes = row_text[row_local..]
-        .chars()
-        .next()
+    // `get` (not indexing): `pos.col` is a byte column into the *current* text, while these rows
+    // are whatever the last viewport push rendered. An edit that moves the cursor to a different
+    // line — a block move especially — adopts the new cursor from its own RPC response one round
+    // trip before the matching rows arrive, so for that frame the column can land mid-char in the
+    // stale line and slicing there would panic. Same +1 approximation as the off-window case.
+    let char_bytes = row_text
+        .get(row_local..)
+        .and_then(|s| s.chars().next())
         .map_or(1, |c| c.len_utf8() as u32);
     LogicalPosition {
         line: pos.line,

@@ -27673,3 +27673,358 @@ async fn history_records_per_workspace_and_persists() {
 
     drop(server);
 }
+
+// ---- block edits (markdown reading view, docs/markdown-view.md §12) -----------------------------
+
+#[tokio::test]
+async fn move_block_swaps_siblings_selects_the_moved_text_and_undoes_atomically() {
+    use aether_protocol::input::{BlockUnit, InputMoveBlock, MoveBlockParams};
+    let (server, mut ws, buffer_id) = setup_with_buffer("# T\n\nAlpha.\n\nBeta.\n\nGamma.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    // Reading position on "Alpha." (line 2).
+    set_snapped(&mut ws, 10, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputMoveBlock>(
+        &mut ws,
+        11,
+        &MoveBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Block,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    // The moved block lands selected whole-line at its new position (line 4).
+    assert_eq!(r.cursor.anchor, p(4, 0));
+    assert_eq!(r.cursor.position.line, 4);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "# T\n\nBeta.\n\nAlpha.\n\nGamma.\n");
+    // ONE undo reverses the whole move — the swap was a single transaction.
+    let u: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        13,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert!(u.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "# T\n\nAlpha.\n\nBeta.\n\nGamma.\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_block_on_a_focused_container_moves_the_whole_container() {
+    use aether_protocol::input::{BlockUnit, InputMoveBlock, MoveBlockParams};
+    // A `j`/`k` walk parks the point on the quote's own `>` — the reading view lights the
+    // whole quote there, so the move must take the quote and its nested children, not the
+    // quote's single-line first paragraph (which used to win the line-extent resolution).
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("Intro.\n\n> Outer.\n>\n> > Inner.\n\nOutro.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputMoveBlock>(
+        &mut ws,
+        11,
+        &MoveBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Block,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "Intro.\n\nOutro.\n\n> Outer.\n>\n> > Inner.\n");
+    // Point in, point out: parked on the quote at its new position.
+    assert_eq!(r.cursor.anchor, p(4, 0));
+    assert_eq!(r.cursor.position, p(4, 0));
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_block_at_the_end_is_a_quiet_noop() {
+    use aether_protocol::input::{BlockUnit, InputMoveBlock, MoveBlockParams};
+    let (server, mut ws, buffer_id) = setup_with_buffer("Alpha.\n\nBeta.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputMoveBlock>(
+        &mut ws,
+        11,
+        &MoveBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Block,
+        },
+    )
+    .await;
+    assert!(!r.applied);
+    assert_eq!(r.reason, None, "boundary no-op stays quiet");
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_paragraph_unit_works_on_plain_text() {
+    use aether_protocol::input::{BlockUnit, InputMoveBlock, MoveBlockParams};
+    let (server, mut ws, buffer_id) = setup_with_buffer("fn a() {\n}\n\nfn b() {\n}\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputMoveBlock>(
+        &mut ws,
+        11,
+        &MoveBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Paragraph,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "fn b() {\n}\n\nfn a() {\n}\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn delete_block_cuts_around_and_paste_block_restores() {
+    use aether_protocol::input::{InputDeleteBlock, InputPasteBlock, PasteBlockParams};
+    let (server, mut ws, buffer_id) = setup_with_buffer("Alpha.\n\nBeta.\n\nGamma.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputDeleteBlock>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+    assert!(r.applied);
+    assert_eq!(r.text.as_deref(), Some("Beta.\n"), "clipboard payload");
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text, "Alpha.\n\nGamma.\n",
+        "separator went with the block"
+    );
+    // Cursor landed on the block now filling the gap; paste the cut text back before it.
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputPasteBlock>(
+        &mut ws,
+        13,
+        &PasteBlockParams {
+            buffer_id,
+            text: "Beta.\n".into(),
+            replace: false,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text, "Alpha.\n\nBeta.\n\nGamma.\n",
+        "cut → paste round-trips"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn block_depth_demotes_headings_and_quotes_paragraphs() {
+    use aether_protocol::input::{BlockDepthParams, InputBlockDepth};
+    let (server, mut ws, buffer_id) = setup_with_buffer("## Head\n\nBody.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputBlockDepth>(
+        &mut ws,
+        11,
+        &BlockDepthParams {
+            buffer_id,
+            deeper: true,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "### Head\n\nBody.\n");
+    // A paragraph has no level to change, so "deeper" means one more blockquote level — a
+    // quote is a container in the block tree, so wrapping is genuinely a step down.
+    set_snapped(&mut ws, 13, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputBlockDepth>(
+        &mut ws,
+        14,
+        &BlockDepthParams {
+            buffer_id,
+            deeper: true,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 15, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "### Head\n\n> Body.\n");
+    // And `Ctrl-h` peels it back off.
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputBlockDepth>(
+        &mut ws,
+        16,
+        &BlockDepthParams {
+            buffer_id,
+            deeper: false,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 17, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "### Head\n\nBody.\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn move_block_past_a_list_that_interrupts_it_keeps_the_block_separate() {
+    use aether_protocol::input::{BlockUnit, InputMoveBlock, MoveBlockParams};
+    // A list may follow a paragraph with no blank line between them. Reversing that adjacency
+    // without restoring a separator would leave the paragraph re-parsed as a lazy continuation
+    // of the last list item — appended to it, and unmovable from there.
+    let (server, mut ws, buffer_id) = setup_with_buffer("Intro.\n- a\n- b\n\nOutro.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
+    let down = || MoveBlockParams {
+        buffer_id,
+        direction: VerticalDirection::Down,
+        unit: BlockUnit::Block,
+    };
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputMoveBlock>(&mut ws, 11, &down()).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- a\n- b\n\nIntro.\n\nOutro.\n");
+    // Still a top-level block: it keeps moving instead of being stuck inside the list.
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputMoveBlock>(&mut ws, 13, &down()).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- a\n- b\n\nOutro.\n\nIntro.\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn block_edits_refuse_front_matter_with_a_reason() {
+    use aether_protocol::input::{InputDeleteBlock, InputPasteBlock, PasteBlockParams};
+    // Front matter is only front matter while it opens the file: cutting it, replacing it or
+    // pushing a block above it all refuse with a toastable reason (docs/markdown-view.md §12.1).
+    let (server, mut ws, buffer_id) = setup_with_buffer("---\nkey: v\n---\n\nBody.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputDeleteBlock>(&mut ws, 11, &BufferOnlyParams { buffer_id }).await;
+    assert!(!r.applied);
+    assert_eq!(r.reason.as_deref(), Some("Front matter stays at the top"));
+    assert_eq!(r.text, None, "nothing reached the clipboard");
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputPasteBlock>(
+        &mut ws,
+        12,
+        &PasteBlockParams {
+            buffer_id,
+            text: "Injected.".into(),
+            replace: false,
+        },
+    )
+    .await;
+    assert!(!r.applied);
+    assert!(r.reason.is_some());
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 13, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "---\nkey: v\n---\n\nBody.\n", "document untouched");
+    drop(server);
+}
+
+#[tokio::test]
+async fn indenting_a_list_item_lands_the_cursor_on_that_item() {
+    use aether_protocol::input::{BlockDepthParams, InputBlockDepth};
+    // A nested item's span starts at its marker, so the indent in front of it belongs to the
+    // parent. Landing on the line start focused the parent and the next press acted on it.
+    let (server, mut ws, buffer_id) = setup_with_buffer("- one\n- two\n- three\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(1, 2), p(1, 2), Granularity::Char).await;
+    let deeper = |deeper: bool| BlockDepthParams { buffer_id, deeper };
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputBlockDepth>(&mut ws, 11, &deeper(true)).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- one\n  - two\n- three\n");
+    // Invoked from a bare reading position, so the landing stays a point — parked on the
+    // indented item's own marker (col 2), not out in the indent that belongs to its parent.
+    assert_eq!(r.cursor.position, p(1, 2));
+    assert_eq!(r.cursor.anchor, r.cursor.position, "no selection conjured");
+    // And the next press still acts on it: un-nesting puts it straight back.
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputBlockDepth>(&mut ws, 13, &deeper(false)).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text, "- one\n- two\n- three\n",
+        "Ctrl-l / Ctrl-h ping-pong"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_task_flips_the_checkbox_under_the_cursor() {
+    use aether_protocol::input::{InputToggleTask, ToggleTaskParams};
+    let (server, mut ws, buffer_id) = setup_with_buffer("- [ ] open\n- [x] done\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(0, 6), p(0, 6), Granularity::Char).await;
+    let toggle = |set| ToggleTaskParams { buffer_id, set };
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputToggleTask>(&mut ws, 11, &toggle(None)).await;
+    assert!(r.applied);
+    assert_eq!(r.cursor.position, p(0, 6), "length unchanged, cursor stays");
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- [x] open\n- [x] done\n");
+    // `set` asks for a state rather than a flip — `Ctrl-a`/`Ctrl-Alt-a`. Asking for the state the
+    // box is already in is a quiet no-op, so a held key settles the list instead of flapping it.
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputToggleTask>(&mut ws, 13, &toggle(Some(true))).await;
+    assert!(!r.applied, "already checked");
+    assert!(r.reason.is_none(), "quietly, with no toast");
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputToggleTask>(&mut ws, 14, &toggle(Some(false))).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 15, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- [ ] open\n- [x] done\n", "unchecked, neighbour untouched");
+    drop(server);
+}
+
+#[tokio::test]
+async fn toggle_task_refuses_when_the_cursor_is_not_inside_a_task_item() {
+    use aether_protocol::input::{InputToggleTask, ToggleTaskParams};
+    // `Ctrl-a` sends unconditionally, so the resolver is the only gate: from a neighbouring
+    // block it must refuse quietly, not reach into the list and toggle a box the cursor never
+    // touched.
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("Intro.\n\n- [ ] open\n\nOutro.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let toggle = ToggleTaskParams {
+        buffer_id,
+        set: Some(true),
+    };
+    for (line, col, from) in [(0, 2, "Intro"), (4, 2, "Outro"), (3, 0, "the separator")] {
+        set_snapped(&mut ws, 10, buffer_id, p(line, col), p(line, col), Granularity::Char).await;
+        let r: aether_protocol::input::BlockEditResult =
+            send_request::<InputToggleTask>(&mut ws, 11, &toggle).await;
+        assert!(!r.applied, "no toggle from {from}");
+        assert!(r.reason.is_none(), "and quietly, from {from}");
+    }
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "Intro.\n\n- [ ] open\n\nOutro.\n", "box untouched");
+    drop(server);
+}

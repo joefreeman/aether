@@ -1,0 +1,10 @@
+[package]
+name = "aether-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The shared markdown block model: pulldown-cmark parse with source spans, the element list, and block-edit resolution. One parser for the reading view (client) and structural edits (server)."
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+serde = { workspace = true }

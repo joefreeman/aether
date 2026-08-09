@@ -302,7 +302,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "read-headings", tier: 3, contexts: &[C::Read], keys: "o/Alt-o",
         trigger: Trigger::Action(|a| matches!(a, Action::ReadStepHeading(_))),
         text: "Use {} to jump between headings" },
-    HintDef { id: "read-copy", tier: 3, contexts: &[C::Read], keys: "y",
+    HintDef { id: "read-copy", tier: 3, contexts: &[C::Read], keys: "Ctrl-c",
         trigger: Trigger::Action(|a| matches!(a, Action::ReadCopy)),
         text: "Use {} to copy the link URL or block source" },
 

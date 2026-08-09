@@ -31,6 +31,17 @@ fn no_request(fx: &Effects) -> bool {
     !fx.0.iter().any(|e| matches!(e, Effect::Request { .. }))
 }
 
+/// Every `Effect::Request` in `fx`, in emission (= wire) order — for composite actions that
+/// queue several.
+fn all_requests(fx: &Effects) -> Vec<(&'static str, serde_json::Value)> {
+    fx.0.iter()
+        .filter_map(|e| match e {
+            Effect::Request { method, params, .. } => Some((*method, params.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The single `Effect::Request` in `fx` (panics otherwise — these tests pin exact traffic).
 fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     let mut reqs = fx.0.iter().filter_map(|e| match e {
@@ -6998,16 +7009,553 @@ fn read_tab_shows_the_focused_target_without_following() {
 }
 
 #[test]
-fn read_y_copies_the_focused_elements_source() {
+fn read_ctrl_c_copies_the_focused_elements_source() {
     let mut s = read_session();
-    // Cursor on the heading: `y` copies its markdown source.
-    let fx = key(&mut s, 'y');
+    // Cursor on the heading: `Ctrl-c` (the editor's clipboard chord) copies its markdown source.
+    let fx = ctrl(&mut s, 'c');
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
             Effect::WriteClipboard(text) if text == "# Title"
         )),
-        "y copies the element source"
+        "Ctrl-c copies the element source"
+    );
+    // The old vim-style `y` is gone: bare `y` does nothing in Read.
+    let fx = key(&mut s, 'y');
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::WriteClipboard(_))),
+        "bare y no longer copies"
+    );
+}
+
+#[test]
+fn read_shift_j_extends_selection_block_wise() {
+    let mut s = read_session();
+    // Shift-j from the heading: a whole-line block selection heading..=first-paragraph via
+    // cursor/set + Line granularity — the anchor plants at the heading's line, the cursor
+    // lands on the paragraph's; the server snaps both to the normal form.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::SHIFT, Some("J".into()), ROWS);
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/set");
+    assert_eq!(p["granularity"], json!("line"));
+    assert_eq!(p["anchor"]["line"], json!(0));
+    assert_eq!(p["position"]["line"], json!(2));
+}
+
+#[test]
+fn read_x_snaps_then_walks_and_shift_grows() {
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // First press: the focused block alone, whole-line form (the editor's `x` snaps the
+    // current line before walking; a one-line heading: both ends line 0).
+    let fx = key(&mut s, 'x');
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/set");
+    assert_eq!(p["granularity"], json!("line"));
+    assert_eq!(p["anchor"]["line"], json!(0));
+    assert_eq!(p["position"]["line"], json!(0));
+    // With the whole heading selected (as the server would hold it), plain `x` WALKS: the
+    // next block alone — not an extension.
+    s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 7 };
+    let fx = key(&mut s, 'x');
+    let (_t, _method, p) = the_request(&fx);
+    assert_eq!(p["anchor"]["line"], json!(2));
+    assert_eq!(p["position"]["line"], json!(2));
+    // Shift-x from the same whole-block selection GROWS the bottom instead.
+    let fx = s.on_key(KeyCode::Char('x'), Mods::SHIFT, Some("X".into()), ROWS);
+    let (_t, _method, p) = the_request(&fx);
+    assert_eq!(p["anchor"]["line"], json!(0));
+    assert_eq!(p["position"]["line"], json!(2));
+}
+
+#[test]
+fn read_alt_x_selects_the_previous_block_and_saturates() {
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // The editor's first-press asymmetry: Alt-x from a bare reading position selects the
+    // block *above* (cursor on the first paragraph → the heading), not the focused one.
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/set");
+    assert_eq!(p["anchor"]["line"], json!(0));
+    assert_eq!(p["position"]["line"], json!(0));
+    // At the document top it saturates: Alt-x on the heading selects the heading itself.
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let (_t, _method, p) = the_request(&fx);
+    assert_eq!(p["anchor"]["line"], json!(0));
+    assert_eq!(p["position"]["line"], json!(0));
+}
+
+#[test]
+fn read_x_snaps_a_partial_selection_before_advancing() {
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // A non-whole selection (a few chars inside the first paragraph): plain `x` collapses
+    // to the direction's edge block whole — consuming the press without advancing, exactly
+    // like the editor's snap-before-walk.
+    s.buffer.cursor.anchor = LogicalPosition { line: 2, col: 1 };
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 5 };
+    let fx = key(&mut s, 'x');
+    let (_t, _method, p) = the_request(&fx);
+    assert_eq!(p["anchor"]["line"], json!(2));
+    assert_eq!(p["position"]["line"], json!(2));
+}
+
+#[test]
+fn read_ctrl_c_copies_the_extended_selections_source() {
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // A whole-line selection over heading + first paragraph, as the server would hold it:
+    // copy takes the source slice, inclusive of the end cursor's newline.
+    s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 11 };
+    let fx = ctrl(&mut s, 'c');
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::WriteClipboard(text) if text == "# Title\n\nFirst para.\n"
+        )),
+        "selection source copied"
+    );
+}
+
+#[test]
+fn read_projections_pause_while_the_parse_is_being_refreshed() {
+    use aether_client::update::Event;
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::input::BlockEditResult;
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // An edit's new cursor is adopted from its own response, a round trip before the re-parse
+    // lands. Deriving focus against the old parse meanwhile painted the bar on whatever block
+    // happened to sit at those bytes in the *previous* document — a flash on an unrelated
+    // block. Nothing is drawn until the new parse arrives.
+    let read = s.read.as_ref().unwrap();
+    assert!(read.display_block_focus(&s.buffer.cursor).is_some());
+    let cursor = CursorState {
+        position: LogicalPosition { line: 4, col: 0 },
+        anchor: LogicalPosition { line: 4, col: 0 },
+        ..Default::default()
+    };
+    let fx = s.on_event(Event::BlockEditDone(Ok(BlockEditResult {
+        applied: true,
+        reason: None,
+        revision: 2,
+        cursor,
+        text: None,
+    })));
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )),
+        "the refresh is in flight"
+    );
+    let read = s.read.as_ref().unwrap();
+    assert!(read.loading, "…and the view knows its parse is stale");
+    assert_eq!(read.display_block_focus(&s.buffer.cursor), None);
+    assert_eq!(read.display_target(&s.buffer.cursor), None);
+    assert_eq!(read.display_selection(&s.buffer.cursor), None);
+    // The new parse restores them.
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 2, "text": "# Title\n\nMoved.\n\nFirst para.\n" })),
+    );
+    let read = s.read.as_ref().unwrap();
+    assert!(!read.loading);
+    assert!(read.display_block_focus(&s.buffer.cursor).is_some());
+}
+
+#[test]
+fn read_extended_selection_suppresses_the_display_target() {
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // Cursor inside the link span: the pill shows while the selection is a point…
+    s.buffer.cursor.position = LogicalPosition { line: 4, col: 5 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let read = s.read.as_ref().unwrap();
+    assert!(read.target_focus(s.buffer.cursor.position).is_some());
+    assert!(read.display_target(&s.buffer.cursor).is_some());
+    // …and goes away as soon as the selection is extended (§12: one selection at a time).
+    s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
+    let read = s.read.as_ref().unwrap();
+    assert!(read.target_focus(s.buffer.cursor.position).is_some());
+    assert!(read.display_target(&s.buffer.cursor).is_none());
+}
+
+#[test]
+fn read_i_and_a_enter_insert_at_the_blocks_edges() {
+    use aether_client::session::Mode;
+    use aether_protocol::LogicalPosition;
+    // `i` from a bare reading position on the first paragraph: caret at the block's start,
+    // editor in Insert, the reading view gone — and no presentation preference recorded.
+    let mut s = read_session();
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Insert);
+    assert!(s.read.is_none());
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(p["motion"]["kind"], json!("goto"));
+    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 0}));
+    // `a`: the append position — the caret gap before the block's terminating newline.
+    let mut s = read_session();
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = key(&mut s, 'a');
+    assert_eq!(s.mode, Mode::Insert);
+    let (_t, _m, p) = the_request(&fx);
+    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 11}));
+}
+
+#[test]
+fn read_i_extended_uses_the_editors_selection_edge() {
+    use aether_client::session::Mode;
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // An extended whole-line selection: `i` hands the landing to the server's own
+    // Insert-entry motion instead of a client-computed Goto.
+    s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 11 };
+    let fx = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Insert);
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(p["motion"]["kind"], json!("selection_edge"));
+}
+
+#[test]
+fn read_ctrl_e_changes_block_content_keeping_the_newline() {
+    use aether_client::session::Mode;
+    use aether_protocol::LogicalPosition;
+    let mut s = read_session();
+    // Rewrite the first paragraph: the selection re-materializes over the *content* only —
+    // (2,0)..(2,10), the final '.' — so the terminating newline and both separators survive
+    // the editor's Change; then Insert on the emptied line.
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = ctrl(&mut s, 'e');
+    assert_eq!(s.mode, Mode::Insert);
+    assert!(s.read.is_none());
+    let reqs = all_requests(&fx);
+    assert_eq!(reqs.len(), 2, "cursor/set then input/change: {reqs:?}");
+    assert_eq!(reqs[0].0, "cursor/set");
+    assert_eq!(reqs[0].1["anchor"], json!({"line": 2, "col": 0}));
+    assert_eq!(reqs[0].1["position"], json!({"line": 2, "col": 10}));
+    assert!(
+        reqs[0].1.get("granularity").is_none(),
+        "exact char range, no snap"
+    );
+    assert_eq!(reqs[1].0, "input/change");
+}
+
+#[test]
+fn read_ctrl_o_opens_a_paragraph_below_and_above() {
+    use aether_client::session::Mode;
+    use aether_protocol::LogicalPosition;
+    // Below: park at the paragraph's append position, insert the blank pair; the caret ends
+    // between them, so no corrective move.
+    let mut s = read_session();
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = ctrl(&mut s, 'o');
+    assert_eq!(s.mode, Mode::Insert);
+    assert!(s.read.is_none());
+    let reqs = all_requests(&fx);
+    assert_eq!(reqs.len(), 2, "goto + text: {reqs:?}");
+    assert_eq!(reqs[0].0, "cursor/move");
+    assert_eq!(
+        reqs[0].1["motion"]["position"],
+        json!({"line": 2, "col": 11})
+    );
+    assert_eq!(reqs[1].0, "input/text");
+    assert_eq!(reqs[1].1["text"], json!("\n\n"));
+    // Above: the insert at the block's first line pushes the caret past both newlines, so a
+    // corrective Goto returns it to the (unchanged) insertion line.
+    let mut s = read_session();
+    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = ctrl_alt(&mut s, 'o');
+    let reqs = all_requests(&fx);
+    assert_eq!(reqs.len(), 3, "goto + text + corrective goto: {reqs:?}");
+    assert_eq!(
+        reqs[0].1["motion"]["position"],
+        json!({"line": 2, "col": 0})
+    );
+    assert_eq!(reqs[1].1["text"], json!("\n\n"));
+    assert_eq!(
+        reqs[2].1["motion"]["position"],
+        json!({"line": 2, "col": 0})
+    );
+}
+
+#[test]
+fn read_transitions_do_not_record_a_presentation_preference() {
+    use aether_client::session::Mode;
+    // `Space v` back into the editor records "source"; the edit transitions must not — the
+    // buffer's remembered choice stays "read", so the next open still renders the view.
+    let mut s = read_session();
+    let buffer = s.buffer.buffer_id;
+    assert_eq!(s.read_preference(buffer), Some(true), "entry recorded read");
+    let _ = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Insert);
+    assert_eq!(
+        s.read_preference(buffer),
+        Some(true),
+        "the transition left the preference alone"
+    );
+    // Contrast: Space v out of Read is the explicit "I prefer source" signal.
+    let mut s = read_session();
+    let _ = leader(&mut s, 'v');
+    assert_eq!(s.read_preference(s.buffer.buffer_id), Some(false));
+}
+
+#[test]
+fn read_ctrl_z_undoes_from_the_reading_view() {
+    let mut s = read_session();
+    let fx = ctrl(&mut s, 'z');
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "edit/undo");
+    let fx = ctrl_alt(&mut s, 'z');
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "edit/redo");
+}
+
+#[test]
+fn read_ctrl_j_k_move_blocks_and_the_editor_moves_paragraphs() {
+    // Read: block grain, with the Ctrl-Alt aliases.
+    let mut s = read_session();
+    let fx = ctrl(&mut s, 'j');
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "input/move_block");
+    assert_eq!(p["direction"], json!("down"));
+    assert_eq!(p["unit"], json!("block"));
+    let fx = ctrl_alt(&mut s, 'k');
+    let (_t, _m, p) = the_request(&fx);
+    assert_eq!(
+        (&p["direction"], &p["unit"]),
+        (&json!("up"), &json!("block"))
+    );
+    // Editor: the Ctrl-Alt chords move blank-line paragraphs, any file type.
+    let mut s = session();
+    let fx = ctrl_alt(&mut s, 'j');
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "input/move_block");
+    assert_eq!(p["unit"], json!("paragraph"));
+}
+
+#[test]
+fn read_ctrl_x_cuts_and_the_response_lands_on_the_clipboard() {
+    use aether_client::update::Event;
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::input::BlockEditResult;
+    let mut s = read_session();
+    let fx = ctrl(&mut s, 'x');
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "input/delete_block");
+    let fx = s.on_event(Event::BlockEditDone(Ok(BlockEditResult {
+        applied: true,
+        reason: None,
+        revision: 2,
+        cursor: CursorState::default(),
+        text: Some("Beta.\n".into()),
+    })));
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::WriteClipboard(t) if t == "Beta.\n")),
+        "cut payload reaches the clipboard"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )),
+        "the parse refreshes off the edit response"
+    );
+}
+
+#[test]
+fn read_ctrl_v_pastes_through_the_clipboard_flow() {
+    use aether_client::session::PasteKind;
+    let mut s = read_session();
+    let fx = ctrl(&mut s, 'v');
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::ReadClipboard(PasteKind::Block { replace: false })
+        )),
+        "Ctrl-v asks the shell for the clipboard with the block kind"
+    );
+    // The shell's callback lands as input/paste_block.
+    let fx = s.paste(PasteKind::Block { replace: true }, "New block.".into());
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "input/paste_block");
+    assert_eq!(p["text"], json!("New block."));
+    assert_eq!(p["replace"], json!(true));
+}
+
+#[test]
+fn read_ctrl_h_l_change_depth_and_refusals_toast_only_with_reason() {
+    use aether_client::update::Event;
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::input::BlockEditResult;
+    let mut s = read_session();
+    let fx = ctrl(&mut s, 'l');
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "input/block_depth");
+    assert_eq!(p["deeper"], json!(true));
+    // A reasoned refusal toasts…
+    let refusal = |reason: Option<&str>| {
+        Event::BlockEditDone(Ok(BlockEditResult {
+            applied: false,
+            reason: reason.map(str::to_string),
+            revision: 1,
+            cursor: CursorState::default(),
+            text: None,
+        }))
+    };
+    let fx = s.on_event(refusal(Some("Depth applies to headings and list items")));
+    assert!(fx
+        .0
+        .iter()
+        .any(|e| matches!(e, Effect::Toast { message, .. } if message.contains("Depth"))),);
+    // …a quiet boundary no-op doesn't.
+    let fx = s.on_event(refusal(None));
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
+}
+
+#[test]
+fn enter_toggles_a_task_items_checkbox() {
+    use aether_client::update::Event;
+    use aether_protocol::LogicalPosition;
+    // A read fixture with task items.
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "- [ ] open\n- [x] done\n" })),
+    );
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 6 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "input/toggle_task");
+    let _ = Event::BlockEditDone; // (adoption covered by the cut test)
+}
+
+#[test]
+fn j_steps_one_block_from_a_selected_fence() {
+    use aether_protocol::LogicalPosition;
+    // `x` on a fence leaves the cursor on the closing fence line's newline — a byte a Code span
+    // does not reach, unlike a paragraph's. Resolving the step origin there fell forward to the
+    // block *after* the fence, so `j` landed two blocks down and skipped one.
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _method, _) = the_request(&fx);
+    let text = "Intro.\n\n```rust\nfn a() {}\n```\n\nMiddle.\n\nLast.\n";
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": text })));
+    // Cursor on the closing fence line's newline, as a whole-line block selection leaves it.
+    s.buffer.cursor.anchor = LogicalPosition { line: 2, col: 0 };
+    s.buffer.cursor.position = LogicalPosition { line: 4, col: 3 };
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["kind"], "goto");
+    let line = params["motion"]["position"]["line"]
+        .as_u64()
+        .expect("a goto line");
+    assert_eq!(line, 6, "the block right after the fence, not the one past it");
+}
+
+#[test]
+fn ctrl_a_checks_a_task_item_in_markdown_and_still_adjusts_numbers_elsewhere() {
+    // One pair of keys, one meaning — "adjust what's under the cursor, up or down" — resolving to
+    // whatever the buffer has. Markdown gives up number adjustment for it, deliberately.
+    let mut s = md_session();
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/toggle_task");
+    assert_eq!(params["set"], json!(true), "up checks the box");
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL_ALT, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/toggle_task");
+    assert_eq!(params["set"], json!(false), "down unchecks it");
+    // The same chord in the reading view resolves the same way — that is the point of it.
+    let fx = leader(&mut s, 'v');
+    let (token, _method, _) = the_request(&fx);
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "- [ ] open\n" })));
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/toggle_task");
+    assert_eq!(params["set"], json!(true));
+    // A non-markdown buffer keeps the number adjust.
+    let mut s = session();
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/adjust_number");
+    assert_eq!(params["delta"], json!(1));
+}
+
+#[test]
+fn enter_toggles_a_task_item_holding_more_than_one_block() {
+    use aether_protocol::LogicalPosition;
+    // An item with a sub-list (or a second paragraph) lists its inner block as an element of its
+    // own, so innermost-first resolution stops there and never sees the checkbox. The item around
+    // it owns the box — the same outward walk the server's `resolve_toggle_task` does.
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _method, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "- [ ] outer\n\n  - [x] inner\n" })),
+    );
+    // On the outer item's own text, whose innermost element is the paragraph, not the item.
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 8 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "input/toggle_task");
+}
+
+#[test]
+fn enter_does_not_follow_a_link_the_selection_has_un_armed() {
+    use aether_protocol::LogicalPosition;
+    // With the selection extended the shells hide the target pill, so nothing on screen says a
+    // link is armed. Enter must not follow one it isn't showing.
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _method, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({ "revision": 1, "text": "[docs](https://example.com) and text.\n" })),
+    );
+    // Point cursor on the link: Enter follows it.
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 2 };
+    s.buffer.cursor.anchor = s.buffer.cursor.position;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
+        "an armed link still follows"
+    );
+    // Same cursor, selection extended over the block: no navigation, no request.
+    s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
+    s.buffer.cursor.position = LogicalPosition { line: 0, col: 30 };
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        !fx.0
+            .iter()
+            .any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
+        "the un-armed link is not followed"
     );
 }
 
@@ -7049,6 +7597,28 @@ fn read_table_contains_no_editing_action() {
                     | Action::ReadEnds { .. }
                     | Action::ReadActivate
                     | Action::ReadCopy
+                    | Action::ReadSelectBlock(_)
+                    // §12's curated edits: undo/redo act on the buffer but create no new
+                    // text shape from Read; each future edit action is added here
+                    // deliberately, keeping the §1.4 discipline as an explicit list.
+                    | Action::Undo
+                    | Action::Redo
+                    // §12 phase 2: the to-the-editor transitions — they place the cursor
+                    // and hand over to the editor's own insert/change machinery.
+                    | Action::ReadInsert { .. }
+                    | Action::ReadChange
+                    | Action::ReadOpenBlock { .. }
+                    // §12 phase 3: the structural edits — selection-relative server ops,
+                    // atomic, refusals as applied:false.
+                    | Action::MoveBlock { .. }
+                    | Action::ReadCutBlock
+                    | Action::ReadPasteBlock { .. }
+                    | Action::ReadBlockDepth { .. }
+                    // The editor's adjust-the-value pair, re-declared in the Read table so
+                    // `Ctrl-a`/`Ctrl-Alt-a` check and uncheck a task item on both sides of
+                    // `Space v`. In markdown they never touch a number.
+                    | Action::IncrementNumber
+                    | Action::DecrementNumber
                     | Action::Scroll { .. }
                     | Action::EnterSearch
                     | Action::SearchCycle(_)
@@ -7077,7 +7647,7 @@ fn buffer_changed_with_newer_revision_refetches_content() {
     }));
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "buffer/content", "newer revision → re-fetch");
-    // An equal (or older) revision is quiet.
+    // A repeat of the same signal is quiet: a fetch is already in flight.
     let fx = s.on_event(Event::ServerPush(Notification {
         jsonrpc: JsonRpc,
         method: "buffer/changed".into(),
@@ -7086,6 +7656,43 @@ fn buffer_changed_with_newer_revision_refetches_content() {
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "no duplicate fetch while one is already in flight"
+    );
+}
+
+#[test]
+fn read_undo_refetches_despite_the_restored_older_revision() {
+    use aether_client::update::Event;
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::envelope::{JsonRpc, Notification};
+    use aether_protocol::input::UndoResult;
+    // Undo restores the undone entry's revision NUMBER — revisions identify states, they
+    // don't order them — so a change signal can arrive with an *older* revision than the
+    // parse. It must still refetch (the old `>` guard left the view rendering undone text).
+    let mut s = read_session(); // parse at revision 1
+    let fx = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: "buffer/changed".into(),
+        params: json!({"buffer_id": s.buffer.buffer_id, "revision": 0}),
+    }));
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(
+        method, "buffer/content",
+        "older revision → still a re-fetch"
+    );
+    // And the client's own undo response refreshes directly, without waiting for the
+    // server's change push.
+    let mut s = read_session();
+    let fx = s.on_event(Event::UndoRedoDone(Ok(UndoResult {
+        revision: 0,
+        applied: true,
+        cursor: CursorState::default(),
+    })));
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )),
+        "own undo response → re-fetch"
     );
 }
 
@@ -7495,3 +8102,4 @@ fn explicit_boot_presentation_overrides_default_and_jump_rules() {
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "buffer/content");
 }
+

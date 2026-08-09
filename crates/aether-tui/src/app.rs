@@ -243,6 +243,10 @@ pub struct ReadViewState {
     /// subtree (a parent item's bar covers its nested items, matching the GUI/web wrappers).
     /// `None` only while loading/empty.
     pub bar_rows: Option<(usize, usize)>,
+    /// The extended selection as an inclusive layout-row range (docs/markdown-view.md §12):
+    /// all rows of blocks intersecting the server selection, separators inside riding along.
+    /// `None` while the selection is a point — most of the time.
+    pub sel_rows: Option<(usize, usize)>,
     /// The Enter target (interactive-grain): the link/image/footnote-ref span the cursor sits
     /// inside, inverted on top of the block tint. `None` unless the cursor is inside one.
     pub target_focus: Option<usize>,

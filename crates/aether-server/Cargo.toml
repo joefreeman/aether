@@ -26,6 +26,7 @@ thiserror.workspace = true
 
 ropey.workspace = true
 regex.workspace = true
+aether-markdown.workspace = true
 pulldown-cmark.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true

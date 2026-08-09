@@ -3763,3 +3763,73 @@ fn jumplist_wire_shapes() {
     );
     assert_eq!(to_value(PickerKind::Jumplist).unwrap(), json!("jumplist"));
 }
+
+#[test]
+fn block_edit_wire_shapes() {
+    use aether_protocol::cursor::VerticalDirection;
+    use aether_protocol::input::{BlockEditResult, BlockUnit, MoveBlockParams, PasteBlockParams};
+
+    // The move params: unit rides as a snake_case string.
+    let v = to_value(MoveBlockParams {
+        buffer_id: 3,
+        direction: VerticalDirection::Down,
+        unit: BlockUnit::Paragraph,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "buffer_id": 3, "direction": "down", "unit": "paragraph" })
+    );
+    assert_eq!(to_value(BlockUnit::Block).unwrap(), json!("block"));
+
+    let v = to_value(PasteBlockParams {
+        buffer_id: 3,
+        text: "New block.".into(),
+        replace: true,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "buffer_id": 3, "text": "New block.", "replace": true })
+    );
+
+    // The shared result: reason and text (delete's clipboard) skip when absent.
+    let v = to_value(BlockEditResult {
+        applied: false,
+        reason: None,
+        revision: 7,
+        cursor: CursorState::default(),
+        text: None,
+    })
+    .unwrap();
+    assert!(v.get("reason").is_none(), "quiet refusal has no reason");
+    assert!(v.get("text").is_none());
+    let v = to_value(BlockEditResult {
+        applied: false,
+        reason: Some("Front matter stays at the top".into()),
+        revision: 7,
+        cursor: CursorState::default(),
+        text: Some("Beta.\n".into()),
+    })
+    .unwrap();
+    assert_eq!(v["reason"], json!("Front matter stays at the top"));
+    assert_eq!(v["text"], json!("Beta.\n"));
+
+    // The checkbox params: `set` names the state wanted (Ctrl-a / Ctrl-Alt-a) and is absent for a
+    // plain flip (Enter), which is also how an older client's payload decodes.
+    use aether_protocol::input::ToggleTaskParams;
+    let v = to_value(ToggleTaskParams {
+        buffer_id: 3,
+        set: Some(true),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "buffer_id": 3, "set": true }));
+    let v = to_value(ToggleTaskParams {
+        buffer_id: 3,
+        set: None,
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "buffer_id": 3 }));
+    let p: ToggleTaskParams = serde_json::from_value(json!({ "buffer_id": 3 })).unwrap();
+    assert_eq!(p.set, None, "a missing `set` flips");
+}

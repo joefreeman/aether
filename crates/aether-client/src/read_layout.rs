@@ -67,6 +67,10 @@ pub enum SpanKind {
     Link,
     /// Secondary text: image placeholders, footnote labels, front matter, raw HTML.
     Dim,
+    /// A completed task item's prose. Its own kind rather than [`SpanKind::Dim`]: "done" has to
+    /// stay comfortably readable (it is still content), where `Dim` is the tone for chrome like
+    /// rules and table borders. The web client's `li.md-task-done` colour is the reference.
+    TaskDone,
     /// List bullets / numbers / task checkboxes.
     Marker,
     /// The quote bar (`┃ `) — coloured by the alert kind when present.
@@ -129,7 +133,7 @@ pub fn layout(
         elements,
         code_hl: code_highlights,
     };
-    layout_blocks(blocks, ctx, None, cols, false, &mut out);
+    layout_blocks(blocks, ctx, None, cols, false, false, &mut out);
     // Trim the trailing separator so the document ends on content.
     while out.last().is_some_and(|r| r.spans.is_empty()) {
         out.pop();
@@ -138,9 +142,20 @@ pub fn layout(
 }
 
 /// The first row rendering element `idx`, for scroll reveal.
-pub fn first_row_of_element(rows: &[ReadRow], idx: usize) -> Option<usize> {
+///
+/// Matched by span *containment*, not index equality: every block is an element at any depth
+/// (§12.6), so a container's content rows carry the *inner* block's index and the only rows left
+/// bearing the container's own are the blank separators between its children. Equality found one
+/// of those — a row in the middle — and revealed the block from there, leaving its opening rows
+/// off the top of the viewport. Containment is also how the bar rows resolve, so the two agree.
+pub fn first_row_of_element(rows: &[ReadRow], elements: &[Element], idx: usize) -> Option<usize> {
+    let span = elements.get(idx)?.span();
+    let inside = |e: Option<usize>| {
+        e.and_then(|i| elements.get(i))
+            .is_some_and(|el| el.span().start >= span.start && el.span().end <= span.end)
+    };
     rows.iter()
-        .position(|r| r.element == Some(idx) || r.spans.iter().any(|s| s.element == Some(idx)))
+        .position(|r| inside(r.element) || r.spans.iter().any(|s| inside(s.element)))
 }
 
 /// The widest *pannable* row of `element` — the basis for horizontal-scroll clamping and the
@@ -200,12 +215,16 @@ fn element_index(elements: &[Element], span: Span) -> Option<usize> {
 /// `in_item` = laying out a list item's blocks: a nested list then hugs its introducing line
 /// instead of getting the blank separator (§2.8's "tighter inside lists" — the blank read as
 /// the item ending); paragraphs of a loose item keep their separation.
+/// `dim` tones the prose down — a completed task item's content (see [`SpanKind::TaskDone`]).
+/// It stops at a nested list: every item states its own done-ness, so an open item indented under
+/// a completed one reads as open, rather than inheriting its parent's tone.
 fn layout_blocks(
     blocks: &[Block],
     ctx: Ctx,
     inherit: Option<usize>,
     cols: usize,
     in_item: bool,
+    dim: bool,
     out: &mut Vec<ReadRow>,
 ) {
     for block in blocks {
@@ -214,7 +233,19 @@ fn layout_blocks(
             out.push(ReadRow::blank());
         }
         let own = element_index(ctx.elements, block_span(block)).or(inherit);
+        let from = out.len();
         layout_block(block, ctx, own, cols, out);
+        if dim && !matches!(block, Block::List { .. }) {
+            for row in &mut out[from..] {
+                for span in &mut row.spans {
+                    // Only plain prose gives way: a link keeps its own colour so it still reads
+                    // as a link, and code keeps the panel's.
+                    if span.style.kind == SpanKind::Text {
+                        span.style.kind = SpanKind::TaskDone;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -401,6 +432,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 own,
                 cols.saturating_sub(2).max(8),
                 false,
+                false,
                 &mut inner,
             );
             for mut row in inner {
@@ -489,6 +521,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 own,
                 cols.saturating_sub(2).max(8),
                 false,
+                false,
                 &mut inner,
             );
             for mut row in inner {
@@ -545,7 +578,15 @@ fn layout_list(
         let indent = " ".repeat(marker.width());
         let inner_cols = cols.saturating_sub(marker.width()).max(8);
         let mut inner = Vec::new();
-        layout_blocks(&item.blocks, ctx, own, inner_cols, true, &mut inner);
+        layout_blocks(
+            &item.blocks,
+            ctx,
+            own,
+            inner_cols,
+            true,
+            item.checked == Some(true),
+            &mut inner,
+        );
         let mut first_content = true;
         for mut row in inner {
             // Items are tight by default: skip the blank separators between an item's blocks
@@ -1474,7 +1515,93 @@ mod tests {
         assert!(link_span.style.underline);
         // Element 1 is the link (0 = the paragraph).
         assert_eq!(link_span.element, Some(1));
-        assert_eq!(first_row_of_element(&rows, 1), Some(0));
+        assert_eq!(first_row_of_element(&rows, &els, 1), Some(0));
+    }
+
+    #[test]
+    fn a_completed_task_items_prose_reads_as_done() {
+        // The web client colours `li.md-task-done`; this is the same rule for the shells that
+        // render from this layout. Prose gives way, the checkbox and a link inside it do not —
+        // the box column stays even and a link still reads as a link.
+        let md = "- [x] Done, with a [link](https://example.com) inside\n- [ ] Open task\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 60, &Default::default());
+        let kinds = |row: &ReadRow| -> Vec<SpanKind> {
+            row.spans.iter().map(|s| s.style.kind).collect()
+        };
+        let done = &rows[0];
+        assert!(
+            kinds(done).contains(&SpanKind::TaskDone),
+            "completed prose is toned down: {:?}",
+            kinds(done)
+        );
+        assert!(
+            !kinds(done).contains(&SpanKind::Text),
+            "no plain-text span survives in a completed item"
+        );
+        assert_eq!(
+            kinds(done)[0],
+            SpanKind::Marker,
+            "the checkbox keeps the marker tone"
+        );
+        assert!(
+            kinds(done).contains(&SpanKind::Link),
+            "a link keeps its own colour"
+        );
+        // The open item is untouched.
+        let open = rows.last().expect("two items");
+        assert!(kinds(open).contains(&SpanKind::Text));
+        assert!(!kinds(open).contains(&SpanKind::TaskDone));
+
+        // And the tone stops at a nested list: an open item indented under a completed one states
+        // its own done-ness rather than inheriting its parent's.
+        let md = "- [x] Done parent\n  - [ ] Open child\n  - [x] Done child\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 60, &Default::default());
+        let text = rows_text(&rows);
+        let row_of = |needle: &str| {
+            text.iter()
+                .position(|t| t.contains(needle))
+                .expect("row present")
+        };
+        assert!(kinds(&rows[row_of("Done parent")]).contains(&SpanKind::TaskDone));
+        assert!(
+            kinds(&rows[row_of("Open child")]).contains(&SpanKind::Text),
+            "the indented open item reads as open"
+        );
+        assert!(
+            kinds(&rows[row_of("Done child")]).contains(&SpanKind::TaskDone),
+            "an indented completed item still reads as done"
+        );
+    }
+
+    #[test]
+    fn reveal_finds_a_container_through_its_children() {
+        // Every block is an element at any depth now (§12.6), so a container's *content* rows
+        // carry the inner block's index and the only rows left holding the container's own are
+        // the blank separators between its children. Index equality therefore found one of those
+        // — a row in the middle of the container — and revealed the block from there, leaving its
+        // first rows above the viewport. Containment answers with the first row instead, which is
+        // also how the bar rows resolve.
+        let md = "Intro.\n\n> Quoted one.\n>\n> Quoted two.\n";
+        let blocks = parse(md);
+        let els = elements(&blocks);
+        let rows = layout(&blocks, &els, 40, &Default::default());
+        let qi = els
+            .iter()
+            .position(|e| e.span().start == md.find('>').unwrap() as u32)
+            .expect("the quote is an element");
+        let row = first_row_of_element(&rows, &els, qi).expect("the quote reveals");
+        assert!(
+            rows_text(&rows)[row].contains("Quoted one"),
+            "its first content row"
+        );
+        assert!(
+            rows.iter().position(|r| r.element == Some(qi)) > Some(row),
+            "and that is earlier than the separator row index equality used to find"
+        );
     }
 
     #[test]

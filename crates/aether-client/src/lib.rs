@@ -17,7 +17,10 @@ pub mod grid;
 pub mod hints;
 pub mod keymap;
 pub mod labels;
-pub mod markdown;
+// The markdown block model lives in the shared `aether-markdown` crate (docs/markdown-view.md
+// §12 phase 3a) — the server resolves structural edits against the same parse the reading view
+// renders from. Re-exported under the old path so shells and the wasm boundary are unchanged.
+pub use aether_markdown as markdown;
 pub mod path_editor;
 pub mod picker;
 pub mod read_layout;

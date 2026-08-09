@@ -524,3 +524,112 @@ pub struct UndoResult {
     /// (stack empty), the cursor is unchanged but echoed back for consistency.
     pub cursor: CursorState,
 }
+
+// ---- block edits (markdown reading view, docs/markdown-view.md §12) -----------------------------
+//
+// Selection-relative structural edits: the server resolves the block boundaries at edit time
+// with the same `aether-markdown` parse the reading view renders from, applies one atomic
+// replacement (one undo entry), and reports refusals as `applied: false` — a `reason` when the
+// client should toast, none for a quiet boundary no-op.
+
+/// Result shared by the block-edit family.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockEditResult {
+    pub applied: bool,
+    /// One-line refusal reason to toast; absent for quiet boundary no-ops and successes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub revision: Revision,
+    pub cursor: CursorState,
+    /// `input/delete_block` only: the removed blocks' source (separators excluded), for the
+    /// client's clipboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// What `input/move_block` swaps: markdown sibling blocks (the reading view's grain) or
+/// blank-line-delimited paragraphs (the editor's, any file type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockUnit {
+    Paragraph,
+    Block,
+}
+
+/// Move the selected block(s)/paragraph past the adjacent sibling, separators travelling with
+/// the gaps; the moved text lands selected.
+pub struct InputMoveBlock;
+impl RpcMethod for InputMoveBlock {
+    const NAME: &'static str = "input/move_block";
+    type Params = MoveBlockParams;
+    type Result = BlockEditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MoveBlockParams {
+    pub buffer_id: BufferId,
+    pub direction: crate::cursor::VerticalDirection,
+    pub unit: BlockUnit,
+}
+
+/// Cut the selected block(s): around-block removal (the blocks' lines plus the adjacent blank
+/// run), the blocks' own source returned for the clipboard.
+pub struct InputDeleteBlock;
+impl RpcMethod for InputDeleteBlock {
+    const NAME: &'static str = "input/delete_block";
+    type Params = BufferOnlyParams;
+    type Result = BlockEditResult;
+}
+
+/// Paste text as its own block before the selection (`replace: false`) or in place of the
+/// selected block(s) (`replace: true`), separator-normalized either way.
+pub struct InputPasteBlock;
+impl RpcMethod for InputPasteBlock {
+    const NAME: &'static str = "input/paste_block";
+    type Params = PasteBlockParams;
+    type Result = BlockEditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PasteBlockParams {
+    pub buffer_id: BufferId,
+    pub text: String,
+    pub replace: bool,
+}
+
+/// Change the focused block's depth: a heading's level, a list item's nesting (subtree
+/// riding along). Refuses elsewhere with a reason.
+pub struct InputBlockDepth;
+impl RpcMethod for InputBlockDepth {
+    const NAME: &'static str = "input/block_depth";
+    type Params = BlockDepthParams;
+    type Result = BlockEditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlockDepthParams {
+    pub buffer_id: BufferId,
+    pub deeper: bool,
+}
+
+/// Change the checkbox of the task item under the cursor. The document length is unchanged, so
+/// the cursor stays put.
+pub struct InputToggleTask;
+impl RpcMethod for InputToggleTask {
+    const NAME: &'static str = "input/toggle_task";
+    type Params = ToggleTaskParams;
+    type Result = BlockEditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToggleTaskParams {
+    pub buffer_id: BufferId,
+    /// The state to put the box in: `Some(true)` checks, `Some(false)` unchecks, `None` flips.
+    ///
+    /// Asking for a state rather than only flipping is what lets one pair of keys serve both
+    /// modes: `Ctrl-a`/`Ctrl-Alt-a` mean check/uncheck, the same up/down sense they carry over a
+    /// number. Requesting the state a box is already in resolves to a quiet no-op, so holding
+    /// `Ctrl-a` down a task list settles it rather than flapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<bool>,
+}

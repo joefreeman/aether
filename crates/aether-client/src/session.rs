@@ -759,6 +759,10 @@ pub enum PasteKind {
     AtCursor,
     /// Insert-mode `Ctrl-Alt-v`: replace the whole line.
     Line,
+    /// Read-mode `Ctrl-v`/`Ctrl-Alt-v`: paste as its own block before the selection, or in
+    /// place of the selected block(s) — `input/paste_block`, separator-normalized
+    /// (docs/markdown-view.md §12).
+    Block { replace: bool },
 }
 
 /// The window's editing context over its server connection — exactly what the server calls a
@@ -956,11 +960,22 @@ impl ReadView {
         self.hl_gen += 1;
     }
 
-    /// The byte offset of a cursor position (clamped to the text).
+    /// The byte offset of a cursor position, clamped to the text *and* to a char boundary.
+    ///
+    /// The boundary clamp is not defensive tidiness: cursors arrive from the server at the
+    /// current revision while this parse may still be a revision behind (an edit adopts its new
+    /// cursor a round trip before the re-parse lands), so a byte column measured on one document
+    /// can land mid-character when applied to another. Every reading-view slice is indexed with
+    /// what this returns, and `&str` indexing inside a multi-byte char panics — taking the whole
+    /// client down, wasm shell included. Clamp once, here, rather than at each use.
     pub fn byte_of(&self, pos: LogicalPosition) -> u32 {
         let line = (pos.line as usize).min(self.line_starts.len().saturating_sub(1));
         let start = self.line_starts.get(line).copied().unwrap_or(0);
-        (start + pos.col).min(self.text.len() as u32)
+        let mut at = (start + pos.col).min(self.text.len() as u32) as usize;
+        while at > 0 && !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at as u32
     }
 
     /// The `LogicalPosition` of a byte offset (line via binary search; col is a byte col).
@@ -978,7 +993,7 @@ impl ReadView {
 
     /// The focused element for a cursor: innermost containing, else next after, else last
     /// (docs/markdown-view.md §1.3). `None` only for an empty/unloaded document. This is the
-    /// *action* focus (`Enter`, `y`); rendering splits it into two projections of the same
+    /// *action* focus (`Enter`, `Ctrl-c`); rendering splits it into two projections of the same
     /// cursor — [`Self::block_focus`] and [`Self::target_focus`].
     pub fn focus(&self, cursor: LogicalPosition) -> Option<usize> {
         crate::markdown::element_at(&self.elements, self.byte_of(cursor))
@@ -991,9 +1006,56 @@ impl ReadView {
     pub fn block_focus(&self, cursor: LogicalPosition) -> Option<usize> {
         crate::markdown::element_at_matching(
             &self.elements,
-            self.byte_of(cursor),
+            self.focus_byte(cursor),
             crate::markdown::Element::is_block,
         )
+    }
+
+    /// The byte block-grain resolution happens at: the cursor's, except on a line's terminating
+    /// newline, where it steps back onto the last content byte of that line.
+    ///
+    /// A whole-line cursor sits on the newline, and only *some* block spans reach that far —
+    /// paragraphs and headings include their trailing newline, fenced code blocks and front
+    /// matter stop at their last content char. Resolving the raw byte therefore fell forward to
+    /// the *next* block for a fence, so selecting or moving a code block drew the bar one block
+    /// too low. The owning line is unambiguous, so ask about the content instead of the
+    /// terminator.
+    ///
+    /// [`Self::block_focus`] and `j`/`k` stepping both resolve here, so the block the bar is
+    /// drawn on is the block a step moves from.
+    pub fn focus_byte(&self, cursor: LogicalPosition) -> u32 {
+        let byte = self.byte_of(cursor);
+        let on_newline = self.text.as_bytes().get(byte as usize) == Some(&b'\n');
+        let line_start = self
+            .line_starts
+            .get(cursor.line as usize)
+            .copied()
+            .unwrap_or(0);
+        if on_newline && byte > line_start {
+            byte - 1
+        } else {
+            byte
+        }
+    }
+
+    /// The task item `Enter` would toggle: the innermost checkbox-bearing item *containing* the
+    /// cursor.
+    ///
+    /// Walking outward is the whole point. Innermost-of-any-kind — what [`Self::focus`] gives —
+    /// stops at the inner block of an item holding two of them (a second paragraph, a sub-list),
+    /// and the checkbox belongs to the item around it, so Enter did nothing on exactly those
+    /// items while working on simple ones. Resolves from the raw cursor byte, the same input the
+    /// server's `resolve_toggle_task` uses, so the two agree on which item is meant.
+    pub fn task_item(&self, cursor: LogicalPosition) -> Option<usize> {
+        crate::markdown::containing_element(&self.elements, self.byte_of(cursor), |e| {
+            matches!(
+                e,
+                crate::markdown::Element::Item {
+                    checked: Some(_),
+                    ..
+                }
+            )
+        })
     }
 
     /// The Enter target: the innermost *interactive* element (link, image, footnote ref) whose
@@ -1009,7 +1071,141 @@ impl ReadView {
         )
     }
 
-    /// The source text of an element's span, for `y` copies.
+    /// Whether the cursor-derived projections describe a parse we already know is out of date: a
+    /// refresh is in flight over content still on screen.
+    ///
+    /// An edit's new cursor is adopted from its own RPC response, a round trip before the
+    /// re-parse lands. Deriving focus in between paints it on whichever block happens to occupy
+    /// those bytes in the *old* document — a bar flashing on an unrelated block, worst after a
+    /// move, which relocates the cursor furthest. The shells draw nothing for that frame; the
+    /// real position arrives with the new parse. Behavioural sites keep using the raw
+    /// projections: a stale parse is still the best guess available for what a key should act on.
+    fn projections_stale(&self) -> bool {
+        self.loading && !self.blocks.is_empty()
+    }
+
+    /// The reading position as the shells should *display* it — [`Self::block_focus`], held back
+    /// while the parse under it is known-stale ([`Self::projections_stale`]).
+    pub fn display_block_focus(
+        &self,
+        cursor: &aether_protocol::cursor::CursorState,
+    ) -> Option<usize> {
+        if self.projections_stale() {
+            return None;
+        }
+        self.block_focus(cursor.position)
+    }
+
+    /// The target as the shells should *display* it: suppressed while the selection is
+    /// extended (docs/markdown-view.md §12.1) — a block-range selection plus an armed pill is
+    /// two selections on screen at once. Behavioral sites (`l`/`h` stepping) keep the
+    /// position-grain [`Self::target_focus`]; their Gotos collapse the selection anyway.
+    pub fn display_target(&self, cursor: &aether_protocol::cursor::CursorState) -> Option<usize> {
+        if !cursor.is_point() || self.projections_stale() {
+            return None;
+        }
+        self.target_focus(cursor.position)
+    }
+
+    /// The extended selection's inclusive byte range, for the shells' block tint — the one
+    /// definition all three share. `None` for a point cursor, and while the parse is stale.
+    pub fn display_selection(
+        &self,
+        cursor: &aether_protocol::cursor::CursorState,
+    ) -> Option<(u32, u32)> {
+        if cursor.is_point() || self.projections_stale() {
+            return None;
+        }
+        let (a, b) = (self.byte_of(cursor.anchor), self.byte_of(cursor.position));
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// The first and last *line-grain* positions of `elements[idx]`'s span — endpoints for a
+    /// whole-line block selection. Columns are byte cols on those lines; callers pass them to
+    /// `cursor/set` with `Granularity::Line`, so the server snaps to the normal form
+    /// (`anchor.col == 0`, `cursor.col == line_end`) — the client never computes line ends.
+    pub fn block_lines(&self, idx: usize) -> (LogicalPosition, LogicalPosition) {
+        let span = self.elements[idx].span();
+        let first = self.pos_of(span.start);
+        // `end - 1` is the span's last byte: on the last content line whether or not the
+        // parser's span includes the trailing newline.
+        let last = self.pos_of(span.end.saturating_sub(1).max(span.start));
+        (first, last)
+    }
+
+    /// The block range under the selection — `(top, bottom, whole)`: top/bottom element
+    /// indices plus whether the selection already covers those blocks whole (whole-line at
+    /// both ends). A point cursor resolves to the focused block, not-whole. A range edge on a
+    /// separator line resolves forward at the top and back at the bottom, so the range never
+    /// rounds outward past its own blocks.
+    pub fn selection_blocks(
+        &self,
+        cursor: &aether_protocol::cursor::CursorState,
+    ) -> Option<(usize, usize, bool)> {
+        let (a, p) = (self.byte_of(cursor.anchor), self.byte_of(cursor.position));
+        let (min, max) = (a.min(p), a.max(p));
+        // Resolution shared with the server's structural edits — the one definition of "which
+        // blocks does this selection cover" (aether-markdown, §12): a point resolves like
+        // [`Self::block_focus`] (innermost containing block), a range by whole-line extent.
+        let (tb, bb) =
+            crate::markdown::edit::selection_block_range(&self.text, &self.elements, min, max)?;
+        let (ts, bs) = (self.elements[tb].span(), self.elements[bb].span());
+        Some((
+            tb,
+            bb,
+            !cursor.is_point() && min <= ts.start && max + 1 >= bs.end,
+        ))
+    }
+
+    /// The append byte of `elements[idx]`'s block: the caret gap *before* this byte is
+    /// "after the last content char" — the terminating newline when present, or one past the
+    /// span for a final block without one. `i`/`a`/`Ctrl-o`'s landing math
+    /// (docs/markdown-view.md §12).
+    ///
+    /// Trailing blank lines are walked off first. Separator blanks belong to the gaps *between*
+    /// blocks (§12.1), but a loose list item's parser span swallows the one after it, so the raw
+    /// last byte was the separator's newline and `a` landed a line low — typing then opened a new
+    /// block in the gap instead of extending the item.
+    pub fn block_append_byte(&self, idx: usize) -> u32 {
+        let span = self.elements[idx].span();
+        let base = span.start as usize;
+        let end = (span.end as usize).min(self.text.len()).max(base);
+        let content = &self.text[base..end];
+        let bytes = content.as_bytes();
+        // Walk back over whole blank lines: `cut` ends on the last content line's terminator.
+        let mut cut = bytes.len();
+        while cut > 0 {
+            let ls = bytes[..cut - 1]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |i| i + 1);
+            if !content[ls..cut].trim().is_empty() {
+                break;
+            }
+            cut = ls;
+        }
+        match bytes.get(cut.wrapping_sub(1)) {
+            Some(b'\n') => (base + cut - 1) as u32,
+            _ => (base + cut) as u32,
+        }
+    }
+
+    /// The byte of the last *content* char of `elements[idx]` — excluding the block's
+    /// terminating newline when present. The end of `Ctrl-e`'s content-only change range: the
+    /// newline (and every separator) survives the rewrite, so the document's block structure
+    /// does (docs/markdown-view.md §12).
+    pub fn block_content_end(&self, idx: usize) -> u32 {
+        let span = self.elements[idx].span();
+        let end = (span.end as usize).min(self.text.len());
+        let content = &self.text[span.start as usize..end];
+        let content = content.strip_suffix('\n').unwrap_or(content);
+        match content.char_indices().last() {
+            Some((i, _)) => span.start + i as u32,
+            None => span.start,
+        }
+    }
+
+    /// The source text of an element's span, for `Ctrl-c` copies.
     pub fn slice(&self, span: crate::markdown::Span) -> &str {
         let (s, e) = (
             span.start as usize,
@@ -1141,6 +1337,13 @@ impl Session {
             .into_iter()
             .flat_map(|g| g.rows)
             .collect()
+    }
+
+    /// The remembered read-vs-source presentation choice for `buffer` (`Space v` records it;
+    /// the §12 edit transitions deliberately don't). Exposed read-only so tests can pin that
+    /// contract.
+    pub fn read_preference(&self, buffer: BufferId) -> Option<bool> {
+        self.read_pref.get(&buffer).copied()
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
@@ -1371,6 +1574,65 @@ mod tests {
         // reconnect curve rather than hammering forever.
         assert_eq!(boot_backoff(21), reconnect_backoff(1));
         assert_eq!(boot_backoff(30), reconnect_backoff(10));
+    }
+
+    #[test]
+    fn block_append_byte_parks_before_the_blocks_own_terminator() {
+        // A loose list item's span swallows the blank line after it, so the raw last byte was
+        // the *separator's* newline: `a` landed on the blank line between the bullets and typing
+        // opened a new top-level block in the gap instead of extending the item.
+        let mut read = ReadView::loading(1);
+        let text = "- First para.\n\n  Second para.\n\n- Next item.\n".to_string();
+        read.adopt(1, text.clone());
+        let item = read
+            .elements
+            .iter()
+            .position(|e| matches!(e, crate::markdown::Element::Item { .. }))
+            .expect("the item is an element");
+        let at = read.block_append_byte(item) as usize;
+        assert_eq!(&text[at..at + 1], "\n");
+        assert!(
+            text[..at].ends_with("Second para."),
+            "parks on the item's own terminator, not the separator below it: {:?}",
+            &text[..at]
+        );
+        // A final block without a trailing newline still appends one past its last char — and
+        // that char being multi-byte doesn't move it.
+        let mut read = ReadView::loading(1);
+        read.adopt(1, "Alpha.\n\nCafé".to_string());
+        let last = read.elements.len() - 1;
+        assert_eq!(read.block_append_byte(last) as usize, "Alpha.\n\nCafé".len());
+    }
+
+    #[test]
+    fn read_view_byte_of_clamps_to_a_char_boundary() {
+        // A cursor is adopted from an edit's own reply while this parse is still a revision
+        // behind, so a byte column measured on the new document gets applied to the old one and
+        // can land inside a multi-byte char. Every reading-view slice indexes with `byte_of`, and
+        // `&str` indexing there panics — so it clamps back to the boundary instead.
+        let mut read = ReadView::loading(1);
+        read.adopt(1, "Alpha — beta.\n\nGamma.\n".to_string());
+        let em_dash = "Alpha ".len() as u32; // the dash occupies 6..9
+        for col in em_dash..em_dash + 3 {
+            let at = read.byte_of(LogicalPosition { line: 0, col });
+            assert!(
+                read.text.is_char_boundary(at as usize),
+                "col {col} resolved to {at}, inside a char"
+            );
+        }
+        // Past the end of the text clamps to its length, still a boundary.
+        let end = read.byte_of(LogicalPosition {
+            line: 99,
+            col: 9999,
+        });
+        assert_eq!(end as usize, read.text.len());
+        // And the block ops that slice with it resolve rather than panic.
+        let cursor = aether_protocol::cursor::CursorState {
+            anchor: LogicalPosition { line: 0, col: 7 },
+            position: LogicalPosition { line: 2, col: 3 },
+            ..Default::default()
+        };
+        assert!(read.selection_blocks(&cursor).is_some());
     }
 
     #[test]

@@ -539,6 +539,15 @@ async fn bring_up(
             }
         }
 
+        // Warm each newly-opened buffer's symbol outline now that there is a server to ask.
+        // Otherwise the only other trigger is a `publishDiagnostics` for that buffer, and a
+        // server with nothing to report on a clean file never sends one — marksman on markdown
+        // is exactly that — so `o`/`Alt-o` and `Space o` stayed empty for the whole session.
+        // (The buffer-open warm runs before the server is ready and finds nothing to ask.)
+        for bid in &s.lsp.servers[&key].open_buffers {
+            crate::handlers::spawn_document_symbol_refresh(state.clone(), *bid);
+        }
+
         tracing::info!(server = caps.name.as_deref().unwrap_or(&key.language), language = %key.language, root = %key.root.display(), "language server ready");
         let mut out = collect_status_pushes(s, &key);
         out.extend(crate::handlers::refresh_lsp_server_pickers(s));

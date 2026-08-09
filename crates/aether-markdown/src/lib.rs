@@ -1,3 +1,12 @@
+//! The shared markdown block model: one parser for presentation *and* edits.
+//!
+//! Extracted from the client core (docs/markdown-view.md §12, phase 3a) so the server can
+//! resolve structural edits against literally the same parse the reading view renders from —
+//! block boundaries agree by construction, one `Cargo.lock`, one code path. The client
+//! re-exports this crate as `aether_client::markdown`, so shells and wasm are unchanged.
+//!
+//! ---
+//!
 //! Markdown → AST for the reading view and hover popovers.
 //!
 //! Markdown is parsed once here (with `pulldown-cmark`, a real CommonMark parser) into a small
@@ -20,6 +29,8 @@
 //! punctuation) before this design was committed — ranges are exact for everything the source
 //! map needs. The one quirk: an *indented* code block's span starts after the first line's
 //! indent. Harmless at element grain.
+
+pub mod edit;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::Serialize;
@@ -430,8 +441,21 @@ impl Builder {
         }
     }
 
+    /// Record a `[x]`/`[ ]` box on the item that owns it. The marker belongs to the nearest
+    /// *enclosing* item, which is not always the frame on top: a **tight** list emits
+    /// `Start(Item)` → `TaskListMarker` → text, but a **loose** one (any blank line between
+    /// items — which a second paragraph forces) wraps the content in a paragraph first, so the
+    /// marker arrives with `Frame::Paragraph` on top. Reading only the top frame therefore
+    /// dropped the box on every loose task list, and since pulldown consumes the `[x]` text
+    /// either way, the state vanished from the rendered document entirely — plain bullets, and
+    /// `Enter` refusing to toggle (`edit::resolve_toggle_task` targets `checked: Some(_)`).
     fn task_marker(&mut self, done: bool) {
-        if let Some(Frame::Item { checked, .. }) = self.stack.last_mut() {
+        if let Some(Frame::Item { checked, .. }) = self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|f| matches!(f, Frame::Item { .. }))
+        {
             *checked = Some(done);
         }
     }
@@ -699,20 +723,34 @@ impl Element {
 pub fn elements(blocks: &[Block]) -> Vec<Element> {
     let mut out = Vec::new();
     let mut slugs: HashMap<String, u32> = HashMap::new();
-    walk_blocks(blocks, true, &mut out, &mut slugs);
+    walk_blocks(blocks, None, &mut out, &mut slugs);
     out
 }
 
-/// `top` selects whether blocks at this level are elements themselves. List items and their
-/// nested items always are (the reading grain of a list is the item); a container's inner
-/// paragraphs are not (the container is the grain) — but their interactive inlines always
-/// collect, so a link inside a quote stays a `Tab` stop.
+/// Collect the block-grain elements of one level. `parent` is the enclosing container's span —
+/// `None` at the document's top level.
+///
+/// **Every block is an element, at any depth.** A quote's paragraphs, a list item's second
+/// paragraph, a fence inside an item: all of them are reading stops and all of them can be
+/// selected and edited, because focus resolves innermost-first and so the inner block wins over
+/// its container wherever there is one (docs/markdown-view.md §12.6). Containers used to list
+/// only *some* of their children — headings and list items, because those arms happened to push
+/// unconditionally — which is why "act on the inner thing" worked for a heading in a quote but
+/// not for a paragraph in the same quote.
+///
+/// The one exception is a container holding a **single** block: it and its child describe the
+/// same content, so listing both would mean two stops that look identical, and for a tight list
+/// item the two spans are literally equal (which would also confuse span-keyed lookups). The
+/// container is the grain there. Headings are exempt from even that — they must stay listed at
+/// any depth for `o`/`Alt-o` navigation and for the slugs `#anchor` links resolve through.
 fn walk_blocks(
     blocks: &[Block],
-    top: bool,
+    parent: Option<Span>,
     out: &mut Vec<Element>,
     slugs: &mut HashMap<String, u32>,
 ) {
+    let solo_child = parent.is_some() && blocks.len() == 1;
+    let listed = |span: &Span| !solo_child && parent != Some(*span);
     for block in blocks {
         match block {
             Block::Heading {
@@ -733,7 +771,7 @@ fn walk_blocks(
                 walk_inlines(content, out);
             }
             Block::Paragraph { content, span } => {
-                if top {
+                if listed(span) {
                     out.push(Element::Block { span: *span });
                 }
                 walk_inlines(content, out);
@@ -742,14 +780,14 @@ fn walk_blocks(
             | Block::Rule { span }
             | Block::FrontMatter { span, .. }
             | Block::Html { span, .. } => {
-                if top {
+                if listed(span) {
                     out.push(Element::Block { span: *span });
                 }
             }
             Block::Table {
                 head, rows, span, ..
             } => {
-                if top {
+                if listed(span) {
                     out.push(Element::Block { span: *span });
                 }
                 for cell in head.iter().chain(rows.iter().flatten()) {
@@ -765,23 +803,25 @@ fn walk_blocks(
                 // The paragraph is the `j`/`k` stop (bar host); the image markup inside it is
                 // the Enter target — leaving the trailing whitespace as the rest byte, so a
                 // display image joins the `l`-opts-in model like links do.
-                out.push(Element::Block { span: *span });
+                if listed(span) {
+                    out.push(Element::Block { span: *span });
+                }
                 out.push(Element::Image {
                     span: *inner_span,
                     src: src.clone(),
                 });
             }
             Block::Quote { content, span, .. } => {
-                if top {
+                if listed(span) {
                     out.push(Element::Block { span: *span });
                 }
-                walk_blocks(content, false, out, slugs);
+                walk_blocks(content, Some(*span), out, slugs);
             }
             Block::FootnoteDef { content, span, .. } => {
-                if top {
+                if listed(span) {
                     out.push(Element::Block { span: *span });
                 }
-                walk_blocks(content, false, out, slugs);
+                walk_blocks(content, Some(*span), out, slugs);
             }
             Block::List { items, .. } => {
                 for item in items {
@@ -789,7 +829,7 @@ fn walk_blocks(
                         span: item.span,
                         checked: item.checked,
                     });
-                    walk_blocks(&item.blocks, false, out, slugs);
+                    walk_blocks(&item.blocks, Some(item.span), out, slugs);
                 }
             }
         }
@@ -1315,6 +1355,43 @@ mod tests {
         );
     }
 
+    /// A *loose* task list keeps its boxes too. The marker arrives inside the item's paragraph
+    /// frame there, not on the item itself, and reading only the top frame dropped it: the
+    /// `[x]` text is consumed by the parser either way, so the item rendered as a plain bullet
+    /// with its state gone, and `Enter` had nothing to toggle.
+    #[test]
+    fn task_list_markers_survive_loose_items() {
+        // Loose by blank line between items…
+        let blocks = parse("- [x] done item\n\n- [ ] open item\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!("expected list, got {blocks:?}");
+        };
+        assert_eq!(items[0].checked, Some(true));
+        assert_eq!(items[1].checked, Some(false));
+        // …and loose because an item holds a second paragraph.
+        let blocks = parse("- [ ] open item\n\n  A second paragraph.\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!("expected list, got {blocks:?}");
+        };
+        assert_eq!(items[0].checked, Some(false));
+        assert_eq!(items[0].blocks.len(), 2, "both paragraphs are the item's");
+    }
+
+    /// A task item nested inside another one binds its box to the *inner* item — the nearest
+    /// enclosing one, not the outermost on the stack.
+    #[test]
+    fn nested_task_marker_binds_to_the_innermost_item() {
+        let blocks = parse("- [ ] outer\n\n  - [x] inner\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!("expected list, got {blocks:?}");
+        };
+        assert_eq!(items[0].checked, Some(false));
+        let Block::List { items: inner, .. } = &items[0].blocks[1] else {
+            panic!("expected a nested list, got {:?}", items[0].blocks);
+        };
+        assert_eq!(inner[0].checked, Some(true));
+    }
+
     #[test]
     fn ordered_list_keeps_start_number() {
         let md = "3. third\n4. fourth\n";
@@ -1447,6 +1524,47 @@ mod tests {
             unreachable!()
         };
         assert_eq!(*span, span_of(md, "[docs](https://x.y)"));
+    }
+
+    #[test]
+    fn container_children_are_reading_stops_of_their_own() {
+        // Every block is an element at any depth (docs/markdown-view.md §12.6), so focus —
+        // which resolves innermost-first — lands on the inner block rather than its container.
+        // Containers used to list only headings and list items, which is why "act on the inner
+        // thing" worked for a heading in a quote but not a paragraph in the same quote.
+        let spans = |md: &str| -> Vec<(u32, u32)> {
+            elements(&parse(md))
+                .iter()
+                .filter(|e| e.is_block())
+                .map(|e| (e.span().start, e.span().end))
+                .collect()
+        };
+        // Both paragraphs of a quote, and the quote itself.
+        assert_eq!(
+            spans("> Para one.\n>\n> Para two.\n"),
+            vec![(0, 26), (2, 12), (16, 26)]
+        );
+        // A loose item's second paragraph is reachable — it never was before.
+        assert_eq!(
+            spans("- First para.\n\n  Second para.\n\n- Next item.\n"),
+            vec![(0, 31), (2, 14), (17, 30), (31, 44)]
+        );
+        // …and the innermost element at a byte inside it is that paragraph, not the item.
+        let md = "- First para.\n\n  Second para.\n\n- Next item.\n";
+        let els = elements(&parse(md));
+        let at = md.find("Second").unwrap() as u32;
+        assert_eq!(
+            element_at_matching(&els, at, Element::is_block).map(|i| els[i].span()),
+            Some(Span { start: 17, end: 30 })
+        );
+
+        // A container holding a *single* block is its own grain: listing both would be two
+        // stops over the same content, and for a tight list item the spans are literally equal.
+        assert_eq!(spans("> Alpha.\n"), vec![(0, 9)]);
+        assert_eq!(spans("- a\n- b\n"), vec![(0, 4), (4, 8)]);
+        // A heading stays listed even as a solo child — `o`/`Alt-o` and `#anchor` slugs need it.
+        let els = elements(&parse("> ### H\n"));
+        assert!(els.iter().any(|e| matches!(e, Element::Heading { .. })));
     }
 
     #[test]

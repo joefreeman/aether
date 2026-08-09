@@ -1975,6 +1975,7 @@ impl Shell {
             return Some(crate::app::ReadViewState {
                 rows: std::sync::Arc::new(Vec::new()),
                 bar_rows: None,
+                sel_rows: None,
                 target_focus: None,
                 scroll: 0,
                 hscroll: std::collections::HashMap::new(),
@@ -2012,9 +2013,33 @@ impl Shell {
         let rows = self.read_cache.as_ref().expect("just filled").4.clone();
         // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
         // always marks the reading position; the interactive target inverts on top of it.
-        let cursor = self.session.buffer.cursor.position;
-        let block_focus = read.block_focus(cursor);
-        let target_focus = read.target_focus(cursor);
+        // An extended selection adds a third (§12): the NORD2 tint over the selected blocks'
+        // rows — and suppresses the pill (display_target), one selection on screen at a time.
+        let cursor_state = self.session.buffer.cursor;
+        let block_focus = read.display_block_focus(&cursor_state);
+        let target_focus = read.display_target(&cursor_state);
+        // The selected block range, as rows: first..=last row whose element's span falls inside
+        // the selection's inclusive byte range; separator blanks inside ride along.
+        let sel_rows = read
+            .display_selection(&cursor_state)
+            .and_then(|(min, max)| {
+                let mut range: Option<(usize, usize)> = None;
+                for (i, row) in rows.iter().enumerate() {
+                    // Containment, not overlap: an item's span contains its nested children's,
+                    // so overlap would tint every ancestor of the selected item as well.
+                    let hit = row.element.is_some_and(|e| {
+                        let s = read.elements[e].span();
+                        s.start >= min && s.end <= max + 1
+                    });
+                    if hit {
+                        range = Some(match range {
+                            Some((first, _)) => (first, i),
+                            None => (i, i),
+                        });
+                    }
+                }
+                range
+            });
         // The bar spans the focused block's whole *subtree* — first..=last row whose element's
         // span nests inside the focused span, gaps (separator blanks) riding along — so a
         // parent item's bar covers its nested items, exactly like the GUI/web item wrappers.
@@ -2043,9 +2068,9 @@ impl Shell {
         let reveal = target_focus.or(block_focus);
         if reveal != self.read_last_focus {
             self.read_last_focus = reveal;
-            if let Some(row) =
-                reveal.and_then(|f| aether_client::read_layout::first_row_of_element(&rows, f))
-            {
+            if let Some(row) = reveal.and_then(|f| {
+                aether_client::read_layout::first_row_of_element(&rows, &read.elements, f)
+            }) {
                 let padded = row as u16 + crate::ui::READ_PAD_TOP;
                 if padded < self.read_scroll || padded >= self.read_scroll.saturating_add(visible) {
                     // Rest the element ~20% down, matching the editor's jump reveals.
@@ -2059,6 +2084,7 @@ impl Shell {
         Some(crate::app::ReadViewState {
             rows,
             bar_rows,
+            sel_rows,
             target_focus,
             scroll: self.read_scroll,
             hscroll: self.read_hscroll.clone(),

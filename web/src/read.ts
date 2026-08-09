@@ -28,6 +28,9 @@ export interface ReadDoc {
    *  inside, rendered as the pill on top of the block bar; null otherwise. Both derive from
    *  the one server cursor. */
   target_span: MdSpan | null;
+  /** The extended block selection's inclusive source byte range (docs/markdown-view.md §12) —
+   *  intersecting top-level blocks tint `.md-selected`. Null while the cursor is a point. */
+  selection_span?: MdSpan | null;
   buffer_id: number;
   /** Content revision the document was parsed at — the shell's DOM-rebuild key. */
   revision: number;
@@ -59,26 +62,41 @@ export function renderReadView(container: HTMLElement, doc: ReadDoc): void {
   }
   for (const b of doc.blocks) root.append(renderBlock(b, doc));
   container.replaceChildren(root);
-  markFocus(container, doc.focus_span, doc.target_span);
+  markFocus(container, doc.focus_span, doc.target_span, doc.selection_span ?? null);
 }
 
-/** Mark the two focus projections (cheap enough to run per render): `.md-focus` — the block
+/** Mark the focus projections (cheap enough to run per render): `.md-focus` — the block
  *  bar — on the reading-position node, `.md-target` — the pill — on the interactive node the
  *  cursor sits inside. They usually differ (bar on the paragraph, pill on its link) and may
- *  coincide (a block image is both position and target). */
+ *  coincide (a block image is both position and target). An extended selection adds
+ *  `.md-selected` — the editor's selection tint — to every *top-level* block intersecting its
+ *  byte range (the core suppresses the pill while one exists). */
 export function markFocus(
   container: HTMLElement,
   block: MdSpan | null,
   target: MdSpan | null,
+  selection: MdSpan | null = null,
 ): void {
-  for (const el of container.querySelectorAll(".md-focus, .md-target")) {
-    el.classList.remove("md-focus", "md-target");
+  for (const el of container.querySelectorAll(".md-focus, .md-target, .md-selected")) {
+    el.classList.remove("md-focus", "md-target", "md-selected");
   }
   if (block) {
     container.querySelector(`[data-espan="${spanKey(block)}"]`)?.classList.add("md-focus");
   }
   if (target) {
     container.querySelector(`[data-espan="${spanKey(target)}"]`)?.classList.add("md-target");
+  }
+  if (selection) {
+    // Every *contained* stamped node gets the class; the CSS scopes the tint to the same
+    // block-node list the focus bar uses, so inline spans inside stay unpainted. Containment
+    // rather than overlap: a list item's span contains its nested children's, so overlap would
+    // tint every ancestor of the selected item too.
+    for (const el of container.querySelectorAll("[data-espan]")) {
+      const parts = (el.getAttribute("data-espan") ?? "").split(":").map(Number);
+      if (parts.length === 2 && parts[0] >= selection.start && parts[1] <= selection.end + 1) {
+        el.classList.add("md-selected");
+      }
+    }
   }
 }
 

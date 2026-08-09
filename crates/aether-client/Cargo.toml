@@ -7,7 +7,7 @@ description = "The platform-free Aether client: modal state machine, keymap, pic
 
 [dependencies]
 aether-protocol = { workspace = true }
-pulldown-cmark = { workspace = true }
+aether-markdown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

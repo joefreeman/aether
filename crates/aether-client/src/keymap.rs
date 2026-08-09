@@ -12,7 +12,7 @@
 //! time, and tables are scanned in order so more-specific chords precede catch-alls.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
-use aether_protocol::input::{CommentStyle, SurroundTarget};
+use aether_protocol::input::{BlockUnit, CommentStyle, SurroundTarget};
 use aether_protocol::picker::PickerKind;
 
 /// Layout-resolved key identity, normalised from the platform's key event: letters lowercase
@@ -483,8 +483,47 @@ pub enum Action {
     /// `Ctrl-Enter` — the picker's open-in-new-window, at reading grain: a relative-path link
     /// opens in a new window (GUI) / tab (web); anything else behaves like `Enter`.
     ReadActivateNewWindow,
-    /// `y` — copy the focused element: a link's URL, otherwise its markdown source.
+    /// `Ctrl-c` — copy: an extended selection's source, else the focused element (a link's
+    /// URL, otherwise its markdown source).
     ReadCopy,
+    /// `x`/`Alt-x` — the editor's line-select at block grain (docs/markdown-view.md §12):
+    /// plain presses walk block to block (whole-line normal form), Shift grows the selection.
+    ReadSelectBlock(Direction),
+    /// `i`/`a` — to the editor, inserting at the selection's start / end: an extended
+    /// selection uses the editor's own Insert-entry motions; a bare reading position enters
+    /// at the focused block's start / append position (docs/markdown-view.md §12).
+    ReadInsert {
+        at_end: bool,
+    },
+    /// `Ctrl-e` — rewrite the selected block(s): a content-only change (the trailing newline
+    /// and separators survive), landing in Insert on the emptied line.
+    ReadChange,
+    /// `Ctrl-o`/`Ctrl-Alt-o` — open a new paragraph below / above the focused block and
+    /// enter Insert (the editor's open-line at block grain).
+    ReadOpenBlock {
+        above: bool,
+    },
+    /// Move the selection past a sibling: `Ctrl-j`/`k` in Read (block grain, with `Ctrl-Alt`
+    /// aliases so editor muscle memory lands too), `Ctrl-Alt-j`/`k` in the editor
+    /// (blank-line paragraphs, any file type). One atomic server edit
+    /// (docs/markdown-view.md §12).
+    MoveBlock {
+        down: bool,
+        unit: BlockUnit,
+    },
+    /// `Ctrl-x` in Read — cut the selected block(s): around-block removal, the blocks'
+    /// source to the clipboard.
+    ReadCutBlock,
+    /// `Ctrl-v`/`Ctrl-Alt-v` in Read — paste the clipboard as its own block before the
+    /// selection / in place of the selected block(s).
+    ReadPasteBlock {
+        replace: bool,
+    },
+    /// `Ctrl-l`/`Ctrl-h` in Read — the indent chords at block grain: demote/promote a
+    /// heading, nest/un-nest a list item (subtree riding along); toasts elsewhere.
+    ReadBlockDepth {
+        deeper: bool,
+    },
 }
 
 impl Action {
@@ -902,6 +941,10 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
     bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
     bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
+    // The paragraph-grain sibling of Ctrl-j/k: swap the blank-line-delimited chunk under the
+    // selection with its neighbour, gap and all — any file type (docs/markdown-view.md §12).
+    bind!(G, ch('j'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: true, unit: BlockUnit::Paragraph }, "Edit", "Move paragraph down"),
+    bind!(G, ch('k'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: false, unit: BlockUnit::Paragraph }, "Edit", "Move paragraph up"),
     // Join/un-join are exact mirrors on `g`: join deletes "\n"+indent parking the cursor on the
     // seam; un-join inserts them back, cursor staying before the break — so the pair ping-pongs.
     // `Ctrl-Alt-g` survives legacy key encoding (ESC + 0x07 — `g` is not a sequence introducer,
@@ -911,10 +954,12 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('l'), Exact(Mods::CTRL), A::Indent, "Edit", "Indent"),
     bind!(G, ch('h'), Exact(Mods::CTRL), A::Dedent, "Edit", "Dedent"),
     // Mode-agnostic (Global so they fire in Insert too); the mode-specific Change/ChangeLine
-    // pair sits on Ctrl-e in NORMAL/INSERT. Global is checked before the mode tables, so these
-    // Ctrl-a chords win everywhere.
-    bind!(G, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Increment number"),
-    bind!(G, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Decrement number"),
+    // pair sits on Ctrl-e in NORMAL/INSERT. Global is checked before Normal and Insert, so these
+    // win there; Read skips Global and re-declares them below, so the pair means the same thing
+    // in every mode. The *value* they adjust is whatever the buffer has — a number, or a task
+    // checkbox in markdown: one pair of keys, one meaning, "adjust what's under the cursor".
+    bind!(G, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Increment number / check task"),
+    bind!(G, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Decrement number / uncheck task"),
     bind!(G, ch('o'), Exact(Mods::CTRL), A::OpenLineBelow, "Edit", "Open line below"),
     bind!(G, ch('o'), Exact(Mods::CTRL_ALT), A::OpenLineAbove, "Edit", "Open line above"),
     // Mode-agnostic edits (same action in Normal and Insert) live here rather than being split
@@ -970,8 +1015,10 @@ static SEARCH: &[Binding] = &[
 
 /// The markdown reading view's keys (docs/markdown-view.md §2.3). Where the editor already has a
 /// key for the concept, Read reuses it — `o` heading-steps like symbol nav, `g`/`Alt-g` are the
-/// ends pair, `j`/`k` move the (reading) cursor while the arrows scroll, search and jumplist keys
-/// are verbatim. Deliberately contains no editing action (see [`KeyContext::Read`]).
+/// ends pair, `j`/`k` move the (reading) cursor while the arrows scroll, `Ctrl-c` copies (the
+/// editor's clipboard chord — acting on the focused element, since Read has no selection), search
+/// and jumplist keys are verbatim. Deliberately contains no editing action (see
+/// [`KeyContext::Read`]).
 #[rustfmt::skip]
 static READ: &[Binding] = &[
     bind!(R, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
@@ -988,7 +1035,43 @@ static READ: &[Binding] = &[
     bind!(R, ch('g'), IgnoreShift(Mods::ALT), A::ReadEnds { last: true }, "Read", "Last element"),
     bind!(R, KeyCode::Enter, Exact(Mods::NONE), A::ReadActivate, "Read", "Follow link / open image / jump to footnote"),
     bind!(R, KeyCode::Enter, Exact(Mods::CTRL), A::ReadActivateNewWindow, "Read", "Open link in a new window/tab"),
-    bind!(R, ch('y'), Exact(Mods::NONE), A::ReadCopy, "Read", "Copy link URL or element source"),
+    bind!(R, ch('c'), Exact(Mods::CTRL), A::ReadCopy, "Read", "Copy selection, link URL, or element source"),
+
+    // ---- block selection (docs/markdown-view.md §12; the editor's `x` line-select machine
+    // at block grain: plain presses walk, Shift grows — and Shift-j/k extend through
+    // read_step) ----
+    bind!(R, ch('x'), IgnoreShift(Mods::NONE), A::ReadSelectBlock(Direction::Forward), "Read", "Select block downward (Shift extends)"),
+    bind!(R, ch('x'), IgnoreShift(Mods::ALT), A::ReadSelectBlock(Direction::Backward), "Read", "Select block upward (Shift extends)"),
+
+    // ---- undo/redo (the Global table's chords, whitelisted here — Read still skips Global,
+    // whose other chords are edits; §12's curated-edit discipline) ----
+    bind!(R, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
+    bind!(R, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
+    // The editor's adjust-the-value pair, re-declared because Read skips Global. Same action, so
+    // the same key does the same thing on either side of `Space v`.
+    bind!(R, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Check task item"),
+    bind!(R, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Uncheck task item"),
+
+    // ---- to the editor (§12 transitions; deliberately NOT recording a read-vs-source
+    // preference — Space v remains the "I prefer source" signal) ----
+    bind!(R, ch('i'), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
+    bind!(R, ch('a'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
+    bind!(R, ch('e'), Exact(Mods::CTRL), A::ReadChange, "Edit", "Edit: rewrite selected block(s)"),
+    bind!(R, ch('o'), Exact(Mods::CTRL), A::ReadOpenBlock { above: false }, "Edit", "Edit: open paragraph below"),
+    bind!(R, ch('o'), Exact(Mods::CTRL_ALT), A::ReadOpenBlock { above: true }, "Edit", "Edit: open paragraph above"),
+
+    // ---- structural edits (§12 phase 3: selection-relative server ops, atomic, one undo
+    // entry each; the grain-relative reading of the editor's chords — Ctrl-j/k move the
+    // block the way they move a line, Ctrl-h/l change depth the way they change indent) ----
+    bind!(R, ch('j'), Exact(Mods::CTRL), A::MoveBlock { down: true, unit: BlockUnit::Block }, "Edit", "Move block(s) down"),
+    bind!(R, ch('k'), Exact(Mods::CTRL), A::MoveBlock { down: false, unit: BlockUnit::Block }, "Edit", "Move block(s) up"),
+    bind!(R, ch('j'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: true, unit: BlockUnit::Block }),
+    bind!(R, ch('k'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: false, unit: BlockUnit::Block }),
+    bind!(R, ch('x'), Exact(Mods::CTRL), A::ReadCutBlock, "Edit", "Cut block(s)"),
+    bind!(R, ch('v'), Exact(Mods::CTRL), A::ReadPasteBlock { replace: false }, "Edit", "Paste as block"),
+    bind!(R, ch('v'), Exact(Mods::CTRL_ALT), A::ReadPasteBlock { replace: true }, "Edit", "Paste replacing selected block(s)"),
+    bind!(R, ch('l'), Exact(Mods::CTRL), A::ReadBlockDepth { deeper: true }, "Edit", "Deepen: demote heading / nest item / quote"),
+    bind!(R, ch('h'), Exact(Mods::CTRL), A::ReadBlockDepth { deeper: false }, "Edit", "Shallow: promote heading / un-nest item / unquote"),
 
     // ---- coarse reading-position jumps + view placement (the editor's own keys) ----
     // `v` rides the editor's visual-line page motion: the jump distance is measured in the

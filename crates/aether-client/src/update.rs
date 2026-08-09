@@ -57,14 +57,16 @@ use aether_protocol::history::{
     HistoryStateParams, HistoryStateResult,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CountedEditParams, EditRedo, EditResult, EditUndo,
-    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputChangeLine,
-    InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
+    BlockDepthParams, BlockEditResult, BufferOnlyParams, CaseKind, CountedEditParams, EditRedo,
+    EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
+    InputBlockDepth, InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock,
+    InputDeleteLine, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
     InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine,
-    InputOpenLineParams, InputReplaceLine, InputReplaceLineParams, InputSurround,
-    InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
+    InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams, InputSurround,
+    InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask,
+    ToggleTaskParams,
     InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
-    ToggleCommentParams, UndoRedoParams, UndoResult,
+    MoveBlockParams, PasteBlockParams, ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
@@ -127,6 +129,9 @@ pub enum Event {
     /// An edit resolved: adopt the new revision + cursor.
     EditDone(Result<EditResult, String>),
     UndoRedoDone(Result<UndoResult, String>),
+    /// A structural block edit resolved (docs/markdown-view.md §12): adopt revision + cursor,
+    /// clipboard the cut payload, toast a reasoned refusal, refresh the reading view's parse.
+    BlockEditDone(Result<BlockEditResult, String>),
     CopyDone(Result<BufferCopyResult, String>),
     CutDone(Result<BufferCutResult, String>),
     /// The shell read the system clipboard for a paste gesture.
@@ -442,9 +447,36 @@ impl Session {
                     Effects::toast_grouped("Nothing to undo or redo", ToastKind::Info, "undo-redo")
                 };
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
-                fx
+                // A `Ctrl-z` in the reading view changes the text under the parse: refresh
+                // straight off our own response rather than relying on the server's change
+                // push alone (idempotent — the in-flight guard drops the duplicate when the
+                // push arrives too).
+                fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
             }
             Event::UndoRedoDone(Err(e)) => Effects::error(e),
+
+            Event::BlockEditDone(Ok(r)) => {
+                self.buffer.revision = r.revision;
+                self.buffer.cursor = r.cursor;
+                let mut fx = Effects::none();
+                if let Some(text) = r.text {
+                    // The cut payload.
+                    fx.push(Effect::WriteClipboard(text));
+                }
+                if let Some(reason) = r.reason {
+                    // A reasoned refusal; quiet boundary no-ops carry none.
+                    fx = fx.and(Effects::toast_grouped(
+                        reason,
+                        ToastKind::Info,
+                        "block-edit",
+                    ));
+                }
+                fx.push(Effect::RevealCursor(RevealStyle::Follow));
+                // The edit changed the text under the reading view's parse — refresh off our
+                // own response, exactly like undo (revisions identify states, `!=` guard).
+                fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
+            }
+            Event::BlockEditDone(Err(e)) => Effects::error(e),
 
             // Opening replaces whatever prompt was up: `Space ?` is only reachable from Normal mode
             // via the leader, so nothing that owns the keyboard can be underneath it.
@@ -496,8 +528,15 @@ impl Session {
                     return Effects::none(); // buffer switched under the fetch
                 }
                 // The buffer moved on while the fetch was in flight — chase the newer
-                // revision. A pending anchor stays armed for the fresh fetch, and the view
-                // stays loading meanwhile (the anchor-hold invariant: no paint before place).
+                // revision. Deliberately `>`, not `!=`: on a fresh open the client's
+                // `buffer.revision` is *behind* the fetched content (the fetch is often the
+                // first thing carrying a real revision), so a mismatch alone is normal. An
+                // undo landing mid-fetch (revision restored *backwards*, see
+                // `maybe_refresh_read`) slips past this check, but its change signal — and
+                // the undoing client's own `UndoRedoDone` refresh — refetch one round trip
+                // later, so the stale adopt is transient. A pending anchor stays armed for
+                // the fresh fetch, and the view stays loading meanwhile (the anchor-hold
+                // invariant: no paint before place).
                 if self.buffer.revision > c.revision {
                     if self.pending_read_anchor.is_none() {
                         read.adopt(c.revision, c.text);
@@ -1770,6 +1809,14 @@ impl Session {
             PasteKind::Line => {
                 self.edit::<InputReplaceLine>(InputReplaceLineParams { buffer_id, text })
             }
+            PasteKind::Block { replace } => self.request_str::<InputPasteBlock>(
+                PasteBlockParams {
+                    buffer_id,
+                    text,
+                    replace,
+                },
+                Event::BlockEditDone,
+            ),
         }
     }
 
@@ -2025,10 +2072,14 @@ impl Session {
     /// React to a change signal for `buffer_id` at `revision`: when the reading view shows that
     /// buffer at an older revision, re-fetch (docs/markdown-view.md §3.1).
     fn maybe_refresh_read(&mut self, buffer_id: BufferId, revision: u64) -> Effects {
+        // `!=`, not `>`: revisions identify buffer states, they don't order them — undo
+        // *restores* the undone entry's older revision number (dirty-tracking relies on
+        // that), so a `Ctrl-z` in the reading view signals a change with a revision that
+        // went backwards. Any revision other than the parsed one means the text moved.
         let stale = self
             .read
             .as_ref()
-            .is_some_and(|r| r.buffer_id == buffer_id && revision > r.revision);
+            .is_some_and(|r| r.buffer_id == buffer_id && revision != r.revision);
         if stale {
             self.refetch_read_content()
         } else {
@@ -6460,9 +6511,12 @@ impl Session {
         // bindings match any modifier). It just moves the caret.
         let extend = mods.shift && self.mode != Mode::Insert;
 
-        // Global table first (mode-identical Ctrl shortcuts), then the mode's own. Read mode
-        // skips Global entirely — its chords are edits (undo, indent, move lines), and the
-        // reading view is read-only by construction (docs/markdown-view.md §1.4).
+        // Global table first (mode-identical Ctrl shortcuts), then the mode's own. Read mode skips
+        // Global entirely and re-declares what it wants: Global's edit chords are *line*-grain
+        // (join, indent, move lines) and the reading view acts on blocks, so it opts in binding by
+        // binding — `Ctrl-z`, `Ctrl-a` — rather than inheriting a keymap written for the editor.
+        // (It was once simply read-only; §12 gave it editing, and the opt-in list is what replaced
+        // that blanket exclusion.)
         let ctx = match self.mode {
             Mode::Normal => KeyContext::Normal,
             Mode::Insert => KeyContext::Insert,
@@ -6550,7 +6604,14 @@ impl Session {
         if self.conn != ConnState::Connected
             && matches!(
                 action,
-                A::EnterInsert(_) | A::OpenLineBelow | A::OpenLineAbove | A::Change | A::CutChange
+                A::EnterInsert(_)
+                    | A::OpenLineBelow
+                    | A::OpenLineAbove
+                    | A::Change
+                    | A::CutChange
+                    | A::ReadInsert { .. }
+                    | A::ReadChange
+                    | A::ReadOpenBlock { .. }
             )
         {
             // Grouped: each blocked keystroke while disconnected refreshes one hint, not a stack.
@@ -6871,16 +6932,8 @@ impl Session {
             A::Dedent => self.repeat_edit::<InputDedent>(count),
             // Insert mode has no selection: scan for the number at the caret rather than acting on
             // the (nonexistent) selection, and collapse afterwards.
-            A::IncrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
-                buffer_id,
-                delta: count as i32,
-                scan_at_cursor: self.mode == Mode::Insert,
-            }),
-            A::DecrementNumber => self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
-                buffer_id,
-                delta: -(count as i32),
-                scan_at_cursor: self.mode == Mode::Insert,
-            }),
+            A::IncrementNumber => self.adjust_value(true, count),
+            A::DecrementNumber => self.adjust_value(false, count),
             A::ToggleComment(style, target) => {
                 self.edit::<InputToggleComment>(ToggleCommentParams {
                     buffer_id,
@@ -7152,13 +7205,45 @@ impl Session {
             A::ReadStep(dir) => self.read_step(
                 dir == Direction::Forward,
                 count,
+                extend,
                 crate::markdown::Element::is_block,
             ),
             A::ReadStepLink(dir) => self.read_step_link_in_block(dir == Direction::Forward, count),
             A::ReadShowTarget => self.read_show_target(),
-            A::ReadStepHeading(dir) => self.read_step(dir == Direction::Forward, count, |e| {
-                matches!(e, crate::markdown::Element::Heading { .. })
-            }),
+            A::ReadStepHeading(dir) => {
+                self.read_step(dir == Direction::Forward, count, extend, |e| {
+                    matches!(e, crate::markdown::Element::Heading { .. })
+                })
+            }
+            A::ReadSelectBlock(dir) => {
+                self.read_select_block(dir == Direction::Forward, count, extend)
+            }
+            A::ReadInsert { at_end } => self.read_insert(at_end),
+            A::ReadChange => self.read_change(),
+            A::ReadOpenBlock { above } => self.read_open_block(above),
+            A::MoveBlock { down, unit } => self.request_str::<InputMoveBlock>(
+                MoveBlockParams {
+                    buffer_id,
+                    direction: if down {
+                        VerticalDirection::Down
+                    } else {
+                        VerticalDirection::Up
+                    },
+                    unit,
+                },
+                Event::BlockEditDone,
+            ),
+            A::ReadCutBlock => self.request_str::<InputDeleteBlock>(
+                BufferOnlyParams { buffer_id },
+                Event::BlockEditDone,
+            ),
+            A::ReadPasteBlock { replace } => {
+                Effects::one(Effect::ReadClipboard(PasteKind::Block { replace }))
+            }
+            A::ReadBlockDepth { deeper } => self.request_str::<InputBlockDepth>(
+                BlockDepthParams { buffer_id, deeper },
+                Event::BlockEditDone,
+            ),
             A::ReadEnds { last } => self.read_ends(last),
             A::ReadActivate => self.read_activate(),
             A::ReadActivateNewWindow => self.read_activate_new_window(),
@@ -7192,17 +7277,36 @@ impl Session {
     /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
     /// move the server cursor to the landed element's start: focus is derived from the cursor, so
     /// the `Goto` *is* the focus change (docs/markdown-view.md §1.3). Quiet no-op at the ends.
+    /// With `extend` (Shift) the step *selects* instead (docs/markdown-view.md §12): the landed
+    /// block's far line becomes the cursor via `cursor/set` + `Granularity::Line` (the server
+    /// snaps to whole-line normal form), the anchor holding at the selection's origin — the
+    /// first extending step plants it at the focused block's near edge, so the selection covers
+    /// origin..=landed as whole blocks.
     fn read_step(
         &mut self,
         forward: bool,
         count: u32,
+        extend: bool,
         pred: impl Fn(&crate::markdown::Element) -> bool,
     ) -> Effects {
-        let target = {
+        enum Landing {
+            Goto(LogicalPosition),
+            Select {
+                position: LogicalPosition,
+                anchor: LogicalPosition,
+            },
+        }
+        let landing = {
             let Some(read) = self.read.as_ref() else {
                 return Effects::none();
             };
-            let Some(mut idx) = read.focus(self.buffer.cursor.position) else {
+            let cursor = self.buffer.cursor;
+            // Step from the byte the bar is drawn at, not the raw cursor. A block selection parks
+            // the cursor on its last line's terminating newline, and only some block spans reach
+            // that far — a fence stops at its closing backtick — so the raw byte resolved forward
+            // to the block *after* the fence and `j` silently skipped one.
+            let byte = read.focus_byte(cursor.position);
+            let Some(mut idx) = crate::markdown::element_at(&read.elements, byte) else {
                 return Effects::none();
             };
             // Stepping is class-relative: when the derived focus doesn't match the predicate (a
@@ -7211,7 +7315,6 @@ impl Session {
             // the paragraph start re-derives focus to the link (innermost at that byte), and
             // stepping back from the link finds its own containing paragraph, forever.
             if !pred(&read.elements[idx]) {
-                let byte = read.byte_of(self.buffer.cursor.position);
                 if let Some(c) = crate::markdown::containing_element(&read.elements, byte, &pred) {
                     idx = c;
                 }
@@ -7229,11 +7332,262 @@ impl Session {
             let Some(idx) = moved else {
                 return Effects::none();
             };
-            // Land outside any leading interactive span, so the step selects the block alone
-            // (the bar) — `l` opts into its links (docs/markdown-view.md §2.3).
-            read.pos_of(crate::markdown::block_rest_byte(&read.elements, idx))
+            if extend {
+                let (first, last) = read.block_lines(idx);
+                let anchor = if cursor.is_point() {
+                    let origin = read.block_focus(cursor.position).unwrap_or(idx);
+                    let (ofirst, olast) = read.block_lines(origin);
+                    if forward {
+                        ofirst
+                    } else {
+                        olast
+                    }
+                } else {
+                    cursor.anchor
+                };
+                Landing::Select {
+                    position: if forward { last } else { first },
+                    anchor,
+                }
+            } else {
+                // Land outside any leading interactive span, so the step selects the block alone
+                // (the bar) — `l` opts into its links (docs/markdown-view.md §2.3).
+                Landing::Goto(read.pos_of(crate::markdown::block_rest_byte(&read.elements, idx)))
+            }
         };
-        self.move_motion(Motion::Goto { position: target }, false)
+        match landing {
+            Landing::Goto(position) => self.move_motion(Motion::Goto { position }, false),
+            Landing::Select { position, anchor } => self.request_str::<CursorSet>(
+                CursorSetParams {
+                    buffer_id: self.buffer.buffer_id,
+                    position,
+                    anchor,
+                    granularity: Granularity::Line,
+                },
+                Event::CursorMsg,
+            ),
+        }
+    }
+
+    /// `x`/`Alt-x` (+Shift): the editor's `cursor/select_line` state machine translated to
+    /// block grain (docs/markdown-view.md §12; see `cursor_select_line_once` server-side).
+    /// Plain presses *walk*: `x` snaps the focused block first, then a press on a whole-block
+    /// selection selects the *next* block alone; `Alt-x` selects the *previous* block even on
+    /// the first press (the editor's first-press asymmetry). Shift *grows* — `Shift-x` the
+    /// bottom, `Alt-Shift-x` the top — but only once a whole-block span exists: a non-whole
+    /// selection first snaps (Shift) or collapses to its edge block (plain), without
+    /// advancing. The cursor stays at whichever end it occupied (fresh selections default it
+    /// to the bottom); edges saturate at the document ends. The editor's
+    /// empty-line-point-is-whole rule has no analog — block walks step block to block and
+    /// can't get stuck on separators. Counts iterate the machine; one `cursor/set` +
+    /// `Granularity::Line` lands the result in whole-line normal form.
+    fn read_select_block(&mut self, forward: bool, count: u32, extend: bool) -> Effects {
+        let (position, anchor) = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let cursor = self.buffer.cursor;
+            let is_block = crate::markdown::Element::is_block;
+            let step = |idx: usize, fwd: bool| {
+                crate::markdown::step_element(&read.elements, idx, fwd, is_block)
+            };
+            let (a, p) = (read.byte_of(cursor.anchor), read.byte_of(cursor.position));
+            let cursor_at_top = !cursor.is_point() && p < a;
+            // Current state: the block range under the selection, and whether the selection
+            // already covers it whole ([`crate::session::ReadView::selection_blocks`]). A
+            // point cursor is "the focused block, not yet selected".
+            let Some((mut top, mut bottom, mut whole)) = read.selection_blocks(&cursor) else {
+                return Effects::none();
+            };
+            let mut fresh = cursor.is_point();
+            for _ in 0..count.max(1) {
+                if fresh {
+                    if !forward {
+                        // Alt-x's first press selects the block *above*, saturating at the top.
+                        top = step(top, false).unwrap_or(top);
+                    }
+                    bottom = top;
+                    (fresh, whole) = (false, true);
+                    continue;
+                }
+                if !whole {
+                    // Snap before advancing: Shift keeps the (now whole) range, a plain press
+                    // collapses to the direction's edge block.
+                    if !extend {
+                        if forward {
+                            top = bottom;
+                        } else {
+                            bottom = top;
+                        }
+                    }
+                    whole = true;
+                    continue;
+                }
+                if forward {
+                    let next = step(bottom, true).unwrap_or(bottom);
+                    if !extend {
+                        top = next;
+                    }
+                    bottom = next;
+                } else {
+                    let prev = step(top, false).unwrap_or(top);
+                    if !extend {
+                        bottom = prev;
+                    }
+                    top = prev;
+                }
+            }
+            let (top_first, _) = read.block_lines(top);
+            let (_, bottom_last) = read.block_lines(bottom);
+            if cursor_at_top {
+                (top_first, bottom_last)
+            } else {
+                (bottom_last, top_first)
+            }
+        };
+        self.request_str::<CursorSet>(
+            CursorSetParams {
+                buffer_id: self.buffer.buffer_id,
+                position,
+                anchor,
+                granularity: Granularity::Line,
+            },
+            Event::CursorMsg,
+        )
+    }
+
+    /// Leave the reading view for the editor as an *edit transition* (docs/markdown-view.md
+    /// §12): unlike `Space v`, does NOT record a presentation preference — ducking out to
+    /// type is not "I prefer source". The caller sets the destination mode.
+    fn read_exit_for_edit(&mut self) {
+        self.read = None;
+        if self.mode == Mode::Read {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// `i`/`a`: to the editor, inserting at the selection's start / end. An extended
+    /// selection uses the editor's own Insert-entry motions (`SelectionEdge`, resolved
+    /// server-side); a bare reading position enters at the focused block's start, or its
+    /// append position — the caret gap before the block's terminating newline (buffer end
+    /// when the last block has none).
+    fn read_insert(&mut self, at_end: bool) -> Effects {
+        let target = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let cursor = self.buffer.cursor;
+            if cursor.is_point() {
+                let Some(f) = read.block_focus(cursor.position) else {
+                    return Effects::none();
+                };
+                let byte = if at_end {
+                    read.block_append_byte(f)
+                } else {
+                    read.elements[f].span().start
+                };
+                Some(read.pos_of(byte))
+            } else {
+                None
+            }
+        };
+        self.read_exit_for_edit();
+        self.mode = Mode::Insert;
+        match target {
+            Some(position) => self.move_motion(Motion::Goto { position }, false),
+            None => self.enter_insert_at(if at_end {
+                // `LastLineEnd`, not `SelectionEnd`: a block selection is always in whole-line
+                // normal form, so its last char *is* the terminating newline and "one past the
+                // last char" is column 0 of the separator line below — typing there wedges the
+                // text into the gap between blocks. The bare-position branch above parks before
+                // that newline, and `a` has to mean the same thing either way.
+                InsertWhere::LastLineEnd
+            } else {
+                InsertWhere::SelectionStart
+            }),
+        }
+    }
+
+    /// `Ctrl-e`: rewrite the selected block(s) — a *content-only* change. The selection is
+    /// re-materialized from block start to the last content char (`Granularity::Char`,
+    /// exact), so the bottom block's terminating newline and every separator survive the
+    /// delete: the editor's `Change` then lands Insert on an emptied line with clean blanks
+    /// either side (vim's `cc` shape, not a raw block-delete that would splice the next
+    /// block up). A multi-block selection collapses to one new block the same way.
+    fn read_change(&mut self) -> Effects {
+        let (anchor, position) = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some((top, bottom, _)) = read.selection_blocks(&self.buffer.cursor) else {
+                return Effects::none();
+            };
+            let start = read.elements[top].span().start;
+            (
+                read.pos_of(start),
+                read.pos_of(read.block_content_end(bottom).max(start)),
+            )
+        };
+        self.read_exit_for_edit();
+        self.mode = Mode::Insert;
+        let buffer_id = self.buffer.buffer_id;
+        self.request_str::<CursorSet>(
+            CursorSetParams {
+                buffer_id,
+                position,
+                anchor,
+                granularity: Granularity::Char,
+            },
+            Event::CursorMsg,
+        )
+        .and(self.edit::<InputChange>(CountedEditParams {
+            buffer_id,
+            count: 1,
+        }))
+    }
+
+    /// `Ctrl-o`/`Ctrl-Alt-o`: open a new *paragraph* below / above the focused block and
+    /// enter Insert — the editor's open-line at block grain. One `input/text "\n\n"` = one
+    /// undo entry. Below: the caret parks at the block's append position, and after the
+    /// insert it sits on the middle empty line, a blank either side. Above: the insert at
+    /// the block's first line pushes the caret past both newlines, so a corrective Goto
+    /// returns it to the (unchanged) insertion line — the middle empty line again. Escaping
+    /// without typing leaves the blank pair (it renders identically; vim leaves its empty
+    /// line too).
+    fn read_open_block(&mut self, above: bool) -> Effects {
+        let (edge, correct_back) = {
+            let Some(read) = self.read.as_ref() else {
+                return Effects::none();
+            };
+            let Some(f) = read.block_focus(self.buffer.cursor.position) else {
+                return Effects::none();
+            };
+            if above {
+                let span = read.elements[f].span();
+                let pos = LogicalPosition {
+                    line: read.pos_of(span.start).line,
+                    col: 0,
+                };
+                (pos, Some(pos))
+            } else {
+                (read.pos_of(read.block_append_byte(f)), None)
+            }
+        };
+        self.read_exit_for_edit();
+        self.mode = Mode::Insert;
+        let buffer_id = self.buffer.buffer_id;
+        let mut fx = self.move_motion(Motion::Goto { position: edge }, false);
+        fx = fx.and(self.edit::<InputText>(InputTextParams {
+            buffer_id,
+            text: "\n\n".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        }));
+        if let Some(pos) = correct_back {
+            fx = fx.and(self.move_motion(Motion::Goto { position: pos }, false));
+        }
+        fx
     }
 
     /// `h`/`l`: step the Enter target among the interactive elements *inside the focused
@@ -7403,12 +7757,52 @@ impl Session {
     /// `Enter`: follow the focused element — open a link (external → system handler, `#anchor` →
     /// the heading, relative path → open in Aether), open an image externally, or jump to a
     /// footnote's definition. No-op on non-interactive blocks (docs/markdown-view.md §2.3).
+    /// `Ctrl-a`/`Ctrl-Alt-a`: adjust the value under the cursor, up or down.
+    ///
+    /// Over a number that is increment/decrement. In a markdown buffer it is the task checkbox
+    /// instead — up checks, down unchecks — so one pair of keys means the same thing in the
+    /// editor and the reading view, which is the whole point of putting it here rather than on a
+    /// read-only chord. Markdown gives up number adjustment for it: an ordered list's markers are
+    /// positions a renderer assigns, not values worth nudging by hand.
+    fn adjust_value(&mut self, up: bool, count: u32) -> Effects {
+        let buffer_id = self.buffer.buffer_id;
+        if self.buffer.language.as_deref() == Some("markdown") {
+            return self.request_str::<InputToggleTask>(
+                ToggleTaskParams {
+                    buffer_id,
+                    set: Some(up),
+                },
+                Event::BlockEditDone,
+            );
+        }
+        let count = count as i32;
+        self.edit::<InputAdjustNumber>(InputAdjustNumberParams {
+            buffer_id,
+            delta: if up { count } else { -count },
+            // Insert mode has no selection: scan for the number at the caret rather than acting on
+            // the (nonexistent) selection, and collapse afterwards.
+            scan_at_cursor: self.mode == Mode::Insert,
+        })
+    }
+
     fn read_activate(&mut self) -> Effects {
         let idx = {
             let Some(read) = self.read.as_ref() else {
                 return Effects::none();
             };
-            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+            let cursor = self.buffer.cursor;
+            // A link is followable only while it is *shown* as armed. With the selection extended
+            // the shells suppress the target pill (`display_target`), so resolving innermost-any
+            // here would follow a link nothing on screen marks — `Alt-x` up a paragraph that
+            // opens with one, then Enter, and the view navigates away. With a selection up, Enter
+            // is the block-grain action only.
+            let armed = cursor
+                .is_point()
+                .then(|| read.focus(cursor.position))
+                .flatten()
+                .filter(|i| read.elements[*i].is_interactive());
+            // Then the checkbox, resolved *outward* — see `ReadView::task_item`.
+            let Some(idx) = armed.or_else(|| read.task_item(cursor.position)) else {
                 return Effects::none();
             };
             idx
@@ -7423,6 +7817,7 @@ impl Session {
             Link(String),
             Image(String),
             Footnote(LogicalPosition),
+            ToggleTask,
         }
         let act = {
             let Some(read) = self.read.as_ref() else {
@@ -7441,10 +7836,26 @@ impl Session {
                     };
                     Act::Footnote(read.pos_of(span.start))
                 }
+                // A task item's activation IS toggling its checkbox (docs/markdown-view.md
+                // §12) — the armed-link pill keeps precedence via `focus()`'s innermost-any
+                // resolution, and clicks never route here (`read_click_activate` filters to
+                // links/footnote refs).
+                crate::markdown::Element::Item {
+                    checked: Some(_), ..
+                } => Act::ToggleTask,
                 _ => return Effects::none(),
             }
         };
         match act {
+            // Enter *flips* — it acts on the box in front of you without your having to know
+            // which way it is pointing. `Ctrl-a`/`Ctrl-Alt-a` are the directional pair.
+            Act::ToggleTask => self.request_str::<InputToggleTask>(
+                ToggleTaskParams {
+                    buffer_id: self.buffer.buffer_id,
+                    set: None,
+                },
+                Event::BlockEditDone,
+            ),
             Act::Link(href) => self.read_follow_link(&href),
             Act::Image(src) => {
                 // A remote image opens as the URL itself — resolving it against the buffer's
@@ -7727,21 +8138,40 @@ impl Session {
         Some(parent.join(target).to_string_lossy().into_owned())
     }
 
-    /// `y`: copy the focused element — a link's URL, otherwise its markdown source.
+    /// `Ctrl-c`: copy — an extended selection's source (whole blocks, separators included),
+    /// else the focused element: a link's URL, otherwise its markdown source.
     fn read_copy(&mut self) -> Effects {
         let (text, what) = {
             let Some(read) = self.read.as_ref() else {
                 return Effects::none();
             };
-            let Some(idx) = read.focus(self.buffer.cursor.position) else {
-                return Effects::none();
-            };
-            match &read.elements[idx] {
-                crate::markdown::Element::Link { href, .. } => (href.clone(), "link URL"),
-                el => (
-                    read.slice(el.span()).trim_end().to_string(),
-                    "element source",
-                ),
+            let cursor = self.buffer.cursor;
+            if !cursor.is_point() {
+                // Inclusive selection: the end cursor's char (the newline, in whole-line
+                // normal form) is part of the range.
+                let (a, b) = (read.byte_of(cursor.anchor), read.byte_of(cursor.position));
+                let (start, end) = (a.min(b) as usize, a.max(b) as usize);
+                let end = end
+                    + read.text[end..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                (
+                    read.text.get(start..end).unwrap_or("").to_string(),
+                    "selection",
+                )
+            } else {
+                let Some(idx) = read.focus(cursor.position) else {
+                    return Effects::none();
+                };
+                match &read.elements[idx] {
+                    crate::markdown::Element::Link { href, .. } => (href.clone(), "link URL"),
+                    el => (
+                        read.slice(el.span()).trim_end().to_string(),
+                        "element source",
+                    ),
+                }
             }
         };
         if text.is_empty() {

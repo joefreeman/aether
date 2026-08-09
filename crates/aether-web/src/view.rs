@@ -74,17 +74,26 @@ fn read_view(s: &Session) -> Value {
         return Value::Null;
     };
     let span_json = |sp: aether_client::markdown::Span| json!({ "start": sp.start, "end": sp.end });
+    let cursor = s.buffer.cursor;
     let block = read
-        .block_focus(s.buffer.cursor.position)
+        .display_block_focus(&cursor)
         .map(|i| read.elements[i].span());
+    // Suppressed while the selection is extended (docs/markdown-view.md §12) — the
+    // selection tint replaces the pill on screen.
     let target = read
-        .target_focus(s.buffer.cursor.position)
+        .display_target(&cursor)
         .map(|i| read.elements[i].span());
+    // The extended selection's inclusive byte range: the shell tints every block node whose
+    // span falls inside it. Absent while the cursor is a point.
+    let selection = read
+        .display_selection(&cursor)
+        .map(|(min, max)| json!({ "start": min, "end": max }));
     json!({
         "loading": read.loading,
         "blocks": jv(&read.blocks),
         "focus_span": block.map(span_json),
         "target_span": target.map(span_json),
+        "selection_span": selection,
         "buffer_id": read.buffer_id,
         // Rebuild keys for the shell: the DOM is rebuilt only when the parsed content or the
         // fence highlights change (focus changes just re-mark), so images aren't re-fetched on

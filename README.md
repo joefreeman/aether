@@ -146,10 +146,18 @@ toggling back lands where you were reading.
 | `l`/`h` | Focus next/previous link in the block |
 | `o`/`Alt-o` | Next/previous heading |
 | `g`/`Alt-g` | First/last element |
-| `Enter` | Follow the link, open the image, or jump to the footnote |
+| `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
 | `Ctrl-Enter` | Follow a relative link in a new window |
 | `Tab` | Show the link's or image's target |
-| `y` | Copy the link URL, or the element's Markdown source |
+| `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
+| `Ctrl-c` | Copy the selection, the link URL, or the element's Markdown source |
+| `Ctrl-z`/`Ctrl-Alt-z` | Undo / redo |
+| `i`/`a` | Edit: insert at block/selection start / end |
+| `Ctrl-e` | Edit: rewrite the selected block(s) |
+| `Ctrl-o`/`Ctrl-Alt-o` | Edit: open a new paragraph below / above |
+| `Ctrl-j`/`Ctrl-k` | Move block(s) down / up (`Ctrl-Alt-j`/`k` moves paragraphs in the editor) |
+| `Ctrl-x`, `Ctrl-v`/`Ctrl-Alt-v` | Cut block(s); paste as block / replace selection |
+| `Ctrl-l`/`Ctrl-h` | Deepen/flatten: heading level, list nesting, or blockquote level |
 
 Search, jump history and the scroll/placement keys behave as they do in normal mode.
 

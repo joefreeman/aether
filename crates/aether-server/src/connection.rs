@@ -28,10 +28,11 @@ use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDi
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
-    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputChange, InputChangeLine,
-    InputDedent, InputDelete, InputDeleteLine, InputIndent, InputJoinLines, InputMoveLines,
-    InputNewlineAndIndent, InputOpenLine, InputReplaceLine, InputSurround, InputTab, InputText,
-    InputToggleComment, InputTransformCase, InputUnsurround,
+    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputBlockDepth, InputChange,
+    InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputIndent,
+    InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent, InputOpenLine,
+    InputPasteBlock, InputReplaceLine, InputSurround, InputTab, InputText, InputToggleComment,
+    InputToggleTask, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::jumplist::{JumplistCapture, JumplistStep};
 use aether_protocol::lsp::{
@@ -458,6 +459,11 @@ async fn dispatch(
         EditRedo::NAME => run!(EditRedo, handlers::edit_redo),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
+        InputMoveBlock::NAME => run!(InputMoveBlock, handlers::input_move_block),
+        InputDeleteBlock::NAME => run!(InputDeleteBlock, handlers::input_delete_block),
+        InputPasteBlock::NAME => run!(InputPasteBlock, handlers::input_paste_block),
+        InputBlockDepth::NAME => run!(InputBlockDepth, handlers::input_block_depth),
+        InputToggleTask::NAME => run!(InputToggleTask, handlers::input_toggle_task),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),
         InputAdjustNumber::NAME => run!(InputAdjustNumber, handlers::input_adjust_number),

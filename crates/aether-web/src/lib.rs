@@ -444,6 +444,9 @@ fn parse_paste(v: &Value) -> Result<PasteKind, JsValue> {
         Some("replace") => Ok(PasteKind::Replace { count }),
         Some("at_cursor") => Ok(PasteKind::AtCursor),
         Some("line") => Ok(PasteKind::Line),
+        Some("block") => Ok(PasteKind::Block {
+            replace: v.get("replace").and_then(Value::as_bool).unwrap_or(false),
+        }),
         other => Err(JsValue::from_str(&format!("unknown paste kind: {other:?}"))),
     }
 }
@@ -712,6 +715,7 @@ fn paste_value(p: &PasteKind) -> Value {
         PasteKind::Replace { count } => json!({ "kind": "replace", "count": count }),
         PasteKind::AtCursor => json!({ "kind": "at_cursor" }),
         PasteKind::Line => json!({ "kind": "line" }),
+        PasteKind::Block { replace } => json!({ "kind": "block", "replace": replace }),
     }
 }
 

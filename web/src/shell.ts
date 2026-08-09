@@ -1825,6 +1825,14 @@ export class Shell {
     // EXCEPT Ctrl/Cmd-V: leave its default so the native `paste` event fires into the capture
     // textarea (no clipboard-read prompt). The core still processes it (→ ReadClipboard); the
     // paste-event handler supplies the text.
+    // And EXCEPT Ctrl/Cmd-C over a native select-to-copy drag in the reading view (the one place
+    // text is user-selectable): the browser's copy takes the dragged selection; without one the
+    // chord falls through to the core's ReadCopy (focused element's URL/source).
+    const isCopy = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "c" || e.key === "C");
+    if (isCopy && this.readActive) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed) return;
+    }
     const isPaste = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "v" || e.key === "V");
     if (!isPaste) e.preventDefault();
     // A lone modifier keydown isn't fed to the core (it would disturb pending captures).
@@ -2091,14 +2099,20 @@ export class Shell {
     return this.session.on_rpc_result(BigInt(token), ok, method, value) as CoreEffect[];
   }
 
-  /** Handle `Effect::ReadClipboard`. A Ctrl-v gesture (before / at_cursor) rides the native `paste`
-   *  event into the focused capture textarea — no permission prompt — so we just stash the descriptor
-   *  for the paste handler. Ctrl-r (replace / line) has no native paste, so read directly (prompts in
-   *  Firefox — acceptable per the user). */
+  /** Handle `Effect::ReadClipboard`. A Ctrl-v gesture (before / at_cursor / block) rides the native
+   *  `paste` event into the focused capture textarea — no permission prompt — so we just stash the
+   *  descriptor for the paste handler. Ctrl-r (replace / line) has no native paste, so read directly
+   *  (prompts in Firefox — acceptable per the user).
+   *
+   *  The list must track every kind the keydown handler lets through un-`preventDefault`ed: the
+   *  reading view's block paste is a Ctrl-v like the others, and leaving it out meant the browser
+   *  fired its `paste` event with nothing armed to receive it, so read-mode paste fell to the
+   *  permission path — a Firefox prompt every time, and outright failure on a non-secure origin. */
   private handleReadClipboard(paste: unknown): void {
     const kind = (paste as { kind?: string } | null)?.kind;
     const nativePasteable =
-      (kind === "before" || kind === "at_cursor") && document.activeElement === this.capture;
+      (kind === "before" || kind === "at_cursor" || kind === "block") &&
+      document.activeElement === this.capture;
     if (nativePasteable) {
       this.pendingPaste = paste;
     } else {
@@ -2712,7 +2726,12 @@ export class Shell {
         renderReadView(this.bufferEl, v.read);
       } else {
         applyFenceHighlights(this.bufferEl, v.read);
-        markFocus(this.bufferEl, v.read.focus_span, v.read.target_span);
+        markFocus(
+          this.bufferEl,
+          v.read.focus_span,
+          v.read.target_span,
+          v.read.selection_span ?? null,
+        );
       }
       // Reveal keyed on the target when the cursor sits inside one (a Tab step must reveal
       // the link, not just its paragraph), else the block bar.

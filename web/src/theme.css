@@ -1216,10 +1216,36 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read ul, .md-read ol { margin: 0.7em 0; padding-left: 1.6em; }
 .md-read li::marker { color: var(--nord4); }
 .md-read li { margin: 0.25em 0; }
-.md-read li.md-task { list-style: none; margin-left: -1.3em; }
-.md-read li.md-task > p { display: inline; } /* checkbox and text share the line */
+/* Task items: the checkbox takes a column of its own, so the box and the first line share a row
+   while the item's blocks stay blocks. A task item can hold more than one — a loose item's
+   second paragraph, a fence — and the previous `li.md-task > p { display: inline }` applied to
+   every one of them, running them together on a single line and collapsing the focus bar (whose
+   top/bottom insets need a block box) to a stub. Grid items don't margin-collapse, so the first
+   and last block give up their own vertical margins to keep the item as tight as the inline row
+   was. */
+.md-read li.md-task {
+  list-style: none;
+  margin-left: -1.3em;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+}
+.md-read li.md-task > :not(.md-task-box) { grid-column: 2; }
+.md-read li.md-task > :nth-child(2) { margin-top: 0; }
+.md-read li.md-task > :last-child { margin-bottom: 0; }
+/* A nested list hugs the line that introduces it, the same "tighter inside lists" rule the
+   terminal client's layout follows (§2.8) — indenting an item should step it right, not push it
+   down a line. Both sides have to give it up: a task item is a grid, where margins don't
+   collapse, so the introducing block's bottom margin and the list's top margin would otherwise
+   add up rather than overlap. */
+.md-read li > :where(ul, ol) { margin-top: 0; }
+.md-read li > :has(+ :where(ul, ol)) { margin-bottom: 0; }
 .md-read .md-task-box { color: var(--nord4); margin-right: 0.45em; }
 .md-read li.md-task-done { color: var(--nord3-brighter); }
+/* …but only for its own prose. Every item states its own done-ness, so the colour must not
+   cascade into a sub-list: an open item indented under a completed one reads as open. A nested
+   item that *is* done re-applies the rule above for itself. */
+.md-read li.md-task-done :where(ul, ol) { color: var(--nord4); }
 
 .md-read code {
   font-family: "JetBrains Mono", ui-monospace, monospace;
@@ -1265,7 +1291,11 @@ a.picker-row:not(.selected):hover .picker-main {
 
 .md-read blockquote {
   margin: 0.9em 0;
-  padding: 0.4em 0.9em;
+  /* The extra 0.6rem on the left is the children's bar strip (the native client's geometry:
+     container bar, padding, child bar, text). It is unconditional — a solo child never lights
+     it (§12.6, the quote is its own grain there), but reserving it only for multi-child quotes
+     left sibling quotes sitting at different indents. */
+  padding: 0.4em 0.9em 0.4em calc(0.9em + 0.6rem);
   border-left: 3px solid var(--nord3);
   color: var(--nord4);
 }
@@ -1360,6 +1390,63 @@ a.picker-row:not(.selected):hover .picker-main {
    up exactly with block bars (nested items step right one list-indent per level). */
 .md-read li.md-focus::before {
   left: calc(-1.6em - 0.9rem);
+}
+/* …except a task item, which `margin-left: -1.3em` has already pulled that far left so its
+   checkbox can stand in the marker's place. Its bar gives the 1.3em back, or it lands outside
+   the reading column instead of in the gutter with everything else. */
+.md-read li.md-task.md-focus::before {
+  left: calc(-0.3em - 0.9rem);
+}
+/* A loose item's children are reading stops of their own (docs/markdown-view.md §12.6), so each
+   carries its own bar — but that bar can't ride the shared gutter: the space belongs to the
+   item's marker, and at -0.9rem the bar paints straight over the bullet (measured: the browser
+   leaves ~14px between bullet and text at the reading size, and the bar is 3 of them). The
+   children make room for it instead, which is the native client's geometry — bullet, bar, text.
+   The `:has()` reads "two children that are neither the checkbox nor a nested list" — which is
+   exactly when an item's children are stops at all (a solo child *is* the item, and keeps the
+   item's own bar). Nested lists have to be excluded from the *count* as well as from the target:
+   their own items carry item-grain bars in their own gutter, one indent step right, so an item
+   whose second block is merely a sub-list needs none of this — and counting it shifted the
+   item's own text right by this margin the moment you indented something underneath it. */
+.md-read li:has(> :not(.md-task-box, ul, ol) ~ :not(.md-task-box, ul, ol))
+    > :not(.md-task-box, ul, ol) {
+  margin-left: 0.6rem;
+}
+.md-read li:has(> :not(.md-task-box, ul, ol) ~ :not(.md-task-box, ul, ol))
+    > :not(.md-task-box, ul, ol).md-focus::before {
+  left: -0.6rem;
+}
+/* Inside a container the model is one sentence: a focused block's bar sits in its container's
+   bar column — the page gutter at top level, the quote's reserved strip (see the blockquote
+   padding) when nested — so bars stack one column per nesting level, native-style. The rules
+   below are that sentence spelled out per geometry. A quote child's bar rides the strip: */
+.md-read blockquote > .md-focus::before {
+  left: -0.6rem;
+}
+/* A focused quote itself measures from its *border* box: `left` resolves against the padding
+   box, so without the 3px border folded in, the quote's bar sat one border-width off the
+   column its sibling blocks' bars use (and, nested, ended up hugging its own border bar). */
+.md-read blockquote.md-focus::before {
+  left: calc(-0.9rem - 3px);
+}
+.md-read blockquote > blockquote.md-focus::before {
+  left: calc(-0.6rem - 3px);
+}
+/* Items of a quote-held list clear the list indent plus the *strip* term, not the page-gutter
+   term (which overshot into the quote's border) — landing them on the same column as their
+   sibling blocks' bars, one list-indent step right per nesting level as everywhere. */
+.md-read blockquote li.md-focus::before {
+  left: calc(-1.6em - 0.6rem);
+}
+.md-read blockquote li.md-task.md-focus::before {
+  left: calc(-0.3em - 0.6rem);
+}
+/* The extended block selection (docs/markdown-view.md §12): the editor's selection shade over
+   every selected block — same node list as the focus bar, so inline spans never paint. The
+   core suppresses the target pill while a selection is extended. */
+.md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
+    .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-selected {
+  background: var(--nord2);
 }
 /* The Enter target — the interactive span (link, footnote ref, image) the cursor sits inside —
    inverts *on top of* the block bar: the bar says "you are reading here", the pill says "Enter
