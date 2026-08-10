@@ -27936,9 +27936,128 @@ async fn block_edits_refuse_front_matter_with_a_reason() {
     .await;
     assert!(!r.applied);
     assert!(r.reason.is_some());
+    // Opening *above* it would push it down; opening below is an ordinary paragraph after a
+    // legal block, so only one direction refuses.
+    use aether_protocol::input::{InputOpenBlock, OpenBlockParams};
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputOpenBlock>(
+        &mut ws,
+        13,
+        &OpenBlockParams {
+            buffer_id,
+            above: true,
+        },
+    )
+    .await;
+    assert!(!r.applied);
+    assert_eq!(r.reason.as_deref(), Some("Front matter stays at the top"));
     let c: BufferContentResult =
-        send_request::<BufferContent>(&mut ws, 13, &BufferContentParams { buffer_id }).await;
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
     assert_eq!(c.text, "---\nkey: v\n---\n\nBody.\n", "document untouched");
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputOpenBlock>(
+        &mut ws,
+        15,
+        &OpenBlockParams {
+            buffer_id,
+            above: false,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 16, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "---\nkey: v\n---\n\n\n\nBody.\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn open_block_continues_a_list_and_lands_where_the_typing_goes() {
+    use aether_protocol::input::{InputOpenBlock, InputText, InputTextParams, OpenBlockParams};
+    // Why this op is resolved against the parse at all: a paragraph opened at column 0 inside a
+    // list splits the list in two. The new line has to carry the marker, and the caret has to
+    // come back past it, so the next thing typed is the item's text.
+    let (server, mut ws, buffer_id) = setup_with_buffer("- one\n- two\n- three\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, 10, buffer_id, p(1, 2), p(1, 2), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult = send_request::<InputOpenBlock>(
+        &mut ws,
+        11,
+        &OpenBlockParams {
+            buffer_id,
+            above: false,
+        },
+    )
+    .await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- one\n- two\n- \n- three\n", "a sibling, tight");
+    assert_eq!(r.cursor.position, p(2, 2), "parked past the new marker");
+    assert_eq!(r.cursor.anchor, r.cursor.position, "collapsed for Insert");
+    // The client enters Insert on that landing, so what it types has to complete the item.
+    let _: aether_protocol::input::EditResult = send_request::<InputText>(
+        &mut ws,
+        13,
+        &InputTextParams {
+            buffer_id,
+            text: "two and a half".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 14, &BufferContentParams { buffer_id }).await;
+    assert_eq!(c.text, "- one\n- two\n- two and a half\n- three\n");
+    drop(server);
+}
+
+#[tokio::test]
+async fn open_block_reads_the_block_it_opens_from() {
+    use aether_protocol::input::{InputOpenBlock, OpenBlockParams};
+    // A task item's sibling starts unchecked; a quote's new paragraph stays quoted (blank line
+    // included, or the quote would end there); a heading begets body text, not a heading.
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\n- [x] done\n\n> One.\n>\n> Two.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let open = |above: bool| OpenBlockParams { buffer_id, above };
+    set_snapped(&mut ws, 10, buffer_id, p(2, 0), p(2, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputOpenBlock>(&mut ws, 11, &open(false)).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 12, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text,
+        "# Title\n\n- [x] done\n- [ ] \n\n> One.\n>\n> Two.\n"
+    );
+    assert_eq!(r.cursor.position, p(3, 6), "past marker and empty box");
+
+    set_snapped(&mut ws, 13, buffer_id, p(5, 2), p(5, 2), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputOpenBlock>(&mut ws, 14, &open(false)).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 15, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text, "# Title\n\n- [x] done\n- [ ] \n\n> One.\n>\n> \n>\n> Two.\n",
+        "still inside the quote, separator included"
+    );
+    assert_eq!(r.cursor.position, p(7, 2), "past the quote marker");
+
+    // The heading: the blank-pair paragraph shape, unchanged from before the op knew about
+    // block types.
+    set_snapped(&mut ws, 16, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
+    let r: aether_protocol::input::BlockEditResult =
+        send_request::<InputOpenBlock>(&mut ws, 17, &open(false)).await;
+    assert!(r.applied);
+    let c: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 18, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        c.text, "# Title\n\n\n\n- [x] done\n- [ ] \n\n> One.\n>\n> \n>\n> Two.\n",
+        "a paragraph, not another heading"
+    );
+    assert_eq!(r.cursor.position, p(2, 0));
     drop(server);
 }
 

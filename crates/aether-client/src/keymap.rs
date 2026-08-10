@@ -498,8 +498,9 @@ pub enum Action {
     /// `Ctrl-e` — rewrite the selected block(s): a content-only change (the trailing newline
     /// and separators survive), landing in Insert on the emptied line.
     ReadChange,
-    /// `Ctrl-o`/`Ctrl-Alt-o` — open a new paragraph below / above the focused block and
-    /// enter Insert (the editor's open-line at block grain).
+    /// `Ctrl-o`/`Ctrl-Alt-o` — open a new block below / above the focused one and enter
+    /// Insert (the editor's open-line at block grain). What gets opened is read off the
+    /// focused block: a sibling item inside a list, a paragraph elsewhere.
     ReadOpenBlock {
         above: bool,
     },
@@ -514,6 +515,10 @@ pub enum Action {
     /// `Ctrl-x` in Read — cut the selected block(s): around-block removal, the blocks'
     /// source to the clipboard.
     ReadCutBlock,
+    /// `Ctrl-d` in Read — delete the focused/selected block(s): the same around-block
+    /// removal as `Ctrl-x` with the clipboard left alone, which is exactly how the editor's
+    /// `Ctrl-d` (delete selection) stands to its `Ctrl-x` (cut selection).
+    ReadDeleteBlock,
     /// `Ctrl-v`/`Ctrl-Alt-v` in Read — paste the clipboard as its own block before the
     /// selection / in place of the selected block(s).
     ReadPasteBlock {
@@ -1042,6 +1047,11 @@ static READ: &[Binding] = &[
     // read_step) ----
     bind!(R, ch('x'), IgnoreShift(Mods::NONE), A::ReadSelectBlock(Direction::Forward), "Read", "Select block downward (Shift extends)"),
     bind!(R, ch('x'), IgnoreShift(Mods::ALT), A::ReadSelectBlock(Direction::Backward), "Read", "Select block upward (Shift extends)"),
+    // The editor's own reverse/orient pair, unchanged: swapping the ends moves the bar to the
+    // other edge of the block range, and every extension key already grows from the cursor's
+    // end — so `r` is what re-aims `x`/`Shift-j`/`Shift-k` at the top of a selection.
+    bind!(R, ch('r'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Read", "Reverse selection (swap cursor and anchor)"),
+    bind!(R, ch('r'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Read", "Orient selection forward (cursor to end)"),
 
     // ---- undo/redo (the Global table's chords, whitelisted here — Read still skips Global,
     // whose other chords are edits; §12's curated-edit discipline) ----
@@ -1057,8 +1067,8 @@ static READ: &[Binding] = &[
     bind!(R, ch('i'), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
     bind!(R, ch('a'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
     bind!(R, ch('e'), Exact(Mods::CTRL), A::ReadChange, "Edit", "Edit: rewrite selected block(s)"),
-    bind!(R, ch('o'), Exact(Mods::CTRL), A::ReadOpenBlock { above: false }, "Edit", "Edit: open paragraph below"),
-    bind!(R, ch('o'), Exact(Mods::CTRL_ALT), A::ReadOpenBlock { above: true }, "Edit", "Edit: open paragraph above"),
+    bind!(R, ch('o'), Exact(Mods::CTRL), A::ReadOpenBlock { above: false }, "Edit", "Edit: open block below (list item in a list)"),
+    bind!(R, ch('o'), Exact(Mods::CTRL_ALT), A::ReadOpenBlock { above: true }, "Edit", "Edit: open block above (list item in a list)"),
 
     // ---- structural edits (§12 phase 3: selection-relative server ops, atomic, one undo
     // entry each; the grain-relative reading of the editor's chords — Ctrl-j/k move the
@@ -1068,6 +1078,7 @@ static READ: &[Binding] = &[
     bind!(R, ch('j'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: true, unit: BlockUnit::Block }),
     bind!(R, ch('k'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: false, unit: BlockUnit::Block }),
     bind!(R, ch('x'), Exact(Mods::CTRL), A::ReadCutBlock, "Edit", "Cut block(s)"),
+    bind!(R, ch('d'), Exact(Mods::CTRL), A::ReadDeleteBlock, "Edit", "Delete block(s)"),
     bind!(R, ch('v'), Exact(Mods::CTRL), A::ReadPasteBlock { replace: false }, "Edit", "Paste as block"),
     bind!(R, ch('v'), Exact(Mods::CTRL_ALT), A::ReadPasteBlock { replace: true }, "Edit", "Paste replacing selected block(s)"),
     bind!(R, ch('l'), Exact(Mods::CTRL), A::ReadBlockDepth { deeper: true }, "Edit", "Deepen: demote heading / nest item / quote"),

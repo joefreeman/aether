@@ -30,9 +30,9 @@ use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
     EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputBlockDepth, InputChange,
     InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent, InputOpenLine,
-    InputPasteBlock, InputReplaceLine, InputSurround, InputTab, InputText, InputToggleComment,
-    InputToggleTask, InputTransformCase, InputUnsurround,
+    InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent, InputOpenBlock,
+    InputOpenLine, InputPasteBlock, InputReplaceLine, InputSurround, InputTab, InputText,
+    InputToggleComment, InputToggleTask, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::jumplist::{JumplistCapture, JumplistStep};
 use aether_protocol::lsp::{
@@ -463,6 +463,7 @@ async fn dispatch(
         InputDeleteBlock::NAME => run!(InputDeleteBlock, handlers::input_delete_block),
         InputPasteBlock::NAME => run!(InputPasteBlock, handlers::input_paste_block),
         InputBlockDepth::NAME => run!(InputBlockDepth, handlers::input_block_depth),
+        InputOpenBlock::NAME => run!(InputOpenBlock, handlers::input_open_block),
         InputToggleTask::NAME => run!(InputToggleTask, handlers::input_toggle_task),
         InputIndent::NAME => run!(InputIndent, handlers::input_indent),
         InputDedent::NAME => run!(InputDedent, handlers::input_dedent),

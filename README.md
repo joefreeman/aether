@@ -150,13 +150,15 @@ toggling back lands where you were reading.
 | `Ctrl-Enter` | Follow a relative link in a new window |
 | `Tab` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
+| `r`/`Alt-r` | Reverse the selection / orient it forward |
 | `Ctrl-c` | Copy the selection, the link URL, or the element's Markdown source |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo / redo |
 | `i`/`a` | Edit: insert at block/selection start / end |
 | `Ctrl-e` | Edit: rewrite the selected block(s) |
-| `Ctrl-o`/`Ctrl-Alt-o` | Edit: open a new paragraph below / above |
+| `Ctrl-o`/`Ctrl-Alt-o` | Edit: open a new block below / above — a list item inside a list, a paragraph elsewhere |
 | `Ctrl-j`/`Ctrl-k` | Move block(s) down / up (`Ctrl-Alt-j`/`k` moves paragraphs in the editor) |
 | `Ctrl-x`, `Ctrl-v`/`Ctrl-Alt-v` | Cut block(s); paste as block / replace selection |
+| `Ctrl-d` | Delete block(s) (no clipboard) |
 | `Ctrl-l`/`Ctrl-h` | Deepen/flatten: heading level, list nesting, or blockquote level |
 
 Search, jump history and the scroll/placement keys behave as they do in normal mode.

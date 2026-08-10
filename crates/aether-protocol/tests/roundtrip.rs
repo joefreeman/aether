@@ -3793,6 +3793,15 @@ fn block_edit_wire_shapes() {
         json!({ "buffer_id": 3, "text": "New block.", "replace": true })
     );
 
+    // The open params: direction as a bare flag, like the depth pair's `deeper`.
+    use aether_protocol::input::OpenBlockParams;
+    let v = to_value(OpenBlockParams {
+        buffer_id: 3,
+        above: true,
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "buffer_id": 3, "above": true }));
+
     // The shared result: reason and text (delete's clipboard) skip when absent.
     let v = to_value(BlockEditResult {
         applied: false,

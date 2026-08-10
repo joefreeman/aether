@@ -47,8 +47,9 @@ use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle,
     CountedEditParams, EditResult, InputAdjustNumberParams, InputMoveLinesParams,
     InputNewlineAndIndentParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
-    InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams, PasteBlockParams,
-    SurroundTarget, ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
+    InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams,
+    PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCaptureParams, JumplistCaptureResult, JumplistStepParams, JumplistStepResult,
@@ -10135,6 +10136,9 @@ fn resolve_block_edit(
         BlockOp::ToggleTask { set } => {
             md::resolve_toggle_task(&text, &elements, b, *set).map(|e| (e, None))
         }
+        BlockOp::Open { above } => {
+            md::resolve_open(&text, &blocks, &elements, min, max, *above).map(|e| (e, None))
+        }
     }
 }
 
@@ -10246,6 +10250,17 @@ pub async fn input_block_depth(
 ) -> Result<BlockEditResult, RpcError> {
     let op = BlockOp::Depth {
         deeper: params.deeper,
+    };
+    block_edit_rpc(state, ctx, params.buffer_id, op).await
+}
+
+pub async fn input_open_block(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: OpenBlockParams,
+) -> Result<BlockEditResult, RpcError> {
+    let op = BlockOp::Open {
+        above: params.above,
     };
     block_edit_rpc(state, ctx, params.buffer_id, op).await
 }
@@ -10935,6 +10950,7 @@ enum BlockOp {
     PasteBlock { text: String, replace: bool },
     Depth { deeper: bool },
     ToggleTask { set: Option<bool> },
+    Open { above: bool },
 }
 
 enum EditKind {

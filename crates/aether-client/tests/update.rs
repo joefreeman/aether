@@ -7257,43 +7257,56 @@ fn read_ctrl_e_changes_block_content_keeping_the_newline() {
 }
 
 #[test]
-fn read_ctrl_o_opens_a_paragraph_below_and_above() {
+fn read_ctrl_o_opens_a_block_via_the_server_then_enters_insert() {
     use aether_client::session::Mode;
-    use aether_protocol::LogicalPosition;
-    // Below: park at the paragraph's append position, insert the blank pair; the caret ends
-    // between them, so no corrective move.
+    // One RPC — what gets opened (sibling item / paragraph) is the server's parse to decide,
+    // not ours — and the mode waits for it: the caret comes back parked in the new block.
     let mut s = read_session();
-    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.buffer.cursor.anchor = s.buffer.cursor.position;
     let fx = ctrl(&mut s, 'o');
+    let (token, method, p) = the_request(&fx);
+    assert_eq!(method, "input/open_block");
+    assert_eq!(p["above"], json!(false));
+    assert_eq!(s.mode, Mode::Read, "still reading until the edit lands");
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "applied": true,
+            "revision": 2,
+            "cursor": { "position": {"line": 4, "col": 2}, "anchor": {"line": 4, "col": 2} },
+        })),
+    );
     assert_eq!(s.mode, Mode::Insert);
-    assert!(s.read.is_none());
-    let reqs = all_requests(&fx);
-    assert_eq!(reqs.len(), 2, "goto + text: {reqs:?}");
-    assert_eq!(reqs[0].0, "cursor/move");
-    assert_eq!(
-        reqs[0].1["motion"]["position"],
-        json!({"line": 2, "col": 11})
+    assert!(s.read.is_none(), "handed over to the editor");
+    assert_eq!(s.buffer.cursor.position.col, 2, "parked past the marker");
+    assert!(
+        all_requests(&fx).is_empty(),
+        "the landing needs no correcting move"
     );
-    assert_eq!(reqs[1].0, "input/text");
-    assert_eq!(reqs[1].1["text"], json!("\n\n"));
-    // Above: the insert at the block's first line pushes the caret past both newlines, so a
-    // corrective Goto returns it to the (unchanged) insertion line.
+
     let mut s = read_session();
-    s.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.buffer.cursor.anchor = s.buffer.cursor.position;
-    let fx = ctrl_alt(&mut s, 'o');
-    let reqs = all_requests(&fx);
-    assert_eq!(reqs.len(), 3, "goto + text + corrective goto: {reqs:?}");
-    assert_eq!(
-        reqs[0].1["motion"]["position"],
-        json!({"line": 2, "col": 0})
+    let (_, _, p) = the_request(&ctrl_alt(&mut s, 'o'));
+    assert_eq!(p["above"], json!(true));
+}
+
+#[test]
+fn read_ctrl_o_refused_stays_in_the_reading_view() {
+    use aether_client::session::Mode;
+    // Opening above front matter would demote it; the refusal must not strand the user in
+    // Insert over a document the server never changed.
+    let mut s = read_session();
+    let token = the_request(&ctrl_alt(&mut s, 'o')).0;
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "applied": false,
+            "reason": "Front matter stays at the top",
+            "revision": 1,
+            "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
+        })),
     );
-    assert_eq!(reqs[1].1["text"], json!("\n\n"));
-    assert_eq!(
-        reqs[2].1["motion"]["position"],
-        json!({"line": 2, "col": 0})
-    );
+    assert_eq!(s.mode, Mode::Read);
+    assert!(s.read.is_some());
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
 }
 
 #[test]
@@ -7379,6 +7392,57 @@ fn read_ctrl_x_cuts_and_the_response_lands_on_the_clipboard() {
         )),
         "the parse refreshes off the edit response"
     );
+}
+
+#[test]
+fn read_r_reverses_the_selection_and_alt_r_orients_it_forward() {
+    // The editor's own pair, reused verbatim: focus derives from the cursor, so swapping the
+    // ends moves the bar to the other edge — and Shift-j/k then grow from there, because
+    // `read_step` extends from the cursor's block and keeps the anchor.
+    let mut s = read_session();
+    let (_t, method, _p) = the_request(&key(&mut s, 'x'));
+    assert_eq!(method, "cursor/set", "a block selection to reverse");
+    let (_t, method, p) = the_request(&key(&mut s, 'r'));
+    assert_eq!(method, "cursor/swap_anchor");
+    // `forward_only: false` is the wire default and skips (the plain toggle).
+    assert!(p.get("forward_only").is_none(), "{p}");
+    let fx = s.on_key(KeyCode::Char('r'), Mods::ALT, None, ROWS);
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/swap_anchor");
+    assert_eq!(p["forward_only"], json!(true));
+}
+
+#[test]
+fn read_ctrl_d_deletes_the_blocks_without_touching_the_clipboard() {
+    use aether_client::session::Mode;
+    // Same removal and the same RPC as `Ctrl-x`; what separates them is that the removed
+    // source is dropped rather than clipboarded — the editor's `Ctrl-d` vs `Ctrl-x`, at
+    // block grain. Driven through `on_rpc_result` so the request's own mapping runs.
+    let mut s = read_session();
+    let (token, method, _p) = the_request(&ctrl(&mut s, 'd'));
+    assert_eq!(method, "input/delete_block");
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "applied": true,
+            "revision": 2,
+            "cursor": { "position": {"line": 2, "col": 0}, "anchor": {"line": 2, "col": 0} },
+            "text": "Beta.\n",
+        })),
+    );
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::WriteClipboard(_))),
+        "the payload the server always sends is dropped, not clipboarded"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )),
+        "the parse refreshes off the edit response"
+    );
+    assert_eq!(s.buffer.revision, 2);
+    assert_eq!(s.mode, Mode::Read, "a deletion is not a transition");
 }
 
 #[test]
@@ -7601,6 +7665,8 @@ fn read_table_contains_no_editing_action() {
                     | Action::ReadActivate
                     | Action::ReadCopy
                     | Action::ReadSelectBlock(_)
+                    // Selection orientation: a cursor/anchor swap, no text touched.
+                    | Action::SwapAnchor { .. }
                     // §12's curated edits: undo/redo act on the buffer but create no new
                     // text shape from Read; each future edit action is added here
                     // deliberately, keeping the §1.4 discipline as an explicit list.
@@ -7615,6 +7681,7 @@ fn read_table_contains_no_editing_action() {
                     // atomic, refusals as applied:false.
                     | Action::MoveBlock { .. }
                     | Action::ReadCutBlock
+                    | Action::ReadDeleteBlock
                     | Action::ReadPasteBlock { .. }
                     | Action::ReadBlockDepth { .. }
                     // The editor's adjust-the-value pair, re-declared in the Read table so

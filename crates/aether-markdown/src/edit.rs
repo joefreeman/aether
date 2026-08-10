@@ -1141,6 +1141,180 @@ fn split_lines_incl(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+// ---- open ---------------------------------------------------------------------------------------
+
+/// `Ctrl-o`/`Ctrl-Alt-o`: open a new block below / above the focused one, landing the caret in
+/// it for the client to enter Insert on.
+///
+/// What "a new block" means is read off the focused one, because the alternative — always a
+/// paragraph at column 0 — is wrong wherever a block's *lines* carry structure. Opened inside a
+/// list it left an unindented, unmarked line, which parses as a paragraph splitting the list in
+/// two; opened inside a quote it left the quote. So the new line reproduces the focused block's
+/// line prefix (quote markers, a nested item's indentation) and, on a list item, its marker: a
+/// fresh sibling item, with an empty box when the focused item has one. Every other block opens
+/// a paragraph, as before — a heading begets body text, not another heading.
+///
+/// The separator is the seam already in force, this file's rule throughout: none inside a tight
+/// list (a blank line would split it), the blank line back inside a loose one, and elsewhere the
+/// blank line that separates top-level blocks — spelt with the container prefix, since a truly
+/// blank line ends a quote.
+///
+/// The landing is collapsed whatever the selection was: Insert follows immediately, and the
+/// caret belongs in the block just opened, not around the one it was opened from.
+pub fn resolve_open(
+    text: &str,
+    blocks: &[Block],
+    elements: &[Element],
+    sel_min: u32,
+    sel_max: u32,
+    above: bool,
+) -> Resolved {
+    let Some((top, bottom)) = selection_block_range(text, elements, sel_min, sel_max) else {
+        return open_blockless(text, above);
+    };
+    let idx = if above { top } else { bottom };
+    let span = elements[idx].span();
+    // Only above: nothing pushed above front matter leaves it front matter, while opening
+    // *below* it is an ordinary paragraph after a legal block.
+    if above {
+        guard_front_matter(blocks, &[span])?;
+    }
+    let chunk = chunk_of(text, span, span);
+    let first_line_end = line_end_incl(text, chunk.start);
+    // Everything in front of the block's own span on its first line: the quote markers, and for
+    // a nested item the indentation that belongs to its parent's span. Carried verbatim, this is
+    // what keeps the opened block inside the container rather than after it.
+    let own_start = (span.start as usize).clamp(chunk.start, first_line_end);
+    let prefix = &text[chunk.start..own_start];
+    let opened = match &elements[idx] {
+        Element::Item { checked, .. } => format!(
+            "{prefix}{}",
+            sibling_marker(&text[own_start..first_line_end], checked.is_some(), above)
+        ),
+        _ => prefix.to_string(),
+    };
+    // A blank line inside a quote is spelt with the quote's own markers; a bare one would end
+    // the quote. Trailing spaces on it would just be trailing whitespace.
+    let separator = format!("{}\n", prefix.trim_end());
+    let sep = if matches!(elements[idx], Element::Item { .. })
+        && item_seam_is_tight(text, blocks, span, above)
+    {
+        ""
+    } else {
+        &separator
+    };
+    let (at, insert, caret) = if above {
+        (
+            chunk.start,
+            format!("{opened}\n{sep}"),
+            chunk.start + opened.len(),
+        )
+    } else {
+        let at = chunk.end;
+        // The block's last line may be the document's, with no newline to open past.
+        let terminate = if at == text.len() && !text.ends_with('\n') && !text.is_empty() {
+            "\n"
+        } else {
+            ""
+        };
+        let caret = at + terminate.len() + sep.len() + opened.len();
+        (at, format!("{terminate}{sep}{opened}\n"), caret)
+    };
+    Ok(BlockEdit {
+        range: at..at,
+        text: insert,
+        anchor: caret,
+        cursor: caret,
+    })
+}
+
+/// The marker a new sibling of the item opening `line` should carry: the same bullet, or a
+/// stepped number, plus an empty box when the item is a task (the new item is a new job, so it
+/// starts unchecked however the focused one stands).
+///
+/// Numbers: a renderer counts an ordered list from its *first* item's marker and renumbers the
+/// rest, so the head's is the only number a new item can get wrong. Opening below takes the
+/// item's number + 1 — exactly right at the end of a list, which is where items are usually
+/// added — and opening above takes the item's own, which is what keeps a list that starts at 3
+/// starting at 3 when a new head goes in above it.
+fn sibling_marker(line: &str, task: bool, above: bool) -> String {
+    let Some(width) = marker_width(line) else {
+        // An item with nothing after its marker (`-` alone on its line) is still an item, and
+        // `marker_width` wants the space that isn't there.
+        return match line.as_bytes().first() {
+            Some(c @ (b'-' | b'*' | b'+')) => format!("{} ", *c as char),
+            _ => String::new(),
+        };
+    };
+    let mut marker = line[..width].to_string();
+    if let Some(r) = ordered_marker_range(line) {
+        if let Ok(n) = line[r.start..r.end - 1].parse::<u64>() {
+            let stepped = if above { n } else { n.saturating_add(1) };
+            marker.replace_range(r.start..r.end - 1, &stepped.to_string());
+        }
+    }
+    if task {
+        marker.push_str("[ ] ");
+    }
+    marker
+}
+
+/// Whether an item opened next to the one at `span` should sit newline-adjacent to it. A tight
+/// list's items are, and a blank line between them splits the list in two; a loose list's are
+/// not, and dropping its blank line would leave the list tight around the new item alone.
+///
+/// Read off the seam already in force on the side the new item lands, falling back to the other
+/// side, and to tight for a one-item list — the shape a list is written in before it has a
+/// second item to be loose about.
+fn item_seam_is_tight(text: &str, blocks: &[Block], span: Span, above: bool) -> bool {
+    let Some(place) = locate(blocks, span, true) else {
+        return true;
+    };
+    let adjacent = |a: usize, b: usize| {
+        chunk_of(text, place.siblings[a], place.siblings[a]).end
+            >= line_start(text, place.siblings[b].start as usize)
+    };
+    let before = place.index.checked_sub(1).map(|p| adjacent(p, place.index));
+    let after =
+        (place.index + 1 < place.siblings.len()).then(|| adjacent(place.index, place.index + 1));
+    let (near, far) = if above {
+        (before, after)
+    } else {
+        (after, before)
+    };
+    near.or(far).unwrap_or(true)
+}
+
+/// The no-blocks fallback: an empty document — or one the parse yields no blocks for, nothing
+/// but link reference definitions say — has no block to open next to, but this key is the way
+/// into an empty file from the reading view, so it opens at the document's end / start instead
+/// of refusing. Whatever text is there is kept.
+fn open_blockless(text: &str, above: bool) -> Resolved {
+    if above {
+        let sep = if text.trim().is_empty() { "" } else { "\n\n" };
+        return Ok(BlockEdit {
+            range: 0..0,
+            text: sep.to_string(),
+            anchor: 0,
+            cursor: 0,
+        });
+    }
+    let at = text.len();
+    let sep = match () {
+        _ if text.trim().is_empty() => "",
+        _ if text.ends_with("\n\n") => "",
+        _ if text.ends_with('\n') => "\n",
+        _ => "\n\n",
+    };
+    let caret = at + sep.len();
+    Ok(BlockEdit {
+        range: at..at,
+        text: sep.to_string(),
+        anchor: caret,
+        cursor: caret,
+    })
+}
+
 // ---- toggle task --------------------------------------------------------------------------------
 
 /// `Enter` on a task item: flip its checkbox. `byte` is the cursor; the innermost task item
@@ -2289,5 +2463,174 @@ mod tests {
         let at = doc.find("Body.").unwrap() as u32;
         let e = resolve_move_paragraph(doc, at, at, true).unwrap();
         assert_eq!(apply(doc, &e), "---\nkey: v\n---\n\nMore.\n\nBody.\n");
+    }
+
+    // ---- open ----
+
+    /// The document an open produced, with `|` marking where the caret landed — the whole
+    /// point of the op is *where you can type*, so the tests read the two together.
+    fn opened(text: &str, e: &BlockEdit) -> String {
+        assert_eq!(e.anchor, e.cursor, "an open always lands collapsed");
+        let mut out = apply(text, e);
+        out.insert(e.cursor, '|');
+        out
+    }
+
+    fn open(md: &str, at: u32, above: bool) -> Resolved {
+        let (blocks, els) = fixture(md);
+        resolve_open(md, &blocks, &els, at, at, above)
+    }
+
+    #[test]
+    fn open_below_a_paragraph_leaves_the_blank_pair() {
+        // The pre-existing shape, unchanged: separator, empty line to type on, separator.
+        let doc = "Alpha one.\n\nBeta two.\n";
+        let e = open(doc, 0, false).unwrap();
+        assert_eq!(opened(doc, &e), "Alpha one.\n\n|\n\nBeta two.\n");
+        // And a heading begets body text, not another heading.
+        let doc = "## Sub\n\nBody.\n";
+        let e = open(doc, 0, false).unwrap();
+        assert_eq!(opened(doc, &e), "## Sub\n\n|\n\nBody.\n");
+    }
+
+    #[test]
+    fn open_above_the_first_block_pushes_it_down() {
+        let doc = "# Title\n\nBody.\n";
+        let e = open(doc, 0, true).unwrap();
+        assert_eq!(opened(doc, &e), "|\n\n# Title\n\nBody.\n");
+    }
+
+    #[test]
+    fn open_at_eof_without_a_trailing_newline() {
+        let doc = "Alpha.";
+        let e = open(doc, 0, false).unwrap();
+        assert_eq!(opened(doc, &e), "Alpha.\n\n|\n");
+    }
+
+    #[test]
+    fn open_on_a_tight_list_item_adds_a_sibling_not_a_paragraph() {
+        // The bug this op exists for: a paragraph opened at column 0 here splits the list in two.
+        let doc = "- one\n- two\n- three\n";
+        let e = open(doc, 8, false).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n- two\n- |\n- three\n");
+        let e = open(doc, 8, true).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n- |\n- two\n- three\n");
+        // The list stays one list either way.
+        let out = apply(doc, &open(doc, 8, false).unwrap());
+        assert_eq!(parse(&out).len(), 1, "still a single list: {out:?}");
+    }
+
+    #[test]
+    fn open_on_a_loose_list_item_keeps_the_lists_blank_lines() {
+        let doc = "- one\n\n- two\n\n- three\n";
+        let at = doc.find("two").unwrap() as u32;
+        let e = open(doc, at, false).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n\n- two\n\n- |\n\n- three\n");
+        let e = open(doc, at, true).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n\n- |\n\n- two\n\n- three\n");
+    }
+
+    #[test]
+    fn open_below_the_last_item_of_a_list_stays_in_the_list() {
+        // No sibling below to read the seam from: the gap above the item answers instead, so the
+        // new item joins the tight list rather than taking the blank line that follows it.
+        let doc = "- one\n- two\n\nAfter.\n";
+        let e = open(doc, 8, false).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n- two\n- |\n\nAfter.\n");
+    }
+
+    #[test]
+    fn open_on_a_task_item_starts_the_new_one_unchecked() {
+        let doc = "- [x] done\n- [ ] todo\n";
+        let e = open(doc, 6, false).unwrap();
+        assert_eq!(opened(doc, &e), "- [x] done\n- [ ] |\n- [ ] todo\n");
+    }
+
+    #[test]
+    fn open_on_an_ordered_item_steps_the_number_below_and_keeps_the_start_above() {
+        let doc = "1. one\n2. two\n";
+        let at = doc.find("two").unwrap() as u32;
+        let e = open(doc, at, false).unwrap();
+        assert_eq!(opened(doc, &e), "1. one\n2. two\n3. |\n");
+        // A list that starts at 3 keeps starting at 3 when a new head goes in above: the new
+        // item takes the head's own number, since a renderer counts the list from that marker.
+        let doc = "3. three\n4. four\n";
+        let e = open(doc, 0, true).unwrap();
+        assert_eq!(opened(doc, &e), "3. |\n3. three\n4. four\n");
+    }
+
+    #[test]
+    fn open_on_a_nested_item_keeps_its_indentation() {
+        let doc = "- one\n  - a\n  - b\n";
+        let at = doc.find("- a").unwrap() as u32;
+        let e = open(doc, at, false).unwrap();
+        assert_eq!(opened(doc, &e), "- one\n  - a\n  - |\n  - b\n");
+    }
+
+    #[test]
+    fn open_inside_a_quote_stays_inside_the_quote() {
+        // Both halves matter: the new line carries the marker, and so does the blank line
+        // between — a bare one would end the quote and leave the rest outside it.
+        let doc = "> Alpha.\n>\n> Beta.\n";
+        let e = open(doc, 2, false).unwrap();
+        assert_eq!(opened(doc, &e), "> Alpha.\n>\n> |\n>\n> Beta.\n");
+        let out = apply(doc, &e);
+        assert!(
+            matches!(parse(&out).as_slice(), [Block::Quote { .. }]),
+            "one quote, not two: {out:?}"
+        );
+        // A quote holding a *single* block lists only the container (the element list's
+        // solo-child rule), so the focused block there is the quote itself — and the block
+        // opened next to it is its sibling, at the top level. The grain decides, as it does
+        // for move and cut.
+        let doc = "> Solo.\n";
+        let e = open(doc, 2, false).unwrap();
+        assert_eq!(opened(doc, &e), "> Solo.\n\n|\n");
+    }
+
+    #[test]
+    fn open_on_a_quoted_list_item_carries_both_the_marker_and_the_quote() {
+        let doc = "> - one\n> - two\n";
+        let at = doc.find("two").unwrap() as u32;
+        let e = open(doc, at, false).unwrap();
+        assert_eq!(opened(doc, &e), "> - one\n> - two\n> - |\n");
+    }
+
+    #[test]
+    fn open_above_front_matter_refuses_but_below_it_is_ordinary() {
+        let doc = "---\nkey: v\n---\n\nBody.\n";
+        assert!(matches!(open(doc, 0, true), Err(Refusal::Why(_))));
+        let e = open(doc, 0, false).unwrap();
+        assert_eq!(opened(doc, &e), "---\nkey: v\n---\n\n|\n\nBody.\n");
+    }
+
+    #[test]
+    fn open_from_a_selection_uses_its_far_edge_and_lands_collapsed() {
+        let doc = "Alpha one.\n\nBeta two.\n\nGamma three.\n";
+        let (blocks, els) = fixture(doc);
+        let (lo, hi) = (0, doc.find("Gamma").unwrap() as u32 - 1);
+        let e = resolve_open(doc, &blocks, &els, lo, hi, false).unwrap();
+        assert_eq!(
+            opened(doc, &e),
+            "Alpha one.\n\nBeta two.\n\n|\n\nGamma three.\n"
+        );
+        let e = resolve_open(doc, &blocks, &els, lo, hi, true).unwrap();
+        assert_eq!(
+            opened(doc, &e),
+            "|\n\nAlpha one.\n\nBeta two.\n\nGamma three.\n"
+        );
+    }
+
+    #[test]
+    fn open_in_a_document_with_no_blocks_still_gives_somewhere_to_type() {
+        // The reading view of an empty file has nothing to open next to, and refusing would
+        // leave no way into it at all.
+        let e = open("", 0, false).unwrap();
+        assert_eq!(opened("", &e), "|");
+        let doc = "[a]: https://example.com\n";
+        let e = open(doc, 0, false).unwrap();
+        assert_eq!(opened(doc, &e), "[a]: https://example.com\n\n|");
+        let e = open(doc, 0, true).unwrap();
+        assert_eq!(opened(doc, &e), "|\n\n[a]: https://example.com\n");
     }
 }

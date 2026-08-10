@@ -597,6 +597,22 @@ pub struct PasteBlockParams {
     pub replace: bool,
 }
 
+/// Open a new block below (`above: false`) or above the focused one and land the caret in it:
+/// a fresh sibling item inside a list — marker, indentation and empty checkbox included — a
+/// paragraph everywhere else. The client enters Insert when the result comes back applied.
+pub struct InputOpenBlock;
+impl RpcMethod for InputOpenBlock {
+    const NAME: &'static str = "input/open_block";
+    type Params = OpenBlockParams;
+    type Result = BlockEditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenBlockParams {
+    pub buffer_id: BufferId,
+    pub above: bool,
+}
+
 /// Change the focused block's depth: a heading's level, a list item's nesting (subtree
 /// riding along). Refuses elsewhere with a reason.
 pub struct InputBlockDepth;

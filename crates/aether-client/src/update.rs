@@ -61,12 +61,12 @@ use aether_protocol::input::{
     EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
     InputBlockDepth, InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock,
     InputDeleteLine, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine,
-    InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams, InputSurround,
-    InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask,
-    InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
-    MoveBlockParams, PasteBlockParams, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
-    UndoResult,
+    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
+    InputOpenLine, InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams,
+    InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
+    InputToggleTask, InputTransformCase, InputTransformCaseParams, InputUnsurround,
+    InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams, PasteBlockParams,
+    ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
@@ -132,6 +132,9 @@ pub enum Event {
     /// A structural block edit resolved (docs/markdown-view.md §12): adopt revision + cursor,
     /// clipboard the cut payload, toast a reasoned refusal, refresh the reading view's parse.
     BlockEditDone(Result<BlockEditResult, String>),
+    /// `Ctrl-o`/`Ctrl-Alt-o` resolved: the same adoption, and — only once the server says the
+    /// block was actually opened — the hand-over to the editor in Insert.
+    OpenBlockDone(Result<BlockEditResult, String>),
     CopyDone(Result<BufferCopyResult, String>),
     CutDone(Result<BufferCutResult, String>),
     /// The shell read the system clipboard for a paste gesture.
@@ -477,6 +480,29 @@ impl Session {
                 fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
             }
             Event::BlockEditDone(Err(e)) => Effects::error(e),
+
+            Event::OpenBlockDone(Ok(r)) => {
+                self.buffer.revision = r.revision;
+                self.buffer.cursor = r.cursor;
+                let mut fx = Effects::none();
+                if r.applied {
+                    // The caret is already parked in the block the server opened (its landing is
+                    // collapsed), so the hand-over is just the mode: no Goto of our own, and
+                    // nothing to correct for. A refusal leaves the reading view exactly as it
+                    // was — the transition is the *edit's* to make, not the keypress's.
+                    self.read_exit_for_edit();
+                    self.mode = Mode::Insert;
+                } else if let Some(reason) = r.reason {
+                    fx = fx.and(Effects::toast_grouped(
+                        reason,
+                        ToastKind::Info,
+                        "block-edit",
+                    ));
+                }
+                fx.push(Effect::RevealCursor(RevealStyle::Follow));
+                fx
+            }
+            Event::OpenBlockDone(Err(e)) => Effects::error(e),
 
             // Opening replaces whatever prompt was up: `Space ?` is only reachable from Normal mode
             // via the leader, so nothing that owns the keyboard can be underneath it.
@@ -7220,7 +7246,10 @@ impl Session {
             }
             A::ReadInsert { at_end } => self.read_insert(at_end),
             A::ReadChange => self.read_change(),
-            A::ReadOpenBlock { above } => self.read_open_block(above),
+            A::ReadOpenBlock { above } => self.request_str::<InputOpenBlock>(
+                OpenBlockParams { buffer_id, above },
+                Event::OpenBlockDone,
+            ),
             A::MoveBlock { down, unit } => self.request_str::<InputMoveBlock>(
                 MoveBlockParams {
                     buffer_id,
@@ -7237,6 +7266,14 @@ impl Session {
                 BufferOnlyParams { buffer_id },
                 Event::BlockEditDone,
             ),
+            // The same removal, and deliberately the same RPC: what separates delete from cut
+            // is what the *client* does with the payload, exactly as in the editor
+            // (`DeleteSelection` vs `Cut`). The resolver computes the removed source either
+            // way, so the payload is dropped here rather than asked for — no clipboard.
+            A::ReadDeleteBlock => self
+                .request_str::<InputDeleteBlock>(BufferOnlyParams { buffer_id }, |r| {
+                    Event::BlockEditDone(r.map(|r| BlockEditResult { text: None, ..r }))
+                }),
             A::ReadPasteBlock { replace } => {
                 Effects::one(Effect::ReadClipboard(PasteKind::Block { replace }))
             }
@@ -7544,50 +7581,6 @@ impl Session {
             buffer_id,
             count: 1,
         }))
-    }
-
-    /// `Ctrl-o`/`Ctrl-Alt-o`: open a new *paragraph* below / above the focused block and
-    /// enter Insert — the editor's open-line at block grain. One `input/text "\n\n"` = one
-    /// undo entry. Below: the caret parks at the block's append position, and after the
-    /// insert it sits on the middle empty line, a blank either side. Above: the insert at
-    /// the block's first line pushes the caret past both newlines, so a corrective Goto
-    /// returns it to the (unchanged) insertion line — the middle empty line again. Escaping
-    /// without typing leaves the blank pair (it renders identically; vim leaves its empty
-    /// line too).
-    fn read_open_block(&mut self, above: bool) -> Effects {
-        let (edge, correct_back) = {
-            let Some(read) = self.read.as_ref() else {
-                return Effects::none();
-            };
-            let Some(f) = read.block_focus(self.buffer.cursor.position) else {
-                return Effects::none();
-            };
-            if above {
-                let span = read.elements[f].span();
-                let pos = LogicalPosition {
-                    line: read.pos_of(span.start).line,
-                    col: 0,
-                };
-                (pos, Some(pos))
-            } else {
-                (read.pos_of(read.block_append_byte(f)), None)
-            }
-        };
-        self.read_exit_for_edit();
-        self.mode = Mode::Insert;
-        let buffer_id = self.buffer.buffer_id;
-        let mut fx = self.move_motion(Motion::Goto { position: edge }, false);
-        fx = fx.and(self.edit::<InputText>(InputTextParams {
-            buffer_id,
-            text: "\n\n".into(),
-            select_pasted: false,
-            replace_selection: false,
-            at: None,
-        }));
-        if let Some(pos) = correct_back {
-            fx = fx.and(self.move_motion(Motion::Goto { position: pos }, false));
-        }
-        fx
     }
 
     /// `h`/`l`: step the Enter target among the interactive elements *inside the focused
