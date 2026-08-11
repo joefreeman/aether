@@ -25874,9 +25874,14 @@ async fn open_path_with_no_workspace_creates_ephemeral() {
         "expected an ephemeral workspace id, got {:?}",
         opened.workspace.name
     );
-    assert!(
-        opened.workspace.paths.is_empty(),
-        "ephemeral workspace has no roots"
+    assert_eq!(
+        opened.workspace.paths,
+        vec![std::path::Path::new(&ext_abs)
+            .parent()
+            .unwrap()
+            .display()
+            .to_string()],
+        "an ephemeral workspace is rooted at the file's directory, nothing wider"
     );
     let buf = opened.opened.expect("open_path returns the opened buffer");
     assert_eq!(buf.path.as_deref(), Some(ext_abs.as_str()));
@@ -26278,6 +26283,256 @@ async fn a_dirty_or_occupied_temporary_workspace_survives_a_new_one() {
         "unsaved and occupied contexts both survive the new one"
     );
     drop(server);
+}
+
+/// A temporary workspace is rooted at the directory of the file that created it, so its
+/// file-oriented pickers have something to work over: the Files index lists that directory, and the
+/// explorer opens there instead of failing with "no workspace paths configured".
+#[tokio::test]
+async fn a_temporary_workspace_is_rooted_at_its_files_directory() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let ext_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(ext_dir.join("neighbour.rs"), "fn neighbour() {}\n").unwrap();
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        1,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        opened.workspace.paths,
+        vec![ext_dir.display().to_string()],
+        "the file's own directory is the temporary context's root"
+    );
+
+    let files = picker_file_names(&mut ws, 2).await;
+    assert!(
+        files.contains(&"outside.rs".to_string()) && files.contains(&"neighbour.rs".to_string()),
+        "the Files picker lists the rooted directory: {files:?}"
+    );
+
+    // The explorer resolves its anchor from the roots; with none it used to error outright.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Explorer,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let entries: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::DirEntry { name, .. } => name.clone(),
+            other => panic!("expected DirEntry, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        entries.contains(&"outside.rs".to_string()),
+        "the explorer lands in the rooted directory: {entries:?}"
+    );
+    drop(server);
+}
+
+/// Opening a file from *another* directory into the same temporary context appends its parent — a
+/// temporary workspace is multi-root like any other. A file already under one of its roots adds
+/// nothing.
+#[tokio::test]
+async fn a_temporary_workspace_gains_a_root_per_directory() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let first_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let second_dir = tempfile::tempdir().unwrap();
+    let elsewhere = second_dir.path().join("elsewhere.rs");
+    std::fs::write(&elsewhere, "fn elsewhere() {}\n").unwrap();
+    let second_root = std::fs::canonicalize(second_dir.path()).unwrap();
+
+    send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        1,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let second: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        2,
+        &WorkspaceOpenPathParams {
+            path: std::fs::canonicalize(&elsewhere)
+                .unwrap()
+                .display()
+                .to_string(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        second.workspace.paths,
+        vec![
+            first_dir.display().to_string(),
+            second_root.display().to_string()
+        ],
+        "each new directory becomes a root of the same temporary context"
+    );
+
+    // A sibling of the first file is already covered — no third root.
+    let sibling = sibling_external_file(&ext_abs, "sibling.rs");
+    let third: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        3,
+        &WorkspaceOpenPathParams {
+            path: sibling,
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(third.workspace.paths.len(), 2, "no duplicate root");
+    drop(server);
+}
+
+/// Rooting a temporary workspace must not read as trusting it: the file is inside a root now, but
+/// it's a root we synthesized from the file itself, so no language server is launched for it. The
+/// same file opened inside the configured workspace does get one.
+#[tokio::test]
+async fn a_temporary_workspace_gets_no_language_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let inside = dir.path().join("inside.rs");
+    std::fs::write(&inside, "fn inside() {}\n").unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.rs");
+    std::fs::write(&outside, "fn outside() {}\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    let outside_abs = std::fs::canonicalize(&outside)
+        .unwrap()
+        .display()
+        .to_string();
+    std::mem::forget(dir);
+    std::mem::forget(outside_dir);
+
+    let server = aether_server::spawn_for_test_with_lsp(
+        "test-proj",
+        vec![dir_path],
+        vec![("rust".to_string(), Default::default())],
+    )
+    .await
+    .unwrap();
+
+    // Temporary context: rooted at the file's directory, still no server.
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        1,
+        &WorkspaceOpenPathParams {
+            path: outside_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert!(
+        !opened.workspace.paths.is_empty(),
+        "the temporary context is rooted (that's the point of the exclusion)"
+    );
+    assert!(
+        opened.opened.expect("buffer").lsp_server.is_none(),
+        "no language server in an untrusted temporary workspace"
+    );
+    assert!(
+        server.state.lock().await.lsp.servers.is_empty(),
+        "and none was launched behind the response"
+    );
+
+    // The configured workspace is trusted: the same language does get a server there.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws2,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("inside.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        open.lsp_server.is_some(),
+        "a trusted workspace still launches its servers"
+    );
+    drop(server);
+}
+
+/// The `relative_path`s in the Files picker's first window.
+async fn picker_file_names(ws: &mut TestWs, id: u64) -> Vec<String> {
+    let view = send_request::<PickerView>(
+        ws,
+        id,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Files,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    view.update
+        .expect("window")
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::File { relative_path, .. } => relative_path.clone(),
+            other => panic!("expected File, got {other:?}"),
+        })
+        .collect()
 }
 
 /// Write `name` next to the given external file and return its canonical path — a second file

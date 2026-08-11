@@ -323,8 +323,10 @@ pub struct WorkspaceEntry {
     /// The persisted workspace name, or `None` for an ephemeral workspace. `Some` ⇔ a `<name>.toml`
     /// exists on disk ⇔ this workspace survives losing its last buffer.
     pub name: Option<String>,
-    /// Canonicalized workspace paths. Each is either a file or a directory. Empty for an ephemeral
-    /// workspace (so every buffer in it is "external" — see [`WorkspaceEntry::contains`]).
+    /// Canonicalized workspace paths. Each is either a file or a directory. Read from the config for
+    /// a persisted workspace; for an ephemeral one they're synthesized from the files it hosts (one
+    /// per directory — see [`ServerState::adopt_ephemeral_root`]), which is bookkeeping for the
+    /// pickers rather than a statement of trust.
     pub paths: Vec<PathBuf>,
     /// Workspace-wide candidate cache for this workspace. Walked lazily on first picker access;
     /// survives picker hide/show.
@@ -386,9 +388,10 @@ impl DormantBuffer {
 }
 
 impl WorkspaceEntry {
-    /// True iff the given canonical path falls under one of this workspace's roots. Always `false`
-    /// for an ephemeral workspace (no roots), which is exactly what makes every buffer in it
-    /// "external" — see [`ServerState::buffer_is_external`].
+    /// True iff the given canonical path falls under one of this workspace's roots. A file that
+    /// isn't contained is a *guest* — no git baseline, no language server (`buffer_open`). Note this
+    /// is containment, not trust: an ephemeral workspace's own files are contained (it roots itself
+    /// at their directories) and still get no language server.
     pub fn contains(&self, canonical: &Path) -> bool {
         self.paths
             .iter()
@@ -486,30 +489,6 @@ impl ServerState {
         self.buffer_workspaces.get(&buffer_id).map(|s| s.as_str())
     }
 
-    /// Whether a buffer is *external* to its owning workspace: a file-backed buffer whose path falls
-    /// under none of the workspace's roots. Computed live from the roots (never stored), so adding or
-    /// removing a root reclassifies open buffers automatically. Scratch buffers (no path) and
-    /// buffers whose workspace can't be found are not external. Every file-backed buffer in an
-    /// ephemeral workspace is external (it has no roots). External buffers get no git baseline and a
-    /// trust-restricted LSP path (see the LSP manager); the client shows an "external" marker.
-    pub fn buffer_is_external(&self, buffer_id: BufferId) -> bool {
-        let Some(path) = self
-            .buffers
-            .get(&buffer_id)
-            .and_then(|b| b.canonical_path.as_deref())
-        else {
-            return false;
-        };
-        match self
-            .buffer_workspaces
-            .get(&buffer_id)
-            .and_then(|id| self.workspaces.get(id))
-        {
-            Some(workspace) => !workspace.contains(path),
-            None => false,
-        }
-    }
-
     /// The display number for a *new* ephemeral workspace: the lowest positive integer not in use by
     /// another live ephemeral workspace. Mirrors [`Self::next_scratch_number`] — numbers stay small
     /// and a freed one is reused once its workspace is pruned — so the picker shows `(workspace 1)`,
@@ -603,6 +582,39 @@ impl ServerState {
             }
         }
         self.workspaces.remove(workspace_id);
+        true
+    }
+
+    /// Give an ephemeral workspace a root for the file it's about to host: the file's **parent
+    /// directory**. Returns whether a root was added.
+    ///
+    /// A rootless workspace can't answer any file-oriented question — the Files index walks roots,
+    /// grep walks roots, the explorer refuses to open without one, and every picker row is addressed
+    /// as `(path_index, relative_path)`, which needs a root to be relative *to*. So a temporary
+    /// context used to have dead pickers. The parent directory is the smallest root that contains
+    /// the file you opened: bounded, predictable, and already the directory the explorer should land
+    /// in. Opening a second file from elsewhere into the same context appends its parent (a temp
+    /// context is multi-root like any other); a file already under an existing root adds nothing.
+    ///
+    /// Deliberately *not* the enclosing project root (an upward walk for `.git` / `Cargo.toml`): a
+    /// dotfiles repo in `$HOME` would silently root the context at the home directory and hand the
+    /// Files picker the whole tree. Widening to the project is a decision to make explicitly.
+    ///
+    /// A file directly under the filesystem root is left rootless rather than rooting a workspace at
+    /// `/`. No-op for a persisted workspace — those own their roots, and an open must never edit them.
+    pub fn adopt_ephemeral_root(&mut self, workspace_id: &str, canonical: &Path) -> bool {
+        let Some(workspace) = self.workspaces.get_mut(workspace_id) else {
+            return false;
+        };
+        if !workspace.is_ephemeral() || workspace.contains(canonical) {
+            return false;
+        }
+        // `parent.parent()` is `None` only at the filesystem root.
+        let Some(parent) = canonical.parent().filter(|p| p.parent().is_some()) else {
+            return false;
+        };
+        workspace.paths.push(parent.to_path_buf());
+        workspace.workspace_index = Arc::new(WorkspaceIndex::new(workspace.paths.clone()));
         true
     }
 
@@ -2310,6 +2322,46 @@ mod workspace_state_tests {
         assert!(s.has_unprotected_unsaved_buffers());
         s.buffers.get_mut(&temp).unwrap().dirty = false;
         assert!(!s.has_unprotected_unsaved_buffers(), "clean again");
+    }
+
+    /// A temporary workspace takes the opened file's parent directory as a root — the smallest one
+    /// that makes its pickers work. A second directory appends a root; a file already covered adds
+    /// nothing; a persisted workspace is never touched; and a file at the filesystem root is left
+    /// alone rather than rooting a workspace at `/`.
+    #[test]
+    fn adopt_ephemeral_root_takes_the_files_directory() {
+        let mut s = ServerState::new();
+        let id = s.register_ephemeral_workspace();
+        assert!(s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes/todo.md")));
+        assert_eq!(
+            s.workspaces[&id].paths,
+            vec![PathBuf::from("/home/joe/notes")]
+        );
+
+        assert!(
+            !s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes/sub/other.md")),
+            "already under an existing root"
+        );
+        assert!(s.adopt_ephemeral_root(&id, Path::new("/etc/hosts")));
+        assert_eq!(
+            s.workspaces[&id].paths,
+            vec![PathBuf::from("/home/joe/notes"), PathBuf::from("/etc")],
+            "a second directory becomes a second root"
+        );
+
+        assert!(
+            !s.adopt_ephemeral_root(&id, Path::new("/vmlinuz")),
+            "a file at the filesystem root would root the workspace at /"
+        );
+        assert!(!s.adopt_ephemeral_root("nonexistent", Path::new("/a/b.txt")));
+
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        assert!(
+            !s.adopt_ephemeral_root("p", Path::new("/elsewhere/x.rs")),
+            "a persisted workspace owns its roots; an open must not edit them"
+        );
+        assert_eq!(s.workspaces["p"].paths, vec![PathBuf::from("/p")]);
     }
 
     /// Opening a new temporary workspace supersedes the idle ones before it — the contexts a client

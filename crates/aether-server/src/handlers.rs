@@ -1107,6 +1107,13 @@ pub async fn workspace_open_path(
                 (id, true)
             }
         };
+        // Root the temporary context at this file's directory so its pickers have something to
+        // work over (`adopt_ephemeral_root`); a no-op for a persisted workspace, and for a file
+        // already under a root of the temporary one. The buffer's parent directory is watched by
+        // `buffer/open` either way, so the new root needs no separate watch registration.
+        if s.adopt_ephemeral_root(&id, &canonical) {
+            tracing::info!(workspace = %id, root = %canonical.parent().unwrap_or(&canonical).display(), "temporary workspace adopted a root");
+        }
         let paths = s
             .workspaces
             .get(&id)
@@ -2332,22 +2339,36 @@ async fn buffer_open_inner(
         s.git_both_hunks.insert(id, git_both);
     }
 
-    // LSP, for *internal* files only (under a workspace root). Discover a workspace root within the
-    // trusted workspace and ensure a server keyed to that workspace + root, launching one if needed.
-    // `ensure` returns a launch request when it created a fresh (Starting) handle; we spawn the
-    // handshake after releasing the lock. `notify_open` is a no-op until the server is ready — the
-    // launch task opens every registered buffer once the handshake lands.
+    // LSP, for *internal* files in a *trusted* workspace. Discover a workspace root within it and
+    // ensure a server keyed to that workspace + root, launching one if needed. `ensure` returns a
+    // launch request when it created a fresh (Starting) handle; we spawn the handshake after
+    // releasing the lock. `notify_open` is a no-op until the server is ready — the launch task opens
+    // every registered buffer once the handshake lands.
     //
-    // External files (outside every root) get NO language server: we never launch one in untrusted
-    // territory (the workspace-trust boundary), and we don't attach them to another workspace's
-    // running server either — that would put two buffers (this guest + the owning workspace's) on one
-    // server for the same URI, the very ambiguity per-workspace keying exists to avoid.
+    // Two exclusions, for the same reason from different directions:
+    //
+    // - **External files** (outside every root) get no server: we never launch one in untrusted
+    //   territory, and we don't attach them to another workspace's running server either — that
+    //   would put two buffers (this guest + the owning workspace's) on one server for the same URI,
+    //   the very ambiguity per-workspace keying exists to avoid.
+    // - **Temporary workspaces** get no server *even though their files are now inside a root*. That
+    //   root is synthesized from the file's own directory to make the pickers work
+    //   (`adopt_ephemeral_root`), and it must not be read as an act of trust: `ae /tmp/whatever.rs`
+    //   is precisely the case where you don't want a language server executing over content you
+    //   haven't vouched for. Trust follows the workspace you configured, not the file you opened —
+    //   which is why this asks the workspace rather than deriving it from containment, as the
+    //   external check does. (Git is deliberately *not* excluded: reading a repo's index is not the
+    //   same risk as launching a binary, and diff/blame on a file you opened in passing is useful.)
+    let untrusted_workspace = s
+        .workspaces
+        .get(&active_workspace_name)
+        .is_some_and(|w| w.is_ephemeral());
     let mut lsp_launch: Option<(
         crate::lsp::manager::LspServerKey,
         crate::lsp::config::LspServerSpec,
         u64,
     )> = None;
-    if !external {
+    if !external && !untrusted_workspace {
         if let Some(language) = s.buffers[&id].language.clone() {
             if let Some(spec) = crate::lsp::config::server_spec(&language) {
                 let roots = s
