@@ -218,10 +218,11 @@ async fn backup_flush_loop(state: SharedState) {
 /// Watchdog for client-conjured servers: once the server is idle, start a clock; if it stays idle
 /// for `timeout`, notify `shutdown` so the accept loop exits. A reconnecting client resets the clock.
 ///
-/// "Idle" means no clients connected. When backups are *disabled* (in-process tests/embeddings) a
-/// dirty buffer additionally pins the server open — reaping it would silently drop unsaved work. When
-/// backups are *enabled*, unsaved work is safe on disk (and re-flushed on shutdown), so a dirty
-/// buffer no longer blocks the reap: that interim guard is exactly what backup persistence retires.
+/// "Idle" means no clients connected. A dirty buffer whose content wouldn't survive the process
+/// additionally pins the server open — reaping it would silently drop unsaved work. That covers
+/// backups being *disabled* (in-process tests/embeddings) and dirty buffers in an *ephemeral*
+/// workspace, which is never backed up. Everything else is safe on disk (and re-flushed on
+/// shutdown), so it no longer blocks the reap: that interim guard is what backup persistence retires.
 async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify>) {
     // Poll often enough to honour `timeout` without busy-looping; for the long production timeout
     // this lands at the 15s ceiling, while short test timeouts still get a sub-timeout cadence.
@@ -231,7 +232,7 @@ async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify
         tokio::time::sleep(poll).await;
         let idle = {
             let s = state.lock().await;
-            let unsaved_pins = s.backups_path.is_none() && s.has_unsaved_buffers();
+            let unsaved_pins = s.has_unprotected_unsaved_buffers();
             s.clients.is_empty() && !unsaved_pins
         };
         if idle {
@@ -552,6 +553,70 @@ mod tests {
             "server reaped itself despite a dirty buffer"
         );
         handle.abort();
+    }
+
+    /// With backups on, *where* the dirty buffer lives decides whether it pins the server: a named
+    /// workspace's unsaved content is flushed to `backups/` and restored on the next open, so the
+    /// reap is safe — but an ephemeral ("no workspace") context is never backed up, so reaping it
+    /// would silently discard the edits. Both servers are started together and judged after one
+    /// timeout window.
+    #[tokio::test]
+    async fn only_an_unbacked_dirty_buffer_pins_the_server_open() {
+        let backups = tempfile::tempdir().unwrap();
+        // One dirty buffer, in a named workspace (backed up) or an ephemeral one (not).
+        let dirty_in = |ephemeral: bool| {
+            let mut s = ServerState::new();
+            s.backups_path = Some(backups.path().to_path_buf());
+            let workspace = if ephemeral {
+                s.register_ephemeral_workspace()
+            } else {
+                s.workspaces.insert(
+                    "p".into(),
+                    crate::state::WorkspaceEntry {
+                        id: "p".into(),
+                        name: Some("p".into()),
+                        paths: Vec::new(),
+                        workspace_index: Arc::new(crate::workspace_index::WorkspaceIndex::new(
+                            Vec::new(),
+                        )),
+                        mru_buffers: Default::default(),
+                        dormant_buffers: Vec::new(),
+                        projects: Vec::new(),
+                    },
+                );
+                "p".to_string()
+            };
+            let id: aether_protocol::BufferId = 1;
+            let mut buf = Buffer::new_at_path(id, PathBuf::from("/tmp/dirty.txt"), None);
+            buf.dirty = true;
+            s.buffers.insert(id, buf);
+            s.buffer_workspaces.insert(id, workspace);
+            Arc::new(Mutex::new(s))
+        };
+        let timeout = Some(Duration::from_millis(80));
+        let backed_up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let temporary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backed_up = tokio::spawn(run_with_listener(
+            backed_up_listener,
+            dirty_in(false),
+            timeout,
+        ));
+        let temporary = tokio::spawn(run_with_listener(
+            temporary_listener,
+            dirty_in(true),
+            timeout,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            backed_up.is_finished(),
+            "a dirty buffer whose content is safe in backups/ must not block the reap"
+        );
+        assert!(
+            !temporary.is_finished(),
+            "a dirty buffer in a temporary workspace is never backed up — reaping it would lose it"
+        );
+        temporary.abort();
     }
 
     /// A persistent (`None` timeout) server — the `ae server` daemon — never reaps, even with no

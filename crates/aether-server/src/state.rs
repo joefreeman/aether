@@ -606,6 +606,59 @@ impl ServerState {
         true
     }
 
+    /// Ephemeral workspaces a *new* one supersedes: every throwaway context nothing is using any
+    /// more. See [`Self::supersede_ephemeral_workspaces`] for the rule and why it exists.
+    fn superseded_ephemeral_workspaces(&self) -> Vec<String> {
+        self.workspaces
+            .values()
+            .filter(|w| w.is_ephemeral())
+            .filter(|w| !self.workspace_active_anywhere(&w.id))
+            .filter(|w| {
+                self.buffers_in_workspace(&w.id).into_iter().all(|id| {
+                    !self.buffers.get(&id).is_some_and(|b| b.dirty)
+                        && !self.viewports.values().any(|v| v.buffer_id == id)
+                })
+            })
+            .map(|w| w.id.clone())
+            .collect()
+    }
+
+    /// Retire every ephemeral workspace a newly-created one supersedes, closing their buffers.
+    /// Returns the workspace ids removed, the buffer ids closed, and the keys of any language
+    /// servers torn down with them (so the caller can refresh the affected pickers).
+    ///
+    /// Temporary workspaces are meant to behave like transient buffers: one at a time, replaced
+    /// rather than accumulated. An ephemeral context normally dies with its last buffer, but a
+    /// client that quits (`Space q`) without closing that buffer leaves it behind — the buffers live
+    /// on in the daemon — so every subsequent "open a file with no workspace" used to mint another
+    /// one and the switcher filled up with `(workspace N)` rows. Opening a new one now sweeps the
+    /// stale ones away.
+    ///
+    /// A temporary workspace is spared when anything still holds it: a client parked in it, a
+    /// viewport showing one of its buffers, or an **unsaved** buffer — nothing here may discard
+    /// work. (Those exemptions are also why this can't simply be done on disconnect.)
+    pub fn supersede_ephemeral_workspaces(
+        &mut self,
+    ) -> (
+        Vec<String>,
+        Vec<BufferId>,
+        Vec<crate::lsp::manager::LspServerKey>,
+    ) {
+        let ids = self.superseded_ephemeral_workspaces();
+        let mut closed = Vec::new();
+        let mut stopped = Vec::new();
+        for id in &ids {
+            for buffer_id in self.buffers_in_workspace(id) {
+                closed.push(buffer_id);
+                if let Some(key) = self.close_buffer(buffer_id) {
+                    stopped.push(key);
+                }
+            }
+            self.workspaces.remove(id);
+        }
+        (ids, closed, stopped)
+    }
+
     /// Rename a loaded workspace in place: move its entry to the new key (updating `entry.name`),
     /// then re-point every buffer association and client active-workspace that referenced the old
     /// name. Open buffers are otherwise untouched — only the name key changes, nothing is closed —
@@ -654,22 +707,62 @@ impl ServerState {
             .collect()
     }
 
-    /// Whether any open buffer (in any workspace) has unsaved edits. The idle reaper consults this so
-    /// an auto-started server never shuts itself down while work is in flight.
-    pub fn has_unsaved_buffers(&self) -> bool {
-        self.buffers.values().any(|b| b.dirty)
+    /// How many buffers in `workspace` have unsaved edits — **loaded or not**. Drives the
+    /// unsaved-count shown on each row of the workspace picker.
+    ///
+    /// Live dirty buffers (`Buffer::dirty`) plus every on-disk backup of the workspace that no live
+    /// buffer accounts for. The disk half is what makes the indicator honest for a workspace nobody
+    /// has activated since the server started: the daemon idle-reaps, so most unsaved work is
+    /// sitting in `backups/<workspace>/` rather than in memory (`docs/unsaved-persistence.md`), and
+    /// counting only loaded buffers showed every such workspace as clean. Backups belonging to a
+    /// buffer that *is* loaded are excluded rather than added — the live buffer already counted, and
+    /// double-counting it would be worse than the gap it fixes.
+    ///
+    /// `0` for a workspace with neither (the common case for a configured-but-unvisited workspace),
+    /// and for an ephemeral one with no dirty buffers — those are never backed up.
+    ///
+    /// Costs two directory listings per workspace (of dirs holding one small file per unsaved
+    /// buffer), on a path that is already a disk read — the picker's candidate list enumerates the
+    /// workspaces directory to find its rows in the first place.
+    pub fn unsaved_buffer_count(&self, workspace: &str) -> u32 {
+        let live: Vec<&Buffer> = self
+            .buffer_workspaces
+            .iter()
+            .filter(|(_, p)| p.as_str() == workspace)
+            .filter_map(|(id, _)| self.buffers.get(id))
+            .collect();
+        let dirty = live.iter().filter(|b| b.dirty).count() as u32;
+        let Some(root) = self.backups_path.as_deref() else {
+            return dirty;
+        };
+        let mut keys = crate::backup::workspace_keys(root, workspace);
+        for buf in live {
+            if let Some(path) = buf.canonical_path.as_deref() {
+                keys.files.remove(&crate::backup::path_key(path));
+            }
+            if let Some(number) = buf.scratch_number {
+                keys.scratches.remove(&number);
+            }
+        }
+        dirty + keys.files.len() as u32 + keys.scratches.len() as u32
     }
 
-    /// How many open buffers in `workspace` have unsaved edits (`Buffer::dirty`). Drives the
-    /// unsaved-count shown on each row of the workspace picker. `0` for a workspace with no loaded
-    /// buffers (the common case for a configured-but-unvisited workspace).
-    pub fn unsaved_buffer_count(&self, workspace: &str) -> u32 {
-        self.buffer_workspaces
-            .iter()
-            .filter(|(id, p)| {
-                p.as_str() == workspace && self.buffers.get(id).map(|b| b.dirty).unwrap_or(false)
-            })
-            .count() as u32
+    /// Whether any dirty buffer's content exists **only** in memory — no on-disk backup would
+    /// survive this process. True when backups are disabled entirely (in-process tests and
+    /// embeddings), and for dirty buffers in an *ephemeral* workspace, which is never backed up
+    /// (`flush_backups` skips it, like the session file does). The idle reaper consults this so an
+    /// auto-started server never reaps unsaved work it can't restore.
+    pub fn has_unprotected_unsaved_buffers(&self) -> bool {
+        let backups_enabled = self.backups_path.is_some();
+        self.buffers.iter().any(|(id, b)| {
+            b.dirty
+                && !(backups_enabled
+                    && self
+                        .buffer_workspaces
+                        .get(id)
+                        .and_then(|w| self.workspaces.get(w))
+                        .is_some_and(|w| !w.is_ephemeral()))
+        })
     }
 
     /// The display number to assign a *new* scratch buffer in `workspace`: the lowest positive
@@ -2134,5 +2227,156 @@ mod workspace_state_tests {
             0,
             "a workspace with no buffers reports zero"
         );
+    }
+
+    /// With backups enabled the count also sees unsaved work that *isn't loaded* — the state a
+    /// workspace is in after the daemon idle-reaped and nobody has activated it again. A backup
+    /// whose buffer is live counts once (via the buffer), not twice.
+    #[test]
+    fn unsaved_buffer_count_includes_backups_for_unloaded_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = ServerState::new();
+        s.backups_path = Some(dir.path().to_path_buf());
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        crate::backup::write(
+            &crate::backup::file_backup_path(dir.path(), "p", Path::new("/p/a.rs")),
+            "unsaved a",
+        )
+        .unwrap();
+        crate::backup::write(&crate::backup::scratch_backup_path(dir.path(), "p", 3), "s").unwrap();
+        assert_eq!(
+            s.unsaved_buffer_count("p"),
+            2,
+            "nothing loaded — the backups *are* the unsaved buffers"
+        );
+        assert_eq!(
+            s.unsaved_buffer_count("other"),
+            0,
+            "another workspace's backups don't leak in"
+        );
+
+        // Load one of them (what activation's eager restore does): still one unsaved buffer, not two.
+        let id = s.allocate_buffer_id();
+        let mut buf = Buffer::new_at_path(id, PathBuf::from("/p/a.rs"), None);
+        buf.dirty = true;
+        s.buffers.insert(id, buf);
+        s.buffer_workspaces.insert(id, "p".to_string());
+        assert_eq!(s.unsaved_buffer_count("p"), 2, "1 live + 1 still on disk");
+
+        // Saving it deletes the backup and clears the flag — the workspace reads clean again.
+        crate::backup::delete(&crate::backup::file_backup_path(
+            dir.path(),
+            "p",
+            Path::new("/p/a.rs"),
+        ));
+        crate::backup::delete(&crate::backup::scratch_backup_path(dir.path(), "p", 3));
+        s.buffers.get_mut(&id).unwrap().dirty = false;
+        assert_eq!(s.unsaved_buffer_count("p"), 0);
+    }
+
+    /// The idle reaper's guard: a dirty buffer pins the server open only when its content would die
+    /// with the process — backups disabled, or an ephemeral workspace (never backed up). A dirty
+    /// buffer in a named workspace with backups on is safe on disk, so it doesn't block the reap.
+    #[test]
+    fn unprotected_unsaved_buffers_are_the_ones_no_backup_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = ServerState::new();
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        let named = s.allocate_buffer_id();
+        let mut buf = Buffer::scratch(named, None, 1);
+        buf.dirty = true;
+        s.buffers.insert(named, buf);
+        s.buffer_workspaces.insert(named, "p".to_string());
+
+        assert!(
+            s.has_unprotected_unsaved_buffers(),
+            "backups disabled — any dirty buffer pins the server"
+        );
+        s.backups_path = Some(dir.path().to_path_buf());
+        assert!(
+            !s.has_unprotected_unsaved_buffers(),
+            "a named workspace's dirty buffer is on disk; the reaper may proceed"
+        );
+
+        // The same edit in a temporary workspace has nowhere to be flushed to.
+        let ephemeral = s.register_ephemeral_workspace();
+        let temp = s.allocate_buffer_id();
+        let mut buf = Buffer::scratch(temp, None, 1);
+        buf.dirty = true;
+        s.buffers.insert(temp, buf);
+        s.buffer_workspaces.insert(temp, ephemeral);
+        assert!(s.has_unprotected_unsaved_buffers());
+        s.buffers.get_mut(&temp).unwrap().dirty = false;
+        assert!(!s.has_unprotected_unsaved_buffers(), "clean again");
+    }
+
+    /// Opening a new temporary workspace supersedes the idle ones before it — the contexts a client
+    /// left behind by quitting without closing its buffer. Anything still in use is spared: a client
+    /// parked in it, a viewport showing one of its buffers, or an unsaved buffer. Persisted
+    /// workspaces are never touched.
+    #[test]
+    fn supersede_retires_only_idle_clean_ephemeral_workspaces() {
+        let mut s = ServerState::new();
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        let add_buffer = |s: &mut ServerState, workspace: &str, dirty: bool| -> BufferId {
+            let id = s.allocate_buffer_id();
+            let mut buf = Buffer::new_at_path(id, PathBuf::from("/outside/f.rs"), None);
+            buf.dirty = dirty;
+            s.buffers.insert(id, buf);
+            s.buffer_workspaces.insert(id, workspace.to_string());
+            id
+        };
+        let persisted = add_buffer(&mut s, "p", false);
+
+        let idle = s.register_ephemeral_workspace();
+        let idle_buffer = add_buffer(&mut s, &idle, false);
+        let dirty = s.register_ephemeral_workspace();
+        add_buffer(&mut s, &dirty, true);
+        let occupied = s.register_ephemeral_workspace();
+        add_buffer(&mut s, &occupied, false);
+        let (client, sess) = session(&occupied);
+        s.clients.insert(client, sess);
+        let viewed = s.register_ephemeral_workspace();
+        let viewed_buffer = add_buffer(&mut s, &viewed, false);
+        let viewport_id = s.allocate_viewport_id();
+        s.viewports.insert(
+            viewport_id,
+            Viewport {
+                id: viewport_id,
+                buffer_id: viewed_buffer,
+                client_id: uuid::Uuid::new_v4(),
+                cols: 80,
+                rows: 24,
+                overscan_rows: 0,
+                scroll_logical_line: 0,
+                scroll_sub_row: 0.0,
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+                first_logical_line: 0,
+                last_logical_line_exclusive: 1,
+                diff_view: false,
+            },
+        );
+
+        let (retired, closed, _stopped) = s.supersede_ephemeral_workspaces();
+        assert_eq!(retired, vec![idle.clone()]);
+        assert_eq!(closed, vec![idle_buffer]);
+        assert!(!s.workspaces.contains_key(&idle));
+        assert!(
+            !s.buffers.contains_key(&idle_buffer),
+            "its buffer is closed"
+        );
+        assert!(!s.buffer_workspaces.contains_key(&idle_buffer));
+        for kept in [&dirty, &occupied, &viewed, &"p".to_string()] {
+            assert!(s.workspaces.contains_key(kept), "{kept} should survive");
+        }
+        assert!(s.buffers.contains_key(&persisted));
+
+        // The freed number is reused, so the replacement is `(workspace 1)` again rather than 5.
+        assert_eq!(s.register_ephemeral_workspace(), idle);
     }
 }

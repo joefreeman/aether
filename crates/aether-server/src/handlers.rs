@@ -1074,15 +1074,31 @@ pub async fn workspace_open_path(
     // We never re-home the file into some *other* configured workspace that happens to contain it —
     // an explicit open attaches to the active workspace (as a guest, if external) or to a fresh
     // ephemeral context.
-    let (workspace_id, workspace_paths, server_started_at, created_ephemeral) = {
+    let (workspace_id, workspace_paths, server_started_at, created_ephemeral, superseded_pushes) = {
         let mut s = state.lock().await;
         let active = s
             .clients
             .get(&client_id)
             .and_then(|c| c.active_workspace.clone());
+        let mut superseded_pushes = Vec::new();
         let (id, created) = match active {
             Some(id) => (id, false),
             None => {
+                // A new temporary workspace replaces the idle ones before it, like a transient
+                // buffer replaces the last preview — see `supersede_ephemeral_workspaces` for the
+                // rule (dirty or still-in-use contexts survive).
+                let (retired, closed, stopped) = s.supersede_ephemeral_workspaces();
+                if !retired.is_empty() {
+                    tracing::info!(
+                        workspaces = ?retired,
+                        buffers = closed.len(),
+                        "superseded idle temporary workspaces"
+                    );
+                    superseded_pushes.extend(refresh_buffer_pickers(&mut s));
+                }
+                if !stopped.is_empty() {
+                    superseded_pushes.extend(refresh_lsp_server_pickers(&mut s));
+                }
                 let id = s.register_ephemeral_workspace();
                 if let Some(session) = s.clients.get_mut(&client_id) {
                     session.active_workspace = Some(id.clone());
@@ -1096,8 +1112,11 @@ pub async fn workspace_open_path(
             .get(&id)
             .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
             .unwrap_or_default();
-        (id, paths, s.started_at_unix_ms, created)
+        (id, paths, s.started_at_unix_ms, created, superseded_pushes)
     };
+    for (sender, notif) in superseded_pushes {
+        let _ = sender.send(notif).await;
+    }
 
     let opened = buffer_open(
         state,
@@ -1111,7 +1130,8 @@ pub async fn workspace_open_path(
     )
     .await?;
 
-    // A freshly-minted ephemeral workspace appears in any open switcher.
+    // A freshly-minted ephemeral workspace appears in any open switcher — and any it superseded
+    // drops out of it, in the same rebuild.
     if created_ephemeral {
         let mut s = state.lock().await;
         let pushes = refresh_workspace_pickers(&mut s);

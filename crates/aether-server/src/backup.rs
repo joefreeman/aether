@@ -27,10 +27,46 @@ pub fn scratch_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf
         .join(number.to_string())
 }
 
+/// The backup keys a workspace currently holds on disk: the file-path hashes under `files/` and the
+/// numbers under `scratch/`. Each one is a buffer with unsaved content, whether or not that buffer
+/// is loaded — which is what lets the switcher flag unsaved work in a workspace nobody has activated
+/// yet (`ServerState::unsaved_buffer_count`). Empty (not an error) when the workspace has no backup
+/// directory, the usual case.
+pub fn workspace_keys(root: &Path, workspace: &str) -> WorkspaceBackupKeys {
+    let entries = |dir: PathBuf| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    // Skip a flush's in-flight temp file (`write` renames it into place).
+                    .filter(|name| !name.starts_with(".tmp-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let workspace_root = root.join(workspace);
+    WorkspaceBackupKeys {
+        files: entries(workspace_root.join("files")).into_iter().collect(),
+        scratches: entries(workspace_root.join("scratch"))
+            .iter()
+            .filter_map(|n| n.parse().ok())
+            .collect(),
+    }
+}
+
+/// What [`workspace_keys`] found: one entry per buffer with unsaved content on disk.
+#[derive(Debug, Default)]
+pub struct WorkspaceBackupKeys {
+    /// `path_key` hashes of file-backed buffers (see [`file_backup_path`]).
+    pub files: std::collections::HashSet<String>,
+    /// Scratch numbers (see [`scratch_backup_path`]).
+    pub scratches: std::collections::HashSet<u32>,
+}
+
 /// Deterministic hex key for a canonical path. Uses the std `DefaultHasher` (SipHash with fixed
 /// keys — stable within a build, and dependency-free); a hash change across a toolchain upgrade
 /// would merely orphan old backups, which recover-on-open re-keys on the next open anyway.
-fn path_key(canonical: &Path) -> String {
+pub fn path_key(canonical: &Path) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

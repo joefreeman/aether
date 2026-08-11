@@ -26129,6 +26129,189 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     drop(server);
 }
 
+/// Open an external file with no workspace, then quit the client without closing the buffer — the
+/// context (and its buffer) outlives the client in the daemon. The *next* such open supersedes it:
+/// the stale context is retired, its buffer closed, and the replacement reuses its display number,
+/// so temporary workspaces stay at one rather than accumulating a `(workspace N)` per invocation.
+#[tokio::test]
+async fn a_new_temporary_workspace_supersedes_the_idle_one_before_it() {
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_a,
+        1,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let first_id = opened.workspace.name.clone();
+    let first_buffer = opened.opened.expect("buffer").buffer_id;
+
+    // "Space q": the client goes, the context and its (clean) buffer stay behind server-side.
+    drop(ws_a);
+    wait_for_client_count(&server, 0).await;
+    assert!(
+        server
+            .state
+            .lock()
+            .await
+            .buffers
+            .contains_key(&first_buffer),
+        "the buffer outlives its client"
+    );
+
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let second: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        1,
+        &WorkspaceOpenPathParams {
+            path: sibling_external_file(&ext_abs, "second.rs"),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        second.workspace.name, first_id,
+        "the superseded context's number is free again, so the replacement reuses it"
+    );
+    assert!(
+        !server
+            .state
+            .lock()
+            .await
+            .buffers
+            .contains_key(&first_buffer),
+        "the superseded context's buffer is closed, not orphaned"
+    );
+    let ephemeral = ephemeral_switcher_names(&mut ws_b, 2).await;
+    assert_eq!(
+        ephemeral,
+        vec![second.workspace.name.clone()],
+        "exactly one temporary workspace in the switcher"
+    );
+    drop(server);
+}
+
+/// The exemptions. A temporary workspace with **unsaved changes** is never swept — that would
+/// discard work — and neither is one another client is still parked in. Both survive alongside the
+/// new context.
+#[tokio::test]
+async fn a_dirty_or_occupied_temporary_workspace_survives_a_new_one() {
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_a,
+        1,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let dirty_id = opened.workspace.name.clone();
+    let dirty_buffer = opened.opened.expect("buffer").buffer_id;
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        2,
+        &InputTextParams {
+            buffer_id: dirty_buffer,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    drop(ws_a);
+    wait_for_client_count(&server, 0).await;
+
+    // A second client opens another external file: a fresh context, with the unsaved one untouched.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let occupied: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        1,
+        &WorkspaceOpenPathParams {
+            path: sibling_external_file(&ext_abs, "occupied.rs"),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let occupied_id = occupied.workspace.name.clone();
+    assert_ne!(occupied_id, dirty_id, "the unsaved context wasn't reused");
+    assert!(
+        server
+            .state
+            .lock()
+            .await
+            .buffers
+            .contains_key(&dirty_buffer),
+        "unsaved work is never swept"
+    );
+
+    // A third client opens yet another: B is still parked in its context, so that one is spared too.
+    let (mut ws_c, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let third: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_c,
+        1,
+        &WorkspaceOpenPathParams {
+            path: sibling_external_file(&ext_abs, "third.rs"),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let mut expected = vec![dirty_id, occupied_id, third.workspace.name.clone()];
+    expected.sort();
+    assert_eq!(
+        ephemeral_switcher_names(&mut ws_c, 2).await,
+        expected,
+        "unsaved and occupied contexts both survive the new one"
+    );
+    drop(server);
+}
+
+/// Write `name` next to the given external file and return its canonical path — a second file
+/// outside every workspace, for opens that must land in a *new* temporary workspace.
+fn sibling_external_file(ext_abs: &str, name: &str) -> String {
+    let path = std::path::Path::new(ext_abs).parent().unwrap().join(name);
+    std::fs::write(&path, "fn sibling() {}\n").unwrap();
+    std::fs::canonicalize(&path).unwrap().display().to_string()
+}
+
+/// The ephemeral rows of the workspace switcher, sorted — the `(workspace N)` contexts currently
+/// live. Configured workspaces (read from the real config dir) are filtered out.
+async fn ephemeral_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
+    let mut names: Vec<String> = workspace_switcher_names(ws, id)
+        .await
+        .into_iter()
+        .filter(|n| aether_protocol::is_ephemeral_workspace_id(n))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Poll until the server has exactly `n` clients connected. A dropped socket is torn down
+/// asynchronously, so tests that depend on the disconnect having landed wait for it here.
+async fn wait_for_client_count(server: &aether_server::ServerHandle, n: usize) {
+    for _ in 0..200 {
+        if server.state.lock().await.clients.len() == n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("client count never reached {n}");
+}
+
 // ---- sneak (s / S word-jump) --------------------------------------------------------------------
 
 /// Open `content` and subscribe a full-height, no-wrap viewport. Returns the viewport id alongside
@@ -27029,6 +27212,126 @@ async fn unsaved_file_edits_restored_across_restart() {
         "Xfn main() {}\n",
         "the unsaved edit is restored over the on-disk content"
     );
+    drop(server);
+}
+
+/// The unsaved marker the workspace switcher shows survives a restart. After the daemon goes (idle
+/// reap, restart, crash) the unsaved work is in `backups/`, not in memory — and until the workspace
+/// is activated again nothing loads it, so a count taken from live buffers alone reported every
+/// workspace as clean. It counts the backups too, and stops counting once the buffer is saved.
+#[tokio::test]
+async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
+        send_request::<WorkspaceActivate>(
+            &mut ws,
+            1,
+            &WorkspaceActivateParams {
+                name: "p".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            2,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some("a.rs".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        send_request::<InputText>(
+            &mut ws,
+            3,
+            &InputTextParams {
+                buffer_id: open.buffer_id,
+                text: "X".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            server.state.lock().await.unsaved_buffer_count("p"),
+            1,
+            "the live dirty buffer counts once, not twice with its own backup"
+        );
+        wait_for_backup(&backups.join("p").join("files")).await;
+        drop(ws);
+        drop(server);
+    }
+
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        server.state.lock().await.unsaved_buffer_count("p"),
+        1,
+        "nothing is loaded after the restart, but the workspace still holds unsaved work"
+    );
+
+    // Reopening restores it (dirty); saving writes it out and drops the backup — now it reads clean.
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        server.state.lock().await.unsaved_buffer_count("p"),
+        1,
+        "the restored buffer is the same unsaved buffer the backup stood for"
+    );
+    let _saved: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        3,
+        &BufferSaveParams {
+            buffer_id: reopen.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(server.state.lock().await.unsaved_buffer_count("p"), 0);
     drop(server);
 }
 
