@@ -31,6 +31,7 @@ import type {
   CursorState,
   DiagnosticCounts,
   GitBlameLineResult,
+  GroupHeader,
   GroupSpan,
   LogicalPosition,
   LspServerStatus,
@@ -205,6 +206,9 @@ interface CoreEffect {
   action?: ShellActionDesc;
   hover?: HoverContent;
   style?: "follow" | "jump";
+  /** RevealPickerSelection flavour: minimal keeps the row in view, top aligns it to the top,
+   *  run frames the freshly-opened group run (docs/picker-groups.md §9). */
+  reveal?: "minimal" | "top" | "run";
 }
 
 /** Hover-popover content from the core (Effect::ShowHover): rendered markdown (LSP hover) or stacked
@@ -333,6 +337,10 @@ interface PickerView {
   empty_note: string | null;
   total_display_rows: number;
   window_base: number;
+  /** Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute rows — its
+   *  header's row-space index and item count — for the `run` reveal's scroll math. Null for
+   *  the other kinds and empty result sets. */
+  expanded_run: { header_row: number; len: number } | null;
   directory: string | null;
   directory_parent: string | null;
   /** Explorer tab-completion ghost: the common-prefix suffix `Tab` would append, shown dim after
@@ -856,6 +864,13 @@ function describePickerItem(
         meta: `${item.line + 1}`,
       };
     }
+    case "group":
+      // Unreachable from `renderPickerList` — group rows render as sticky section headers
+      // there (docs/picker-groups.md) — but keeps this function total over the item union.
+      return {
+        primary: item.header.kind === "file" ? item.header.relative_path : item.header.label,
+        meta: String(item.count),
+      };
   }
 }
 
@@ -943,8 +958,9 @@ export class Shell {
   /** Pending coalesced-render frame (see `scheduleRender`); null when none is queued. */
   private renderRaf: number | null = null;
   /** Set by the `RevealPickerSelection` effect: the next picker render scrolls the highlighted row
-   *  into view (keyboard nav / refetch reveal). Free wheel-scrolling never sets it. */
-  private pickerReveal = false;
+   *  into view (keyboard nav / refetch reveal) — or, for the `run` flavour, frames the freshly
+   *  opened group run (docs/picker-groups.md §9). Free wheel-scrolling never sets it. */
+  private pickerReveal: "minimal" | "top" | "run" | null = null;
   /** Set by the `PickerScrollReset` effect (a query change): the next picker render jumps to the top. */
   private pickerScrollReset = false;
   /** Measured picker display-row height (px), for the virtual-scroll spacer + window positioning.
@@ -2031,7 +2047,7 @@ export class Shell {
         // Reveal the highlighted row on the next render (keyboard nav / refetch) — but not on a
         // free wheel-scroll, which emits no effect. A query change resets the scroll to the top.
         case "RevealPickerSelection":
-          this.pickerReveal = true;
+          this.pickerReveal = e.reveal ?? "minimal";
           break;
         case "PickerScrollReset":
           this.pickerScrollReset = true;
@@ -4174,6 +4190,17 @@ export class Shell {
       return;
     }
     list.classList.add("filled");
+    // Collapsible kinds (docs/picker-groups.md): headers arrive as real, selectable `group`
+    // window rows — the span interleave below is skipped (a span-derived header on top would
+    // double it), inter-section gap pixels are off (headers are uniform rows), and the CSS
+    // modifier restores the flex layout + pointer + selection band on the header rows.
+    const collapsible =
+      p.kind === "grep" ||
+      p.kind === "git_changes" ||
+      p.kind === "diagnostics_workspace" ||
+      p.kind === "workspace_symbols" ||
+      p.kind === "jumplist";
+    list.classList.toggle("collapsible", collapsible);
     // Path budget for the row (chars), and the disambiguated root labels — both computed once.
     const ls = getComputedStyle(list);
     const budget = charBudget(list.clientWidth * 0.6, `${ls.fontSize} ${ls.fontFamily}`);
@@ -4196,34 +4223,68 @@ export class Shell {
       p.kind === "grep" || p.kind === "git_changes"
         ? "picker-row picker-group-header tight"
         : "picker-row picker-group-header";
+    // A collapsible group header's display text — shared with the derived headers below so the
+    // two treatments can't drift.
+    const headerText = (header: GroupHeader): string => {
+      if (header.kind === "file") {
+        // File header: the path with root-label disambiguation + budget truncation, matching
+        // file rows elsewhere.
+        if (labels.length > 1) {
+          const label = labels[header.path_index] ?? `root ${header.path_index}`;
+          const pb = Math.max(8, budget - [...label].length - 2);
+          return `${label}: ${truncatePath(header.relative_path, undefined, pb).display}`;
+        }
+        return truncatePath(header.relative_path, undefined, budget).display;
+      }
+      // Label header: rendered verbatim (Definition/References sections, keybinding groups,
+      // workspace-symbol display paths).
+      return header.label;
+    };
     let spanIdx = 0;
     p.items.forEach((item, i) => {
       // Group boundaries are server-pushed spans (window-relative, in order) — open a new section
       // with its header row wherever a span starts. A window starting mid-group repeats the split
       // group's header as its first span (start === 0), so the window is self-describing.
-      while (spanIdx < p.groups.length && p.groups[spanIdx].start === i) {
+      // Collapsible kinds skip this: their headers are the `group` rows themselves (below); the
+      // spans only describe the runs. (A window starting mid-run then opens without a sticky
+      // header until the run's own row is in the window — the 90-row over-fetch makes that rare.)
+      while (!collapsible && spanIdx < p.groups.length && p.groups[spanIdx].start === i) {
         const header = p.groups[spanIdx].header;
         spanIdx++;
         section = document.createElement("div");
         section.className = "picker-section";
         const h = document.createElement("div");
         h.className = headerClass;
-        if (header.kind === "file") {
-          // File header: the path with root-label disambiguation + budget truncation, matching
-          // file rows elsewhere.
-          if (labels.length > 1) {
-            const label = labels[header.path_index] ?? `root ${header.path_index}`;
-            const pb = Math.max(8, budget - [...label].length - 2);
-            h.textContent = `${label}: ${truncatePath(header.relative_path, undefined, pb).display}`;
-          } else {
-            h.textContent = truncatePath(header.relative_path, undefined, budget).display;
-          }
-        } else {
-          // Label header: rendered verbatim (Definition/References sections, keybinding groups).
-          h.textContent = header.label;
-        }
+        h.textContent = headerText(header);
         section.append(h);
         win.append(section);
+      }
+      // A collapsible group's header row: opens its own section (the sticky wrapper) and IS the
+      // sticky header — selectable, click-toggled through the core like Enter, dressed with the
+      // disclosure mark and the run's item count (docs/picker-groups.md).
+      if (item.kind === "group") {
+        section = document.createElement("div");
+        section.className = "picker-section";
+        const row = document.createElement("div");
+        row.className = i === localSel ? `${headerClass} selected` : headerClass;
+        if (i === localSel) selectedRow = row;
+        row.addEventListener("mousedown", (e: MouseEvent) => {
+          e.preventDefault(); // keep focus on the query input
+          if (this.session) this.runEffects(this.session.picker_click(p.offset + i) as CoreEffect[]);
+        });
+        const mark = document.createElement("span");
+        mark.className = "picker-group-mark";
+        mark.textContent = item.expanded ? "▾" : "▸";
+        const main = document.createElement("span");
+        main.className = "picker-main";
+        main.textContent = headerText(item.header);
+        const count = document.createElement("span");
+        count.className = "picker-meta";
+        count.textContent = String(item.count);
+        row.append(mark, main, count);
+        section.append(row);
+        win.append(section);
+        return;
       }
       // File-backed rows are <a> so Ctrl/Cmd/middle-click opens in a new browser tab (the boot URL
       // reader lands the tab on the file); other rows stay plain <div>s. CSS makes them look alike.
@@ -4332,7 +4393,9 @@ export class Shell {
       // (`total_display_rows − total_matches`); gaps above the window = groups that ended
       // above it = `window_base − offset` (the headers strictly above — every grouped window
       // leads with its own header). Both zero for the flat kinds.
-      const grouped = p.groups.length > 0;
+      // Collapsible kinds have no gap pixels at all: headers are uniform window rows and the
+      // `.collapsible` CSS modifier removes the section margins (docs/picker-groups.md).
+      const grouped = p.groups.length > 0 && !collapsible;
       const totalGaps = grouped ? Math.max(0, p.total_display_rows - p.total_matches - 1) : 0;
       const gapsAbove = grouped ? Math.max(0, p.window_base - p.offset) : 0;
       win.style.top = `${p.window_base * this.pickerRowH + gapsAbove * GROUP_GAP_PX}px`;
@@ -4344,7 +4407,10 @@ export class Shell {
     list.replaceChildren(spacer);
     // Re-measure the row height once in the DOM (fractional, so it doesn't drift over a long list) and
     // re-apply if it changed.
-    const probe = win.querySelector(".picker-row:not(.picker-group-header)") as HTMLElement | null;
+    // A fully-collapsed window is all header rows — they're uniform display rows too, so fall
+    // back to probing one rather than keeping a stale measure.
+    const probe = (win.querySelector(".picker-row:not(.picker-group-header)") ??
+      win.querySelector(".picker-row")) as HTMLElement | null;
     const measured = probe?.getBoundingClientRect().height ?? 0;
     if (measured > 0 && Math.abs(measured - this.pickerRowH) > 0.5) {
       this.pickerRowH = measured;
@@ -4358,13 +4424,27 @@ export class Shell {
     if (this.pickerScrollReset) {
       list.scrollTop = 0;
       this.pickerScrollReset = false;
-      this.pickerReveal = false;
-    } else if (this.pickerReveal && selectedRow) {
+      this.pickerReveal = null;
+    } else if (this.pickerReveal === "run" && p.expanded_run && p.expanded_run.header_row === p.selected) {
+      // Frame the freshly-opened group run (docs/picker-groups.md §9): scroll the minimum that
+      // brings the run's last row into view, capped so the header never leaves the top — at the
+      // cap the header row itself sits at the very top (its own sticky position), so nothing
+      // hides under it. Applied only once the view reflects the selected run (header_row ===
+      // selected); until then it stays armed, like the selected-row reveal below. Collapsible
+      // row space carries no gap pixels, so this is pure row arithmetic.
+      const run = p.expanded_run;
+      const top = run.header_row * this.pickerRowH;
+      const bottom = (run.header_row + run.len + 1) * this.pickerRowH;
+      const h = list.clientHeight;
+      if (top < list.scrollTop) list.scrollTop = top;
+      else if (bottom > list.scrollTop + h) list.scrollTop = Math.min(bottom - h, top);
+      this.pickerReveal = null;
+    } else if (this.pickerReveal !== null && this.pickerReveal !== "run" && selectedRow) {
       selectedRow.scrollIntoView({ block: "nearest" });
-      this.pickerReveal = false;
-    } else if (this.pickerReveal && p.total_matches === 0) {
+      this.pickerReveal = null;
+    } else if (this.pickerReveal !== null && p.total_matches === 0) {
       // Nothing to reveal (empty result) — drop the pending reveal so it doesn't fire later.
-      this.pickerReveal = false;
+      this.pickerReveal = null;
     }
     // Otherwise keep `pickerReveal` armed: the resumed window hasn't painted the selected row yet
     // (it arrives a render later), and we want to scroll to it once it does.

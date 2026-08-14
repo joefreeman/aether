@@ -4,7 +4,7 @@
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipValue, DirListingState};
 use aether_protocol::picker::{
-    GroupHeader, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
+    ExpandedRun, GroupHeader, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
 };
 
 /// Rows the panel shows at once.
@@ -19,6 +19,50 @@ pub enum Reveal {
     Minimal,
     /// Align the row to the top unless already visible (grep file-jumps — context below).
     Top,
+    /// Reveal the newly selected group's *run* (docs/picker-groups.md §9): scroll the minimum
+    /// that brings the run's last row into view, capped so the run's header never leaves the
+    /// top — a run taller than the pane shows the header at the very top (where it renders
+    /// itself, so nothing hides under a sticky pin) with as many items as fit. Emitted by the
+    /// group-select path (`Event::GroupSet`); shells resolve the run's rows from the state's
+    /// `expanded_run`, applying only when it matches the selection (`header_row == selected`)
+    /// so a pre-adoption fire against the *old* run is a no-op — the armed re-emit after the
+    /// reshaped push lands does the real work.
+    Run,
+}
+
+/// Which level of the two-level model (docs/picker-groups.md §9) the selection is on, for the
+/// collapsible kinds. **Stored, not derived**: the row-space facts a derivation would read —
+/// `selected` (moved by the `set_group` reply) and `expanded_run` (moved by the reshaping
+/// push) — arrive on separate, order-independent messages, and a held `Alt-j` repeat can fire
+/// in the gap between them. Deriving the level there reads a mismatched pair: the *new*
+/// selection row can land inside the *stale* run interval, misclassify as item level, and
+/// turn a group step into a local walk into the run. Only explicit gestures flip this bit
+/// (step/select/ascend/query → `Group`; descend / a centred open landing on an entry →
+/// `Item`); [`PickerState::selection_at_item_level`] still requires the run interval to agree,
+/// so a stale bit can never move the selection outside the run either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerLevel {
+    /// The selection is a group header; `Alt-j`/`Alt-k` step between groups.
+    Group,
+    /// The selection is inside the expanded run; `Alt-j`/`Alt-k` walk its items.
+    Item,
+}
+
+/// Where a group-select gesture lands the selection within the newly selected run.
+/// Client-side only: the `picker/set_group` reply carries the run's geometry
+/// ([`aether_protocol::picker::ExpandedRun`]) and the client picks the row — the request's
+/// completion closure carries this intent into `Event::GroupSet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupLanding {
+    /// Group-level navigation (`Alt-j`/`Alt-k` on a header, a header click / re-select):
+    /// land on the run's header, staying at group level.
+    Header,
+    /// An item-level spill over the run's *last* row (docs/picker-groups.md §9): enter the
+    /// next group at its first item, staying at item level.
+    RunStart,
+    /// An item-level spill over the run's *first* row: enter the previous group at its last
+    /// item, staying at item level.
+    RunEnd,
 }
 
 pub struct PickerState {
@@ -39,6 +83,22 @@ pub struct PickerState {
     /// The window's group runs (window-relative starts, server-pushed alongside `items` — the
     /// single source of group boundaries; see `GroupSpan`). Empty for the flat kinds.
     pub groups: Vec<GroupSpan>,
+    /// Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute place in the
+    /// row space — header row + item count, server-pushed alongside `items`. What the
+    /// two-level navigation does its local math against, together with the [`Self::level`]
+    /// bit. `None` for the other kinds and while the result set is empty.
+    pub expanded_run: Option<ExpandedRun>,
+    /// The two-level navigation level (collapsible kinds; see [`PickerLevel`] for why this is
+    /// stored rather than derived). Fresh opens and query changes are group level; a centred
+    /// open landing on an entry is item level.
+    pub level: PickerLevel,
+    /// True while a `picker/set_group` gesture (group step/select, item-level spill) awaits
+    /// its outcome — the row space is about to reshape, so `Alt-j`/`Alt-k` repeats are
+    /// swallowed rather than mis-routed against transient state (a repeat mid-reshape would
+    /// step twice, skipping a group's items). Cleared when a real window is adopted
+    /// ([`Self::apply_update`] with items — the reshaping push, whichever side of the reply
+    /// it lands on), and by the no-op/error reply arms (no push follows those).
+    pub group_gesture_in_flight: bool,
     pub offset: u32,
     /// Absolute index of the highlighted row.
     pub selected: u32,
@@ -122,6 +182,9 @@ impl PickerState {
             generation: 0,
             items: Vec::new(),
             groups: Vec::new(),
+            expanded_run: None,
+            level: PickerLevel::Group,
+            group_gesture_in_flight: false,
             offset: 0,
             selected: 0,
             total_matches: 0,
@@ -451,6 +514,12 @@ impl PickerState {
         if let Some(items) = u.items {
             self.items = items;
             self.groups = u.groups;
+            // Like the spans, the expanded run describes the pushed result set — adopted in
+            // lockstep with `items`, kept across count-only ticks.
+            self.expanded_run = u.expanded_run;
+            // A real window landed — any pending group gesture's reshape is now in hand (or
+            // superseded), so `Alt-j`/`Alt-k` repeats may flow again.
+            self.group_gesture_in_flight = false;
             // A real window landed: "no rows" now means genuinely empty, not not-yet-loaded.
             // The hint facts (docs/hints.md) key the chooser's create-vs-open hint on this.
             self.loaded = true;
@@ -478,13 +547,25 @@ impl PickerState {
             let key = item_key(&center);
             if let Some(pos) = self.items.iter().position(|i| item_key(i) == key) {
                 self.selected = self.offset + pos as u32;
+                // The centred row decides the level (docs/picker-groups.md §9): a cursor-
+                // anchored open lands on an entry/hunk — item level; a header anchor stays
+                // group level.
+                if self.kind.collapsible() {
+                    self.level = if matches!(self.items[pos], PickerItem::Group { .. }) {
+                        PickerLevel::Group
+                    } else {
+                        PickerLevel::Item
+                    };
+                }
             } else {
                 self.pending_center = Some(center); // not in this window yet
             }
         }
         // The create row (Explorer) adds one selectable slot past the matches; keep the highlight
-        // within `[0, total_matches]` when it's live, otherwise `[0, total_matches - 1]`.
-        let rows = self.total_matches + self.create_row_index().is_some() as u32;
+        // within the selectable rows (the whole row space for the collapsible kinds — headers
+        // are selectable rows there, so clamping to bare `total_matches` would yank a
+        // header-row selection upward).
+        let rows = self.selectable_rows() + self.create_row_index().is_some() as u32;
         if rows > 0 {
             self.selected = self.selected.min(rows - 1);
         } else {
@@ -496,12 +577,69 @@ impl PickerState {
         true
     }
 
+    /// The count of selectable rows the highlight moves over: matches for the flat /
+    /// derived-header kinds; the whole *row space* — headers plus the expanded run's items —
+    /// for the collapsible kinds (docs/picker-groups.md), whose `selected`/`offset` index
+    /// window rows. `total_display_rows` is that row total (it falls back to `total_matches`
+    /// on adoption for the flat kinds, so this is safe before the first grouped push).
+    fn selectable_rows(&self) -> u32 {
+        if self.kind.collapsible() {
+            self.total_display_rows
+        } else {
+            self.total_matches
+        }
+    }
+
+    /// The expanded run's item rows as an inclusive absolute-row interval, when a collapsible
+    /// picker has one (docs/picker-groups.md §9). The selection is *item level* exactly when
+    /// it sits inside this interval — every other row is a group header.
+    pub fn expanded_item_rows(&self) -> Option<(u32, u32)> {
+        let run = self.expanded_run?;
+        (run.len > 0).then(|| (run.header_row + 1, run.header_row + run.len))
+    }
+
+    /// Two-level navigation level (collapsible kinds, docs/picker-groups.md §9): `true` when
+    /// the selection is *effectively* at item level — the stored [`Self::level`] bit says so
+    /// AND the selection sits inside the expanded run's rows. The conjunction is the point:
+    /// the bit can't misroute a group step into the run when a held repeat fires between the
+    /// `set_group` reply and its reshaping push (see [`PickerLevel`]), and the interval can't
+    /// let a stale bit walk the selection outside the run. Meaningless for the
+    /// non-collapsible kinds — callers gate on [`PickerKind::collapsible`] first.
+    pub fn selection_at_item_level(&self) -> bool {
+        self.level == PickerLevel::Item
+            && self
+                .expanded_item_rows()
+                .is_some_and(|(first, last)| (first..=last).contains(&self.selected))
+    }
+
     /// Move the highlight by `delta`, returning the new window offset to fetch when the
     /// highlight left the fetched window (the caller sends `picker/view`).
+    ///
+    /// For the collapsible kinds this is the *item-level* move of the two-level model
+    /// (docs/picker-groups.md §9): the selection walks the expanded run's rows and stops hard
+    /// at the run's ends — like the jumplist's `]`/`[` at its ends. Group-level moves are
+    /// `picker/set_group { step }`, routed by the caller before it gets here; called at group
+    /// level this is a no-op.
     pub fn move_selection(&mut self, delta: i64) -> Option<u32> {
+        if self.kind.collapsible() {
+            if !self.selection_at_item_level() {
+                return None; // group level (or incoherent/empty): nothing moves locally
+            }
+            let Some((first, last)) = self.expanded_item_rows() else {
+                return None;
+            };
+            self.selected = (self.selected as i64 + delta).clamp(first as i64, last as i64) as u32;
+            let in_window = self.selected >= self.offset
+                && self.selected < self.offset + self.items.len() as u32;
+            if in_window {
+                return None;
+            }
+            self.reveal_on_update = Some(Reveal::Minimal);
+            return Some(self.selected.saturating_sub(FETCH_LIMIT / 2));
+        }
         // The synthetic create row (Explorer) is one extra selectable row past the last match.
         let create = self.create_row_index();
-        let rows = self.total_matches + create.is_some() as u32;
+        let rows = self.selectable_rows() + create.is_some() as u32;
         if rows == 0 {
             return None;
         }
@@ -530,11 +668,18 @@ impl PickerState {
     /// client-side key derivation), every display row the same height (the shell's `ROW_H`).
     /// A window that begins mid-group still leads with its group's header: the server repeats
     /// the split group's header at `start: 0`.
+    ///
+    /// The collapsible kinds (docs/picker-groups.md) skip the span interleave entirely: their
+    /// headers arrive as real, selectable [`PickerItem::Group`] window rows, so items map 1:1
+    /// to `Item` display rows and the spans only feed the sticky pin + the split-window lead.
     pub fn display_rows(&self) -> Vec<DisplayRow<'_>> {
         let mut rows = Vec::with_capacity(self.items.len() + self.groups.len() + 1);
         let mut spans = self.groups.iter().peekable();
         for (i, item) in self.items.iter().enumerate() {
             while let Some(span) = spans.next_if(|s| s.start as usize <= i) {
+                if self.kind.collapsible() {
+                    continue; // headers are the `Group` rows themselves
+                }
                 rows.push(match &span.header {
                     GroupHeader::File {
                         path_index,
@@ -612,9 +757,10 @@ impl PickerState {
     ///
     /// Total gaps across the whole result set: `total groups − 1`. Total groups falls out of
     /// the display metrics (`total_display_rows − total_matches`), so this needs no extra wire
-    /// data. Zero for flat kinds and empty results.
+    /// data. Zero for flat kinds, empty results, and the collapsible kinds — their headers are
+    /// uniform window rows (docs/picker-groups.md), not gap-separated decorations.
     pub fn total_gap_count(&self) -> u32 {
-        if self.groups.is_empty() {
+        if self.groups.is_empty() || self.kind.collapsible() {
             return 0;
         }
         self.total_display_rows
@@ -628,7 +774,7 @@ impl PickerState {
     /// (a group ending inside the window would BE the window's leading group). Zero for flat
     /// kinds.
     pub fn gaps_above_window(&self) -> u32 {
-        if self.groups.is_empty() {
+        if self.groups.is_empty() || self.kind.collapsible() {
             return 0;
         }
         self.window_base().saturating_sub(self.offset)
@@ -730,6 +876,9 @@ pub enum ItemKey<'a> {
     /// The captured entry's position in the jumplist — positional identity, stable for the
     /// picker's lifetime (a re-capture resets the picker).
     JumplistEntry(u32),
+    /// A collapsible group's header row, keyed like the server's `group_key_at`: a `File`
+    /// header is `(path_index, relative_path)`, a `Label` header `(u32::MAX, label)`.
+    Group(u32, &'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -828,6 +977,13 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             mode, keys, desc, ..
         } => ItemKey::Keybinding(mode, keys, desc),
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry(*index),
+        PickerItem::Group { header, .. } => match header {
+            GroupHeader::File {
+                path_index,
+                relative_path,
+            } => ItemKey::Group(*path_index, relative_path),
+            GroupHeader::Label { label } => ItemKey::Group(u32::MAX, label),
+        },
     }
 }
 
@@ -911,38 +1067,52 @@ mod tests {
 
     #[test]
     fn gap_accounting_counts_between_group_gaps() {
-        // The grep window fixture from `grep_display_rows_align_with_server_offsets`: the END
-        // window of an 18-display-row list (13 items + 5 groups), holding its last two groups.
-        let hit = |path: &str, line: u32| PickerItem::GrepHit {
-            path_index: 0,
-            relative_path: path.into(),
+        // A derived-header kind (References-style Label sections): the END window of an
+        // 18-display-row list (13 items + 5 sections), holding its last two sections.
+        let reference = |path: &str, line: u32| PickerItem::Reference {
+            path: path.into(),
+            display_path: path.into(),
             line,
             col: 0,
             preview: "x".into(),
+            is_definition: false,
             match_indices: vec![],
         };
-        let mut s = PickerState::new(PickerKind::Grep);
+        let label_span = |start: u32, label: &str| GroupSpan {
+            start,
+            header: GroupHeader::Label {
+                label: label.into(),
+            },
+            count: None,
+            expanded: None,
+        };
+        let mut s = PickerState::new(PickerKind::References);
         s.offset = 10;
         assert!(s.apply_update(PickerUpdateParams {
-            kind: PickerKind::Grep,
+            kind: PickerKind::References,
             generation: 0,
             offset: 10,
-            items: Some(vec![hit("a.rs", 1), hit("a.rs", 2), hit("b.rs", 1)]),
+            items: Some(vec![
+                reference("a.rs", 1),
+                reference("a.rs", 2),
+                reference("b.rs", 1)
+            ]),
             total_matches: 13,
             total_candidates: 13,
             ticking: false,
-            groups: file_spans(&[(0, 0, "a.rs"), (2, 0, "b.rs")]),
+            groups: vec![label_span(0, "A"), label_span(2, "B")],
             display_offset: Some(14),
             total_display_rows: Some(18),
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
-        // 18 display rows − 13 items = 5 groups → 4 between-group gaps overall.
+        // 18 display rows − 13 items = 5 sections → 4 between-group gaps overall.
         assert_eq!(s.total_gap_count(), 4);
-        // window_base = 13, offset = 10 → 3 headers strictly above = 3 groups ended above.
+        // window_base = 13, offset = 10 → 3 headers strictly above = 3 sections ended above.
         assert_eq!(s.gaps_above_window(), 3);
-        // Window rows: [0]=hdr a.rs, [1..2]=items, [3]=hdr b.rs, [4]=item. The leading header
-        // gets no gap; b.rs's header (and everything after it) shifts by one.
+        // Window rows: [0]=hdr A, [1..2]=items, [3]=hdr B, [4]=item. The leading header
+        // gets no gap; B's header (and everything after it) shifts by one.
         assert_eq!(s.gaps_before_display_rel(0), 0);
         assert_eq!(s.gaps_before_display_rel(2), 0);
         assert_eq!(s.gaps_before_display_rel(3), 1);
@@ -951,6 +1121,14 @@ mod tests {
         let flat = PickerState::new(PickerKind::Files);
         assert_eq!(flat.total_gap_count(), 0);
         assert_eq!(flat.gaps_above_window(), 0);
+        // Nor do the collapsible kinds — their headers are uniform window rows
+        // (docs/picker-groups.md), not gap-separated decorations.
+        let mut grep = PickerState::new(PickerKind::Grep);
+        grep.groups = file_spans(&[(0, 0, "a.rs")]);
+        grep.total_display_rows = 6;
+        grep.total_matches = 4;
+        assert_eq!(grep.total_gap_count(), 0);
+        assert_eq!(grep.gaps_above_window(), 0);
     }
 
     #[test]
@@ -974,12 +1152,16 @@ mod tests {
                 header: GroupHeader::Label {
                     label: "Motion".into(),
                 },
+                count: None,
+                expanded: None,
             },
             GroupSpan {
                 start: 2,
                 header: GroupHeader::Label {
                     label: "Edit".into(),
                 },
+                count: None,
+                expanded: None,
             },
         ];
         s.total_matches = 3;
@@ -1024,6 +1206,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }
@@ -1039,6 +1222,8 @@ mod tests {
                     path_index,
                     relative_path: rel.into(),
                 },
+                count: None,
+                expanded: None,
             })
             .collect()
     }
@@ -1098,6 +1283,8 @@ mod tests {
 
     #[test]
     fn grep_display_rows_align_with_server_offsets() {
+        // Collapsible grep (docs/picker-groups.md): headers arrive as real `Group` window rows
+        // and the offset/selection space IS the display space — no interleave, no reconcile.
         let hit = |path: &str, line: u32| PickerItem::GrepHit {
             path_index: 0,
             relative_path: path.into(),
@@ -1106,41 +1293,53 @@ mod tests {
             preview: "x".into(),
             match_indices: vec![],
         };
+        let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: path.into(),
+            },
+            count,
+            expanded,
+        };
         let mut s = PickerState::new(PickerKind::Grep);
-        s.offset = 10;
         assert!(s.apply_update(PickerUpdateParams {
             kind: PickerKind::Grep,
             generation: 0,
-            offset: 10,
-            items: Some(vec![hit("a.rs", 1), hit("a.rs", 2), hit("b.rs", 1)]),
-            // This window is the END of the result set (rows 13..18 of 18).
-            total_matches: 13,
-            total_candidates: 13,
+            offset: 0,
+            // a.rs collapsed (2 hidden hits), b.rs expanded with its 2 hits inline.
+            items: Some(vec![
+                group("a.rs", 2, false),
+                group("b.rs", 2, true),
+                hit("b.rs", 1),
+                hit("b.rs", 2)
+            ]),
+            total_matches: 4,
+            total_candidates: 4,
             ticking: false,
-            groups: file_spans(&[(0, 0, "a.rs"), (2, 0, "b.rs")]),
-            // The first item sits at display row 14; its group header occupies 13.
-            display_offset: Some(14),
-            total_display_rows: Some(18),
+            groups: file_spans(&[(0, 0, "a.rs"), (1, 0, "b.rs")]),
+            display_offset: Some(0),
+            total_display_rows: Some(4),
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
-        // Window rows: [13]=hdr a.rs, [14]=hit, [15]=hit, [16]=hdr b.rs, [17]=hit.
-        s.selected = 10;
-        assert_eq!(s.selected_display_row(), Some(14));
-        s.selected = 12;
-        assert_eq!(s.selected_display_row(), Some(17));
-        // Viewing the window's range needs no refetch (nothing exists below it); scrolling
-        // above the fetched window does.
-        assert_eq!(s.scrolled_refetch(13), None);
-        assert!(s.scrolled_refetch(5).is_some());
+        // No synthesized header rows: the spans only feed the sticky pin; items map 1:1.
+        let rows = s.display_rows();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| matches!(r, DisplayRow::Item { .. })));
+        assert_eq!(s.window_base(), 0, "row space == display space");
+        // Selection maps identically — header rows are selectable rows like any other.
+        s.selected = 0;
+        assert_eq!(s.selected_display_row(), Some(0));
+        s.selected = 3;
+        assert_eq!(s.selected_display_row(), Some(3));
     }
 
     #[test]
     fn workspace_diagnostics_count_file_headers_in_window_math() {
-        // Regression: `display_rows` grouped workspace Diagnostics by file, but `window_base` (and so
-        // `selected_display_row`) used a hardcoded variant list that omitted `Diagnostic`, so the
-        // window sat one row off and the geometry undercounted the headers. Both now derive from the
-        // server-pushed spans, so a Diagnostic-bearing window is accounted for like Grep.
+        // DiagnosticsWorkspace is collapsible (docs/picker-groups.md): its headers are real
+        // `Group` window rows, so the window math is the identity — no interleave, and the
+        // selection walks headers and items alike.
         let diag = |path: &str, line: u32| PickerItem::Diagnostic {
             path_index: 0,
             relative_path: path.into(),
@@ -1152,42 +1351,77 @@ mod tests {
             message: "boom".into(),
             match_indices: vec![],
         };
+        let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: path.into(),
+            },
+            count,
+            expanded,
+        };
         let mut s = PickerState::new(PickerKind::DiagnosticsWorkspace);
-        // Window rows: [0]=hdr a.rs, [1]=diag, [2]=diag, [3]=hdr b.rs, [4]=diag.
+        // Window rows: [0]=hdr a.rs (expanded), [1]=diag, [2]=diag, [3]=hdr b.rs (collapsed).
         assert!(s.apply_update(PickerUpdateParams {
             kind: PickerKind::DiagnosticsWorkspace,
             generation: 0,
             offset: 0,
             items: Some(vec![
+                group("src/a.rs", 2, true),
                 diag("src/a.rs", 2),
                 diag("src/a.rs", 9),
-                diag("src/b.rs", 4)
+                group("src/b.rs", 1, false)
             ]),
             total_matches: 3,
             total_candidates: 3,
             ticking: false,
-            groups: file_spans(&[(0, 0, "src/a.rs"), (2, 0, "src/b.rs")]),
-            display_offset: Some(1), // a.rs's header occupies display row 0
-            total_display_rows: Some(5), // 3 diagnostics + 2 file headers
+            groups: file_spans(&[(0, 0, "src/a.rs"), (3, 0, "src/b.rs")]),
+            display_offset: Some(0),
+            total_display_rows: Some(4), // 2 headers + the expanded run's 2 diagnostics
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
-        // display_rows interleaves a header before each file's first diagnostic.
-        let headers = s
+        // No synthesized headers — the Group rows are the headers.
+        assert!(s
             .display_rows()
             .iter()
-            .filter(|r| matches!(r, DisplayRow::Header { .. }))
-            .count();
-        assert_eq!(headers, 2, "one header per file group");
-        // The geometry reflects the headers (not just the 3 items)...
-        assert_eq!(s.total_display_rows, 5);
-        // ...and the window leads with a.rs's header, so it starts at row 0, not 1.
+            .all(|r| matches!(r, DisplayRow::Item { .. })));
+        assert_eq!(s.total_display_rows, 4);
         assert_eq!(s.window_base(), 0);
-        // Selected-row math lands on the right display rows (below their headers).
-        s.selected = 0;
+        // Selected-row math is the identity in row space.
+        s.selected = 1;
         assert_eq!(s.selected_display_row(), Some(1));
+        s.selected = 3;
+        assert_eq!(s.selected_display_row(), Some(3));
+        // Selection moves clamp to the row total (4 rows), not the 3-item match count.
+        s.selected = 3;
+        assert!(s.move_selection(5).is_none(), "already at the last row");
+        assert_eq!(s.selected, 3);
+    }
+
+    #[test]
+    fn item_level_needs_both_the_bit_and_the_run_interval() {
+        let mut s = PickerState::new(PickerKind::Grep);
+        s.expanded_run = Some(ExpandedRun {
+            header_row: 1,
+            len: 2,
+        });
+        s.total_display_rows = 4;
+        // Inside the run's interval but the bit says Group — the held-Alt-j reply/push gap
+        // (see `PickerLevel`): NOT item level, and local moves refuse the stale interval.
         s.selected = 2;
-        assert_eq!(s.selected_display_row(), Some(4));
+        assert!(!s.selection_at_item_level());
+        assert_eq!(s.move_selection(1), None);
+        assert_eq!(s.selected, 2, "no local walk at group level");
+        // The bit flips (a descend gesture): both halves agree — item level, clamped moves.
+        s.level = PickerLevel::Item;
+        assert!(s.selection_at_item_level());
+        let _ = s.move_selection(1);
+        assert_eq!(s.selected, 3);
+        // Bit says Item but the selection sits on a header row (a post-re-rank clamp):
+        // not item level either — the interval keeps a stale bit honest.
+        s.selected = 0;
+        assert!(!s.selection_at_item_level());
     }
 
     #[test]
@@ -1270,16 +1504,29 @@ mod tests {
             match_indices: vec![],
         };
         let items = vec![hunk(1), hunk(5)];
-        // Workspace GitChanges leads each file with a header row (the server sends spans)...
+        // Workspace GitChanges is collapsible: its headers arrive as `Group` window rows, and
+        // the spans must NOT be interleaved on top of them (that would double the header)...
         let mut workspace = PickerState::new(PickerKind::GitChanges);
-        workspace.items = items.clone();
+        workspace.items = std::iter::once(PickerItem::Group {
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: "src/main.rs".into(),
+            },
+            count: 2,
+            expanded: true,
+        })
+        .chain(items.clone())
+        .collect();
         workspace.groups = file_spans(&[(0, 0, "src/main.rs")]);
-        assert!(workspace
-            .display_rows()
-            .iter()
-            .any(|r| matches!(r, DisplayRow::Header { .. })));
-        // ...but the buffer-locked GitChangesFile is a single file with no header — the server
-        // sends no spans for it, so the same items render flat.
+        let rows = workspace.display_rows();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the Group row + its two hunks, nothing added"
+        );
+        assert!(rows.iter().all(|r| matches!(r, DisplayRow::Item { .. })));
+        // ...and the buffer-locked GitChangesFile is a single file with no header at all — the
+        // server sends no spans and no Group rows, so the same items render flat.
         let mut file = PickerState::new(PickerKind::GitChangesFile);
         file.items = items;
         assert!(file
@@ -1321,16 +1568,21 @@ mod tests {
                     header: GroupHeader::Label {
                         label: "Definition".into(),
                     },
+                    count: None,
+                    expanded: None,
                 },
                 GroupSpan {
                     start: 1,
                     header: GroupHeader::Label {
                         label: "References".into(),
                     },
+                    count: None,
+                    expanded: None,
                 },
             ],
             display_offset: Some(1),
             total_display_rows: Some(5),
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1407,6 +1659,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1488,6 +1741,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });

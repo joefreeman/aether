@@ -2416,16 +2416,21 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
                     path_index: 1,
                     relative_path: "src/a.rs".into(),
                 },
+                count: None,
+                expanded: None,
             },
             GroupSpan {
                 start: 4,
                 header: GroupHeader::Label {
                     label: "Definition".into(),
                 },
+                count: None,
+                expanded: None,
             },
         ],
         display_offset: Some(11),
         total_display_rows: Some(20),
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2454,6 +2459,153 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
     );
     let back: PickerUpdateParams = from_value(v).unwrap();
     assert!(back.groups.is_empty());
+}
+
+/// The collapsible-group additions (docs/picker-groups.md): the `Group` header row item, the
+/// span's count/expanded decoration, and the `picker/set_group` wire shapes.
+#[test]
+fn collapsible_group_wire_shapes() {
+    use aether_protocol::picker::{
+        GroupHeader, GroupSpan, PickerItem, PickerKind, PickerSetGroupParams, PickerSetGroupResult,
+    };
+
+    // The header row item: internally tagged `group`, with the nested header's own tag; a
+    // collapsed row skips its false `expanded` flag on the wire.
+    let item = PickerItem::Group {
+        header: GroupHeader::File {
+            path_index: 1,
+            relative_path: "src/a.rs".into(),
+        },
+        count: 4,
+        expanded: false,
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["kind"], "group");
+    assert_eq!(v["header"]["kind"], "file");
+    assert_eq!(v["header"]["relative_path"], "src/a.rs");
+    assert_eq!(v["count"], 4);
+    assert!(v.get("expanded").is_none(), "false expanded skipped");
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+
+    let item = PickerItem::Group {
+        header: GroupHeader::Label {
+            label: "src/deep.rs".into(),
+        },
+        count: 2,
+        expanded: true,
+    };
+    let v = to_value(&item).unwrap();
+    assert_eq!(v["expanded"], true);
+    let back: PickerItem = from_value(v).unwrap();
+    assert_eq!(back, item);
+
+    // Spans carry the same decoration for the collapsible kinds; `None` (the derived-header
+    // kinds) is skipped, so their wire shape is unchanged.
+    let span = GroupSpan {
+        start: 0,
+        header: GroupHeader::File {
+            path_index: 0,
+            relative_path: "src/a.rs".into(),
+        },
+        count: Some(10),
+        expanded: Some(true),
+    };
+    let v = to_value(&span).unwrap();
+    assert_eq!(v["count"], 10);
+    assert_eq!(v["expanded"], true);
+    let back: GroupSpan = from_value(v).unwrap();
+    assert_eq!(back, span);
+    let span = GroupSpan {
+        count: None,
+        expanded: None,
+        ..span
+    };
+    let v = to_value(&span).unwrap();
+    assert!(v.get("count").is_none() && v.get("expanded").is_none());
+
+    // `picker/set_group`: the group to select rides as a header OR a step (two-level
+    // navigation, docs/picker-groups.md §9) — the absent half is skipped on the wire; the
+    // selected header's new row (or nothing) comes back.
+    let p = PickerSetGroupParams {
+        kind: PickerKind::Grep,
+        header: Some(GroupHeader::File {
+            path_index: 0,
+            relative_path: "src/a.rs".into(),
+        }),
+        step: None,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["kind"], "grep");
+    assert_eq!(v["header"]["kind"], "file");
+    assert!(v.get("step").is_none(), "absent step skipped");
+    let back: PickerSetGroupParams = from_value(v).unwrap();
+    assert!(back.header.is_some() && back.step.is_none());
+
+    let p = PickerSetGroupParams {
+        kind: PickerKind::Grep,
+        header: None,
+        step: Some(aether_protocol::cursor::Direction::Forward),
+    };
+    let v = to_value(&p).unwrap();
+    assert!(v.get("header").is_none(), "absent header skipped");
+    assert_eq!(v["step"], "forward");
+    let back: PickerSetGroupParams = from_value(v).unwrap();
+    assert!(back.header.is_none() && back.step.is_some());
+
+    let r = PickerSetGroupResult {
+        run: Some(aether_protocol::picker::ExpandedRun {
+            header_row: 3,
+            len: 7,
+        }),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["run"]["header_row"], 3);
+    assert_eq!(v["run"]["len"], 7);
+    let r = PickerSetGroupResult { run: None };
+    let v = to_value(&r).unwrap();
+    assert!(v.get("run").is_none(), "a vanished group answers empty");
+
+    // The expanded run's geometry on `picker/update` (two-level navigation math): absolute
+    // header row + item count, skipped entirely when absent.
+    let run = aether_protocol::picker::ExpandedRun {
+        header_row: 4,
+        len: 12,
+    };
+    let v = to_value(&run).unwrap();
+    assert_eq!(v["header_row"], 4);
+    assert_eq!(v["len"], 12);
+    let back: aether_protocol::picker::ExpandedRun = from_value(v).unwrap();
+    assert_eq!(back, run);
+}
+
+/// The collapsible predicate: the file-grouped kinds plus WorkspaceSymbols and Jumplist — and
+/// NOT the derived-header kinds (References, Keybindings) nor the headerless buffer-locked
+/// GitChangesFile. Every collapsible kind renders group headers.
+#[test]
+fn collapsible_kinds_are_pinned() {
+    use aether_protocol::picker::PickerKind;
+    let collapsible = [
+        PickerKind::Grep,
+        PickerKind::GitChanges,
+        PickerKind::DiagnosticsWorkspace,
+        PickerKind::WorkspaceSymbols,
+        PickerKind::Jumplist,
+    ];
+    for kind in collapsible {
+        assert!(kind.collapsible(), "{kind:?}");
+        assert!(kind.renders_group_headers(), "{kind:?}");
+    }
+    for kind in [
+        PickerKind::References,
+        PickerKind::Keybindings,
+        PickerKind::GitChangesFile,
+        PickerKind::Files,
+        PickerKind::Diagnostics,
+        PickerKind::DocumentSymbols,
+    ] {
+        assert!(!kind.collapsible(), "{kind:?}");
+    }
 }
 
 #[test]
@@ -2665,6 +2817,7 @@ fn picker_update_round_trips_through_notification() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2697,6 +2850,7 @@ fn picker_update_carries_center_on_symbol() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: Some(Box::new(PickerItem::Symbol {
             path: "/p/a.rs".into(),
             display_path: String::new(),

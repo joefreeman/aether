@@ -8,7 +8,7 @@ pub use crate::core::picker::*;
 use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
 use aether_protocol::git::GitStatus;
-use aether_protocol::picker::{BufferDirtyState, GroupHeader, PickerItem, PickerKind};
+use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::viewport::DiffStage;
 use iced::advanced::widget::Tree;
 use iced::advanced::{layout, mouse, renderer, Layout, Widget};
@@ -204,13 +204,13 @@ pub(crate) enum Boundary {
 }
 
 /// Whether this kind pins a sticky group header over the list's top row (the web's
-/// `position: sticky`): the file-grouped kinds pin their file header, Keybindings pins its
-/// group label. References renders section labels but deliberately does *not* pin (at most two
-/// short sections). The single source for the pin itself (`overlay`) AND the one-row reveal
-/// clearance (`app::reveal_target`) — a revealed row must clear the pinned header or it slides
-/// underneath it, so the two must never disagree about which kinds pin.
+/// `position: sticky`): the file-grouped kinds and the Jumplist pin their file header,
+/// Keybindings pins its group label. References renders section labels but deliberately does
+/// *not* pin (at most two short sections). The single source for the pin itself (`overlay`) AND
+/// the one-row reveal clearance (`app::reveal_target`) — a revealed row must clear the pinned
+/// header or it slides underneath it, so the two must never disagree about which kinds pin.
 pub fn pins_group_header(kind: PickerKind) -> bool {
-    kind.groups_by_file() || kind == PickerKind::Keybindings
+    kind.groups_by_file() || matches!(kind, PickerKind::Keybindings | PickerKind::Jumplist)
 }
 
 /// Query-input placeholder per picker — kept in sync with the web client's `PLACEHOLDER` map
@@ -462,7 +462,18 @@ pub fn overlay<'a>(
             DisplayRow::Item { abs, item } => {
                 let selected = abs == state.selected;
                 let hovered = state.hovered == Some(abs);
-                let row_el = container(render_item(item, roots, tether, hovered, ui))
+                // Two-level hierarchy (docs/picker-groups.md §9): the collapsible kinds'
+                // item rows indent under their group header, aligning with the header text
+                // past its disclosure-mark cell. Header rows start flush.
+                let mut content = render_item(item, roots, tether, hovered, ui);
+                if state.kind.collapsible() && !matches!(item, PickerItem::Group { .. }) {
+                    content = row![
+                        iced::widget::Space::new().width(group_item_indent(ui)),
+                        content
+                    ]
+                    .into();
+                }
+                let row_el = container(content)
                     .width(Length::Fill)
                     .height(ui.row_h())
                     .padding([3, 12])
@@ -547,51 +558,54 @@ pub fn overlay<'a>(
     // Headerless kinds (e.g. the single-file GitChangesFile) send no spans; the kind gate also
     // keeps References — which does send spans — deliberately unpinned (at most two short
     // sections).
-    let pinned: Option<&GroupHeader> = if !pins_group_header(state.kind) {
+    let pinned: Option<&GroupSpan> = if !pins_group_header(state.kind) {
         None
     } else {
         window_row_at(state, scroll_y, ui).and_then(|rel| {
             match state.display_rows().get(rel)? {
-                // The governing group of an item row is the last span at-or-before it.
-                DisplayRow::Item { abs, .. } => {
+                // The governing group of an item row is the last span at-or-before it. A
+                // collapsible kind's own `Group` header row renders itself (chevron + count,
+                // selectable) — no pin on top of it (docs/picker-groups.md).
+                DisplayRow::Item { abs, item } => {
+                    if matches!(item, PickerItem::Group { .. }) {
+                        return None;
+                    }
                     let win_idx = abs.checked_sub(state.offset)?;
-                    state
-                        .groups
-                        .iter()
-                        .rev()
-                        .find(|s| s.start <= win_idx)
-                        .map(|s| &s.header)
+                    state.groups.iter().rev().find(|s| s.start <= win_idx)
                 }
                 // A header row at the top pins itself (identical overlay, no flicker). The
-                // display row borrows its content from the span, so hand back that span's header.
+                // display row borrows its content from the span, so hand back that span.
                 DisplayRow::Header {
                     path_index,
                     relative_path,
-                } => state
-                    .groups
-                    .iter()
-                    .find(|s| {
-                        matches!(&s.header, GroupHeader::File { path_index: p, relative_path: r }
+                } => state.groups.iter().find(|s| {
+                    matches!(&s.header, GroupHeader::File { path_index: p, relative_path: r }
                             if p == path_index && r == relative_path)
-                    })
-                    .map(|s| &s.header),
+                }),
                 DisplayRow::Section { label } => state
                     .groups
                     .iter()
-                    .find(|s| matches!(&s.header, GroupHeader::Label { label: l } if l == label))
-                    .map(|s| &s.header),
+                    .find(|s| matches!(&s.header, GroupHeader::Label { label: l } if l == label)),
                 DisplayRow::Create { .. } => None,
             }
         })
     };
     let pin_layer: Element<'_, PickerMsg> = match pinned {
-        Some(pin) => {
-            let header = match pin {
-                GroupHeader::File {
-                    path_index,
-                    relative_path,
-                } => grep_header(roots, *path_index, relative_path, ui),
-                GroupHeader::Label { label } => section_header(label.clone(), ui),
+        Some(span) => {
+            let header = match (span.count, &span.header) {
+                // A collapsible kind's pin stands in for the run's scrolled-off `Group` row —
+                // same chevron + count dressing (the span carries them for exactly this).
+                (Some(count), header) => {
+                    group_pin_header(roots, header, count, span.expanded.unwrap_or(false), ui)
+                }
+                (
+                    None,
+                    GroupHeader::File {
+                        path_index,
+                        relative_path,
+                    },
+                ) => grep_header(roots, *path_index, relative_path, ui),
+                (None, GroupHeader::Label { label }) => section_header(label.clone(), ui),
             };
             container(header)
                 .width(Length::Fill)
@@ -1026,6 +1040,93 @@ fn section_header<'a>(label: impl Into<String>, ui: theme::Ui) -> Element<'a, Pi
     .into()
 }
 
+/// A collapsible group header's display label: the file form matches [`grep_header`]'s
+/// root-label + truncation treatment; a `Label` header renders verbatim. Shared by the
+/// `Group` row and its sticky-pin stand-in so the two can't drift.
+fn group_header_label(roots: &[String], header: &GroupHeader) -> String {
+    match header {
+        GroupHeader::File {
+            path_index,
+            relative_path,
+        } => match root_label(roots, *path_index) {
+            Some(label) => {
+                let budget = GREP_HEADER_MAX_CHARS.saturating_sub(label.chars().count() + 2);
+                format!(
+                    "{label}: {}",
+                    crate::labels::truncate_path(relative_path, budget.max(8))
+                )
+            }
+            None => crate::labels::truncate_path(relative_path, GREP_HEADER_MAX_CHARS),
+        },
+        GroupHeader::Label { label } => label.clone(),
+    }
+}
+
+/// The sticky-pin stand-in for a collapsible kind's scrolled-off `Group` header row
+/// (docs/picker-groups.md): the same chevron + label + right-aligned count dressing as the row
+/// itself, over the section-header backdrop.
+fn group_pin_header<'a>(
+    roots: &[String],
+    header: &GroupHeader,
+    count: u32,
+    expanded: bool,
+    ui: theme::Ui,
+) -> Element<'a, PickerMsg> {
+    container(
+        row![
+            disclosure_mark(expanded, ui),
+            // Not bold (unlike the derived section headers): the indent under the header
+            // (docs/picker-groups.md §9.2) already carries the hierarchy, and NORD8 alone
+            // marks the row as chrome.
+            text(group_header_label(roots, header))
+                .size(ui.body())
+                .font(SANS)
+                .color(theme::NORD8)
+                .wrapping(iced::widget::text::Wrapping::None),
+            iced::widget::Space::new().width(Length::Fill),
+            text(count.to_string())
+                .size(ui.small())
+                .font(SANS)
+                .color(theme::NORD3_BRIGHT)
+                .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(ui.row_h())
+    .padding([3, 12])
+    .align_y(iced::alignment::Vertical::Center)
+    .style(|_| container::Style {
+        background: Some(theme::NORD1.into()),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// The group header's disclosure chevron in a fixed-width cell — fixed so the header text
+/// starts at a known x, and the item rows' indent ([`GROUP_ITEM_INDENT`] = this cell + the
+/// row's 6px gap) lines their text up under it (docs/picker-groups.md §9).
+fn disclosure_mark<'a>(expanded: bool, ui: theme::Ui) -> Element<'a, PickerMsg> {
+    container(
+        text(if expanded { "▾" } else { "▸" })
+            .size(ui.body())
+            .font(SANS)
+            .color(theme::NORD8),
+    )
+    .width(ui.at(MARK_CELL))
+    .into()
+}
+
+/// The disclosure-mark cell's tuned width (px at scale 1); see [`disclosure_mark`].
+const MARK_CELL: f32 = 12.0;
+
+/// A collapsible kind's item-row indent: the mark cell plus the header row's 6px gap, so item
+/// text aligns with the header text above it (docs/picker-groups.md §9).
+pub fn group_item_indent(ui: theme::Ui) -> f32 {
+    ui.at(MARK_CELL) + 6.0
+}
+
 /// A fixed-width leading bullet cell, so rows with and without a status dot line up.
 fn dot_cell<'a>(color: Option<iced::Color>, ui: theme::Ui) -> Element<'a, PickerMsg> {
     let inner: Element<'a, PickerMsg> = match color {
@@ -1115,6 +1216,31 @@ fn render_item<'a>(
     ui: theme::Ui,
 ) -> Element<'a, PickerMsg> {
     match item {
+        // A collapsible group's header row (docs/picker-groups.md) — a real, selectable row
+        // in the same NORD8 bold chrome as the derived headers, plus a disclosure mark and
+        // the run's right-aligned item count. The selection band comes from the row wrapper,
+        // like any other item.
+        PickerItem::Group {
+            header,
+            count,
+            expanded,
+        } => {
+            let label = group_header_label(roots, header);
+            row![
+                disclosure_mark(*expanded, ui),
+                // Not bold — see `group_pin_header` (the pin must render identically).
+                text(label)
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(theme::NORD8)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(count.to_string(), ui),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
         PickerItem::File {
             path_index,
             relative_path,

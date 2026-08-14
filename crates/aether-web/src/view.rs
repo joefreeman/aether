@@ -218,6 +218,12 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // Display-row index of the loaded window's first rendered row (a grep header sits one
                 // row above the first hit) — where the shell positions the window within the spacer.
                 "window_base": p.window_base(),
+                // Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute rows,
+                // for the `Reveal::Run` scroll math. `null` for the other kinds / empty results.
+                "expanded_run": p.expanded_run.map(|r| json!({
+                    "header_row": r.header_row,
+                    "len": r.len,
+                })),
                 "directory": p.directory,
                 "directory_parent": p.directory_parent,
                 // Explorer tab-completion ghost: the common-prefix suffix `Tab` would append to the

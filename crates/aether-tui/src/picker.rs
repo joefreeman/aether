@@ -845,6 +845,12 @@ pub enum ItemKey<'a> {
     JumplistEntry {
         index: u32,
     },
+    /// A collapsible group's header row, keyed like the server's `group_key_at`: a `File`
+    /// header is `(path_index, relative_path)`, a `Label` header `(u32::MAX, label)`.
+    Group {
+        path_index: u32,
+        path: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -919,6 +925,19 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             desc: desc.as_str(),
         },
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry { index: *index },
+        PickerItem::Group { header, .. } => match header {
+            aether_protocol::picker::GroupHeader::File {
+                path_index,
+                relative_path,
+            } => ItemKey::Group {
+                path_index: *path_index,
+                path: relative_path.as_str(),
+            },
+            aether_protocol::picker::GroupHeader::Label { label } => ItemKey::Group {
+                path_index: u32::MAX,
+                path: label.as_str(),
+            },
+        },
     }
 }
 

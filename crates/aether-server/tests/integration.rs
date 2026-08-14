@@ -42,9 +42,10 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavStepResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, MatchOptions, PickerFilters, PickerHide, PickerHideParams,
-    PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset, PickerSectionJump,
-    PickerSectionJumpParams, PickerSelect, PickerSelectParams, PickerSelectResult, PickerUpdate,
+    BufferDirtyState, CaseMode, GroupHeader, MatchOptions, PickerFilters, PickerHide,
+    PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset,
+    PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
+    PickerSelectResult, PickerSetGroup, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
 use aether_protocol::search::{
@@ -11198,12 +11199,34 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     let update = view.update.expect("the view carries its initial window");
     assert_eq!(update.kind, PickerKind::GitChanges);
 
-    // Two hunks across two files: the modification in a.rs, the whole-file add of new.rs. Sorted
-    // by path, so a.rs precedes new.rs.
-    let items = update.items();
-    assert_eq!(items.len(), 2, "two hunks, got {items:?}");
-    assert_eq!(update.total_matches, 2);
+    // Two hunks across two files: one header row per file (sorted by path), hunk counts on
+    // the rows — and the first group opens itself (docs/picker-groups.md §9), so a.rs's hunk
+    // row sits inline under its header from the start.
+    assert_eq!(update.total_matches, 2, "hunks count; headers don't");
+    assert_eq!(
+        group_rows(update.items()),
+        vec![
+            ("a.rs".to_string(), 1, true),
+            ("new.rs".to_string(), 1, false),
+        ]
+    );
+    assert_eq!(
+        update.total_display_rows,
+        Some(3),
+        "2 headers + a.rs's hunk"
+    );
+    assert_eq!(
+        update.expanded_run.map(|r| (r.header_row, r.len)),
+        Some((0, 1)),
+        "the push advertises the expanded run's geometry"
+    );
 
+    // Selecting a.rs explicitly is a no-op re-affirmation of the same shape.
+    let (row, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "a.rs").await;
+    assert_eq!(row, 0);
+    let items = update.items();
+    assert_eq!(items.len(), 3, "2 headers + a.rs's hunk, got {items:?}");
+    assert_eq!(update.total_display_rows, Some(3));
     let PickerItem::GitChange {
         relative_path,
         line,
@@ -11213,9 +11236,9 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
         preview,
         hunk_index,
         ..
-    } = &items[0]
+    } = &items[1]
     else {
-        panic!("expected GitChange, got {:?}", items[0]);
+        panic!("expected GitChange, got {:?}", items[1]);
     };
     assert_eq!(relative_path, "a.rs");
     assert_eq!(*line, 1, "modification anchors on the changed line");
@@ -11224,6 +11247,17 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     assert_eq!(*stage, DiffStage::Unstaged);
     assert_eq!(*hunk_index, 0);
 
+    // Expand new.rs: accordion — a.rs's group folds back up on its own.
+    let (row, update) = select_file_group(&mut ws, 40, PickerKind::GitChanges, 0, "new.rs").await;
+    assert_eq!(row, 1);
+    let items = update.items();
+    assert_eq!(
+        group_rows(items),
+        vec![
+            ("a.rs".to_string(), 1, false),
+            ("new.rs".to_string(), 1, true),
+        ]
+    );
     let PickerItem::GitChange {
         relative_path,
         line,
@@ -11231,17 +11265,14 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
         removed,
         preview,
         ..
-    } = &items[1]
+    } = &items[2]
     else {
-        panic!("expected GitChange, got {:?}", items[1]);
+        panic!("expected GitChange, got {:?}", items[2]);
     };
     assert_eq!(relative_path, "new.rs");
     assert_eq!(*line, 0);
     assert_eq!((*added, *removed), (2, 0), "untracked = whole-file add");
     assert_eq!(preview, "hello");
-
-    // Grouped display rows: 2 hunks + one header per file = 4.
-    assert_eq!(update.total_display_rows, Some(4));
 
     drop(server);
 }
@@ -11297,15 +11328,9 @@ async fn git_changes_picker_collapses_untracked_directories() {
     )
     .await;
     let update = view.update.expect("window rides the response");
-    let paths: Vec<&str> = update
-        .items()
-        .iter()
-        .map(|i| {
-            let PickerItem::GitChange { relative_path, .. } = i else {
-                panic!("expected GitChange, got {i:?}");
-            };
-            relative_path.as_str()
-        })
+    let paths: Vec<String> = group_rows(update.items())
+        .into_iter()
+        .map(|(p, _, _)| p)
         .collect();
     // The modification + the loose new file, but none of the five files inside `junk/`.
     assert_eq!(paths, vec!["a.rs", "loose.rs"], "got {paths:?}");
@@ -11370,16 +11395,9 @@ async fn git_changes_picker_hide_untracked() {
             },
         )
         .await;
-        view.update
-            .expect("window rides the response")
-            .items()
-            .iter()
-            .map(|i| {
-                let PickerItem::GitChange { relative_path, .. } = i else {
-                    panic!("expected GitChange, got {i:?}");
-                };
-                relative_path.clone()
-            })
+        group_rows(view.update.expect("window rides the response").items())
+            .into_iter()
+            .map(|(p, _, _)| p)
             .collect()
     }
 
@@ -11459,19 +11477,20 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
     )
     .await;
     let update = view.update.expect("window rides the response");
-    let items = update.items();
     assert_eq!(
-        items.len(),
-        1,
-        "the unsaved buffer edit shows, got {items:?}"
+        group_rows(update.items()),
+        vec![("a.rs".to_string(), 1, true)],
+        "the unsaved buffer edit shows as a.rs's group, open (the sole/first group)"
     );
+    // Re-select it to check the hunk previews the live buffer text.
+    let (_, update) = select_file_group(&mut ws, 6, PickerKind::GitChanges, 0, "a.rs").await;
     let PickerItem::GitChange {
         relative_path,
         preview,
         ..
-    } = &items[0]
+    } = &update.items()[1]
     else {
-        panic!("expected GitChange, got {:?}", items[0]);
+        panic!("expected GitChange, got {:?}", update.items()[1]);
     };
     assert_eq!(relative_path, "a.rs");
     assert_eq!(
@@ -11542,6 +11561,8 @@ async fn git_changes_file_is_locked_to_its_buffer() {
         explorer_roots: false,
         keybindings: None,
     };
+    // The workspace picker's window is collapsed `Group` headers; the buffer-locked sibling
+    // stays flat `GitChange` rows — both carry the file either way.
     let paths = |view: &aether_protocol::picker::PickerViewResult| -> Vec<String> {
         view.update
             .as_ref()
@@ -11550,7 +11571,11 @@ async fn git_changes_file_is_locked_to_its_buffer() {
             .iter()
             .map(|i| match i {
                 PickerItem::GitChange { relative_path, .. } => relative_path.clone(),
-                other => panic!("expected GitChange, got {other:?}"),
+                PickerItem::Group {
+                    header: GroupHeader::File { relative_path, .. },
+                    ..
+                } => relative_path.clone(),
+                other => panic!("expected GitChange or Group, got {other:?}"),
             })
             .collect()
     };
@@ -11560,6 +11585,9 @@ async fn git_changes_file_is_locked_to_its_buffer() {
         send_request::<PickerView>(&mut ws, 5, &view_params(PickerKind::GitChanges, None)).await;
     let mut p = paths(&workspace);
     p.sort();
+    // The first group opens itself (docs/picker-groups.md §9), so its file appears as both
+    // the header row and its hunk row — identity, not multiplicity, is what's under test.
+    p.dedup();
     assert_eq!(p, vec!["a.rs".to_string(), "b.rs".to_string()]);
 
     // File changes, locked to a.rs's buffer: only a.rs, even though b.rs is also changed.
@@ -11699,10 +11727,346 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
     let centered = view
         .effective_center_on
         .expect("the cursor resolved to a hunk");
-    let PickerItem::GitChange { line, .. } = centered else {
+    let PickerItem::GitChange { line, .. } = &centered else {
         panic!("expected GitChange, got {centered:?}");
     };
-    assert_eq!(line, 4, "centered on the hunk at the cursor line");
+    assert_eq!(*line, 4, "centered on the hunk at the cursor line");
+    // Framing an item implies revealing it (docs/picker-groups.md): the centred open expanded
+    // the cursor's file group, so the resolved hunk is a real window row, not hidden behind a
+    // collapsed header.
+    let update = view.update.expect("window rides the response");
+    assert_eq!(
+        group_rows(update.items()),
+        vec![("a.rs".to_string(), 2, true)],
+        "the cursor's group opens expanded"
+    );
+    assert!(
+        update.items().contains(&centered),
+        "the resolved hunk is visible in the window"
+    );
+
+    drop(server);
+}
+
+/// `picker/set_group` end-to-end (docs/picker-groups.md §9): selecting a group is idempotent
+/// and moves the accordion's one expansion, `step` walks neighbouring groups and stops at the
+/// ends, and a vanished group answers `row: None`.
+#[tokio::test]
+async fn picker_set_group_holds_the_accordion_invariant() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "a.rs", "one\ntwo\nthree\n");
+    std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("accordion-proj", vec![dir_path])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "accordion-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::GitChanges,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+
+    // Selecting the same group twice is idempotent — same row, same window shape.
+    let (row_a, update_a) = select_file_group(&mut ws, 10, PickerKind::GitChanges, 0, "a.rs").await;
+    let (row_b, update_b) = select_file_group(&mut ws, 20, PickerKind::GitChanges, 0, "a.rs").await;
+    assert_eq!((row_a, row_b), (0, 0));
+    assert_eq!(update_a.items(), update_b.items());
+    assert_eq!(
+        group_rows(update_a.items()),
+        vec![
+            ("a.rs".to_string(), 1, true),
+            ("new.rs".to_string(), 1, false),
+        ]
+    );
+
+    // Selecting new.rs moves the expansion (accordion): a.rs folds to a bare header, and the
+    // answered row is new.rs's header in the reshaped space (right below a.rs's header).
+    let (row_new, update_new) =
+        select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "new.rs").await;
+    assert_eq!(row_new, 1);
+    assert_eq!(
+        group_rows(update_new.items()),
+        vec![
+            ("a.rs".to_string(), 1, false),
+            ("new.rs".to_string(), 1, true),
+        ]
+    );
+    // The push advertises the expanded run's geometry for the client's two-level nav math.
+    let run = update_new.expanded_run.expect("a run is always expanded");
+    assert_eq!((run.header_row, run.len), (1, 1));
+
+    // Group-level stepping: Backward from new.rs selects a.rs again (row 0)…
+    let stepped: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        &mut ws,
+        40,
+        &PickerSetGroupParams {
+            kind: PickerKind::GitChanges,
+            header: None,
+            step: Some(Direction::Backward),
+        },
+    )
+    .await;
+    assert_eq!(stepped.run.map(|r| r.header_row), Some(0));
+    // …and Backward again runs off the start: a stop (`row: None`), nothing changes.
+    let at_end: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        &mut ws,
+        41,
+        &PickerSetGroupParams {
+            kind: PickerKind::GitChanges,
+            header: None,
+            step: Some(Direction::Backward),
+        },
+    )
+    .await;
+    assert!(at_end.run.is_none());
+    // Forward walks back onto new.rs.
+    let forward: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        &mut ws,
+        42,
+        &PickerSetGroupParams {
+            kind: PickerKind::GitChanges,
+            header: None,
+            step: Some(Direction::Forward),
+        },
+    )
+    .await;
+    assert_eq!(forward.run.map(|r| (r.header_row, r.len)), Some((1, 1)));
+
+    // A group that isn't in the result set answers `row: None` (benign; the chord raced).
+    let vanished: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        &mut ws,
+        50,
+        &PickerSetGroupParams {
+            kind: PickerKind::GitChanges,
+            header: Some(GroupHeader::File {
+                path_index: 0,
+                relative_path: "no-such-file.rs".into(),
+            }),
+            step: None,
+        },
+    )
+    .await;
+    assert!(vanished.run.is_none());
+
+    drop(server);
+}
+
+/// A window starting *inside* the expanded run has no header row of its own, so the server
+/// repeats the split run's span at `start: 0` (the sticky-pin source), carrying the same
+/// count/expanded decoration as the header row it stands in for — and the row-space display
+/// metrics stay the identity.
+#[tokio::test]
+async fn collapsible_window_mid_group_repeats_the_expanded_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let big: String = (0..10).map(|i| format!("needle {i}\n")).collect();
+    std::fs::write(root.join("big.rs"), big).unwrap();
+    std::fs::write(root.join("small.rs"), "needle\n").unwrap();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("midspan-proj", vec![root]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "midspan-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        2,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let done = drain_grep_until_done(&mut ws).await;
+    assert_eq!(done.total_matches, 11);
+    assert_eq!(
+        group_rows(done.items()),
+        vec![
+            ("big.rs".to_string(), 10, true),
+            ("small.rs".to_string(), 1, false),
+        ],
+        "the first group opens itself"
+    );
+    assert_eq!(
+        done.total_display_rows,
+        Some(12),
+        "2 headers + big.rs's 10 hits"
+    );
+
+    let (row, _) = select_file_group(&mut ws, 10, PickerKind::Grep, 0, "big.rs").await;
+    assert_eq!(row, 0);
+
+    // Re-view a window starting inside big.rs's run (row 3 = its third hit).
+    let view = send_request::<PickerView>(
+        &mut ws,
+        20,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: PickerReset::Keep,
+            offset: 3,
+            limit: 4,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let update = view.update.expect("window rides the response");
+    assert_eq!(update.offset, 3);
+    assert_eq!(update.display_offset, Some(3), "row space IS display space");
+    assert_eq!(
+        update.total_display_rows,
+        Some(12),
+        "2 headers + the expanded run's 10 hits"
+    );
+    let items = update.items();
+    assert_eq!(items.len(), 4);
+    assert!(
+        items.iter().all(
+            |i| matches!(i, PickerItem::GrepHit { relative_path, .. } if relative_path == "big.rs")
+        ),
+        "a mid-run window is all items, no header row: {items:?}"
+    );
+    // The split run's span is repeated at start 0, dressed like its header row.
+    assert_eq!(update.groups.len(), 1);
+    let span = &update.groups[0];
+    assert_eq!(span.start, 0);
+    assert!(
+        matches!(&span.header, GroupHeader::File { relative_path, .. } if relative_path == "big.rs")
+    );
+    assert_eq!((span.count, span.expanded), (Some(10), Some(true)));
+
+    drop(server);
+}
+
+/// `Ctrl-j` capture with the selection sitting on a collapsed header: the anchor resolves to
+/// the run's first item, and the captured list spans the *whole* filtered set — collapse is
+/// view state, not a filter (docs/picker-groups.md).
+#[tokio::test]
+async fn jumplist_capture_includes_collapsed_hidden_hits() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Grep,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let done = drain_grep_until_done(&mut ws).await;
+    assert_eq!(done.total_matches, 3);
+    let anchor = done.items()[0].clone();
+    assert!(
+        matches!(&anchor, PickerItem::Group { .. }),
+        "the collapsed window's first row is a header: {anchor:?}"
+    );
+
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        12,
+        &JumplistCaptureParams {
+            kind: PickerKind::Grep,
+            item: anchor,
+        },
+    )
+    .await;
+    let captured = captured.expect("grep captures");
+    assert_eq!(
+        captured.total, 3,
+        "every hit captured, including the collapsed-hidden ones"
+    );
+    assert_eq!(
+        captured.index, 0,
+        "a header anchor lands on its run's first entry"
+    );
 
     drop(server);
 }
@@ -11766,20 +12130,20 @@ async fn git_changes_picker_query_greps_diff_content() {
     .await;
     let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.generation, 1);
-    let items = update.items();
     assert_eq!(
-        items.len(),
-        1,
-        "only the hunk whose content matches, got {items:?}"
+        group_rows(update.items()),
+        vec![("a.rs".to_string(), 1, true)],
+        "only the file whose hunk content matches"
     );
+    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, 0, "a.rs").await;
     let PickerItem::GitChange {
         relative_path,
         preview,
         match_indices,
         ..
-    } = &items[0]
+    } = &update.items()[1]
     else {
-        panic!("expected GitChange, got {:?}", items[0]);
+        panic!("expected GitChange, got {:?}", update.items()[1]);
     };
     assert_eq!(relative_path, "a.rs");
     assert_eq!(
@@ -11852,8 +12216,10 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
         },
     )
     .await;
-    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let item = update.items().first().expect("a match").clone();
+    let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    // Re-select the group and re-view to get its hunk row in hand.
+    let (_, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "a.rs").await;
+    let item = update.items()[1].clone();
     let item_for_retry = serde_json::to_value(&item).unwrap();
 
     let result: PickerSelectResult = send_request::<PickerSelect>(
@@ -11969,22 +12335,11 @@ async fn git_changes_keep_view_preserves_query_within_one_open() {
         "the content query survives a Keep re-view"
     );
     let update = view.update.expect("window rides the response");
-    let items = update.items();
     assert_eq!(
-        items.len(),
-        1,
-        "still filtered to the matching hunk, got {items:?}"
+        group_rows(update.items()),
+        vec![("a.rs".to_string(), 1, true)],
+        "still filtered to the file with the matching hunk"
     );
-    let PickerItem::GitChange {
-        relative_path,
-        preview,
-        ..
-    } = &items[0]
-    else {
-        panic!("expected GitChange, got {:?}", items[0]);
-    };
-    assert_eq!(relative_path, "a.rs");
-    assert_eq!(preview, "alpha MARKER");
 
     drop(server);
 }
@@ -12047,15 +12402,16 @@ async fn git_changes_picker_query_is_a_regex() {
         },
     )
     .await;
-    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, 0, "a.rs").await;
     let items = update.items();
     assert_eq!(
         items.len(),
-        1,
-        "the regex matches the changed line, got {items:?}"
+        2,
+        "the regex matches the changed line: its header + hunk, got {items:?}"
     );
-    let PickerItem::GitChange { preview, .. } = &items[0] else {
-        panic!("expected GitChange, got {:?}", items[0]);
+    let PickerItem::GitChange { preview, .. } = &items[1] else {
+        panic!("expected GitChange, got {:?}", items[1]);
     };
     assert_eq!(preview, "let count = 1");
 
@@ -12126,15 +12482,9 @@ async fn git_changes_picker_filters_by_directory() {
     )
     .await;
     let update = view.update.expect("window rides the response");
-    let paths: Vec<&str> = update
-        .items()
-        .iter()
-        .map(|i| {
-            let PickerItem::GitChange { relative_path, .. } = i else {
-                panic!("expected GitChange, got {i:?}");
-            };
-            relative_path.as_str()
-        })
+    let paths: Vec<String> = group_rows(update.items())
+        .into_iter()
+        .map(|(p, _, _)| p)
         .collect();
     assert_eq!(paths, vec!["src/a.rs"], "the dir scope drops docs/b.md");
 
@@ -12213,15 +12563,9 @@ async fn git_changes_picker_filters_by_exact_file() {
     )
     .await;
     let update = view.update.expect("window rides the response");
-    let paths: Vec<&str> = update
-        .items()
-        .iter()
-        .map(|i| {
-            let PickerItem::GitChange { relative_path, .. } = i else {
-                panic!("expected GitChange, got {i:?}");
-            };
-            relative_path.as_str()
-        })
+    let paths: Vec<String> = group_rows(update.items())
+        .into_iter()
+        .map(|(p, _, _)| p)
         .collect();
     assert_eq!(
         paths,
@@ -14809,6 +15153,85 @@ async fn setup_grep_workspace() -> (
     (server, ws)
 }
 
+/// A collapsible picker window's `Group` header rows as `(header text, count, expanded)`
+/// triples — the file's relative path or the label — which is what a collapsed window is made
+/// of by default (docs/picker-groups.md). Non-header rows are skipped.
+fn group_rows(items: &[PickerItem]) -> Vec<(String, u32, bool)> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header,
+                count,
+                expanded,
+            } => Some((
+                match header {
+                    GroupHeader::File { relative_path, .. } => relative_path.clone(),
+                    GroupHeader::Label { label } => label.clone(),
+                },
+                *count,
+                *expanded,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Select (and thereby expand) one file group in a collapsible picker (`picker/set_group`)
+/// and return the header's new absolute row plus the reshaped window. The window comes from a
+/// follow-up `Keep` re-view's response, not from the set_group push — `send_request` discards
+/// notifications while waiting, so the push may already be gone by the time the response is
+/// read. Uses request ids `id` and `id + 1`.
+async fn select_file_group(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    kind: PickerKind,
+    path_index: u32,
+    relative_path: &str,
+) -> (u32, PickerUpdateParams) {
+    let result: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        ws,
+        id,
+        &PickerSetGroupParams {
+            kind,
+            header: Some(GroupHeader::File {
+                path_index,
+                relative_path: relative_path.into(),
+            }),
+            step: None,
+        },
+    )
+    .await;
+    let view = send_request::<PickerView>(
+        ws,
+        id + 1,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind,
+            reset: PickerReset::Keep,
+            offset: 0,
+            limit: 50,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    (
+        result
+            .run
+            .expect("selected group is present in the ranking")
+            .header_row,
+        view.update.expect("a Keep re-view carries its window"),
+    )
+}
+
 /// Drain `picker/update` notifications until one arrives with `ticking: false` (the search has
 /// finished). Returns the final params so the caller can assert on hit count and items.
 async fn drain_grep_until_done(
@@ -14863,13 +15286,24 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     let final_update = drain_grep_until_done(&mut ws).await;
     assert_eq!(final_update.kind, PickerKind::Grep);
     assert_eq!(final_update.generation, 1);
-    // 2 hits in main.rs + 1 hit in lib.rs = 3 GrepHits total.
+    // 2 hits in main.rs + 1 hit in lib.rs = 3 GrepHits total (headers don't count).
     assert_eq!(final_update.total_matches, 3);
-    let hit = final_update
+    // One header row per file, hit counts on the rows; the first group (lib.rs) opens itself.
+    assert_eq!(
+        group_rows(final_update.items()),
+        vec![
+            ("src/lib.rs".to_string(), 1, true),
+            ("src/main.rs".to_string(), 2, false),
+        ]
+    );
+    // Re-select lib.rs's group and re-view to get its hit row in hand.
+    let (row, update) = select_file_group(&mut ws, 30, PickerKind::Grep, 0, "src/lib.rs").await;
+    assert_eq!(row, 0, "lib.rs's header stays the first row");
+    let hit = update
         .items()
         .iter()
         .find(|i| matches!(i, PickerItem::GrepHit { relative_path, .. } if relative_path == "src/lib.rs"))
-        .expect("lib.rs hit present");
+        .expect("lib.rs hit present after expanding its group");
     let (line, col, preview) = match hit {
         PickerItem::GrepHit {
             line, col, preview, ..
@@ -16322,19 +16756,21 @@ async fn jumplist_capture_from_git_changes_picker() {
     drop(server);
 }
 
-/// The Jumplist picker (`Space j`): rows are the captured entries with their source group
-/// headers; a fuzzy query narrows them in place (candidate order preserved); selecting jumps
-/// like the source picker's Enter; and `Ctrl-j` re-captures the filtered subset — iterative
-/// narrowing (docs/jumplist.md §2.6).
+/// The Jumplist picker (`Space j`): a collapsible accordion of the captured entries under
+/// their source group headers (one run always open — the selected group; `picker/set_group`
+/// moves it); a fuzzy query narrows the entries in place (candidate order preserved);
+/// selecting jumps like the source picker's Enter; and `Ctrl-j` re-captures the filtered
+/// subset — iterative narrowing (docs/jumplist.md §2.6).
 #[tokio::test]
 async fn jumplist_picker_lists_filters_and_recaptures() {
-    use aether_protocol::picker::GroupHeader;
-
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
     let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
 
-    // Open the picker: three rows in captured order under their file headers.
+    // Open the picker: the Jumplist is collapsible (docs/picker-groups.md §9), so with
+    // nothing centred the accordion opens with one selectable `Group` row per captured file
+    // and the FIRST group's entries inline — the rest hidden behind their headers (but still
+    // counted: collapse is view state).
     let view = send_request::<PickerView>(
         &mut ws,
         22,
@@ -16358,49 +16794,66 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     let update = view.update.expect("the view carries its initial window");
     assert_eq!(update.kind, PickerKind::Jumplist);
     let items = update.items();
-    assert_eq!(items.len(), 3);
+    assert_eq!(
+        group_rows(items),
+        vec![
+            ("src/lib.rs".to_string(), 1, true),
+            ("src/main.rs".to_string(), 2, false),
+        ],
+        "one header per file, in captured order, the first group open"
+    );
+    assert_eq!(items.len(), 3, "2 headers + lib.rs's entry inline");
+    assert!(
+        matches!(&items[1], PickerItem::JumplistEntry { index: 0, .. }),
+        "the open group's entry follows its header, got {:?}",
+        items[1]
+    );
+
+    // Select main.rs: its entries interleave below the header, each carrying its landing line
+    // (0-based) for the right-aligned line number — main.rs's hits are on lines 1 and 2.
+    let (_row, update) =
+        select_file_group(&mut ws, 23, PickerKind::Jumplist, 0, "src/main.rs").await;
+    let items = update.items();
+    assert_eq!(
+        items.len(),
+        4,
+        "two headers + the expanded run's two entries"
+    );
     let PickerItem::JumplistEntry {
         index,
         line,
         display,
         ..
-    } = &items[0]
+    } = &items[2]
     else {
-        panic!("expected JumplistEntry, got {:?}", items[0]);
+        panic!("expected JumplistEntry, got {:?}", items[2]);
     };
-    assert_eq!(*index, 0);
-    // The row carries the entry's landing line (0-based) for the right-aligned line number —
-    // lib.rs's hit is on line 0; main.rs's hits below are on lines 1 and 2.
-    assert_eq!(*line, 0);
+    assert_eq!(*index, 1);
+    assert_eq!(*line, 1);
     assert!(
         display.contains("needle"),
         "row text is the source line: {display}"
     );
-    let lines: Vec<u32> = items
-        .iter()
-        .map(|it| match it {
-            PickerItem::JumplistEntry { line, .. } => *line,
-            other => panic!("expected JumplistEntry, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(lines, vec![0, 1, 2], "each row carries its source line");
-    // Group spans carry the source picker's file headers.
     assert!(
-        update.groups.iter().any(|g| matches!(
-            &g.header,
-            GroupHeader::File { relative_path, .. } if relative_path == "src/lib.rs"
-        )),
-        "lib.rs header present, got {:?}",
-        update.groups
+        matches!(
+            &items[3],
+            PickerItem::JumplistEntry {
+                index: 2,
+                line: 2,
+                ..
+            }
+        ),
+        "the run's second entry follows, got {:?}",
+        items[3]
     );
 
     // Enter on a row jumps exactly like the source picker's select (match landed selected).
     let selected: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
-        23,
+        25,
         &PickerSelectParams {
             kind: PickerKind::Jumplist,
-            item: items[2].clone(),
+            item: items[3].clone(),
         },
     )
     .await;
@@ -16421,7 +16874,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     // "fn needle() {}" (no semicolon).
     let _: () = send_request::<PickerQuery>(
         &mut ws,
-        24,
+        26,
         &PickerQueryParams {
             filters: Default::default(),
             kind: PickerKind::Jumplist,
@@ -16435,7 +16888,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     // entry (main.rs:1), which becomes the narrowed list's first.
     let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
         &mut ws,
-        25,
+        27,
         &JumplistCaptureParams {
             kind: PickerKind::Jumplist,
             item: PickerItem::JumplistEntry {
@@ -16457,13 +16910,13 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
 
     // Stepping now walks the narrowed set only: from the top of main.rs → 1, 2, then stops at
     // the end — lib.rs's entry is no longer in the list.
-    set_point_cursor(&mut ws, 26, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    set_point_cursor(&mut ws, 28, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
     let mut current = buffer_id;
     let mut seen = Vec::new();
     for i in 0..2u64 {
         let target = send_request::<JumplistStep>(
             &mut ws,
-            27 + i,
+            29 + i,
             &JumplistStepParams {
                 buffer_id: current,
                 direction: Direction::Forward,
@@ -16539,6 +16992,26 @@ async fn jumplist_picker_centers_on_the_cursor_nearest_entry() {
         Some(PickerItem::JumplistEntry { index, .. }) => assert_eq!(index, 1),
         other => panic!("expected a resolved JumplistEntry, got {other:?}"),
     }
+    // Framing an entry implies revealing it: the centred entry's group opens expanded, the
+    // other file's stays a collapsed header (the collapsible centred-open rule).
+    let update = view.update.expect("the view carries its window");
+    let expanded: Vec<(&str, bool)> = update
+        .items()
+        .iter()
+        .filter_map(|it| match it {
+            PickerItem::Group {
+                header: GroupHeader::File { relative_path, .. },
+                expanded,
+                ..
+            } => Some((relative_path.as_str(), *expanded)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        expanded,
+        vec![("src/lib.rs", false), ("src/main.rs", true)],
+        "the cursor-nearest entry's group auto-expands"
+    );
 
     // Past every entry in the buffer's file — and the list — the resolution wraps to #0.
     set_point_cursor(&mut ws, 24, buffer_id, LogicalPosition { line: 3, col: 0 }).await;
@@ -21565,7 +22038,48 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
         .await;
         if let Some(items) = view.update.as_ref().and_then(|u| u.items.clone()) {
             if !items.is_empty() {
-                return items;
+                // The first group opens itself (docs/picker-groups.md §9), but symbols can
+                // span several files: select the first group explicitly and re-view so
+                // callers get its Symbol rows; headers are stripped from the return.
+                let Some(PickerItem::Group { header, .. }) = items.first() else {
+                    return items;
+                };
+                let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
+                    ws,
+                    400,
+                    &PickerSetGroupParams {
+                        kind: PickerKind::WorkspaceSymbols,
+                        header: Some(header.clone()),
+                        step: None,
+                    },
+                )
+                .await;
+                let view = send_request::<PickerView>(
+                    ws,
+                    401,
+                    &PickerViewParams {
+                        kind: PickerKind::WorkspaceSymbols,
+                        reset: PickerReset::Keep,
+                        offset: 0,
+                        limit: 50,
+                        from_selection: false,
+                        filters: None,
+                        center_on: None,
+                        center_on_cursor: None,
+                        directory_path: None,
+                        buffer_id: None,
+                        explorer_roots: false,
+                        keybindings: None,
+                    },
+                )
+                .await;
+                return view
+                    .update
+                    .and_then(|u| u.items)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|i| !matches!(i, PickerItem::Group { .. }))
+                    .collect();
             }
         }
     }
@@ -23694,17 +24208,21 @@ async fn grep_with_filters(
     }
 }
 
-/// The relative paths hit by an update, deduplicated, in result order.
+/// The relative paths hit by an update, in result order — read off the collapsed window's
+/// `Group` header rows, which carry exactly one row per matched file
+/// (docs/picker-groups.md).
 fn grep_hit_files(update: &PickerUpdateParams) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for item in update.items() {
-        if let PickerItem::GrepHit { relative_path, .. } = item {
-            if out.last() != Some(relative_path) {
-                out.push(relative_path.clone());
-            }
-        }
-    }
-    out
+    update
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            PickerItem::Group {
+                header: GroupHeader::File { relative_path, .. },
+                ..
+            } => Some(relative_path.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -23904,7 +24422,9 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
     // Only the text file hits — the binary is skipped, not searched as raw bytes.
     assert_eq!(grep_hit_files(&update), vec!["minified.js"]);
     assert_eq!(update.total_matches, 1);
-    match &update.items()[0] {
+    // The hit rides behind its collapsed header; expand to get the row.
+    let (_, update) = select_file_group(&mut ws, 11, PickerKind::Grep, 0, "minified.js").await;
+    match &update.items()[1] {
         PickerItem::GrepHit {
             preview,
             match_indices,
@@ -24380,15 +24900,20 @@ async fn grep_filter_root_scope() {
     let update = grep_with_filters(&mut ws, 10, "needle", filters, 1).await;
     assert_eq!(update.total_matches, 1);
     match &update.items()[0] {
-        PickerItem::GrepHit {
-            path_index,
-            relative_path,
+        PickerItem::Group {
+            header:
+                GroupHeader::File {
+                    path_index,
+                    relative_path,
+                },
+            count,
             ..
         } => {
             assert_eq!(*path_index, 1);
             assert_eq!(relative_path, "b.txt");
+            assert_eq!(*count, 1);
         }
-        other => panic!("expected GrepHit, got {other:?}"),
+        other => panic!("expected b.txt's group header, got {other:?}"),
     }
     // Scopes in *different roots* union — the expressiveness globs can't reach (a glob is
     // root-relative but applies across all roots; only a dir scope pins one).

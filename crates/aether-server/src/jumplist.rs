@@ -39,8 +39,11 @@ pub struct JumplistEntry {
     pub abs_path: String,
     pub position: LogicalPosition,
     pub anchor: Option<LogicalPosition>,
-    /// The source picker's group header for this row (file or section label); `None` for the
-    /// ungrouped kinds (buffer diagnostics, document symbols, single-file changes).
+    /// The source picker's group header for this row (file or section label). `None` only
+    /// while a capture is being assembled — the ungrouped source kinds (buffer diagnostics,
+    /// document symbols, single-file changes) leave it empty and [`assign_file_groups`] fills
+    /// it in. Every *stored* entry has one: the Jumplist picker is collapsible, and its row
+    /// space requires every row keyed (docs/picker-groups.md).
     pub group: Option<GroupHeader>,
     /// The source row's text — the Jumplist picker's row + fuzzy haystack.
     pub display: String,
@@ -226,7 +229,7 @@ fn relative_parts(path_index: u32, relative_path: &str) -> (Option<u32>, Option<
 }
 
 /// Enrich freshly captured entries with their file identity: derive each entry's workspace-relative
-/// parts from `abs_path` (when it lives inside `roots`) and give any still-ungrouped entry a `File`
+/// parts from `abs_path` (when it lives inside `roots`) and give every still-ungrouped entry a
 /// group header. Run by the capture handler, which has the active workspace's roots.
 ///
 /// Two jobs, one pass:
@@ -234,10 +237,13 @@ fn relative_parts(path_index: u32, relative_path: &str) -> (Option<u32>, Option<
 ///   document symbols render flat — no file header. But the jumplist is reopened from anywhere,
 ///   often on a *different* buffer, so every row must show which file it belongs to. Entries that
 ///   already carry a header (grep's `File`, references' `Definition`/`References` labels) keep it.
+///   Out-of-workspace files (references into dependencies) get their absolute path as a `Label`
+///   header — the WorkspaceSymbols convention, and what makes grouping *total*: the Jumplist
+///   picker's collapsible row space keys every row (docs/picker-groups.md).
 /// - **Path consistency.** Buffer-scoped candidates arrive with no relative parts (see
 ///   [`relative_parts`]); filling them from `abs_path` makes the open resolve the same file the
-///   source picker's *select* would (which opens by `abs_path`) instead of erroring. Out-of-workspace
-///   files (references into dependencies) keep `None` parts and open by absolute path, ungrouped.
+///   source picker's *select* would (which opens by `abs_path`) instead of erroring.
+///   Out-of-workspace files keep `None` parts and open by absolute path.
 pub fn assign_file_groups(entries: &mut [JumplistEntry], roots: &[std::path::PathBuf]) {
     for e in entries {
         if e.relative_path.is_none() {
@@ -250,13 +256,15 @@ pub fn assign_file_groups(entries: &mut [JumplistEntry], roots: &[std::path::Pat
             }
         }
         if e.group.is_none() {
-            if let (Some(path_index), Some(relative_path)) = (e.path_index, e.relative_path.clone())
-            {
-                e.group = Some(GroupHeader::File {
+            e.group = Some(match (e.path_index, e.relative_path.clone()) {
+                (Some(path_index), Some(relative_path)) => GroupHeader::File {
                     path_index,
                     relative_path,
-                });
-            }
+                },
+                _ => GroupHeader::Label {
+                    label: e.abs_path.clone(),
+                },
+            });
         }
     }
 }
@@ -857,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn assign_file_groups_keeps_labels_and_leaves_external_files_ungrouped() {
+    fn assign_file_groups_keeps_labels_and_labels_external_files_by_abs_path() {
         let roots = vec![std::path::PathBuf::from("/ws")];
         let mut labeled_entry = headerless("/ws/a.rs");
         labeled_entry.group = Some(GroupHeader::Label {
@@ -869,9 +877,15 @@ mod tests {
         // An existing header (references' Label) is preserved; parts are still derived.
         assert!(matches!(entries[0].group, Some(GroupHeader::Label { .. })));
         assert_eq!(entries[0].relative_path.as_deref(), Some("a.rs"));
-        // Out-of-workspace: nothing to derive, stays ungrouped (opens by absolute path).
+        // Out-of-workspace: no parts to derive (opens by absolute path), but grouping is total —
+        // the collapsible picker keys every row — so the absolute path becomes the header.
         assert_eq!(entries[1].path_index, None);
         assert_eq!(entries[1].relative_path, None);
-        assert_eq!(entries[1].group, None);
+        assert_eq!(
+            entries[1].group,
+            Some(GroupHeader::Label {
+                label: "/elsewhere/dep.rs".into(),
+            })
+        );
     }
 }

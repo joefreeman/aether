@@ -392,6 +392,17 @@ export type PickerItem =
       /** The captured entry's flat display text (docs/jumplist.md §2.2). */
       display: string;
       match_indices?: number[];
+    }
+  | {
+      kind: "group";
+      /** A collapsible group's header row (docs/picker-groups.md §9) — a real, selectable
+       *  window row, not a derived decoration. Click selects (and expands) the group; Enter
+       *  jumps to its first item — both routed through the core. */
+      header: GroupHeader;
+      /** Items in the run, shown on the row whether collapsed or expanded. */
+      count: number;
+      /** Whether the run's items follow this row in the window. Absent = collapsed. */
+      expanded?: boolean;
     };
 
 /** Mirrors aether-protocol::picker::GroupHeader (serde tag = "kind", snake_case). What a group's
@@ -411,4 +422,9 @@ export type GroupHeader =
 export interface GroupSpan {
   start: number;
   header: GroupHeader;
+  /** Collapsible kinds only (docs/picker-groups.md): the run's item count and whether it is
+   *  the expanded run — the same decoration as its `group` row, so a sticky pin standing in
+   *  for a scrolled-off header renders identically. Absent for the derived-header kinds. */
+  count?: number;
+  expanded?: boolean;
 }

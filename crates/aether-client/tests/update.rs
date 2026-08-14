@@ -923,6 +923,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         groups: Vec::new(),
         display_offset: Some(0),
         total_display_rows: Some(matches + 1),
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -986,6 +987,7 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
         groups: Vec::new(),
         display_offset: Some(0),
         total_display_rows: Some(matches),
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1058,6 +1060,7 @@ fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1304,6 +1307,412 @@ fn alt_l_and_alt_h_jump_keybinding_groups_via_section_jump() {
     assert_eq!(params["direction"], "backward");
 }
 
+/// A collapsible picker window (docs/picker-groups.md): a.rs collapsed with 2 hidden hits,
+/// b.rs expanded (selected group) with its 2 hits inline. Row space: [0]=a.rs hdr,
+/// [1]=b.rs hdr, [2..3]=hits.
+fn grep_with_groups(s: &mut Session) {
+    use aether_protocol::picker::{ExpandedRun, GroupHeader, GroupSpan, PickerItem, PickerKind};
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let p = s.picker.as_mut().unwrap();
+    let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
+        header: GroupHeader::File {
+            path_index: 0,
+            relative_path: path.into(),
+        },
+        count,
+        expanded,
+    };
+    let hit = |line: u32| PickerItem::GrepHit {
+        path_index: 0,
+        relative_path: "b.rs".into(),
+        line,
+        col: 0,
+        preview: "x".into(),
+        match_indices: vec![],
+    };
+    p.items = vec![
+        group("a.rs", 2, false),
+        group("b.rs", 2, true),
+        hit(1),
+        hit(2),
+    ];
+    p.groups = ["a.rs", "b.rs"]
+        .iter()
+        .enumerate()
+        .map(|(i, path)| GroupSpan {
+            start: i as u32,
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: (*path).into(),
+            },
+            count: Some(2),
+            expanded: Some(i == 1),
+        })
+        .collect();
+    p.total_matches = 4;
+    p.total_display_rows = 4;
+    p.expanded_run = Some(ExpandedRun {
+        header_row: 1,
+        len: 2,
+    });
+}
+
+#[test]
+fn alt_l_descends_into_the_selected_group() {
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // On the selected (expanded) group's header: Alt-l descends onto the run's first item —
+    // a local move, no round-trip (docs/picker-groups.md §9).
+    s.picker.as_mut().unwrap().selected = 1;
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    assert!(find_request(&fx, "picker/section_jump").is_none());
+    assert_eq!(s.picker.as_ref().unwrap().selected, 2);
+    // On an item row: as deep as it goes — nothing fires.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    // On a header that is NOT the open group (transient, post-re-rank): Alt-l re-selects
+    // that group first — each press makes progress.
+    s.picker.as_mut().unwrap().selected = 0;
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("Alt-l re-selects the group");
+    assert_eq!(params["kind"], "grep");
+    assert_eq!(params["header"]["relative_path"], "a.rs");
+    assert!(params.get("step").is_none(), "header-addressed, not a step");
+}
+
+#[test]
+fn alt_h_ascends_to_the_header_and_never_touches_the_query() {
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // On an item row: ascend onto the run's header — a local move, nothing collapses
+    // (moving the group selection is what moves the expansion, docs/picker-groups.md §9).
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.selected = 3;
+        p.level = aether_client::picker::PickerLevel::Item;
+    }
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx), "ascend is local — no set_group");
+    // A plain row reveal — run framing is the group *select* gesture's, not ascend's.
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::RevealPickerSelection(aether_client::picker::Reveal::Minimal)
+        )),
+        "ascend reveals minimally"
+    );
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        1,
+        "lands on the header"
+    );
+    // On a header: as shallow as it goes — a no-op. Alt-h never wipes the query
+    // (that's Alt-Backspace's).
+    let p = s.picker.as_mut().unwrap();
+    p.selected = 0;
+    p.query = "needle".into();
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(
+        s.picker.as_ref().unwrap().query,
+        "needle",
+        "the query survives Alt-h"
+    );
+    // Alt-Backspace is the unwind: clear the query — and never a group gesture.
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    assert!(
+        find_request(&fx, "picker/query").is_some(),
+        "unwind stage: clear the query"
+    );
+    assert_eq!(s.picker.as_ref().unwrap().query, "");
+}
+
+#[test]
+fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
+    use aether_client::picker::GroupLanding;
+    use aether_client::update::Event;
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // Group level (selection on a header): Alt-j/k are a server-resolved group *step* —
+    // the neighbour may sit past the fetched window (docs/picker-groups.md §9).
+    s.picker.as_mut().unwrap().selected = 1;
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("group-level Alt-j steps");
+    assert_eq!(params["step"], "forward");
+    assert!(params.get("header").is_none(), "step-addressed, no header");
+    // Resolve the gesture (a stop releases the single-flight guard at reply time — no
+    // reshaping push follows a stop) so the next key isn't swallowed.
+    let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("group-level Alt-k steps");
+    assert_eq!(params["step"], "backward");
+    let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
+    // Item level — entered by the *descend gesture* (Alt-l), which is what flips the stored
+    // level bit; poking `selected` into the run alone must not (that's the held-key guard,
+    // see `PickerLevel`). Local moves clamp to the run.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 2);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    assert_eq!(s.picker.as_ref().unwrap().selected, 3);
+    // At the run's last row Alt-j *spills* into the next group — an RPC, not a local
+    // walk-out; the selection waits for the reply. (Landings are exercised in
+    // item_level_spills_across_group_edges.)
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
+    assert_eq!(params["step"], "forward");
+    assert_eq!(s.picker.as_ref().unwrap().selected, 3);
+    let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::RunStart)); // the very end: a stop
+                                                                           // Back inside, Alt-k walks locally…
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    assert_eq!(s.picker.as_ref().unwrap().selected, 2);
+    // …and at the run's first row it spills backward.
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("upward spill steps back");
+    assert_eq!(params["step"], "backward");
+}
+
+/// The held-`Alt-j` race (see `PickerLevel` / `group_gesture_in_flight`): a group step's
+/// outcome arrives as two order-independent messages — the reply moves `selected`, the
+/// reshaping push moves `expanded_run`. A repeat firing between them used to derive "item
+/// level" from the *new* selection row against the *stale* run interval and walk into the
+/// run. Now repeats during a gesture are swallowed (single-flight, released by the push's
+/// adoption), and the stored level bit backstops the routing either way.
+#[test]
+fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
+    use aether_client::picker::GroupLanding;
+    use aether_client::update::Event;
+    use aether_protocol::picker::ExpandedRun;
+    let mut s = session();
+    grep_with_groups(&mut s);
+    s.picker.as_mut().unwrap().selected = 1; // b.rs's header — group level
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_some());
+    // A repeat while the gesture is mid-reshape is swallowed, not misrouted.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx), "repeat during the gesture is swallowed");
+    // The reply lands the next group's header row *in the incoming row space* (row 2), while
+    // the stale local `expanded_run` ({header_row: 1, len: 2}) still claims rows 2..=3 as
+    // b.rs's items — the misclassifying pair (the reshaping push hasn't been adopted yet).
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(ExpandedRun {
+            header_row: 2,
+            len: 4,
+        })),
+        GroupLanding::Header,
+    ));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 2);
+    // A repeat in the reply→push gap: still swallowed — and crucially NOT a local walk into
+    // the stale interval.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 2, "no local walk");
+    // The reshaping push adopts (fresh run + guard release): stepping resumes.
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.expanded_run = Some(ExpandedRun {
+            header_row: 2,
+            len: 4,
+        });
+        p.group_gesture_in_flight = false;
+    }
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("stepping resumes after adoption");
+    assert_eq!(params["step"], "forward");
+}
+
+/// Item-level `Alt-j`/`Alt-k` spill over the run's edges (docs/picker-groups.md §9): down
+/// off the last item enters the next group at its *first* item, up off the first enters the
+/// previous at its *last* — both staying at item level, revealed minimally (a continuous
+/// scan, not a run framing).
+#[test]
+fn item_level_spills_across_group_edges() {
+    use aether_client::picker::{GroupLanding, Reveal};
+    use aether_client::update::Event;
+    use aether_protocol::picker::ExpandedRun;
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // Enter b.rs's run (header row 1, items 2..=3) and walk to its last item.
+    s.picker.as_mut().unwrap().selected = 1;
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS); // descend → 2
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS); // → 3 (last)
+                                                                 // Down off the last item: the same step RPC as group navigation — the landing intent
+                                                                 // stays client-side.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
+    assert_eq!(params["step"], "forward");
+    // The reply carries the newly selected run's geometry; a RunStart landing enters at its
+    // first item — item level, minimal reveal.
+    let fx = s.on_event(Event::GroupSet(
+        Ok(Some(ExpandedRun {
+            header_row: 4,
+            len: 5,
+        })),
+        GroupLanding::RunStart,
+    ));
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        5,
+        "first item of the entered run"
+    );
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::RevealPickerSelection(Reveal::Minimal))),
+        "spills reveal minimally, not run-framed"
+    );
+    // A RunEnd landing (an upward spill) enters at the previous run's last item.
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(ExpandedRun {
+            header_row: 0,
+            len: 4,
+        })),
+        GroupLanding::RunEnd,
+    ));
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        4,
+        "last item of the entered run"
+    );
+    // Once the reshaping push adopts (run + guard release), local walking resumes at item
+    // level from the landing row.
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.expanded_run = Some(ExpandedRun {
+            header_row: 0,
+            len: 4,
+        });
+        p.group_gesture_in_flight = false;
+    }
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    assert_eq!(s.picker.as_ref().unwrap().selected, 3, "local move resumes");
+}
+
+#[test]
+fn alt_h_is_unbound_in_flat_pickers() {
+    use aether_protocol::picker::PickerKind;
+    // Files: Alt-h used to clear the query, duplicating Alt-Backspace; now only Alt-Backspace
+    // unwinds and Alt-h does nothing (and must not leak an `h` into the query).
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    s.picker.as_mut().unwrap().query = "needle".into();
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().query, "needle");
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(
+        find_request(&fx, "picker/query").is_some(),
+        "Alt-Backspace still clears"
+    );
+    assert_eq!(s.picker.as_ref().unwrap().query, "");
+}
+
+#[test]
+fn explorer_alt_h_ascends_regardless_of_the_query() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj/src/sub".into());
+        p.directory_parent = Some("/proj/src".into());
+        p.query = "ma".into();
+    }
+    // Alt-h is the structural mirror of Alt-l's descend: one press ascends the breadcrumb even
+    // with a query typed (navigation starts a fresh listing) — clearing the query *first* and
+    // staying put is Alt-Backspace's unwind, not Alt-h's.
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let view = find_request(&fx, "picker/view").expect("ascends via picker/view");
+    assert_eq!(view["directory_path"], json!("/proj/src"));
+}
+
+#[test]
+fn enter_on_a_group_header_jumps_to_its_first_item() {
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // Enter on a header IS a jump (docs/picker-groups.md §9): the Group row rides
+    // `picker/select` and the server resolves it to the group's first item — so
+    // type-query-then-Enter takes the top hit without a mandatory descend. The picker
+    // closes like any accept.
+    s.picker.as_mut().unwrap().selected = 0;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(find_request(&fx, "picker/set_group").is_none());
+    let params = find_request(&fx, "picker/select").expect("Enter selects the header");
+    assert_eq!(params["item"]["kind"], "group");
+    assert_eq!(params["item"]["header"]["relative_path"], "a.rs");
+    assert!(find_request(&fx, "picker/hide").is_some());
+    assert!(s.picker.is_none(), "accept closes the picker");
+}
+
+#[test]
+fn clicking_a_group_header_selects_it_instead_of_jumping() {
+    use aether_client::update::Event;
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // A header click is the disclosure gesture: select (and expand) the group — no select,
+    // no close. The mouse path to a jump is clicking a visible item row.
+    let fx = s.on_event(Event::PickerClicked(0));
+    let params = find_request(&fx, "picker/set_group").expect("click selects the group");
+    assert_eq!(params["header"]["relative_path"], "a.rs");
+    assert!(find_request(&fx, "picker/select").is_none());
+    assert!(s.picker.is_some(), "the picker stays open");
+    // Clicking an item row accepts it, as ever.
+    let fx = s.on_event(Event::PickerClicked(2));
+    assert!(find_request(&fx, "picker/select").is_some());
+}
+
+#[test]
+fn group_set_landing_seats_the_selection() {
+    use aether_client::picker::{GroupLanding, Reveal};
+    use aether_client::update::Event;
+    use aether_protocol::picker::ExpandedRun;
+    let mut s = session();
+    grep_with_groups(&mut s);
+    s.picker.as_mut().unwrap().selected = 3;
+    // A Header landing seats the selection on the selected run's header row.
+    let fx = s.on_event(Event::GroupSet(
+        Ok(Some(ExpandedRun {
+            header_row: 1,
+            len: 2,
+        })),
+        GroupLanding::Header,
+    ));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 1);
+    assert!(no_request(&fx), "in-window: no refetch needed");
+    // Group navigation frames the whole freshly-opened run, not just its header row —
+    // immediately and re-armed for the reshaped push (docs/picker-groups.md §9).
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::RevealPickerSelection(Reveal::Run))),
+        "group select reveals the run"
+    );
+    assert_eq!(
+        s.picker.as_ref().unwrap().reveal_on_update,
+        Some(Reveal::Run)
+    );
+    // A landing outside the fetched window chases with a refetch.
+    let fx = s.on_event(Event::GroupSet(
+        Ok(Some(ExpandedRun {
+            header_row: 90,
+            len: 3,
+        })),
+        GroupLanding::Header,
+    ));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 90);
+    assert!(
+        find_request(&fx, "picker/view").is_some(),
+        "out-of-window: refetch"
+    );
+    // A vanished group / a step off the ends adopts nothing.
+    let before = s.picker.as_ref().unwrap().selected;
+    let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
+    assert_eq!(s.picker.as_ref().unwrap().selected, before);
+}
+
 #[test]
 fn enter_on_a_keybinding_row_is_a_noop() {
     use aether_protocol::picker::{PickerItem, PickerKind};
@@ -1414,6 +1823,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2558,6 +2968,7 @@ fn picker_view_response_renders_items_without_the_push() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -2618,6 +3029,7 @@ fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total:
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -3651,6 +4063,7 @@ fn selecting_the_create_row_creates_the_file() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -4181,6 +4594,7 @@ fn workspace_create_row_appears_for_a_novel_name_in_the_workspaces_picker() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
+        expanded_run: None,
         center_on: None,
         explorer_peek_missing: false,
     });
@@ -4220,6 +4634,7 @@ fn accepting_the_workspaces_create_row_emits_workspace_create() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -5237,6 +5652,7 @@ fn symbol_push_center_on_lands_the_highlight() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: Some(Box::new(sym(5, "b"))),
             explorer_peek_missing: false,
         })
@@ -5299,6 +5715,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
+            expanded_run: None,
             center_on: Some(Box::new(sym(81, "externally_modified"))),
             explorer_peek_missing: false,
         })

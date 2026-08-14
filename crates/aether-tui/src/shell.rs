@@ -178,6 +178,12 @@ pub struct Shell {
     /// survives a recentering refetch (and its empty-items frames). Reset by
     /// `Effect::PickerScrollReset`.
     picker_scroll: crate::ui::PickerScroll,
+    /// Armed by `Effect::RevealPickerSelection(Reveal::Run)` — a group select/step wants the
+    /// freshly-opened run framed (docs/picker-groups.md §9). Applied by `sync_picker` once the
+    /// core state is coherent (the selected row IS the expanded run's header — the reshaped
+    /// push may land a batch after the reply); cleared then, on a scroll reset, and when the
+    /// picker closes.
+    pending_group_reveal: bool,
     /// Monotonic id for the latest `viewport/subscribe`. Stale `Done::Subscribed` responses
     /// (whose epoch != this) are dropped so a superseded subscribe can't reinstate a viewport
     /// the server has already replaced.
@@ -276,6 +282,7 @@ pub async fn run(
         reveal_after_fetch: None,
         place_after_fetch: None,
         picker_scroll: crate::ui::PickerScroll::default(),
+        pending_group_reveal: false,
         subscribe_epoch: 0,
         last_click: None,
         click_streak: 0,
@@ -520,12 +527,18 @@ impl Shell {
                         self.reveal_cursor();
                     }
                 }
-                Effect::RevealPickerSelection(_) | Effect::PickerScrollReset => {
-                    // Selection reveals are handled by the sync (`visible_start` follows
-                    // `selected`); a reset just snaps the window to the top.
-                    if matches!(effect, Effect::PickerScrollReset) {
-                        self.picker_scroll = crate::ui::PickerScroll::default();
+                Effect::RevealPickerSelection(reveal) => {
+                    // Plain selection reveals are handled by the sync (`visible_start` follows
+                    // `selected`); the group-run flavour (docs/picker-groups.md §9) arms a
+                    // scroll adjustment `sync_picker` applies once the run is coherent.
+                    if matches!(reveal, aether_client::picker::Reveal::Run) {
+                        self.pending_group_reveal = true;
                     }
+                }
+                Effect::PickerScrollReset => {
+                    // A reset just snaps the window to the top (and outruns any armed reveal).
+                    self.picker_scroll = crate::ui::PickerScroll::default();
+                    self.pending_group_reveal = false;
                 }
                 Effect::Reconnect { attempt } => self.spawn_reconnect(attempt),
                 Effect::HintTickNow => {
@@ -2333,6 +2346,7 @@ impl Shell {
         let p = &mut self.state.picker;
         let Some(core) = &self.session.picker else {
             p.open = false;
+            self.pending_group_reveal = false;
             return;
         };
         p.open = true;
@@ -2401,7 +2415,7 @@ impl Shell {
         // boundary — the item-index math jumped a header + gap there. `picker_scroll_step` also
         // carries the on-screen position across a recentering refetch (and preserves it through
         // the empty-items frames a fast scroll produces, rather than snapping to the top).
-        let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups);
+        let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups, core.kind.collapsible());
         let pin = crate::ui::pins_group_header(core.kind) && !p.groups.is_empty();
         self.picker_scroll = crate::ui::picker_scroll_step(
             &rows,
@@ -2411,6 +2425,28 @@ impl Shell {
             core.offset,
             self.picker_scroll,
         );
+        // A group select/step armed the run reveal (docs/picker-groups.md §9): once the core
+        // is coherent — the selection IS the expanded run's header, inside the fetched
+        // window — frame the run and disarm. Until then it stays armed: the reshaped push can
+        // land a batch after the reply that moved the selection.
+        if self.pending_group_reveal {
+            if let Some(run) = core.expanded_run {
+                if run.header_row == core.selected && run.header_row >= core.offset {
+                    let header_rel = (run.header_row - core.offset) as usize;
+                    if header_rel < rows.len() {
+                        let top = crate::ui::picker_scroll_for_run(
+                            self.picker_scroll.top,
+                            p.pane_rows.max(1) as usize,
+                            header_rel,
+                            run.len as usize,
+                        );
+                        self.picker_scroll.top = top;
+                        self.picker_scroll.sel_pane = header_rel.saturating_sub(top);
+                        self.pending_group_reveal = false;
+                    }
+                }
+            }
+        }
         p.visible_start = self.picker_scroll.top;
     }
 

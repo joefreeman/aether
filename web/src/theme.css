@@ -1090,6 +1090,38 @@ a.picker-row:not(.selected):hover .picker-main {
    below). Must stay equal to shell.ts's GROUP_GAP_PX: the shell adds the same pixels to the
    spacer height and window offset so the virtual scroll stays honest. */
 .picker-section:not(:last-child) { margin-bottom: 6px; }
+/* Collapsible kinds (docs/picker-groups.md): headers are real, selectable window rows — restore
+   the flex row layout (the derived headers are block + ellipsis), pointer cursor, no
+   inter-section gap (headers are uniform rows, so the geometry carries no gap pixels), and the
+   selection band must win over the header backdrop (the base header rule sets nord1 later in
+   the sheet than `.picker-row.selected`). */
+.picker-list.collapsible .picker-section:not(:last-child) { margin-bottom: 0; }
+.picker-list.collapsible .picker-row.picker-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  /* Not bold (unlike the derived section headers): the item indent under the header carries
+     the hierarchy; NORD8 alone marks the row as chrome (docs/picker-groups.md §9.2). */
+  font-weight: normal;
+}
+.picker-list.collapsible .picker-row.picker-group-header .picker-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Fixed-width mark cell so the header text starts at a known x — the item indent below lines
+   item text up under it (docs/picker-groups.md §9). */
+.picker-list.collapsible .picker-row.picker-group-header .picker-group-mark { flex: 0 0 auto; width: 1em; }
+/* Two-level hierarchy: item rows indent under their group header's text — the mark cell + the
+   header's 6px flex gap past the row's base 12px padding. Headers start flush. */
+.picker-list.collapsible .picker-row:not(.picker-group-header) { padding-left: calc(12px + 1em + 6px); }
+.picker-list.collapsible .picker-row.picker-group-header .picker-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--nord3-bright);
+  font-weight: normal;
+}
+.picker-list.collapsible .picker-row.picker-group-header.selected { background: var(--nord2); }
 /* Grep hits are code lines — the editor's mono font. Scoped to the preview text only; the line
    number keeps the picker's sans-serif. */
 .picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }

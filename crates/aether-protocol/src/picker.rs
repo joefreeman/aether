@@ -122,10 +122,12 @@ pub enum PickerKind {
     WorkspaceSymbols,
     /// The client's jumplist (`Space j`, docs/jumplist.md), one row per
     /// captured entry, fuzzy-matched on the entry's display text, grouped by the entries'
-    /// carried source headers (file or section label; a list captured from an ungrouped source
-    /// renders flat). Rebuilt from the live list on every open — nothing to resume, the backing
-    /// list persists regardless. Selecting a row jumps to its entry (via `FileAt`); `Ctrl-j`
-    /// *re-captures* the currently-filtered subset, narrowing the list in place.
+    /// carried source headers (file or section label; capture guarantees every entry one —
+    /// out-of-workspace files get their absolute path as a label). Collapsible
+    /// ([`Self::collapsible`]): a centred open expands the cursor-nearest entry's group,
+    /// the rest sit collapsed. Rebuilt from the live list on every open — nothing to resume, the
+    /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
+    /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
     Jumplist,
 }
 
@@ -160,12 +162,35 @@ impl PickerKind {
         )
     }
 
-    /// Whether this picker interleaves non-selectable header rows above grouped runs of items.
-    /// A superset of [`Self::groups_by_file`]: the file-grouped kinds plus the section-labelled
-    /// ones — References (a `Definition` section and a `References` section) and Keybindings (one
-    /// section per binding group). The header *content* differs per kind — file path vs section
-    /// label — but the header *row* accounting is identical, so clients gate header-clearance and
-    /// virtual-scroll row math on this single predicate.
+    /// Whether this kind's groups are collapsible (docs/picker-groups.md): group headers are
+    /// pushed as first-class *selectable rows* ([`PickerItem::Group`]) interleaved into the
+    /// window — the whole window/offset/selection space counts rows, not bare items — with
+    /// exactly one group expanded at a time whenever there are groups (accordion): the
+    /// *selected* group. Selection is two-level: moving between groups expands the group
+    /// landed on (`picker/set_group`), descending puts the selection among the expanded run's
+    /// items. The [`Self::groups_by_file`] kinds plus WorkspaceSymbols and Jumplist today, but
+    /// deliberately a separate predicate: the two can diverge. The remaining grouped kinds
+    /// (References, Keybindings) keep derived, non-selectable, always-expanded headers.
+    pub fn collapsible(self) -> bool {
+        matches!(
+            self,
+            PickerKind::Grep
+                | PickerKind::GitChanges
+                | PickerKind::DiagnosticsWorkspace
+                | PickerKind::WorkspaceSymbols
+                | PickerKind::Jumplist
+        )
+    }
+
+    /// Whether this picker renders header rows above grouped runs of items (and the server
+    /// pushes [`GroupSpan`]s describing them). A superset of [`Self::groups_by_file`]: the
+    /// file-grouped kinds plus the section-labelled ones — References (a `Definition` section
+    /// and a `References` section), Keybindings (one section per binding group), Jumplist and
+    /// WorkspaceSymbols (file-or-label headers). The header
+    /// *content* differs per kind — file path vs section label — and so does the header row's
+    /// nature: for the [`Self::collapsible`] kinds it's a real, selectable window row
+    /// ([`PickerItem::Group`]); for the rest it's a client-derived decoration interleaved
+    /// above the run, gating header-clearance and virtual-scroll row math.
     pub fn renders_group_headers(self) -> bool {
         matches!(
             self,
@@ -620,6 +645,24 @@ pub enum PickerItem {
         /// Char offsets into [`KeybindingEntry::haystack`] covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
+    },
+    /// A group's header in the collapsible kinds ([`PickerKind::collapsible`],
+    /// docs/picker-groups.md) — a first-class, selectable *row* in the pushed window, not a
+    /// client-derived decoration like the other grouped kinds' headers. Identity is `header`'s
+    /// group key. Exactly one group is expanded whenever groups exist (accordion — the
+    /// *selected* group, docs/picker-groups.md §9); the expanded group's items follow its
+    /// header, every other group renders as a bare header row. `Enter` on a header *is* a
+    /// jump: `picker/select` resolves it server-side to the group's first item. Click selects
+    /// + expands via `picker/set_group`.
+    Group {
+        header: GroupHeader,
+        /// Items in the group's run — rendered on the row (the collapsed row's tell for
+        /// what's inside), counted whether or not the run is expanded.
+        count: u32,
+        /// Whether this run's items follow it in the row space. At most one `Group` in a
+        /// result set is expanded.
+        #[serde(default, skip_serializing_if = "is_false")]
+        expanded: bool,
     },
     /// One captured entry in the Jumplist picker (docs/jumplist.md). Identity is `index` —
     /// the entry's position in the captured list, stable for the picker's lifetime (the list
@@ -1167,6 +1210,78 @@ pub enum GroupHeader {
 pub struct GroupSpan {
     pub start: u32,
     pub header: GroupHeader,
+    /// Collapsible kinds only (docs/picker-groups.md): the run's item count and whether it is
+    /// the expanded run — the same decoration the run's [`PickerItem::Group`] row carries, so
+    /// a sticky pin standing in for a scrolled-off header renders identically to the row
+    /// itself. `None` for the non-collapsible grouped kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<bool>,
+}
+
+/// The expanded run's place in a collapsible picker's row space (docs/picker-groups.md §9):
+/// its header's absolute row plus its item count — the run's item rows occupy
+/// `[header_row + 1, header_row + len]`. Rides `picker/update` so the client can do exact,
+/// local two-level navigation math (clamping item-level moves to the run, telling item rows
+/// from header rows by interval) even when the run overflows the fetched window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpandedRun {
+    /// Absolute row (in the collapsible row space) of the expanded run's header.
+    pub header_row: u32,
+    /// Items in the run — all of them rows, following the header.
+    pub len: u32,
+}
+
+// ---- picker/set_group ---------------------------------------------------------------------------
+
+/// Select — and thereby expand — one group in a collapsible picker
+/// ([`PickerKind::collapsible`], docs/picker-groups.md §9). Exactly one group is expanded at a
+/// time (accordion): selecting one implicitly collapses the previous, and there is no
+/// explicit collapse — group-level navigation is what moves the expansion. The group is
+/// addressed either by its `header` (a click, or a gesture on a header row the client holds)
+/// or by `step` (the group-level `Alt-j`/`Alt-k` — the run adjacent to the currently-expanded
+/// one, resolved server-side so it works past the fetched window). Exactly one of the two
+/// must be set. The server recomputes the row space, replies with the selected header's new
+/// absolute row index, and pushes a fresh window through the normal `picker/update` path; the
+/// client adopts `row` as its selection and lets its offset/generation guards + refetch
+/// reconcile the window, so response/push arrival order doesn't matter.
+pub struct PickerSetGroup;
+impl RpcMethod for PickerSetGroup {
+    const NAME: &'static str = "picker/set_group";
+    type Params = PickerSetGroupParams;
+    type Result = PickerSetGroupResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PickerSetGroupParams {
+    /// Which picker to act on (the client's open one). Must be a collapsible kind.
+    pub kind: PickerKind,
+    /// The group to select, identified by its header — both sides derive the same group key
+    /// from it, so no index rides the wire to go stale across a re-rank. `None` when `step`
+    /// addresses the group instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<GroupHeader>,
+    /// Select the run adjacent to the currently-expanded one (`Forward` = the next run,
+    /// `Backward` = the previous). A step past the first/last run is a no-op (`row: None`) —
+    /// group navigation stops at the ends, like the jumplist's `]`/`[`. `None` when `header`
+    /// addresses the group instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<Direction>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PickerSetGroupResult {
+    /// The selected run's place in the reshaped row space — its header row + item count. The
+    /// client picks its own landing row from it: the header for group-level navigation, the
+    /// run's first/last item for an item-level spill over a run edge (docs/picker-groups.md
+    /// §9 — moving down off a run's last item enters the next group at its first item, and
+    /// up off the first enters the previous at its last, which needs the new run's *length*
+    /// at reply time). `None` when nothing changed: the named group is no longer in the
+    /// result set (it re-ranked away mid-flight), a `step` ran off the ends, or the kind
+    /// doesn't collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<ExpandedRun>,
 }
 
 // ---- picker/update (notification) ---------------------------------------------------------------
@@ -1217,6 +1332,12 @@ pub struct PickerUpdateParams {
     /// last group's) is reachable. `None` for the flat kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_display_rows: Option<u32>,
+    /// Collapsible kinds only (docs/picker-groups.md §9): where the expanded run sits in the
+    /// row space (see [`ExpandedRun`]). Describes the same result set as `items`, so like the
+    /// spans it's meaningless on a count-only tick (`items: None`), where the client keeps its
+    /// current value. `None` for the other kinds and while the result set is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_run: Option<ExpandedRun>,
     /// A server-resolved highlight to adopt when this push lands — currently the DocumentSymbols
     /// picker's cursor-enclosing symbol, computed on the async fill (the picker opens before the
     /// `textDocument/documentSymbol` round-trip returns, so this can't ride the `picker/view`

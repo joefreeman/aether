@@ -742,6 +742,8 @@ fn reveal_value(r: aether_client::picker::Reveal) -> Value {
         match r {
             Reveal::Minimal => "minimal",
             Reveal::Top => "top",
+            // Frame the freshly-opened group run (docs/picker-groups.md §9).
+            Reveal::Run => "run",
         }
         .into(),
     )

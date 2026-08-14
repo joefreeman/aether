@@ -65,8 +65,9 @@ use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
-    PickerReset, PickerSectionJumpParams, PickerSelectParams, PickerSelectResult, PickerUpdate,
-    PickerUpdateParams, PickerViewParams, PickerViewResult,
+    PickerReset, PickerSectionJumpParams, PickerSelectParams, PickerSelectResult,
+    PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
+    PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -13335,12 +13336,23 @@ pub async fn picker_view(
     let mut effective_offset = params.offset;
     let effective_center_on = cursor_resolved_item.or_else(|| params.center_on.clone());
     if let Some(item) = effective_center_on.as_ref() {
-        if let Some(rank) = picker.rank_of(item) {
+        // Collapsible kinds: framing an item implies revealing it — expand its group before
+        // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames
+        // a visible row rather than a collapsed header (docs/picker-groups.md). Centering on a
+        // `Group` row just frames the header; it expands nothing.
+        if picker.kind.collapsible() && !matches!(item, PickerItem::Group { .. }) {
+            if let Some(group_key) = picker.group_key_of_item(item) {
+                picker.expanded = Some(group_key);
+            }
+        }
+        // `row_of` == the ranked position for the flat / derived-header kinds; row space for
+        // the collapsible ones.
+        if let Some(row) = picker.row_of(item) {
             let half = limit / 2;
-            effective_offset = rank.saturating_sub(half);
+            effective_offset = row.saturating_sub(half);
         }
     }
-    let total = picker.ranked.len() as u32;
+    let total = picker.total_rows();
     if effective_offset >= total {
         effective_offset = total.saturating_sub(limit);
     }
@@ -13465,6 +13477,10 @@ pub async fn picker_query(
     picker.query = params.query;
     picker.filters = params.filters;
     picker.generation = params.generation;
+    // A query change resets the client's selection to row 0 — drop the expanded key so the
+    // accordion re-coheres with it: the first run of the *new* ranking opens itself
+    // (docs/picker-groups.md §9) and row 0 is its header again.
+    picker.expanded = None;
     let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
         && picker
             .last_completed_search
@@ -13669,8 +13685,81 @@ pub async fn picker_hide(
         picker.ranked.clear();
         picker.last_completed_search = None;
         picker.pending_async_load = None;
+        picker.expanded = None;
     }
     Ok(())
+}
+
+/// Select — and thereby expand — one group in a collapsible picker (docs/picker-groups.md
+/// §9), addressed by `header` (a click, `Alt-l` on a header the client holds) or by `step`
+/// (the group-level `Alt-j`/`Alt-k` — the run adjacent to the expanded one, resolved here so
+/// it works past the fetched window). Accordion semantics: selecting a group implicitly
+/// collapses the previous one; there is no explicit collapse — group navigation is what
+/// moves the expansion. Replies with the selected header's absolute row in the reshaped
+/// space (the client adopts it as its selection) and pushes the reshaped window through the
+/// normal `picker/update` path; the client's offset/generation guards + refetch reconcile,
+/// so response/push arrival order doesn't matter.
+pub async fn picker_set_group(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PickerSetGroupParams,
+) -> Result<PickerSetGroupResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let ServerState {
+        pickers, matcher, ..
+    } = &mut *s;
+    // A missing slot or a non-collapsible kind is a benign no-op (`run: None`), matching
+    // `picker/query`'s lenient style — the picker may have raced a close.
+    let Some(picker) = pickers.get_mut(&(client_id, params.kind)) else {
+        return Ok(PickerSetGroupResult { run: None });
+    };
+    if !params.kind.collapsible() {
+        return Ok(PickerSetGroupResult { run: None });
+    }
+    // Resolve the target group against the current ranking FIRST: acting on one that
+    // re-ranked away mid-flight — or a step off the ends — is a benign no-op (`run: None`)
+    // that must not disturb the accordion state. A vanished key left in `expanded` would
+    // surprise-expand if a later streaming batch brought the group back.
+    let group_key = match (&params.header, params.step) {
+        (Some(header), None) => {
+            let key = picker_state::group_key_of_header(header);
+            picker
+                .first_candidate_of_group(&key)
+                .is_some()
+                .then_some(key)
+        }
+        (None, Some(direction)) => picker.step_group_key(direction),
+        // Neither or both halves: a malformed request, not a benign race.
+        _ => {
+            return Err(RpcError::invalid_params(
+                "picker/set_group takes exactly one of header/step",
+            ))
+        }
+    };
+    let Some(group_key) = group_key else {
+        return Ok(PickerSetGroupResult { run: None });
+    };
+    picker.expanded = Some(group_key);
+    // The selected run's geometry in the reshaped space — the fresh layout resolves the key
+    // we just installed. The client picks its landing row from it (header for group nav,
+    // first/last item for an item-level spill — the latter is why the *length* rides the
+    // reply rather than just the header row).
+    let run = picker.row_layout().and_then(|layout| {
+        layout
+            .expanded
+            .map(|e| aether_protocol::picker::ExpandedRun {
+                header_row: layout.header_row(e),
+                len: layout.runs[e].len,
+            })
+    });
+    let update = picker_state::build_update(picker, matcher);
+    let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
+    drop(s);
+    if let (Some(sender), Some(update)) = (outbound, update) {
+        let _ = sender.send(picker_update_notif(update)).await;
+    }
+    Ok(PickerSetGroupResult { run })
 }
 
 /// The `buffer/open` params that jump to a captured results entry: transient, cursor landing
@@ -13730,20 +13819,33 @@ pub async fn jumplist_capture(
             "no active picker for this client",
         ));
     };
-    let ci = picker.candidates.position_of(&params.item).ok_or_else(|| {
-        RpcError::invalid_params("selected item is not in the picker's candidate set")
-    })? as u32;
+    // A collapsible picker's selection can sit on a group's header row; anchor the capture on
+    // that run's first item (the capture itself spans the whole filtered set either way —
+    // collapse is view state, not a filter; docs/picker-groups.md).
+    let ci = match &params.item {
+        PickerItem::Group { header, .. } => picker
+            .first_candidate_of_group(&picker_state::group_key_of_header(header))
+            .ok_or_else(|| {
+                RpcError::invalid_params("the anchor group is not in the picker's result set")
+            })?,
+        item => picker.candidates.position_of(item).ok_or_else(|| {
+            RpcError::invalid_params("selected item is not in the picker's candidate set")
+        })?,
+    } as u32;
     let Some((mut list, candidate_indices)) = crate::jumplist::capture(picker, &mut s.matcher)
     else {
         return Ok(None);
     };
     // Give every entry its file identity: derive workspace-relative parts from `abs_path` (so the
-    // open resolves the file rather than the root directory) and a `File` group header for the
-    // headerless buffer-scoped sources (so the picker shows which file each row belongs to).
-    if let Some(workspace) = s.active_workspace(client_id) {
-        let roots = workspace.paths.clone();
-        crate::jumplist::assign_file_groups(&mut list.entries, &roots);
-    }
+    // open resolves the file rather than the root directory) and a group header for the headerless
+    // buffer-scoped sources (so the picker shows which file each row belongs to). Unconditional —
+    // the Jumplist picker's collapsible row space keys every row, so grouping must be total even
+    // with no roots to relativize against (out-of-workspace entries get absolute-path labels).
+    let roots = s
+        .active_workspace(client_id)
+        .map(|w| w.paths.clone())
+        .unwrap_or_default();
+    crate::jumplist::assign_file_groups(&mut list.entries, &roots);
     // A re-capture from the Jumplist picker narrows the list but keeps describing what the
     // entries are entries *of*: the original source kind and query, not the narrowing query
     // typed into the Jumplist picker.

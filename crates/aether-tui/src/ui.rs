@@ -1633,7 +1633,17 @@ pub enum PickerRow {
 /// a window that begins mid-group still leads with its group's header. Flat windows (no spans) map
 /// one item to one row, so view-row scroll collapses to item scroll — exactly the flat-picker
 /// behaviour.
-pub fn picker_window_rows(items_len: usize, groups: &[GroupSpan]) -> Vec<PickerRow> {
+pub fn picker_window_rows(
+    items_len: usize,
+    groups: &[GroupSpan],
+    collapsible: bool,
+) -> Vec<PickerRow> {
+    // Collapsible kinds (docs/picker-groups.md): headers arrive as real, selectable
+    // `PickerItem::Group` rows, so the window maps 1:1 — no interleaved headers, no gaps.
+    // The spans only feed the sticky stamp ([`collapsible_pin`]).
+    if collapsible {
+        return (0..items_len).map(PickerRow::Item).collect();
+    }
     let mut rows = Vec::with_capacity(items_len + groups.len() * 2);
     let mut gi = 0;
     for i in 0..items_len {
@@ -1649,6 +1659,37 @@ pub fn picker_window_rows(items_len: usize, groups: &[GroupSpan]) -> Vec<PickerR
     rows
 }
 
+/// The span to stamp over the pane's top row for a *collapsible* pinning kind: the governing
+/// run's span, but only when the top view row sits inside the expanded run — when the top row
+/// IS the run's own `Group` header it already renders itself identically, so no stamp (and a
+/// press there hits the row, which is selectable). Shared by the draw and the hit-test so the
+/// two can't disagree about whether row 0 is covered.
+pub fn collapsible_pin<'a>(
+    state: &'a AppState,
+    rows: &[PickerRow],
+    top: usize,
+) -> Option<&'a GroupSpan> {
+    let kind = state.picker.kind?;
+    if !kind.collapsible() || !pins_group_header(kind) {
+        return None;
+    }
+    let PickerRow::Item(i) = rows.get(top)? else {
+        return None;
+    };
+    if matches!(
+        state.picker.items.get(*i),
+        Some(PickerItem::Group { .. }) | None
+    ) {
+        return None;
+    }
+    state
+        .picker
+        .groups
+        .iter()
+        .rev()
+        .find(|s| (s.start as usize) <= *i)
+}
+
 /// The group whose header should pin over the pane top when view row `top` is first visible: the
 /// last group starting at or before `top`. `None` for a flat window (no headers).
 pub fn picker_governing_group(rows: &[PickerRow], top: usize) -> Option<usize> {
@@ -1660,11 +1701,12 @@ pub fn picker_governing_group(rows: &[PickerRow], top: usize) -> Option<usize> {
 }
 
 /// Whether this picker kind pins a sticky group header over the pane's top row — mirrors the
-/// native/web clients (`aether_iced::picker::pins_group_header`): the file-grouped kinds and
-/// Keybindings pin their header; References renders section labels but deliberately doesn't pin.
+/// native/web clients (`aether_iced::picker::pins_group_header`): the file-grouped kinds, the
+/// Jumplist, and Keybindings pin their header; References renders section labels but
+/// deliberately doesn't pin.
 /// The pinned header covers the top view row, so the scroll math keeps the selection below it.
 pub fn pins_group_header(kind: PickerKind) -> bool {
-    kind.groups_by_file() || kind == PickerKind::Keybindings
+    kind.groups_by_file() || matches!(kind, PickerKind::Keybindings | PickerKind::Jumplist)
 }
 
 /// The view-row scroll offset (`top`, an index into [`picker_window_rows`]) that keeps the selected
@@ -1697,6 +1739,33 @@ pub fn picker_row_scroll_for_selected(
         top = sel_row + 1 - pane;
     }
     top.min(max_top)
+}
+
+/// The §9 group-run reveal (docs/picker-groups.md): the pane-top view row that frames the
+/// freshly-opened run — the minimal move from `top` that brings the run's last row into view,
+/// capped so the run's header never leaves the pane top. A run taller than the pane shows the
+/// header at the very top, where the row renders *itself* (the sticky pin only stamps when the
+/// top row sits inside the run), so capping there keeps the first item visible below it.
+/// `header_rel` is the header's window-relative view row; rows are window view rows
+/// (collapsible kinds map 1:1 to items).
+pub fn picker_scroll_for_run(
+    top: usize,
+    pane_height: usize,
+    header_rel: usize,
+    len: usize,
+) -> usize {
+    let pane = pane_height.max(1);
+    let last = header_rel + len;
+    if header_rel < top {
+        // Header above the pane (a backward step): align it to the top.
+        header_rel
+    } else if last >= top + pane {
+        // Run overflows the pane bottom: scroll the minimum that shows its last row, capped
+        // so the header stays visible.
+        (last + 1 - pane).min(header_rel)
+    } else {
+        top
+    }
 }
 
 /// The shell's picker-scroll continuity state: the first visible view row (`top`), the selected
@@ -1886,14 +1955,21 @@ pub fn picker_hit(state: &AppState, cols: u16, rows: u16, row: u16, col: u16) ->
     if picker_empty_message(&state.picker).is_some() {
         return PickerHit::Chrome;
     }
-    let view_rows = picker_window_rows(state.picker.items.len(), &state.picker.groups);
+    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    let view_rows = picker_window_rows(state.picker.items.len(), &state.picker.groups, collapsible);
     let top = state.picker.visible_start.min(view_rows.len());
     let pane_row = (row - layout.results.y) as usize;
     // The sticky group header is stamped *over* the pane's top row, so a press there hits the
-    // header — not the item it covers (mirrors the pin in `draw_picker_results`).
-    let pinned = state.picker.kind.is_some_and(pins_group_header)
-        && !state.picker.groups.is_empty()
-        && picker_governing_group(&view_rows, top).is_some();
+    // header — not the item it covers (mirrors the pin in `draw_picker_results`). For the
+    // collapsible kinds the stamp exists only mid-run (`collapsible_pin`); a `Group` row at the
+    // top renders itself and stays clickable.
+    let pinned = if collapsible {
+        collapsible_pin(state, &view_rows, top).is_some()
+    } else {
+        state.picker.kind.is_some_and(pins_group_header)
+            && !state.picker.groups.is_empty()
+            && picker_governing_group(&view_rows, top).is_some()
+    };
     if pane_row == 0 && pinned {
         return PickerHit::Chrome;
     }
@@ -2547,7 +2623,8 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // over-fetched cache that lets us scroll without an RPC.
     let pane_height = area.height as usize;
     let groups = &state.picker.groups;
-    let rows = picker_window_rows(state.picker.items.len(), groups);
+    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    let rows = picker_window_rows(state.picker.items.len(), groups, collapsible);
     let top = state.picker.visible_start.min(rows.len());
     let end = (top + pane_height).min(rows.len());
 
@@ -2604,13 +2681,26 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         let highlighted = i == state.picker.selected;
+        // Two-level hierarchy (docs/picker-groups.md §9): the collapsible kinds' item rows
+        // indent two cells under their group header, aligning with the header text past its
+        // "▸ "/"▾ " disclosure mark. Header rows (and everything in the flat kinds) start flush.
+        let indent = collapsible && !matches!(item, PickerItem::Group { .. });
+        let item_width = (text_width as usize).saturating_sub(if indent { 2 } else { 0 });
         let mut spans = picker_item_spans(
             item,
             &state.root_labels,
             state.tether,
             highlighted,
-            text_width as usize,
+            item_width,
         );
+        if indent {
+            let style = if highlighted {
+                Style::default().bg(NORD2)
+            } else {
+                Style::default()
+            };
+            spans.insert(0, Span::styled("  ", style));
+        }
         // Italicise the synthetic "+ Create …" row so it reads as an action affordance rather
         // than a real entry. Applied uniformly across all spans of the row (including any
         // fuzzy-match-highlight spans), since the synthetic never has match indices anyway.
@@ -2635,8 +2725,23 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // header over the pane's first row (the web/native `position: sticky`). When that row is
     // already its group's header the overlay is identical; when it's an item scrolled up under
     // the group, the header covers it — the scroll math keeps the selection clear of this row.
+    // Collapsible kinds stamp only mid-run, dressed like the `Group` row the span stands in
+    // for (count + disclosure mark); their own header rows render themselves.
     if let Some(kind) = state.picker.kind {
-        if pins_group_header(kind) && !groups.is_empty() {
+        if collapsible {
+            if let Some(span) = collapsible_pin(state, &rows, top) {
+                if let Some(first) = lines.first_mut() {
+                    *first = Line::from(group_row_spans(
+                        &span.header,
+                        span.count.unwrap_or(0),
+                        span.expanded.unwrap_or(false),
+                        &state.root_labels,
+                        false,
+                        text_width as usize,
+                    ));
+                }
+            }
+        } else if pins_group_header(kind) && !groups.is_empty() {
             if let (Some(first), Some(gi)) = (lines.first_mut(), picker_governing_group(&rows, top))
             {
                 *first = Line::from(header_spans(&groups[gi].header));
@@ -2660,11 +2765,20 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
-    let total = state.picker.total_matches as u64;
+    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    // Collapsible kinds scroll row space (headers are rows), so the bar spans the row total.
+    let total = if collapsible {
+        state
+            .picker
+            .total_display_rows
+            .unwrap_or(state.picker.total_matches) as u64
+    } else {
+        state.picker.total_matches as u64
+    };
     // Thumb size = the items actually on screen; thumb position = the absolute index of the top
     // visible item (`offset` + its window-relative index). Derive both from the view rows in the
     // slice — over-fetch means `items.len()` would oversize the thumb and `offset` alone peg it.
-    let rows = picker_window_rows(state.picker.items.len(), &state.picker.groups);
+    let rows = picker_window_rows(state.picker.items.len(), &state.picker.groups, collapsible);
     let top = state.picker.visible_start.min(rows.len());
     let end = (top + area.height as usize).min(rows.len());
     let items_in_view = rows[top..end].iter().filter_map(|r| match r {
@@ -2688,6 +2802,21 @@ fn picker_item_spans(
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
+    if let PickerItem::Group {
+        header,
+        count,
+        expanded,
+    } = item
+    {
+        return group_row_spans(
+            header,
+            *count,
+            *expanded,
+            root_labels,
+            highlighted,
+            max_width,
+        );
+    }
     if let PickerItem::GrepHit {
         line,
         preview,
@@ -2953,7 +3082,8 @@ fn picker_item_spans(
         | PickerItem::LspServer { .. }
         | PickerItem::Reference { .. }
         | PickerItem::Symbol { .. }
-        | PickerItem::Keybinding { .. } => unreachable!("handled above"),
+        | PickerItem::Keybinding { .. }
+        | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
         (
@@ -3054,6 +3184,56 @@ fn grep_file_header_spans(
     };
     let (display, _) = truncate_path_with_indices(&combined, &[], max_width);
     vec![Span::styled(display, style)]
+}
+
+/// A collapsible group's header row (docs/picker-groups.md) — a real, selectable row, unlike
+/// the derived headers above: `▸/▾` disclosure mark + the header text in the same NORD8 bold
+/// chrome, the run's item count right-aligned dim, and the NORD2 selection band when
+/// highlighted like any other row.
+fn group_row_spans(
+    header: &GroupHeader,
+    count: u32,
+    expanded: bool,
+    root_labels: &[String],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = picker_row_bg(highlighted);
+    // NORD8 alone carries the header chrome — no bold: with the run's items indented under
+    // the header (docs/picker-groups.md §9.2) the hierarchy already reads, and the derived
+    // (non-collapsible) section headers keep their bold as the visual tell for "not a row".
+    let style = Style::default().fg(NORD8).bg(bg);
+    let count_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
+    // The mark reads as part of the header chrome; ambiguous-width glyph, so the budget below
+    // keeps ≥1 spare col (the same allowance the buffer-status dot makes).
+    let mark = if expanded { "▾ " } else { "▸ " };
+    let text = match header {
+        GroupHeader::File {
+            path_index,
+            relative_path,
+        } => {
+            let label = root_label_or_blank(root_labels, *path_index);
+            if label.is_empty() {
+                relative_path.clone()
+            } else {
+                format!("{label}: {relative_path}")
+            }
+        }
+        GroupHeader::Label { label } => label.clone(),
+    };
+    let count_str = count.to_string();
+    let text_budget = max_width.saturating_sub(2 + count_str.len() + 1);
+    let (display, _) = truncate_path_with_indices(&text, &[], text_budget);
+    let display_w = display.width();
+    let pad = max_width
+        .saturating_sub(2 + display_w + count_str.len())
+        .max(1);
+    vec![
+        Span::styled(mark.to_string(), style),
+        Span::styled(display, style),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        Span::styled(count_str, count_style),
+    ]
 }
 
 /// Picker section label (References' `Definition` / `References`, a Keybindings group) — same
@@ -6566,6 +6746,8 @@ mod tests {
                     path_index: fi as u32,
                     relative_path: (*path).to_string(),
                 },
+                count: None,
+                expanded: None,
             });
             for line in 0..*n {
                 items.push(PickerItem::GrepHit {
@@ -6581,13 +6763,34 @@ mod tests {
         (items, spans)
     }
 
+    /// The §9 group-run reveal (docs/picker-groups.md): frame the freshly-opened run — the
+    /// minimal move that shows its last row, capped so the header never leaves the pane top.
+    #[test]
+    fn run_reveal_frames_the_expanded_run() {
+        // Pane of 6 rows; run header at view row 8 with 3 items (rows 9..=11).
+        // Below the pane and it fits: bottom-align its last row.
+        assert_eq!(picker_scroll_for_run(4, 6, 8, 3), 6);
+        // Already fully visible (either alignment): no movement.
+        assert_eq!(picker_scroll_for_run(6, 6, 8, 3), 6);
+        assert_eq!(picker_scroll_for_run(7, 6, 8, 3), 7);
+        // Header above the pane (a backward step): align it to the top.
+        assert_eq!(picker_scroll_for_run(10, 6, 8, 3), 8);
+        // Run taller than the pane: cap at the header — its first items show, the rest
+        // stays below the fold (never past the point where the first item would hide).
+        assert_eq!(picker_scroll_for_run(0, 6, 2, 10), 2);
+        // And sitting at the cap already is stable.
+        assert_eq!(picker_scroll_for_run(2, 6, 2, 10), 2);
+        // Degenerate one-row pane: still lands on the header.
+        assert_eq!(picker_scroll_for_run(5, 1, 3, 2), 3);
+    }
+
     /// Emulate pressing `j` down the whole list — as `sync_picker` does: `selected` increments and
     /// `picker_row_scroll_for_selected` recomputes the view-row scroll from the previous one — and
     /// assert the scroll stays well-behaved at every step. This is the direct regression for the
     /// grep / keybindings scroll bug: item-index scroll jumped a header + gap at every group
     /// boundary, landing the selection at the top (reset) or with rows beneath it.
     fn assert_smooth_walk_down(items: &[PickerItem], groups: &[GroupSpan], pane: usize, pin: bool) {
-        let rows = picker_window_rows(items.len(), groups);
+        let rows = picker_window_rows(items.len(), groups, false);
         let sel_row_of = |sel: usize| {
             rows.iter()
                 .position(|r| matches!(r, PickerRow::Item(i) if *i == sel))
@@ -6681,7 +6884,14 @@ mod tests {
             offset: 0,
         };
         assert_eq!(
-            picker_scroll_step(&picker_window_rows(90, &[]), 89, pane, false, 0, steady),
+            picker_scroll_step(
+                &picker_window_rows(90, &[], false),
+                89,
+                pane,
+                false,
+                0,
+                steady
+            ),
             steady,
             "already settled at the bottom — no change"
         );
@@ -6689,7 +6899,7 @@ mod tests {
         // The move leaves the cache: the core clears `items` and refetches at 90 - 45 = 45. This
         // sync sees an *empty* window (a fast scroll can pile several up). The anchor must survive:
         // `sel_pane` and `offset` unchanged, only `top` clamped for the (empty) render.
-        let empty = picker_window_rows(0, &[]);
+        let empty = picker_window_rows(0, &[], false);
         let mid = picker_scroll_step(&empty, 45, pane, false, 45, steady);
         assert_eq!(
             mid,
@@ -6703,7 +6913,7 @@ mod tests {
 
         // Window B [45, 135) lands; selection is window-relative 45. Reseeded from the preserved
         // pane row (17), the selection stays on the bottom edge — not snapped to the top.
-        let rows_b = picker_window_rows(90, &[]);
+        let rows_b = picker_window_rows(90, &[], false);
         let landed = picker_scroll_step(&rows_b, 45, pane, false, 45, mid);
         assert_eq!(landed.top, 28);
         assert_eq!(
@@ -6726,10 +6936,17 @@ mod tests {
             offset: 0,
         };
         // Empty refetch frame (0 items → no rows regardless of spans): anchor must survive.
-        let mid = picker_scroll_step(&picker_window_rows(0, &[]), 45, pane, true, 45, steady);
+        let mid = picker_scroll_step(
+            &picker_window_rows(0, &[], false),
+            45,
+            pane,
+            true,
+            45,
+            steady,
+        );
         assert_eq!(mid.sel_pane, 6, "anchor preserved through the empty frame");
         // Real window lands; the selection keeps its mid-pane row rather than snapping to row 1.
-        let rows = picker_window_rows(90, &spans);
+        let rows = picker_window_rows(90, &spans, false);
         let landed = picker_scroll_step(&rows, 45, pane, true, 45, mid);
         let sel_row = rows
             .iter()
@@ -6749,7 +6966,7 @@ mod tests {
     fn window_rows_expand_headers_and_gaps() {
         let (items, spans) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
         assert_eq!(
-            picker_window_rows(items.len(), &spans),
+            picker_window_rows(items.len(), &spans, false),
             vec![
                 PickerRow::Header(0),
                 PickerRow::Item(0),
@@ -6761,7 +6978,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            picker_window_rows(3, &[]),
+            picker_window_rows(3, &[], false),
             vec![PickerRow::Item(0), PickerRow::Item(1), PickerRow::Item(2)]
         );
     }
@@ -6772,14 +6989,17 @@ mod tests {
     fn governing_group_follows_the_scroll() {
         // rows: 0=Hdr a, 1=Item0, 2=Item1, 3=Gap, 4=Hdr b, 5=Item2, 6=Item3
         let (items, spans) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
-        let rows = picker_window_rows(items.len(), &spans);
+        let rows = picker_window_rows(items.len(), &spans, false);
         assert_eq!(picker_governing_group(&rows, 0), Some(0)); // on a's header
         assert_eq!(picker_governing_group(&rows, 2), Some(0)); // mid a → still a
         assert_eq!(picker_governing_group(&rows, 3), Some(0)); // the gap still belongs to a
         assert_eq!(picker_governing_group(&rows, 4), Some(1)); // on b's header
         assert_eq!(picker_governing_group(&rows, 6), Some(1)); // mid b
                                                                // Flat windows have no groups to pin.
-        assert_eq!(picker_governing_group(&picker_window_rows(3, &[]), 1), None);
+        assert_eq!(
+            picker_governing_group(&picker_window_rows(3, &[], false), 1),
+            None
+        );
     }
 
     /// The pin gate mirrors the native/web clients: file-grouped kinds and Keybindings pin;
@@ -6944,6 +7164,8 @@ mod tests {
                 path_index: 0,
                 relative_path: "a.rs".into(),
             },
+            count: None,
+            expanded: None,
         }];
         let picker = crate::picker::PickerState {
             open: true,
@@ -7005,83 +7227,89 @@ mod tests {
         }
     }
 
-    /// In a grouped picker the pane interleaves headers and gap rows with the items. A press on a
-    /// hit selects that hit — the index accounts for the non-selectable rows above it — while a
-    /// press on a file header or the blank gap above it does nothing.
+    /// In a collapsible picker (docs/picker-groups.md) the headers are real, selectable
+    /// `Group` window rows: a press on a header selects it (Enter/click then toggles), a press
+    /// on a hit selects that hit, and the window maps 1:1 — no gap rows, no skipped indices.
     #[test]
-    fn picker_click_skips_group_headers_and_gaps() {
-        let (items, groups) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
-        // Give the hits distinguishable previews so `cell_of` can find each row.
-        let items: Vec<PickerItem> = items
-            .into_iter()
-            .enumerate()
-            .map(|(i, item)| match item {
-                PickerItem::GrepHit {
-                    path_index,
-                    relative_path,
-                    line,
-                    col,
-                    match_indices,
-                    ..
-                } => PickerItem::GrepHit {
-                    path_index,
-                    relative_path,
-                    line,
-                    col,
-                    preview: format!("HIT{i}"),
-                    match_indices,
-                },
-                other => other,
-            })
-            .collect();
+    fn picker_click_selects_group_header_rows() {
+        let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: path.into(),
+            },
+            count,
+            expanded,
+        };
+        let hit = |line: u32| PickerItem::GrepHit {
+            path_index: 0,
+            relative_path: "a.rs".into(),
+            line,
+            col: 0,
+            preview: format!("HIT{line}"),
+            match_indices: Vec::new(),
+        };
+        // Row space: [0]=a.rs hdr (expanded), [1..2]=its hits, [3]=b.rs hdr (collapsed).
+        let items = vec![
+            group("a.rs", 2, true),
+            hit(0),
+            hit(1),
+            group("b.rs", 2, false),
+        ];
+        let spans = |start: u32, path: &str, expanded: bool| GroupSpan {
+            start,
+            header: GroupHeader::File {
+                path_index: 0,
+                relative_path: path.into(),
+            },
+            count: Some(2),
+            expanded: Some(expanded),
+        };
         let state = picker_app(crate::picker::PickerState {
             open: true,
             kind: Some(PickerKind::Grep),
-            total_matches: items.len() as u32,
-            total_display_rows: Some(items.len() as u32 + groups.len() as u32),
+            total_matches: 4,
+            total_display_rows: Some(4),
             items,
-            groups,
+            groups: vec![spans(0, "a.rs", true), spans(3, "b.rs", false)],
             ..Default::default()
         });
         let rows = render_rows(&state);
-        for i in 0..4 {
-            let preview = format!("HIT{i}");
-            assert_eq!(
-                hit_at(&state, cell_of(&rows, &preview)),
-                PickerHit::Item(i),
-                "clicking {preview} should select item {i}"
-            );
-        }
-        // View rows: 0=Hdr a.rs, 1=HIT0, 2=HIT1, 3=Gap, 4=Hdr b.rs, 5=HIT2, 6=HIT3. The interior
-        // header and the blank gap above it aren't selectable.
-        let (header_row, header_col) = cell_of(&rows, "b.rs");
+        assert_eq!(hit_at(&state, cell_of(&rows, "HIT0")), PickerHit::Item(1));
+        assert_eq!(hit_at(&state, cell_of(&rows, "HIT1")), PickerHit::Item(2));
         assert_eq!(
-            hit_at(&state, (header_row, header_col)),
-            PickerHit::Chrome,
-            "the b.rs group header isn't a selectable row"
+            hit_at(&state, cell_of(&rows, "a.rs")),
+            PickerHit::Item(0),
+            "the top header row renders itself (no stamp) and is selectable"
         );
         assert_eq!(
-            hit_at(&state, (header_row - 1, header_col)),
-            PickerHit::Chrome,
-            "the gap above the b.rs header isn't a selectable row"
+            hit_at(&state, cell_of(&rows, "b.rs")),
+            PickerHit::Item(3),
+            "a collapsed group's header is a selectable row"
         );
     }
 
-    /// The sticky header is stamped over the pane's top row, hiding the item scrolled under it — so
-    /// a press there hits the header, not the invisible row beneath. (Same state as
-    /// `sticky_header_pins_over_the_top_row_when_scrolled_mid_group`: view row 3, HIT2, is covered.)
+    /// Scrolled inside an expanded run, the run's header (long gone above) is stamped over the
+    /// pane's top row — a press there hits the stamp, not the invisible hit beneath. The stamp
+    /// carries the `Group` row's dressing (count), and only exists mid-run: at the run's own
+    /// header row the row renders itself (see `picker_click_selects_group_header_rows`).
     #[test]
     fn picker_click_on_the_pinned_header_selects_nothing() {
-        let items: Vec<PickerItem> = (0..8)
-            .map(|n| PickerItem::GrepHit {
+        let mut items: Vec<PickerItem> = vec![PickerItem::Group {
+            header: GroupHeader::File {
                 path_index: 0,
                 relative_path: "a.rs".into(),
-                line: n,
-                col: 0,
-                preview: format!("HIT{n}"),
-                match_indices: Vec::new(),
-            })
-            .collect();
+            },
+            count: 8,
+            expanded: true,
+        }];
+        items.extend((0..8).map(|n| PickerItem::GrepHit {
+            path_index: 0,
+            relative_path: "a.rs".into(),
+            line: n,
+            col: 0,
+            preview: format!("HIT{n}"),
+            match_indices: Vec::new(),
+        }));
         let state = picker_app(crate::picker::PickerState {
             open: true,
             kind: Some(PickerKind::Grep),
@@ -7092,10 +7320,13 @@ mod tests {
                     path_index: 0,
                     relative_path: "a.rs".into(),
                 },
+                count: Some(8),
+                expanded: Some(true),
             }],
             total_matches: 8,
-            selected: 4,
-            visible_start: 3,
+            total_display_rows: Some(9),
+            selected: 5,
+            visible_start: 3, // top view row = HIT2 (item 3) — mid-run, so the stamp covers it
             ..Default::default()
         });
         let rows = render_rows(&state);
@@ -7104,8 +7335,8 @@ mod tests {
             PickerHit::Chrome,
             "the pinned header must not select the hit it covers"
         );
-        // The rows below the pin are still live: HIT3 is view row 4, the first uncovered item.
-        assert_eq!(hit_at(&state, cell_of(&rows, "HIT3")), PickerHit::Item(3));
+        // The rows below the stamp are still live: HIT3 (item 4) is the first uncovered row.
+        assert_eq!(hit_at(&state, cell_of(&rows, "HIT3")), PickerHit::Item(4));
     }
 
     /// Presses outside the results pane: the query row (and the rest of the box's chrome) is
@@ -7626,6 +7857,8 @@ mod tests {
                 path_index: 0,
                 relative_path: "a.rs".into(),
             },
+            count: None,
+            expanded: None,
         }];
         assert_eq!(picker_content_rows(&p), 10);
         // A single group (display rows = matches + 1) adds no gaps — and never underflows.
