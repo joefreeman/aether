@@ -961,6 +961,9 @@ impl Session {
                         }
                         p.directory = r.directory_path;
                         p.directory_parent = r.directory_parent;
+                        // Jumplist: whether this capture is worth path-scoping — gates the
+                        // dir/glob chip chords ([`PickerState::filter_available`]).
+                        p.path_filterable = r.path_filterable;
                         if initial {
                             // Adopt the resumed query (the changes pickers preserve theirs across
                             // opens; every other kind comes back empty) and the persisted filters
@@ -3396,7 +3399,7 @@ impl Session {
         };
         if !matches!(
             p.kind,
-            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges
+            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges | PickerKind::Jumplist
         ) {
             return Effects::none();
         }
@@ -3415,7 +3418,7 @@ impl Session {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
-        if !chips::filter_applies(p.kind, id) {
+        if !p.filter_available(id) {
             return Effects::none();
         }
         // Explorer and Files both show hidden (and, for the Explorer, ignored) entries by default,
@@ -3443,7 +3446,7 @@ impl Session {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
-        if !chips::filter_applies(p.kind, ChipId::Glob(0)) {
+        if !p.filter_available(ChipId::Glob(0)) {
             return Effects::none();
         }
         // The editor owns the keys now; a lingering chip selection would go stale once the
@@ -3470,7 +3473,7 @@ impl Session {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
-        if !chips::filter_applies(p.kind, ChipId::Dir(0)) {
+        if !p.filter_available(ChipId::Dir(0)) {
             return Effects::none();
         }
         p.chip_selected = None;
@@ -3482,9 +3485,12 @@ impl Session {
         } else {
             ChipEditorField::Path
         };
-        // Grep / GitChanges may scope to a single file; the Files picker stays directory-only
-        // (narrowing a file list to one file is degenerate).
-        let allow_files = matches!(p.kind, PickerKind::Grep | PickerKind::GitChanges);
+        // Grep / GitChanges / Jumplist may scope to a single file; the Files picker stays
+        // directory-only (narrowing a file list to one file is degenerate).
+        let allow_files = matches!(
+            p.kind,
+            PickerKind::Grep | PickerKind::GitChanges | PickerKind::Jumplist
+        );
         let mut ed = ChipEditor::dir(
             current.map(|d| d.relative_path).unwrap_or_default(),
             field,

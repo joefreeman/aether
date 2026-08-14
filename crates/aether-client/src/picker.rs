@@ -2,7 +2,7 @@
 //! generation staleness, selection and identity, chip/filter state, display-row math. The
 //! rendering half lives in the shell (`src/picker.rs`).
 //!
-use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipValue, DirListingState};
+use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipId, ChipValue, DirListingState};
 use aether_protocol::picker::{
     ExpandedRun, GroupHeader, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
 };
@@ -167,6 +167,11 @@ pub struct PickerState {
     /// `items` means "not loaded yet", not "no results". The hint facts read this so the
     /// workspace chooser's empty-list hint can't fire on the pre-load flash (docs/hints.md).
     pub loaded: bool,
+    /// Jumplist only: whether the captured list is worth path-scoping (spans more than one file,
+    /// with at least one in-root entry) — the `picker/view` echo of the server-computed flag.
+    /// Gates the dir/glob chip chords via [`Self::filter_available`]; false until the first view
+    /// result lands, so early chords are clean no-ops.
+    pub path_filterable: bool,
 }
 
 /// Braille throbber frames for the "still searching" spinner (left of the picker's count).
@@ -206,7 +211,16 @@ impl PickerState {
             refetch_in_flight: false,
             refetch_chases_selection: false,
             loaded: false,
+            path_filterable: false,
         }
+    }
+
+    /// Whether a filter chip is available *right now*: the static per-kind table
+    /// ([`chips::filter_applies`]), plus the Jumplist's data gate — its dir/glob chips only
+    /// apply when the capture spans in-root files (the server's `path_filterable` echo).
+    pub fn filter_available(&self, id: ChipId) -> bool {
+        chips::filter_applies(self.kind, id)
+            && (self.kind != PickerKind::Jumplist || self.path_filterable)
     }
 
     /// Workspace rows this (Workspaces) picker is showing, or `None` when it isn't the

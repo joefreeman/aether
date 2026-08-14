@@ -3205,6 +3205,7 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         directory_path: None,
         directory_parent: None,
         filters: Default::default(),
+        path_filterable: false,
         update: None,
     };
     let v = to_value(&r).unwrap();
@@ -3216,9 +3217,16 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         "all-default filters should be skipped from the wire"
     );
     assert!(
+        v.get("path_filterable").is_none(),
+        "false (the non-Jumplist default) should be skipped from the wire"
+    );
+    assert!(
         v.get("update").is_none(),
         "update: None should be skipped from the wire"
     );
+    // Absent on the wire deserializes back to false — the pre-flag shape stays valid.
+    let back: PickerViewResult = from_value(v).unwrap();
+    assert!(!back.path_filterable);
 }
 
 #[test]
@@ -3233,11 +3241,13 @@ fn picker_view_result_directory_fields_serialized() {
         directory_path: Some("/proj/src".into()),
         directory_parent: Some("/proj".into()),
         filters: Default::default(),
+        path_filterable: true,
         update: None,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["directory_path"], "/proj/src");
     assert_eq!(v["directory_parent"], "/proj");
+    assert_eq!(v["path_filterable"], true);
 }
 
 #[test]
@@ -3330,6 +3340,7 @@ fn picker_view_result_filters_serialized_when_non_default() {
             whole_word: true,
             ..Default::default()
         },
+        path_filterable: false,
         update: None,
     };
     let v = to_value(&r).unwrap();

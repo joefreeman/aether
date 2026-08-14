@@ -1338,6 +1338,14 @@ impl FilesFilter {
         true
     }
 
+    /// Whether an entry with *no* root-relative path (the Jumplist's out-of-workspace captures)
+    /// survives: only when no path filter is active at all. Scopes and globs are defined over
+    /// root-relative paths, so a pathless entry can't satisfy — or be meaningfully exempted
+    /// from — either; the predictable reading is "any path narrowing drops it".
+    fn passes_pathless(&self) -> bool {
+        !self.reject_all && self.directories.is_empty() && self.overrides.is_none()
+    }
+
     fn passes(&self, file: &CachedFile, status: Option<aether_protocol::git::GitStatus>) -> bool {
         if !self.passes_path(file.path_index, &file.relative_path) {
             return false;
@@ -1385,14 +1393,15 @@ impl PickerState {
         self.ranked.clear();
         let strategy = self.candidates.match_strategy();
         // Files: filter chips narrow the candidate set before (and independently of) the fuzzy
-        // match. The other kinds filter elsewhere — Grep in the search worker, Explorer when
-        // the listing is built — so their predicate is always "pass".
-        // Files and Git changes both narrow by glob/dir chips before fuzzy matching (Git changes
-        // shares the path-scope half — it's inherently changed-only). The other kinds filter
-        // elsewhere (Grep in the search worker, Explorer when the listing is built), so their
-        // predicate is always "pass".
+        // match. Files, Git changes and the Jumplist all narrow by glob/dir chips before fuzzy
+        // matching (Git changes and the Jumplist share the path-scope half — Git changes is
+        // inherently changed-only; the Jumplist filters its captured entries' file identity).
+        // The other kinds filter elsewhere (Grep in the search worker, Explorer when the
+        // listing is built), so their predicate is always "pass".
         let files_filter = match &self.candidates {
-            PickerCandidates::Files { .. } | PickerCandidates::GitChanges(_)
+            PickerCandidates::Files { .. }
+            | PickerCandidates::GitChanges(_)
+            | PickerCandidates::Jumplist(_)
                 if !self.filters.is_default() =>
             {
                 Some(FilesFilter::new(&self.filters))
@@ -1410,6 +1419,15 @@ impl PickerState {
                 PickerCandidates::GitChanges(v) => {
                     ff.passes_path(v[i].path_index, &v[i].relative_path)
                         && !(ff.hide_untracked && v[i].untracked)
+                }
+                PickerCandidates::Jumplist(v) => {
+                    match (v[i].path_index, v[i].relative_path.as_deref()) {
+                        (Some(pi), Some(rp)) => ff.passes_path(pi, rp),
+                        // Out-of-workspace entry (references into dependencies): no root-relative
+                        // path for scopes/globs to speak about, so any active path filter
+                        // excludes it.
+                        _ => ff.passes_pathless(),
+                    }
                 }
                 _ => true,
             }
@@ -3267,6 +3285,80 @@ mod tests {
         };
         s.rerank(&mut m);
         assert_eq!(s.ranked, vec![0, 1], "both src/a.rs hunks, no docs/b.md");
+    }
+
+    #[test]
+    fn jumplist_rerank_filters_by_dir_and_glob_and_drops_pathless_entries() {
+        use aether_protocol::picker::{GroupHeader, PickerFilters, ScopedPath};
+        let entry = |rel: Option<&str>, abs: &str, line: u32, display: &str| {
+            crate::jumplist::JumplistEntry {
+                path_index: rel.map(|_| 0),
+                relative_path: rel.map(str::to_string),
+                abs_path: abs.into(),
+                position: aether_protocol::LogicalPosition { line, col: 0 },
+                anchor: None,
+                group: Some(match rel {
+                    Some(r) => GroupHeader::File {
+                        path_index: 0,
+                        relative_path: r.into(),
+                    },
+                    None => GroupHeader::Label { label: abs.into() },
+                }),
+                display: display.into(),
+            }
+        };
+        let cands = PickerCandidates::Jumplist(vec![
+            entry(Some("src/a.rs"), "/p/src/a.rs", 1, "hit one"),
+            entry(Some("src/a.rs"), "/p/src/a.rs", 9, "hit two"),
+            entry(Some("docs/b.md"), "/p/docs/b.md", 2, "hit three"),
+            // Out-of-workspace (a references capture into a dependency): no relative parts.
+            entry(None, "/dep/x.rs", 3, "hit four"),
+        ]);
+        let mut m = make_matcher();
+
+        // No filters: everything passes, document order.
+        let mut s = PickerState::new(cands.clone());
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1, 2, 3]);
+
+        // A directory scope keeps src/a.rs's entries (contiguous) and drops the rest —
+        // including the pathless entry, which no scope can speak about.
+        let mut s = PickerState::new(cands.clone());
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+                is_file: false,
+            }],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1], "src entries only, pathless dropped");
+
+        // An exclude glob drops src; docs survives. The pathless entry still drops — any
+        // active path filter excludes what has no root-relative path.
+        let mut s = PickerState::new(cands.clone());
+        s.filters = PickerFilters {
+            globs: vec!["!src/**".into()],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![2], "docs survives; src and pathless drop");
+
+        // Filters compose with the fuzzy query: scope to src, query "two" — matches stay in
+        // document (candidate) order, and only in-scope rows are scored at all.
+        let mut s = PickerState::new(cands);
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+                is_file: false,
+            }],
+            ..Default::default()
+        };
+        s.query = "two".into();
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![1], "query narrows within the scoped set");
     }
 
     #[test]

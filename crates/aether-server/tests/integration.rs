@@ -16962,6 +16962,151 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     drop(server);
 }
 
+/// The Jumplist picker's dir/glob chips (docs/picker-filters.md): path filters narrow the
+/// captured entries by their file identity, re-capture bakes the narrowed set in, and the
+/// `path_filterable` echo tracks whether the (current) capture is worth scoping at all —
+/// true while it spans multiple files, false once narrowed to one.
+#[tokio::test]
+async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
+    // Workspace needle hits: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4 — two files.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let _buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Fresh open: the capture spans two files with in-root entries — path-scoping applies.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        22,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    assert_eq!(view.total_candidates, 3);
+    assert!(
+        view.path_filterable,
+        "two captured files, both in-root: the dir/glob chips apply"
+    );
+
+    // Scope to src/main.rs (a file scope — Jumplist allows them, like Grep): the view narrows
+    // to that file's two entries; the pattern is a filter change = query change.
+    let filters = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+            is_file: true,
+        }],
+        ..Default::default()
+    };
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        23,
+        &PickerQueryParams {
+            filters: filters.clone(),
+            kind: PickerKind::Jumplist,
+            query: String::new(),
+            generation: 1,
+        },
+    )
+    .await;
+
+    // Re-view (Keep): the filtered window shows one file group with its two entries; the
+    // persisted filters echo back, and the flag still describes the *capture* (unchanged).
+    let view = send_request::<PickerView>(
+        &mut ws,
+        24,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: PickerReset::Keep,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    assert_eq!(view.filters, filters, "the slot persists the filter set");
+    assert!(
+        view.path_filterable,
+        "the backing capture still spans two files"
+    );
+    let items = view
+        .update
+        .expect("the view carries its window")
+        .items()
+        .to_vec();
+    assert_eq!(
+        group_rows(&items),
+        vec![("src/main.rs".to_string(), 2, true)],
+        "the lib.rs group is filtered out entirely"
+    );
+    assert_eq!(items.len(), 3, "one header + the two main.rs entries");
+
+    // Ctrl-j bakes the filtered set in: the narrowed list is main.rs's two entries.
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        25,
+        &JumplistCaptureParams {
+            kind: PickerKind::Jumplist,
+            item: PickerItem::JumplistEntry {
+                index: 1,
+                line: 0,
+                display: String::new(),
+                match_indices: vec![],
+            },
+        },
+    )
+    .await;
+    let captured = captured.expect("the filtered subset captures");
+    assert_eq!(captured.total, 2, "the file-scoped entries only");
+
+    // A fresh open of the narrowed list: one file left, so path-scoping no longer applies —
+    // the flag is recomputed from the entries on every view.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        26,
+        &PickerViewParams {
+            from_selection: false,
+            filters: None,
+            kind: PickerKind::Jumplist,
+            reset: PickerReset::All,
+            offset: 0,
+            limit: 30,
+            center_on: None,
+            center_on_cursor: None,
+            directory_path: None,
+            buffer_id: None,
+            explorer_roots: false,
+            keybindings: None,
+        },
+    )
+    .await;
+    assert_eq!(view.total_candidates, 2);
+    assert!(
+        !view.path_filterable,
+        "a single-file capture is all-or-nothing under a path filter"
+    );
+
+    drop(server);
+}
+
 /// `Space j` opens the Jumplist picker framed on "where you are": `center_on_cursor` resolves
 /// the entry at-or-after the cursor (inclusive — the just-jumped-to entry counts), wrapping
 /// past the end, and echoes it via `effective_center_on` for the client to highlight.

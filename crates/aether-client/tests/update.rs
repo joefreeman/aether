@@ -945,6 +945,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         directory_path: None,
         directory_parent: None,
         filters: Default::default(),
+        path_filterable: false,
         update: Some(update(Some(vec![]), 0)),
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -1202,6 +1203,57 @@ fn files_picker_alt_dot_hides_hidden_with_explorer_polarity() {
             .iter()
             .any(|c| matches!(c, ChipValue::Hidden { .. })),
         "second Alt-. removes the chip"
+    );
+}
+
+#[test]
+fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerKind, PickerViewResult};
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Jumplist, None, None, false, None);
+
+    // Before the view result lands (and whenever the capture isn't worth scoping — one file,
+    // or nothing in-root) the dir/glob chords are clean no-ops.
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    assert!(
+        s.picker.as_ref().unwrap().chip_editor.is_none(),
+        "Alt-g must not open the glob editor without the path_filterable echo"
+    );
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
+
+    // The server says this capture spans in-root files → the path chips apply.
+    let view = PickerViewResult {
+        query: String::new(),
+        generation: 0,
+        total_candidates: 3,
+        effective_offset: 0,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: Default::default(),
+        path_filterable: true,
+        update: None,
+    };
+    let _ = s.on_event(Event::PickerViewed {
+        initial: true,
+        result: Ok(view),
+    });
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    assert!(
+        s.picker.as_ref().unwrap().chip_editor.is_some(),
+        "Alt-g opens the glob editor once the echo lands"
+    );
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+
+    // The pattern chips never apply to the Jumplist — its query is a fuzzy match over the
+    // captured row text, not a content regex — regardless of the flag.
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    assert!(
+        s.picker.as_ref().unwrap().chips.is_empty(),
+        "Alt-w stays a no-op on the Jumplist picker"
     );
 }
 
@@ -2981,6 +3033,7 @@ fn picker_view_response_renders_items_without_the_push() {
         directory_path: None,
         directory_parent: None,
         filters: Default::default(),
+        path_filterable: false,
         update: Some(update),
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -3042,6 +3095,7 @@ fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total:
         directory_path: None,
         directory_parent: None,
         filters: Default::default(),
+        path_filterable: false,
         update: Some(update),
     };
     s.on_event(Event::PickerViewed {

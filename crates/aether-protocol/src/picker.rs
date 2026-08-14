@@ -804,7 +804,9 @@ pub struct ScopedPath {
 /// Which fields apply depends on the picker kind: Grep reads everything (including
 /// `hide_untracked`); Files reads `globs`/`directories`/`changed_only`/`hide_untracked`/`hide_hidden`;
 /// GitChanges reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer
-/// reads `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`. Inapplicable fields are
+/// reads `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`; Jumplist reads
+/// `globs`/`directories` (against each captured entry's file identity — and only when the capture
+/// spans in-root files at all, see `PickerViewResult::path_filterable`). Inapplicable fields are
 /// ignored, not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
@@ -1037,6 +1039,13 @@ pub struct PickerViewResult {
     /// is a render of this, not a parallel store.
     #[serde(default, skip_serializing_if = "PickerFilters::is_default")]
     pub filters: PickerFilters,
+    /// Jumplist only: whether the captured list is worth path-scoping — it spans more than one
+    /// file and at least one entry sits inside a workspace root. Gates the dir/glob chips
+    /// client-side (a single-file capture is all-or-nothing, like `GitChangesFile`'s intrinsic
+    /// scope; an all-external capture has no root-relative paths for scopes/globs to match).
+    /// Always `false` for the other kinds — their chip availability is static per kind.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub path_filterable: bool,
     /// The initial result window (items at `effective_offset`). Mirrors the `picker/update` push
     /// the server also emits, but riding the response lets the client render items atomically with
     /// adopting `generation`/`effective_offset`. The separate push can arrive *before* this

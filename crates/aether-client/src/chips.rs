@@ -100,7 +100,10 @@ pub struct Chip {
 /// Whether a filter chip applies to this picker kind (chords are clean no-ops elsewhere):
 /// Grep takes everything; Files the scope chips + changed-only + the hidden visibility chip
 /// (its index includes hidden files, so `Alt-.` hides them — but not `ignored`, which would need
-/// a re-walk); the Explorer both visibility chips + changed-only.
+/// a re-walk); the Explorer both visibility chips + changed-only; the Jumplist the path-scope
+/// chips only. Static per kind — the Jumplist additionally gates on the captured data
+/// ([`crate::picker::PickerState::filter_available`] wraps this with the server's
+/// `path_filterable` echo).
 pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
         PickerKind::Grep => true,
@@ -127,6 +130,11 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
             id,
             ChipId::Ignored | ChipId::Hidden | ChipId::Changed | ChipId::Untracked
         ),
+        // Narrow the captured list by file identity. Pattern chips (case/word/regex) don't
+        // apply — the query is a fuzzy match over the captured row text, not a content regex —
+        // and the git/visibility chips describe live workspace state, which a positional
+        // snapshot doesn't have.
+        PickerKind::Jumplist => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
         _ => false,
     }
 }
@@ -997,6 +1005,26 @@ mod tests {
         assert_eq!(adopt_filters(&wire), chips);
         assert!(apply_chip_toggle(&mut chips, ChipId::Untracked, false));
         assert!(!wire_filters(&chips).hide_untracked);
+    }
+
+    #[test]
+    fn jumplist_offers_only_the_path_scope_chips() {
+        // Dir/glob narrow the captured entries by file identity; nothing else applies — the
+        // query is a fuzzy match (no pattern chips) and the entries are a positional snapshot
+        // (no live git/visibility state to filter).
+        assert!(filter_applies(PickerKind::Jumplist, ChipId::Dir(0)));
+        assert!(filter_applies(PickerKind::Jumplist, ChipId::Glob(0)));
+        for id in [
+            ChipId::Case,
+            ChipId::Word,
+            ChipId::Regex,
+            ChipId::Ignored,
+            ChipId::Hidden,
+            ChipId::Changed,
+            ChipId::Untracked,
+        ] {
+            assert!(!filter_applies(PickerKind::Jumplist, id), "{id:?}");
+        }
     }
 
     #[test]

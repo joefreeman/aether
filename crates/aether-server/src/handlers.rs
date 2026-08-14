@@ -13386,6 +13386,13 @@ pub async fn picker_view(
         }
         _ => (None, None),
     };
+    // Jumplist: tell the client whether this capture is worth path-scoping (gates its dir/glob
+    // chips). Derived from the entries on every view — the list only changes via re-capture,
+    // and each view rebuilds candidates from it, so there's no stored flag to go stale.
+    let path_filterable = match &picker.candidates {
+        picker_state::PickerCandidates::Jumplist(v) => crate::jumplist::path_filterable(v),
+        _ => false,
+    };
     let result = PickerViewResult {
         query: picker.query.clone(),
         generation: picker.generation,
@@ -13395,6 +13402,7 @@ pub async fn picker_view(
         directory_path,
         directory_parent,
         filters: picker.filters.clone(),
+        path_filterable,
         // Carry the window on the response too — see `PickerViewResult::update`. The push below
         // stays for redundancy (and for the async grep walk's later updates).
         update: update.clone(),

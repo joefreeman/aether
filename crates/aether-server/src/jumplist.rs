@@ -269,6 +269,26 @@ pub fn assign_file_groups(entries: &mut [JumplistEntry], roots: &[std::path::Pat
     }
 }
 
+/// Whether a captured list is worth path-scoping — echoed as `PickerViewResult::path_filterable`
+/// to gate the Jumplist picker's dir/glob chips client-side. True when the entries span more than
+/// one file *and* at least one sits inside a workspace root: a single-file list is all-or-nothing
+/// under a path filter (the same reason `GitChangesFile` offers no scope chips), and an
+/// all-external list has no root-relative paths for scopes or globs to match. Callers pass stored
+/// entries (post-[`assign_file_groups`], so in-root entries have their relative parts filled).
+pub fn path_filterable(entries: &[JumplistEntry]) -> bool {
+    let mut first_file = None;
+    let mut multi_file = false;
+    let mut any_in_root = false;
+    for e in entries {
+        multi_file |= *first_file.get_or_insert(&e.abs_path) != &e.abs_path;
+        any_in_root |= e.relative_path.is_some();
+        if multi_file && any_in_root {
+            return true;
+        }
+    }
+    false
+}
+
 /// Map every ranked index through `make`, keeping the candidate index alongside — the common
 /// per-kind loop.
 fn ranked_entries(
@@ -862,6 +882,25 @@ mod tests {
                 relative_path: "src/lib.rs".into(),
             })
         );
+    }
+
+    #[test]
+    fn path_filterable_needs_multiple_files_with_an_in_root_entry() {
+        // Two in-root files: scoping can distinguish them.
+        assert!(path_filterable(&[entry("/a", 1, 0), entry("/b", 2, 0)]));
+        // One file (however many entries): a path filter is all-or-nothing.
+        assert!(!path_filterable(&[entry("/a", 1, 0), entry("/a", 9, 0)]));
+        // Multiple files but all external (no relative parts): nothing root-relative to match.
+        assert!(!path_filterable(&[
+            headerless("/dep/a.rs"),
+            headerless("/dep/b.rs"),
+        ]));
+        // Mixed: one in-root + one external still benefits (scope to the in-root side).
+        assert!(path_filterable(&[
+            entry("/ws/a.rs", 1, 0),
+            headerless("/dep/b.rs")
+        ]));
+        assert!(!path_filterable(&[]));
     }
 
     #[test]
