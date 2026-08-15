@@ -1,0 +1,20 @@
+[package]
+name = "aether-connection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aether editor — the native shells' WebSocket transport: connection actor, ordered inbound stream, RPC handle."
+
+[dependencies]
+aether-client = { workspace = true }
+aether-protocol = { workspace = true }
+
+serde.workspace = true
+serde_json.workspace = true
+
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true

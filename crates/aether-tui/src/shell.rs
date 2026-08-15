@@ -13,8 +13,7 @@ use crate::app::{
     AppState, BlameState, EditorMode, EditorState, HoverBlock, HoverBody, HoverPopup,
     PendingLeader, SearchState as TuiSearchState, StatusKind, StatusMessage,
 };
-use crate::connection::Handle;
-use crate::connection::RpcError;
+use crate::connection::{Handle, Inbound, RpcError};
 use crate::{clipboard, labels, ui};
 use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
 use aether_client::keymap::{
@@ -26,7 +25,6 @@ use aether_client::session::{
     Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
-use aether_protocol::envelope::Notification;
 use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
@@ -54,22 +52,11 @@ const TAB_WIDTH: u32 = 4;
 /// no click count, so the shell synthesises the streak from press timing.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// A completed async operation, drained from the shell's `FuturesUnordered`.
+/// A completed async operation, drained from the shell's `FuturesUnordered`. Only work that is
+/// NOT a server message on the live connection belongs here — dials and timers. RPC replies ride
+/// the ordered [`Inbound`] stream and dispatch through [`Continuation`]s, so a push the server
+/// emits after a response is always processed after it (docs/client-core.md).
 enum Done {
-    /// An `Effect::Request` outcome — token routes it to the session's parked mapping.
-    Core(u64, Result<serde_json::Value, RpcError>),
-    /// `viewport/subscribe` result (shell-initiated; geometry). The epoch identifies which
-    /// subscribe this answers, so a response superseded by a newer subscribe (e.g. a burst of
-    /// `<`/`>` grep jumps) can be dropped instead of installing a since-deleted viewport_id.
-    Subscribed(u64, Result<ViewportSubscribeResult, RpcError>),
-    /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`).
-    Window(Result<ViewportWindowResult, RpcError>),
-    /// Cursor-line blame, formatted shell-side ("author · 3w ago" needs a clock).
-    Blame {
-        buffer_id: u64,
-        line: u32,
-        text: Option<String>,
-    },
     /// A reconnect dial attempt (see `Effect::Reconnect`).
     Reconnected(Box<Result<Reestablished, ReconnectError>>),
     /// The initial boot dial: connect + bootstrap from the `Connecting` launch state. `NotUp`
@@ -79,13 +66,29 @@ enum Done {
     ToastExpired(u64),
 }
 
+/// What to do with an RPC reply when it arrives on the [`Inbound`] stream — registered under the
+/// request id at send time, resolved by [`Shell::on_inbound`] in stream order.
+enum Continuation {
+    /// An `Effect::Request` outcome — token routes it to the session's parked mapping.
+    Core { token: u64 },
+    /// `viewport/subscribe` (shell-initiated; geometry). A newer subscribe supersedes it by
+    /// *deregistering* it (`subscribe()` removes the previous entry via `pending_subscribe`),
+    /// so a reply from a burst of subscribes (e.g. `<`/`>` grep jumps) that survives to dispatch
+    /// is always the live one — never a since-deleted viewport_id.
+    Subscribed,
+    /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`).
+    Window,
+    /// Cursor-line blame, formatted at dispatch ("author · 3w ago" needs a clock).
+    Blame { buffer_id: u64, line: u32 },
+}
+
 /// How long a floating toast (bottom-right) stays before it auto-dismisses — matching the web/native
 /// clients' transient toasts.
 const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 struct Reestablished {
     handle: Handle,
-    notifications: mpsc::UnboundedReceiver<Notification>,
+    inbound: mpsc::UnboundedReceiver<Inbound>,
     /// The restored workspace + landing buffer, or `None` when the workspace is gone — renamed or
     /// removed by another client while we were disconnected. The connection itself is fine, so the
     /// shell recovers into the workspace chooser rather than failing.
@@ -120,7 +123,7 @@ impl From<crate::connection::ConnectError> for ReconnectError {
 /// of the connecting placeholder.
 struct Booted {
     handle: Handle,
-    notifications: mpsc::UnboundedReceiver<Notification>,
+    inbound: mpsc::UnboundedReceiver<Inbound>,
     session: Session,
     state: AppState,
     startup: Effects,
@@ -145,10 +148,16 @@ type DoneFuture = Pin<Box<dyn std::future::Future<Output = Done> + Send>>;
 
 pub struct Shell {
     pub handle: Handle,
-    notifications: mpsc::UnboundedReceiver<Notification>,
+    /// Server messages — replies and pushes — in wire order (see `connection.rs`).
+    inbound: mpsc::UnboundedReceiver<Inbound>,
     pub session: Session,
     pub state: AppState,
     pending: FuturesUnordered<DoneFuture>,
+    /// In-flight RPCs by request id: the reply arrives on `inbound` and dispatches its
+    /// continuation in stream order. Cleared (drained as connection-closed errors) when the
+    /// stream ends, and on a connection swap — a fresh Handle restarts its ids, so stale
+    /// entries would collide.
+    inflight: std::collections::HashMap<u64, Continuation>,
     /// The view's scroll position as a visual row into the buffer's full height —
     /// the iced shell's `scroll_px` with rows for pixels.
     top_visual_row: u32,
@@ -184,10 +193,12 @@ pub struct Shell {
     /// push may land a batch after the reply); cleared then, on a scroll reset, and when the
     /// picker closes.
     pending_group_reveal: bool,
-    /// Monotonic id for the latest `viewport/subscribe`. Stale `Done::Subscribed` responses
-    /// (whose epoch != this) are dropped so a superseded subscribe can't reinstate a viewport
-    /// the server has already replaced.
-    subscribe_epoch: u64,
+    /// The in-flight `viewport/subscribe`'s request id. A newer subscribe removes it from
+    /// `inflight` (deregistering the stale continuation) so a superseded reply can't reinstate
+    /// a viewport the server has already replaced. Cleared when the reply dispatches, and
+    /// alongside every `inflight` wipe — a fresh `Handle` restarts its ids, so a stale value
+    /// here could deregister an unrelated new request.
+    pending_subscribe: Option<u64>,
     /// The last left-press `(when, row, col)`, for synthesising double/triple clicks: the
     /// terminal reports plain presses with no click count, so a same-cell press within
     /// [`MULTI_CLICK_WINDOW`] extends the streak (1→Char, 2→Word, 3+→Line).
@@ -265,10 +276,11 @@ pub async fn run(
     session.conn = ConnState::Connecting;
     let mut shell = Shell {
         handle: crate::connection::dummy_handle(),
-        notifications: crate::connection::dummy_notifications(),
+        inbound: crate::connection::dummy_inbound(),
         session,
         state: connecting_state(term.0, term.1),
         pending: FuturesUnordered::new(),
+        inflight: std::collections::HashMap::new(),
         top_visual_row: 0,
         scroll_anchor: None,
         scroll_col: 0,
@@ -283,7 +295,7 @@ pub async fn run(
         place_after_fetch: None,
         picker_scroll: crate::ui::PickerScroll::default(),
         pending_group_reveal: false,
-        subscribe_epoch: 0,
+        pending_subscribe: None,
         last_click: None,
         click_streak: 0,
         should_quit: false,
@@ -337,25 +349,26 @@ pub async fn run(
                 let fx = shell.session.on_hint_tick(now_unix_ms());
                 shell.run_effects(fx);
             }
-            // Only poll the notifications channel while connected. Once the socket dies the channel
+            // Only poll the inbound stream while connected. Once the socket dies the channel
             // is closed, so `recv()` returns `None` *immediately* — without this guard the `select!`
             // would spin on that arm (re-dispatching `ConnectionLost` + redrawing) and peg a core
             // during the whole reconnect backoff. The first `None` (handled while still Connected)
             // flips us to Reconnecting, disabling the arm until `Reconnected` installs a fresh one.
-            n = shell.notifications.recv(), if shell.session.conn == ConnState::Connected => {
+            n = shell.inbound.recv(), if shell.session.conn == ConnState::Connected => {
                 match n {
-                    Some(n) => shell.dispatch(CoreEvent::ServerPush(n)),
-                    None => shell.dispatch(CoreEvent::ConnectionLost),
+                    Some(msg) => shell.on_inbound(msg),
+                    None => shell.on_connection_lost(),
                 }
             }
             Some(done) = shell.pending.next() => shell.on_done(done),
         }
-        // Coalesce a burst of already-arrived server pushes into a single redraw — a streaming grep
-        // emits a `picker/update` per batch, and the broad intermediate queries (`as`…) flood them.
-        // Without this we'd sync+draw once per push and fall behind the stream (the native client
-        // coalesces the same way by rendering once per frame).
-        while let Ok(n) = shell.notifications.try_recv() {
-            shell.dispatch(CoreEvent::ServerPush(n));
+        // Coalesce a burst of already-arrived server messages into a single redraw — a streaming
+        // grep emits a `picker/update` per batch, and the broad intermediate queries (`as`…) flood
+        // them. Without this we'd sync+draw once per message and fall behind the stream (the native
+        // client coalesces the same way by rendering once per frame). Drained FIFO, so the wire
+        // order the inbound stream carries survives the coalescing.
+        while let Ok(msg) = shell.inbound.try_recv() {
+            shell.on_inbound(msg);
         }
         // No buffer/window exists until a connection lands; these are no-ops while connecting but
         // gated explicitly so a dummy-handle call can never slip out.
@@ -444,11 +457,11 @@ impl Shell {
                     method,
                     params,
                 } => {
-                    // Enqueue NOW (`call` sends synchronously) so requests hit the wire in
-                    // effect-emission order — the core's sequencing contract.
-                    let fut = self.handle.call(method, params);
-                    self.pending
-                        .push(Box::pin(async move { Done::Core(token, fut.await) }));
+                    // Enqueue NOW (`send_raw` is synchronous) so requests hit the wire in
+                    // effect-emission order — the core's sequencing contract. The reply comes
+                    // back on the ordered inbound stream and routes by request id.
+                    let id = self.handle.send_raw(method, params);
+                    self.inflight.insert(id, Continuation::Core { token });
                 }
                 Effect::Toast {
                     message,
@@ -552,79 +565,158 @@ impl Shell {
         }
     }
 
-    fn on_done(&mut self, done: Done) {
-        match done {
-            Done::Core(token, result) => {
+    /// One message off the ordered inbound stream: a push feeds the core; a reply routes to
+    /// the continuation registered under its request id. Processing here, in stream order, IS
+    /// the delivery contract (docs/client-core.md) — a push the server emitted after a reply is
+    /// handled after it.
+    fn on_inbound(&mut self, msg: Inbound) {
+        match msg {
+            Inbound::Notification(n) => self.dispatch(CoreEvent::ServerPush(n)),
+            Inbound::Response { id, method, result } => {
+                // An unknown id was superseded (connection swap cleared the table) — drop it.
+                if let Some(cont) = self.inflight.remove(&id) {
+                    self.on_response(cont, method, result);
+                }
+            }
+        }
+    }
+
+    /// The inbound stream ended: the socket is gone. Flip the core to reconnecting, then fail
+    /// every in-flight continuation — the actor resolves only awaiting dials on shutdown, so
+    /// stream-mode replies are ours to drain, and none is coming. Core tokens get the error
+    /// (parked mappings must unpark); the shell's own viewport/blame continuations die silently —
+    /// the reconnect's fresh subscribe re-establishes the viewport, and a "connection closed"
+    /// toast per request would just pile noise on the reconnect banner.
+    fn on_connection_lost(&mut self) {
+        self.dispatch(CoreEvent::ConnectionLost);
+        for (_, cont) in std::mem::take(&mut self.inflight) {
+            match cont {
+                Continuation::Core { token } => {
+                    let fx = self.session.on_rpc_result(
+                        token,
+                        Err(RpcError {
+                            method: "connection",
+                            code: 0,
+                            message: "connection closed".into(),
+                        }),
+                    );
+                    self.run_effects(fx);
+                }
+                Continuation::Subscribed => self.pending_subscribe = None,
+                Continuation::Window => {
+                    self.fetch_in_flight = false;
+                    self.refetch_queued = false;
+                }
+                Continuation::Blame { .. } => {}
+            }
+        }
+    }
+
+    fn on_response(
+        &mut self,
+        cont: Continuation,
+        method: &'static str,
+        result: Result<serde_json::Value, RpcError>,
+    ) {
+        match cont {
+            Continuation::Core { token } => {
                 let fx = self.session.on_rpc_result(token, result);
                 self.run_effects(fx);
             }
-            Done::Subscribed(epoch, _) if epoch != self.subscribe_epoch => {
-                // A newer subscribe has been issued; this one's viewport was already replaced
-                // (and likely deleted) server-side. Adopting it would reinstate a stale
-                // viewport_id and fire fetches that fail with "unknown viewport_id".
+            Continuation::Subscribed => {
+                // This reply is the live subscribe — a superseded one would have been
+                // deregistered — so the slot is free either way.
+                self.pending_subscribe = None;
+                match crate::connection::parse_reply::<ViewportSubscribeResult>(method, result) {
+                    Ok(res) => {
+                        let scroll = self.subscribe_scroll;
+                        self.session.adopt_subscribe(res);
+                        // A wrap toggle left a content anchor pending: restore the view to it
+                        // (keeping the same content on screen across the reflow). Otherwise
+                        // position the top at the subscribe's scroll line and reveal the cursor
+                        // as usual.
+                        if let Some(row) = self.session.resolve_scroll_anchor() {
+                            self.top_visual_row = row;
+                            self.clamp_scroll();
+                        } else {
+                            if let Some(w) = self.session.window.as_ref() {
+                                if let Some(rel) = rows_before_line(w, scroll.logical_line) {
+                                    self.top_visual_row = w.first_visual_row + rel;
+                                }
+                            }
+                            self.clamp_scroll();
+                            self.reveal_cursor();
+                        }
+                        // Diff view rides the subscribe params; nothing to re-apply here.
+                    }
+                    Err(e) => self.status(StatusMessage::error(format!("Subscribe failed: {e}"))),
+                }
             }
-            Done::Subscribed(_, Ok(res)) => {
-                let scroll = self.subscribe_scroll;
-                self.session.adopt_subscribe(res);
-                // A wrap toggle left a content anchor pending: restore the view to it (keeping the
-                // same content on screen across the reflow). Otherwise position the top at the
-                // subscribe's scroll line and reveal the cursor as usual.
-                if let Some(row) = self.session.resolve_scroll_anchor() {
-                    self.top_visual_row = row;
-                    self.clamp_scroll();
-                } else {
-                    if let Some(w) = self.session.window.as_ref() {
-                        if let Some(rel) = rows_before_line(w, scroll.logical_line) {
-                            self.top_visual_row = w.first_visual_row + rel;
+            Continuation::Window => {
+                match crate::connection::parse_reply::<ViewportWindowResult>(method, result) {
+                    Ok(res) => {
+                        self.fetch_in_flight = false;
+                        self.session.adopt_window(res);
+                        self.clamp_scroll();
+                        if let Some(style) = self.reveal_after_fetch.take() {
+                            self.reveal_cursor_styled(style);
+                        }
+                        if let Some(place) = self.place_after_fetch.take() {
+                            self.place_cursor_in_window(place);
+                        }
+                        if self.refetch_queued {
+                            self.refetch_queued = false;
+                            self.maybe_fetch();
                         }
                     }
-                    self.clamp_scroll();
-                    self.reveal_cursor();
-                }
-                // Diff view rides the subscribe params, so there's nothing to re-apply here.
-            }
-            Done::Subscribed(_, Err(e)) => {
-                self.status(StatusMessage::error(format!("Subscribe failed: {e}")))
-            }
-            Done::Window(Ok(res)) => {
-                self.fetch_in_flight = false;
-                self.session.adopt_window(res);
-                self.clamp_scroll();
-                if let Some(style) = self.reveal_after_fetch.take() {
-                    self.reveal_cursor_styled(style);
-                }
-                if let Some(place) = self.place_after_fetch.take() {
-                    self.place_cursor_in_window(place);
-                }
-                if self.refetch_queued {
-                    self.refetch_queued = false;
-                    self.maybe_fetch();
+                    Err(e) => {
+                        self.fetch_in_flight = false;
+                        self.refetch_queued = false;
+                        // A fetch can race a resubscribe: the viewport it targeted was deleted before
+                        // the call landed. The pending newer subscribe reveals the cursor afresh, so
+                        // this is expected churn, not a failure worth surfacing.
+                        if e.code != aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND.code() {
+                            self.status(StatusMessage::error(format!(
+                                "Viewport update failed: {e}"
+                            )));
+                        }
+                    }
                 }
             }
-            Done::Window(Err(e)) => {
-                self.fetch_in_flight = false;
-                self.refetch_queued = false;
-                // A fetch can race a resubscribe: the viewport it targeted was deleted before
-                // the call landed. The pending newer subscribe reveals the cursor afresh, so
-                // this is expected churn, not a failure worth surfacing.
-                if e.code != aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND.code() {
-                    self.status(StatusMessage::error(format!("Viewport update failed: {e}")));
-                }
+            Continuation::Blame { buffer_id, line } => {
+                let text =
+                    crate::connection::parse_reply::<aether_protocol::git::GitBlameLineResult>(
+                        method, result,
+                    )
+                    .ok()
+                    .and_then(|r| r.blame)
+                    .map(|b| {
+                        if b.is_uncommitted {
+                            "uncommitted".into()
+                        } else {
+                            format!("{} · {}", b.author, time_ago(b.timestamp))
+                        }
+                    });
+                self.dispatch(CoreEvent::BlameLine {
+                    buffer_id,
+                    line,
+                    text,
+                });
             }
-            Done::Blame {
-                buffer_id,
-                line,
-                text,
-            } => self.dispatch(CoreEvent::BlameLine {
-                buffer_id,
-                line,
-                text,
-            }),
+        }
+    }
+
+    fn on_done(&mut self, done: Done) {
+        match done {
             Done::ToastExpired(id) => self.state.toasts.retain(|t| t.id != id),
             Done::Reconnected(result) => match *result {
                 Ok(r) => {
                     self.handle = r.handle;
-                    self.notifications = r.notifications;
+                    self.inbound = r.inbound;
+                    // A fresh Handle restarts its request ids — stale entries would collide
+                    // (and a stale pending-subscribe id could deregister a new request).
+                    self.inflight.clear();
+                    self.pending_subscribe = None;
                     match r.restore {
                         Some((workspace, open)) => {
                             let restarted = r.restarted;
@@ -650,7 +742,9 @@ impl Shell {
                     self.boot = None;
                     self.boot_attempt = 0;
                     self.handle = b.handle;
-                    self.notifications = b.notifications;
+                    self.inbound = b.inbound;
+                    self.inflight.clear();
+                    self.pending_subscribe = None;
                     self.session = b.session;
                     self.state = b.state;
                     // Boot installs the session directly (no `adopt_switch`), so the markdown
@@ -1234,17 +1328,12 @@ impl Shell {
             return;
         };
         let (cols, rows) = self.grid();
-        let h = self.handle.clone();
-        let fut = async move {
-            h.rpc::<ViewportResize>(ViewportResizeParams {
-                viewport_id,
-                cols,
-                rows,
-            })
-            .await
-        };
-        self.pending
-            .push(Box::pin(async move { Done::Window(fut.await) }));
+        let id = self.handle.send::<ViewportResize>(ViewportResizeParams {
+            viewport_id,
+            cols,
+            rows,
+        });
+        self.inflight.insert(id, Continuation::Window);
     }
 
     // ---- shell actions (geometry + local overlays) --------------------------------------
@@ -1392,28 +1481,27 @@ impl Shell {
             })
         };
         self.subscribe_scroll = scroll;
-        self.subscribe_epoch += 1;
-        let epoch = self.subscribe_epoch;
-        let h = self.handle.clone();
-        let buffer_id = self.session.buffer.buffer_id;
-        let wrap = self.session.wrap;
-        let diff_view = self.session.diff_view;
-        let fut = async move {
-            h.rpc::<ViewportSubscribe>(ViewportSubscribeParams {
-                buffer_id,
+        // Supersede any subscribe still in flight: deregistering its continuation drops the
+        // stale adoption entirely — the server has already replaced (and likely deleted) that
+        // viewport, and adopting it would fire fetches that fail with "unknown viewport_id".
+        if let Some(old) = self.pending_subscribe.take() {
+            self.inflight.remove(&old);
+        }
+        let id = self
+            .handle
+            .send::<ViewportSubscribe>(ViewportSubscribeParams {
+                buffer_id: self.session.buffer.buffer_id,
                 cols,
                 rows,
                 overscan_rows: rows,
                 scroll,
-                wrap,
+                wrap: self.session.wrap,
                 continuation_marker_width: 2,
                 tab_width: TAB_WIDTH,
-                diff_view,
-            })
-            .await
-        };
-        self.pending
-            .push(Box::pin(async move { Done::Subscribed(epoch, fut.await) }));
+                diff_view: self.session.diff_view,
+            });
+        self.inflight.insert(id, Continuation::Subscribed);
+        self.pending_subscribe = Some(id);
     }
 
     fn max_scroll_row(&self) -> u32 {
@@ -1463,16 +1551,13 @@ impl Shell {
             return;
         }
         self.fetch_in_flight = true;
-        let h = self.handle.clone();
-        let fut = async move {
-            h.rpc::<ViewportScrollToRow>(ViewportScrollToRowParams {
+        let id = self
+            .handle
+            .send::<ViewportScrollToRow>(ViewportScrollToRowParams {
                 viewport_id,
                 top_visual_row: top_row,
-            })
-            .await
-        };
-        self.pending
-            .push(Box::pin(async move { Done::Window(fut.await) }));
+            });
+        self.inflight.insert(id, Continuation::Window);
     }
 
     /// After a cursor move: fetch around the cursor when it left the loaded window,
@@ -1488,19 +1573,14 @@ impl Shell {
             };
             self.reveal_after_fetch = Some(style);
             self.fetch_in_flight = true;
-            let h = self.handle.clone();
-            let fut = async move {
-                h.rpc::<ViewportScroll>(ViewportScrollParams {
-                    viewport_id,
-                    scroll: ScrollPosition {
-                        logical_line: line,
-                        sub_row: 0.0,
-                    },
-                })
-                .await
-            };
-            self.pending
-                .push(Box::pin(async move { Done::Window(fut.await) }));
+            let id = self.handle.send::<ViewportScroll>(ViewportScrollParams {
+                viewport_id,
+                scroll: ScrollPosition {
+                    logical_line: line,
+                    sub_row: 0.0,
+                },
+            });
+            self.inflight.insert(id, Continuation::Window);
             return;
         }
         self.reveal_cursor_styled(style);
@@ -1629,19 +1709,14 @@ impl Shell {
             };
             self.place_after_fetch = Some(place);
             self.fetch_in_flight = true;
-            let h = self.handle.clone();
-            let fut = async move {
-                h.rpc::<ViewportScroll>(ViewportScrollParams {
-                    viewport_id,
-                    scroll: ScrollPosition {
-                        logical_line: line,
-                        sub_row: 0.0,
-                    },
-                })
-                .await
-            };
-            self.pending
-                .push(Box::pin(async move { Done::Window(fut.await) }));
+            let id = self.handle.send::<ViewportScroll>(ViewportScrollParams {
+                viewport_id,
+                scroll: ScrollPosition {
+                    logical_line: line,
+                    sub_row: 0.0,
+                },
+            });
+            self.inflight.insert(id, Continuation::Window);
             return;
         }
         self.place_cursor_in_window(place);
@@ -1681,29 +1756,13 @@ impl Shell {
             self.session.blame = None;
         }
         let buffer_id = self.session.buffer.buffer_id;
-        let h = self.handle.clone();
-        let fut = async move {
-            h.rpc::<GitBlameLine>(GitBlameLineParams {
-                buffer_id,
-                line,
-                include_commit_info: false,
-            })
-            .await
-        };
-        self.pending.push(Box::pin(async move {
-            let text = fut.await.ok().and_then(|r| r.blame).map(|b| {
-                if b.is_uncommitted {
-                    "uncommitted".into()
-                } else {
-                    format!("{} · {}", b.author, time_ago(b.timestamp))
-                }
-            });
-            Done::Blame {
-                buffer_id,
-                line,
-                text,
-            }
-        }));
+        let id = self.handle.send::<GitBlameLine>(GitBlameLineParams {
+            buffer_id,
+            line,
+            include_commit_info: false,
+        });
+        self.inflight
+            .insert(id, Continuation::Blame { buffer_id, line });
     }
 
     // ---- reconnect (the dial loop; policy lives in the core) ------------------------------
@@ -2736,7 +2795,7 @@ async fn boot_dial(
         // process just spawned, so poll fast at first (see `boot_backoff`).
         tokio::time::sleep(boot_backoff(attempt)).await;
     }
-    let (handle, notifications) = crate::connection::connect(&server_url, &spec.version)
+    let (handle, inbound) = crate::connection::connect(&server_url, &spec.version)
         .await
         .map_err(ReconnectError::from)?;
     let (session, state, startup) = bootstrap(
@@ -2752,7 +2811,7 @@ async fn boot_dial(
     .map_err(|e| ReconnectError::Fatal(e.to_string()))?;
     Ok(Booted {
         handle,
-        notifications,
+        inbound,
         session,
         state,
         startup,
@@ -2775,7 +2834,7 @@ async fn dial(
     use aether_protocol::workspace::{WorkspaceActivate, WorkspaceActivateParams};
 
     tokio::time::sleep(reconnect_backoff(attempt)).await;
-    let (handle, notifications) = crate::connection::connect(&server_url, &version)
+    let (handle, inbound) = crate::connection::connect(&server_url, &version)
         .await
         .map_err(ReconnectError::from)?;
     // The connection died while the chooser was up (a placeholder session — its workspace name
@@ -2784,7 +2843,7 @@ async fn dial(
     if workspace.is_empty() {
         return Ok(Reestablished {
             handle,
-            notifications,
+            inbound,
             restore: None,
             restarted: false,
         });
@@ -2802,7 +2861,7 @@ async fn dial(
         Err(_) => {
             return Ok(Reestablished {
                 handle,
-                notifications,
+                inbound,
                 restore: None,
                 restarted: false,
             });
@@ -2839,7 +2898,7 @@ async fn dial(
     };
     Ok(Reestablished {
         handle,
-        notifications,
+        inbound,
         restore: Some((activated.workspace, open)),
         restarted: false,
     })

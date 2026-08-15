@@ -2572,7 +2572,7 @@ fn collapsible_group_wire_shapes() {
         header_row: 4,
         len: 12,
     };
-    let v = to_value(&run).unwrap();
+    let v = to_value(run).unwrap();
     assert_eq!(v["header_row"], 4);
     assert_eq!(v["len"], 12);
     let back: aether_protocol::picker::ExpandedRun = from_value(v).unwrap();

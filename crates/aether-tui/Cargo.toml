@@ -7,13 +7,13 @@ description = "Aether editor — terminal client."
 
 [dependencies]
 aether-client = { workspace = true }
+aether-connection = { workspace = true }
 aether-protocol.workspace = true
 
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
 tracing.workspace = true

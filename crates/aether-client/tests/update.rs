@@ -960,6 +960,90 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
 }
 
 #[test]
+fn view_response_does_not_regress_a_query_typed_before_it() {
+    // Request pipelining: the user types into a fresh picker before its `picker/view` response
+    // has arrived. Typing claims the generation (the server adopts `picker/query`'s number), so
+    // the response's carried snapshot — the slot's pre-reopen generation and its resumed (empty)
+    // query — must not regress either: adopting them would clobber the typed query and orphan
+    // the query's own push. (Pushes can't race the response itself — shells deliver server
+    // messages in wire order, docs/client-core.md — so pipelining is the one case this gates.)
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, PickerViewResult, SymbolKind,
+    };
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::DocumentSymbols, None, None, false, None);
+    // Type "f" while the view response is still in flight: generation 0 → 1, claimed.
+    let _ = key(&mut s, 'f');
+    {
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.query, "f");
+        assert_eq!(p.generation, 1);
+    }
+    // The view response lands late, carrying the slot's carried generation (4) and the resumed
+    // empty query. Neither may overwrite what typing established.
+    let view = PickerViewResult {
+        query: String::new(),
+        generation: 4,
+        total_candidates: 0,
+        effective_offset: 0,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: Default::default(),
+        path_filterable: false,
+        update: None,
+    };
+    let _ = s.on_event(Event::PickerViewed {
+        initial: true,
+        result: Ok(view),
+    });
+    {
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.query, "f", "typed query survives the late response");
+        assert_eq!(p.generation, 1, "claimed generation survives the late response");
+    }
+    // The query's own push (the server adopted generation 1) applies and settles the picker.
+    let sym = |line: u32, name: &str| PickerItem::Symbol {
+        path: "/p/a.rs".into(),
+        display_path: String::new(),
+        line,
+        col: 0,
+        name: name.into(),
+        symbol_kind: SymbolKind::Function,
+        detail: String::new(),
+        depth: 0,
+        context: false,
+        match_indices: vec![],
+    };
+    let push = PickerUpdateParams {
+        kind: PickerKind::DocumentSymbols,
+        generation: 1,
+        offset: 0,
+        items: Some(vec![sym(0, "foo"), sym(5, "fizz")]),
+        total_matches: 2,
+        total_candidates: 2,
+        ticking: false,
+        groups: Vec::new(),
+        display_offset: None,
+        total_display_rows: None,
+        expanded_run: None,
+        center_on: None,
+        explorer_peek_missing: false,
+    };
+    let _ = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: PickerUpdate::NAME.into(),
+        params: serde_json::to_value(&push).unwrap(),
+    }));
+    let p = s.picker.as_ref().unwrap();
+    assert_eq!(p.items.len(), 2, "the query's push applies under the claimed generation");
+    assert!(!p.ticking);
+}
+
+#[test]
 fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
     // The grep streaming sequence at the core: the previous query's hits stay put through the
     // initial count-only tick (`items: None`) and the throttled count ticks while the new search

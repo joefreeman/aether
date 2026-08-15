@@ -3720,14 +3720,17 @@ fn parse_definition(
         serde_json::Value::Object(_) => v,
         _ => return None,
     };
-    parse_location_entry(first, encoding)
+    parse_location_entry(first, encoding, &mut FileLineCache::new())
 }
 
 /// Parse a single LSP `Location` / `LocationLink` object into a location in editor coordinates.
-/// Shared by `parse_definition` (first entry only) and `parse_references` (every entry).
+/// Shared by `parse_definition` (first entry only) and `parse_references` (every entry — whose
+/// `cache` is what keeps a many-references-in-one-file response from re-reading that file per
+/// position).
 fn parse_location_entry(
     entry: &serde_json::Value,
     encoding: crate::lsp::position::PositionEncoding,
+    cache: &mut FileLineCache,
 ) -> Option<LspLocation> {
     let (uri, range) = if let Some(u) = entry.get("uri") {
         (u.as_str()?, entry.get("range")?)
@@ -3743,25 +3746,27 @@ fn parse_location_entry(
     let line = start.get("line")?.as_u64()? as u32;
     let character = start.get("character")?.as_u64()? as u32;
     let path = crate::lsp::uri::uri_to_path(uri)?;
-    let col = target_byte_col(&path, line, character, encoding);
+    let col = cache.byte_col(&path, line, character, encoding);
     let position = LogicalPosition { line, col };
     Some(LspLocation {
         path: path.display().to_string(),
         position,
-        end: lsp_range_end_inclusive(range, position, &path, encoding),
+        end: lsp_range_end_inclusive(range, position, |l, ch| {
+            cache.byte_col(&path, l, ch, encoding)
+        }),
     })
 }
 
 /// The inclusive last position of an LSP `range` (the identifier span), or `start` when the range
 /// is empty, multi-line, or malformed. LSP end is exclusive, so step back one LSP char; identifiers
-/// are single-line, so this stays on the start line and encoding-correct via `target_byte_col`.
-/// Shared by `parse_location_entry` (references / goto-definition) and `push_symbol` (the outline),
-/// so all three land the identifier selected identically.
+/// are single-line, so this stays on the start line, converted to a byte column by `col_at`
+/// (rope-backed for the outline, cached-file-backed for cross-file locations). Shared by
+/// `parse_location_entry` (references / goto-definition) and `push_symbol` (the outline), so all
+/// three land the identifier selected identically.
 fn lsp_range_end_inclusive(
     range: &serde_json::Value,
     start: LogicalPosition,
-    path: &std::path::Path,
-    encoding: crate::lsp::position::PositionEncoding,
+    mut col_at: impl FnMut(u32, u32) -> u32,
 ) -> LogicalPosition {
     (|| {
         let s = range.get("start")?;
@@ -3772,7 +3777,7 @@ fn lsp_range_end_inclusive(
         let same_line = e.get("line")?.as_u64()? as u32 == line;
         (same_line && end_char > start_char).then(|| LogicalPosition {
             line,
-            col: target_byte_col(path, line, end_char - 1, encoding),
+            col: col_at(line, end_char - 1),
         })
     })()
     .unwrap_or(start)
@@ -3785,10 +3790,11 @@ fn parse_references(
     v: &serde_json::Value,
     encoding: crate::lsp::position::PositionEncoding,
 ) -> Vec<LspLocation> {
+    let mut cache = FileLineCache::new();
     match v {
         serde_json::Value::Array(a) => a
             .iter()
-            .filter_map(|e| parse_location_entry(e, encoding))
+            .filter_map(|e| parse_location_entry(e, encoding, &mut cache))
             .collect(),
         _ => Vec::new(),
     }
@@ -3853,13 +3859,14 @@ fn parse_document_symbols(
     v: &serde_json::Value,
     abs_path: &str,
     encoding: crate::lsp::position::PositionEncoding,
+    text: &ropey::Rope,
 ) -> Vec<picker_state::SymbolCandidate> {
     let serde_json::Value::Array(items) = v else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for item in items {
-        push_symbol(item, abs_path, encoding, 0, &mut out);
+        push_symbol(item, abs_path, encoding, 0, &mut out, text);
     }
     // Flat servers (e.g. vscode-html-language-server) return `SymbolInformation[]` with no
     // `children`, so every symbol lands at depth 0 with the parent merely named in `containerName`.
@@ -3897,13 +3904,15 @@ fn assign_depth_by_containment(cands: &mut [picker_state::SymbolCandidate]) {
 }
 
 /// Append one parsed symbol (and, for `DocumentSymbol`, its children) to `out`. Handles both the
-/// hierarchical and the flat response shapes by probing for the fields each carries.
+/// hierarchical and the flat response shapes by probing for the fields each carries. Positions
+/// convert against `text` — the live rope of the (open) document the symbols describe.
 fn push_symbol(
     entry: &serde_json::Value,
     abs_path: &str,
     encoding: crate::lsp::position::PositionEncoding,
     depth: u32,
     out: &mut Vec<picker_state::SymbolCandidate>,
+    text: &ropey::Rope,
 ) {
     let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
         return;
@@ -3913,14 +3922,13 @@ fn push_symbol(
         .and_then(|v| v.as_u64())
         .map(aether_protocol::picker::SymbolKind::from_lsp)
         .unwrap_or_default();
-    let path = std::path::Path::new(abs_path);
     let pos_at = |range: &serde_json::Value, edge: &str| -> Option<LogicalPosition> {
         let p = range.get(edge)?;
         let line = p.get("line")?.as_u64()? as u32;
         let character = p.get("character")?.as_u64()? as u32;
         Some(LogicalPosition {
             line,
-            col: target_byte_col(path, line, character, encoding),
+            col: rope_byte_col(text, line, character, encoding),
         })
     };
     // DocumentSymbol: `selectionRange` is the name, `range` the full extent. SymbolInformation:
@@ -3939,7 +3947,9 @@ fn push_symbol(
     // Inclusive last char of the name span (see `lsp_range_end_inclusive`); a point when there's no
     // distinct span.
     let name_end = name_range
-        .map(|r| lsp_range_end_inclusive(r, name_pos, path, encoding))
+        .map(|r| {
+            lsp_range_end_inclusive(r, name_pos, |l, ch| rope_byte_col(text, l, ch, encoding))
+        })
         .unwrap_or(name_pos);
     // The enclosing extent for cursor-containment; fall back to a zero-width span at the name.
     let range_start = full_range
@@ -3969,16 +3979,54 @@ fn push_symbol(
     });
     if let Some(children) = entry.get("children").and_then(|c| c.as_array()) {
         for child in children {
-            push_symbol(child, abs_path, encoding, depth + 1, out);
+            push_symbol(child, abs_path, encoding, depth + 1, out, text);
         }
     }
 }
 
-/// Convert a target position's `character` (in the server's encoding) to a byte column. For UTF-8
-/// the character *is* the byte offset; otherwise read the target line from disk to convert
-/// (best-effort — falls back to the raw character if the file can't be read).
-fn target_byte_col(
-    path: &std::path::Path,
+/// Per-parse cache of target files' lines, for converting cross-file LSP positions (references /
+/// goto-definition — files that may not be open) into byte columns. Each file is read from disk
+/// once per parse: the previous per-position `read_to_string` made a many-entry response
+/// O(entries × file size), seconds of grinding after the server had already answered.
+#[derive(Default)]
+struct FileLineCache(HashMap<std::path::PathBuf, Option<Vec<String>>>);
+
+impl FileLineCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert `character` (in the server's encoding) on `path:line` to a byte column. For UTF-8
+    /// the character *is* the byte offset (no read at all); otherwise best-effort against the
+    /// cached file — falling back to the raw character when the file/line can't be read.
+    fn byte_col(
+        &mut self,
+        path: &std::path::Path,
+        line: u32,
+        character: u32,
+        encoding: crate::lsp::position::PositionEncoding,
+    ) -> u32 {
+        if matches!(encoding, crate::lsp::position::PositionEncoding::Utf8) {
+            return character;
+        }
+        let lines = self.0.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|c| c.lines().map(str::to_string).collect())
+        });
+        match lines.as_ref().and_then(|ls| ls.get(line as usize)) {
+            Some(l) => crate::lsp::position::lsp_to_byte(l, character, encoding) as u32,
+            None => character,
+        }
+    }
+}
+
+/// [`FileLineCache::byte_col`]'s live-buffer sibling: convert against the rope the server's
+/// positions were synced from. The right source for the outline — the document is the open
+/// buffer, so disk may lag the `didChange` stream the server answered against (unsaved edits),
+/// and the rope is already in memory (no I/O at all).
+fn rope_byte_col(
+    text: &ropey::Rope,
     line: u32,
     character: u32,
     encoding: crate::lsp::position::PositionEncoding,
@@ -3986,13 +4034,14 @@ fn target_byte_col(
     if matches!(encoding, crate::lsp::position::PositionEncoding::Utf8) {
         return character;
     }
-    let Ok(content) = std::fs::read_to_string(path) else {
+    if line as usize >= text.len_lines() {
         return character;
-    };
-    match content.lines().nth(line as usize) {
-        Some(line_str) => crate::lsp::position::lsp_to_byte(line_str, character, encoding) as u32,
-        None => character,
     }
+    let mut s: String = text.line(line as usize).chunks().collect();
+    while s.ends_with('\n') || s.ends_with('\r') {
+        s.pop();
+    }
+    crate::lsp::position::lsp_to_byte(&s, character, encoding) as u32
 }
 
 /// Re-resolve a buffer's Git baseline from disk (HEAD changed externally — commit / checkout /
@@ -6725,18 +6774,21 @@ async fn build_reference_candidates(
     state: &SharedState,
     client_id: ClientId,
     buffer_id: BufferId,
-) -> Vec<picker_state::ReferenceCandidate> {
+) -> AsyncResolveAttempt<Vec<picker_state::ReferenceCandidate>> {
     // Resolve the LSP request and the workspace roots under the lock, then release it for the I/O.
-    let (req, roots) = {
+    let (resolve, roots) = {
         let s = state.lock().await;
         let roots = s
             .active_workspace(client_id)
             .map(|p| p.paths.clone())
             .unwrap_or_default();
-        (lsp_cursor_request(&s, client_id, buffer_id).ready(), roots)
+        (lsp_cursor_request(&s, client_id, buffer_id), roots)
     };
-    let Some(req) = req else {
-        return Vec::new();
+    if matches!(resolve, CursorResolve::Starting) {
+        return AsyncResolveAttempt::ServerBusy;
+    }
+    let Some(req) = resolve.ready() else {
+        return AsyncResolveAttempt::Done(Vec::new());
     };
     let refs_params = serde_json::json!({
         "textDocument": { "uri": req.uri.clone() },
@@ -6749,9 +6801,17 @@ async fn build_reference_candidates(
         .await
     {
         Ok(v) => parse_references(&v, req.encoding),
+        // A timeout from a server mid-`$/progress` (indexing) usually means the answer is queued
+        // behind the work, not lost — retry so the picker fills when it lands. Any other error
+        // (or a timeout from an idle server) settles empty as before.
+        Err(crate::lsp::client::LspError::Timeout)
+            if buffer_server_busy(state, buffer_id).await =>
+        {
+            return AsyncResolveAttempt::ServerBusy;
+        }
         Err(e) => {
             tracing::debug!(error = %e, "lsp references request failed");
-            return Vec::new();
+            return AsyncResolveAttempt::Done(Vec::new());
         }
     };
     // Resolve the definition in parallel so its reference row can be split into the Definition
@@ -6837,20 +6897,21 @@ async fn build_reference_candidates(
     // Definition first, then the file-grouped order within each section. Stable `sort_by_key`, so
     // the `(display_path, line, col)` ordering set above survives inside each section.
     out.sort_by_key(|c| !c.is_definition);
-    out
+    AsyncResolveAttempt::Done(out)
 }
 
 /// Build the document-symbols-picker candidates: ask the language server for the picked buffer's
 /// symbols (`textDocument/documentSymbol`), flattening any hierarchy into a depth-tagged list.
-/// Returns the candidates plus the cursor's buffer position (for the initial cursor-enclosing
-/// highlight) — both empty/None when there's no ready server, the buffer isn't file-backed, or the
-/// request fails. Async (off the lock): one LSP round-trip.
+/// `Done` carries the candidates plus the cursor's buffer position (for the initial
+/// cursor-enclosing highlight) — both empty/None when there's no usable server, the buffer isn't
+/// file-backed, or the request fails; `ServerStarting` asks the caller to retry once the server's
+/// handshake lands. Async (off the lock): one LSP round-trip.
 async fn build_symbol_candidates(
     state: &SharedState,
     client_id: ClientId,
     buffer_id: BufferId,
-) -> (Vec<picker_state::SymbolCandidate>, Option<LogicalPosition>) {
-    let (req, abs_path, cursor) = {
+) -> AsyncResolveAttempt<(Vec<picker_state::SymbolCandidate>, Option<LogicalPosition>)> {
+    let (resolve, abs_path, cursor, text) = {
         let s = state.lock().await;
         let abs_path = s
             .buffers
@@ -6859,14 +6920,21 @@ async fn build_symbol_candidates(
         // The cursor's byte position (for centering on the enclosing symbol), in buffer coords —
         // not the LSP-encoded one in `req`.
         let cursor = s.cursors.get(&(client_id, buffer_id)).map(|c| c.position);
+        // Snapshot of the live text for position conversion (a rope clone is cheap) — the server's
+        // positions describe the synced buffer content, not whatever is on disk.
+        let text = s.buffers.get(&buffer_id).map(|b| b.text.clone());
         (
-            lsp_cursor_request(&s, client_id, buffer_id).ready(),
+            lsp_cursor_request(&s, client_id, buffer_id),
             abs_path,
             cursor,
+            text,
         )
     };
-    let (Some(req), Some(abs_path)) = (req, abs_path) else {
-        return (Vec::new(), None);
+    if matches!(resolve, CursorResolve::Starting) {
+        return AsyncResolveAttempt::ServerBusy;
+    }
+    let (Some(req), Some(abs_path), Some(text)) = (resolve.ready(), abs_path, text) else {
+        return AsyncResolveAttempt::Done((Vec::new(), None));
     };
     // documentSymbol is whole-document: only the URI is needed (no cursor position).
     let params_json = serde_json::json!({
@@ -6877,13 +6945,20 @@ async fn build_symbol_candidates(
         .request("textDocument/documentSymbol", params_json)
         .await
     {
-        Ok(v) => parse_document_symbols(&v, &abs_path.display().to_string(), req.encoding),
+        Ok(v) => parse_document_symbols(&v, &abs_path.display().to_string(), req.encoding, &text),
+        // See `build_reference_candidates`: an indexing server's timeout means "queued", not
+        // "no symbols" — retry rather than settling an answer that goes stale when it lands.
+        Err(crate::lsp::client::LspError::Timeout)
+            if buffer_server_busy(state, buffer_id).await =>
+        {
+            return AsyncResolveAttempt::ServerBusy;
+        }
         Err(e) => {
             tracing::debug!(error = %e, "lsp documentSymbol request failed");
             Vec::new()
         }
     };
-    (candidates, cursor)
+    AsyncResolveAttempt::Done((candidates, cursor))
 }
 
 /// Everything needed to ask a buffer's language server for its document-symbol outline, resolved
@@ -6895,6 +6970,9 @@ struct LspDocSymbolRequest {
     uri: String,
     encoding: crate::lsp::position::PositionEncoding,
     abs_path: String,
+    /// Snapshot of the live text for position conversion (a rope clone is cheap) — the server's
+    /// positions describe the synced buffer content, not whatever is on disk.
+    text: ropey::Rope,
 }
 
 fn lsp_doc_symbol_request(s: &ServerState, buffer_id: BufferId) -> Option<LspDocSymbolRequest> {
@@ -6910,6 +6988,7 @@ fn lsp_doc_symbol_request(s: &ServerState, buffer_id: BufferId) -> Option<LspDoc
         uri: crate::lsp::uri::path_to_uri(path),
         encoding: handle.position_encoding,
         abs_path: path.display().to_string(),
+        text: buf.text.clone(),
     })
 }
 
@@ -6929,7 +7008,7 @@ pub async fn refresh_document_symbols(state: &SharedState, buffer_id: BufferId) 
         .request("textDocument/documentSymbol", params_json)
         .await
     {
-        Ok(v) => parse_document_symbols(&v, &req.abs_path, req.encoding),
+        Ok(v) => parse_document_symbols(&v, &req.abs_path, req.encoding, &req.text),
         Err(e) => {
             tracing::debug!(error = %e, "lsp documentSymbol refresh failed");
             return; // keep any previous cache rather than blanking it on a transient failure
@@ -6957,6 +7036,91 @@ static ASYNC_LOAD_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 fn next_async_load_epoch() -> u64 {
     ASYNC_LOAD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Outcome of one async picker-resolve attempt (References / DocumentSymbols): the candidates to
+/// apply, or "the buffer's server can't answer *yet*" — the one miss worth retrying, because it
+/// resolves itself and settling empty now would show a false "No symbols found" during exactly
+/// the window the picker is most reached for (right after opening a workspace). Two cases land
+/// on `ServerBusy`: a handshake still in flight (`Starting`, becomes `Ready` or `Crashed`), and
+/// a `Ready` server that withheld its answer past the request timeout while reporting active
+/// `$/progress` work — several servers queue requests until indexing lands.
+enum AsyncResolveAttempt<T> {
+    Done(T),
+    ServerBusy,
+}
+
+/// How often a picker resolve re-checks a busy server, and the total wall-clock budget before it
+/// gives up and settles empty. The budget spans real indexing runs (a cold rust-analyzer on a big
+/// workspace); the picker honestly shows its loading state the whole time, and a superseded epoch
+/// ends the wait early regardless.
+const RESOLVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const RESOLVE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One retry beat for a resolve waiting out a busy server: sleep the interval, then report
+/// whether this load is still the picker's current one. `false` — the picker was closed, or a
+/// newer open minted a fresh epoch — ends the retry loop; the newer load polls for itself.
+async fn async_load_still_wanted(
+    state: &SharedState,
+    client_id: ClientId,
+    kind: PickerKind,
+    epoch: u64,
+) -> bool {
+    tokio::time::sleep(RESOLVE_RETRY_INTERVAL).await;
+    let s = state.lock().await;
+    s.pickers
+        .get(&(client_id, kind))
+        .is_some_and(|p| p.pending_async_load == Some(epoch))
+}
+
+/// True when `buffer_id`'s server is mid-`$/progress` work (indexing, `cargo check`) — the state
+/// in which a timed-out request is worth retrying: the server is alive and will answer once the
+/// work lands, so settling empty now would go stale the moment it does.
+async fn buffer_server_busy(state: &SharedState, buffer_id: BufferId) -> bool {
+    let s = state.lock().await;
+    s.lsp
+        .doc_server
+        .get(&buffer_id)
+        .and_then(|key| s.lsp.servers.get(key))
+        .is_some_and(|h| !h.progress.is_empty())
+}
+
+/// Run one picker resolve to completion, waiting out a server that can't answer yet (handshake
+/// in flight, or withholding answers mid-indexing) rather than settling to a false "nothing
+/// found" — the picker stays on its loading state (`pending_async_load` uncleared) until an
+/// answer lands. `ServerBusy` retries `attempt`: each beat sleeps the interval, then re-checks
+/// that this load is still the picker's current one ([`async_load_still_wanted`] — the check
+/// runs fresh right before the next attempt, and a `Done` result never pays a sleep). `None` =
+/// superseded (picker closed or reopened) — the caller just returns; the newer load polls for
+/// itself. Budget exhausted = settle `empty`, so the picker shows its honest empty state
+/// instead of loading forever.
+///
+/// `attempt` returns an owned future (clone the `Arc`s in) rather than borrowing through an
+/// `AsyncFnMut`: the callers run under `tokio::spawn`, and a lending closure's future trips
+/// rustc's "`Send` is not general enough" limitation there.
+async fn resolve_waiting_out_busy_server<T, Fut>(
+    state: &SharedState,
+    client_id: ClientId,
+    kind: PickerKind,
+    epoch: u64,
+    empty: T,
+    mut attempt: impl FnMut() -> Fut,
+) -> Option<T>
+where
+    Fut: std::future::Future<Output = AsyncResolveAttempt<T>>,
+{
+    let deadline = std::time::Instant::now() + RESOLVE_RETRY_BUDGET;
+    loop {
+        match attempt().await {
+            AsyncResolveAttempt::Done(v) => return Some(v),
+            AsyncResolveAttempt::ServerBusy if std::time::Instant::now() < deadline => {
+                if !async_load_still_wanted(state, client_id, kind, epoch).await {
+                    return None;
+                }
+            }
+            AsyncResolveAttempt::ServerBusy => return Some(empty),
+        }
+    }
 }
 
 /// Pick the References-picker candidate to seed the initial highlight on, returning its
@@ -7078,7 +7242,21 @@ pub fn spawn_reference_resolve(
     epoch: u64,
 ) {
     tokio::spawn(async move {
-        let candidates = build_reference_candidates(&state, client_id, buffer_id).await;
+        let Some(candidates) = resolve_waiting_out_busy_server(
+            &state,
+            client_id,
+            PickerKind::References,
+            epoch,
+            Vec::new(),
+            || {
+                let state = state.clone();
+                async move { build_reference_candidates(&state, client_id, buffer_id).await }
+            },
+        )
+        .await
+        else {
+            return; // superseded — the newer load owns the picker now
+        };
         // The cursor + its file, so the picker opens on the occurrence find-references was invoked
         // on (the same "land on where you are" the grep / outline pickers do). Use the selection's
         // *leading edge* (min of anchor/position), like the grep picker: a jump lands the identifier
@@ -7120,7 +7298,21 @@ pub fn spawn_symbol_resolve(
     epoch: u64,
 ) {
     tokio::spawn(async move {
-        let (candidates, cursor) = build_symbol_candidates(&state, client_id, buffer_id).await;
+        let Some((candidates, cursor)) = resolve_waiting_out_busy_server(
+            &state,
+            client_id,
+            PickerKind::DocumentSymbols,
+            epoch,
+            (Vec::new(), None),
+            || {
+                let state = state.clone();
+                async move { build_symbol_candidates(&state, client_id, buffer_id).await }
+            },
+        )
+        .await
+        else {
+            return; // superseded — the newer load owns the picker now
+        };
         apply_async_candidates(
             &state,
             client_id,
@@ -13470,6 +13662,29 @@ pub async fn picker_query(
     } else {
         None
     };
+    // WorkspaceSymbols: resolve the fan-out targets up front (immutable borrows of `s`, like the
+    // Explorer roots above) — the initial push below needs them: whether anything will actually be
+    // asked decides `ticking`, and the fan-out size seeds the completion counter. A fan-out of
+    // zero servers settles immediately rather than spinning forever. The scoping rule lives in
+    // `symbol_servers`; a `Dir` filter prunes the fan-out rather than merely filtering results —
+    // a server whose root is disjoint from the scope can't contribute. The query minimum is
+    // grep's: below it a per-keystroke LSP fan-out (uncancellable — see
+    // `docs/workspace-symbols.md`) is pure churn.
+    let symbol_fanout = (matches!(params.kind, PickerKind::WorkspaceSymbols)
+        && params.query.len() >= grep::MIN_QUERY_LEN)
+        .then(|| {
+            let workspace = s.active_workspace(client_id)?;
+            let roots = workspace.paths.clone();
+            let scopes = scoped_dirs(&params.filters, &roots);
+            let servers: Vec<_> = s
+                .lsp
+                .symbol_servers(&workspace.id)
+                .into_iter()
+                .filter(|srv| dir_scope_admits(&srv.root, &scopes))
+                .collect();
+            Some((servers, roots))
+        })
+        .flatten();
     let ServerState {
         pickers, matcher, ..
     } = &mut *s;
@@ -13507,10 +13722,16 @@ pub async fn picker_query(
             }
         }
         // Workspace symbols: the query is the search, so drop the prior answers and let the
-        // fan-out (spawned below, off the lock) refill them server by server.
+        // fan-out (spawned below, off the lock) refill them server by server. Seeded here —
+        // before any spawned request can land its merge (see `seed_symbol_fanout`).
         PickerKind::WorkspaceSymbols => {
             picker.candidates = picker_state::PickerCandidates::WorkspaceSymbols(Vec::new());
             picker.ranked.clear();
+            picker.seed_symbol_fanout(
+                symbol_fanout
+                    .as_ref()
+                    .map_or(0, |(servers, _)| servers.len()),
+            );
         }
         // Explorer: the query is a path. Re-list the directory it peeks into (anchor + the path
         // part) before reranking, so typing `src/` descends and `src/ma` filters `src`. Skip in
@@ -13558,10 +13779,12 @@ pub async fn picker_query(
     let will_spawn_grep_search = matches!(params.kind, PickerKind::Grep)
         && query_for_grep.len() >= grep::MIN_QUERY_LEN
         && !grep_cache_hit;
-    // Same minimum as grep: below it an LSP fan-out is pure churn (one request per pinned server,
-    // none cancellable — see `docs/workspace-symbols.md`).
-    let will_spawn_symbol_search = matches!(params.kind, PickerKind::WorkspaceSymbols)
-        && query_for_grep.len() >= grep::MIN_QUERY_LEN;
+    // Only tick when at least one server will actually be asked: with an empty fan-out (no
+    // capable pinned server, or the Dir scope excluded them all) nothing would ever push again,
+    // so a `ticking` push here would strand the client on its loading state.
+    let will_spawn_symbol_search = symbol_fanout
+        .as_ref()
+        .is_some_and(|(servers, _)| !servers.is_empty());
     // Mark the initial push as ticking when we're about to spawn the search. Without this the
     // client would briefly see "0 hits, search finished" between sending the query and the
     // coordinator's first batch landing. Send it as a count-only tick (`items: None`) too: the
@@ -13583,23 +13806,6 @@ pub async fn picker_query(
         }
     }
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
-    // Resolve the eligible servers under the lock (the scoping rule lives in `symbol_servers`),
-    // plus the roots for display-path shortening. A `Dir` filter prunes the fan-out rather than
-    // merely filtering results: a server whose root is disjoint from the scope can't contribute.
-    let symbol_fanout = will_spawn_symbol_search
-        .then(|| {
-            let workspace = s.active_workspace(client_id)?;
-            let roots = workspace.paths.clone();
-            let scopes = scoped_dirs(&filters_for_grep, &roots);
-            let servers: Vec<_> = s
-                .lsp
-                .symbol_servers(&workspace.id)
-                .into_iter()
-                .filter(|srv| dir_scope_admits(&srv.root, &scopes))
-                .collect();
-            Some((servers, roots))
-        })
-        .flatten();
     let workspace_index_for_grep = if matches!(params.kind, PickerKind::Grep) {
         // Active-workspace lookup can fail in the (defensively-handled) case where the client
         // somehow lost its active workspace between opening the picker and querying it. Skip the
@@ -13693,6 +13899,7 @@ pub async fn picker_hide(
         picker.ranked.clear();
         picker.last_completed_search = None;
         picker.pending_async_load = None;
+        picker.seed_symbol_fanout(0);
         picker.expanded = None;
     }
     Ok(())
@@ -15163,7 +15370,7 @@ mod lsp_parse_tests {
                 ]
             }
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "Parser");
         assert_eq!(
@@ -15201,7 +15408,7 @@ mod lsp_parse_tests {
                 "location": {"uri": "file:///p/a.rs", "range": {"start": {"line": 5, "character": 3}, "end": {"line": 5, "character": 9}}}
             }
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "helper");
         assert_eq!(
@@ -15220,6 +15427,25 @@ mod lsp_parse_tests {
     }
 
     #[test]
+    fn document_symbols_convert_utf16_columns_against_the_rope() {
+        // A UTF-16 server's character offsets land on multi-byte text: conversion runs against
+        // the live rope (the synced buffer content the server's positions describe) — no disk
+        // I/O, and correct for unsaved edits the on-disk file doesn't have yet.
+        let text = ropey::Rope::from_str("λλ fn naïve() {}\n");
+        let v = json!([
+            {"name": "naïve", "kind": 12,
+             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 16}},
+             "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 11}}}
+        ]);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf16, &text);
+        assert_eq!(syms.len(), 1);
+        // "λλ fn " is 6 UTF-16 units but 8 bytes; the name's inclusive last char ('e', unit 10)
+        // sits at byte 13 ('ï' is two bytes).
+        assert_eq!(syms[0].start, LogicalPosition { line: 0, col: 8 });
+        assert_eq!(syms[0].end, LogicalPosition { line: 0, col: 13 });
+    }
+
+    #[test]
     fn document_symbols_flat_reconstructs_depth_from_ranges() {
         // A flat SymbolInformation[] (like vscode-html) with nested ranges — html > head > meta —
         // gets its tree rebuilt from `range` containment so the outline indents.
@@ -15232,7 +15458,7 @@ mod lsp_parse_tests {
             {"name": "body", "kind": 8, "location": loc((7, 2), (23, 9))},
             {"name": "h1", "kind": 8, "location": loc((8, 4), (8, 20))},
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.html", PositionEncoding::Utf8);
+        let syms = parse_document_symbols(&v, "/p/a.html", PositionEncoding::Utf8, &ropey::Rope::new());
         let depth = |name: &str| syms.iter().find(|c| c.name == name).unwrap().depth;
         assert_eq!(depth("html"), 0);
         assert_eq!(depth("head"), 1);
@@ -15245,13 +15471,13 @@ mod lsp_parse_tests {
     #[test]
     fn document_symbols_null_and_bad_entries_skipped() {
         // null / non-array → empty; entries missing name or position are skipped, not fatal.
-        assert!(parse_document_symbols(&json!(null), "/p/a.rs", PositionEncoding::Utf8).is_empty());
+        assert!(parse_document_symbols(&json!(null), "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new()).is_empty());
         let v = json!([
             {"name": "ok", "kind": 13, "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}},
             {"kind": 13, "selectionRange": {"start": {"line": 1, "character": 0}}},
             {"name": "no_pos", "kind": 13},
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8);
+        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "ok");
     }

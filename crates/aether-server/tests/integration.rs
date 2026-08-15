@@ -122,6 +122,27 @@ async fn send_request<M: RpcMethod>(
     }
 }
 
+/// The `picker/view` params every picker test starts from: a fresh full open (`reset: All`),
+/// window at the top, `limit: 50`, nothing else set. Tests that deviate spell out only the
+/// deviating fields via struct update: `PickerViewParams { buffer_id: Some(b), ..view_params(k) }`
+/// — so the field a test *cares about* is the only one visible at the call site.
+fn view_params(kind: PickerKind) -> PickerViewParams {
+    PickerViewParams {
+        kind,
+        reset: PickerReset::All,
+        offset: 0,
+        limit: 50,
+        from_selection: false,
+        filters: None,
+        center_on: None,
+        center_on_cursor: None,
+        directory_path: None,
+        buffer_id: None,
+        explorer_roots: false,
+        keybindings: None,
+    }
+}
+
 /// Like `send_request` but expects the RPC to return an error; returns the error message.
 /// Panics on a successful response.
 async fn send_request_expect_err<M: RpcMethod>(
@@ -10802,18 +10823,8 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -10872,18 +10883,9 @@ async fn picker_query_restarts_the_window_at_the_top() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
             offset: 2,
             limit: 2,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -10935,18 +10937,10 @@ fn keybindings_view_params(
     rows: Option<Vec<aether_protocol::picker::KeybindingEntry>>,
 ) -> PickerViewParams {
     PickerViewParams {
-        from_selection: false,
-        filters: None,
-        kind: PickerKind::Keybindings,
         reset,
-        offset: 0,
         limit: 30,
-        center_on: None,
-        center_on_cursor: None,
-        directory_path: None,
-        buffer_id: None,
-        explorer_roots: false,
         keybindings: rows,
+        ..view_params(PickerKind::Keybindings)
     }
 }
 
@@ -11181,18 +11175,8 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -11312,18 +11296,8 @@ async fn git_changes_picker_collapses_untracked_directories() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -11380,18 +11354,9 @@ async fn git_changes_picker_hide_untracked() {
             ws,
             id,
             &PickerViewParams {
-                from_selection: false,
                 filters,
-                kind: PickerKind::GitChanges,
-                reset: PickerReset::All,
-                offset: 0,
                 limit: 30,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
-                buffer_id: None,
-                explorer_roots: false,
-                keybindings: None,
+                ..view_params(PickerKind::GitChanges)
             },
         )
         .await;
@@ -11461,18 +11426,8 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
         &mut ws,
         5,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -11547,19 +11502,10 @@ async fn git_changes_file_is_locked_to_its_buffer() {
     )
     .await;
 
-    let view_params = |kind, buffer_id| PickerViewParams {
-        from_selection: false,
-        filters: None,
-        kind,
-        reset: PickerReset::All,
-        offset: 0,
-        limit: 30,
-        center_on: None,
-        center_on_cursor: None,
-        directory_path: None,
+    let view = |kind, buffer_id| PickerViewParams {
         buffer_id,
-        explorer_roots: false,
-        keybindings: None,
+        limit: 30,
+        ..view_params(kind)
     };
     // The workspace picker's window is collapsed `Group` headers; the buffer-locked sibling
     // stays flat `GitChange` rows — both carry the file either way.
@@ -11582,7 +11528,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
 
     // Workspace changes: both files.
     let workspace =
-        send_request::<PickerView>(&mut ws, 5, &view_params(PickerKind::GitChanges, None)).await;
+        send_request::<PickerView>(&mut ws, 5, &view(PickerKind::GitChanges, None)).await;
     let mut p = paths(&workspace);
     p.sort();
     // The first group opens itself (docs/picker-groups.md §9), so its file appears as both
@@ -11594,7 +11540,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
     let file = send_request::<PickerView>(
         &mut ws,
         6,
-        &view_params(PickerKind::GitChangesFile, Some(buffer_id)),
+        &view(PickerKind::GitChangesFile, Some(buffer_id)),
     )
     .await;
     assert_eq!(
@@ -11619,19 +11565,10 @@ async fn changes_pickers_reopen_clean_and_rebuild_their_hunks() {
     std::mem::forget(dir);
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "reopen-proj", "a.rs").await;
-    let view_params = |kind, buffer_id| PickerViewParams {
-        from_selection: false,
-        filters: None,
-        kind,
-        reset: PickerReset::All,
-        offset: 0,
-        limit: 30,
-        center_on: None,
-        center_on_cursor: None,
-        directory_path: None,
+    let view = |kind, buffer_id| PickerViewParams {
         buffer_id,
-        explorer_roots: false,
-        keybindings: None,
+        limit: 30,
+        ..view_params(kind)
     };
     let row_count = |view: &aether_protocol::picker::PickerViewResult| {
         view.update.as_ref().expect("window").items().len()
@@ -11642,7 +11579,7 @@ async fn changes_pickers_reopen_clean_and_rebuild_their_hunks() {
         (PickerKind::GitChangesFile, Some(buffer_id)),
         (PickerKind::GitChanges, None),
     ] {
-        let first = send_request::<PickerView>(&mut ws, id, &view_params(kind, scoped)).await;
+        let first = send_request::<PickerView>(&mut ws, id, &view(kind, scoped)).await;
         assert!(row_count(&first) > 0, "{kind:?} opens with the hunk");
 
         // Narrow it to nothing and turn on a chip, the state that used to survive.
@@ -11663,7 +11600,7 @@ async fn changes_pickers_reopen_clean_and_rebuild_their_hunks() {
         .await;
         let _: () = send_request::<PickerHide>(&mut ws, id + 2, &PickerHideParams { kind }).await;
 
-        let reopen = send_request::<PickerView>(&mut ws, id + 3, &view_params(kind, scoped)).await;
+        let reopen = send_request::<PickerView>(&mut ws, id + 3, &view(kind, scoped)).await;
         assert_eq!(reopen.query, "", "{kind:?} reopens with no query");
         assert_eq!(
             reopen.filters,
@@ -11709,18 +11646,9 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
         &mut ws,
         4,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
             center_on_cursor: Some(buffer_id),
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -11779,18 +11707,8 @@ async fn picker_set_group_holds_the_accordion_invariant() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -11910,18 +11828,8 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -11961,18 +11869,10 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
         &mut ws,
         20,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
             offset: 3,
             limit: 4,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -12014,18 +11914,8 @@ async fn jumplist_capture_includes_collapsed_hidden_hits() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -12099,18 +11989,8 @@ async fn git_changes_picker_query_greps_diff_content() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -12189,18 +12069,8 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -12300,18 +12170,9 @@ async fn git_changes_keep_view_preserves_query_within_one_open() {
 
     // Open (fresh), search "marker", then hide.
     let open = |reset| PickerViewParams {
-        from_selection: false,
-        filters: None,
-        kind: PickerKind::GitChanges,
         reset,
-        offset: 0,
         limit: 30,
-        center_on: None,
-        center_on_cursor: None,
-        directory_path: None,
-        buffer_id: None,
-        explorer_roots: false,
-        keybindings: None,
+        ..view_params(PickerKind::GitChanges)
     };
     let _ = send_request::<PickerView>(&mut ws, 2, &open(PickerReset::All)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
@@ -12370,18 +12231,8 @@ async fn git_changes_picker_query_is_a_regex() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -12459,7 +12310,6 @@ async fn git_changes_picker_filters_by_directory() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -12468,16 +12318,8 @@ async fn git_changes_picker_filters_by_directory() {
                 }],
                 ..Default::default()
             }),
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -12540,7 +12382,6 @@ async fn git_changes_picker_filters_by_exact_file() {
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -12549,16 +12390,8 @@ async fn git_changes_picker_filters_by_exact_file() {
                 }],
                 ..Default::default()
             }),
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -12583,18 +12416,8 @@ async fn picker_query_ranks_matches_and_carries_indices() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12642,18 +12465,8 @@ async fn picker_select_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12711,18 +12524,8 @@ async fn picker_keep_view_centers_on_a_named_item() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12746,11 +12549,7 @@ async fn picker_keep_view_centers_on_a_named_item() {
         &mut ws,
         13,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
             center_on: Some(PickerItem::File {
                 path_index: 0,
@@ -12758,11 +12557,7 @@ async fn picker_keep_view_centers_on_a_named_item() {
                 match_indices: vec![],
                 git_status: None,
             }),
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12785,18 +12580,8 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12827,18 +12612,8 @@ async fn picker_reset_wipes_persisted_query() {
         &mut ws,
         13,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Files)
         },
     )
     .await;
@@ -12938,18 +12713,8 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13019,18 +12784,8 @@ async fn buffers_picker_select_returns_buffer_id() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13139,18 +12894,8 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13264,18 +13009,8 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &mut ws,
         4,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13364,18 +13099,8 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &mut ws,
         4,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13482,18 +13207,8 @@ async fn buffers_picker_pushes_on_save() {
         &mut ws,
         5,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13565,18 +13280,8 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -13661,18 +13366,8 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         &mut ws_b,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -15208,18 +14903,8 @@ async fn select_file_group(
         ws,
         id + 1,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind,
             reset: PickerReset::Keep,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(kind)
         },
     )
     .await;
@@ -15254,18 +14939,8 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15375,17 +15050,10 @@ async fn picker_grep_from_selection_seeds_query_and_searches() {
         4,
         &PickerViewParams {
             from_selection: true,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
             buffer_id: Some(buffer_id),
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15442,17 +15110,10 @@ async fn picker_grep_from_selection_empty_is_unseeded() {
         4,
         &PickerViewParams {
             from_selection: true,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
             buffer_id: Some(buffer_id),
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15475,18 +15136,8 @@ async fn picker_grep_query_initial_push_keeps_the_window() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15539,18 +15190,8 @@ async fn picker_grep_short_query_yields_empty_result() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15588,18 +15229,8 @@ async fn picker_grep_keeps_hits_across_a_keep_scoped_re_view() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15627,18 +15258,9 @@ async fn picker_grep_keeps_hits_across_a_keep_scoped_re_view() {
         &mut ws,
         13,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15663,18 +15285,8 @@ async fn closing_a_picker_clears_it_and_moves_the_generation() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15708,18 +15320,9 @@ async fn closing_a_picker_clears_it_and_moves_the_generation() {
         &mut ws,
         13,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15756,25 +15359,8 @@ async fn grep_fresh_open_wipes_hits_and_filters() {
     )
     .await;
 
-    let reopen: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        12,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let reopen: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, 12, &view_params(PickerKind::Grep)).await;
     assert_eq!(reopen.query, "", "the query is wiped on a fresh open");
     assert_eq!(reopen.total_candidates, 0, "so are the hits it produced");
     assert_eq!(
@@ -15843,18 +15429,8 @@ async fn grep_fresh_open_installs_seeded_filters_over_the_wipe() {
         &mut ws,
         12,
         &PickerViewParams {
-            from_selection: false,
             filters: Some(seed.clone()),
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15879,18 +15455,8 @@ async fn picker_grep_treats_query_as_regex() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -15930,18 +15496,8 @@ async fn picker_grep_caches_completed_query() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -16024,18 +15580,8 @@ async fn setup_grep_with_needle_query() -> (
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -16559,18 +16105,10 @@ async fn grep_ignores_center_on_cursor() {
         &mut ws,
         22,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
             center_on_cursor: Some(buffer_id),
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -16677,18 +16215,8 @@ async fn jumplist_capture_from_git_changes_picker() {
         &mut ws,
         3,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::GitChanges,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::GitChanges)
         },
     )
     .await;
@@ -16775,18 +16303,8 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
         &mut ws,
         22,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Jumplist)
         },
     )
     .await;
@@ -16978,18 +16496,8 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
         &mut ws,
         22,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Jumplist)
         },
     )
     .await;
@@ -17027,18 +16535,9 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
         &mut ws,
         24,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Jumplist)
         },
     )
     .await;
@@ -17083,18 +16582,8 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
         &mut ws,
         26,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Jumplist)
         },
     )
     .await;
@@ -17119,18 +16608,9 @@ async fn jumplist_picker_centers_on_the_cursor_nearest_entry() {
     // first entry → nearest at-or-after is #1.
     set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
     let view_params = |center: Option<u64>| PickerViewParams {
-        from_selection: false,
-        filters: None,
-        kind: PickerKind::Jumplist,
-        reset: PickerReset::All,
-        offset: 0,
         limit: 30,
-        center_on: None,
         center_on_cursor: center,
-        directory_path: None,
-        buffer_id: None,
-        explorer_roots: false,
-        keybindings: None,
+        ..view_params(PickerKind::Jumplist)
     };
     let view = send_request::<PickerView>(&mut ws, 23, &view_params(Some(buffer_id))).await;
     match view.effective_center_on {
@@ -17178,18 +16658,8 @@ async fn jumplist_picker_opens_empty_without_a_capture() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Jumplist)
         },
     )
     .await;
@@ -17277,18 +16747,8 @@ async fn workspace_switch_wipes_the_captured_results() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -17383,18 +16843,8 @@ async fn picker_explorer_default_lists_workspace_root() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17435,18 +16885,9 @@ async fn picker_explorer_navigate_into_subdirectory() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17481,18 +16922,8 @@ async fn picker_explorer_query_filters_by_prefix() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17545,18 +16976,8 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17616,18 +17037,8 @@ async fn setup_peek_workspace() -> (
         &mut ws,
         2,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17833,18 +17244,9 @@ async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
         &mut ws,
         4,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17877,18 +17279,8 @@ async fn picker_explorer_empty_query_restores_full_listing() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -17943,18 +17335,8 @@ async fn picker_explorer_query_is_smartcase() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18010,18 +17392,9 @@ async fn picker_explorer_select_file_returns_absolute_path() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18062,18 +17435,8 @@ async fn picker_explorer_select_directory_errors() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18109,18 +17472,9 @@ async fn picker_explorer_rejects_path_outside_workspace() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
             directory_path: Some("/etc".into()),
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18324,18 +17678,9 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
             directory_path: Some(target.display().to_string()),
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18354,18 +17699,9 @@ async fn picker_explorer_resumes_last_directory() {
         &mut ws,
         12,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
             reset: PickerReset::Keep,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18443,18 +17779,8 @@ async fn picker_explorer_tags_entries_with_git_status() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -18496,25 +17822,8 @@ async fn picker_explorer_tags_entries_with_git_status() {
 async fn picker_files_tags_entries_with_git_status() {
     use aether_protocol::git::GitStatus;
     let (server, mut ws, _root) = setup_explorer_git_workspace().await;
-    let _view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        10,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, 10, &view_params(PickerKind::Files)).await;
 
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     let status_of = |target: &str| -> Option<GitStatus> {
@@ -18565,18 +17874,8 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -21970,18 +21269,8 @@ async fn wait_for_buffer_diagnostic(
             ws,
             id_base + i,
             &PickerViewParams {
-                from_selection: false,
-                filters: None,
-                kind: PickerKind::Diagnostics,
-                reset: PickerReset::All,
-                offset: 0,
-                limit: 50,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
                 buffer_id: Some(buffer_id),
-                explorer_roots: false,
-                keybindings: None,
+                ..view_params(PickerKind::Diagnostics)
             },
         )
         .await;
@@ -22010,18 +21299,8 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, id_base: u64,
             ws,
             id_base + i,
             &PickerViewParams {
-                from_selection: false,
-                filters: None,
-                kind: PickerKind::Diagnostics,
-                reset: PickerReset::All,
-                offset: 0,
-                limit: 50,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
                 buffer_id: Some(buffer_id),
-                explorer_roots: false,
-                keybindings: None,
+                ..view_params(PickerKind::Diagnostics)
             },
         )
         .await;
@@ -22129,25 +21408,7 @@ fn dummy_symbol(
 /// Polls the `picker/view` response rather than waiting on pushes, because `send_request` eats
 /// notifications (see `docs/projects.md`'s dummy-fixture note).
 async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
-    let _ = send_request::<PickerView>(
-        ws,
-        90,
-        &PickerViewParams {
-            kind: PickerKind::WorkspaceSymbols,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            from_selection: false,
-            filters: None,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(ws, 90, &view_params(PickerKind::WorkspaceSymbols)).await;
     let _: () = send_request::<PickerQuery>(
         ws,
         91,
@@ -22166,18 +21427,8 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
             ws,
             200 + i,
             &PickerViewParams {
-                kind: PickerKind::WorkspaceSymbols,
                 reset: PickerReset::Keep,
-                offset: 0,
-                limit: 50,
-                from_selection: false,
-                filters: None,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
-                buffer_id: None,
-                explorer_roots: false,
-                keybindings: None,
+                ..view_params(PickerKind::WorkspaceSymbols)
             },
         )
         .await;
@@ -22203,18 +21454,8 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
                     ws,
                     401,
                     &PickerViewParams {
-                        kind: PickerKind::WorkspaceSymbols,
                         reset: PickerReset::Keep,
-                        offset: 0,
-                        limit: 50,
-                        from_selection: false,
-                        filters: None,
-                        center_on: None,
-                        center_on_cursor: None,
-                        directory_path: None,
-                        buffer_id: None,
-                        explorer_roots: false,
-                        keybindings: None,
+                        ..view_params(PickerKind::WorkspaceSymbols)
                     },
                 )
                 .await;
@@ -22513,6 +21754,304 @@ async fn workspace_symbols_keep_server_matches_our_matcher_would_reject() {
         match_indices.is_empty(),
         "unmatched by us, so nothing to highlight",
     );
+}
+
+/// Symbols spread across files render one group per file — files ordered by their best match,
+/// each file's rows contiguous, the server-matched-only file trailing — and group stepping
+/// reaches every file. Flat score ordering used to interleave files, which rendered duplicate
+/// headers and (a group key resolves to its *first* run) snapped `set_group` back to the first
+/// copy, leaving later groups unreachable.
+#[tokio::test]
+async fn workspace_symbol_groups_stay_contiguous_and_step_to_every_file() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/a_early.rs", "fn bag_of_roots() {}\n"),
+        ("src/m_mid.rs", "fn unrelated() {}\n"),
+        ("src/z_late.rs", "fn brotli_footer() {}\nfn boot() {}\n"),
+    ]);
+    let early = dir.path().join("src/a_early.rs");
+    let mid = dir.path().join("src/m_mid.rs");
+    let late = dir.path().join("src/z_late.rs");
+    let dummy = DummyLspConfig {
+        // For the query "boot": the consecutive "boot" far outscores the scattered matches, so
+        // best-match ordering must put the alphabetically-last file first; "unrelated" is a
+        // server match our matcher rejects, so its file trails as the never-filtered group.
+        workspace_symbols: vec![
+            dummy_symbol("bag_of_roots", &early, 0, 3),
+            dummy_symbol("unrelated", &mid, 0, 3),
+            dummy_symbol("brotli_footer", &late, 0, 3),
+            dummy_symbol("boot", &late, 1, 3),
+        ],
+        symbol_query_filter: false,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-groups",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-groups".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = |reset| PickerViewParams {
+        reset,
+        ..view_params(PickerKind::WorkspaceSymbols)
+    };
+    let _ = send_request::<PickerView>(&mut ws, 90, &view(PickerReset::All)).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        91,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "boot".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    // The fan-out is spawned, so poll the view until the merge lands (one server, one batch).
+    let mut items = Vec::new();
+    for i in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let view = send_request::<PickerView>(&mut ws, 200 + i, &view(PickerReset::Keep)).await;
+        if let Some(got) = view.update.and_then(|u| u.items).filter(|v| !v.is_empty()) {
+            items = got;
+            break;
+        }
+    }
+
+    // Row space: z_late.rs (auto-expanded best-match run, its rows inline, best first), then
+    // the two collapsed groups — each file exactly once.
+    let mut headers: Vec<(String, u32, bool)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for item in &items {
+        match item {
+            PickerItem::Group {
+                header: GroupHeader::Label { label },
+                count,
+                expanded,
+            } => headers.push((label.clone(), *count, *expanded)),
+            PickerItem::Symbol { name, .. } => names.push(name.clone()),
+            other => panic!("unexpected row: {other:?}"),
+        }
+    }
+    assert_eq!(
+        headers,
+        vec![
+            ("src/z_late.rs".into(), 2, true),
+            ("src/a_early.rs".into(), 1, false),
+            ("src/m_mid.rs".into(), 1, false),
+        ],
+        "one group per file: best match first, never-filtered file last"
+    );
+    assert_eq!(names, vec!["boot", "brotli_footer"]);
+
+    // Group stepping visits each run once and stops at the end — no snap-back to a duplicate.
+    let step = PickerSetGroupParams {
+        kind: PickerKind::WorkspaceSymbols,
+        header: None,
+        step: Some(Direction::Forward),
+    };
+    let r: PickerSetGroupResult = send_request::<PickerSetGroup>(&mut ws, 500, &step).await;
+    assert_eq!(
+        r.run.map(|r| r.header_row),
+        Some(1),
+        "first step lands on a_early.rs"
+    );
+    let r: PickerSetGroupResult = send_request::<PickerSetGroup>(&mut ws, 501, &step).await;
+    assert_eq!(
+        r.run.map(|r| r.header_row),
+        Some(2),
+        "second step lands on m_mid.rs"
+    );
+    let r: PickerSetGroupResult = send_request::<PickerSetGroup>(&mut ws, 502, &step).await;
+    assert!(r.run.is_none(), "stepping off the last group is a no-op");
+}
+
+/// [`send_request`], but returning every `picker/update` push that arrived ahead of the response —
+/// the connection writer prefers replies over pushes, so which lands first is nondeterministic and
+/// a test asserting on a query's own push must capture both sides of the race.
+async fn send_request_collecting_updates<M: RpcMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    params: &M::Params,
+) -> (M::Result, Vec<PickerUpdateParams>) {
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id,
+        method: M::NAME.into(),
+        params: Some(serde_json::to_value(params).unwrap()),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    loop {
+        let text = next_text(ws).await;
+        match serde_json::from_str::<ClientInbound>(&text).expect("parseable inbound") {
+            ClientInbound::Response(r) if r.id == id => {
+                return (
+                    serde_json::from_value(r.result).expect("typed result"),
+                    updates,
+                );
+            }
+            ClientInbound::Error(e) if e.id == id => {
+                panic!("request {id} ({}) returned error: {:?}", M::NAME, e.error);
+            }
+            ClientInbound::Notification(n) if n.method == PickerUpdate::NAME => {
+                updates.push(serde_json::from_value(n.params).expect("typed params"));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A query no server matches still settles: the merge that completes the fan-out must push
+/// `ticking: false` even though it contributed nothing. Without the completion accounting no
+/// push ever followed the `ticking` one and the client spun on "Searching projects…" forever.
+#[tokio::test]
+async fn workspace_symbols_settle_when_no_server_matches() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\nfn helper_one() {}\n"),
+    ]);
+    let target = dir.path().join("src/main.rs");
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol("helper_one", &target, 1, 3)],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-empty",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-empty".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ =
+        send_request::<PickerView>(&mut ws, 10, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let ((), mut updates) = send_request_collecting_updates::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "zzzzzz".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    // The settling push — the only server answered with nothing — may have raced the response
+    // either way; keep reading until it shows. Gate on the query's generation so the view's
+    // initial (generation-0, also non-ticking) push can't satisfy the assertion vacuously.
+    let settled = loop {
+        if let Some(u) = updates.iter().find(|u| u.generation == 1 && !u.ticking) {
+            break u.clone();
+        }
+        updates.push(
+            expect_notification_within::<PickerUpdate>(&mut ws, std::time::Duration::from_secs(2))
+                .await,
+        );
+    };
+    assert_eq!(settled.total_matches, 0);
+    assert!(
+        settled.items.as_ref().is_some_and(|i| i.is_empty()),
+        "the settling push carries the (empty) window, not a count-only tick"
+    );
+}
+
+/// An empty fan-out — the pinned server doesn't advertise `workspace/symbol` — settles in the
+/// query's own push. Marking it `ticking` would strand the client: nothing is in flight, so
+/// nothing would ever clear it.
+#[tokio::test]
+async fn workspace_symbols_with_no_capable_server_settle_immediately() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/main.rs", "fn main() {}\n"),
+    ]);
+    // No `workspace_symbols` → the handshake doesn't advertise `workspaceSymbolProvider`, so the
+    // pinned server is excluded from the fan-out.
+    let dummy = DummyLspConfig::default();
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-none",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-none".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ =
+        send_request::<PickerView>(&mut ws, 10, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let ((), mut updates) = send_request_collecting_updates::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "helper".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    while !updates.iter().any(|u| u.generation == 1) {
+        updates.push(
+            expect_notification_within::<PickerUpdate>(&mut ws, std::time::Duration::from_secs(2))
+                .await,
+        );
+    }
+    for u in updates.iter().filter(|u| u.generation == 1) {
+        assert!(!u.ticking, "an empty fan-out must not promise answers");
+        assert!(
+            u.items.is_some(),
+            "the settled push carries the (empty) window"
+        );
+    }
 }
 
 /// Poll until `f` holds against the server's LSP state, or fail after ~2s. Server startup is a
@@ -23147,18 +22686,9 @@ async fn references_picker_lists_all_uses() {
                 &mut ws,
                 id,
                 &PickerViewParams {
-                    from_selection: false,
-                    filters: None,
-                    kind: PickerKind::References,
-                    reset: PickerReset::All,
-                    offset: 0,
                     limit: 30,
-                    center_on: None,
-                    center_on_cursor: None,
-                    directory_path: None,
                     buffer_id: Some(buffer_id),
-                    explorer_roots: false,
-                    keybindings: None,
+                    ..view_params(PickerKind::References)
                 },
             )
             .await;
@@ -23247,6 +22777,171 @@ async fn references_picker_lists_all_uses() {
     };
     assert_eq!(*line, 0, "seeded on the cursor's occurrence (line 0)");
     assert!(*is_definition, "that occurrence is the definition");
+}
+
+/// A picker opened while the buffer's server is still doing its handshake waits it out and fills
+/// on a SINGLE open — the resolve retries until the server leaves `Starting` instead of settling
+/// to a false "No references found" (which is what the picker showed for the first seconds after
+/// opening a workspace, exactly when it's reached for).
+#[tokio::test]
+async fn references_picker_waits_out_a_starting_server() {
+    use aether_server::{DummyLspConfig, DummyRange};
+    use std::time::Duration;
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n",
+    )]);
+    let dummy = DummyLspConfig {
+        references: vec![DummyRange::on(0, 3, 9), DummyRange::on(4, 12, 18)],
+        // Hold the handshake well past the resolve's retry interval, so the picker's first
+        // attempts genuinely find the server `Starting`.
+        initialize_delay: Some(Duration::from_millis(600)),
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "refs-slow-start",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 0, 3).await; // on `helper`'s declaration
+
+    // ONE open, immediately — the handshake above is still in flight.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        12,
+        &PickerViewParams {
+            limit: 30,
+            buffer_id: Some(buffer_id),
+            ..view_params(PickerKind::References)
+        },
+    )
+    .await;
+    // The first settle push must already carry the references: the resolve waited for the
+    // server rather than settling empty while it was starting.
+    let done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let p: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+            if p.kind == PickerKind::References && !p.ticking {
+                break p;
+            }
+        }
+    })
+    .await
+    .expect("the resolve never settled");
+    drop(server);
+    assert_eq!(
+        done.total_matches, 2,
+        "the declaration + call site, from the one open"
+    );
+}
+
+/// The DocumentSymbols picker (`Space o`) fills from ONE open: the async resolve pushes the
+/// outline with `ticking: false`, framed + centred on the cursor's enclosing symbol even when that
+/// symbol ranks deep in the list — the re-framed offset rides the push with `center_on`, and the
+/// client adopts it (nothing in this exchange may leave the picker on "Finding symbols…").
+#[tokio::test]
+async fn document_symbols_picker_fills_and_centers_deep() {
+    use aether_server::{DummyDocSymbol, DummyLspConfig, DummyRange};
+    use std::time::Duration;
+    // 40 one-line functions, f00..f39 — enough that f35's rank sits past half the 30-row window.
+    let content: String = (0..40).map(|i| format!("fn f{i:02}() {{}}\n")).collect();
+    let dir = lay_out(&[("main.rs", content.as_str())]);
+    let dummy = DummyLspConfig {
+        document_symbols: (0..40)
+            .map(|i| DummyDocSymbol {
+                name: format!("f{i:02}"),
+                kind: 12,
+                range: DummyRange::on(i, 0, 11),
+                selection: DummyRange::on(i, 3, 6),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "symbols-fill",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 35, 5).await; // inside f35's extent
+
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        12,
+        &PickerViewParams {
+            limit: 30,
+            buffer_id: Some(buffer_id),
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let p: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+            if p.kind == PickerKind::DocumentSymbols && !p.ticking {
+                break p;
+            }
+        }
+    })
+    .await
+    .expect("the symbols resolve never settled");
+    drop(server);
+
+    assert_eq!(done.total_matches, 40, "the whole outline");
+    // The cursor sits in f35 (rank 35): the window is framed around it (35 − limit/2 = 20) and
+    // the centred row rides the push for the client to adopt.
+    assert_eq!(done.offset, 20);
+    let center = done
+        .center_on
+        .as_deref()
+        .expect("the cursor-enclosing symbol is centred");
+    let PickerItem::Symbol { name, line, .. } = center else {
+        panic!("center_on should be a Symbol, got {center:?}");
+    };
+    assert_eq!(name, "f35");
+    assert_eq!(*line, 35);
+    // And the framed window really contains that row.
+    assert!(
+        done.items()
+            .iter()
+            .any(|i| matches!(i, PickerItem::Symbol { name, .. } if name == "f35")),
+        "the centred symbol is inside the pushed window"
+    );
 }
 
 /// Phase 5: `lsp/format` applies the server's edits to the buffer, and saving writes the formatted
@@ -23550,25 +23245,8 @@ async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
 
     // The Jumplist picker now groups the entries under a File header for main.rs — even though the
     // source buffer-diagnostics picker rendered flat.
-    let view: PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        22,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Jumplist,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let view: PickerViewResult =
+        send_request::<PickerView>(&mut ws, 22, &view_params(PickerKind::Jumplist)).await;
     let vu = view.update.expect("jumplist view carries its window");
     assert!(
         vu.groups.iter().any(|g| matches!(
@@ -24300,25 +23978,7 @@ async fn setup_grep_filter_workspace() -> (
     .await;
 
     // Open the grep picker once; individual tests drive it via picker/query.
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Grep)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await; // initial empty push
     (server, ws)
 }
@@ -24542,25 +24202,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Grep)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
     let update = grep_with_filters(&mut ws, 10, "needle", PickerFilters::default(), 1).await;
@@ -24626,25 +24268,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Grep)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
     // Fire a burst of queries *without reading anything back* — like a user typing while the
@@ -24810,25 +24434,7 @@ async fn grep_default_excludes_whitelisted_dotfile() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Grep)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await; // initial empty push
 
     // Default: the whitelisted dotfile is NOT searched (grep default = no dotfiles).
@@ -24892,18 +24498,8 @@ async fn grep_keep_view_echoes_filters_and_all_wipes_them() {
         &mut ws,
         12,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -24912,25 +24508,8 @@ async fn grep_keep_view_echoes_filters_and_all_wipes_them() {
     assert_eq!(resume.total_candidates, 6, "as do the hits they produced");
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
-    let reset: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        13,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let reset: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, 13, &view_params(PickerKind::Grep)).await;
     assert!(
         reset.filters.is_default(),
         "an `all` reset wipes filters too"
@@ -24959,18 +24538,9 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
         &mut ws,
         11,
         &PickerViewParams {
-            from_selection: false,
             filters: Some(scoped.clone()),
-            kind: PickerKind::Grep,
             reset: PickerReset::Keep,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Grep)
         },
     )
     .await;
@@ -25013,25 +24583,7 @@ async fn grep_filter_root_scope() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Grep,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Grep)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
     let filters = PickerFilters {
@@ -25122,25 +24674,7 @@ async fn files_picker_filters_narrow_candidates() {
         }
     }
 
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        10,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 10, &view_params(PickerKind::Files)).await;
     let first = expect_notification::<PickerUpdate>(&mut ws).await;
     // Default walk now includes the tracked hidden files (`.hidden.rs`, `.gitignore`) alongside
     // src/main.rs, src/lib.rs, README.md, changed.rs, new.rs; only gitignored `debug.log` and
@@ -25318,25 +24852,7 @@ async fn files_picker_shows_hidden_dirs() {
     };
 
     // Default view: the hidden-dir file and the normal file both show; the gitignored file stays out.
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        2,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::Files)).await;
     let first = expect_notification::<PickerUpdate>(&mut ws).await;
     let names = names_of(&first);
     assert!(
@@ -25400,18 +24916,9 @@ async fn explorer_filters_hide_and_changed_only() {
             ws,
             id,
             &PickerViewParams {
-                from_selection: false,
                 filters,
-                kind: PickerKind::Explorer,
                 reset: PickerReset::Keep,
-                offset: 0,
-                limit: 50,
-                center_on: None,
-                center_on_cursor: None,
-                directory_path: None,
-                buffer_id: None,
-                explorer_roots: false,
-                keybindings: None,
+                ..view_params(PickerKind::Explorer)
             },
         )
         .await;
@@ -25471,25 +24978,7 @@ async fn explorer_filters_hide_and_changed_only() {
     assert_eq!(entry_names(&update), vec!["changed.rs", "new.rs"]);
 
     // ...and a reset open clears them.
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        15,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let _ = send_request::<PickerView>(&mut ws, 15, &view_params(PickerKind::Explorer)).await;
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert!(
         entry_names(&update).contains(&"src"),
@@ -26424,18 +25913,8 @@ async fn buffers_picker_reports_transient_flag() {
         &mut ws,
         10,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Buffers,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -26495,25 +25974,7 @@ async fn setup_with_external_file() -> (aether_server::ServerHandle, TestWs, Str
 
 /// Names of the rows in the workspace switcher (Workspaces picker, empty query).
 async fn workspace_switcher_names(ws: &mut TestWs, id: u64) -> Vec<String> {
-    let view = send_request::<PickerView>(
-        ws,
-        id,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Workspaces,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let view = send_request::<PickerView>(ws, id, &view_params(PickerKind::Workspaces)).await;
     view.update
         .expect("the view response carries its window")
         .items()
@@ -26994,18 +26455,8 @@ async fn a_temporary_workspace_is_rooted_at_its_files_directory() {
         &mut ws,
         3,
         &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Explorer,
-            reset: PickerReset::All,
-            offset: 0,
             limit: 30,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
+            ..view_params(PickerKind::Explorer)
         },
     )
     .await;
@@ -27175,25 +26626,7 @@ async fn a_temporary_workspace_gets_no_language_server() {
 
 /// The `relative_path`s in the Files picker's first window.
 async fn picker_file_names(ws: &mut TestWs, id: u64) -> Vec<String> {
-    let view = send_request::<PickerView>(
-        ws,
-        id,
-        &PickerViewParams {
-            from_selection: false,
-            filters: None,
-            kind: PickerKind::Files,
-            reset: PickerReset::All,
-            offset: 0,
-            limit: 50,
-            center_on: None,
-            center_on_cursor: None,
-            directory_path: None,
-            buffer_id: None,
-            explorer_roots: false,
-            keybindings: None,
-        },
-    )
-    .await;
+    let view = send_request::<PickerView>(ws, id, &view_params(PickerKind::Files)).await;
     view.update
         .expect("window")
         .items()

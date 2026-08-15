@@ -6,6 +6,7 @@ members = [
     "crates/aether-server",
     "crates/aether-tui",
     "crates/aether-client",
+    "crates/aether-connection",
     "crates/aether-iced",
     "crates/aether-web",
     "crates/aether-ae",
@@ -20,6 +21,7 @@ license = "MIT"
 aether-protocol = { path = "crates/aether-protocol" }
 aether-markdown = { path = "crates/aether-markdown" }
 aether-client = { path = "crates/aether-client" }
+aether-connection = { path = "crates/aether-connection" }
 aether-server = { path = "crates/aether-server" }
 aether-tui = { path = "crates/aether-tui" }
 aether-iced = { path = "crates/aether-iced" }

@@ -100,6 +100,26 @@ pub struct DummyLspConfig {
     /// the server returns *everything* regardless of query, which is how a test reproduces a server
     /// whose match rules differ from ours (rust-analyzer's `#` widening, say).
     pub symbol_query_filter: bool,
+    /// Hold the `initialize` reply this long, keeping the server in `Starting` — for tests that
+    /// exercise what happens while a server is still coming up (a real cold start, minus the
+    /// multi-second wait).
+    pub initialize_delay: Option<std::time::Duration>,
+    /// `textDocument/documentSymbol` results (the hierarchical `DocumentSymbol[]` shape, flat
+    /// here — no children), and flips `documentSymbolProvider` in the handshake. Answered for
+    /// any requested document.
+    pub document_symbols: Vec<DummyDocSymbol>,
+}
+
+/// One `textDocument/documentSymbol` result for [`DummyLspConfig`].
+#[derive(Debug, Clone)]
+pub struct DummyDocSymbol {
+    pub name: String,
+    /// LSP `SymbolKind`; 12 (Function) is a reasonable default.
+    pub kind: u8,
+    /// The symbol's full extent (`range`) — what cursor containment tests against.
+    pub range: DummyRange,
+    /// The name span (`selectionRange`) — where a jump lands.
+    pub selection: DummyRange,
 }
 
 /// One `workspace/symbol` result for [`DummyLspConfig`].
@@ -139,6 +159,9 @@ where
 
         match method {
             "initialize" => {
+                if let Some(delay) = config.initialize_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 respond(
                     &mut writer,
                     id,
@@ -152,6 +175,7 @@ where
                             "referencesProvider": !config.references.is_empty(),
                             "documentFormattingProvider": !config.formatting.is_empty(),
                             "workspaceSymbolProvider": !config.workspace_symbols.is_empty(),
+                            "documentSymbolProvider": !config.document_symbols.is_empty(),
                         },
                         "serverInfo": { "name": "dummy-lsp" },
                     }),
@@ -227,6 +251,21 @@ where
                                     "end": { "line": s.line, "character": s.character + s.name.chars().count() as u32 },
                                 },
                             },
+                        })
+                    })
+                    .collect();
+                respond(&mut writer, id, Value::Array(syms)).await;
+            }
+            "textDocument/documentSymbol" => {
+                let syms: Vec<Value> = config
+                    .document_symbols
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "kind": s.kind,
+                            "range": s.range.to_json(),
+                            "selectionRange": s.selection.to_json(),
                         })
                     })
                     .collect();

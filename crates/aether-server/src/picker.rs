@@ -1206,6 +1206,11 @@ pub struct PickerState {
     /// task applies its result. Distinct from `generation` (which a *query* change bumps): a query
     /// while loading must re-filter the pending result, not cancel the resolve.
     pub pending_async_load: Option<u64>,
+    /// WorkspaceSymbols only: how many `workspace/symbol` requests from the current generation's
+    /// fan-out are still unanswered. Private — mutated only through [`Self::seed_symbol_fanout`],
+    /// [`Self::add_symbol_query`], and [`Self::note_symbol_merge`], whose docs carry the
+    /// balance invariant this counter lives or dies by.
+    pending_symbol_queries: usize,
     /// Grep only: the `(query, filters)` whose walk last completed (`ticking: false` push went
     /// out). When the next `picker/query` arrives with the same pair, the candidates are still
     /// valid — skip the wipe + respawn and just re-emit the current window. Cleared whenever a
@@ -1382,9 +1387,39 @@ impl PickerState {
             explorer_peek_missing: false,
             subscribed: None,
             pending_async_load: None,
+            pending_symbol_queries: 0,
             last_completed_search: None,
             expanded: None,
         }
+    }
+
+    /// Seed the WorkspaceSymbols fan-out counter for a fresh query: `n` `workspace/symbol`
+    /// requests are about to be spawned, and every one ends in exactly one
+    /// [`crate::symbols::merge_results`] call ([`Self::note_symbol_merge`]), whatever the server
+    /// answered — that balance is the whole contract. While the counter is non-zero the merges
+    /// push `ticking: true`; the merge that takes it to zero always pushes, even with nothing
+    /// new, so the picker settles to its empty note instead of spinning forever on a query no
+    /// server matched. Generation-scoped implicitly: a query re-seeds it, and a stale merge
+    /// bails on the generation check before counting itself. `picker/hide` seeds 0 (nothing
+    /// pending survives a close).
+    pub fn seed_symbol_fanout(&mut self, n: usize) {
+        self.pending_symbol_queries = n;
+    }
+
+    /// A became-ready server's re-query counts itself into the fan-out — one more merge is
+    /// coming. Must be called under the same lock as the generation snapshot the re-query was
+    /// filtered by: a keystroke in the gap would re-seed the counter, and this increment would
+    /// unbalance the new fan-out.
+    pub fn add_symbol_query(&mut self) {
+        self.pending_symbol_queries += 1;
+    }
+
+    /// One fan-out answer merged: count it off, and report whether that settles the picker.
+    /// `true` means this was the final answer — the caller MUST push `ticking: false`, even
+    /// with nothing new, because that push is the only thing that settles the client.
+    pub fn note_symbol_merge(&mut self) -> bool {
+        self.pending_symbol_queries = self.pending_symbol_queries.saturating_sub(1);
+        self.pending_symbol_queries == 0
     }
 
     /// Recompute the ranked match list against the current candidates and query. Cheap for
@@ -1461,25 +1496,43 @@ impl PickerState {
                         scored.push((score, i as u32));
                     }
                 }
-                if matches!(self.candidates, PickerCandidates::WorkspaceSymbols(_)) {
+                if let PickerCandidates::WorkspaceSymbols(v) = &self.candidates {
                     // Order, never filter. The *server* ran the match — and some servers give the
                     // query extra meaning (rust-analyzer widens into dependencies with a trailing
                     // `#`, the stdlib with `*`), which a literal fuzzy match against symbol names
                     // fails on every row. Filtering here would empty the picker for a query that
                     // worked perfectly at the server.
                     //
-                    // So: matches sort by score and keep their `match_indices` (they highlight);
-                    // everything the server returned that nucleo *doesn't* match keeps its arrival
-                    // order at the tail, unhighlighted. See `docs/workspace-symbols.md` § Merging.
-                    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-                    let matched: std::collections::HashSet<u32> =
-                        scored.iter().map(|(_, i)| *i).collect();
-                    self.ranked = scored.iter().map(|(_, i)| *i).collect();
-                    self.ranked.extend(
-                        (0..self.candidates.len() as u32).filter(|i| {
-                            !matched.contains(i) && passes(&self.candidates, *i as usize)
-                        }),
-                    );
+                    // And order at *group* grain, not row grain: the collapsible row space derives
+                    // its runs from consecutive group keys and resolves a key to its *first* run
+                    // (`row_layout` / `run_of_key`), so a file interleaved across ranked space
+                    // renders as duplicate groups and traps the expanded-group resolution in the
+                    // first of them. Files sort by their best row's score; rows within a file by
+                    // their own score, unscored rows last in the merge's line order; files nucleo
+                    // matched nothing in trail in the merge's path order, unhighlighted. `ranked[0]`
+                    // is still the globally best match. See `docs/workspace-symbols.md` § Merging.
+                    let mut own: Vec<Option<u32>> = vec![None; v.len()];
+                    let mut best: std::collections::HashMap<&str, u32> =
+                        std::collections::HashMap::new();
+                    for &(score, i) in &scored {
+                        own[i as usize] = Some(score);
+                        best.entry(v[i as usize].display_path.as_str())
+                            .and_modify(|b| *b = (*b).max(score))
+                            .or_insert(score);
+                    }
+                    let mut ranked: Vec<u32> = (0..v.len() as u32)
+                        .filter(|i| passes(&self.candidates, *i as usize))
+                        .collect();
+                    ranked.sort_unstable_by_key(|&i| {
+                        let c = &v[i as usize];
+                        (
+                            std::cmp::Reverse(best.get(c.display_path.as_str()).copied()),
+                            c.display_path.as_str(),
+                            std::cmp::Reverse(own[i as usize]),
+                            i,
+                        )
+                    });
+                    self.ranked = ranked;
                     return;
                 }
                 if let PickerCandidates::Symbols(syms) = &self.candidates {
@@ -2677,6 +2730,55 @@ mod tests {
             proj.grouped_display_metrics(1),
             Some((1, 3)),
             "b.rs selected: 2 headers + its 1 diagnostic; offset stays the identity"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_rank_at_group_grain() {
+        // The collapsible row space needs each file's rows contiguous in ranked order —
+        // `row_layout` derives runs from consecutive keys and `run_of_key` resolves a key to
+        // its *first* run, so flat score ordering used to split a file around a better-scoring
+        // one, render its group twice, and trap the expanded-group resolution in the first
+        // copy. Files order by best member score, rows within by own score, no-match files
+        // trail; nothing is filtered.
+        let cand = |path: &str, line: u32, name: &str| WorkspaceSymbolCandidate {
+            abs_path: format!("/w/{path}"),
+            display_path: path.into(),
+            line,
+            col: 0,
+            name: name.into(),
+            symbol_kind: aether_protocol::picker::SymbolKind::Function,
+            container: String::new(),
+        };
+        // Candidate order is the merge's `(display_path, line)` sort. Scores for "boot":
+        // the consecutive "boot" far outscores the scattered subsequence matches
+        // ("brotli_footer", "bag_of_roots"), and "unrelated" doesn't match at all. Old
+        // flat-score ranked order split z_late.rs around a_early.rs.
+        let mut s = PickerState::new(PickerCandidates::WorkspaceSymbols(vec![
+            cand("a_early.rs", 0, "bag_of_roots"),
+            cand("m_mid.rs", 0, "unrelated"),
+            cand("z_late.rs", 0, "brotli_footer"),
+            cand("z_late.rs", 5, "boot"),
+        ]));
+        assert_eq!(s.kind, PickerKind::WorkspaceSymbols);
+        s.query = "boot".into();
+        s.rerank(&mut make_matcher());
+        let names: Vec<&str> = s
+            .ranked
+            .iter()
+            .map(|&i| s.candidates.display_at(i as usize))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["boot", "brotli_footer", "bag_of_roots", "unrelated"],
+            "best-match file first and contiguous (best row leading), no-match file last"
+        );
+        let layout = s.row_layout().expect("collapsible kind");
+        assert_eq!(layout.runs.len(), 3, "one run per file, none duplicated");
+        assert_eq!(
+            layout.expanded,
+            Some(0),
+            "fresh rank: the best file's run opens itself"
         );
     }
 

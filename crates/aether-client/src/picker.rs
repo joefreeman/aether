@@ -115,6 +115,14 @@ pub struct PickerState {
     /// Matched by identity ([`item_key`]) — the listed item carries live decoration
     /// (git status, match indices) the anchor doesn't.
     pub pending_center: Option<PickerItem>,
+    /// Whether this picker instance knows the server slot's generation yet. False from open
+    /// until the `picker/view` response adopts `r.generation` — or a query keystroke claims the
+    /// number first (the server obeys `picker/query`'s generation, so from that point the
+    /// client's is authoritative and the response's carried snapshot must not regress it, nor
+    /// clobber the typed query). Pushes can't arrive before the response — shells deliver
+    /// server messages in wire order (docs/client-core.md) — so this only guards against the
+    /// client's own request pipelining.
+    pub generation_adopted: bool,
     /// Scroll the highlight into view when the next update lands (set by keyboard moves that
     /// forced a refetch and by centred opens — scroll-driven refetches must NOT yank the view).
     pub reveal_on_update: Option<Reveal>,
@@ -198,6 +206,7 @@ impl PickerState {
             display_offset: 0,
             total_display_rows: 0,
             pending_center: None,
+            generation_adopted: false,
             reveal_on_update: None,
             hovered: None,
             directory: None,
@@ -517,8 +526,22 @@ impl PickerState {
 
     /// Apply a `picker/update` push. Stale pushes (older generation, other window) are
     /// discarded per the protocol. Returns false when discarded.
-    pub fn apply_update(&mut self, u: PickerUpdateParams) -> bool {
-        if u.kind != self.kind || u.generation != self.generation || u.offset != self.offset {
+    pub fn apply_update(&mut self, mut u: PickerUpdateParams) -> bool {
+        if u.kind != self.kind || u.generation != self.generation {
+            return false;
+        }
+        // A server-resolved highlight (the async fills' cursor-enclosing symbol / reference)
+        // rides the push with the window re-framed around it — adopt that offset and arm the
+        // centre, or the offset guard below would reject a fill centred deep in the list. This
+        // must sit behind the kind + generation checks: adopting from a push that is already
+        // stale desyncs `offset` from the server's window (which resets to 0 on a query), after
+        // which every live push is rejected and the picker wedges on its loading state.
+        if let Some(center) = u.center_on.take() {
+            self.offset = u.offset;
+            self.pending_center = Some(*center);
+            self.reveal_on_update = Some(Reveal::Minimal);
+        }
+        if u.offset != self.offset {
             return false;
         }
         // `None` is a throttled count-only tick (streaming grep): keep the current window, update
@@ -639,9 +662,7 @@ impl PickerState {
             if !self.selection_at_item_level() {
                 return None; // group level (or incoherent/empty): nothing moves locally
             }
-            let Some((first, last)) = self.expanded_item_rows() else {
-                return None;
-            };
+            let (first, last) = self.expanded_item_rows()?;
             self.selected = (self.selected as i64 + delta).clamp(first as i64, last as i64) as u32;
             let in_window = self.selected >= self.offset
                 && self.selected < self.offset + self.items.len() as u32;
@@ -1253,6 +1274,51 @@ mod tests {
         assert!(!s.apply_update(update(PickerKind::Files, 2, 50, 9, 9)));
         assert!(!s.apply_update(update(PickerKind::Buffers, 2, 0, 9, 9)));
         assert_eq!(s.items.len(), 5);
+    }
+
+    /// The centred item for the `center_on` tests. A `Workspace` row on a DocumentSymbols
+    /// picker looks odd, but it's the [`update`] fixture's item kind (kind-agnostic on
+    /// purpose — the offset/selection math under test never inspects the variant), and the
+    /// centre must match one of the pushed window's items by identity ("p3" = index 3).
+    fn centered_item() -> PickerItem {
+        PickerItem::Workspace {
+            name: "p3".into(),
+            unsaved_buffers: 0,
+            match_indices: vec![],
+        }
+    }
+
+    #[test]
+    fn stale_center_push_leaves_no_trace() {
+        // The `Space o` wedge: the async fill lands with `center_on` + a re-framed window just
+        // after a keystroke bumped the generation. Adopting its offset while rejecting the push
+        // desynced the window from the server's (reset to 0 by the query) — every later push was
+        // then offset-rejected and the picker stuck on "Finding symbols…".
+        let mut s = PickerState::new(PickerKind::DocumentSymbols);
+        s.generation = 3; // a keystroke has moved on
+        let mut stale = update(PickerKind::DocumentSymbols, 2, 46, 90, 200);
+        stale.center_on = Some(Box::new(centered_item()));
+        assert!(!s.apply_update(stale));
+        assert_eq!(s.offset, 0, "a stale push's re-framed offset must not stick");
+        assert!(s.pending_center.is_none());
+        assert!(s.ticking, "nothing applied — still loading");
+        // The live push for the new generation (window reset to the top) applies and settles.
+        assert!(s.apply_update(update(PickerKind::DocumentSymbols, 3, 0, 5, 5)));
+        assert!(!s.ticking);
+    }
+
+    #[test]
+    fn live_center_push_adopts_the_reframed_window() {
+        // The adoption the guard must not break: a live fill centred deep in the list arrives
+        // with the window framed around the centred item — the client takes the pushed offset
+        // and lands the selection on the item (the deep-symbols bug).
+        let mut s = PickerState::new(PickerKind::DocumentSymbols);
+        let mut fill = update(PickerKind::DocumentSymbols, 0, 46, 90, 200);
+        fill.center_on = Some(Box::new(centered_item()));
+        assert!(s.apply_update(fill));
+        assert_eq!(s.offset, 46);
+        assert_eq!(s.selected, 46 + 3, "selection lands on the centred item");
+        assert!(s.pending_center.is_none());
     }
 
     #[test]

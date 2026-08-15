@@ -964,15 +964,19 @@ impl Session {
                         // Jumplist: whether this capture is worth path-scoping — gates the
                         // dir/glob chip chords ([`PickerState::filter_available`]).
                         p.path_filterable = r.path_filterable;
-                        if initial {
+                        if initial && !p.generation_adopted {
                             // Adopt the resumed query (the changes pickers preserve theirs across
                             // opens; every other kind comes back empty) and the persisted filters
-                            // (seeded opens get their seed echoed).
+                            // (seeded opens get their seed echoed). Skipped when a query keystroke
+                            // beat this response: the client's generation (and typed query) already
+                            // own the slot — the server adopted them via `picker/query` — and
+                            // regressing to the response's snapshot would orphan the query's push.
                             p.generation = r.generation;
                             p.query = r.query;
                             p.total_candidates = r.total_candidates;
                             p.adopt_filters(&r.filters);
                         }
+                        p.generation_adopted = true;
                         // Apply the window folded into the response now that generation/offset
                         // are set, so a Grep resume renders its rows even when the redundant
                         // `picker/update` push raced ahead of this response and was discarded.
@@ -2944,6 +2948,10 @@ impl Session {
             return Effects::none();
         };
         p.generation += 1;
+        // Typing claims the generation: the server adopts `picker/query`'s number, so from here
+        // the client's is authoritative — a view response landing later must not regress it (nor
+        // clobber the typed query with its carried snapshot).
+        p.generation_adopted = true;
         p.selected = 0;
         p.offset = 0;
         // Selection resets to row 0 — the (auto-expanded) top group's header: group level,
@@ -4769,16 +4777,12 @@ impl Session {
                     let mut reveal = None;
                     if let Some(p) = &mut self.picker {
                         // A server-resolved highlight (DocumentSymbols' cursor-enclosing symbol on
-                        // the async fill) rides the push — adopt it as the pending centre + reveal,
-                        // exactly like the view response's `effective_center_on`, before applying.
-                        // The server frames the window around it, so adopt that offset too; without
-                        // this the offset guard in `apply_update` would discard a push centred on a
-                        // symbol far down the list (the bug where deep symbols never selected).
-                        if let Some(center) = u.center_on.clone() {
-                            p.offset = u.offset;
-                            p.pending_center = Some(*center);
-                            p.reveal_on_update = Some(Reveal::Minimal);
-                        }
+                        // the async fill) rides the push as `center_on`; `apply_update` adopts it —
+                        // together with the window the server re-framed around it — behind its
+                        // staleness guards, exactly like the view response's `effective_center_on`.
+                        // A rejected push is genuinely stale: shells deliver server messages in
+                        // wire order (docs/client-core.md), so a push can't outrun the view
+                        // response that establishes the slot's generation.
                         if p.apply_update(u) && p.pending_center.is_none() {
                             reveal = p.reveal_on_update.take();
                         }

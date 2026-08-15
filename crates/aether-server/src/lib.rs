@@ -36,7 +36,8 @@ pub use config::{
 pub use config::{ProjectEntry, ProjectRef};
 /// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
 pub use lsp::dummy::{
-    DiagnosticsTrigger, DummyDiagnostic, DummyLspConfig, DummyRange, DummySymbol, DummyTextEdit,
+    DiagnosticsTrigger, DummyDiagnostic, DummyDocSymbol, DummyLspConfig, DummyRange, DummySymbol,
+    DummyTextEdit,
 };
 pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_full, spawn_for_test_multi,

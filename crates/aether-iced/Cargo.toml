@@ -7,12 +7,11 @@ description = "Aether editor — iced (native GUI) client."
 
 [dependencies]
 aether-client = { workspace = true }
+aether-connection = { workspace = true }
 aether-protocol = { workspace = true }
 serde = { workspace = true }
 iced = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

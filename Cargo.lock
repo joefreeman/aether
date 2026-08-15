@@ -53,20 +53,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "aether-iced"
+name = "aether-connection"
 version = "0.3.0"
 dependencies = [
  "aether-client",
  "aether-protocol",
  "anyhow",
- "directories",
  "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "aether-iced"
+version = "0.3.0"
+dependencies = [
+ "aether-client",
+ "aether-connection",
+ "aether-protocol",
+ "anyhow",
+ "directories",
  "iced",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
@@ -151,6 +165,7 @@ name = "aether-tui"
 version = "0.3.0"
 dependencies = [
  "aether-client",
+ "aether-connection",
  "aether-protocol",
  "anyhow",
  "arboard",
@@ -163,7 +178,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "unicode-width",

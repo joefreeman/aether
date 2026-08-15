@@ -221,6 +221,11 @@ fn symbol_kind(raw: u8) -> SymbolKind {
 /// candidates are deduped against everything already accumulated — not just within this batch —
 /// because overlapping declared roots (a Cargo workspace and one of its member crates) mean the
 /// duplicate usually arrives from a *different* server.
+///
+/// Also the fan-out's completion accounting ([`crate::picker::PickerState::note_symbol_merge`]):
+/// every spawned request lands here exactly once — `query_server` maps errors and timeouts to an
+/// empty contribution — and the merge that settles the fan-out always pushes, even with nothing
+/// new (a query matching nothing would otherwise spin on "Searching projects…" forever).
 pub async fn merge_results(
     state: &SharedState,
     client_id: ClientId,
@@ -237,8 +242,9 @@ pub async fn merge_results(
         return; // picker closed
     };
     if picker.generation != generation {
-        return; // a newer query superseded this one
+        return; // a newer query superseded this one (its own fan-out re-seeded the counter)
     }
+    let settled = picker.note_symbol_merge();
     let crate::picker::PickerCandidates::WorkspaceSymbols(existing) = &mut picker.candidates else {
         return;
     };
@@ -253,18 +259,23 @@ pub async fn merge_results(
             existing.push(c);
         }
     }
-    if existing.len() == before {
-        return; // nothing new — don't churn the client's window
+    if existing.len() == before && !settled {
+        return; // nothing new, more answers coming — don't churn the client's window
     }
-    // Group by file so the header spans stay contiguous, then rerank against the live query.
-    existing.sort_by(|a, b| {
-        a.display_path
-            .cmp(&b.display_path)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    picker.rerank(matcher);
-    let update = crate::picker::build_update(picker, matcher);
+    if existing.len() != before {
+        // Group by file so the header spans stay contiguous, then rerank against the live query.
+        existing.sort_by(|a, b| {
+            a.display_path
+                .cmp(&b.display_path)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        picker.rerank(matcher);
+    }
+    let mut update = crate::picker::build_update(picker, matcher);
+    if let Some(ref mut u) = update {
+        u.ticking = !settled;
+    }
     drop(s);
     if let (Some(sender), Some(params)) = (outbound, update) {
         let _ = sender
@@ -285,7 +296,7 @@ pub async fn merge_results(
 /// discards this the same way any late arrival is discarded.
 pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager::LspServerKey) {
     let pending: Vec<(ClientId, u64, String, SymbolServer, Vec<PathBuf>)> = {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
         let Some(server) = s
             .lsp
             .symbol_servers(&key.workspace)
@@ -297,7 +308,8 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
         let Some(roots) = s.workspaces.get(&key.workspace).map(|w| w.paths.clone()) else {
             return;
         };
-        s.pickers
+        let pending: Vec<_> = s
+            .pickers
             .iter()
             .filter(|((_, kind), _)| *kind == PickerKind::WorkspaceSymbols)
             .filter(|((client_id, _), p)| {
@@ -317,7 +329,18 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
                     roots.clone(),
                 )
             })
-            .collect()
+            .collect();
+        // Count each re-query into the fan-out here, under the same lock as its generation
+        // snapshot (see `add_symbol_query` for the race this placement prevents).
+        for (client_id, ..) in &pending {
+            if let Some(p) = s
+                .pickers
+                .get_mut(&(*client_id, PickerKind::WorkspaceSymbols))
+            {
+                p.add_symbol_query();
+            }
+        }
+        pending
     };
     for (client_id, generation, query, server, roots) in pending {
         let state = state.clone();
