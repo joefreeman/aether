@@ -1031,6 +1031,14 @@ static READ: &[Binding] = &[
     // ---- the reading cursor ----
     bind!(R, ch('j'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Forward), "Read", "Focus next element"),
     bind!(R, ch('k'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Backward), "Read", "Focus previous element"),
+    // Unlisted muscle-memory aliases (the Ctrl-Alt-j/k pattern, §12.1.7): the editor's other
+    // line-step motions — `p`/`Alt-p`'s first-non-blank step, `Alt-j`/`k`'s visual-row step —
+    // all collapse into the element step at block grain, so the keys land where the hand
+    // expects. IgnoreShift keeps Shift as the extend modifier, exactly as on `j`/`k`.
+    bind!(R, ch('p'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Forward)),
+    bind!(R, ch('p'), IgnoreShift(Mods::ALT), A::ReadStep(Direction::Backward)),
+    bind!(R, ch('j'), IgnoreShift(Mods::ALT), A::ReadStep(Direction::Forward)),
+    bind!(R, ch('k'), IgnoreShift(Mods::ALT), A::ReadStep(Direction::Backward)),
     bind!(R, ch('l'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Forward), "Read", "Focus next link in block"),
     bind!(R, ch('h'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Backward), "Read", "Focus previous link in block"),
     bind!(R, KeyCode::Tab, Exact(Mods::NONE), A::ReadShowTarget, "Read", "Show link/image target"),
@@ -1052,6 +1060,14 @@ static READ: &[Binding] = &[
     // end — so `r` is what re-aims `x`/`Shift-j`/`Shift-k` at the top of a selection.
     bind!(R, ch('r'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Read", "Reverse selection (swap cursor and anchor)"),
     bind!(R, ch('r'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Read", "Orient selection forward (cursor to end)"),
+    // The editor's whole-buffer / collapse pair at block grain. A whole-buffer selection is
+    // already whole-line normal form, so `%` needs no read-side math — every block selected,
+    // front matter included (structural ops on it still refuse server-side, as they do for an
+    // `x` selection swept over it). `,` drops a multi-block selection back to the cursor-end
+    // block without moving — the only collapse that doesn't also step (`j`/`k`) or need a
+    // whole-block span (`x`).
+    bind!(R, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Read", "Select all blocks"),
+    bind!(R, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Read", "Collapse selection to the cursor's block"),
 
     // ---- undo/redo (the Global table's chords, whitelisted here — Read still skips Global,
     // whose other chords are edits; §12's curated-edit discipline) ----
@@ -1079,6 +1095,9 @@ static READ: &[Binding] = &[
     bind!(R, ch('k'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: false, unit: BlockUnit::Block }),
     bind!(R, ch('x'), Exact(Mods::CTRL), A::ReadCutBlock, "Edit", "Cut block(s)"),
     bind!(R, ch('d'), Exact(Mods::CTRL), A::ReadDeleteBlock, "Edit", "Delete block(s)"),
+    // The Delete key follows Normal's Delete → delete-selection at block grain: an unlisted
+    // alias of Ctrl-d (`Any`, matching Normal's pattern for the key).
+    bind!(R, KeyCode::Delete, Any, A::ReadDeleteBlock),
     bind!(R, ch('v'), Exact(Mods::CTRL), A::ReadPasteBlock { replace: false }, "Edit", "Paste as block"),
     bind!(R, ch('v'), Exact(Mods::CTRL_ALT), A::ReadPasteBlock { replace: true }, "Edit", "Paste replacing selected block(s)"),
     bind!(R, ch('l'), Exact(Mods::CTRL), A::ReadBlockDepth { deeper: true }, "Edit", "Deepen: demote heading / nest item / quote"),
@@ -1641,6 +1660,49 @@ mod tests {
         assert!(matches!(
             lookup(KeyContext::Normal, ch('q'), Mods::ALT).map(|b| b.action),
             Some(Action::TreeContract)
+        ));
+    }
+
+    #[test]
+    fn read_aliases_cover_editor_muscle_memory() {
+        // `p`/`Alt-p` and `Alt-j`/`Alt-k` alias the element step: the editor's line-step
+        // variants collapse into one motion at block grain (docs/markdown-view.md §2.3).
+        // IgnoreShift keeps Shift as the extend modifier, as on `j`/`k`.
+        let shifted = |base: Mods| Mods {
+            shift: true,
+            ..base
+        };
+        for (code, mods, dir) in [
+            (ch('p'), Mods::NONE, Direction::Forward),
+            (ch('p'), Mods::ALT, Direction::Backward),
+            (ch('j'), Mods::ALT, Direction::Forward),
+            (ch('k'), Mods::ALT, Direction::Backward),
+            (ch('p'), shifted(Mods::NONE), Direction::Forward),
+            (ch('j'), shifted(Mods::ALT), Direction::Forward),
+        ] {
+            assert!(matches!(
+                lookup(KeyContext::Read, code, mods).map(|b| b.action),
+                Some(Action::ReadStep(d)) if d == dir
+            ));
+        }
+        // The Ctrl rows stay the structural block moves.
+        assert!(matches!(
+            lookup(KeyContext::Read, ch('j'), Mods::CTRL).map(|b| b.action),
+            Some(Action::MoveBlock { down: true, .. })
+        ));
+        // `%` selects every block (the char already encodes Shift), `,` collapses the block
+        // selection, and the Delete key deletes block(s) exactly like Ctrl-d.
+        assert!(matches!(
+            lookup(KeyContext::Read, ch('%'), shifted(Mods::NONE)).map(|b| b.action),
+            Some(Action::SelectAll)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Read, ch(','), Mods::NONE).map(|b| b.action),
+            Some(Action::CollapseSelection)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Read, KeyCode::Delete, Mods::NONE).map(|b| b.action),
+            Some(Action::ReadDeleteBlock)
         ));
     }
 

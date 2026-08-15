@@ -7478,6 +7478,79 @@ fn read_j_steps_focus_via_goto_to_next_block() {
 }
 
 #[test]
+fn read_p_and_alt_jk_alias_the_element_step() {
+    let mut s = read_session();
+    // `p` steps like `j` — the editor's first-non-blank line step collapses into the element
+    // step at block grain…
+    let fx = key(&mut s, 'p');
+    let (t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["position"], json!({"line": 2, "col": 0}));
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({
+            "position": {"line": 2, "col": 0},
+            "anchor": {"line": 2, "col": 0},
+        })),
+    );
+    // …and `Alt-k` steps back like `k` (the visual-row variant, same collapse).
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"]["position"], json!({"line": 0, "col": 0}));
+}
+
+#[test]
+fn read_percent_selects_all_blocks() {
+    let mut s = read_session();
+    let fx = s.on_key(
+        KeyCode::Char('%'),
+        Mods {
+            shift: true,
+            ..Mods::NONE
+        },
+        Some("%".into()),
+        ROWS,
+    );
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "cursor/select_all");
+}
+
+#[test]
+fn read_comma_collapses_the_block_selection() {
+    let mut s = read_session();
+    // A point cursor has nothing to collapse: `,` is swallowed.
+    assert!(no_request(&key(&mut s, ',')));
+    // Build a real block selection: `x` selects the focused heading whole-line…
+    let fx = key(&mut s, 'x');
+    let (t, method, _p) = the_request(&fx);
+    assert_eq!(method, "cursor/set");
+    let _ = s.on_rpc_result(
+        t,
+        Ok(json!({
+            "position": {"line": 0, "col": 7},
+            "anchor": {"line": 0, "col": 0},
+        })),
+    );
+    // …then `,` collapses to the cursor end without moving: a point `cursor/set` at the
+    // default Char grain (skipped on the wire).
+    let fx = key(&mut s, ',');
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/set");
+    assert_eq!(params["position"], json!({"line": 0, "col": 7}));
+    assert_eq!(params["position"], params["anchor"]);
+    assert_eq!(params.get("granularity"), None);
+}
+
+#[test]
+fn read_delete_key_aliases_ctrl_d() {
+    let mut s = read_session();
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    let (_t, method, _p) = the_request(&fx);
+    assert_eq!(method, "input/delete_block");
+}
+
+#[test]
 fn read_count_applies_to_element_steps() {
     let mut s = read_session();
     // `2j` from the heading skips to the second paragraph (line 4).
@@ -8302,6 +8375,9 @@ fn read_table_contains_no_editing_action() {
                     | Action::ReadSelectBlock(_)
                     // Selection orientation: a cursor/anchor swap, no text touched.
                     | Action::SwapAnchor { .. }
+                    // Whole-buffer select and collapse: cursor-only, like the swap.
+                    | Action::SelectAll
+                    | Action::CollapseSelection
                     // §12's curated edits: undo/redo act on the buffer but create no new
                     // text shape from Read; each future edit action is added here
                     // deliberately, keeping the §1.4 discipline as an explicit list.
