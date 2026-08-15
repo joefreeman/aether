@@ -1,52 +1,106 @@
-/* Nord palette — mirrors crates/aether-tui/src/ui.rs so the web client matches the terminal. */
+/* Role-based theme — hand-mirrors the role tables in crates/aether-client/src/theme.rs (the
+   single source of truth for every client's palette). One `--role` custom property per `Theme`
+   field, kebab-cased: `:root` carries the DARK table (pixel-identical to the pre-theme
+   constants), `:root[data-theme="light"]` further down overrides every role with the LIGHT
+   table — shell.ts stamps `data-theme` from the synced `theme` app setting. KEEP BOTH BLOCKS IN
+   SYNC with theme.rs: when a role is added or a value tuned there, mirror it here. The
+   `--nordN` shades are fixed and referenced only from the two theme blocks; every other rule
+   in this file uses role vars. */
 :root {
-  --nord0: #2e3440; /* main background */
-  --nord1: #3b4252; /* status line / panel */
-  --nord2: #434c5e; /* selection background */
-  --nord3: #4c566a; /* dim — hit/sneak fills, muted glyphs */
-  --nord3-bright: #616e88; /* lighter dim (the terminal's ignored-entry shade) */
-  /* Off-palette, brighter still: dim-but-legible text on the picker's NORD1 panel. The picker
-     sits on NORD1 (the terminal's picker rows sit on NORD0), so the terminal's dim shades read
-     too dark here — this lifts them while staying clearly subordinate to NORD4/NORD6 text.
-     Also the syntax comment colour (.hl-comment): NORD3 comments were ~1.4:1 against the reading
-     view's NORD1 code panels; this shade reaches ~2.8:1 there (~3.5:1 on the editor) while
-     staying below NORD9 keywords — the dimmest real syntax colour — so the salience ladder
-     keeps its order. */
+  /* ---- Shades (theme.rs NORD0…NORD15 — never change between themes) ---- */
+  --nord0: #2e3440; /* Polar Night — darkest */
+  --nord1: #3b4252;
+  --nord2: #434c5e;
+  --nord3: #4c566a;
+  --nord3-bright: #616e88; /* off-palette Polar Night extension — "lighter dim" */
+  /* Off-palette, brighter still — the dark syntax-comment shade (NORD3 comments were ~1.4:1
+     against the reading view's NORD1 code panels; this reaches ~2.8:1 there, ~3.5:1 on the
+     editor, while staying below NORD9 keywords, so comments stay the dimmest rung). Also the
+     web's lifted dim chrome text: its picker sits on NORD1, not the terminal's NORD0, so the
+     dim shades needed a lift — which lands on this same value (see --syn-comment / --fg-muted). */
   --nord3-brighter: #7b88a1;
-  --nord4: #d8dee9; /* main foreground */
-  --nord6: #eceff4; /* Snow Storm — brightest (picker text) */
-  --nord7: #8fbcbb; /* types */
-  --nord8: #88c0d0; /* functions, accents */
-  --nord9: #81a1c1; /* keywords, operators */
-  --nord10: #5e81ac; /* active selection bg */
-  --nord11: #bf616a; /* error */
-  --nord12: #d08770; /* attributes, macros */
-  --nord13: #ebcb8b; /* string escapes, warnings */
-  --nord14: #a3be8c; /* strings */
-  --nord15: #b48ead; /* numbers, constants */
+  --nord4: #d8dee9; /* Snow Storm */
+  --nord5: #e5e9f0; /* only the light theme uses this one */
+  --nord6: #eceff4; /* Snow Storm — brightest */
+  --nord7: #8fbcbb; /* Frost — teal */
+  --nord8: #88c0d0; /* Frost — cyan */
+  --nord9: #81a1c1; /* Frost — light blue */
+  --nord10: #5e81ac; /* Frost — deep blue */
+  --nord11: #bf616a; /* Aurora — red */
+  --nord12: #d08770; /* Aurora — orange */
+  --nord13: #ebcb8b; /* Aurora — yellow */
+  --nord14: #a3be8c; /* Aurora — green */
+  --nord15: #b48ead; /* Aurora — purple */
 
-  --git-added-bg: #2d3a2d;
-  --git-modified-bg: #3a3628;
-  /* Staged variants keep each kind's hue, dimmed — hue says *what* changed, brightness says
-     whether it still needs staging (bright = unstaged, muted = in the index). */
+  /* ---- Roles: the DARK table (theme.rs Theme::DARK) ---- */
+  color-scheme: dark; /* native scrollbars/checkboxes follow the app theme */
+  /* Backgrounds */
+  --bg: var(--nord0); /* editor / app background */
+  --bg-panel: var(--nord1); /* status line, panels, picker surfaces */
+  --bg-selection: var(--nord2); /* chrome selection: picker active row, chips */
+  --bg-visual: var(--nord10); /* editor visual-mode selection */
+  --fill-dim: var(--nord3); /* muted fills: search-hit tint, sneak word band */
+  --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
+  --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
+  --match-bracket: var(--nord12); /* paired-bracket highlight under the cursor — chrome, not syntax */
+  --cursor-line-bg: #343a48; /* current-line tint, ~40% from NORD0 toward NORD1 */
+  --overlay-border: var(--nord3-brighter); /* outline for floating overlays' frames */
+  --border-subtle: var(--nord3); /* hairline chrome borders — a step quieter than overlay-border */
+  /* Foregrounds */
+  --fg: var(--nord4); /* main text */
+  --fg-bright: var(--nord6); /* brightest text: headings, the search query */
+  --fg-muted: var(--nord3-brighter); /* dim-but-legible chrome text: picker meta, placeholders */
+  --fg-dim: var(--nord3-bright); /* legible secondary text on panels */
+  --fg-faint: var(--nord3); /* barely-there text: muted glyphs, disabled chrome */
+  --fg-on-accent: var(--nord0); /* text on an accent/selection fill (the cursor cell) */
+  --ghost-text: #8c96a5; /* ghost/example text in prompts — off-palette, a touch above fg-muted */
+  /* Accents & status */
+  --accent: var(--nord8); /* the interaction accent: cursor, links, focus */
+  --accent-alt: var(--nord9); /* secondary accent: branch/meta text */
+  --accent-deep: var(--nord10); /* deep accent used as a fill (focused buttons) */
+  --error: var(--nord11);
+  --warning: var(--nord13);
+  --info: var(--nord8);
+  --ok: var(--nord14);
+  /* Buffer-state dot (status bar + favicon; shell.ts bufferStateColor mirrors these) */
+  --state-deleted: var(--nord11);
+  --state-changed: var(--nord12);
+  --state-unsaved: var(--nord9);
+  /* Git — hue says *what* changed; the dimmed "staged" variants say it's already in the index */
+  --git-added: var(--nord14);
+  --git-modified: var(--nord13);
+  --git-deleted: var(--nord11);
   --git-staged-added: #6e8060; /* dimmed nord14 */
   --git-staged-modified: #9e8a62; /* dimmed nord13 */
   --git-staged-deleted: #844c53; /* dimmed nord11 */
-  --git-staged-added-bg: #2f3631; /* staged line tints, likewise dimmer */
-  --git-staged-modified-bg: #35342d;
-  --git-staged-deleted-bg: #33252a; /* staged phantom rows */
+  /* Inline-diff line tints (and phantom deleted rows' backgrounds) */
+  --git-added-bg: #2d3a2d;
+  --git-modified-bg: #3a3628;
   --git-deleted-bg: #3b2226;
-
-  /* Current-line tint, ~40% from NORD0 toward NORD1: subtler than NORD1 (which the status line
-     uses) so the cursorline doesn't read as a panel. Off-palette — Nord has no shade in between. */
-  --cursor-line-bg: #343a48;
-  /* Cursorline variants for changed lines under the diff view: a brighter green/olive so the
-     cursor's line still reads as added/modified rather than the plain blue cursorline hiding it. */
+  --git-staged-added-bg: #2f3631;
+  --git-staged-modified-bg: #35342d;
+  --git-staged-deleted-bg: #33252a;
+  /* Cursorline variants on changed lines, so the cursorline doesn't hide the change colour */
   --cursor-line-added-bg: #3a4d3a;
   --cursor-line-modified-bg: #4a4632;
-  /* ...and staged counterparts, so the cursor on a staged line keeps its dimmer identity. */
   --cursor-line-staged-added-bg: #3a453c;
   --cursor-line-staged-modified-bg: #434138;
+  /* Markdown reading view */
+  --md-code-bg: var(--nord1); /* code spans/blocks panel */
+  --md-table-stripe-bg: #323845; /* alternating table row, between bg and md-code-bg */
+  --md-alert-important: var(--nord15); /* the "Important" alert's hue — purple, not a status */
+  /* Syntax (tree-sitter capture roles) */
+  --syn-keyword: var(--nord9);
+  --syn-string: var(--nord14);
+  --syn-string-special: var(--nord13);
+  --syn-comment: var(--nord3-brighter);
+  --syn-constant: var(--nord15);
+  --syn-function: var(--nord8);
+  --syn-macro: var(--nord12);
+  --syn-type: var(--nord7);
+  /* TODO(theme): the danger button's hover shade — error nudged toward the pointer; hover
+     states are shell-local, so theme.rs carries no role for it. */
+  --modal-danger-hover: #cf6f77;
 
   /* ---- Chrome text sizing ----
      Everything outside the buffer (status bar, pickers, dialogs, hover, toasts, hints) sizes from
@@ -68,6 +122,71 @@
   --ui-status-h: calc(var(--ui-font-size) * 1.5 + 4px);
 }
 
+/* ---- Roles: the LIGHT table (theme.rs Theme::LIGHT) ----
+   Polar Night and Snow Storm swap ends; Frost/Aurora accents darken to hold contrast on the
+   pale backgrounds (the originals sit at ~2–3:1 against Snow Storm and wash out). The salience
+   ladders (comment below keyword; staged dimmer than unstaged; stripe between bg and panel)
+   keep their dark-theme ordering. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: var(--nord6);
+  --bg-panel: var(--nord5);
+  --bg-selection: var(--nord4);
+  --bg-visual: #c2d6e7; /* pale Frost — dark text stays readable inside a selection */
+  --fill-dim: #d8dfe8;
+  --sneak-prefix-bg: #c4cedb; /* darker than fill-dim: prominence inverts on light */
+  --match-highlight: #9a7522; /* = warning today; free to diverge */
+  --match-bracket: #ab5f38; /* = syn-macro today; free to diverge */
+  --cursor-line-bg: #e4e9f0; /* ~40% from NORD6 toward NORD5 */
+  --overlay-border: #aab4c4;
+  --border-subtle: #d8dfe8; /* = fill-dim today; borders can darken independently */
+  --fg: var(--nord0);
+  --fg-bright: #242933; /* a step below NORD0, as NORD6 sits a step above NORD4 */
+  --fg-muted: #8892a4; /* = syn-comment today; free to diverge */
+  --fg-dim: var(--nord3);
+  --fg-faint: #aeb7c6;
+  --fg-on-accent: var(--nord6);
+  --ghost-text: #8a94a6;
+  --accent: #3e7a8f; /* NORD8 darkened (~1.9:1 on NORD6 as-is) */
+  --accent-alt: var(--nord10);
+  --accent-deep: var(--nord10);
+  --error: var(--nord11);
+  --warning: #9a7522; /* NORD13 darkened — yellow is unreadable on Snow Storm */
+  --info: #3e7a8f;
+  --ok: #5a7547; /* NORD14 darkened */
+  --state-deleted: var(--nord11);
+  --state-changed: #ab5f38; /* NORD12 darkened */
+  --state-unsaved: var(--nord10);
+  --git-added: #5a7547;
+  --git-modified: #9a7522;
+  --git-deleted: var(--nord11);
+  --git-staged-added: #8ca378; /* staged = lifted toward bg, mirroring dark's dimming */
+  --git-staged-modified: #bb9d66;
+  --git-staged-deleted: #cc8a91;
+  --git-added-bg: #dcebd4;
+  --git-modified-bg: #eee8cd;
+  --git-deleted-bg: #f2d8da;
+  --git-staged-added-bg: #e3ecdf;
+  --git-staged-modified-bg: #ebe7d8;
+  --git-staged-deleted-bg: #efe0e2;
+  --cursor-line-added-bg: #d3e4cb;
+  --cursor-line-modified-bg: #e6dfc0;
+  --cursor-line-staged-added-bg: #dde7d8;
+  --cursor-line-staged-modified-bg: #e7e3d2;
+  --md-code-bg: #e1e6ee;
+  --md-table-stripe-bg: #e9edf3;
+  --md-alert-important: #8d6488; /* = syn-constant today; free to diverge */
+  --syn-keyword: var(--nord10);
+  --syn-string: #5a7547;
+  --syn-string-special: #9a7522;
+  --syn-comment: #8892a4; /* dimmest rung: below NORD10 keywords on NORD6, like dark */
+  --syn-constant: #8d6488; /* NORD15 darkened */
+  --syn-function: #3e7a8f;
+  --syn-macro: #ab5f38; /* NORD12 darkened */
+  --syn-type: #4f8886; /* NORD7 darkened */
+  --modal-danger-hover: #a84f58; /* TODO(theme): error darkened for hover on light */
+}
+
 html, body, #app {
   height: 100%;
   margin: 0;
@@ -77,8 +196,8 @@ html, body, #app {
 #app {
   display: flex;
   flex-direction: column;
-  background: var(--nord0);
-  color: var(--nord4);
+  background: var(--bg);
+  color: var(--fg);
   font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
@@ -191,8 +310,8 @@ html, body, #app {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  background: var(--nord1);
-  color: var(--nord4);
+  background: var(--bg-panel);
+  color: var(--fg);
   font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   padding: 2px 8px;
   white-space: pre;
@@ -226,14 +345,14 @@ html, body, #app {
 .status-transient { font-style: italic; } /* preview buffer: the status-bar file label slants */
 .picker-italic { font-style: italic; } /* preview buffer rows in the buffers picker */
 .status-git { white-space: nowrap; } /* git change counts; spacing comes from the group's flex gap */
-.git-added { color: var(--nord14); }
-.git-modified { color: var(--nord13); }
-.git-deleted { color: var(--nord11); }
+.git-added { color: var(--git-added); }
+.git-modified { color: var(--git-modified); }
+.git-deleted { color: var(--git-deleted); }
 /* Dimmed (in-index) shades for a staged change summary, mirroring the inline-diff convention. */
 .git-staged-added { color: var(--git-staged-added); }
 .git-staged-deleted { color: var(--git-staged-deleted); }
-.git-branch { color: var(--nord9); }  /* Frost blue — secondary, distinct from the nord4 path */
-.git-base { color: var(--nord9); }    /* Frost blue — current diff base [HEAD]/[index] */
+.git-branch { color: var(--accent-alt); }  /* Frost blue — secondary, distinct from the nord4 path */
+.git-base { color: var(--accent-alt); }    /* Frost blue — current diff base [HEAD]/[index] */
 .status-icon {
   width: 1.05em;
   height: 1.05em;
@@ -246,14 +365,14 @@ html, body, #app {
 }
 @keyframes status-spin { to { transform: rotate(360deg); } }
 .status-icon.spin { transform-origin: 50% 50%; animation: status-spin 0.9s linear infinite; }
-.sev-error { color: var(--nord11); }
-.sev-warning { color: var(--nord13); }
-.sev-information { color: var(--nord8); }
-.sev-hint { color: var(--nord4); } /* near-white: readable on dark chrome, distinct from info */
-.lsp-ready { color: var(--nord14); }
-.lsp-busy { color: var(--nord13); }
-.lsp-crashed { color: var(--nord11); }
-.lsp-stopped { color: var(--nord3); }
+.sev-error { color: var(--error); }
+.sev-warning { color: var(--warning); }
+.sev-information { color: var(--info); }
+.sev-hint { color: var(--fg); } /* near-white: readable on dark chrome, distinct from info */
+.lsp-ready { color: var(--ok); }
+.lsp-busy { color: var(--warning); }
+.lsp-crashed { color: var(--error); }
+.lsp-stopped { color: var(--fg-faint); }
 
 /* Toasts — transient messages, top-right, auto-dismissing. */
 #toasts {
@@ -268,9 +387,9 @@ html, body, #app {
   pointer-events: none;
 }
 .toast {
-  background: var(--nord1);
-  color: var(--nord4);
-  border: 1px solid var(--nord3);
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border-subtle);
   border-left-width: 3px;
   border-radius: 4px;
   padding: 6px 12px;
@@ -281,10 +400,10 @@ html, body, #app {
   font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 .toast.fade { opacity: 0; }
-.toast.error { border-left-color: var(--nord11); }
-.toast.warning { border-left-color: var(--nord13); }
-.toast.success { border-left-color: var(--nord14); }
-.toast.info { border-left-color: var(--nord8); }
+.toast.error { border-left-color: var(--error); }
+.toast.warning { border-left-color: var(--warning); }
+.toast.success { border-left-color: var(--ok); }
+.toast.info { border-left-color: var(--info); }
 
 /* Connection banner — top-center, above everything; amber while reconnecting, red when given up. */
 #conn-banner {
@@ -296,16 +415,16 @@ html, body, #app {
   display: flex;
   align-items: center;
   gap: 10px;
-  background: var(--nord13);
-  color: var(--nord0);
+  background: var(--warning);
+  color: var(--fg-on-accent);
   font: var(--ui-small)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding: 6px 14px;
   border-radius: 6px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
 }
 #conn-banner.failed {
-  background: var(--nord11);
-  color: var(--nord6);
+  background: var(--error);
+  color: var(--fg-bright);
 }
 
 /* The hint corner (docs/hints.md): a quiet top-right "Hint: …" chip, sentence dim with the
@@ -316,14 +435,14 @@ html, body, #app {
   top: 8px;
   right: 12px;
   z-index: 30; /* over the overlays (picker hints must show over the picker), under the banner */
-  background: var(--nord1);
-  color: var(--nord3-bright);
+  background: var(--bg-panel);
+  color: var(--fg-dim);
   font: var(--ui-small)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding: 3px 10px;
   border-radius: 5px;
 }
 #hint-corner .hint-keys {
-  color: var(--nord8);
+  color: var(--accent);
   font-weight: 600;
 }
 .conn-retry {
@@ -355,9 +474,9 @@ html, body, #app {
      propagation, so a drag-select here never starts an editor selection. */
   user-select: text;
   cursor: auto;
-  background: var(--nord1);
-  color: var(--nord4);
-  border: 1px solid var(--nord3);
+  background: var(--bg-panel);
+  color: var(--fg);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   padding: 6px 10px;
   white-space: pre-wrap;
@@ -383,7 +502,7 @@ html, body, #app {
   gap: calc(var(--ui-font-size) * 11 / 13);
 }
 #hover .md-line { margin: 0; }
-#hover .md-heading { font-weight: bold; color: var(--nord6); }
+#hover .md-heading { font-weight: bold; color: var(--fg-bright); }
 #hover .md-h1 { font-size: var(--ui-title); }
 #hover .md-h2 { font-size: var(--ui-heading-lg); }
 #hover .md-h3 { font-size: var(--ui-heading); }
@@ -393,13 +512,13 @@ html, body, #app {
 #hover .md-code {
   margin: 0;
   padding: 6px 8px;
-  background: var(--nord0);
+  background: var(--bg);
   border-radius: 4px;
   white-space: pre-wrap;
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: var(--ui-small);
 }
-#hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--nord8); }
+#hover code { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--accent); }
 /* Lists: the list is one flex item (outer spacing via the gap); items get a small internal gap. */
 #hover .md-list { margin: 0; padding-left: 1.4em; }
 #hover .md-list li { margin: 2px 0; }
@@ -407,24 +526,24 @@ html, body, #app {
 #hover .md-quote {
   margin: 0;
   padding-left: 10px;
-  border-left: 2px solid var(--nord3);
+  border-left: 2px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 /* Links: blue + underline (matches the native client's link colour). */
 #hover a,
-#hover .md-link { color: var(--nord9); text-decoration: underline; }
-#hover a:hover { color: var(--nord8); }
-#hover hr { border: none; border-top: 1px solid var(--nord3); margin: 0; }
+#hover .md-link { color: var(--accent-alt); text-decoration: underline; }
+#hover a:hover { color: var(--accent); }
+#hover hr { border: none; border-top: 1px solid var(--border-subtle); margin: 0; }
 /* Stacked diagnostic / commit blocks: one paragraph each, severity-coloured by its .sev-* class. */
 #hover .hover-block + .hover-block { margin-top: 6px; }
 
 /* Diagnostic hover: tint text + border by severity (id-specificity needed to beat #hover color). */
-#hover.sev-error { color: var(--nord11); border-color: var(--nord11); }
-#hover.sev-warning { color: var(--nord13); border-color: var(--nord13); }
-#hover.sev-information { color: var(--nord8); border-color: var(--nord8); }
-#hover.sev-hint { color: var(--nord4); border-color: var(--nord4); }
+#hover.sev-error { color: var(--error); border-color: var(--error); }
+#hover.sev-warning { color: var(--warning); border-color: var(--warning); }
+#hover.sev-information { color: var(--info); border-color: var(--info); }
+#hover.sev-hint { color: var(--fg); border-color: var(--fg); }
 
 /* Floating search input — sits above the status bar on the left, with a limited width (JS sets
    `bottom` to clear the status bar; `display` toggles flex/none). */
@@ -437,8 +556,8 @@ html, body, #app {
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--nord1);
-  border: 1px solid var(--nord3);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.22);
   padding: 5px 10px;
@@ -449,12 +568,12 @@ html, body, #app {
   border: none;
   outline: none;
   background: transparent;
-  color: var(--nord6);
+  color: var(--fg-bright);
   font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-.search-input::placeholder { color: var(--nord3); }
+.search-input::placeholder { color: var(--fg-faint); }
 .search-count {
-  color: var(--nord4);
+  color: var(--fg);
   flex: 0 0 auto;
   font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -464,7 +583,7 @@ html, body, #app {
 .row.modified-bg { background: var(--git-modified-bg); }
 .row.added-bg.staged { background: var(--git-staged-added-bg); }
 .row.modified-bg.staged { background: var(--git-staged-modified-bg); }
-.row.deleted-phantom { background: var(--git-deleted-bg); color: var(--nord11); }
+.row.deleted-phantom { background: var(--git-deleted-bg); color: var(--git-deleted); }
 .row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }
 /* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
    distinct from the status line's NORD1. Ordered after the diff tints so it wins on the cursor's
@@ -488,11 +607,11 @@ html, body, #app {
   position: sticky;
   left: 0;
   z-index: 1;
-  background: var(--nord0);
+  background: var(--bg);
 }
-.gutter.added { border-left-color: var(--nord14); }
-.gutter.modified { border-left-color: var(--nord13); }
-.gutter.phantom { border-left-color: var(--nord11); }
+.gutter.added { border-left-color: var(--git-added); }
+.gutter.modified { border-left-color: var(--git-modified); }
+.gutter.phantom { border-left-color: var(--git-deleted); }
 /* Staged dims the kind colour. The two-class rules out-rank the single-class kind rules, so the
    stage wins where both apply. */
 .gutter.added.staged { border-left-color: var(--git-staged-added); }
@@ -511,77 +630,77 @@ html, body, #app {
   height: 0;
   border-top: 4px solid transparent;
   border-bottom: 4px solid transparent;
-  border-left: 6px solid var(--nord11);
+  border-left: 6px solid var(--git-deleted);
 }
 
 .content { flex: 1 1 auto; }
-.cont-marker { color: var(--nord3); }
+.cont-marker { color: var(--fg-faint); }
 
 /* Matches the terminal: a search match is a quiet NORD3 fill — the brightest of Nord's Polar Night
    shades, so it stays visible on the NORD1 current-line tint while sitting below the selection. The
    selection paints over it in the more saturated NORD10, and the cursor over that. Precedence is
    source order (all single-class): search-hit < selection < cursor. */
-.search-hit { background: var(--nord3); }
+.search-hit { background: var(--fill-dim); }
 /* Comments are themed NORD3-BRIGHTER — only ~2:1 against the NORD3 fill — so a match inside one
    would be barely legible. Lift just that text to the normal foreground (the italic from
    .hl-comment stays); the compound selector outranks .hl-comment so this wins. Every other
    syntax color reads fine on NORD3. */
-.search-hit.hl-comment { color: var(--nord4); }
-.sel { background: var(--nord10); }
+.search-hit.hl-comment { color: var(--fg); }
+.sel { background: var(--bg-visual); }
 /* Selected-whitespace indicators (terminal parity): a muted NORD3 glyph over the selection blue —
    `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→` overlaid
    on a tab, which keeps its literal `\t` so `tab-size` preserves its width. The `.sel`-compound
    selectors outrank the `.hl-*` syntax colours, so the glyph is NORD3 even inside a highlight. */
-.sel.ws-dot, .sel.ws-nl { color: var(--nord3); }
+.sel.ws-dot, .sel.ws-nl { color: var(--fg-faint); }
 .ws-tab { position: relative; }
-.ws-tab::before { content: "→"; position: absolute; left: 0; color: var(--nord3); pointer-events: none; }
+.ws-tab::before { content: "→"; position: absolute; left: 0; color: var(--fg-faint); pointer-events: none; }
 /* Under the block cursor the cell inverts (NORD4 fill); flip the `→` to NORD0 so it stays legible,
    matching how the `·`/`↵` glyphs invert via the `.cursor` colour rule above. */
-.ws-tab.cursor:not(.insert):not(.pending)::before { color: var(--nord0); }
+.ws-tab.cursor:not(.insert):not(.pending)::before { color: var(--fg-on-accent); }
 /* Only the plain block cursor (Normal mode) inverts the cell — dark glyph on the NORD4 fill. The
    insert I-beam and the pending underscore are just an edge accent and must leave the character's
    syntax colour intact (`color: inherit` here would override the `.hl-*` colour with the default
    foreground, mis-colouring the char under the caret). */
-.cursor:not(.insert):not(.pending) { background: var(--nord4); color: var(--nord0); }
-.cursor.insert { box-shadow: inset 1.5px 0 0 var(--nord8); }
+.cursor:not(.insert):not(.pending) { background: var(--fg); color: var(--fg-on-accent); }
+.cursor.insert { box-shadow: inset 1.5px 0 0 var(--accent); }
 /* Waiting for the next key of a chord (after f/t, Space, surround, or a partial count): an underscore
    under the cell, matching the terminal's SteadyUnderScore — NORD8 accent on the bottom edge. */
-.cursor.pending { box-shadow: inset 0 -2px 0 var(--nord8); }
+.cursor.pending { box-shadow: inset 0 -2px 0 var(--accent); }
 
 /* Matching bracket (cursor on/inside a bracket pair) — bold orange, matching the terminal. */
-.match-bracket { color: var(--nord12); font-weight: bold; }
+.match-bracket { color: var(--match-bracket); font-weight: bold; }
 
 /* Sneak (s/S) word-jump: candidate words get the same quiet NORD3 tint as a search hit; comment
    text inside one is lifted to NORD4 so it stays visible (mirrors .search-hit.hl-comment). */
-.sneak-target { background: var(--nord3); }
-.sneak-target.hl-comment { color: var(--nord4); }
+.sneak-target { background: var(--fill-dim); }
+.sneak-target.hl-comment { color: var(--fg); }
 /* The label glyph painted over a word's first cell: a bold dark char on Aurora yellow, the
    high-contrast "press this to jump" marker (matches the terminal/iced label style). Overrides any
    syntax colour on that cell. */
-.sneak-label { background: var(--nord13); color: var(--nord0); font-weight: bold; }
+.sneak-label { background: var(--match-highlight); color: var(--fg-on-accent); font-weight: bold; }
 /* The rest of the typed prefix: the typed characters on a cooler, brighter band than the word tint
    (a lighter slate) — between it and the bright label cell in prominence. */
-.sneak-chip { background: #616e88; }
+.sneak-chip { background: var(--sneak-prefix-bg); }
 /* Comment text on the chip band is ~1.5:1 — lift it like the hit/target rules above (terminal
    parity: the TUI lifts dim foregrounds on this band too). */
-.sneak-chip.hl-comment { color: var(--nord4); }
+.sneak-chip.hl-comment { color: var(--fg); }
 /* End-of-line git blame for the cursor line. */
-.blame-eol { color: var(--nord3); font-style: italic; }
+.blame-eol { color: var(--fg-faint); font-style: italic; }
 
 /* Diagnostics — wavy underline in the severity colour. */
-.diag-error { text-decoration: underline wavy var(--nord11); }
-.diag-warning { text-decoration: underline wavy var(--nord13); }
-.diag-information { text-decoration: underline wavy var(--nord8); }
-.diag-hint { text-decoration: underline wavy var(--nord4); }
+.diag-error { text-decoration: underline wavy var(--error); }
+.diag-warning { text-decoration: underline wavy var(--warning); }
+.diag-information { text-decoration: underline wavy var(--info); }
+.diag-hint { text-decoration: underline wavy var(--fg); }
 
 /* ---- Modal dialogs (confirm / save-as) ---- */
 .modal {
   min-width: calc(var(--ui-font-size) * 360 / 13);
   max-width: 70vw;
-  background: var(--nord1);
-  color: var(--nord6);
+  background: var(--bg-panel);
+  color: var(--fg-bright);
   font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  border: 1px solid var(--nord3);
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
   padding: 16px;
@@ -592,42 +711,42 @@ html, body, #app {
 .modal-input,
 .modal-select {
   font: inherit;
-  background: var(--nord0);
-  color: var(--nord6);
-  border: 1px solid var(--nord3);
+  background: var(--bg);
+  color: var(--fg-bright);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   padding: 6px 8px;
   outline: none;
 }
 .modal-input { flex: 1 1 auto; min-width: 0; }
-.modal-input:focus, .modal-select:focus { border-color: var(--nord8); }
+.modal-input:focus, .modal-select:focus { border-color: var(--accent); }
 /* The save-as completion editor reuses the dir chip editor's ghost-stacking inputs (`picker-editor-*`)
    inside a modal field, so the root/path segments + `:` separator + gray ghost suggestions read the
    same as the picker. The field is a bordered box (like `.modal-input`) holding those inline parts. */
 .saveas-field {
   align-items: center;
   gap: 6px;
-  background: var(--nord0);
-  border: 1px solid var(--nord3);
+  background: var(--bg);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   padding: 6px 8px;
 }
-.saveas-field:focus-within { border-color: var(--nord8); }
+.saveas-field:focus-within { border-color: var(--accent); }
 .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 .modal-btn {
   font: inherit;
-  background: var(--nord2);
-  color: var(--nord6);
-  border: 1px solid var(--nord3);
+  background: var(--bg-selection);
+  color: var(--fg-bright);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   padding: 5px 14px;
   cursor: pointer;
 }
-.modal-btn:hover { background: var(--nord3); }
-.modal-btn.primary { background: var(--nord10); border-color: var(--nord10); }
-.modal-btn.primary:hover { background: var(--nord8); border-color: var(--nord8); }
-.modal-btn.danger { background: var(--nord11); border-color: var(--nord11); }
-.modal-btn.danger:hover { background: #cf6f77; border-color: #cf6f77; }
+.modal-btn:hover { background: var(--fill-dim); }
+.modal-btn.primary { background: var(--accent-deep); border-color: var(--accent-deep); }
+.modal-btn.primary:hover { background: var(--accent); border-color: var(--accent); }
+.modal-btn.danger { background: var(--error); border-color: var(--error); }
+.modal-btn.danger:hover { background: var(--modal-danger-hover); border-color: var(--modal-danger-hover); }
 /* Dim per-button shortcut hint (the confirm buttons advertise `y`/`n`). Inherits the button's
    text colour so it stays legible on both the plain and red fills. */
 .modal-btn .modal-key { margin-left: 7px; font-size: var(--ui-fine); opacity: 0.55; }
@@ -650,9 +769,9 @@ html, body, #app {
 /* Label/value grid, shared by the LSP detail and the app-info dialog — both are the same kind of
    read-only "facts about a thing" screen, so they read identically. */
 .info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; margin-bottom: 16px; }
-.info-key { color: var(--nord3-brighter); }
+.info-key { color: var(--fg-muted); }
 .info-val { word-break: break-word; } /* sans-serif (inherits the modal's font) */
-.lsp-info-hint { color: var(--nord3-brighter); font-size: var(--ui-small); }
+.lsp-info-hint { color: var(--fg-muted); font-size: var(--ui-small); }
 
 /* Application info (Space ?). Same box as the LSP detail, plus section headings. Height-capped
    and self-scrolling like
@@ -669,34 +788,34 @@ html, body, #app {
    spacing. Rows hug, and the gap between *sections* does the grouping instead. Scoped to app-info
    so the LSP dialog (a handful of rows, no sections) keeps its roomier spacing. */
 .modal.app-info .info-rows { gap: 2px 16px; line-height: 1.35; margin-bottom: 0; }
-.app-info-section { color: var(--nord8); font-weight: 600; font-size: var(--ui-small); margin: 12px 0 3px; }
+.app-info-section { color: var(--accent); font-weight: 600; font-size: var(--ui-small); margin: 12px 0 3px; }
 .app-info-section:first-of-type { margin-top: 10px; }
 /* Only the client/server build-mismatch row — the one thing here that's actionable. */
-.info-val.warn { color: var(--nord13); }
+.info-val.warn { color: var(--warning); }
 
 /* Workspace settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
 .modal.workspace-settings { width: min(640px, 88vw); }
 .modal.workspace-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
 /* Small gray labels (matching the native client). Tucked tight above their field (~3px) so each
    label+field reads as one group, with a wider gap (8px) above it from the previous group. */
-.ps-label { color: var(--nord3-brighter); font-size: var(--ui-small); margin: 8px 0 3px; }
+.ps-label { color: var(--fg-muted); font-size: var(--ui-small); margin: 8px 0 3px; }
 /* Name + add-root native <input> fields: boxed, frost border when focused. */
 .ps-input {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  background: var(--nord0);
-  color: var(--nord6);
-  border: 1px solid var(--nord3);
+  background: var(--bg);
+  color: var(--fg-bright);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   padding: 5px 8px;
   font-family: inherit; /* the dialog is sans-serif (`.modal`); inputs don't inherit font by default */
   font-size: inherit;
   outline: none;
 }
-.ps-input::placeholder { color: var(--nord3-brighter); }
-.ps-input:focus, .ps-input.focused { border-color: var(--nord8); }
-.ps-placeholder { color: var(--nord3-brighter); }
+.ps-input::placeholder { color: var(--fg-muted); }
+.ps-input:focus, .ps-input.focused { border-color: var(--accent); }
+.ps-placeholder { color: var(--fg-muted); }
 /* The existing roots, as a semantic <ul> with custom bullets (native markers don't survive the
    flex rows). The add-root input + error are siblings below, styled to match. */
 .ps-roots { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -709,7 +828,7 @@ html, body, #app {
   gap: 6px;
   /* sans-serif, inherited from `.modal` — the dialog isn't code */
 }
-.ps-bullet { flex: 0 0 auto; margin-left: 6px; color: var(--nord6); }
+.ps-bullet { flex: 0 0 auto; margin-left: 6px; color: var(--fg-bright); }
 /* The path hugs its own text (so the selection background does too) and ellipsises when long. */
 .ps-root-path {
   flex: 0 1 auto;
@@ -719,7 +838,7 @@ html, body, #app {
   white-space: nowrap;
 }
 /* Selection tints just the text (terminal-client parity), not the whole row. */
-.ps-root-path.selected { background: var(--nord2); }
+.ps-root-path.selected { background: var(--bg-selection); }
 /* A project row's trailing tag: the language whose server it pins, dim — or, when the declaration
    is broken (deleted marker, unrecognised name), the reason in red. Pushed right by the delete
    button's `margin-left: auto`, so it sits just left of the ✕. */
@@ -732,15 +851,15 @@ html, body, #app {
   white-space: nowrap;
   font-size: 0.85em;
 }
-.ps-project-language { color: var(--nord3-brighter); }
-.ps-project-error { color: var(--nord11); }
+.ps-project-language { color: var(--fg-muted); }
+.ps-project-error { color: var(--error); }
 /* With a tag present the delete button no longer needs to claim the free space itself. */
 .ps-project-language ~ .ps-root-delete, .ps-project-error ~ .ps-root-delete { margin-left: 6px; }
 .ps-root-delete {
   flex: 0 0 auto;
   margin-left: auto; /* the path hugs its text now, so push the delete to the right edge */
-  background: var(--nord3);
-  color: var(--nord6);
+  background: var(--fill-dim);
+  color: var(--fg-bright);
   border: none;
   border-radius: 4px;
   padding: 2px 8px;
@@ -748,7 +867,7 @@ html, body, #app {
   font: inherit;
   line-height: 1.2;
 }
-.ps-root-delete:hover { background: var(--nord11); }
+.ps-root-delete:hover { background: var(--error); }
 /* The add-root field is a borderless input after its bullet — the caret is the focus cue (like the
    terminal's input row), not a box. */
 .ps-add-input {
@@ -758,11 +877,11 @@ html, body, #app {
   border: none;
   outline: none;
   padding: 0;
-  color: var(--nord6);
+  color: var(--fg-bright);
   font: inherit;
 }
-.ps-add-input::placeholder { color: var(--nord3-brighter); font-style: italic; }
-.ps-add-input.invalid { color: var(--nord11); }
+.ps-add-input::placeholder { color: var(--fg-muted); font-style: italic; }
+.ps-add-input.invalid { color: var(--error); }
 /* The add-project row's field. It reuses the dir/save-as editor's `picker-editor-*` ghost-stacking
    DOM wholesale, so only the flex container is defined here: the segments size themselves (the root
    hugs its content, the path takes the rest) exactly as they do in the picker. */
@@ -776,7 +895,7 @@ html, body, #app {
    pushes, and a second grower would steal half its width. */
 .ps-language-gap { flex: 0 0 auto; width: 12px; }
 .ps-language-gap.grow { flex-grow: 1; }
-.ps-error { color: var(--nord11); font-size: var(--ui-small); margin-top: 8px; }
+.ps-error { color: var(--error); font-size: var(--ui-small); margin-top: 8px; }
 
 /* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,
    then per-setting blocks of a label-left / native-checkbox-right row with the description grouped
@@ -786,12 +905,12 @@ html, body, #app {
 .modal.app-settings .modal-message { font-weight: 600; margin-bottom: 14px; }
 .as-group { margin-bottom: 16px; }
 .as-group:last-of-type { margin-bottom: 0; }
-.as-group-title { color: var(--nord8); font-size: var(--ui-small); font-weight: 600; margin: 0 0 10px; }
+.as-group-title { color: var(--accent); font-size: var(--ui-small); font-weight: 600; margin: 0 0 10px; }
 .as-setting { margin-bottom: 12px; }
 .as-setting:last-child { margin-bottom: 0; }
 .as-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.as-label { color: var(--nord6); flex: 1 1 auto; cursor: pointer; }
-.as-check { accent-color: var(--nord8); cursor: pointer; margin: 0; flex: 0 0 auto; }
+.as-label { color: var(--fg-bright); flex: 1 1 auto; cursor: pointer; }
+.as-check { accent-color: var(--accent); cursor: pointer; margin: 0; flex: 0 0 auto; }
 /* A stepped numeric setting (font size): a compact pill showing the current value; click cycles. */
 .as-value {
   flex: 0 0 auto;
@@ -799,16 +918,16 @@ html, body, #app {
   padding: 2px 8px;
   font: inherit;
   text-align: center;
-  color: var(--nord6);
-  background: var(--nord2);
-  border: 1px solid var(--nord3);
+  color: var(--fg-bright);
+  background: var(--bg-selection);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
   cursor: pointer;
 }
 /* Focus rings just the control — a future setting may pair several controls in one row. */
 .as-setting.selected .as-check,
-.as-setting.selected .as-value { outline: 2px solid var(--nord8); outline-offset: 2px; border-radius: 2px; }
-.as-desc { color: var(--nord3-brighter); font-size: var(--ui-small); margin-top: 2px; }
+.as-setting.selected .as-value { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.as-desc { color: var(--fg-muted); font-size: var(--ui-small); margin-top: 2px; }
 
 /* ---- Picker overlay (command-palette style) ---- */
 .overlay {
@@ -826,10 +945,10 @@ html, body, #app {
   max-height: 70vh;
   display: flex;
   flex-direction: column;
-  background: var(--nord1);
-  color: var(--nord6);
+  background: var(--bg-panel);
+  color: var(--fg-bright);
   font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-  border: 1px solid var(--nord3);
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
   overflow: hidden;
@@ -837,11 +956,11 @@ html, body, #app {
 .picker-input-row {
   display: flex;
   align-items: center;
-  background: var(--nord0);
+  background: var(--bg);
   padding: 10px 12px;
 }
 .picker-path {
-  color: var(--nord8);
+  color: var(--accent);
   flex: 0 1 auto;
   max-width: 55%;
   white-space: nowrap;
@@ -852,7 +971,7 @@ html, body, #app {
   border: none;
   outline: none;
   background: transparent;
-  color: var(--nord6);
+  color: var(--fg-bright);
   font: inherit;
   flex: 1 1 auto;
   min-width: 0;
@@ -872,8 +991,8 @@ html, body, #app {
 /* In the search bar the chips sit right against the query — drop the picker row's trailing gap. */
 #searchbar .picker-chips { margin-right: 0; }
 .picker-chip {
-  background: var(--nord2);
-  color: var(--nord8);
+  background: var(--bg-selection);
+  color: var(--accent);
   padding: 1px 7px;
   border-radius: 4px;
   font-size: var(--ui-small);
@@ -883,9 +1002,9 @@ html, body, #app {
   text-overflow: ellipsis;
   cursor: pointer;
 }
-.picker-chip.exclude { color: var(--nord11); }
-.picker-chip.selected { background: var(--nord8); color: var(--nord0); }
-.picker-chip.selected.exclude { background: var(--nord11); color: var(--nord0); }
+.picker-chip.exclude { color: var(--error); }
+.picker-chip.selected { background: var(--accent); color: var(--fg-on-accent); }
+.picker-chip.selected.exclude { background: var(--error); color: var(--fg-on-accent); }
 /* Flag chips (boolean/cycling toggles) render their abbreviation underlined. */
 .picker-chip.flag { text-decoration: underline; }
 /* The chip editor line (Alt-g glob / Alt-d dir), revealed below the input row so chips + query
@@ -895,18 +1014,18 @@ html, body, #app {
   display: flex;
   align-items: center;
   gap: 6px;
-  background: var(--nord0);
+  background: var(--bg);
   padding: 0 12px 8px;
 }
 .picker-editor-label {
-  color: var(--nord8);
+  color: var(--accent);
   flex: 0 0 auto;
 }
 .picker-editor-input {
   border: none;
   outline: none;
   background: transparent;
-  color: var(--nord6);
+  color: var(--fg-bright);
   font: inherit;
   flex: 1 1 auto;
   min-width: 0;
@@ -933,12 +1052,12 @@ html, body, #app {
   pointer-events: none;
   white-space: pre;
   overflow: hidden;
-  color: var(--nord3-brighter);
+  color: var(--fg-muted);
 }
 .picker-editor-ghost .typed { visibility: hidden; }
 /* An invalid segment (root matching no label / path that doesn't exist) colours red — the
    visible form of "Enter will refuse this". */
-.picker-editor-input.invalid { color: var(--nord11); }
+.picker-editor-input.invalid { color: var(--error); }
 /* Content-hugging variant for the dir editor's root segment: the ghost layer becomes the
    in-flow sizer and the input overlays it, so the segment is exactly as wide as typed text +
    ghost remainder and the `:` separator sits flush after it — the row reads as one
@@ -961,12 +1080,12 @@ html, body, #app {
   text-overflow: ellipsis;
   cursor: text;
 }
-.picker-editor-seg.root { color: var(--nord8); }
-.picker-editor-seg.invalid { color: var(--nord11); }
+.picker-editor-seg.root { color: var(--accent); }
+.picker-editor-seg.invalid { color: var(--error); }
 /* The root/path separator: committed-prefix blue, pulled against the root segment (the row's
    flex gap would otherwise read as `beta :`). */
 .picker-editor-sep {
-  color: var(--nord8);
+  color: var(--accent);
   flex: 0 0 auto;
   margin-left: -6px;
 }
@@ -977,11 +1096,11 @@ html, body, #app {
 }
 /* Separator below the input — only when the list has anything to separate (`filled` is toggled by
    renderList), so an empty picker doesn't show a stray line doubling the input's bottom border. */
-.picker-list.filled { border-top: 1px solid var(--nord3); }
+.picker-list.filled { border-top: 1px solid var(--border-subtle); }
 /* Empty/loading message (References while resolving, or after an empty resolve). */
 .picker-empty {
   padding: 6px 12px;
-  color: var(--nord3);
+  color: var(--fg-faint);
   font-style: italic;
 }
 /* Virtual scroll: spacer spans all results; the loaded window is positioned within it. */
@@ -1007,32 +1126,32 @@ a.picker-row:not(.selected):hover .picker-main {
   text-decoration: underline;
 }
 .picker-row.selected {
-  background: var(--nord2);
+  background: var(--bg-selection);
 }
-.picker-prefix { color: var(--nord13); flex: 0 0 auto; }
+.picker-prefix { color: var(--match-highlight); flex: 0 0 auto; }
 /* References location prefix (`path:line`): dim, and allowed to ellipsize up to ~half the row so a
    long path can't crowd out the preview. Brightens on the selected row, like the meta column. */
 .picker-prefix.picker-loc {
-  color: var(--nord3);
+  color: var(--fg-faint);
   max-width: 55%;
   overflow: hidden;
   text-overflow: ellipsis;
   margin-right: 0.4em;
 }
-.picker-row.selected .picker-prefix.picker-loc { color: var(--nord4); }
-.sev-error { color: var(--nord11); }
-.sev-warning { color: var(--nord13); }
-.sev-information { color: var(--nord8); }
-.sev-hint { color: var(--nord4); } /* near-white: readable on dark chrome, distinct from info */
+.picker-row.selected .picker-prefix.picker-loc { color: var(--fg); }
+.sev-error { color: var(--error); }
+.sev-warning { color: var(--warning); }
+.sev-information { color: var(--info); }
+.sev-hint { color: var(--fg); } /* near-white: readable on dark chrome, distinct from info */
 .picker-main { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 /* Dim suffix right after the primary text (multi-root file rows: the root's name) — the path
    shrinks/ellipsizes first, like the terminal's budget math. */
-.picker-suffix { flex: 0 0 auto; color: var(--nord3-brighter); }
-.picker-dir { color: var(--nord8); } /* directories in frost blue, matching the terminal UI */
+.picker-suffix { flex: 0 0 auto; color: var(--fg-muted); }
+.picker-dir { color: var(--accent); } /* directories in frost blue, matching the terminal UI */
 /* Dimmed explorer entries — .gitignore'd files/folders (same shade for both: the trailing `/`
    already tells dirs apart). A lighter gray, legible on both the normal and selected backgrounds
    but clearly subordinate to the snow-white files / frost-blue dirs. */
-.picker-dim { color: var(--nord3-brighter); }
+.picker-dim { color: var(--fg-muted); }
 /* Left status-bullet for explorer entries: a fixed-width cell (so names align) holding a coloured
    `•` on a real change — green = new, yellow = modified, red = removed/conflict. */
 .picker-bullet {
@@ -1053,24 +1172,24 @@ a.picker-row:not(.selected):hover .picker-main {
   align-items: center;
 }
 .picker-bullet-added,
-.picker-bullet-untracked { color: var(--nord14); }
-.picker-bullet-modified { color: var(--nord13); }
+.picker-bullet-untracked { color: var(--git-added); }
+.picker-bullet-modified { color: var(--git-modified); }
 .picker-bullet-deleted,
-.picker-bullet-conflicted { color: var(--nord11); }
+.picker-bullet-conflicted { color: var(--git-deleted); }
 /* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the
    far edge. Colours match the editor status bar / favicon; the dot itself is the shared
    `.buffer-status-dot` circle, so size parity with the status bar holds by construction. */
 .picker-dirty-dot { margin-left: auto; }
-.picker-dirty-unsaved { color: var(--nord9); }
-.picker-dirty-externally_modified { color: var(--nord12); }
-.picker-dirty-externally_deleted { color: var(--nord11); }
-.picker-row.create .picker-main { color: var(--nord14); } /* "+ create …" row in green */
+.picker-dirty-unsaved { color: var(--state-unsaved); }
+.picker-dirty-externally_modified { color: var(--state-changed); }
+.picker-dirty-externally_deleted { color: var(--state-deleted); }
+.picker-row.create .picker-main { color: var(--ok); } /* "+ create …" row in green */
 /* Picker group header (grep/git-changes files, reference sections, keybinding groups) —
    non-selectable, bold; the path in frost blue (matches the terminal). */
 /* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).
    Sticky within its .picker-section so the header stays pinned while scrolling that group's rows. */
 .picker-row.picker-group-header {
-  color: var(--nord8);
+  color: var(--accent);
   font-weight: bold;
   cursor: default;
   white-space: nowrap;
@@ -1080,7 +1199,7 @@ a.picker-row:not(.selected):hover .picker-main {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: var(--nord1);
+  background: var(--bg-panel);
 }
 /* Keep a row from hiding under the sticky group header when revealed (e.g. Alt-k up): clear it by one
    header row. `--picker-row-h` is the measured display-row height the shell sets on the list. */
@@ -1118,10 +1237,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-list.collapsible .picker-row.picker-group-header .picker-meta {
   flex: 0 0 auto;
   margin-left: auto;
-  color: var(--nord3-bright);
+  color: var(--fg-dim);
   font-weight: normal;
 }
-.picker-list.collapsible .picker-row.picker-group-header.selected { background: var(--nord2); }
+.picker-list.collapsible .picker-row.picker-group-header.selected { background: var(--bg-selection); }
 /* Grep hits are code lines — the editor's mono font. Scoped to the preview text only; the line
    number keeps the picker's sans-serif. */
 .picker-row.grep-hit .picker-main { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
@@ -1140,19 +1259,19 @@ a.picker-row:not(.selected):hover .picker-main {
 /* The line number never shrinks away under a long code line: size to content, pushed to the right
    edge (the preview is the flexible cell and ellipsizes instead). */
 .picker-row.grep-hit .picker-meta { flex: 0 0 auto; margin-left: auto; }
-.picker-meta { color: var(--nord3-brighter); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
-.picker-row.selected .picker-meta { color: var(--nord4); }
+.picker-meta { color: var(--fg-muted); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+.picker-row.selected .picker-meta { color: var(--fg); }
 /* Keybinding chords read as the row's value, in the frost blue the native client uses (and the
    old help dialog's key column used). After the `.selected` rule so it wins on selected rows too
    (same specificity, later order) — the native client doesn't dim the chord on selection either. */
-.picker-row.keybinding .picker-meta { color: var(--nord8); }
-.picker .match { color: var(--nord13); font-weight: bold; }
-.picker-row.selected .match { color: var(--nord13); }
+.picker-row.keybinding .picker-meta { color: var(--accent); }
+.picker .match { color: var(--match-highlight); font-weight: bold; }
+.picker-row.selected .match { color: var(--match-highlight); }
 /* Match summary ("X/Y") to the right of the input, like the terminal UI. */
 .picker-count {
   flex: 0 0 auto;
   margin-left: 12px;
-  color: var(--nord3-brighter);
+  color: var(--fg-muted);
   font-size: var(--ui-small);
   white-space: nowrap;
 }
@@ -1163,8 +1282,8 @@ a.picker-row:not(.selected):hover .picker-main {
   margin-left: 12px;
   width: var(--ui-fine);
   height: var(--ui-fine);
-  border: 2px solid var(--nord3);
-  border-top-color: var(--nord8);
+  border: 2px solid var(--fill-dim);
+  border-top-color: var(--accent);
   border-radius: 50%;
   animation: picker-spin 0.7s linear infinite;
 }
@@ -1173,20 +1292,20 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 
 /* Syntax highlight kinds — keys match render.ts's HL_CLASS, values mirror ui.rs::lookup_exact. */
-.hl-keyword { color: var(--nord9); }
-.hl-string { color: var(--nord14); }
-.hl-string-special { color: var(--nord13); }
-.hl-comment { color: var(--nord3-brighter); font-style: italic; }
-.hl-constant { color: var(--nord15); }
-.hl-function { color: var(--nord8); }
-.hl-macro { color: var(--nord12); }
-.hl-type { color: var(--nord7); }
-.hl-parameter { color: var(--nord4); }
-.hl-punct { color: var(--nord4); }
-.hl-property { color: var(--nord4); }
-.hl-title { color: var(--nord8); font-weight: bold; }
-.hl-uri { color: var(--nord8); text-decoration: underline; }
-.hl-reference { color: var(--nord8); }
+.hl-keyword { color: var(--syn-keyword); }
+.hl-string { color: var(--syn-string); }
+.hl-string-special { color: var(--syn-string-special); }
+.hl-comment { color: var(--syn-comment); font-style: italic; }
+.hl-constant { color: var(--syn-constant); }
+.hl-function { color: var(--syn-function); }
+.hl-macro { color: var(--syn-macro); }
+.hl-type { color: var(--syn-type); }
+.hl-parameter { color: var(--fg); }
+.hl-punct { color: var(--fg); }
+.hl-property { color: var(--fg); }
+.hl-title { color: var(--syn-function); font-weight: bold; }
+.hl-uri { color: var(--syn-function); text-decoration: underline; }
+.hl-reference { color: var(--syn-function); }
 .hl-emphasis { font-style: italic; }
 .hl-strong { font-weight: bold; }
 
@@ -1214,11 +1333,11 @@ a.picker-row:not(.selected):hover .picker-main {
   max-width: 42.5em;
   margin: 0 auto;
   padding: 1.5rem 1rem;
-  color: var(--nord4);
+  color: var(--fg);
 }
 
 .md-read-loading {
-  color: var(--nord3-bright);
+  color: var(--fg-dim);
   font-style: italic;
 }
 
@@ -1234,19 +1353,19 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 /* The terminal's heading colour ladder: frost blue majors, teal H3, white H4, body-grey
    H5/H6 — colour distinguishes the minor levels, which share the 1.1em size. */
-.md-read h1, .md-read h2 { color: var(--nord8); }
-.md-read h3 { color: var(--nord7); }
-.md-read h4 { color: var(--nord6); }
-.md-read h5, .md-read h6 { color: var(--nord4); }
+.md-read h1, .md-read h2 { color: var(--syn-function); }
+.md-read h3 { color: var(--syn-type); }
+.md-read h4 { color: var(--fg-bright); }
+.md-read h5, .md-read h6 { color: var(--fg); }
 .md-read h1 { font-size: 1.75em; }
-.md-read h2 { font-size: 1.45em; border-bottom: 1px solid var(--nord2); padding-bottom: 0.2em; }
+.md-read h2 { font-size: 1.45em; border-bottom: 1px solid var(--bg-selection); padding-bottom: 0.2em; }
 .md-read h3 { font-size: 1.25em; }
 .md-read h4, .md-read h5, .md-read h6 { font-size: 1.1em; }
 .md-read > :first-child { margin-top: 0; }
 
 .md-read p { margin: 0.7em 0; }
 .md-read ul, .md-read ol { margin: 0.7em 0; padding-left: 1.6em; }
-.md-read li::marker { color: var(--nord4); }
+.md-read li::marker { color: var(--fg); }
 .md-read li { margin: 0.25em 0; }
 /* Task items: the checkbox takes a column of its own, so the box and the first line share a row
    while the item's blocks stay blocks. A task item can hold more than one — a loose item's
@@ -1272,29 +1391,29 @@ a.picker-row:not(.selected):hover .picker-main {
    add up rather than overlap. */
 .md-read li > :where(ul, ol) { margin-top: 0; }
 .md-read li > :has(+ :where(ul, ol)) { margin-bottom: 0; }
-.md-read .md-task-box { color: var(--nord4); margin-right: 0.45em; }
-.md-read li.md-task-done { color: var(--nord3-brighter); }
+.md-read .md-task-box { color: var(--fg); margin-right: 0.45em; }
+.md-read li.md-task-done { color: var(--fg-muted); }
 /* …but only for its own prose. Every item states its own done-ness, so the colour must not
    cascade into a sub-list: an open item indented under a completed one reads as open. A nested
    item that *is* done re-applies the rule above for itself. */
-.md-read li.md-task-done :where(ul, ol) { color: var(--nord4); }
+.md-read li.md-task-done :where(ul, ol) { color: var(--fg); }
 
 .md-read code {
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 0.85em;
-  background: var(--nord1);
+  background: var(--md-code-bg);
   border-radius: 3px;
   padding: 0.1em 0.35em;
 }
 
 .md-read .md-codeblock {
-  background: var(--nord1);
+  background: var(--md-code-bg);
   border-radius: 6px;
   margin: 0.9em 0;
   /* no overflow clip: the focus bar renders outside the box; the <pre> scrolls itself */
 }
 .md-read .md-codeblock-lang {
-  color: var(--nord3-brighter);
+  color: var(--fg-muted);
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 0.75em;
   padding: 0.4em 0.9em 0;
@@ -1311,11 +1430,11 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 .md-read .md-rawhtml,
 .md-read .md-front-matter {
-  color: var(--nord3-bright);
+  color: var(--fg-dim);
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 0.8em;
   background: none;
-  border-left: 2px solid var(--nord2);
+  border-left: 2px solid var(--bg-selection);
   padding: 0.2em 0 0.2em 0.8em;
   margin: 0.9em 0;
   white-space: pre-wrap;
@@ -1328,23 +1447,23 @@ a.picker-row:not(.selected):hover .picker-main {
      it (§12.6, the quote is its own grain there), but reserving it only for multi-child quotes
      left sibling quotes sitting at different indents. */
   padding: 0.4em 0.9em 0.4em calc(0.9em + 0.6rem);
-  border-left: 3px solid var(--nord3);
-  color: var(--nord4);
+  border-left: 3px solid var(--border-subtle);
+  color: var(--fg);
 }
 .md-read blockquote > :first-child { margin-top: 0.2em; }
 .md-read blockquote > :last-child { margin-bottom: 0.2em; }
 .md-read blockquote.md-alert { border-left-width: 3px; }
 .md-read .md-alert-label { font-weight: 650; margin-top: 0.4em; }
-.md-read .md-alert-note { border-left-color: var(--nord8); }
-.md-read .md-alert-note .md-alert-label { color: var(--nord8); }
-.md-read .md-alert-tip { border-left-color: var(--nord14); }
-.md-read .md-alert-tip .md-alert-label { color: var(--nord14); }
-.md-read .md-alert-important { border-left-color: var(--nord15); }
-.md-read .md-alert-important .md-alert-label { color: var(--nord15); }
-.md-read .md-alert-warning { border-left-color: var(--nord13); }
-.md-read .md-alert-warning .md-alert-label { color: var(--nord13); }
-.md-read .md-alert-caution { border-left-color: var(--nord11); }
-.md-read .md-alert-caution .md-alert-label { color: var(--nord11); }
+.md-read .md-alert-note { border-left-color: var(--info); }
+.md-read .md-alert-note .md-alert-label { color: var(--info); }
+.md-read .md-alert-tip { border-left-color: var(--ok); }
+.md-read .md-alert-tip .md-alert-label { color: var(--ok); }
+.md-read .md-alert-important { border-left-color: var(--md-alert-important); }
+.md-read .md-alert-important .md-alert-label { color: var(--md-alert-important); }
+.md-read .md-alert-warning { border-left-color: var(--warning); }
+.md-read .md-alert-warning .md-alert-label { color: var(--warning); }
+.md-read .md-alert-caution { border-left-color: var(--error); }
+.md-read .md-alert-caution .md-alert-label { color: var(--error); }
 
 /* The rule sits in a stamped, padded wrapper so the focus bar has height to stand next to
    (top/bottom-inset ::before on a bare 1px <hr> collapses to nothing). */
@@ -1354,7 +1473,7 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 .md-read hr {
   border: none;
-  border-top: 1px solid var(--nord2);
+  border-top: 1px solid var(--bg-selection);
   margin: 0;
 }
 
@@ -1369,7 +1488,7 @@ a.picker-row:not(.selected):hover .picker-main {
   overflow-x: auto;
   width: fit-content;
   max-width: 100%;
-  border: 1px solid var(--nord3);
+  border: 1px solid var(--border-subtle);
   border-radius: 4px;
 }
 .md-read table { border-collapse: collapse; font-size: 0.95em; }
@@ -1377,12 +1496,12 @@ a.picker-row:not(.selected):hover .picker-main {
   padding: 0.35em 0.75em;
   text-align: left;
 }
-.md-read th { color: var(--nord6); background: var(--nord1); }
-.md-read tbody tr:nth-child(even) { background: color-mix(in srgb, var(--nord1) 40%, transparent); }
+.md-read th { color: var(--fg-bright); background: var(--md-code-bg); }
+.md-read tbody tr:nth-child(even) { background: var(--md-table-stripe-bg); }
 
-.md-read a.md-link { color: var(--nord8); text-decoration: underline; text-underline-offset: 2px; }
-.md-read a.md-link:hover { color: var(--nord7); }
-.md-read a.md-link-internal { color: var(--nord9); cursor: default; }
+.md-read a.md-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md-read a.md-link:hover { color: var(--syn-type); }
+.md-read a.md-link-internal { color: var(--accent-alt); cursor: default; }
 /* Cross-file targets carry a real app href (picker-row treatment) — read as clickable. */
 /* Every link and footnote ref acts on click (follows like Enter), href or not — so they all
    read as clickable. The refs stay <sup>, not <a>: they don't carry URL state. */
@@ -1391,15 +1510,15 @@ a.picker-row:not(.selected):hover .picker-main {
 
 .md-read .md-image { max-width: 100%; border-radius: 4px; margin: 0; display: block; }
 .md-read .md-image-inline { display: inline; margin: 0; vertical-align: middle; max-height: 1.5em; }
-.md-read .md-image-alt { color: var(--nord3-bright); }
+.md-read .md-image-alt { color: var(--fg-dim); }
 /* Display images live in a stamped wrapper (the bar/ring host — ::before can't render on a
    replaced element); it shrinks to the image so the target ring hugs it. */
 .md-read .md-image-block { width: fit-content; max-width: 100%; margin: 0.9em 0; }
 
-.md-read .md-footnote-def { color: var(--nord3-brighter); font-size: 0.9em; margin: 0.5em 0; }
+.md-read .md-footnote-def { color: var(--fg-muted); font-size: 0.9em; margin: 0.5em 0; }
 .md-read .md-footnote-def p { display: inline; margin: 0; }
-.md-read .md-footnote-label { color: var(--nord9); }
-.md-read sup.md-footnote-ref { color: var(--nord9); font-size: 0.75em; }
+.md-read .md-footnote-label { color: var(--accent-alt); }
+.md-read sup.md-footnote-ref { color: var(--accent-alt); font-size: 0.75em; }
 
 /* The reading cursor: a frost bar down the focused element's left edge (settled on after
    trying background tints and full-window bands — the bar marks position without recolouring
@@ -1416,7 +1535,7 @@ a.picker-row:not(.selected):hover .picker-main {
   top: 0.15em;
   bottom: 0.15em;
   width: 3px;
-  background: var(--nord8);
+  background: var(--accent);
 }
 /* List items: clear the list's indent plus the shared gutter, so top-level item bars line
    up exactly with block bars (nested items step right one list-indent per level). */
@@ -1478,7 +1597,7 @@ a.picker-row:not(.selected):hover .picker-main {
    core suppresses the target pill while a selection is extended. */
 .md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
     .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-selected {
-  background: var(--nord2);
+  background: var(--bg-selection);
 }
 /* The Enter target — the interactive span (link, footnote ref, image) the cursor sits inside —
    inverts *on top of* the block bar: the bar says "you are reading here", the pill says "Enter
@@ -1486,18 +1605,18 @@ a.picker-row:not(.selected):hover .picker-main {
    paragraph, pill on its link) and coincide on a block image, which is both. */
 .md-read a.md-link.md-target,
 .md-read sup.md-target {
-  background: var(--nord8);
-  color: var(--nord0);
+  background: var(--accent);
+  color: var(--fg-on-accent);
   /* A 1px halo, not a padded lozenge: the pill hugs the text (outline is draw-only, so
      arming shifts nothing). */
-  outline: 1px solid var(--nord8);
+  outline: 1px solid var(--accent);
   border-radius: 2px;
   text-decoration: none;
 }
 /* An armed inline image keeps the full-weight ring — a 1px line vanishes against
    image content. */
 .md-read img.md-target {
-  outline: 3px solid var(--nord8);
+  outline: 3px solid var(--accent);
   border-radius: 2px;
 }
 /* A targeted display image shows NO ring: block-grain selection is the position bar's job

@@ -69,6 +69,9 @@ const EDITOR_LINE_HEIGHT: text::LineHeight = text::LineHeight::Relative(LINE_HEI
 
 /// What the app gives the widget to draw — borrowed views of app state.
 pub struct Content<'a> {
+    /// The resolved colour roles for the session's theme mode — the app resolves
+    /// [`theme::palette`] once per view pass and hands it down, like the chrome does.
+    pub palette: &'static theme::Palette,
     pub window: Option<&'a Window>,
     pub cursor: CursorState,
     pub insert_mode: bool,
@@ -366,7 +369,8 @@ where
     ) {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        fill(renderer, bounds, theme::NORD0);
+        let p = self.content.palette;
+        fill(renderer, bounds, p.bg);
 
         let (Some(cell), Some(window)) = (state.cell, self.content.window) else {
             return;
@@ -415,12 +419,12 @@ where
                 let staged = v.stage == DiffStage::Staged;
                 let (bg, fg, bar) = if staged {
                     (
-                        theme::GIT_STAGED_DELETED_BG,
-                        theme::GIT_STAGED_DELETED,
-                        theme::GIT_STAGED_DELETED,
+                        p.git_staged_deleted_bg,
+                        p.git_staged_deleted,
+                        p.git_staged_deleted,
                     )
                 } else {
-                    (theme::GIT_DELETED_BG, theme::NORD11, theme::NORD11)
+                    (p.git_deleted_bg, p.git_deleted, p.git_deleted)
                 };
                 fill(
                     renderer,
@@ -480,10 +484,10 @@ where
                 let staged = line.diff_stage == DiffStage::Staged;
                 let diff_bg = if self.content.diff_view {
                     match (line.diff_marker, staged) {
-                        (Some(DiffMarker::Added), false) => Some(theme::GIT_ADDED_BG),
-                        (Some(DiffMarker::Modified), false) => Some(theme::GIT_MODIFIED_BG),
-                        (Some(DiffMarker::Added), true) => Some(theme::GIT_STAGED_ADDED_BG),
-                        (Some(DiffMarker::Modified), true) => Some(theme::GIT_STAGED_MODIFIED_BG),
+                        (Some(DiffMarker::Added), false) => Some(p.git_added_bg),
+                        (Some(DiffMarker::Modified), false) => Some(p.git_modified_bg),
+                        (Some(DiffMarker::Added), true) => Some(p.git_staged_added_bg),
+                        (Some(DiffMarker::Modified), true) => Some(p.git_staged_modified_bg),
                         _ => None,
                     }
                 } else {
@@ -491,28 +495,28 @@ where
                 };
                 let row_bg = match (on_cursor_line, diff_bg, line.diff_marker, staged) {
                     (false, bg, ..) => bg,
-                    (true, None, ..) => Some(theme::CURSOR_LINE_BG),
+                    (true, None, ..) => Some(p.cursor_line_bg),
                     (true, Some(_), Some(DiffMarker::Added), false) => {
-                        Some(theme::CURSOR_LINE_ADDED_BG)
+                        Some(p.cursor_line_added_bg)
                     }
                     (true, Some(_), Some(DiffMarker::Modified), false) => {
-                        Some(theme::CURSOR_LINE_MODIFIED_BG)
+                        Some(p.cursor_line_modified_bg)
                     }
                     (true, Some(_), Some(DiffMarker::Added), true) => {
-                        Some(theme::CURSOR_LINE_STAGED_ADDED_BG)
+                        Some(p.cursor_line_staged_added_bg)
                     }
                     (true, Some(_), Some(DiffMarker::Modified), true) => {
-                        Some(theme::CURSOR_LINE_STAGED_MODIFIED_BG)
+                        Some(p.cursor_line_staged_modified_bg)
                     }
-                    (true, Some(_), ..) => Some(theme::CURSOR_LINE_BG),
+                    (true, Some(_), ..) => Some(p.cursor_line_bg),
                 };
                 if let Some(bg) = row_bg {
                     fill(renderer, row_bounds, bg);
                 }
 
-                // Search-match fills: a quiet NORD3, under selection and cursor (matching the
-                // web's search-hit < selection < cursor stacking). The spans are kept — the
-                // text pass below lifts NORD3-coloured glyphs inside them.
+                // Search-match fills: the quiet dim fill, under selection and cursor (matching
+                // the web's search-hit < selection < cursor stacking). The spans are kept — the
+                // text pass below lifts comment-coloured glyphs inside them.
                 let hit_spans: Vec<(u32, u32)> = line
                     .search_matches
                     .iter()
@@ -527,12 +531,12 @@ where
                             width: (end - start) as f32 * cell.width,
                             height: cell.height,
                         },
-                        theme::NORD3,
+                        p.fill_dim,
                     );
                 }
 
-                // Sneak word-jump targets: a NORD3 tint over each candidate word (like a search
-                // hit), plus a bright NORD13 "chip" over the typed prefix. Tuple is
+                // Sneak word-jump targets: a dim tint over each candidate word (like a search
+                // hit), plus a bright match-emphasis "chip" over the typed prefix. Tuple is
                 // `(start_dcol, end_dcol, prefix_end_dcol, label)`; the label glyph and chip blanks
                 // are drawn in/after the text pass below.
                 let sneak_spans: Vec<(u32, u32, u32, Option<char>)> = line
@@ -558,7 +562,7 @@ where
                             width: (end - start) as f32 * cell.width,
                             height: cell.height,
                         },
-                        theme::NORD3,
+                        p.fill_dim,
                     );
                     if prefix_end > start {
                         // Typed prefix: a cooler, brighter band over the word tint...
@@ -570,7 +574,7 @@ where
                                 width: (prefix_end - start) as f32 * cell.width,
                                 height: cell.height,
                             },
-                            theme::SNEAK_PREFIX_BG,
+                            p.sneak_prefix_bg,
                         );
                         // ...with just the label's first cell bright on top.
                         fill_content(
@@ -581,7 +585,7 @@ where
                                 width: cell.width,
                                 height: cell.height,
                             },
-                            theme::NORD13,
+                            p.match_highlight,
                         );
                     }
                 }
@@ -592,7 +596,7 @@ where
                     .diff_marker
                     .filter(|m| !(self.content.diff_view && *m == DiffMarker::Deleted));
                 if let Some(marker) = gutter_marker {
-                    let color = gutter_color(marker, line.diff_stage);
+                    let color = gutter_color(p, marker, line.diff_stage);
                     if marker == DiffMarker::Deleted {
                         // A pure deletion sits *between* this surviving line and the one above,
                         // so mark it with a small triangle straddling this line's top boundary
@@ -613,7 +617,7 @@ where
                     }
                 }
 
-                // Selection: the saturated NORD10 blue, over the NORD3 search-hit fill
+                // Selection: the saturated visual-selection fill, over the dim search-hit fill
                 // (terminal/web parity — hit < selection < cursor).
                 if draw_selection {
                     if let Some((start, end)) = grid::row_selection_span(
@@ -632,7 +636,7 @@ where
                                 width: (end - start) as f32 * cell.width,
                                 height: cell.height,
                             },
-                            theme::NORD10,
+                            p.bg_visual,
                         );
                     }
                 }
@@ -653,7 +657,7 @@ where
                                             width: width as f32 * cell.width,
                                             height: cell.height,
                                         },
-                                        theme::NORD3,
+                                        p.fill_dim,
                                     );
                                 }
                             }
@@ -668,16 +672,16 @@ where
                         CONTINUATION_MARKER.to_string(),
                         Point::new(text_x(0), y),
                         cell,
-                        theme::NORD3,
+                        p.fg_faint,
                         content_clip,
                     );
                 }
 
                 // Text, as runs of identical highlight kind. "Inside a search hit" is part
-                // of the run key: comments are themed NORD3_BRIGHTER — only ~2:1 against
-                // the NORD3 hit fill — so a match inside one would be barely legible. Lift
-                // just that text to the normal foreground (the web's `.search-hit.hl-comment`
-                // rule; every other syntax colour reads fine on NORD3).
+                // of the run key: comments are the palette's dimmest rung — barely legible
+                // against the dim hit fill — so a match inside one would vanish. Lift just
+                // that text to the normal foreground (the web's `.search-hit.hl-comment`
+                // rule; every other syntax colour reads fine on the fill).
                 let in_hit = |dcol: u32| {
                     hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
                         || sneak_spans
@@ -701,10 +705,10 @@ where
                         return;
                     }
                     let mut color = kind
-                        .and_then(theme::highlight_color)
-                        .unwrap_or(theme::NORD4);
-                    if hit && color == theme::NORD3_BRIGHTER {
-                        color = theme::NORD4;
+                        .and_then(|k| theme::highlight_color(p.mode, k))
+                        .unwrap_or(p.fg);
+                    if hit && Some(color) == theme::highlight_color(p.mode, "comment") {
+                        color = p.fg;
                     }
                     draw_text_run(
                         renderer,
@@ -731,7 +735,7 @@ where
                     start
                 };
                 for c in &cells {
-                    // Selected whitespace gets a muted NORD3 indicator glyph over the selection
+                    // Selected whitespace gets a muted indicator glyph over the selection
                     // fill (terminal parity): `→` for tabs, `·` for trailing spaces. Drawn as its
                     // own run so the next text run repositions itself past the tab's full width.
                     let selected = draw_selection
@@ -750,7 +754,7 @@ where
                             g.to_string(),
                             Point::new(text_x(c.dcol), y),
                             cell,
-                            theme::NORD3,
+                            p.fg_faint,
                             content_clip,
                         );
                         continue;
@@ -791,7 +795,7 @@ where
                                 lbl.to_string(),
                                 Point::new(text_x(start), y),
                                 cell,
-                                theme::NORD0,
+                                p.fg_on_accent,
                                 content_clip,
                             );
                         }
@@ -819,7 +823,7 @@ where
                         "↵".to_string(),
                         Point::new(text_x(end_dcol), y),
                         cell,
-                        theme::NORD3,
+                        p.fg_faint,
                         content_clip,
                     );
                 }
@@ -833,7 +837,7 @@ where
                             btext.to_string(),
                             Point::new(text_x(end + 3), y),
                             cell,
-                            theme::NORD3_BRIGHT,
+                            p.fg_dim,
                             content_clip,
                         );
                     }
@@ -860,7 +864,7 @@ where
                             text_x(start),
                             y + cell.height - 2.0,
                             (end - start).max(1) as f32 * cell.width,
-                            theme::diagnostic_color(diag.severity),
+                            theme::diagnostic_color(p.mode, diag.severity),
                             content_left,
                         );
                     }
@@ -885,7 +889,7 @@ where
                             width: width as f32 * cell.width,
                             height: 2.0,
                         },
-                        theme::NORD4,
+                        p.fg,
                     );
                 } else if self.content.insert_mode {
                     fill_content(
@@ -896,7 +900,7 @@ where
                             width: 2.0,
                             height: cell.height,
                         },
-                        theme::NORD8,
+                        p.accent,
                     );
                 } else {
                     fill_content(
@@ -907,7 +911,7 @@ where
                             width: width as f32 * cell.width,
                             height: cell.height,
                         },
-                        theme::NORD4,
+                        p.fg,
                     );
                     // Re-draw the char — or, on selected whitespace, its `→`/`·`/`↵` glyph — under
                     // the block in the background colour, so the cursor doesn't blank the indicator.
@@ -928,7 +932,7 @@ where
                             g.to_string(),
                             Point::new(x, y),
                             cell,
-                            theme::NORD0,
+                            p.fg_on_accent,
                             content_clip,
                         );
                     } else if let Some(ch) = char_at(window, cursor_pos) {
@@ -938,7 +942,7 @@ where
                                 ch.to_string(),
                                 Point::new(x, y),
                                 cell,
-                                theme::NORD0,
+                                p.fg_on_accent,
                                 content_clip,
                             );
                         }
@@ -957,7 +961,7 @@ where
                             x,
                             y + cell.height - 2.0,
                             width as f32 * cell.width,
-                            theme::diagnostic_color(sev),
+                            theme::diagnostic_color(p.mode, sev),
                             content_left,
                         );
                     }
@@ -1356,14 +1360,14 @@ fn cursor_ws_glyph(
     }
 }
 
-fn gutter_color(marker: DiffMarker, stage: DiffStage) -> Color {
+fn gutter_color(p: &theme::Palette, marker: DiffMarker, stage: DiffStage) -> Color {
     match (marker, stage) {
-        (DiffMarker::Added, DiffStage::Unstaged) => theme::GIT_ADDED,
-        (DiffMarker::Modified, DiffStage::Unstaged) => theme::GIT_MODIFIED,
-        (DiffMarker::Deleted, DiffStage::Unstaged) => theme::GIT_DELETED,
-        (DiffMarker::Added, DiffStage::Staged) => theme::GIT_STAGED_ADDED,
-        (DiffMarker::Modified, DiffStage::Staged) => theme::GIT_STAGED_MODIFIED,
-        (DiffMarker::Deleted, DiffStage::Staged) => theme::GIT_STAGED_DELETED,
+        (DiffMarker::Added, DiffStage::Unstaged) => p.git_added,
+        (DiffMarker::Modified, DiffStage::Unstaged) => p.git_modified,
+        (DiffMarker::Deleted, DiffStage::Unstaged) => p.git_deleted,
+        (DiffMarker::Added, DiffStage::Staged) => p.git_staged_added,
+        (DiffMarker::Modified, DiffStage::Staged) => p.git_staged_modified,
+        (DiffMarker::Deleted, DiffStage::Staged) => p.git_staged_deleted,
     }
 }
 

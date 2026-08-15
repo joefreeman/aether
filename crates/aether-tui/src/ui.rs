@@ -6,11 +6,13 @@ use crate::app::{
 };
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
+use aether_client::theme::{Rgb, Theme};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::search::SearchMatchRange;
+use aether_protocol::settings::ThemeMode;
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
     DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, Highlight, VisualRow, WrapMode,
@@ -52,66 +54,35 @@ fn char_display_width(c: char, current_col: u32) -> u32 {
     }
 }
 
-// ---- Nord palette ------------------------------------------------------------------------------
-// https://www.nordtheme.com/. Used for both the syntax-highlight foreground colors and the
-// painted background/status colors so the editor's appearance is independent of the terminal's
-// own color scheme.
+// ---- Theme -------------------------------------------------------------------------------------
+// Colours come from the core's role tables (`aether_client::theme`) — the single source of truth
+// shared by every shell. `Theme::DARK` maps each role to exactly the Nord constant this file used
+// to hardcode (the role comments in theme.rs name them), so dark renders pixel-identical to the
+// pre-theme TUI; `Theme::LIGHT` is the light counterpart. Call sites reference roles through
+// [`th`] + [`c`]. The active mode is thread-local: the draw path is single-threaded, but `cargo
+// test` runs many tests in one process, and a process-global would let one test's Light leak into
+// another's dark assertions.
 
-const NORD0: Color = Color::Rgb(46, 52, 64); // Polar Night — main background
-const NORD1: Color = Color::Rgb(59, 66, 82); // Polar Night — status line / panel
-const NORD2: Color = Color::Rgb(67, 76, 94); // Polar Night — selection background
-const NORD3: Color = Color::Rgb(76, 86, 106); // Polar Night — dim (hit/sneak fills, muted glyphs)
-const NORD3_BRIGHT: Color = Color::Rgb(97, 110, 136); // Polar Night — lighter dim (ignored entries)
-/// Off-palette, brighter still — the syntax comment colour: NORD3 comments were ~1.4:1 against
-/// the reading view's NORD1 code panels; this reaches ~2.8:1 there (~3.5:1 on the editor) while
-/// staying below NORD9 keywords, so comments remain the dimmest rung of the ladder. Mirrors the
-/// web client's `--nord3-brighter`.
-const NORD3_BRIGHTER: Color = Color::Rgb(123, 136, 161); // #7b88a1
-/// Outline for the floating overlays' rounded frame and their input/results separator (see
-/// [`overlay_block`] / [`draw_picker_separator`]). A step brighter than `NORD3_BRIGHT` so the border
-/// reads clearly against the editor, but still muted vs the full `NORD4` foreground. The one knob to
-/// turn to make the overlay outline heavier/lighter — detach it from the palette shade to do so.
-const OVERLAY_BORDER_FG: Color = NORD3_BRIGHTER;
-const NORD4: Color = Color::Rgb(216, 222, 233); // Snow Storm — main foreground
-const NORD6: Color = Color::Rgb(236, 239, 244); // Snow Storm — brightest (headings)
-const NORD7: Color = Color::Rgb(143, 188, 187); // Frost — types
-const NORD8: Color = Color::Rgb(136, 192, 208); // Frost — functions, accents
-const NORD9: Color = Color::Rgb(129, 161, 193); // Frost — keywords, operators
-const NORD10: Color = Color::Rgb(94, 129, 172); // Frost — deep blue (active selection bg)
-const NORD11: Color = Color::Rgb(191, 97, 106); // Aurora red — error text
-const NORD12: Color = Color::Rgb(208, 135, 112); // Aurora orange — attributes, macros
-const NORD13: Color = Color::Rgb(235, 203, 139); // Aurora yellow — string escapes
-const NORD14: Color = Color::Rgb(163, 190, 140); // Aurora green — strings
-const NORD15: Color = Color::Rgb(180, 142, 173); // Aurora purple — numbers, constants
+thread_local! {
+    /// The mode this thread paints with. The shell sets it every frame from `session.theme`
+    /// before `draw`; tests exercising light mode set it (and restore Dark) themselves.
+    static THEME_MODE: std::cell::Cell<ThemeMode> = const { std::cell::Cell::new(ThemeMode::Dark) };
+}
 
-// Inline diff backgrounds. Phantom "deleted" rows render red-on-dark-red so they read as removed
-// without being mistaken for real buffer content; added/modified real lines get a subtle dark
-// tint behind their normal syntax-highlighted text.
-const GIT_DELETED_BG: Color = Color::Rgb(59, 34, 38); // dark muted red
-const GIT_ADDED_BG: Color = Color::Rgb(45, 58, 45); // dark muted green
-const GIT_MODIFIED_BG: Color = Color::Rgb(58, 54, 40); // dark muted olive
-                                                       // Staged variants keep each kind's hue but dimmed/desaturated — hue says *what* changed,
-                                                       // brightness says whether it still needs staging (bright = unstaged, muted = in the index).
-const GIT_STAGED_ADDED: Color = Color::Rgb(110, 128, 96); // dimmed NORD14
-const GIT_STAGED_MODIFIED: Color = Color::Rgb(158, 138, 98); // dimmed NORD13
-const GIT_STAGED_DELETED: Color = Color::Rgb(132, 76, 83); // dimmed NORD11
-const GIT_STAGED_ADDED_BG: Color = Color::Rgb(47, 54, 49); // staged line tints, likewise dimmer
-const GIT_STAGED_MODIFIED_BG: Color = Color::Rgb(53, 52, 45);
-const GIT_STAGED_DELETED_BG: Color = Color::Rgb(51, 37, 42); // staged phantom rows
+/// Install the theme mode for this thread's subsequent painting.
+pub fn set_theme_mode(mode: ThemeMode) {
+    THEME_MODE.with(|m| m.set(mode));
+}
 
-// Current-line highlight (Vim's `cursorline`). A custom tint ~40% of the way from the NORD0
-// background to NORD1: subtler than NORD1 (which the status line uses, so the cursorline doesn't
-// read as heavy as a panel) while still clearly marking the line. Off-palette by necessity — Nord
-// has no shade between NORD0 and NORD1.
-const CURSOR_LINE_BG: Color = Color::Rgb(52, 58, 72);
-// Cursorline variants for changed lines under the diff view: a brighter green/olive so the cursor's
-// line still reads as added/modified instead of the plain blue cursorline hiding the diff tint.
-const CURSOR_LINE_ADDED_BG: Color = Color::Rgb(58, 77, 58);
-const CURSOR_LINE_MODIFIED_BG: Color = Color::Rgb(74, 70, 50);
-// ...and their staged counterparts, lifted from the staged tints the same way — so the cursor
-// landing on a staged line doesn't make it flare back up to the unstaged brightness.
-const CURSOR_LINE_STAGED_ADDED_BG: Color = Color::Rgb(58, 69, 60);
-const CURSOR_LINE_STAGED_MODIFIED_BG: Color = Color::Rgb(67, 65, 56);
+/// The active role table, per the thread-local mode set by [`set_theme_mode`].
+fn th() -> &'static Theme {
+    Theme::of(THEME_MODE.with(|m| m.get()))
+}
+
+/// Core [`Rgb`] → ratatui [`Color`], at the draw boundary.
+fn c(rgb: Rgb) -> Color {
+    Color::Rgb(rgb.r, rgb.g, rgb.b)
+}
 
 /// Whether the status row is drawn. It takes the terminal's bottom row and the content pane —
 /// where every overlay is centred — gets the rest. Shared by [`draw`] and [`content_area`] so the
@@ -252,13 +223,13 @@ fn draw_hint_corner(f: &mut Frame, state: &AppState, area: Rect) {
         height: 1,
     };
     f.render_widget(Clear, rect);
-    let tint = Style::default().bg(NORD1);
-    let dim = tint.fg(NORD3_BRIGHT);
+    let tint = Style::default().bg(c(th().bg_panel));
+    let dim = tint.fg(c(th().fg_dim));
     let spans = vec![
         Span::styled(" ".to_string(), tint),
         Span::styled(PREFIX.to_string(), dim),
         Span::styled(before.clone(), dim),
-        Span::styled(keys.clone(), tint.fg(NORD8)),
+        Span::styled(keys.clone(), tint.fg(c(th().accent))),
         Span::styled(after, dim),
         Span::styled(" ".to_string(), tint),
     ];
@@ -271,7 +242,7 @@ fn draw_hint_corner(f: &mut Frame, state: &AppState, area: Rect) {
 /// painted on top reads as the only live thing on screen.
 fn dim_backdrop(buf: &mut Buffer, area: Rect) {
     // Override only fg/bg; leave the cell's existing modifiers (italic etc.) intact.
-    let dim = Style::default().fg(NORD3).bg(NORD0);
+    let dim = Style::default().fg(c(th().fg_faint)).bg(c(th().bg));
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
@@ -301,7 +272,7 @@ fn draw_workspace_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) 
     draw_settings_header(f, settings, layout.header);
     draw_settings_rows(f, state, settings, layout.rows);
     if let (Some(err_area), Some(msg)) = (layout.error, settings.error.as_deref()) {
-        let style = Style::default().fg(NORD11).bg(NORD0);
+        let style = Style::default().fg(c(th().error)).bg(c(th().bg));
         let text = truncate_right(msg, err_area.width as usize);
         f.render_widget(Paragraph::new(Span::styled(text, style)), err_area);
     }
@@ -311,7 +282,7 @@ fn draw_workspace_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) 
 /// Each group has a frost-accent header; each setting is a flush-left white label with its
 /// `[✓]`/`[ ]` checkbox on the right, and its description on the line directly below (no gap). A
 /// blank line separates the group header and each setting. Only the focused setting's *checkbox* is
-/// highlighted (a NORD2 cell), not the whole row. Toggle-only — no caret to place.
+/// highlighted (a selection-shade cell), not the whole row. Toggle-only — no caret to place.
 fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let Some(settings) = state.app_settings.as_ref() else {
         return;
@@ -338,11 +309,11 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 
     const CHECK_W: usize = 3; // "[✓]" / "[ ]"
     let title_style = Style::default()
-        .fg(NORD6)
-        .bg(NORD0)
+        .fg(c(th().fg_bright))
+        .bg(c(th().bg))
         .add_modifier(Modifier::BOLD);
-    let group_style = Style::default().fg(NORD8).bg(NORD0);
-    let desc_style = Style::default().fg(NORD3).bg(NORD0);
+    let group_style = Style::default().fg(c(th().accent)).bg(c(th().bg));
+    let desc_style = Style::default().fg(c(th().fg_faint)).bg(c(th().bg));
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -364,16 +335,16 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             // A gap before each setting (separating it from the header / the previous setting).
             lines.push(Line::from(""));
             // Label flush-left, control right-aligned. Only the control carries the focus highlight
-            // (a NORD2 background). A toggle shows a checkbox; a stepped value (font size) shows the
+            // (the selection background). A toggle shows a checkbox; a stepped value (font size) shows the
             // number — the terminal can't change its own font, but the value is shown for parity and
             // because the setting is synced (it drives the GUI/web clients).
             let (control_text, control_fg) = match row.control {
-                AppSettingControl::Toggle(true) => ("[\u{2713}]".to_string(), NORD8),
-                AppSettingControl::Toggle(false) => ("[ ]".to_string(), NORD6),
-                AppSettingControl::Value(v) => (v.to_string(), NORD8),
+                AppSettingControl::Toggle(true) => ("[\u{2713}]".to_string(), c(th().accent)),
+                AppSettingControl::Toggle(false) => ("[ ]".to_string(), c(th().fg_bright)),
+                AppSettingControl::Value(v) => (v.to_string(), c(th().accent)),
             };
             let control_w = control_text.chars().count().max(CHECK_W);
-            let check_bg = if selected { NORD2 } else { NORD0 };
+            let check_bg = c(if selected { th().bg_selection } else { th().bg });
             let label_budget = w.saturating_sub(control_w + 1);
             let label = truncate_right(row.label, label_budget);
             let pad = w
@@ -382,7 +353,7 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}{}", label, " ".repeat(pad)),
-                    Style::default().fg(NORD6).bg(NORD0),
+                    Style::default().fg(c(th().fg_bright)).bg(c(th().bg)),
                 ),
                 Span::styled(
                     format!("{control_text:>control_w$}"),
@@ -399,7 +370,7 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     }
 
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(NORD4).bg(NORD0)),
+        Paragraph::new(lines).style(Style::default().fg(c(th().fg)).bg(c(th().bg))),
         content,
     );
 }
@@ -510,7 +481,7 @@ fn draw_hover_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     };
     f.render_widget(
         Paragraph::new(layout.lines)
-            .style(Style::default().bg(NORD0).fg(NORD4))
+            .style(Style::default().bg(c(th().bg)).fg(c(th().fg)))
             .scroll((offset, 0)),
         text_area,
     );
@@ -550,27 +521,17 @@ fn hover_lines(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Border color for the hover popup: the worst severity among its diagnostic blocks (matching the
-/// gutter dot / text), or frost blue (`NORD8`) for a Markdown LSP-hover popup.
+/// gutter dot / text), or the accent (frost blue in dark) for a Markdown LSP-hover popup.
 fn hover_border_color(body: &crate::app::HoverBody) -> Color {
     match body {
         crate::app::HoverBody::Blocks(blocks) => blocks
             .iter()
             .filter_map(|b| b.severity)
             .max_by_key(|s| severity_rank(*s))
-            .map_or(NORD8, diag_color),
-        crate::app::HoverBody::Markdown(_) => NORD8,
+            .map_or(c(th().accent), diag_color),
+        crate::app::HoverBody::Markdown(_) => c(th().accent),
     }
 }
-
-/// Background for code (block & inline) in Markdown hovers.
-const MD_CODE_BG: Color = NORD1;
-
-/// Reading-view table stripe: alternating body rows band, so a row reads across wide columns
-/// without a rule under every cell. A custom shade ~30% of the way from NORD0 to NORD1 — enough
-/// to band the row, light enough that a NORD1 code chip still reads on top of it (Nord has
-/// nothing between the two, same reason [`CURSOR_LINE_BG`] is off-palette). The header row is
-/// deliberately unbanded: bold white plus the separator rule already set it apart.
-const MD_TABLE_STRIPE_BG: Color = Color::Rgb(50, 56, 69);
 
 /// Render a hover body to fully-styled, width-wrapped display lines. Diagnostic blocks keep their
 /// severity-icon prefix and colour; Markdown is rendered with headings, code backgrounds, inline
@@ -580,7 +541,7 @@ fn render_hover_lines(body: &crate::app::HoverBody, width: usize) -> Vec<Line<'s
         crate::app::HoverBody::Blocks(blocks) => hover_display_lines(blocks, width)
             .into_iter()
             .map(|(text, severity)| {
-                let fg = severity.map_or(NORD4, diag_color);
+                let fg = severity.map_or(c(th().fg), diag_color);
                 Line::from(Span::styled(text, Style::default().fg(fg)))
             })
             .collect(),
@@ -608,7 +569,9 @@ fn md_hover_lines(blocks: &[MdBlock], width: usize) -> Vec<Line<'static>> {
 fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
     match block {
         MdBlock::Heading { content, .. } => {
-            let base = Style::default().fg(NORD6).add_modifier(Modifier::BOLD);
+            let base = Style::default()
+                .fg(c(th().fg_bright))
+                .add_modifier(Modifier::BOLD);
             let segs = md_inline_segs(content, base);
             wrap_styled(&segs, width)
                 .into_iter()
@@ -616,7 +579,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                 .collect()
         }
         MdBlock::Paragraph { content, .. } => {
-            let segs = md_inline_segs(content, Style::default().fg(NORD4));
+            let segs = md_inline_segs(content, Style::default().fg(c(th().fg)));
             wrap_styled(&segs, width)
                 .into_iter()
                 .map(Line::from)
@@ -625,7 +588,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
         MdBlock::Code { code, .. } => {
             // Each code line gets a code background, padded out to the full width so the block reads
             // as a solid panel.
-            let style = Style::default().fg(NORD4).bg(MD_CODE_BG);
+            let style = Style::default().fg(c(th().fg)).bg(c(th().md_code_bg));
             code.split('\n')
                 .map(|raw| {
                     let mut s: String = raw.chars().take(width).collect();
@@ -665,7 +628,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                     } else {
                         indent.clone()
                     };
-                    let mut spans = vec![Span::styled(prefix, Style::default().fg(NORD4))];
+                    let mut spans = vec![Span::styled(prefix, Style::default().fg(c(th().fg)))];
                     spans.extend(line.spans);
                     out.push(Line::from(spans));
                 }
@@ -673,7 +636,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
             out
         }
         MdBlock::Quote { content, .. } => {
-            let bar = Span::styled("│ ", Style::default().fg(NORD3));
+            let bar = Span::styled("│ ", Style::default().fg(c(th().fg_faint)));
             let inner = md_hover_lines(content, width.saturating_sub(2));
             inner
                 .into_iter()
@@ -687,7 +650,7 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
         MdBlock::Rule { .. } => {
             vec![Line::from(Span::styled(
                 "─".repeat(width),
-                Style::default().fg(NORD3),
+                Style::default().fg(c(th().fg_faint)),
             ))]
         }
         // The remaining kinds only occur in document (reading-view) parses; hover content never
@@ -705,25 +668,33 @@ fn md_block_lines(block: &MdBlock, width: usize) -> Vec<Line<'static>> {
                             .collect::<String>()
                     })
                     .collect();
-                Line::from(Span::styled(cells.join(" | "), Style::default().fg(NORD4)))
+                Line::from(Span::styled(
+                    cells.join(" | "),
+                    Style::default().fg(c(th().fg)),
+                ))
             })
             .collect(),
         MdBlock::Image { alt, .. } => vec![Line::from(Span::styled(
             format!("[image: {alt}]"),
-            Style::default().fg(NORD3),
+            Style::default().fg(c(th().fg_faint)),
         ))],
         MdBlock::FrontMatter { .. } => Vec::new(),
         MdBlock::FootnoteDef { label, content, .. } => {
             let mut lines = vec![Line::from(Span::styled(
                 format!("[{label}]:"),
-                Style::default().fg(NORD3),
+                Style::default().fg(c(th().fg_faint)),
             ))];
             lines.extend(md_hover_lines(content, width));
             lines
         }
         MdBlock::Html { raw, .. } => raw
             .split('\n')
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(NORD3))))
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(c(th().fg_faint)),
+                ))
+            })
             .collect(),
     }
 }
@@ -740,7 +711,7 @@ fn md_collect_segs(inlines: &[MdInline], base: Style, out: &mut Vec<(String, Sty
         match inl {
             MdInline::Text { text } => out.push((text.clone(), base)),
             MdInline::Code { text } => {
-                out.push((text.clone(), base.fg(NORD8).bg(MD_CODE_BG)));
+                out.push((text.clone(), base.fg(c(th().accent)).bg(c(th().md_code_bg))));
             }
             MdInline::Strong { content } => {
                 md_collect_segs(content, base.add_modifier(Modifier::BOLD), out);
@@ -753,16 +724,19 @@ fn md_collect_segs(inlines: &[MdInline], base: Style, out: &mut Vec<(String, Sty
                 // (frost blue + underline) but not clickable.
                 md_collect_segs(
                     content,
-                    base.fg(NORD9).add_modifier(Modifier::UNDERLINED),
+                    base.fg(c(th().accent_alt))
+                        .add_modifier(Modifier::UNDERLINED),
                     out,
                 );
             }
             MdInline::Strikethrough { content } => {
                 md_collect_segs(content, base.add_modifier(Modifier::CROSSED_OUT), out);
             }
-            MdInline::Image { alt, .. } => out.push((format!("[{alt}]"), base.fg(NORD3))),
+            MdInline::Image { alt, .. } => {
+                out.push((format!("[{alt}]"), base.fg(c(th().fg_faint))))
+            }
             MdInline::FootnoteRef { label, .. } => {
-                out.push((format!("[{label}]"), base.fg(NORD3)));
+                out.push((format!("[{label}]"), base.fg(c(th().fg_faint))));
             }
             // Segment flow has no line-break primitive; a hard break degrades to a space in
             // hover popovers (the reading view renders breaks properly).
@@ -917,7 +891,8 @@ fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, v
 /// The one TUI scrollbar renderer: a 1-column track in the leftmost column of `area`, with a
 /// thumb sized `visible/total` of the height and positioned at `offset/total`. Geometry comes
 /// from [`aether_client::scrollbar::thumb`] (shared with the other shells); the glyphs/colours
-/// (`█` thumb NORD8, `│` track NORD3) are the TUI's house style, shared by the editor pane,
+/// (a bolder `┃` thumb in the dim foreground over a faint `│` track) are the TUI's house style,
+/// shared by the editor pane,
 /// pickers, and overlays. Draws nothing when the content fits (no [`thumb`] result).
 ///
 /// Inputs are `u64` so the editor can pass full visual-row counts on very large files without
@@ -945,8 +920,8 @@ fn render_scrollbar(f: &mut Frame, area: Rect, offset: u64, total: u64, visible:
     // glyphs are centred in the cell, so the thumb reads as a denser stretch of one thin line
     // rather than a block punched out of it — and the thumb is a grey, not an accent, matching
     // the iced editor's theme-grey scrollbar.
-    let thumb_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
-    let track_style = Style::default().fg(NORD2).bg(NORD0);
+    let thumb_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
+    let track_style = Style::default().fg(c(th().bg_selection)).bg(c(th().bg));
     for i in 0..track_h {
         let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
         let glyph = if in_thumb { "┃" } else { "│" };
@@ -995,14 +970,14 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::WorkspaceSettingsS
         return;
     }
     let heading_style = Style::default()
-        .fg(NORD6)
-        .bg(NORD0)
+        .fg(c(th().fg_bright))
+        .bg(c(th().bg))
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default()
-        .fg(NORD4)
-        .bg(NORD0)
+        .fg(c(th().fg))
+        .bg(c(th().bg))
         .add_modifier(Modifier::BOLD);
-    let value_style = Style::default().fg(NORD4).bg(NORD0);
+    let value_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     let area_w = area.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(6);
     if area.height >= 1 {
@@ -1031,7 +1006,7 @@ fn draw_settings_header(f: &mut Frame, settings: &crate::app::WorkspaceSettingsS
         lines.push(Line::from(Span::styled("Workspace roots:", label_style)));
     }
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(NORD4).bg(NORD0)),
+        Paragraph::new(lines).style(Style::default().fg(c(th().fg)).bg(c(th().bg))),
         area,
     );
 }
@@ -1106,7 +1081,7 @@ fn draw_settings_rows(
         return;
     }
     use crate::app::SettingsRowView;
-    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let base_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     let total_items = settings.rows.len();
     let max = (area.height as usize).max(1);
     // `selected` is dialog-global (0 = name field, drawn in the header). Scroll on the *display*
@@ -1117,8 +1092,8 @@ fn draw_settings_rows(
         .min(total_items.saturating_sub(max));
     let area_w = area.width as usize;
     let placeholder_style = Style::default()
-        .fg(NORD3)
-        .bg(NORD0)
+        .fg(c(th().fg_faint))
+        .bg(c(th().bg))
         .add_modifier(Modifier::ITALIC);
     let mut lines: Vec<Line> = Vec::new();
     for row in settings.rows.iter().skip(start).take(max) {
@@ -1131,7 +1106,10 @@ fn draw_settings_rows(
             let (text, style) = if text.is_empty() {
                 (placeholder.to_string(), placeholder_style)
             } else {
-                (text.to_string(), Style::default().fg(NORD4).bg(NORD0))
+                (
+                    text.to_string(),
+                    Style::default().fg(c(th().fg)).bg(c(th().bg)),
+                )
             };
             Line::from(vec![
                 Span::styled(" ", base_style),
@@ -1146,7 +1124,7 @@ fn draw_settings_rows(
                 let dot_w = if status.is_some() { 2 } else { 0 };
                 let truncated = truncate_middle(root, text_budget.saturating_sub(dot_w));
                 let bg = picker_row_bg(highlighted);
-                let path_style = Style::default().fg(NORD4).bg(bg);
+                let path_style = Style::default().fg(c(th().fg)).bg(bg);
                 let mut spans = vec![leading, Span::styled(truncated, path_style)];
                 if let Some(kind) = status {
                     spans.push(Span::styled(" ".to_string(), path_style));
@@ -1167,8 +1145,8 @@ fn draw_settings_rows(
                 lines.push(Line::from(Span::styled(
                     truncate_right(label, area_w),
                     Style::default()
-                        .fg(NORD4)
-                        .bg(NORD0)
+                        .fg(c(th().fg))
+                        .bg(c(th().bg))
                         .add_modifier(Modifier::BOLD),
                 )));
             }
@@ -1182,8 +1160,8 @@ fn draw_settings_rows(
                 // broken — the reason, in red. The tag is reserved first so the path truncates
                 // around it rather than pushing it off the edge.
                 let (tag, tag_fg) = match error {
-                    Some(e) => (e.clone(), NORD11),
-                    None => (language.clone(), NORD3),
+                    Some(e) => (e.clone(), c(th().error)),
+                    None => (language.clone(), c(th().fg_faint)),
                 };
                 let tag = truncate_right(&tag, text_budget.saturating_sub(4).min(40));
                 let tag_w = tag.chars().count();
@@ -1192,7 +1170,7 @@ fn draw_settings_rows(
                 let bg = picker_row_bg(highlighted);
                 lines.push(Line::from(vec![
                     leading,
-                    Span::styled(truncated, Style::default().fg(NORD4).bg(bg)),
+                    Span::styled(truncated, Style::default().fg(c(th().fg)).bg(bg)),
                     Span::styled(" ".to_string(), Style::default().bg(bg)),
                     Span::styled(tag, Style::default().fg(tag_fg).bg(bg)),
                 ]));
@@ -1231,15 +1209,15 @@ fn project_editor_line<'a>(
         ]);
     }
     let mut spans = vec![Span::styled(" ", base_style)];
-    let text_style = Style::default().fg(NORD4).bg(NORD0);
+    let text_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     // Same ghost tone as the chip editor's suggestion text.
-    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    let ghost_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
     if ed.multi_root {
         // While the root segment is focused it shows the typed filter plus its inline completion;
         // otherwise the settled root label.
         if ed.on_root {
             let style = if ed.root_invalid {
-                text_style.fg(NORD11)
+                text_style.fg(c(th().error))
             } else {
                 text_style
             };
@@ -1251,14 +1229,14 @@ fn project_editor_line<'a>(
             // The committed-prefix blue the dir chip editor and status bar use for a settled root.
             spans.push(Span::styled(
                 ed.root_display.clone(),
-                Style::default().fg(NORD8).bg(NORD0),
+                Style::default().fg(c(th().accent)).bg(c(th().bg)),
             ));
         }
         spans.push(Span::styled(": ", ghost_style));
     }
     {
         let style = if ed.path_invalid {
-            text_style.fg(NORD11)
+            text_style.fg(c(th().error))
         } else {
             text_style
         };
@@ -1277,9 +1255,9 @@ fn project_editor_line<'a>(
     if ed.on_language || !ed.language_input.text.is_empty() {
         spans.push(Span::styled(SEGMENT_GAP, ghost_style));
         let style = if ed.language_invalid {
-            text_style.fg(NORD11)
+            text_style.fg(c(th().error))
         } else {
-            text_style.fg(NORD8)
+            text_style.fg(c(th().accent))
         };
         if ed.language_input.text.is_empty() {
             spans.push(Span::styled("language…".to_string(), placeholder_style));
@@ -1462,13 +1440,17 @@ fn root_buffer_status(state: &AppState, root: &str) -> Option<BufferStatusKind> 
 
 /// Empty no-workspace view: a centered hint telling the user how to open the workspace picker.
 /// Drawn instead of the buffer pane when `state.editor` is `None`. Fills the full pane in the
-/// editor's NORD0 background so the no-workspace state visually matches an open editor instead of
+/// editor background so the no-workspace state visually matches an open editor instead of
 /// falling through to the terminal's default colors.
-/// The backdrop behind the Workspaces chooser before any workspace is selected: a bare NORD0 fill,
+/// The backdrop behind the Workspaces chooser before any workspace is selected: a bare
+/// editor-background fill,
 /// matching the native client's boot view. The chooser is the only UI here — dismissing it exits
 /// the app (the shell sets `should_quit`), so this is only ever a momentary flash.
 fn draw_no_workspace_view(f: &mut Frame, _state: &AppState, area: Rect) {
-    f.render_widget(Paragraph::new("").style(Style::default().bg(NORD0)), area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(c(th().bg))),
+        area,
+    );
 }
 
 // ---- picker overlay ----------------------------------------------------------------------------
@@ -1825,15 +1807,16 @@ pub fn picker_scroll_step(
 }
 
 /// Shared frame for the floating overlays (picker, the two settings modals, LSP detail, hover):
-/// rounded corners + a dim NORD3 border over a NORD0 fill, mirroring the rounded "card" the native
+/// rounded corners + the overlay-border grey over the editor background, mirroring the rounded
+/// "card" the native
 /// and web clients draw. Callers that tint the border (the hover popup keys it to diagnostic
 /// severity) chain `.border_style(...)` afterwards to override the default.
 fn overlay_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(OVERLAY_BORDER_FG))
-        .style(Style::default().bg(NORD0).fg(NORD4))
+        .border_style(Style::default().fg(c(th().overlay_border)))
+        .style(Style::default().bg(c(th().bg)).fg(c(th().fg)))
 }
 
 /// The picker overlay's on-screen geometry. [`draw_picker_overlay`] paints from it and
@@ -2005,7 +1988,7 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
     let text_w = area.width.saturating_sub(2).max(1); // reserve the scrollbar column + a gap
     let busy = matches!(detail.status, LspStatus::Ready) && !detail.progress.is_empty();
     let dot_color = if busy {
-        NORD13
+        c(th().warning)
     } else {
         lsp_status_color(&detail.status)
     };
@@ -2014,20 +1997,26 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
             Span::styled("• ".to_string(), Style::default().fg(dot_color)),
             Span::styled(
                 detail.name.clone(),
-                Style::default().fg(NORD4).add_modifier(Modifier::BOLD),
+                Style::default().fg(c(th().fg)).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
     ];
     let w = text_w as usize;
-    push_detail_row(&mut lines, "Language", &detail.language, NORD4, w);
-    push_detail_row(&mut lines, "Workspace", &detail.workspace_root, NORD4, w);
+    push_detail_row(&mut lines, "Language", &detail.language, c(th().fg), w);
+    push_detail_row(
+        &mut lines,
+        "Workspace",
+        &detail.workspace_root,
+        c(th().fg),
+        w,
+    );
     if let LspStatus::Crashed { code, message } = &detail.status {
         let mut msg = message.clone();
         if let Some(c) = code {
             msg.push_str(&format!(" (exit code {c})"));
         }
-        push_detail_row(&mut lines, "Error", &msg, NORD11, w);
+        push_detail_row(&mut lines, "Error", &msg, c(th().error), w);
     }
     for (i, p) in detail.progress.iter().enumerate() {
         let mut text = p.title.clone();
@@ -2042,7 +2031,7 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
             &mut lines,
             if i == 0 { "Working" } else { "" },
             &text,
-            NORD13,
+            c(th().warning),
             w,
         );
     }
@@ -2056,7 +2045,7 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
     };
     f.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(NORD0).fg(NORD4))
+            .style(Style::default().bg(c(th().bg)).fg(c(th().fg)))
             .scroll((offset, 0)),
         text_area,
     );
@@ -2092,7 +2081,9 @@ fn draw_app_info_overlay(f: &mut Frame, info: &crate::app::AppInfoView, area: Re
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "Aether".to_string(),
-            Style::default().fg(NORD6).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(c(th().fg_bright))
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
@@ -2102,14 +2093,14 @@ fn draw_app_info_overlay(f: &mut Frame, info: &crate::app::AppInfoView, area: Re
         }
         lines.push(Line::from(Span::styled(
             section.title.to_string(),
-            Style::default().fg(NORD8),
+            Style::default().fg(c(th().accent)),
         )));
         for row in &section.rows {
             // Yellow is the drift warning — the one row here that means something is wrong rather
             // than merely being a fact about the install.
             let color = match row.tone {
-                aether_client::app_info::InfoTone::Warn => NORD13,
-                aether_client::app_info::InfoTone::Normal => NORD4,
+                aether_client::app_info::InfoTone::Warn => c(th().warning),
+                aether_client::app_info::InfoTone::Normal => c(th().fg),
             };
             push_detail_row(&mut lines, row.label, &row.value, color, text_w);
         }
@@ -2124,7 +2115,7 @@ fn draw_app_info_overlay(f: &mut Frame, info: &crate::app::AppInfoView, area: Re
     };
     f.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(NORD0).fg(NORD4))
+            .style(Style::default().bg(c(th().bg)).fg(c(th().fg)))
             .scroll((offset, 0)),
         text_area,
     );
@@ -2154,7 +2145,10 @@ fn push_detail_row(
     for (i, wrapped) in wrap_words(value, val_w).into_iter().enumerate() {
         let lbl = if i == 0 { label } else { "" };
         lines.push(Line::from(vec![
-            Span::styled(format!("{lbl:<KEY_W$}"), Style::default().fg(NORD3)),
+            Span::styled(
+                format!("{lbl:<KEY_W$}"),
+                Style::default().fg(c(th().fg_faint)),
+            ),
             Span::styled(wrapped, Style::default().fg(color)),
         ]));
     }
@@ -2182,16 +2176,16 @@ fn pad_horizontal(area: Rect) -> Rect {
 /// prompt (glob/dir editor) is open it replaces the whole row. If the row is too narrow to
 /// hold the counts, they get dropped first so the query stays visible.
 fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
-    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let base_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     let placeholder_style = Style::default()
-        .fg(NORD3)
-        .bg(NORD0)
+        .fg(c(th().fg_faint))
+        .bg(c(th().bg))
         .add_modifier(Modifier::ITALIC);
     // Both the root label and the relative-path portion are *committed* parts of the prefix —
     // colour them the same blue so the contrast in the row reads as "committed prefix" (blue)
     // vs "editable query" (default fg). Mirrored in the save-as prompt renderer.
-    let label_style = Style::default().fg(NORD8).bg(NORD0);
-    let path_style = Style::default().fg(NORD8).bg(NORD0);
+    let label_style = Style::default().fg(c(th().accent)).bg(c(th().bg));
+    let path_style = Style::default().fg(c(th().accent)).bg(c(th().bg));
 
     let total_width = area.width as usize;
     let (label_text, path_text) = explorer_input_prefix(state, total_width);
@@ -2207,7 +2201,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    let ghost_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
 
     let (left_text, left_style, left_w) = if state.picker.query.is_empty() {
         // Suppress the placeholder when the explorer prefix, a chip row, or a completion ghost is
@@ -2283,12 +2277,12 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
     let Some(ed) = state.picker.chip_editor.as_ref() else {
         return (Vec::new(), 0);
     };
-    let label_style = Style::default().fg(NORD8).bg(NORD0);
-    let text_style = Style::default().fg(NORD4).bg(NORD0);
-    let ghost_style = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+    let label_style = Style::default().fg(c(th().accent)).bg(c(th().bg));
+    let text_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
+    let ghost_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
     // An invalid segment (root matching no label / path that doesn't exist) renders red — the
     // visible form of "the commit gate will refuse this".
-    let invalid_style = Style::default().fg(NORD11).bg(NORD0);
+    let invalid_style = Style::default().fg(c(th().error)).bg(c(th().bg));
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut w: usize = 0;
@@ -2367,7 +2361,7 @@ fn chip_editor_spans(state: &AppState) -> (Vec<Span<'static>>, u16) {
 
 /// Render the chip editor line (see [`chip_editor_spans`]).
 fn draw_chip_editor_row(f: &mut Frame, state: &AppState, area: Rect) {
-    let base_style = Style::default().fg(NORD4).bg(NORD0);
+    let base_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     let (spans, _) = chip_editor_spans(state);
     f.render_widget(Paragraph::new(Line::from(spans)).style(base_style), area);
 }
@@ -2385,7 +2379,7 @@ fn chip_budget(total_width: usize, prefix_w: usize) -> usize {
 /// a dim `…+N` marker — but never the selected chip, so chip-row navigation always shows what
 /// it's acting on.
 /// The search prompt's lead segment: the `/` (or `?`) prefix followed by the active match-option
-/// chips, styled like the grep picker's filter chips (NORD8 on NORD2; the whole-word chip
+/// chips, styled like the grep picker's filter chips (accent on the selection shade; the whole-word chip
 /// underlined). Returns the spans plus their total display width, so the caret placement can land
 /// just past them and the typed query.
 fn search_prompt_lead(search: &SearchState) -> (Vec<Span<'static>>, u16) {
@@ -2395,8 +2389,8 @@ fn search_prompt_lead(search: &SearchState) -> (Vec<Span<'static>>, u16) {
     if !search.option_chips.is_empty() {
         spans.push(Span::raw(" "));
         width += 1;
-        let chip_style = Style::default().fg(NORD8).bg(NORD2);
-        let selected_style = Style::default().fg(NORD0).bg(NORD8);
+        let chip_style = Style::default().fg(c(th().accent)).bg(c(th().bg_selection));
+        let selected_style = Style::default().fg(c(th().fg_on_accent)).bg(c(th().accent));
         for (i, (label, underline)) in search.option_chips.iter().enumerate() {
             let mut style = if search.chip_selected == Some(i) {
                 selected_style
@@ -2442,12 +2436,12 @@ fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usi
         start += 1;
     }
 
-    let chip_style = Style::default().fg(NORD8).bg(NORD2);
-    let chip_exclude_style = Style::default().fg(NORD11).bg(NORD2);
-    let chip_selected_style = Style::default().fg(NORD0).bg(NORD8);
-    let chip_selected_exclude_style = Style::default().fg(NORD0).bg(NORD11);
-    let gap_style = Style::default().fg(NORD4).bg(NORD0);
-    let marker_style = Style::default().fg(NORD3).bg(NORD0);
+    let chip_style = Style::default().fg(c(th().accent)).bg(c(th().bg_selection));
+    let chip_exclude_style = Style::default().fg(c(th().error)).bg(c(th().bg_selection));
+    let chip_selected_style = Style::default().fg(c(th().fg_on_accent)).bg(c(th().accent));
+    let chip_selected_exclude_style = Style::default().fg(c(th().fg_on_accent)).bg(c(th().error));
+    let gap_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
+    let marker_style = Style::default().fg(c(th().fg_faint)).bg(c(th().bg));
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut total = 0usize;
@@ -2570,13 +2564,13 @@ fn draw_picker_separator(f: &mut Frame, box_area: Rect, area: Rect) {
     }
     let line: String = "─".repeat(area.width as usize);
     // Match the frame: the rule and its `├`/`┤` tees are part of the overlay border, so they share
-    // `overlay_block`'s `OVERLAY_BORDER_FG`.
+    // `overlay_block`'s overlay-border role.
     f.render_widget(
-        Paragraph::new(line).style(Style::default().fg(OVERLAY_BORDER_FG).bg(NORD0)),
+        Paragraph::new(line).style(Style::default().fg(c(th().overlay_border)).bg(c(th().bg))),
         area,
     );
     let buf = f.buffer_mut();
-    let style = Style::default().fg(OVERLAY_BORDER_FG).bg(NORD0);
+    let style = Style::default().fg(c(th().overlay_border)).bg(c(th().bg));
     let left_x = box_area.x;
     let right_x = box_area.x + box_area.width.saturating_sub(1);
     if area.y >= buf.area.y && area.y < buf.area.y + buf.area.height {
@@ -2595,8 +2589,8 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         f.render_widget(
             Paragraph::new(msg).style(
                 Style::default()
-                    .bg(NORD0)
-                    .fg(NORD3)
+                    .bg(c(th().bg))
+                    .fg(c(th().fg_faint))
                     .add_modifier(Modifier::ITALIC),
             ),
             area,
@@ -2647,7 +2641,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     };
     for row in &rows[top..end] {
         let i = match row {
-            // Inter-group gap: an empty line — the Paragraph's NORD0 background fills the row.
+            // Inter-group gap: an empty line — the Paragraph's page background fills the row.
             PickerRow::Gap => {
                 lines.push(Line::default());
                 continue;
@@ -2668,8 +2662,8 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                 let prefix = format!("Delete {} \"", pending.noun);
                 const SUFFIX: &str = "\"? [y/N]";
                 let warn_style = Style::default()
-                    .fg(NORD11)
-                    .bg(NORD0)
+                    .fg(c(th().error))
+                    .bg(c(th().bg))
                     .add_modifier(Modifier::BOLD);
                 let name_budget =
                     (text_width as usize).saturating_sub(prefix.width() + SUFFIX.width());
@@ -2695,7 +2689,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         );
         if indent {
             let style = if highlighted {
-                Style::default().bg(NORD2)
+                Style::default().bg(c(th().bg_selection))
             } else {
                 Style::default()
             };
@@ -2716,7 +2710,10 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             let used: usize = spans.iter().map(|s| s.content.width()).sum();
             let pad = (text_width as usize).saturating_sub(used);
             if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), Style::default().bg(NORD2)));
+                spans.push(Span::styled(
+                    " ".repeat(pad),
+                    Style::default().bg(c(th().bg_selection)),
+                ));
             }
         }
         lines.push(Line::from(spans));
@@ -2749,7 +2746,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
         }
     }
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        Paragraph::new(lines).style(Style::default().bg(c(th().bg)).fg(c(th().fg))),
         text_area,
     );
 
@@ -3034,8 +3031,10 @@ fn picker_item_spans(
     }
 
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
 
     // A workspace row's display label is computed (an ephemeral context becomes "(workspace N)"), so
     // it's owned here to outlive the borrow taken in the match below.
@@ -3066,7 +3065,7 @@ fn picker_item_spans(
                 },
                 // Frost-blue dot when the workspace has unsaved buffers, matching the unsaved
                 // buffer-dot colour; nothing when clean.
-                (*unsaved_buffers > 0).then_some(NORD9),
+                (*unsaved_buffers > 0).then_some(c(th().state_unsaved)),
                 ephemeral,
                 false,
             )
@@ -3096,7 +3095,7 @@ fn picker_item_spans(
     // Dormant rows lose their foreground brightness (keeping the highlight bg), reading as "present
     // but not loaded" — the terminal analogue of the GUI's greyed text.
     let (base, match_style) = if dim {
-        (base.fg(NORD3), match_style.fg(NORD3))
+        (base.fg(c(th().fg_faint)), match_style.fg(c(th().fg_faint)))
     } else {
         (base, match_style)
     };
@@ -3155,16 +3154,17 @@ fn picker_item_spans(
 /// Buffer-state dot colour for a picker row, matching the editor status bar / web favicon.
 /// `None` for a clean buffer (no dot).
 fn buffer_dirty_dot_color(status: BufferDirtyState) -> Option<Color> {
+    let t = th();
     match status {
         BufferDirtyState::Clean => None,
-        BufferDirtyState::Unsaved => Some(NORD9), // frost blue — unsaved edits
-        BufferDirtyState::ExternallyModified => Some(NORD12), // aurora orange — changed on disk
-        BufferDirtyState::ExternallyDeleted => Some(NORD11), // aurora red — gone on disk
+        BufferDirtyState::Unsaved => Some(c(t.state_unsaved)),
+        BufferDirtyState::ExternallyModified => Some(c(t.state_changed)),
+        BufferDirtyState::ExternallyDeleted => Some(c(t.state_deleted)),
     }
 }
 
 /// Header row above each file's hits in the Grep picker: `{label}: {relative}` (the label only
-/// for multi-root workspaces), all in NORD8 (frost blue), bold. Non-selectable; the picker cursor
+/// for multi-root workspaces), all in the accent, bold. Non-selectable; the picker cursor
 /// lives on the GrepHit rows below.
 fn grep_file_header_spans(
     path_index: u32,
@@ -3173,8 +3173,8 @@ fn grep_file_header_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let style = Style::default()
-        .fg(NORD8)
-        .bg(NORD0)
+        .fg(c(th().accent))
+        .bg(c(th().bg))
         .add_modifier(Modifier::BOLD);
     let label = root_label_or_blank(root_labels, path_index);
     let combined = if label.is_empty() {
@@ -3187,8 +3187,8 @@ fn grep_file_header_spans(
 }
 
 /// A collapsible group's header row (docs/picker-groups.md) — a real, selectable row, unlike
-/// the derived headers above: `▸/▾` disclosure mark + the header text in the same NORD8 bold
-/// chrome, the run's item count right-aligned dim, and the NORD2 selection band when
+/// the derived headers above: `▸/▾` disclosure mark + the header text in the same accent bold
+/// chrome, the run's item count right-aligned dim, and the selection band when
 /// highlighted like any other row.
 fn group_row_spans(
     header: &GroupHeader,
@@ -3199,10 +3199,10 @@ fn group_row_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    // NORD8 alone carries the header chrome — no bold: with the run's items indented under
+    // The accent alone carries the header chrome — no bold: with the run's items indented under
     // the header (docs/picker-groups.md §9.2) the hierarchy already reads, and the derived
     // (non-collapsible) section headers keep their bold as the visual tell for "not a row".
-    let style = Style::default().fg(NORD8).bg(bg);
+    let style = Style::default().fg(c(th().accent)).bg(bg);
     let count_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
     // The mark reads as part of the header chrome; ambiguous-width glyph, so the budget below
     // keeps ≥1 spare col (the same allowance the buffer-status dot makes).
@@ -3240,40 +3240,37 @@ fn group_row_spans(
 /// bold header chrome as [`grep_file_header_spans`] but a label rather than a file path.
 fn section_header_spans(label: &str, max_width: usize) -> Vec<Span<'static>> {
     let style = Style::default()
-        .fg(NORD8)
-        .bg(NORD0)
+        .fg(c(th().accent))
+        .bg(c(th().bg))
         .add_modifier(Modifier::BOLD);
     vec![Span::styled(truncate_right(label, max_width), style)]
 }
 
 /// Dim foreground for secondary text on a picker row (root labels, line numbers, locations,
-/// metadata tails). NORD3 is a neighbouring Polar Night shade to the NORD2 selection background
-/// and all but vanishes on it, so the highlighted row brightens its dim spans to NORD4 — the
+/// metadata tails). The faint shade neighbours the selection background (adjacent Polar Night
+/// shades in dark) and all but vanishes on it, so the highlighted row brightens its dim spans
+/// to the full foreground — the
 /// same treatment the web client gives `.picker-row.selected` metadata.
 fn picker_dim_fg(highlighted: bool) -> Color {
-    if highlighted {
-        NORD4
-    } else {
-        NORD3
-    }
+    c(if highlighted { th().fg } else { th().fg_faint })
 }
 
-/// Background for a picker result row: the `NORD2` selection band when highlighted, else the panel
-/// fill. The panel fill is `NORD0` — the same as the editor, so overlays stay flat rather than
+/// Background for a picker result row: the selection band when highlighted, else the panel
+/// fill. The panel fill is the editor background — the same as the editor, so overlays stay flat rather than
 /// elevated (the rounded frame + separator set the picker off instead of a raised background; see
 /// [`overlay_block`]). Centralises the choice that was copy-pasted across every row builder; if the
 /// overlays ever gain elevation, this `else` branch is the single place the rows would change.
 fn picker_row_bg(highlighted: bool) -> Color {
-    if highlighted {
-        NORD2
+    c(if highlighted {
+        th().bg_selection
     } else {
-        NORD0
-    }
+        th().bg
+    })
 }
 
 /// File picker row: `{relative}  {label}` — the relative path styled like other picker items
 /// (fuzzy-match highlight included), then for multi-root workspaces the root's label in a dim
-/// foreground (NORD3) after it. The label is plain text — match indices in the protocol always
+/// foreground (the faint shade) after it. The label is plain text — match indices in the protocol always
 /// index into `relative_path` only.
 fn file_item_spans(
     path_index: u32,
@@ -3285,8 +3282,10 @@ fn file_item_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let label_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
     let label = root_label_or_blank(root_labels, path_index);
     let suffix = if label.is_empty() {
@@ -3324,8 +3323,10 @@ fn buffer_item_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let mut base = Style::default().fg(NORD4).bg(bg);
-    let mut match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let mut base = Style::default().fg(c(th().fg)).bg(bg);
+    let mut match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     if transient {
         base = base.add_modifier(Modifier::ITALIC);
         match_style = match_style.add_modifier(Modifier::ITALIC);
@@ -3387,7 +3388,7 @@ fn buffer_item_spans(
 /// Root row in the Explorer's Roots mode. Renders the disambiguated label as a single span;
 /// match indices from the server index into the root's *basename* — which is always the start
 /// of the label under option-B disambiguation — so we can apply them directly to the label
-/// string. Selected row gets the standard NORD2 background, like other pickers.
+/// string. Selected row gets the standard selection background, like other pickers.
 fn root_item_spans(
     path_index: u32,
     match_indices: &[u32],
@@ -3396,8 +3397,10 @@ fn root_item_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let label = root_label_or_blank(root_labels, path_index).to_string();
     let (display, indices) = truncate_path_with_indices(&label, match_indices, max_width);
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -3463,8 +3466,10 @@ fn preview_row_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let dim_style = base.fg(picker_dim_fg(highlighted));
     let gap = 2; // minimum gap between the preview and the line number
 
@@ -3538,12 +3543,22 @@ fn git_change_row_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
     let dim_style = base.fg(picker_dim_fg(highlighted));
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     // Count colours follow the gutter: bright green/red for unstaged, the dimmed shades for staged.
-    let added_style = base.fg(stage_color(stage, NORD14, GIT_STAGED_ADDED));
-    let removed_style = base.fg(stage_color(stage, NORD11, GIT_STAGED_DELETED));
+    let added_style = base.fg(stage_color(
+        stage,
+        c(th().git_added),
+        c(th().git_staged_added),
+    ));
+    let removed_style = base.fg(stage_color(
+        stage,
+        c(th().git_deleted),
+        c(th().git_staged_deleted),
+    ));
     let gap = 2; // minimum gap between the preview and the summary
 
     // The summary: `-R` then `+A` (additions flush right, diffstat-style), omitting a zero side
@@ -3633,7 +3648,9 @@ fn diagnostic_item_spans(
     // The message itself is colored by severity (matching the squiggle/popup); fuzzy matches stay
     // the bright accent so they remain visible. The range trails in gray parentheses.
     let base = Style::default().fg(diag_color(severity)).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let line_suffix = format!(" ({})", diag_range_label(range));
     // Leading severity icon, matching the status-bar count.
     let icon = format!("{} ", diag_glyph(severity));
@@ -3728,8 +3745,10 @@ fn reference_item_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let dim_style = base.fg(picker_dim_fg(highlighted));
     let gap = 2; // minimum gap between the preview and the location
 
@@ -3816,8 +3835,10 @@ fn symbol_item_spans(
         context,
     } = sym;
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let dim = base.fg(picker_dim_fg(highlighted));
     // A `context` row is an ancestor shown only for tree context while filtering — render the whole
     // row (name included) dim, so it reads as a non-selectable header above its matched descendants.
@@ -3908,8 +3929,10 @@ fn keybinding_item_spans(
 ) -> Vec<Span<'static>> {
     let KeybindingRow { desc, mode, keys } = row;
     let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let dim = base.fg(picker_dim_fg(highlighted));
 
     let seg = aether_client::picker::keybinding_match_segments(desc, mode, keys, match_indices);
@@ -3930,7 +3953,13 @@ fn keybinding_item_spans(
         " ".repeat(max_width.saturating_sub(used)),
         base,
     ));
-    push_styled_with_match_indices(&mut spans, keys, &seg.keys, base.fg(NORD8), match_style);
+    push_styled_with_match_indices(
+        &mut spans,
+        keys,
+        &seg.keys,
+        base.fg(c(th().accent)),
+        match_style,
+    );
     spans
 }
 
@@ -3964,12 +3993,14 @@ fn lsp_server_item_spans(
     // A ready server with active `$/progress` work shows the busy colour (same as the status bar).
     let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
     let dot_color = if busy {
-        NORD13
+        c(th().warning)
     } else {
         lsp_status_color(status)
     };
-    let base = Style::default().fg(NORD4).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     // Dim tail: `language · root`, the root only when the server isn't at the workspace root
     // (empty `root_label` → omitted, so single-root workspaces show just the language).
     let tail = if root_label.is_empty() {
@@ -4042,7 +4073,10 @@ fn lsp_server_item_spans(
         Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
     ));
     if !hint.is_empty() {
-        spans.push(Span::styled(hint, Style::default().fg(NORD13).bg(bg)));
+        spans.push(Span::styled(
+            hint,
+            Style::default().fg(c(th().warning)).bg(bg),
+        ));
     }
     spans
 }
@@ -4064,7 +4098,7 @@ fn lsp_progress_hint(progress: &[LspProgress]) -> String {
     s
 }
 
-/// One Explorer entry row: leaf name with a trailing `/` for directories, NORD8 (frost blue)
+/// One Explorer entry row: leaf name with a trailing `/` for directories, the accent
 /// for directories, fuzzy-match highlights overlaid the same way the Files picker does. The
 /// `/` suffix is appended *after* the name proper so `match_indices` (which index into the
 /// name) don't have to know about it.
@@ -4072,12 +4106,7 @@ fn lsp_progress_hint(progress: &[LspProgress]) -> String {
 /// removed/conflict. `None` for ignored (and clean) entries — they carry no bullet (ignored is
 /// dimmed via its text colour instead).
 fn git_status_bullet_color(s: GitStatus) -> Option<Color> {
-    match s {
-        GitStatus::Added | GitStatus::Untracked => Some(NORD14),
-        GitStatus::Modified => Some(NORD13),
-        GitStatus::Deleted | GitStatus::Conflicted => Some(NORD11),
-        GitStatus::Ignored => None,
-    }
+    th().git_status_bullet(s).map(c)
 }
 
 /// The leading status-indicator cell shared by explorer entries and file-picker rows: a coloured
@@ -4104,12 +4133,14 @@ fn dir_entry_spans(
     // Text colour keeps the frost-blue dir / snow-white file scheme; ignored entries dim to a
     // lighter gray (legible on both the normal and selected backgrounds).
     let fg = match git_status {
-        Some(GitStatus::Ignored) => NORD3_BRIGHT,
-        _ if is_dir => NORD8,
-        _ => NORD4,
+        Some(GitStatus::Ignored) => c(th().fg_dim),
+        _ if is_dir => c(th().accent),
+        _ => c(th().fg),
     };
     let base = Style::default().fg(fg).bg(bg);
-    let match_style = base.fg(NORD13).add_modifier(Modifier::BOLD);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
     let suffix = if is_dir { "/" } else { "" };
     // The bullet cell takes two columns off the budget; the rest is text + the `/` suffix.
     let text_budget = max_width.saturating_sub(2).saturating_sub(suffix.len());
@@ -4273,12 +4304,15 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
     };
     // Fill the whole area (margins included) with the editor's base background, so the reading
     // view sits on the same canvas as the buffer.
-    f.render_widget(Paragraph::new("").style(Style::default().bg(NORD0)), area);
+    f.render_widget(
+        Paragraph::new("").style(Style::default().bg(c(th().bg))),
+        area,
+    );
     if rv.rows.is_empty() {
         if rv.loading {
             let msg = Paragraph::new(Line::from(Span::styled(
                 "Loading…",
-                Style::default().fg(NORD3).bg(NORD0),
+                Style::default().fg(c(th().fg_faint)).bg(c(th().bg)),
             )));
             f.render_widget(msg, content);
         }
@@ -4303,7 +4337,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         // `bar_rows` is the focused block's whole subtree (nested items included).
         let row_focused = rv.bar_rows.is_some_and(|(a, b)| idx >= a && idx <= b);
         // An extended selection tints its blocks' rows with the editor's selection shade
-        // (docs/markdown-view.md §12): page-background cells swap to NORD2 at push time
+        // (docs/markdown-view.md §12): page-background cells swap to the selection shade at push time
         // (`finish_row`); spans with their own background — code panels, chips — keep it,
         // exactly like the table band. Blank separator rows inside the range stay on the page
         // background (only their gutter stub would tint) — per-block bands with clean gaps,
@@ -4318,8 +4352,8 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 spans
                     .into_iter()
                     .map(|mut s| {
-                        if s.style.bg.is_none() || s.style.bg == Some(NORD0) {
-                            s.style = s.style.bg(NORD2);
+                        if s.style.bg.is_none() || s.style.bg == Some(c(th().bg)) {
+                            s.style = s.style.bg(c(th().bg_selection));
                         }
                         s
                     })
@@ -4327,9 +4361,9 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             )
         };
         let mut spans: Vec<Span> = vec![if row_focused {
-            Span::styled("▎ ", Style::default().fg(NORD8).bg(NORD0))
+            Span::styled("▎ ", Style::default().fg(c(th().accent)).bg(c(th().bg)))
         } else {
-            Span::styled("  ", Style::default().bg(NORD0))
+            Span::styled("  ", Style::default().bg(c(th().bg)))
         }];
         // The language-tag row renders as a small "tab": panel background only under
         // ` json ` (the tag plus a space either side), the rest of the row on the page
@@ -4373,7 +4407,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 .unwrap_or(0) as usize;
             let window = (content.width as usize).saturating_sub(used + 2).max(1);
             let total: usize = code_part.iter().map(|s| s.text.width()).sum();
-            let indicator = Style::default().fg(NORD3_BRIGHT).bg(MD_CODE_BG);
+            let indicator = Style::default().fg(c(th().fg_dim)).bg(c(th().md_code_bg));
             spans.push(Span::styled(
                 if off > 0 && total > 0 { "…" } else { " " },
                 indicator,
@@ -4383,7 +4417,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             for rs in &clipped {
                 let style = match &rs.syntax {
                     // A fenced-code token: the editor's own tree-sitter theme, on the panel.
-                    Some(kind) => theme_for(kind).bg(MD_CODE_BG),
+                    Some(kind) => theme_for(kind).bg(c(th().md_code_bg)),
                     None => read_span_style(rs.style),
                 };
                 shown += rs.text.width();
@@ -4413,8 +4447,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             if let Some((thumb_x, thumb_w)) = bar {
                 let tx = (thumb_x.round() as usize).min(window.saturating_sub(1));
                 let tw = (thumb_w.round() as usize).max(1).min(window - tx);
-                let track = Style::default().fg(NORD2).bg(MD_CODE_BG);
-                let thumb = Style::default().fg(NORD3_BRIGHT).bg(MD_CODE_BG);
+                let track = Style::default()
+                    .fg(c(th().bg_selection))
+                    .bg(c(th().md_code_bg));
+                let thumb = Style::default().fg(c(th().fg_dim)).bg(c(th().md_code_bg));
                 spans.push(Span::styled("─".repeat(tx), track));
                 spans.push(Span::styled("━".repeat(tw), thumb));
                 spans.push(Span::styled("─".repeat(window - tx - tw), track));
@@ -4423,7 +4459,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 if fill > 0 {
                     spans.push(Span::styled(
                         " ".repeat(fill),
-                        Style::default().bg(MD_CODE_BG),
+                        Style::default().bg(c(th().md_code_bg)),
                     ));
                 }
             }
@@ -4466,7 +4502,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 avail
             };
-            let indicator = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+            let indicator = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
             if overflows {
                 spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
             }
@@ -4501,7 +4537,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                         .collect()
                 };
                 let base = read_span_style(clipped[0].style);
-                let thumb = Style::default().fg(NORD3_BRIGHT).bg(NORD0);
+                let thumb = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
                 spans.push(Span::styled(seg(0..tx), base));
                 spans.push(Span::styled(seg(tx..tx + tw).replace('─', "━"), thumb));
                 spans.push(Span::styled(seg(tx + tw..chars.len()), base));
@@ -4529,7 +4565,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             let shown: usize = clipped.iter().map(|s| s.text.width()).sum();
             let fill = window.saturating_sub(shown);
             if fill > 0 {
-                spans.push(Span::styled(" ".repeat(fill), Style::default().bg(NORD0)));
+                spans.push(Span::styled(
+                    " ".repeat(fill),
+                    Style::default().bg(c(th().bg)),
+                ));
             }
             if overflows {
                 spans.push(Span::styled(
@@ -4551,7 +4590,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         lines.push(finish_row(spans));
     }
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        Paragraph::new(lines).style(Style::default().bg(c(th().bg)).fg(c(th().fg))),
         content,
     );
     // The same scrollbar the editor pane draws, in the area's rightmost column (over the
@@ -4599,43 +4638,44 @@ fn read_table_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Col
 fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
     use aether_client::markdown::AlertKind;
     use aether_client::read_layout::SpanKind as K;
+    let t = th();
     let alert_color = |k: AlertKind| match k {
-        AlertKind::Note => NORD8,
-        AlertKind::Tip => NORD14,
-        AlertKind::Important => NORD15,
-        AlertKind::Warning => NORD13,
-        AlertKind::Caution => NORD11,
+        AlertKind::Note => t.info,
+        AlertKind::Tip => t.ok,
+        AlertKind::Important => t.md_alert_important,
+        AlertKind::Warning => t.warning,
+        AlertKind::Caution => t.error,
     };
     let mut st = match s.kind {
-        K::Text => Style::default().fg(NORD4),
-        // The heading colour ladder (shared with web/iced): frost blue for the majors, teal
-        // for H3, white for H4, and body-grey for H5/H6 — bold (from the span style) still
-        // sets the minor levels off from prose.
-        K::Heading(1 | 2) => Style::default().fg(NORD8),
-        K::Heading(3) => Style::default().fg(NORD7),
-        K::Heading(4) => Style::default().fg(NORD6),
-        K::Heading(_) => Style::default().fg(NORD4),
+        K::Text => Style::default().fg(c(t.fg)),
+        // The heading colour ladder (shared with web/iced): the title/function hue for the
+        // majors, the type hue (teal in dark) for H3, bright for H4, and body-grey for H5/H6 —
+        // bold (from the span style) still sets the minor levels off from prose.
+        K::Heading(1 | 2) => Style::default().fg(c(t.syn_function)),
+        K::Heading(3) => Style::default().fg(c(t.syn_type)),
+        K::Heading(4) => Style::default().fg(c(t.fg_bright)),
+        K::Heading(_) => Style::default().fg(c(t.fg)),
         // Inline code: body-coloured text on the panel shade (matches the web chip).
-        K::Code => Style::default().fg(NORD4).bg(MD_CODE_BG),
-        K::CodeBlock => Style::default().fg(NORD4).bg(MD_CODE_BG),
-        // The pinned language tag on the panel: the web tag's `--nord3-brighter`, over the
-        // panel background so the pad row reads as one solid strip.
-        K::CodeFrame => Style::default().fg(OVERLAY_BORDER_FG).bg(MD_CODE_BG),
-        K::Rule | K::TableBorder | K::TableDivider | K::Dim => Style::default().fg(NORD3),
-        // A completed task item reads as done without becoming chrome: the web's
-        // `li.md-task-done` tone, which is still legible prose rather than `Dim`'s border grey.
-        K::TaskDone => Style::default().fg(NORD3_BRIGHTER),
-        K::Link => Style::default().fg(NORD9),
+        K::Code => Style::default().fg(c(t.fg)).bg(c(t.md_code_bg)),
+        K::CodeBlock => Style::default().fg(c(t.fg)).bg(c(t.md_code_bg)),
+        // The pinned language tag on the panel: the overlay-border grey, over the panel
+        // background so the pad row reads as one solid strip.
+        K::CodeFrame => Style::default().fg(c(t.overlay_border)).bg(c(t.md_code_bg)),
+        K::Rule | K::TableBorder | K::TableDivider | K::Dim => Style::default().fg(c(t.fg_faint)),
+        // A completed task item reads as done without becoming chrome: the muted shade —
+        // still legible prose rather than `Dim`'s border grey.
+        K::TaskDone => Style::default().fg(c(t.fg_muted)),
+        K::Link => Style::default().fg(c(t.accent_alt)),
         // Bullets/numbers/checkboxes read as body text (uniform with the web/native markers).
-        K::Marker => Style::default().fg(NORD4),
-        K::QuoteBar(None) => Style::default().fg(NORD3),
-        K::QuoteBar(Some(k)) => Style::default().fg(alert_color(k)),
-        K::AlertLabel(k) => Style::default().fg(alert_color(k)),
-        // The header sets itself off with weight and colour alone (bold white over the body's
+        K::Marker => Style::default().fg(c(t.fg)),
+        K::QuoteBar(None) => Style::default().fg(c(t.fg_faint)),
+        K::QuoteBar(Some(k)) => Style::default().fg(c(alert_color(k))),
+        K::AlertLabel(k) => Style::default().fg(c(alert_color(k))),
+        // The header sets itself off with weight and colour alone (bold-bright over the body's
         // grey, plus the separator rule) — no band. Only the body stripe carries a background,
         // which the painter lifts onto the whole row interior (`read_table_band`).
-        K::TableHead => Style::default().fg(NORD6),
-        K::TableStripe => Style::default().fg(NORD4).bg(MD_TABLE_STRIPE_BG),
+        K::TableHead => Style::default().fg(c(t.fg_bright)),
+        K::TableStripe => Style::default().fg(c(t.fg)).bg(c(t.md_table_stripe_bg)),
     };
     if s.bold {
         st = st.add_modifier(Modifier::BOLD);
@@ -4738,7 +4778,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
             spans.insert(
                 0,
-                gutter_bar(stage_color(vrow.stage, NORD11, GIT_STAGED_DELETED)),
+                gutter_bar(stage_color(
+                    vrow.stage,
+                    c(th().git_deleted),
+                    c(th().git_staged_deleted),
+                )),
             );
             lines.push(Line::from(spans));
         }
@@ -4803,7 +4847,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if empty_newline_selected || eol_diag.is_some() {
                         let mut style = if empty_newline_selected {
-                            Style::default().bg(NORD10).fg(NORD3)
+                            Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
                         } else {
                             Style::default()
                         };
@@ -4907,7 +4951,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if is_continuation {
                 spans.push(Span::styled(
                     CONTINUATION_MARKER.to_string(),
-                    Style::default().fg(NORD3),
+                    Style::default().fg(c(th().fg_faint)),
                 ));
             }
             if indent > 0 {
@@ -4931,7 +4975,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 .flatten();
             if highlight_trailing_newline || eol_diag.is_some() {
                 let mut style = if highlight_trailing_newline {
-                    Style::default().bg(NORD10).fg(NORD3)
+                    Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
                 } else {
                     Style::default()
                 };
@@ -4966,7 +5010,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // Paint the whole buffer area with the Nord base style: spans without explicit fg/bg
     // inherit it, and any empty/short visual rows get the background filled too.
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(NORD0).fg(NORD4)),
+        Paragraph::new(lines).style(Style::default().bg(c(th().bg)).fg(c(th().fg))),
         area,
     );
 
@@ -5001,10 +5045,12 @@ fn deleted_virtual_row_spans(text: &str, width: u16, stage: DiffStage) -> Vec<Sp
     shown.push_str(&" ".repeat((width as usize).saturating_sub(used)));
     let style = if stage == DiffStage::Staged {
         Style::default()
-            .fg(GIT_STAGED_DELETED)
-            .bg(GIT_STAGED_DELETED_BG)
+            .fg(c(th().git_staged_deleted))
+            .bg(c(th().git_staged_deleted_bg))
     } else {
-        Style::default().fg(NORD11).bg(GIT_DELETED_BG)
+        Style::default()
+            .fg(c(th().git_deleted))
+            .bg(c(th().git_deleted_bg))
     };
     vec![Span::styled(shown, style)]
 }
@@ -5029,16 +5075,28 @@ fn stage_color(stage: DiffStage, bright: Color, dim: Color) -> Color {
 /// change is staged.
 fn git_gutter_cell(mark: Option<DiffMarker>, stage: DiffStage) -> Span<'static> {
     match mark {
-        Some(DiffMarker::Added) => gutter_bar(stage_color(stage, NORD14, GIT_STAGED_ADDED)),
-        Some(DiffMarker::Modified) => gutter_bar(stage_color(stage, NORD13, GIT_STAGED_MODIFIED)),
+        Some(DiffMarker::Added) => gutter_bar(stage_color(
+            stage,
+            c(th().git_added),
+            c(th().git_staged_added),
+        )),
+        Some(DiffMarker::Modified) => gutter_bar(stage_color(
+            stage,
+            c(th().git_modified),
+            c(th().git_staged_modified),
+        )),
         Some(DiffMarker::Deleted) => {
             // "removed above" top marker
             Span::styled(
                 "▔".to_string(),
-                Style::default().fg(stage_color(stage, NORD11, GIT_STAGED_DELETED)),
+                Style::default().fg(stage_color(
+                    stage,
+                    c(th().git_deleted),
+                    c(th().git_staged_deleted),
+                )),
             )
         }
-        None => Span::styled(" ".to_string(), Style::default().fg(NORD0)), // unchanged → blank
+        None => Span::styled(" ".to_string(), Style::default().fg(c(th().bg))), // unchanged → blank
     }
 }
 
@@ -5057,10 +5115,10 @@ fn prepend_gutter(
 fn diff_marker_bg(marker: DiffMarker, stage: DiffStage) -> Option<Color> {
     match (marker, stage) {
         (DiffMarker::Deleted, _) => None,
-        (DiffMarker::Added, DiffStage::Staged) => Some(GIT_STAGED_ADDED_BG),
-        (DiffMarker::Modified, DiffStage::Staged) => Some(GIT_STAGED_MODIFIED_BG),
-        (DiffMarker::Added, _) => Some(GIT_ADDED_BG),
-        (DiffMarker::Modified, _) => Some(GIT_MODIFIED_BG),
+        (DiffMarker::Added, DiffStage::Staged) => Some(c(th().git_staged_added_bg)),
+        (DiffMarker::Modified, DiffStage::Staged) => Some(c(th().git_staged_modified_bg)),
+        (DiffMarker::Added, _) => Some(c(th().git_added_bg)),
+        (DiffMarker::Modified, _) => Some(c(th().git_modified_bg)),
     }
 }
 
@@ -5069,11 +5127,11 @@ fn diff_marker_bg(marker: DiffMarker, stage: DiffStage) -> Option<Color> {
 /// change is staged, matching the tint scheme; otherwise the plain cursorline.
 fn cursor_line_bg(diff_marker: Option<DiffMarker>, stage: DiffStage) -> Color {
     match (diff_marker, stage) {
-        (Some(DiffMarker::Added), DiffStage::Staged) => CURSOR_LINE_STAGED_ADDED_BG,
-        (Some(DiffMarker::Modified), DiffStage::Staged) => CURSOR_LINE_STAGED_MODIFIED_BG,
-        (Some(DiffMarker::Added), _) => CURSOR_LINE_ADDED_BG,
-        (Some(DiffMarker::Modified), _) => CURSOR_LINE_MODIFIED_BG,
-        _ => CURSOR_LINE_BG,
+        (Some(DiffMarker::Added), DiffStage::Staged) => c(th().cursor_line_staged_added_bg),
+        (Some(DiffMarker::Modified), DiffStage::Staged) => c(th().cursor_line_staged_modified_bg),
+        (Some(DiffMarker::Added), _) => c(th().cursor_line_added_bg),
+        (Some(DiffMarker::Modified), _) => c(th().cursor_line_modified_bg),
+        _ => c(th().cursor_line_bg),
     }
 }
 
@@ -5102,7 +5160,9 @@ fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
     if let Some(text) = blame {
         spans.push(Span::styled(
             format!("    {text}"),
-            Style::default().fg(NORD3).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(c(th().fg_faint))
+                .add_modifier(Modifier::ITALIC),
         ));
     }
 }
@@ -5268,16 +5328,11 @@ fn diagnostics_on_visual_row(
         .collect()
 }
 
-/// The underline / message color for a diagnostic severity.
+/// The underline / message color for a diagnostic severity — the core's mapping
+/// ([`Theme::diagnostic`]): the error/warning/info hues, with Hint on the plain foreground
+/// (readable on the status/popover backgrounds and distinct from the coloured severities).
 fn diag_color(severity: DiagnosticSeverity) -> Color {
-    match severity {
-        DiagnosticSeverity::Error => NORD11,      // red
-        DiagnosticSeverity::Warning => NORD13,    // yellow
-        DiagnosticSeverity::Information => NORD8, // frost blue
-        // Near-white: readable on the status/popover backgrounds and distinct from the coloured
-        // severities (was NORD3 dim gray, which was hard to read).
-        DiagnosticSeverity::Hint => NORD4,
-    }
+    c(th().diagnostic(severity))
 }
 
 /// Severity glyph, shared by the status-bar count, the diagnostics picker, and the hover popover so
@@ -5474,47 +5529,47 @@ fn build_spans(
 
     let style_at = |byte_idx: usize| -> Style {
         let mut style = byte_kind[byte_idx].map(theme_for).unwrap_or_default();
-        // Match-bracket overlay: bold + NORD12 (Aurora orange). The only warm tone in our
-        // palette, so it reads as a distinct "this bracket pairs with the cursor" signal
-        // without colliding with the frost-blue accents used elsewhere. Painted before search
-        // and selection so those (which use bg) still win when stacked.
+        // Match-bracket overlay: bold + the match-bracket hue (Aurora orange in dark) — the
+        // only warm tone in the palette, so it reads as a distinct "this bracket pairs with the
+        // cursor" signal without colliding with the accents used elsewhere. Painted before
+        // search and selection so those (which use bg) still win when stacked.
         if byte_is_match_bracket[byte_idx] {
-            style = style.fg(NORD12).add_modifier(Modifier::BOLD);
+            style = style.fg(c(th().match_bracket)).add_modifier(Modifier::BOLD);
         }
-        // Search match: a quiet NORD3 fill behind the normal syntax text. NORD3 is the brightest of
-        // Nord's Polar Night shades, so it stays visible on the NORD1 current-line tint while still
-        // sitting clearly below the more saturated NORD10 selection, which paints over it.
+        // Search match: the quiet dim fill behind the normal syntax text — visible on the
+        // current-line tint while still sitting clearly below the more saturated visual
+        // selection, which paints over it.
         if byte_in_match[byte_idx] {
-            style = style.bg(NORD3);
-            // Comments are themed NORD3_BRIGHTER — only ~2:1 against the NORD3 fill — so a match
-            // inside one would be barely legible (a NORD3 fg would vanish outright). Lift just
-            // that text to the normal foreground; every other syntax color reads fine.
-            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHTER) {
-                style = style.fg(NORD4);
+            style = style.bg(c(th().fill_dim));
+            // Comments sit on the dimmest legible rung — only ~2:1 against the fill in dark —
+            // so a match inside one would be barely legible (faint text would vanish outright).
+            // Lift just that text to the normal foreground; every other syntax color reads fine.
+            if style.fg == Some(c(th().fg_faint)) || style.fg == Some(c(th().syn_comment)) {
+                style = style.fg(c(th().fg));
             }
         }
-        // Sneak candidate word: a quiet NORD3 tint marking the jump targets (the label cell itself
+        // Sneak candidate word: the quiet dim fill marking the jump targets (the label cell itself
         // is painted separately, below, in the char loop).
         if byte_in_sneak[byte_idx] {
-            style = style.bg(NORD3);
-            if style.fg == Some(NORD3) || style.fg == Some(NORD3_BRIGHTER) {
-                style = style.fg(NORD4);
+            style = style.bg(c(th().fill_dim));
+            if style.fg == Some(c(th().fg_faint)) || style.fg == Some(c(th().syn_comment)) {
+                style = style.fg(c(th().fg));
             }
         }
-        // Typed prefix: a brighter, cooler band (NORD3_BRIGHT) than the word tint — between it and
+        // Typed prefix: a brighter, cooler band (the sneak-prefix role) than the word tint — between it and
         // the bright label cell in prominence. The label cell is painted separately in the char loop.
         if byte_sneak_chip[byte_idx] {
-            style = style.bg(NORD3_BRIGHT);
-            if style.fg == Some(NORD3)
-                || style.fg == Some(NORD3_BRIGHT)
-                || style.fg == Some(NORD3_BRIGHTER)
+            style = style.bg(c(th().sneak_prefix_bg));
+            if style.fg == Some(c(th().fg_faint))
+                || style.fg == Some(c(th().fg_dim))
+                || style.fg == Some(c(th().syn_comment))
             {
-                style = style.fg(NORD4);
+                style = style.fg(c(th().fg));
             }
         }
         if let Some((s, e)) = sel {
             if byte_idx >= s as usize && byte_idx < e as usize {
-                style = style.bg(NORD10);
+                style = style.bg(c(th().bg_visual));
             }
         }
         // Diagnostic underline, colored by severity. Drawn last so it layers over selection/match
@@ -5544,7 +5599,7 @@ fn build_spans(
     // would visually collapse. Track `display_col` to size each tab to the next tab stop;
     // highlight/selection byte ranges still apply to the *original* byte positions so they
     // keep working untouched. Selected whitespace (tabs, trailing spaces) gets a muted
-    // indicator glyph (NORD3) overlaid on the selection bg — `→` for tabs, `·` for trailing
+    // indicator glyph (the faint shade) overlaid on the selection bg — `→` for tabs, `·` for trailing
     // spaces — so the user can see the structure of what they've selected.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current_text = String::new();
@@ -5561,9 +5616,10 @@ fn build_spans(
                 &mut current_text,
                 &mut current_style,
                 &lbl.to_string(),
+                // `self::` because the loop variable `c` (the char) shadows the colour helper.
                 Style::default()
-                    .fg(NORD0)
-                    .bg(NORD13)
+                    .fg(self::c(th().fg_on_accent))
+                    .bg(self::c(th().match_highlight))
                     .add_modifier(Modifier::BOLD),
             );
             continue;
@@ -5583,7 +5639,7 @@ fn build_spans(
                     &mut current_text,
                     &mut current_style,
                     "→",
-                    style.fg(NORD3),
+                    style.fg(self::c(th().fg_faint)),
                 );
                 if pad > 1 {
                     let pad_str = " ".repeat((pad - 1) as usize);
@@ -5611,7 +5667,7 @@ fn build_spans(
                 &mut current_text,
                 &mut current_style,
                 "·",
-                style.fg(NORD3),
+                style.fg(self::c(th().fg_faint)),
             );
         } else {
             let rendered = &truncated[byte_idx..byte_idx + c.len_utf8()];
@@ -5651,50 +5707,27 @@ fn push_text(
     current_text.push_str(text);
 }
 
-/// Map a tree-sitter highlight name to a `Style`. Falls back along dotted prefixes
-/// (e.g. `function.macro` → `function`) before defaulting.
+/// Map a tree-sitter highlight name to a `Style`, via the core theme's semantic table
+/// ([`Theme::syntax`]) — the dotted-prefix fallback (`function.macro` → `function`), the colour,
+/// and the bold/italic/underline attributes all live there; this just converts to ratatui.
 fn theme_for(kind: &str) -> Style {
-    let mut current = kind;
-    loop {
-        if let Some(style) = lookup_exact(current) {
-            return style;
-        }
-        match current.rfind('.') {
-            Some(idx) => current = &current[..idx],
-            None => return Style::default(),
-        }
+    let Some(sx) = th().syntax(kind) else {
+        return Style::default();
+    };
+    let mut st = Style::default();
+    if let Some(color) = sx.color {
+        st = st.fg(c(color));
     }
-}
-
-fn lookup_exact(name: &str) -> Option<Style> {
-    let s = Style::default();
-    Some(match name {
-        "keyword" => s.fg(NORD9),
-        "string" => s.fg(NORD14),
-        "string.escape" | "string.special" => s.fg(NORD13),
-        "comment" => s.fg(NORD3_BRIGHTER).add_modifier(Modifier::ITALIC),
-        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(NORD15),
-        "function" | "function.call" => s.fg(NORD8),
-        "function.macro" => s.fg(NORD12),
-        "type" | "type.builtin" | "module" | "namespace" | "constructor" => s.fg(NORD7),
-        "variable" => s,
-        "variable.parameter" => s.fg(NORD4),
-        "variable.builtin" => s.fg(NORD9),
-        "operator" => s.fg(NORD9),
-        "punctuation.bracket" | "punctuation.delimiter" => s.fg(NORD4),
-        "punctuation.special" => s.fg(NORD12),
-        "attribute" | "label" => s.fg(NORD12),
-        "tag" => s.fg(NORD9),
-        "property" => s.fg(NORD4),
-        // Markdown (tree-sitter-md uses these "text.*" capture names).
-        "text.title" => s.fg(NORD8).add_modifier(Modifier::BOLD),
-        "text.literal" => s.fg(NORD14),
-        "text.uri" => s.fg(NORD8).add_modifier(Modifier::UNDERLINED),
-        "text.reference" => s.fg(NORD8),
-        "text.emphasis" => s.add_modifier(Modifier::ITALIC),
-        "text.strong" => s.add_modifier(Modifier::BOLD),
-        _ => return None,
-    })
+    if sx.bold {
+        st = st.add_modifier(Modifier::BOLD);
+    }
+    if sx.italic {
+        st = st.add_modifier(Modifier::ITALIC);
+    }
+    if sx.underline {
+        st = st.add_modifier(Modifier::UNDERLINED);
+    }
+    st
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
@@ -5753,7 +5786,9 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         let status_dot = state.buffer_status().map(|kind| {
             Span::styled(
                 BUFFER_STATUS_DOT.to_string(),
-                Style::default().bg(NORD1).fg(buffer_status_color(kind)),
+                Style::default()
+                    .bg(c(th().bg_panel))
+                    .fg(buffer_status_color(kind)),
             )
         });
 
@@ -5764,7 +5799,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // Right segment, left→right: search/grep counters, diagnostic counts, the position /
         // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
         // each group so they don't run together.
-        let base = Style::default().bg(NORD1).fg(NORD4);
+        let base = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
         let mut right_spans: Vec<Span<'static>> = Vec::new();
         let gap = |spans: &mut Vec<Span<'static>>| {
             if !spans.is_empty() {
@@ -5827,7 +5862,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             area.width as usize,
         ))
     };
-    let p = Paragraph::new(line).style(Style::default().bg(NORD1).fg(NORD4));
+    let p = Paragraph::new(line).style(Style::default().bg(c(th().bg_panel)).fg(c(th().fg)));
     f.render_widget(p, area);
 }
 
@@ -5835,12 +5870,13 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 /// (info → frost blue, success → green, warning → yellow, error → red).
 fn toast_accent_color(kind: crate::app::StatusKind) -> Color {
     use crate::app::StatusKind;
-    match kind {
-        StatusKind::Info => NORD8,
-        StatusKind::Success => NORD14,
-        StatusKind::Warning => NORD13,
-        StatusKind::Error => NORD11,
-    }
+    let t = th();
+    c(match kind {
+        StatusKind::Info => t.info,
+        StatusKind::Success => t.ok,
+        StatusKind::Warning => t.warning,
+        StatusKind::Error => t.error,
+    })
 }
 
 /// Floating toasts stacked in the bottom-right of `area`: each is a fat status-coloured left bar
@@ -5877,7 +5913,9 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             height: 1,
         };
         f.render_widget(Clear, rect);
-        let tint = Style::default().bg(NORD2).fg(NORD6);
+        let tint = Style::default()
+            .bg(c(th().bg_selection))
+            .fg(c(th().fg_bright));
         let spans = vec![
             Span::styled(
                 " ".to_string(),
@@ -5915,8 +5953,8 @@ fn draw_open_path_prompt_spans(
     _total_width: usize,
 ) -> (Vec<Span<'static>>, u16) {
     const PREFIX: &str = " open: ";
-    let prefix_style = Style::default().bg(NORD1).fg(NORD8);
-    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    let prefix_style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent));
+    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
     let spans = vec![
         Span::styled(PREFIX, prefix_style),
         Span::styled(input.text.clone(), base_style),
@@ -5932,15 +5970,16 @@ fn draw_save_prompt_spans(
     _total_width: usize,
 ) -> (Vec<Span<'static>>, u16) {
     use crate::picker::ChipEditorField;
-    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
     // The chosen-root label / `:` separator share the explorer's committed-prefix blue.
-    let prefix_style = Style::default().bg(NORD1).fg(NORD8);
-    // Ghost / suggestion text. We can't use NORD3 — it's only ~17 brightness off NORD1 and reads
-    // as invisible on the status bar; nor the `DIM` modifier (some terminals ignore it for bright
-    // foregrounds). A mid-tone readable on NORD1 yet plainly dimmer than NORD4.
-    let ghost_style = Style::default().bg(NORD1).fg(Color::Rgb(140, 150, 165));
+    let prefix_style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent));
+    // Ghost / suggestion text (`ghost_text`). The faint shade won't do — it's only ~17
+    // brightness off the panel and reads as invisible on the status bar; nor the `DIM` modifier
+    // (some terminals ignore it for bright foregrounds). So the role is a mid-tone readable on
+    // the panel yet plainly dimmer than the body text — off-palette in both modes.
+    let ghost_style = Style::default().bg(c(th().bg_panel)).fg(c(th().ghost_text));
     // An invalid segment (root matching no label / path whose parent doesn't exist) renders red.
-    let invalid_style = Style::default().bg(NORD1).fg(NORD11);
+    let invalid_style = Style::default().bg(c(th().bg_panel)).fg(c(th().error));
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut w: usize = 0;
@@ -6010,16 +6049,17 @@ fn draw_save_prompt_spans(
 
 /// Style for a `StatusMessage` based on its kind: success → blue (matches the committed-prefix
 /// blue elsewhere in the UI), warning → yellow, error → red, info → default white. Background
-/// stays NORD1 to blend with the surrounding status bar.
+/// stays the panel shade to blend with the surrounding status bar.
 fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     use crate::app::StatusKind;
+    let t = th();
     let fg = match msg.kind {
-        StatusKind::Info => NORD4,
-        StatusKind::Success => NORD8,
-        StatusKind::Warning => NORD13,
-        StatusKind::Error => NORD11,
+        StatusKind::Info => t.fg,
+        StatusKind::Success => t.accent,
+        StatusKind::Warning => t.warning,
+        StatusKind::Error => t.error,
     };
-    Style::default().bg(NORD1).fg(fg)
+    Style::default().bg(c(t.bg_panel)).fg(c(fg))
 }
 
 /// The status row's leading label: an optional `[workspace] ` prefix, the file label, whether
@@ -6054,7 +6094,7 @@ fn build_editor_status_spans(
         transient,
         tethered,
     } = label;
-    let base_style = Style::default().bg(NORD1).fg(NORD4);
+    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
     // A transient (preview) buffer slants the file label (root + path — not the workspace name)
     // instead of spending row width on an explicit marker. Terminals without italic support
     // just show it upright.
@@ -6105,7 +6145,7 @@ fn build_editor_status_spans(
         if !tether_mark.is_empty() {
             spans.push(Span::styled(
                 tether_mark.to_string(),
-                base_style.fg(NORD3_BRIGHTER),
+                base_style.fg(c(th().fg_muted)),
             ));
         }
         used += workspace_prefix.width() + file_label.width() + tether_mark.width();
@@ -6145,11 +6185,12 @@ fn build_editor_status_spans(
 
 /// Accent colour for the buffer-state dot, matching the web client's favicon palette.
 fn buffer_status_color(kind: BufferStatusKind) -> Color {
-    match kind {
-        BufferStatusKind::ExternallyDeleted => NORD11, // aurora red — gone on disk
-        BufferStatusKind::ExternallyModified => NORD12, // aurora orange — changed on disk
-        BufferStatusKind::Unsaved => NORD9,            // frost blue — unsaved edits
-    }
+    let t = th();
+    c(match kind {
+        BufferStatusKind::ExternallyDeleted => t.state_deleted,
+        BufferStatusKind::ExternallyModified => t.state_changed,
+        BufferStatusKind::Unsaved => t.state_unsaved,
+    })
 }
 
 /// Git change counts for the current buffer as colored spans (`+N` added / `~N` modified / `-N`
@@ -6163,8 +6204,8 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
 /// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status`
 /// (server-computed).
 fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
-    let bg = Style::default().bg(NORD1);
-    let meta = bg.fg(NORD9); // branch / base: Frost blue — secondary, distinct from the nord4 path
+    let bg = Style::default().bg(c(th().bg_panel));
+    let meta = bg.fg(c(th().accent_alt)); // branch / base: the secondary accent, distinct from the body-text path
     let mut parts: Vec<Span<'static>> = Vec::new();
     let Some(ed) = state.editor.as_ref() else {
         return parts;
@@ -6177,14 +6218,24 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     }
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [
-        ('+', NORD14, status.unstaged.added, status.staged.added),
+        (
+            '+',
+            c(th().git_added),
+            status.unstaged.added,
+            status.staged.added,
+        ),
         (
             '~',
-            NORD13,
+            c(th().git_modified),
             status.unstaged.modified,
             status.staged.modified,
         ),
-        ('-', NORD11, status.unstaged.deleted, status.staged.deleted),
+        (
+            '-',
+            c(th().git_deleted),
+            status.unstaged.deleted,
+            status.staged.deleted,
+        ),
     ] {
         if unstaged == 0 && staged == 0 {
             continue;
@@ -6206,7 +6257,7 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
 /// `✗ 2`). Empty when the buffer has none. A space sits between each glyph and its count (the
 /// `✗`/`⚠` glyphs read wide), and the severity segments are separated by a space.
 fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
-    let bg = Style::default().bg(NORD1);
+    let bg = Style::default().bg(c(th().bg_panel));
     let mut parts: Vec<Span<'static>> = Vec::new();
     let Some(counts) = state
         .editor
@@ -6246,13 +6297,13 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     // A ready server doing background work (`$/progress` — indexing, `cargo check`) shows the
     // busy colour, so the bar reflects that diagnostics/results may still land.
     let color = if matches!(status.status, LspStatus::Ready) && !status.progress.is_empty() {
-        NORD13
+        c(th().warning)
     } else {
         lsp_status_color(&status.status)
     };
     Some(Span::styled(
         "•".to_string(),
-        Style::default().bg(NORD1).fg(color),
+        Style::default().bg(c(th().bg_panel)).fg(color),
     ))
 }
 
@@ -6260,12 +6311,7 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
 /// picker rows, and the detail title. The transitional states read as "busy" (the loop is
 /// event-driven, so the colour changes when a `lsp/status_changed` arrives rather than animating).
 fn lsp_status_color(status: &LspStatus) -> Color {
-    match status {
-        LspStatus::Ready => NORD14,
-        LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => NORD13,
-        LspStatus::Crashed { .. } => NORD11,
-        LspStatus::Stopped => NORD3,
-    }
+    c(th().lsp_status(status))
 }
 
 /// Truncate `s` so its display width is at most `max`, appending `…` when the input was longer.
@@ -7418,14 +7464,14 @@ mod tests {
             0,
             "code",
             Style::default()
-                .fg(NORD8)
+                .fg(c(th().accent))
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         );
         dim_backdrop(&mut buf, area);
         let cell = buf.cell((0, 0)).expect("cell present");
         assert_eq!(cell.symbol(), "c", "glyph is preserved");
-        assert_eq!(cell.fg, NORD3, "foreground muted to grey");
-        assert_eq!(cell.bg, NORD0, "background flattened to base");
+        assert_eq!(cell.fg, c(th().fg_faint), "foreground muted to grey");
+        assert_eq!(cell.bg, c(th().bg), "background flattened to base");
         // Emphasis is preserved — only the colour is flattened — so italic/bold text keeps reading
         // as italic/bold behind the dialog.
         assert!(
@@ -7552,7 +7598,7 @@ mod tests {
         let heading = &lines[0];
         assert_eq!(line_text(heading), "Title");
         assert!(heading.spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(heading.spans[0].style.fg, Some(NORD6));
+        assert_eq!(heading.spans[0].style.fg, Some(c(th().fg_bright)));
         // List bullets rendered.
         assert!(texts.iter().any(|t| t.starts_with("• one")));
         assert!(texts.iter().any(|t| t.starts_with("• two")));
@@ -7560,12 +7606,13 @@ mod tests {
         assert!(lines
             .iter()
             .flat_map(|l| &l.spans)
-            .any(|s| s.content.as_ref() == "inline" && s.style.bg == Some(MD_CODE_BG)));
+            .any(|s| s.content.as_ref() == "inline" && s.style.bg == Some(c(th().md_code_bg))));
         // Fenced code line gets the code background and is width-padded.
-        assert!(lines
+        assert!(lines.iter().any(|l| l
+            .spans
             .iter()
-            .any(|l| l.spans.iter().any(|s| s.style.bg == Some(MD_CODE_BG))
-                && line_text(l).starts_with("code")));
+            .any(|s| s.style.bg == Some(c(th().md_code_bg)))
+            && line_text(l).starts_with("code")));
     }
 
     #[test]
@@ -7590,10 +7637,13 @@ mod tests {
         // Plain (severity-less) diagnostic block → frost blue.
         assert_eq!(
             hover_border_color(&HoverBody::Blocks(vec![blk(None)])),
-            NORD8
+            c(th().accent)
         );
         // Markdown hover → frost blue.
-        assert_eq!(hover_border_color(&HoverBody::Markdown(vec![])), NORD8);
+        assert_eq!(
+            hover_border_color(&HoverBody::Markdown(vec![])),
+            c(th().accent)
+        );
         // Worst severity wins.
         assert_eq!(
             hover_border_color(&HoverBody::Blocks(vec![
@@ -7655,7 +7705,7 @@ mod tests {
         assert!(text.starts_with("  src/main.rs  beta")); // bullet cell, path, then the label
         let label = spans.last().expect("label span");
         assert_eq!(label.content.as_ref(), "  beta");
-        assert_eq!(label.style.fg, Some(NORD3));
+        assert_eq!(label.style.fg, Some(c(th().fg_faint)));
     }
 
     #[test]
@@ -7683,8 +7733,8 @@ mod tests {
         let text = spans_text(&spans);
         assert!(text.starts_with("• rust-analyzer"));
         assert!(text.ends_with("rust · backend"));
-        assert_eq!(spans[0].style.fg, Some(NORD14)); // ready → green dot
-                                                     // At the workspace root the tail is just the language — no separator.
+        assert_eq!(spans[0].style.fg, Some(c(th().ok))); // ready → green dot
+                                                         // At the workspace root the tail is just the language — no separator.
         let single = lsp_server_item_spans(
             LspServerRow {
                 name: "rust-analyzer",
@@ -7698,7 +7748,7 @@ mod tests {
             60,
         );
         assert!(spans_text(&single).ends_with("  rust"));
-        assert_eq!(single[0].style.fg, Some(NORD3)); // stopped → dim dot
+        assert_eq!(single[0].style.fg, Some(c(th().fg_faint))); // stopped → dim dot
     }
 
     // ---- collapsed picker box ----
@@ -7891,7 +7941,7 @@ mod tests {
         // The number is dim; the padding before it carries at least the 2-col gap.
         assert!(text.contains("let x = 1;  "));
         let num = spans.last().expect("line-number span");
-        assert_eq!(num.style.fg, Some(NORD3));
+        assert_eq!(num.style.fg, Some(c(th().fg_faint)));
     }
 
     #[test]
@@ -7907,7 +7957,7 @@ mod tests {
         );
         assert_eq!(spans_total_width(&spans), 40);
         let loc = spans.last().expect("location span");
-        assert_eq!(loc.style.fg, Some(NORD3), "the location is dim");
+        assert_eq!(loc.style.fg, Some(c(th().fg_faint)), "the location is dim");
     }
 
     #[test]
@@ -7967,7 +8017,7 @@ mod tests {
     fn symbol_context_row_renders_dim() {
         use aether_protocol::picker::SymbolKind;
         // A context (ancestor) row dims its name too — the name span is the dim fg, not the bright
-        // NORD4 a normal row uses.
+        // full body foreground a normal row uses.
         let ctx = symbol_item_spans(
             SymbolRow {
                 name: "Widget",
@@ -7999,28 +8049,29 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("Widget"))
             .unwrap();
-        assert_eq!(name.style.fg, Some(NORD4));
+        assert_eq!(name.style.fg, Some(c(th().fg)));
     }
 
     #[test]
     fn toast_accent_color_matches_kind() {
         use crate::app::StatusKind;
         // Matches the web/native toast border colours.
-        assert_eq!(toast_accent_color(StatusKind::Info), NORD8);
-        assert_eq!(toast_accent_color(StatusKind::Success), NORD14);
-        assert_eq!(toast_accent_color(StatusKind::Warning), NORD13);
-        assert_eq!(toast_accent_color(StatusKind::Error), NORD11);
+        assert_eq!(toast_accent_color(StatusKind::Info), c(th().info));
+        assert_eq!(toast_accent_color(StatusKind::Success), c(th().ok));
+        assert_eq!(toast_accent_color(StatusKind::Warning), c(th().warning));
+        assert_eq!(toast_accent_color(StatusKind::Error), c(th().error));
     }
 
     #[test]
     fn picker_dim_spans_brighten_on_highlighted_row() {
-        // NORD3 is illegible on the NORD2 selection background — highlighted rows lift their
-        // dim spans (here: the grep line number, the file row's root label) to NORD4.
+        // The faint shade is illegible on the selection background — highlighted rows lift
+        // their dim spans (here: the grep line number, the file row's root label) to the full
+        // foreground.
         let num = preview_row_spans(41, "let x = 1;", &[], true, 30);
-        assert_eq!(num.last().unwrap().style.fg, Some(NORD4));
+        assert_eq!(num.last().unwrap().style.fg, Some(c(th().fg)));
         let labels = vec!["alpha".to_string(), "beta".to_string()];
         let file = file_item_spans(1, "src/main.rs", &[], None, &labels, true, 40);
-        assert_eq!(file.last().unwrap().style.fg, Some(NORD4));
+        assert_eq!(file.last().unwrap().style.fg, Some(c(th().fg)));
     }
 
     #[test]
@@ -8042,7 +8093,7 @@ mod tests {
         assert!(text.starts_with("helper();"));
         let hl: String = spans
             .iter()
-            .filter(|s| s.style.fg == Some(NORD13))
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(hl, "hel");
@@ -8051,7 +8102,9 @@ mod tests {
     #[test]
     fn grep_hit_drops_matches_inside_stripped_whitespace() {
         let spans = preview_row_spans(0, "    x", &[1, 2], false, 40);
-        assert!(spans.iter().all(|s| s.style.fg != Some(NORD13)));
+        assert!(spans
+            .iter()
+            .all(|s| s.style.fg != Some(c(th().match_highlight))));
         assert!(spans_text(&spans).starts_with("x "));
     }
 
@@ -8074,7 +8127,7 @@ mod tests {
         );
         let hl: String = spans
             .iter()
-            .filter(|s| s.style.fg == Some(NORD13))
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(hl, "hel", "matches shift onto the same letters");
@@ -8136,18 +8189,18 @@ mod tests {
         assert_eq!(spans_total_width(&spans), 50);
         let hl: String = spans
             .iter()
-            .filter(|s| s.style.fg == Some(NORD13))
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(hl, "w", "keys-segment match styles the right char");
         let desc = spans.first().expect("desc span");
-        assert_eq!(desc.style.fg, Some(NORD4));
+        assert_eq!(desc.style.fg, Some(c(th().fg)));
         // The chord's unmatched chars are frost blue, matching the native client.
         let chord = spans
             .iter()
             .find(|s| s.content.contains("Ctrl-"))
             .expect("chord span");
-        assert_eq!(chord.style.fg, Some(NORD8));
+        assert_eq!(chord.style.fg, Some(c(th().accent)));
     }
 
     #[test]
@@ -8172,7 +8225,7 @@ mod tests {
         assert_eq!(spans_total_width(&spans), 50);
         let hl: String = spans
             .iter()
-            .filter(|s| s.style.fg == Some(NORD13))
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(hl, "w", "keys-segment match survives the mode prefix");
@@ -8283,7 +8336,7 @@ mod tests {
             .iter()
             .find(|s| s.content == " *")
             .expect("tether mark span");
-        assert_eq!(mark.style.fg, Some(NORD3_BRIGHTER));
+        assert_eq!(mark.style.fg, Some(c(th().fg_muted)));
         assert!(!mark.style.add_modifier.contains(Modifier::ITALIC));
 
         // Untethered: no mark.
@@ -8330,7 +8383,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains(BUFFER_STATUS_DOT))
             .expect("status dot span present");
-        assert_eq!(dot_span.style.fg, Some(NORD9));
+        assert_eq!(dot_span.style.fg, Some(c(th().state_unsaved)));
         assert_eq!(spans_total_width(&spans), 30);
     }
 
@@ -8360,7 +8413,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("saved (rev 1)"))
             .expect("status span present");
-        assert_eq!(status_span.style.fg, Some(NORD8));
+        assert_eq!(status_span.style.fg, Some(c(th().accent)));
     }
 
     #[test]
@@ -8393,7 +8446,11 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("Reconnecting"))
             .expect("indicator span present");
-        assert_eq!(span.style.fg, Some(NORD13), "reconnecting is yellow");
+        assert_eq!(
+            span.style.fg,
+            Some(c(th().warning)),
+            "reconnecting is yellow"
+        );
     }
 
     #[test]
@@ -8551,14 +8608,18 @@ mod tests {
         ));
         // Col 0: the label glyph, dark-on-yellow.
         assert_eq!(cells[0].0, 'j', "label glyph painted over the first cell");
-        assert_eq!(cells[0].2, Some(NORD13), "label on Aurora yellow");
+        assert_eq!(
+            cells[0].2,
+            Some(c(th().match_highlight)),
+            "label on Aurora yellow"
+        );
         // Col 1: the rest of the prefix — the typed char on the cooler band (not bold, not yellow).
         assert_eq!(cells[1].0, 'u', "prefix shows the typed char");
-        assert_eq!(cells[1].2, Some(NORD3_BRIGHT), "cooler band");
+        assert_eq!(cells[1].2, Some(c(th().sneak_prefix_bg)), "cooler band");
         assert!(!cells[1].3, "not bold");
-        // Col 2 onward: the candidate-word tint (NORD3).
+        // Col 2 onward: the candidate-word tint (the dim fill).
         assert_eq!(cells[2].0, 'n');
-        assert_eq!(cells[2].2, Some(NORD3));
+        assert_eq!(cells[2].2, Some(c(th().fill_dim)));
     }
 
     #[test]
@@ -8568,7 +8629,7 @@ mod tests {
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
                 assert!(underlined, "cell {col} underlined");
-                assert_eq!(color, Some(NORD13), "cell {col} warning-yellow");
+                assert_eq!(color, Some(c(th().warning)), "cell {col} warning-yellow");
             } else {
                 assert!(!underlined, "cell {col} not underlined");
             }
@@ -8583,23 +8644,27 @@ mod tests {
             (1u32, 2u32, DiagnosticSeverity::Error),
         ];
         let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, &[], 80));
-        assert_eq!(cells[1].1, Some(NORD11), "overlap shows error red");
-        assert_eq!(cells[0].1, Some(NORD4), "non-overlap keeps hint colour");
+        assert_eq!(cells[1].1, Some(c(th().error)), "overlap shows error red");
+        assert_eq!(
+            cells[0].1,
+            Some(c(th().fg)),
+            "non-overlap keeps hint colour"
+        );
     }
 
     #[test]
     fn lsp_status_color_maps_states() {
-        assert_eq!(lsp_status_color(&LspStatus::Ready), NORD14);
-        assert_eq!(lsp_status_color(&LspStatus::Initializing), NORD13);
-        assert_eq!(lsp_status_color(&LspStatus::Restarting), NORD13);
+        assert_eq!(lsp_status_color(&LspStatus::Ready), c(th().ok));
+        assert_eq!(lsp_status_color(&LspStatus::Initializing), c(th().warning));
+        assert_eq!(lsp_status_color(&LspStatus::Restarting), c(th().warning));
         assert_eq!(
             lsp_status_color(&LspStatus::Crashed {
                 code: None,
                 message: String::new()
             }),
-            NORD11
+            c(th().error)
         );
-        assert_eq!(lsp_status_color(&LspStatus::Stopped), NORD3);
+        assert_eq!(lsp_status_color(&LspStatus::Stopped), c(th().fg_faint));
     }
 
     #[test]
@@ -8629,31 +8694,59 @@ mod tests {
         // and crucially not the diff tint itself, so it reads as "cursor here AND changed".
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Added), Unstaged),
-            CURSOR_LINE_ADDED_BG
+            c(th().cursor_line_added_bg)
         );
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Modified), Unstaged),
-            CURSOR_LINE_MODIFIED_BG
+            c(th().cursor_line_modified_bg)
         );
         assert_ne!(
             cursor_line_bg(Some(DiffMarker::Added), Unstaged),
-            GIT_ADDED_BG
+            c(th().git_added_bg)
         );
         // A staged line keeps its dimmer identity under the cursor instead of flaring back up to
         // the unstaged brightness.
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Added), Staged),
-            CURSOR_LINE_STAGED_ADDED_BG
+            c(th().cursor_line_staged_added_bg)
         );
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Modified), Staged),
-            CURSOR_LINE_STAGED_MODIFIED_BG
+            c(th().cursor_line_staged_modified_bg)
         );
         // Deleted (no real-line tint) and unchanged lines fall back to the plain cursorline.
         assert_eq!(
             cursor_line_bg(Some(DiffMarker::Deleted), Unstaged),
-            CURSOR_LINE_BG
+            c(th().cursor_line_bg)
         );
-        assert_eq!(cursor_line_bg(None, Unstaged), CURSOR_LINE_BG);
+        assert_eq!(cursor_line_bg(None, Unstaged), c(th().cursor_line_bg));
+    }
+
+    // ---- theme ----
+
+    /// Role-based theming: at Dark (the thread default) the accessors resolve to the historic
+    /// constants — dark renders pixel-identical to the pre-theme TUI — while Light resolves the
+    /// same roles differently. Sets the mode explicitly on entry and restores Dark on exit so
+    /// the thread-local can't inherit or leak a mode when tests share a thread.
+    #[test]
+    fn theme_mode_flips_the_palette() {
+        set_theme_mode(ThemeMode::Dark);
+        assert_eq!(c(th().bg), Color::Rgb(46, 52, 64)); // NORD0
+        let dark_comment = theme_for("comment");
+        assert_eq!(dark_comment.fg, Some(Color::Rgb(123, 136, 161))); // NORD3_BRIGHTER
+        assert!(dark_comment.add_modifier.contains(Modifier::ITALIC));
+
+        set_theme_mode(ThemeMode::Light);
+        assert_eq!(
+            c(th().bg),
+            Color::Rgb(0xec, 0xef, 0xf4),
+            "light bg swaps to Snow Storm"
+        );
+        assert_ne!(theme_for("comment").fg, dark_comment.fg);
+        assert!(
+            theme_for("comment").add_modifier.contains(Modifier::ITALIC),
+            "attributes ride the mode flip"
+        );
+        set_theme_mode(ThemeMode::Dark);
     }
 }

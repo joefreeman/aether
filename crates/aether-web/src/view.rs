@@ -42,6 +42,9 @@ pub fn build_view(s: &Session) -> Value {
         "ligatures": s.ligatures,
         "buffer_font_size": s.buffer_font_size,
         "ui_font_size": s.ui_font_size,
+        // "dark" | "light" (ThemeMode's lowercase wire form): the shell stamps this onto
+        // `<html data-theme>` and theme.css switches its role variables on it.
+        "theme": jv(&s.theme),
         "diagnostics": jv(&s.diagnostics),
         "lsp": s.lsp.as_ref().map(jv),
         "externally_modified": s.externally_modified,

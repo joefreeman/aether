@@ -2515,7 +2515,14 @@ impl App {
         theme::Ui::new(self.session.ui_font_size)
     }
 
+    /// The resolved colour roles for the session's theme mode. Resolved once per view pass and
+    /// threaded alongside [`theme::Ui`]; `&'static`, so style closures capture it freely.
+    fn palette(&self) -> &'static theme::Palette {
+        theme::palette(self.session.theme)
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
+        let p = self.palette();
         // No workspace picked yet (the mandatory chooser, or the beat after a pick while the
         // activation is in flight): a plain backdrop with no editor chrome behind the overlays,
         // matching the TUI/web no-workspace views. The boot-*connecting* placeholder is the
@@ -2527,8 +2534,8 @@ impl App {
                 container(iced::widget::Space::new())
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(theme::NORD0.into()),
+                    .style(move |_| container::Style {
+                        background: Some(p.bg.into()),
                         ..container::Style::default()
                     })
                     .into()
@@ -2539,6 +2546,7 @@ impl App {
             } else {
                 let editor = editor::editor(
                     editor::Content {
+                        palette: p,
                         window: self.session.window.as_ref(),
                         cursor: self.session.buffer.cursor,
                         insert_mode: self.session.mode == Mode::Insert,
@@ -2568,15 +2576,16 @@ impl App {
         if self.hover.is_some() {
             layers.push(self.hover_overlay());
         }
-        if let Some(p) = &self.session.picker {
+        if let Some(picker) = &self.session.picker {
             layers.push(
                 Element::from(crate::picker::overlay(
-                    p,
+                    picker,
                     &self.session.workspace_paths,
                     self.session.tether,
                     self.picker_scroll_y,
                     self.spinner_phase,
                     self.ui(),
+                    p,
                 ))
                 .map(|m| match m {
                     PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
@@ -2628,26 +2637,22 @@ impl App {
     /// icon; it should read as ambient chrome, not a notification.
     fn hint_corner(&self, hint: aether_client::hints::HintView) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let (before, keys, after) = hint.parts();
-        let dim = |s: &'static str| {
-            text(s)
-                .size(ui.small())
-                .font(SANS)
-                .color(theme::NORD3_BRIGHT)
-        };
+        let dim = move |s: &'static str| text(s).size(ui.small()).font(SANS).color(p.fg_dim);
         let body = iced::widget::row![
             dim("Hint: "),
             dim(before),
             text(keys)
                 .size(ui.small())
                 .font(SANS_BOLD_UI)
-                .color(theme::NORD8),
+                .color(p.accent),
             dim(after),
         ];
         let chip = container(body)
             .padding([4, 10])
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 border: iced::Border {
                     radius: 5.0.into(),
                     ..iced::Border::default()
@@ -2670,11 +2675,13 @@ impl App {
     /// re-establishing failed terminally.
     fn conn_banner(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let (label, bg, fg) = match self.session.conn {
-            ConnState::Failed => ("Disconnected", theme::NORD11, theme::NORD6),
+            // Bright (not `fg_on_accent`) text on the error fill — dark drew NORD6 here.
+            ConnState::Failed => ("Disconnected", p.error, p.fg_bright),
             // Boot before the daemon is up — distinct copy from a mid-session blip.
-            ConnState::Connecting => ("Connecting…", theme::NORD13, theme::NORD0),
-            _ => ("Reconnecting…", theme::NORD13, theme::NORD0),
+            ConnState::Connecting => ("Connecting…", p.warning, p.fg_on_accent),
+            _ => ("Reconnecting…", p.warning, p.fg_on_accent),
         };
         let pill = container(text(label).size(ui.small()).font(SANS).color(fg))
             .padding([6, 14])
@@ -2716,6 +2723,7 @@ impl App {
     /// the whole tree is `Message`-typed rather than mapped at the end).
     fn workspace_settings_body(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let s = self.session.workspace_settings.as_ref().unwrap();
 
         // An editable field: a controlled `text_input` keyed to its core setter. Wrapped in a
@@ -2727,29 +2735,22 @@ impl App {
             |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
                 // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
                 // the text. Both states are the same widget now, so the box height is already consistent.
-                overlay_input(fieldkind, placeholder, value, ui)
+                overlay_input(fieldkind, placeholder, value, ui, p)
             };
 
         // A boxed, optionally-highlighted input/row container.
-        fn boxed_row<'a>(content: Element<'a, Message>, highlighted: bool) -> Element<'a, Message> {
+        fn boxed_row<'a>(
+            content: Element<'a, Message>,
+            highlighted: bool,
+            p: &'static theme::Palette,
+        ) -> Element<'a, Message> {
             container(content)
                 .padding([5, 8])
                 .width(Length::Fill)
                 .style(move |_| container::Style {
-                    background: Some(
-                        if highlighted {
-                            theme::NORD2
-                        } else {
-                            theme::NORD0
-                        }
-                        .into(),
-                    ),
+                    background: Some(if highlighted { p.bg_selection } else { p.bg }.into()),
                     border: iced::Border {
-                        color: if highlighted {
-                            theme::NORD8
-                        } else {
-                            theme::NORD3
-                        },
+                        color: if highlighted { p.accent } else { p.border_subtle },
                         width: 1.0,
                         radius: 4.0.into(),
                     },
@@ -2758,12 +2759,7 @@ impl App {
                 .into()
         }
 
-        let label = |t: &str| {
-            text(t.to_string())
-                .size(ui.small())
-                .font(SANS)
-                .color(theme::NORD3_BRIGHT)
-        };
+        let label = move |t: &str| text(t.to_string()).size(ui.small()).font(SANS).color(p.fg_dim);
 
         // A label tucked tight above its field (~3px), so each label+field reads as one group
         // while the column's `spacing(8)` keeps groups apart.
@@ -2772,6 +2768,7 @@ impl App {
             boxed_row(
                 field(OverlayField::WorkspaceName, &s.name.text, ""),
                 s.on_name(),
+                p,
             ),
         ]
         .spacing(3);
@@ -2780,7 +2777,7 @@ impl App {
             text("Workspace settings")
                 .size(ui.heading())
                 .font(SANS_BOLD_UI)
-                .color(theme::NORD6),
+                .color(p.fg_bright),
             name_group,
         ]
         .spacing(8);
@@ -2793,15 +2790,19 @@ impl App {
                 text("(no roots — add one below)")
                     .size(ui.small())
                     .font(SANS)
-                    .color(theme::NORD3_BRIGHT),
+                    .color(p.fg_dim),
             );
         }
         // A bulleted row: `• <content> …`, indented one bullet-gap from the label (web parity).
         // No row box — selection tints only the path text (see below).
-        fn bulleted<'a>(inner: Element<'a, Message>, ui: theme::Ui) -> Element<'a, Message> {
+        fn bulleted<'a>(
+            inner: Element<'a, Message>,
+            ui: theme::Ui,
+            p: &'static theme::Palette,
+        ) -> Element<'a, Message> {
             container(
                 row![
-                    text("•").size(ui.body()).font(SANS).color(theme::NORD6),
+                    text("•").size(ui.body()).font(SANS).color(p.fg_bright),
                     inner
                 ]
                 .align_y(iced::Alignment::Center)
@@ -2819,18 +2820,18 @@ impl App {
         for (i, root) in s.roots.iter().enumerate() {
             let highlighted = s.row() == SettingsRow::Root(i);
             let delete =
-                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
+                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(p.fg_bright))
                     .padding([2, 8])
-                    .style(|_, status| iced::widget::button::Style {
+                    .style(move |_, status| iced::widget::button::Style {
                         background: Some(
                             if matches!(status, iced::widget::button::Status::Hovered) {
-                                theme::NORD11
+                                p.error
                             } else {
-                                theme::NORD3
+                                p.fill_dim
                             }
                             .into(),
                         ),
-                        text_color: theme::NORD6,
+                        text_color: p.fg_bright,
                         border: iced::Border {
                             radius: 4.0.into(),
                             ..iced::Border::default()
@@ -2854,10 +2855,10 @@ impl App {
                 text(root.clone())
                     .size(ui.body())
                     .font(SANS)
-                    .color(theme::NORD6),
+                    .color(p.fg_bright),
             )
             .style(move |_| container::Style {
-                background: highlighted.then(|| theme::NORD2.into()),
+                background: highlighted.then(|| p.bg_selection.into()),
                 border: iced::Border {
                     radius: 3.0.into(),
                     ..iced::Border::default()
@@ -2867,7 +2868,7 @@ impl App {
             let inner = row![path, iced::widget::Space::new().width(Length::Fill), delete,]
                 .align_y(iced::Alignment::Center)
                 .spacing(6);
-            roots_col = roots_col.push(bulleted(inner.into(), ui));
+            roots_col = roots_col.push(bulleted(inner.into(), ui, p));
         }
 
         // The always-present add-root input row — a borderless input after its bullet, so the caret
@@ -2886,6 +2887,7 @@ impl App {
                 add_root_placeholder,
             ),
             ui,
+            p,
         ));
         col = col.push(roots_col);
 
@@ -2897,18 +2899,18 @@ impl App {
         for (i, project) in s.projects.iter().enumerate() {
             let highlighted = s.row() == SettingsRow::Project(i);
             let delete =
-                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(theme::NORD6))
+                iced::widget::button(text("✕").size(ui.small()).font(SANS).color(p.fg_bright))
                     .padding([2, 8])
-                    .style(|_, status| iced::widget::button::Style {
+                    .style(move |_, status| iced::widget::button::Style {
                         background: Some(
                             if matches!(status, iced::widget::button::Status::Hovered) {
-                                theme::NORD11
+                                p.error
                             } else {
-                                theme::NORD3
+                                p.fill_dim
                             }
                             .into(),
                         ),
-                        text_color: theme::NORD6,
+                        text_color: p.fg_bright,
                         border: iced::Border {
                             radius: 4.0.into(),
                             ..iced::Border::default()
@@ -2932,10 +2934,10 @@ impl App {
                 ))
                 .size(ui.body())
                 .font(SANS)
-                .color(theme::NORD6),
+                .color(p.fg_bright),
             )
             .style(move |_| container::Style {
-                background: highlighted.then(|| theme::NORD2.into()),
+                background: highlighted.then(|| p.bg_selection.into()),
                 border: iced::Border {
                     radius: 3.0.into(),
                     ..iced::Border::default()
@@ -2943,8 +2945,8 @@ impl App {
                 ..container::Style::default()
             });
             let (tag_text, tag_color) = match &project.error {
-                Some(e) => (e.clone(), theme::NORD11),
-                None => (project.language.clone(), theme::NORD3_BRIGHT),
+                Some(e) => (e.clone(), p.error),
+                None => (project.language.clone(), p.fg_dim),
             };
             let tag = text(tag_text).size(ui.small()).font(SANS).color(tag_color);
             let inner = row![
@@ -2955,7 +2957,7 @@ impl App {
             ]
             .align_y(iced::Alignment::Center)
             .spacing(6);
-            projects_col = projects_col.push(bulleted(inner.into(), ui));
+            projects_col = projects_col.push(bulleted(inner.into(), ui, p));
         }
         // The add-project row is the save-as path editor, rendered the same way while it has focus:
         // the root segment shows its inline typeahead ghost, the path segment its completion ghost.
@@ -2974,7 +2976,7 @@ impl App {
             text("Add project...")
                 .size(ui.body())
                 .font(SANS)
-                .color(theme::NORD3_BRIGHT)
+                .color(p.fg_dim)
                 .into()
         } else {
             let mut project_row = row![].align_y(iced::Alignment::Center);
@@ -2995,6 +2997,7 @@ impl App {
                         true,
                         Boundary::ConfirmRoot,
                         ui,
+                        p,
                     ));
                 } else {
                     let display = if invalid {
@@ -3005,17 +3008,13 @@ impl App {
                             .cloned()
                             .unwrap_or_default()
                     };
-                    let color = if invalid { theme::NORD11 } else { theme::NORD8 };
+                    let color = if invalid { p.error } else { p.accent };
                     root_group =
                         root_group.push(text(display).size(ui.body()).font(SANS).color(color));
                     // Only the settled label needs its separator pushed; the focused segment draws
                     // its own (flush against the text — see `field_with_ghost`'s `trailing`).
-                    root_group = root_group.push(
-                        text(":")
-                            .size(ui.body())
-                            .font(SANS)
-                            .color(theme::NORD3_BRIGHT),
-                    );
+                    root_group =
+                        root_group.push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
                 }
                 project_row = project_row.push(root_group).spacing(6);
             }
@@ -3027,11 +3026,7 @@ impl App {
                     text(ed.input.text.clone())
                         .size(ui.body())
                         .font(SANS)
-                        .color(if ed.path_invalid() {
-                            theme::NORD11
-                        } else {
-                            theme::NORD6
-                        }),
+                        .color(if ed.path_invalid() { p.error } else { p.fg_bright }),
                 );
             } else {
                 // Placeholder is always empty here: the ghost layer behind the input is what shows
@@ -3051,6 +3046,7 @@ impl App {
                         Boundary::None
                     },
                     ui,
+                    p,
                 ));
             }
             // The optional language override, right-aligned like the language tags on the project
@@ -3080,17 +3076,14 @@ impl App {
                         true,
                         Boundary::None,
                         ui,
+                        p,
                     ));
                 } else {
                     project_row = project_row.push(
                         text(s.add_project_language.text.clone())
                             .size(ui.body())
                             .font(SANS)
-                            .color(if s.language_invalid() {
-                                theme::NORD11
-                            } else {
-                                theme::NORD3_BRIGHT
-                            }),
+                            .color(if s.language_invalid() { p.error } else { p.fg_dim }),
                     );
                 }
             }
@@ -3108,7 +3101,7 @@ impl App {
                 _ => Message::Noop,
             })
         };
-        projects_col = projects_col.push(bulleted(project_row, ui));
+        projects_col = projects_col.push(bulleted(project_row, ui, p));
         col = col.push(projects_col);
 
         if let Some(err) = &s.error {
@@ -3116,7 +3109,7 @@ impl App {
                 text(err.clone())
                     .size(ui.small())
                     .font(SANS)
-                    .color(theme::NORD11),
+                    .color(p.error),
             );
         }
 
@@ -3125,10 +3118,10 @@ impl App {
         let boxed = container(col.spacing(8))
             .width(ui.at(640.0))
             .padding(16)
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 border: iced::Border {
-                    color: theme::NORD3,
+                    color: p.border_subtle,
                     width: 1.0,
                     radius: 6.0.into(),
                 },
@@ -3163,13 +3156,14 @@ impl App {
     /// workspace-settings modal box + dimmed backdrop.
     fn app_settings_overlay(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let s = self.session.app_settings.as_ref().unwrap();
         let groups = self.session.app_setting_groups();
 
         let mut col = column![text("Application settings")
             .size(ui.heading())
             .font(SANS_BOLD_UI)
-            .color(theme::NORD6)]
+            .color(p.fg_bright)]
         .spacing(14);
 
         // Running flat row index across groups (the index `AppSettingToggle` / `selected` use).
@@ -3178,7 +3172,7 @@ impl App {
             let mut gcol = column![text(group.title.to_string())
                 .size(ui.small())
                 .font(SANS_BOLD_UI)
-                .color(theme::NORD8)]
+                .color(p.accent)]
             .spacing(10);
             for r in &group.rows {
                 let i = flat;
@@ -3201,21 +3195,21 @@ impl App {
                             text(v.to_string())
                                 .size(ui.body())
                                 .font(SANS)
-                                .color(theme::NORD6),
+                                .color(p.fg_bright),
                         )
                         .padding([2, 8])
-                        .style(|_, status| iced::widget::button::Style {
+                        .style(move |_, status| iced::widget::button::Style {
                             background: Some(
                                 if matches!(status, iced::widget::button::Status::Hovered) {
-                                    theme::NORD3
+                                    p.fill_dim
                                 } else {
-                                    theme::NORD2
+                                    p.bg_selection
                                 }
                                 .into(),
                             ),
-                            text_color: theme::NORD6,
+                            text_color: p.fg_bright,
                             border: iced::Border {
-                                color: theme::NORD3,
+                                color: p.border_subtle,
                                 width: 1.0,
                                 radius: 4.0.into(),
                             },
@@ -3231,7 +3225,7 @@ impl App {
                     .style(move |_| container::Style {
                         border: iced::Border {
                             color: if focused {
-                                theme::NORD8
+                                p.accent
                             } else {
                                 iced::Color::TRANSPARENT
                             },
@@ -3246,7 +3240,7 @@ impl App {
                         text(r.label.to_string())
                             .size(ui.body())
                             .font(SANS)
-                            .color(theme::NORD6),
+                            .color(p.fg_bright),
                         iced::widget::Space::new().width(Length::Fill),
                         check,
                     ]
@@ -3255,7 +3249,7 @@ impl App {
                     text(r.hint.to_string())
                         .size(ui.small())
                         .font(SANS)
-                        .color(theme::NORD3_BRIGHT),
+                        .color(p.fg_dim),
                 ]
                 .spacing(2);
                 gcol = gcol.push(field);
@@ -3266,10 +3260,10 @@ impl App {
         let boxed = container(col.spacing(14))
             .width(ui.at(420.0))
             .padding(16)
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 border: iced::Border {
-                    color: theme::NORD3,
+                    color: p.border_subtle,
                     width: 1.0,
                     radius: 6.0.into(),
                 },
@@ -3298,6 +3292,7 @@ impl App {
     /// `#searchbar` (query + beam cursor, match count on the right).
     fn search_bar(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         // The query input is a controlled `text_input` (web parity): its value is the core's
         // search query, edits sync via `search_set_query`, and Enter/Up/Down/Esc bubble to
         // `on_key` (commit / history nav / cancel) since `on_submit` is unset. With option chips
@@ -3312,13 +3307,13 @@ impl App {
                 .size(ui.body())
                 .padding(0)
                 .width(Length::Fill)
-                .style(|_theme, _status| iced::widget::text_input::Style {
+                .style(move |_theme, _status| iced::widget::text_input::Style {
                     background: iced::Background::Color(iced::Color::TRANSPARENT),
                     border: iced::Border::default(),
-                    icon: theme::NORD6,
-                    placeholder: theme::NORD3_BRIGHT,
-                    value: theme::NORD6,
-                    selection: theme::NORD8,
+                    icon: p.fg_bright,
+                    placeholder: p.fg_dim,
+                    value: p.fg_bright,
+                    selection: p.accent,
                 });
             let intercept = !chips.is_empty() && self.session.search.chip_selected.is_none();
             let wrapped = if intercept {
@@ -3356,7 +3351,7 @@ impl App {
         let selected = self.session.search.chip_selected;
         let mut chips_row = row![].spacing(4).align_y(iced::Alignment::Center);
         for (i, chip) in chips.iter().enumerate() {
-            chips_row = chips_row.push(option_chip(chip, selected == Some(i), ui));
+            chips_row = chips_row.push(option_chip(chip, selected == Some(i), ui, p));
         }
         if !chips.is_empty() {
             chips_row = chips_row.push(iced::widget::Space::new().width(6));
@@ -3367,15 +3362,15 @@ impl App {
             .align_y(iced::Alignment::Center);
         bar = bar.push(iced::widget::Space::new().width(Length::Fill));
         if let Some(count) = self.search_count_label() {
-            bar = bar.push(text(count).size(ui.body()).font(SANS).color(theme::NORD4));
+            bar = bar.push(text(count).size(ui.body()).font(SANS).color(p.fg));
         }
         let prompt = container(bar)
             .width(ui.at(420.0))
             .padding([5, 10])
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 border: iced::Border {
-                    color: theme::NORD3,
+                    color: p.border_subtle,
                     width: 1.0,
                     radius: 6.0.into(),
                 },
@@ -3408,6 +3403,7 @@ impl App {
     /// from the question-shaped prompts.
     fn prompt_overlay(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let prompt = self.session.prompt.as_ref().unwrap();
         // The save-as arm embeds a controlled `text_input` (which produces `Message`), so the
         // whole body is built in `Message` space: the Clone-only buttons map their `PromptMsg`
@@ -3433,14 +3429,14 @@ impl App {
             let mut content = row![text(label.to_string())
                 .size(ui.body())
                 .font(SANS)
-                .color(theme::NORD6)]
+                .color(p.fg_bright)]
             .spacing(7)
             .align_y(iced::Alignment::Center);
             if let Some(key) = key {
                 content = content.push(text(format!("({key})")).size(ui.fine()).font(SANS).color(
                     iced::Color {
                         a: 0.55,
-                        ..theme::NORD6
+                        ..p.fg_bright
                     },
                 ));
             }
@@ -3449,13 +3445,13 @@ impl App {
                     .padding([5, 14])
                     .style(move |_, _| {
                         let (bg, border_width, border_color) = match role {
-                            BtnRole::Default => (theme::NORD2, 1.0, theme::NORD3),
-                            BtnRole::Danger => (theme::NORD11, 0.0, iced::Color::TRANSPARENT),
-                            BtnRole::Primary => (theme::NORD10, 0.0, iced::Color::TRANSPARENT),
+                            BtnRole::Default => (p.bg_selection, 1.0, p.border_subtle),
+                            BtnRole::Danger => (p.error, 0.0, iced::Color::TRANSPARENT),
+                            BtnRole::Primary => (p.accent_deep, 0.0, iced::Color::TRANSPARENT),
                         };
                         iced::widget::button::Style {
                             background: Some(bg.into()),
-                            text_color: theme::NORD6,
+                            text_color: p.fg_bright,
                             border: iced::Border {
                                 radius: 4.0.into(),
                                 width: border_width,
@@ -3475,9 +3471,9 @@ impl App {
             Prompt::LspInfo(info) => {
                 let busy = matches!(info.status, LspStatus::Ready) && !info.progress.is_empty();
                 let dot = if busy {
-                    theme::NORD13
+                    p.warning
                 } else {
-                    theme::lsp_status_color(&info.status)
+                    theme::lsp_status_color(p.mode, &info.status)
                 };
                 let kv = |k: &str, v: String| {
                     row![
@@ -3485,10 +3481,10 @@ impl App {
                             text(k.to_string())
                                 .size(ui.body())
                                 .font(SANS)
-                                .color(theme::NORD3_BRIGHT)
+                                .color(p.fg_dim)
                         )
                         .width(ui.at(90.0)),
-                        text(v).size(ui.body()).font(SANS).color(theme::NORD6),
+                        text(v).size(ui.body()).font(SANS).color(p.fg_bright),
                     ]
                     .spacing(8)
                 };
@@ -3510,7 +3506,7 @@ impl App {
                         text(info.name.clone())
                             .size(ui.body())
                             .font(SANS_BOLD_UI)
-                            .color(theme::NORD6),
+                            .color(p.fg_bright),
                     ]
                     .align_y(iced::Alignment::Center),
                     kv("Language", info.language.clone()),
@@ -3518,12 +3514,12 @@ impl App {
                     kv("Status", status_label),
                 ]
                 .spacing(8);
-                for p in &info.progress {
-                    let mut line = p.title.clone();
-                    if let Some(m) = &p.message {
+                for prog in &info.progress {
+                    let mut line = prog.title.clone();
+                    if let Some(m) = &prog.message {
                         line.push_str(&format!(" — {m}"));
                     }
-                    if let Some(pct) = p.percentage {
+                    if let Some(pct) = prog.percentage {
                         line.push_str(&format!(" ({pct}%)"));
                     }
                     col = col.push(kv("Working", line));
@@ -3542,7 +3538,7 @@ impl App {
                 let mut col = column![text("Aether")
                     .size(ui.heading())
                     .font(SANS_BOLD_UI)
-                    .color(theme::NORD6)]
+                    .color(p.fg_bright)]
                 .spacing(12);
                 for section in
                     aether_client::app_info::sections(info.as_deref(), &self.session.conn)
@@ -3550,14 +3546,14 @@ impl App {
                     let mut rows = column![text(section.title)
                         .size(ui.small())
                         .font(SANS_BOLD_UI)
-                        .color(theme::NORD8)]
+                        .color(p.accent)]
                     .spacing(3);
                     for r in section.rows {
                         // Yellow marks the client/server build mismatch — the only row here that
                         // reports a problem rather than a fact.
                         let value_color = match r.tone {
-                            InfoTone::Warn => theme::NORD13,
-                            InfoTone::Normal => theme::NORD6,
+                            InfoTone::Warn => p.warning,
+                            InfoTone::Normal => p.fg_bright,
                         };
                         rows = rows.push(
                             row![
@@ -3565,7 +3561,7 @@ impl App {
                                     text(r.label)
                                         .size(ui.body())
                                         .font(SANS)
-                                        .color(theme::NORD3_BRIGHT)
+                                        .color(p.fg_dim)
                                 )
                                 .width(ui.at(84.0)),
                                 text(r.value).size(ui.body()).font(SANS).color(value_color),
@@ -3581,7 +3577,7 @@ impl App {
                 text(format!("{}?", confirm_phrase(kind)))
                     .size(ui.body())
                     .font(SANS)
-                    .color(theme::NORD6),
+                    .color(p.fg_bright),
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     btn("Yes", Some("y"), BtnRole::Danger, PromptMsg::Accept),
@@ -3624,6 +3620,7 @@ impl App {
                             true,
                             Boundary::ConfirmRoot,
                             ui,
+                            p,
                         ));
                     } else {
                         // Unfocused root: the chosen label in breadcrumb blue — or the raw filter
@@ -3636,16 +3633,12 @@ impl App {
                                 .cloned()
                                 .unwrap_or_default()
                         };
-                        let color = if invalid { theme::NORD11 } else { theme::NORD8 };
+                        let color = if invalid { p.error } else { p.accent };
                         root_group =
                             root_group.push(text(display).size(ui.body()).font(SANS).color(color));
                         // The focused segment draws its own separator flush against the text.
-                        root_group = root_group.push(
-                            text(":")
-                                .size(ui.body())
-                                .font(SANS)
-                                .color(theme::NORD3_BRIGHT),
-                        );
+                        root_group = root_group
+                            .push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
                     }
                     field = field.push(root_group).spacing(6);
                 }
@@ -3667,6 +3660,7 @@ impl App {
                     false,
                     path_boundary,
                     ui,
+                    p,
                 ));
                 let field: Element<'_, Message> = Element::from(field).map(|m| match m {
                     PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::SaveAsRoot, s),
@@ -3679,15 +3673,15 @@ impl App {
                     text("Save as")
                         .size(ui.body())
                         .font(SANS)
-                        .color(theme::NORD6),
+                        .color(p.fg_bright),
                     container(field)
                         .padding([5, 8])
                         .width(Length::Fill)
-                        .style(|_| {
+                        .style(move |_| {
                             container::Style {
-                                background: Some(theme::NORD0.into()),
+                                background: Some(p.bg.into()),
                                 border: iced::Border {
-                                    color: theme::NORD3,
+                                    color: p.border_subtle,
                                     width: 1.0,
                                     radius: 4.0.into(),
                                 },
@@ -3718,13 +3712,13 @@ impl App {
                     .size(ui.body())
                     .padding(0)
                     .width(Length::Fill)
-                    .style(|_theme, _status| iced::widget::text_input::Style {
+                    .style(move |_theme, _status| iced::widget::text_input::Style {
                         background: iced::Background::Color(iced::Color::TRANSPARENT),
                         border: iced::Border::default(),
-                        icon: theme::NORD6,
-                        placeholder: theme::NORD3_BRIGHT,
-                        value: theme::NORD6,
-                        selection: theme::NORD8,
+                        icon: p.fg_bright,
+                        placeholder: p.fg_dim,
+                        value: p.fg_bright,
+                        selection: p.accent,
                     });
                 let input: Element<'_, Message> = Element::from(inner)
                     .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
@@ -3732,15 +3726,15 @@ impl App {
                     text("Open file")
                         .size(ui.body())
                         .font(SANS)
-                        .color(theme::NORD6),
+                        .color(p.fg_bright),
                     container(input)
                         .padding([5, 8])
                         .width(Length::Fill)
-                        .style(|_| {
+                        .style(move |_| {
                             container::Style {
-                                background: Some(theme::NORD0.into()),
+                                background: Some(p.bg.into()),
                                 border: iced::Border {
-                                    color: theme::NORD3,
+                                    color: p.border_subtle,
                                     width: 1.0,
                                     radius: 4.0.into(),
                                 },
@@ -3780,10 +3774,10 @@ impl App {
         let boxed = container(body)
             .width(width)
             .max_height(max_h)
-            .style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 border: iced::Border {
-                    color: theme::NORD3,
+                    color: p.border_subtle,
                     width: 1.0,
                     radius: 6.0.into(),
                 },
@@ -3814,6 +3808,7 @@ impl App {
     /// otherwise (estimated from the content's line count), clamped into the view.
     fn hover_overlay(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let content = self.hover.as_ref().unwrap();
         let mut est_lines = 0usize;
         let body: Element<'_, Message> = match content {
@@ -3823,8 +3818,8 @@ impl App {
                     est_lines += b.text.lines().map(|l| 1 + l.len() / 90).sum::<usize>();
                     let color = b
                         .severity
-                        .map(theme::diagnostic_color)
-                        .unwrap_or(theme::NORD4);
+                        .map(|s| theme::diagnostic_color(p.mode, s))
+                        .unwrap_or(p.fg);
                     // Sans-serif, matching the markdown (LSP) hover and the rest of the chrome —
                     // the app default font is monospace, so diagnostic/commit blocks must opt in.
                     // Diagnostic blocks (those with a severity) lead with the severity glyph,
@@ -3855,7 +3850,7 @@ impl App {
                 est_lines: n,
             } => {
                 est_lines = *n;
-                md_doc(blocks, ui, Message::OpenLink)
+                md_doc(blocks, ui, p, Message::OpenLink)
             }
         };
         // Anchor at the cursor cell. Pick below/above by the room each side has for the
@@ -3958,10 +3953,10 @@ impl App {
         )
         .max_width(640)
         .max_height(max_h)
-        .style(|_| container::Style {
-            background: Some(theme::NORD1.into()),
+        .style(move |_| container::Style {
+            background: Some(p.bg_panel.into()),
             border: iced::Border {
-                color: theme::NORD3,
+                color: p.border_subtle,
                 width: 1.0,
                 radius: 4.0.into(),
             },
@@ -4065,6 +4060,7 @@ impl App {
     /// health dot.
     fn status_bar(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let t = |s: String, color: iced::Color| text(s).size(ui.body()).font(SANS).color(color);
 
         let mut left = row![];
@@ -4076,7 +4072,7 @@ impl App {
         // ephemeral "(no workspace)" context → no prefix, so the bar shows just the file label
         // rather than a stray `[]` or a `[(no workspace)]` that reads like a real workspace.
         if crate::labels::shows_workspace_chrome(&self.session.workspace) {
-            left = left.push(t(format!("[{}] ", self.session.workspace), theme::NORD4));
+            left = left.push(t(format!("[{}] ", self.session.workspace), p.fg));
         }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
@@ -4086,7 +4082,7 @@ impl App {
             budget,
         ))
         .size(ui.body())
-        .color(theme::NORD4)
+        .color(p.fg)
         .font(
             // A transient (preview) buffer slants the file label, like the other clients.
             if self.session.buffer.transient {
@@ -4099,7 +4095,9 @@ impl App {
         // The tether mark (docs/tether.md): a dim ` *` after the file label — closing this buffer
         // exits the window. Upright even on a slanted transient label, like the terminal client.
         if self.session.tethered() {
-            left = left.push(t(" *".into(), theme::NORD3_BRIGHTER));
+            // `fg_muted`: the dim-but-legible rung (dark stays the historic NORD3_BRIGHTER) —
+            // see the buffer picker's tether star.
+            left = left.push(t(" *".into(), p.fg_muted));
         }
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero.
@@ -4110,14 +4108,14 @@ impl App {
             .and_then(|w| w.git_status.as_ref())
         {
             if let Some(branch) = &gs.branch {
-                left = left.push(t(format!("   ⎇  {branch}"), theme::NORD9));
+                left = left.push(t(format!("   ⎇  {branch}"), p.accent_alt));
             }
             let u = &gs.unstaged;
             let s = &gs.staged;
             for (sigil, color, un, st) in [
-                ("+", theme::GIT_ADDED, u.added, s.added),
-                ("~", theme::GIT_MODIFIED, u.modified, s.modified),
-                ("-", theme::GIT_DELETED, u.deleted, s.deleted),
+                ("+", p.git_added, u.added, s.added),
+                ("~", p.git_modified, u.modified, s.modified),
+                ("-", p.git_deleted, u.deleted, s.deleted),
             ] {
                 if un == 0 && st == 0 {
                     continue;
@@ -4140,7 +4138,7 @@ impl App {
                 if s.current_index > 0 && s.total > 0 {
                     right = right.push(t(
                         format!("{}/{}", s.current_index, format_total(s)),
-                        theme::NORD4,
+                        p.fg,
                     ));
                 }
             }
@@ -4148,7 +4146,7 @@ impl App {
         if let Some(results) = self.session.buffer.cursor.jumplist_position {
             right = right.push(t(
                 format!("({}/{})", results.current, results.total),
-                theme::NORD4,
+                p.fg,
             ));
         }
         // Diagnostic counts, as a tight cluster left of the position. Text glyphs stand in for
@@ -4165,19 +4163,19 @@ impl App {
                 if n > 0 {
                     diag = diag.push(t(
                         format!("{} {n}", theme::diag_glyph(sev)),
-                        theme::diagnostic_color(sev),
+                        theme::diagnostic_color(p.mode, sev),
                     ));
                 }
             }
             right = right.push(diag);
         }
-        right = right.push(t(self.position_label(), theme::NORD4));
+        right = right.push(t(self.position_label(), p.fg));
         // LSP health dot: state-coloured; a ready server with in-flight progress shows busy.
         if let Some(lsp) = &self.session.lsp {
             let color = if matches!(lsp.status, LspStatus::Ready) && !lsp.progress.is_empty() {
-                theme::NORD13
+                p.warning
             } else {
-                theme::lsp_status_color(&lsp.status)
+                theme::lsp_status_color(p.mode, &lsp.status)
             };
             right = right.push(t("•".into(), color));
         }
@@ -4187,9 +4185,9 @@ impl App {
         )
         .padding([2, 8])
         .width(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(theme::NORD1.into()),
-            text_color: Some(theme::NORD4),
+        .style(move |_| container::Style {
+            background: Some(p.bg_panel.into()),
+            text_color: Some(p.fg),
             ..container::Style::default()
         })
         .into()
@@ -4199,13 +4197,14 @@ impl App {
     /// web client's `#toasts` (a `▌` glyph stands in for its 3px left border).
     fn toast_overlay(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let mut stack_col = column![].spacing(8).align_x(iced::Alignment::End);
         for toast in &self.toasts {
             let accent = match toast.kind {
-                ToastKind::Info => theme::NORD8,
-                ToastKind::Error => theme::NORD11,
-                ToastKind::Warning => theme::NORD13,
-                ToastKind::Success => theme::NORD14,
+                ToastKind::Info => p.accent,
+                ToastKind::Error => p.error,
+                ToastKind::Warning => p.warning,
+                ToastKind::Success => p.ok,
             };
             // The accent left strip is rendered the way the web does a rounded `border-left`: an
             // accent-coloured rounded base (outer) showing through a 3px left inset, with the NORD1
@@ -4218,11 +4217,11 @@ impl App {
                         text(toast.message.clone())
                             .size(ui.body())
                             .font(SANS)
-                            .color(theme::NORD4),
+                            .color(p.fg),
                     )
                     .padding([6, 12])
-                    .style(|_| container::Style {
-                        background: Some(theme::NORD1.into()),
+                    .style(move |_| container::Style {
+                        background: Some(p.bg_panel.into()),
                         // Square against the accent strip on the left; rounded on the right (just
                         // inside the 1px border, so ~3) to sit within the base's rounded corners.
                         border: iced::Border {
@@ -4245,7 +4244,7 @@ impl App {
                 .style(move |_| container::Style {
                     background: Some(accent.into()),
                     border: iced::Border {
-                        color: theme::NORD3,
+                        color: p.border_subtle,
                         width: 1.0,
                         radius: 4.0.into(),
                     },
@@ -4274,19 +4273,20 @@ impl App {
 }
 
 /// A filter chip for the search bar's match options — same look as the grep picker's chips
-/// (`picker::chip_el`): compact label on a raised NORD2 background, NORD8 text, the whole-word chip
-/// underlined; the keyboard-selected chip inverts (NORD8 background, NORD0 text). Chips are
+/// (`picker::chip_el`): compact label on a raised selection-shade background, accent text, the
+/// whole-word chip underlined; the keyboard-selected chip inverts (accent background). Chips are
 /// keyboard-driven (Left/Right select, Backspace removes, Enter cycles), so this is non-interactive.
 fn option_chip<'a>(
     chip: &crate::chips::Chip,
     selected: bool,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, Message> {
     let underline = matches!(chip.id, crate::chips::ChipId::Word);
     let (bg, fg) = if selected {
-        (theme::NORD8, theme::NORD0)
+        (p.accent, p.fg_on_accent)
     } else {
-        (theme::NORD2, theme::NORD8)
+        (p.bg_selection, p.accent)
     };
     let spans: Vec<iced::widget::text::Span<'a>> = vec![iced::widget::span(chip.label.clone())
         .size(ui.small())
@@ -4325,8 +4325,8 @@ const SANS_BOLD_UI: iced::Font = iced::Font {
 /// current text (so a core-driven reset — clearing the search query on Esc, seeding save-as —
 /// flows straight into the widget) and whose edits sync back via [`Message::OverlayInput`].
 ///
-/// Styled to sit transparently on the overlay panel: NORD6 value, NORD8 caret/selection, a dim
-/// NORD3_BRIGHT placeholder, no border or background of its own (the surrounding container draws
+/// Styled to sit transparently on the overlay panel: bright value, accent caret/selection, a dim
+/// placeholder, no border or background of its own (the surrounding container draws
 /// the box). `on_submit` is deliberately left unset so a single-line `text_input` lets Enter
 /// bubble (`Ignored`) to the core's key handler — the picker's Enter-to-select, save-as accept,
 /// and workspace-settings rename/add all stay on the existing `on_key` path.
@@ -4339,6 +4339,7 @@ fn overlay_input<'a>(
     placeholder: &str,
     value: &str,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, Message> {
     // `alt_passthrough` keeps Alt-chords (the nav idiom) out of the input — winit delivers
     // `Alt+letter` as text on some platforms, which a focused `text_input` would otherwise insert.
@@ -4349,13 +4350,13 @@ fn overlay_input<'a>(
             .font(SANS)
             .size(ui.body())
             .padding(0)
-            .style(|_theme, _status| iced::widget::text_input::Style {
+            .style(move |_theme, _status| iced::widget::text_input::Style {
                 background: iced::Background::Color(iced::Color::TRANSPARENT),
                 border: iced::Border::default(),
-                icon: theme::NORD6,
-                placeholder: theme::NORD3_BRIGHT,
-                value: theme::NORD6,
-                selection: theme::NORD8,
+                icon: p.fg_bright,
+                placeholder: p.fg_dim,
+                value: p.fg_bright,
+                selection: p.accent,
             }),
     )
     .map(move |Typed(s)| Message::OverlayInput(field, s))
@@ -4411,9 +4412,9 @@ enum HoverPlace {
 
 // ---- hover Markdown rendering (the shared AST → iced widgets) ----------------------------------
 //
-// Renders `aether_client::markdown` directly, so the native client matches the web (Nord0 code
-// blocks, accent inline code with no background, white headings, underlined links). Sizes/spacing
-// mirror the web client's CSS.
+// Renders `aether_client::markdown` directly, so the native client matches the web (page-shade
+// code blocks, bright headings, underlined links — all palette roles). Sizes/spacing mirror the
+// web client's CSS.
 
 /// Hover-Markdown sizing, as tuned-at-the-default-base pixels (see [`theme::Ui::at`]): body text,
 /// code blocks, and the gap between blocks.
@@ -4431,11 +4432,12 @@ const MD_SPACING: f32 = 11.0;
 fn md_doc<M: 'static>(
     blocks: &[MdBlock],
     ui: theme::Ui,
+    p: &'static theme::Palette,
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     let mut col = column![].spacing(ui.at(MD_SPACING));
     for b in blocks {
-        col = col.push(md_block(b, ui, on_link));
+        col = col.push(md_block(b, ui, p, on_link));
     }
     col.into()
 }
@@ -4443,6 +4445,7 @@ fn md_doc<M: 'static>(
 fn md_block<M: 'static>(
     b: &MdBlock,
     ui: theme::Ui,
+    p: &'static theme::Palette,
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     match b {
@@ -4453,21 +4456,21 @@ fn md_block<M: 'static>(
                 3 => 14.0,
                 _ => MD_TEXT,
             };
-            md_rich(content, true, theme::NORD6, ui.at(size), on_link)
+            md_rich(content, true, p.fg_bright, ui.at(size), p, on_link)
         }
         MdBlock::Paragraph { content, .. } => {
-            md_rich(content, false, theme::NORD4, ui.at(MD_TEXT), on_link)
+            md_rich(content, false, p.fg, ui.at(MD_TEXT), p, on_link)
         }
         MdBlock::Code { code, .. } => container(
             text(code.clone())
                 .font(iced::Font::MONOSPACE)
                 .size(ui.at(MD_CODE))
-                .color(theme::NORD4),
+                .color(p.fg),
         )
         .width(Length::Fill)
         .padding([6, 8])
-        .style(|_| container::Style {
-            background: Some(theme::NORD0.into()),
+        .style(move |_| container::Style {
+            background: Some(p.bg.into()),
             border: iced::Border {
                 radius: 4.0.into(),
                 ..iced::Border::default()
@@ -4494,21 +4497,21 @@ fn md_block<M: 'static>(
                 }
                 col = col.push(
                     row![
-                        text(marker).size(ui.at(MD_TEXT)).color(theme::NORD4),
-                        md_doc(&item.blocks, ui, on_link),
+                        text(marker).size(ui.at(MD_TEXT)).color(p.fg),
+                        md_doc(&item.blocks, ui, p, on_link),
                     ]
                     .spacing(6),
                 );
             }
             col.into()
         }
-        MdBlock::Quote { content, .. } => row![md_bar(), md_doc(content, ui, on_link)]
+        MdBlock::Quote { content, .. } => row![md_bar(p), md_doc(content, ui, p, on_link)]
             .spacing(8)
             .into(),
         MdBlock::Rule { .. } => container(iced::widget::Space::new())
             .width(Length::Fill)
             .height(1)
-            .style(md_bar_style)
+            .style(move |_| md_bar_style(p))
             .into(),
         // The remaining kinds only occur in document (reading-view) parses; hover content never
         // produces them, but a fallback keeps hover total. The reading view has its own renderer.
@@ -4523,27 +4526,27 @@ fn md_block<M: 'static>(
                     .map(|c| md_plain(c))
                     .collect::<Vec<_>>()
                     .join("  |  ");
-                col = col.push(text(joined).size(ui.at(MD_TEXT)).color(theme::NORD4));
+                col = col.push(text(joined).size(ui.at(MD_TEXT)).color(p.fg));
             }
             col.into()
         }
         MdBlock::Image { alt, .. } => text(format!("[image: {alt}]"))
             .size(ui.at(MD_TEXT))
-            .color(theme::NORD3)
+            .color(p.fg_faint)
             .into(),
         MdBlock::FrontMatter { .. } => iced::widget::Space::new().into(),
         MdBlock::FootnoteDef { label, content, .. } => row![
             text(format!("[{label}]:"))
                 .size(ui.at(MD_TEXT))
-                .color(theme::NORD3),
-            md_doc(content, ui, on_link),
+                .color(p.fg_faint),
+            md_doc(content, ui, p, on_link),
         ]
         .spacing(6)
         .into(),
         MdBlock::Html { raw, .. } => text(raw.clone())
             .font(iced::Font::MONOSPACE)
             .size(ui.at(MD_CODE))
-            .color(theme::NORD3)
+            .color(p.fg_faint)
             .into(),
     }
 }
@@ -4782,6 +4785,7 @@ impl App {
     /// server cursor; per-span focus painting is renderer polish).
     fn read_view(&self) -> Element<'_, Message> {
         let ui = self.ui();
+        let p = self.palette();
         let Some(read) = self.session.read.as_ref() else {
             return iced::widget::Space::new().into();
         };
@@ -4803,7 +4807,7 @@ impl App {
         let mut col = column![].spacing(body * 0.8);
         if read.loading && read.blocks.is_empty() {
             col = col.push(
-                container(text("Loading…").size(body).color(theme::NORD3))
+                container(text("Loading…").size(body).color(p.fg_faint))
                     .width(Length::Fill)
                     .align_x(iced::alignment::Horizontal::Center),
             );
@@ -4826,7 +4830,7 @@ impl App {
             let wrapped: Element<'_, ReadMsg> = if matches!(b, MdBlock::List { .. }) {
                 block
             } else {
-                read_focus_wrap(focused, selected, block)
+                read_focus_wrap(focused, selected, p, block)
             };
             // Air above headings (web parity: `margin: 1.6em 0 0.5em` in the heading's own
             // size — sections breathe): the uniform column spacing supplies 0.8 body of the
@@ -4912,17 +4916,19 @@ impl App {
         // The probe measures this container's bounds, and it finding nothing is what made
         // `;`/`Alt-;` silently do nothing for anything but a top-level block (list *items*
         // anchor themselves in the List arm below, since an item is not a block).
+        let p = self.palette();
         let el = match b {
             MdBlock::Heading { level, content, .. } => {
                 let size = read_heading_size(*level, body);
-                // The terminal's heading colour ladder: frost blue majors, teal H3, white
-                // H4, body-grey H5/H6 — colour distinguishes the minor levels, which share
-                // the smallest size.
+                // The terminal's heading colour ladder: accent majors, the syntax type-teal
+                // H3 (no chrome role carries that shade — the ladder shares it with the
+                // highlighter by design), bright H4, body H5/H6 — colour distinguishes the
+                // minor levels, which share the smallest size.
                 let color = match level {
-                    1 | 2 => theme::NORD8,
-                    3 => theme::NORD7,
-                    4 => theme::NORD6,
-                    _ => theme::NORD4,
+                    1 | 2 => p.accent,
+                    3 => theme::highlight_color(p.mode, "type").unwrap_or(p.accent),
+                    4 => p.fg_bright,
+                    _ => p.fg,
                 };
                 let h = md_rich_in(
                     content,
@@ -4932,6 +4938,7 @@ impl App {
                     READ_FONT_FAMILY,
                     1.3, // headings stay tight; the body carries the airiness
                     target,
+                    p,
                     ReadMsg::Link,
                 );
                 if *level == 2 {
@@ -4942,8 +4949,8 @@ impl App {
                         container(iced::widget::Space::new())
                             .width(Length::Fill)
                             .height(1)
-                            .style(|_| container::Style {
-                                background: Some(theme::NORD2.into()),
+                            .style(move |_| container::Style {
+                                background: Some(p.bg_selection.into()),
                                 ..container::Style::default()
                             }),
                     ]
@@ -4956,15 +4963,13 @@ impl App {
             MdBlock::Paragraph { content, .. } => md_rich_in(
                 content,
                 false,
-                if dim {
-                    theme::NORD3_BRIGHTER
-                } else {
-                    theme::NORD4
-                },
+                // Done-task prose dims to the `fg_muted` rung (NORD3_BRIGHTER in dark).
+                if dim { p.fg_muted } else { p.fg },
                 body,
                 READ_FONT_FAMILY,
                 READ_LINE_HEIGHT,
                 target,
+                p,
                 ReadMsg::Link,
             ),
             MdBlock::Table {
@@ -5013,6 +5018,7 @@ impl App {
                                 block == Some(ib.span()),
                                 span_selected(sel, ib.span()),
                                 6.0,
+                                p,
                                 child,
                             )
                         } else {
@@ -5028,10 +5034,11 @@ impl App {
                     let area = iced::widget::mouse_area(read_focus_wrap(
                         item_focused,
                         item_selected,
+                        p,
                         row![
                             text(marker)
                                 .size(if task { body * MD_TASK_BOX_SCALE } else { body })
-                                .color(theme::NORD4),
+                                .color(p.fg),
                             inner,
                         ]
                         .spacing(8)
@@ -5052,7 +5059,7 @@ impl App {
                 if let Some(kind) = alert {
                     // The alert's label row: the capitalized kind in its colour, semibold —
                     // the web's `.md-alert-label`, the terminal's AlertLabel span.
-                    let (label, color) = alert_style(*kind);
+                    let (label, color) = alert_style(*kind, p);
                     inner =
                         inner.push(text(label).size(body * 0.95).color(color).font(iced::Font {
                             family: READ_FONT_FAMILY,
@@ -5074,6 +5081,7 @@ impl App {
                             block == Some(cb.span()),
                             span_selected(sel, cb.span()),
                             6.0,
+                            p,
                             child,
                         )
                     });
@@ -5084,12 +5092,12 @@ impl App {
                 // that blanked lists): the outer paints the bar colour, the inner repaints the
                 // canvas over everything but the 3px strip. Square corners, matching the
                 // position bar. Alerts colour the bar by kind, matching their label.
-                let bar = alert.map(|k| alert_style(k).1).unwrap_or(theme::NORD3);
+                let bar = alert.map(|k| alert_style(k, p).1).unwrap_or(p.border_subtle);
                 let panel = container(inner)
                     .width(Length::Fill)
                     .padding([8, 10])
-                    .style(|_| container::Style {
-                        background: Some(theme::NORD0.into()),
+                    .style(move |_| container::Style {
+                        background: Some(p.bg.into()),
                         ..container::Style::default()
                     });
                 container(panel)
@@ -5120,7 +5128,7 @@ impl App {
                             text(lang.clone())
                                 .font(iced::Font::MONOSPACE)
                                 .size(body * 0.65)
-                                .color(theme::NORD3_BRIGHT),
+                                .color(p.fg_dim),
                         )
                         .padding(iced::Padding {
                             top: 10.0,
@@ -5132,7 +5140,7 @@ impl App {
                 }
                 // Tree-sitter runs when the server's snippet highlights have landed for this
                 // fence (docs/markdown-view.md §2.8) — the editor's own token colours; plain
-                // NORD4 monospace until then.
+                // body-coloured monospace until then.
                 let hls = self
                     .session
                     .read
@@ -5155,12 +5163,13 @@ impl App {
                         for h in hls {
                             let s = (h.start as usize).min(code.len());
                             let e = (h.end as usize).clamp(s, code.len());
-                            push(&code[pos..s], theme::NORD4);
-                            let color = theme::highlight_color(&h.kind).unwrap_or(theme::NORD4);
+                            push(&code[pos..s], p.fg);
+                            let color =
+                                theme::highlight_color(p.mode, &h.kind).unwrap_or(p.fg);
                             push(&code[s..e], color);
                             pos = e;
                         }
-                        push(&code[pos..], theme::NORD4);
+                        push(&code[pos..], p.fg);
                         iced::widget::rich_text(spans)
                             .size(body * 0.85)
                             .wrapping(iced::widget::text::Wrapping::None)
@@ -5169,7 +5178,7 @@ impl App {
                     None => text(code.clone())
                         .font(iced::Font::MONOSPACE)
                         .size(body * 0.85)
-                        .color(theme::NORD4)
+                        .color(p.fg)
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
                 };
@@ -5200,8 +5209,8 @@ impl App {
                 panel = panel.push(scroll);
                 container(panel)
                     .width(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(theme::NORD1.into()),
+                    .style(move |_| container::Style {
+                        background: Some(p.md_code_bg.into()),
                         border: iced::Border {
                             radius: 6.0.into(),
                             ..iced::Border::default()
@@ -5216,27 +5225,27 @@ impl App {
                 container(iced::widget::Space::new())
                     .width(Length::Fill)
                     .height(1)
-                    .style(md_bar_style),
+                    .style(move |_| md_bar_style(p)),
             )
             .width(Length::Fill)
             .padding([body * 0.5, 0.0])
             .into(),
             // Front matter: the dim literal panel (docs/markdown-view.md) — raw YAML in dim
-            // monospace behind a thin NORD2 rule, the web's `.md-front-matter`. The quote
-            // arm's nested-container bar construction, but 2px and NORD2: literal metadata,
-            // not speech. Must not fall through to `md_block`, whose hover-scale arm hides
-            // front matter entirely (right for popovers, wrong here).
+            // monospace behind a thin selection-shade rule, the web's `.md-front-matter`. The
+            // quote arm's nested-container bar construction, but 2px and the selection shade:
+            // literal metadata, not speech. Must not fall through to `md_block`, whose
+            // hover-scale arm hides front matter entirely (right for popovers, wrong here).
             MdBlock::FrontMatter { text: raw, .. } => {
                 let panel = container(
                     text(raw.trim_end().to_string())
                         .size(body * 0.8)
-                        .color(theme::NORD3_BRIGHT)
+                        .color(p.fg_dim)
                         .font(iced::Font::MONOSPACE),
                 )
                 .width(Length::Fill)
                 .padding([4, 10])
-                .style(|_| container::Style {
-                    background: Some(theme::NORD0.into()),
+                .style(move |_| container::Style {
+                    background: Some(p.bg.into()),
                     ..container::Style::default()
                 });
                 container(panel)
@@ -5245,14 +5254,14 @@ impl App {
                         left: 2.0,
                         ..iced::Padding::ZERO
                     })
-                    .style(|_| container::Style {
-                        background: Some(theme::NORD2.into()),
+                    .style(move |_| container::Style {
+                        background: Some(p.bg_selection.into()),
                         ..container::Style::default()
                     })
                     .into()
             }
             // The remaining kinds read fine at hover scale.
-            other => md_block(other, ui, ReadMsg::Link),
+            other => md_block(other, ui, p, ReadMsg::Link),
         };
         // Always wrapped, only the *id* is conditional: adding a container on focus alone would
         // reflow the block as the reading position moved past it.
@@ -5321,9 +5330,10 @@ impl App {
                 }
             }
         }
+        let p = self.palette();
         let widths = table_column_widths(&naturals, &minimums, self.read_table_avail(body));
         let cell = |content: &[MdInline], header: bool, w: f32| -> Element<'static, ReadMsg> {
-            let color = if header { theme::NORD6 } else { theme::NORD4 };
+            let color = if header { p.fg_bright } else { p.fg };
             container(md_rich_in(
                 content,
                 header,
@@ -5332,6 +5342,7 @@ impl App {
                 READ_FONT_FAMILY,
                 1.4,
                 target,
+                p,
                 ReadMsg::Link,
             ))
             .width(Length::Fixed(w))
@@ -5344,8 +5355,8 @@ impl App {
             for (ci, w) in widths.iter().enumerate() {
                 r = r.push(cell(head.get(ci).unwrap_or(&empty), true, *w));
             }
-            col = col.push(container(r).style(|_| container::Style {
-                background: Some(theme::NORD1.into()),
+            col = col.push(container(r).style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
                 ..container::Style::default()
             }));
         }
@@ -5356,14 +5367,16 @@ impl App {
                 r = r.push(cell(c, false, *w));
             }
             let striped = ri % 2 == 1;
+            // Alpha-scaled panel over the page, not `md_table_stripe_bg`: the stripe has
+            // always been a 40% composite here, and an opaque near-match would shift dark.
             col = col.push(container(r).style(move |_| container::Style {
-                background: striped.then(|| theme::NORD1.scale_alpha(0.4).into()),
+                background: striped.then(|| p.bg_panel.scale_alpha(0.4).into()),
                 ..container::Style::default()
             }));
         }
-        let framed = container(col).style(|_| container::Style {
+        let framed = container(col).style(move |_| container::Style {
             border: iced::Border {
-                color: theme::NORD3,
+                color: p.border_subtle,
                 width: 1.0,
                 radius: 4.0.into(),
             },
@@ -5394,10 +5407,11 @@ impl App {
         target: Option<MdSpan>,
     ) -> Element<'static, ReadMsg> {
         let label = if alt.is_empty() { "image" } else { alt };
+        let p = self.palette();
         let placeholder = |note: &str| -> Element<'static, ReadMsg> {
             text(format!("▨ [{label}]  ({note})"))
                 .size(body * 0.9)
-                .color(theme::NORD3)
+                .color(p.fg_faint)
                 .into()
         };
         let lower = src.to_ascii_lowercase();
@@ -5453,7 +5467,7 @@ impl App {
             .style(move |_| container::Style {
                 border: iced::Border {
                     color: if armed {
-                        theme::NORD8
+                        p.accent
                     } else {
                         iced::Color::TRANSPARENT
                     },
@@ -5526,18 +5540,20 @@ async fn fetch_remote_image(url: String) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// A thin Nord3 bar (the blockquote rule / horizontal rule fill).
-fn md_bar<M: 'static>() -> Element<'static, M> {
+/// A thin dim bar (the blockquote rule / horizontal rule fill).
+fn md_bar<M: 'static>(p: &'static theme::Palette) -> Element<'static, M> {
     container(iced::widget::Space::new())
         .width(2)
         .height(Length::Fill)
-        .style(md_bar_style)
+        .style(move |_| md_bar_style(p))
         .into()
 }
 
-fn md_bar_style(_: &iced::Theme) -> container::Style {
+fn md_bar_style(p: &theme::Palette) -> container::Style {
     container::Style {
-        background: Some(theme::NORD3.into()),
+        // A rule, not a tint band — the hairline chrome shade, painted as a background
+        // because iced draws these bars as filled containers.
+        background: Some(p.border_subtle.into()),
         ..container::Style::default()
     }
 }
@@ -5550,6 +5566,7 @@ fn md_rich<M: 'static>(
     bold: bool,
     base_color: iced::Color,
     size: f32,
+    p: &'static theme::Palette,
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     // Hover density: iced's default line height.
@@ -5561,6 +5578,7 @@ fn md_rich<M: 'static>(
         iced::font::Family::SansSerif,
         1.3,
         None, // hover has no reading target
+        p,
         on_link,
     )
 }
@@ -5574,11 +5592,12 @@ fn md_rich_in<M: 'static>(
     family: iced::font::Family,
     line_height: f32,
     target: Option<MdSpan>,
+    p: &'static theme::Palette,
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     let mut spans = Vec::new();
     md_spans(
-        inlines, bold, false, None, base_color, size, family, target, &mut spans,
+        inlines, bold, false, None, base_color, size, family, target, p, &mut spans,
     );
     iced::widget::rich_text(spans)
         .size(size)
@@ -5596,13 +5615,15 @@ const READ_FONT_FAMILY: iced::font::Family = iced::font::Family::Name("Source Se
 
 /// Alert kind → (label, colour) — the ladder shared with the terminal's `alert_color` and
 /// the web's `.md-alert-*` rules.
-fn alert_style(kind: AlertKind) -> (&'static str, iced::Color) {
+fn alert_style(kind: AlertKind, p: &'static theme::Palette) -> (&'static str, iced::Color) {
     match kind {
-        AlertKind::Note => ("Note", theme::NORD8),
-        AlertKind::Tip => ("Tip", theme::NORD14),
-        AlertKind::Important => ("Important", theme::NORD15),
-        AlertKind::Warning => ("Warning", theme::NORD13),
-        AlertKind::Caution => ("Caution", theme::NORD11),
+        AlertKind::Note => ("Note", p.accent),
+        // Purple has no status meaning, so it gets its own role rather than borrowing the
+        // syntax constant colour (dark NORD15, light its darkened variant).
+        AlertKind::Important => ("Important", p.md_alert_important),
+        AlertKind::Tip => ("Tip", p.ok),
+        AlertKind::Warning => ("Warning", p.warning),
+        AlertKind::Caution => ("Caution", p.error),
     }
 }
 
@@ -5624,9 +5645,10 @@ fn span_selected(sel: Option<(u32, u32)>, span: MdSpan) -> bool {
 fn read_focus_wrap(
     on: bool,
     selected: bool,
+    p: &'static theme::Palette,
     content: Element<'static, ReadMsg>,
 ) -> Element<'static, ReadMsg> {
-    read_focus_wrap_inset(on, selected, 10.0, content)
+    read_focus_wrap_inset(on, selected, 10.0, p, content)
 }
 
 /// Whether a block inside a list item is a reading stop in its own right — and so hosts its own
@@ -5651,11 +5673,12 @@ fn read_focus_wrap_inset(
     on: bool,
     selected: bool,
     gap: f32,
+    p: &'static theme::Palette,
     content: Element<'static, ReadMsg>,
 ) -> Element<'static, ReadMsg> {
-    // The inner container's opaque background doubles as the selection tint: NORD2 (the
-    // editor's selection shade) when the block is inside the extended selection, the page
-    // NORD0 otherwise — either way it keeps the bar strip from bleeding through.
+    // The inner container's opaque background doubles as the selection tint: the chrome
+    // selection shade when the block is inside the extended selection, the page background
+    // otherwise — either way it keeps the bar strip from bleeding through.
     let inner = container(content)
         .width(Length::Fill)
         .padding(iced::Padding {
@@ -5663,7 +5686,7 @@ fn read_focus_wrap_inset(
             ..iced::Padding::ZERO
         })
         .style(move |_| container::Style {
-            background: Some(if selected { theme::NORD2 } else { theme::NORD0 }.into()),
+            background: Some(if selected { p.bg_selection } else { p.bg }.into()),
             ..container::Style::default()
         });
     container(inner)
@@ -5673,7 +5696,7 @@ fn read_focus_wrap_inset(
             ..iced::Padding::ZERO
         })
         .style(move |_| container::Style {
-            background: on.then(|| theme::NORD8.into()),
+            background: on.then(|| p.accent.into()),
             ..container::Style::default()
         })
         .into()
@@ -5705,22 +5728,23 @@ fn md_spans(
     size: f32,
     family: iced::font::Family,
     target: Option<MdSpan>,
+    p: &'static theme::Palette,
     out: &mut Vec<iced::advanced::text::Span<'static, String>>,
 ) {
     for inl in inlines {
         match inl {
             MdInline::Text { text } => {
-                out.push(md_span(text, bold, italic, false, link, base, family))
+                out.push(md_span(text, bold, italic, false, link, base, family, p))
             }
             MdInline::Code { text } => {
-                out.push(md_span(text, bold, italic, true, link, base, family))
+                out.push(md_span(text, bold, italic, true, link, base, family, p))
             }
-            MdInline::Strong { content } => {
-                md_spans(content, true, italic, link, base, size, family, target, out)
-            }
-            MdInline::Emphasis { content } => {
-                md_spans(content, bold, true, link, base, size, family, target, out)
-            }
+            MdInline::Strong { content } => md_spans(
+                content, true, italic, link, base, size, family, target, p, out,
+            ),
+            MdInline::Emphasis { content } => md_spans(
+                content, bold, true, link, base, size, family, target, p, out,
+            ),
             MdInline::Link {
                 href,
                 content,
@@ -5749,9 +5773,10 @@ fn md_spans(
                         size,
                         family,
                         None,
+                        p,
                         &mut inner,
                     );
-                    out.extend(inner.into_iter().map(|s| read_pill(s, size)));
+                    out.extend(inner.into_iter().map(|s| read_pill(s, size, p)));
                 } else {
                     md_spans(
                         content,
@@ -5762,6 +5787,7 @@ fn md_spans(
                         size,
                         family,
                         target,
+                        p,
                         out,
                     )
                 }
@@ -5769,7 +5795,7 @@ fn md_spans(
             MdInline::Strikethrough { content } => {
                 let mut inner = Vec::new();
                 md_spans(
-                    content, bold, italic, link, base, size, family, target, &mut inner,
+                    content, bold, italic, link, base, size, family, target, p, &mut inner,
                 );
                 out.extend(inner.into_iter().map(|s| s.strikethrough(true)));
             }
@@ -5783,12 +5809,13 @@ fn md_spans(
                     italic,
                     false,
                     None,
-                    theme::NORD3,
+                    p.fg_faint,
                     family,
+                    p,
                 )
                 .link(format!("{READ_ARM_PREFIX}{}", span.start));
                 out.push(if target == Some(*span) {
-                    read_pill(s, size)
+                    read_pill(s, size, p)
                 } else {
                     s
                 });
@@ -5800,17 +5827,20 @@ fn md_spans(
                     italic,
                     false,
                     None,
-                    theme::NORD3,
+                    p.fg_faint,
                     family,
+                    p,
                 )
                 .link(format!("{READ_ARM_PREFIX}{}", span.start));
                 out.push(if target == Some(*span) {
-                    read_pill(s, size)
+                    read_pill(s, size, p)
                 } else {
                     s
                 });
             }
-            MdInline::HardBreak => out.push(md_span("\n", bold, italic, false, link, base, family)),
+            MdInline::HardBreak => {
+                out.push(md_span("\n", bold, italic, false, link, base, family, p))
+            }
         }
     }
 }
@@ -5823,9 +5853,10 @@ fn md_spans(
 fn read_pill(
     s: iced::advanced::text::Span<'static, String>,
     size: f32,
+    p: &'static theme::Palette,
 ) -> iced::advanced::text::Span<'static, String> {
-    s.background(theme::NORD8)
-        .color(theme::NORD0)
+    s.background(p.accent)
+        .color(p.fg_on_accent)
         .border(iced::border::rounded(2))
         .padding(iced::Padding {
             top: -0.2 * size,
@@ -5835,6 +5866,7 @@ fn read_pill(
         })
 }
 
+#[allow(clippy::too_many_arguments)] // the same styling-parameter family as `md_spans`
 fn md_span(
     text: &str,
     bold: bool,
@@ -5843,6 +5875,7 @@ fn md_span(
     link: Option<&str>,
     base: iced::Color,
     family: iced::font::Family,
+    p: &'static theme::Palette,
 ) -> iced::advanced::text::Span<'static, String> {
     let font = if code {
         iced::Font::MONOSPACE
@@ -5863,16 +5896,17 @@ fn md_span(
         }
     };
     let color = if link.is_some() {
-        theme::NORD9
+        // Markdown links keep the secondary accent (dark NORD9), matching the web/TUI.
+        p.accent_alt
     } else if code {
-        theme::NORD4
+        p.fg
     } else {
         base
     };
     let mut s = iced::widget::span(text.to_string()).font(font).color(color);
     if code {
-        // The web reading view's inline-code chip: body-coloured text on the panel shade.
-        s = s.background(theme::NORD1);
+        // The web reading view's inline-code chip: body-coloured text on the code-panel shade.
+        s = s.background(p.md_code_bg);
     }
     match link {
         Some(href) => s.link(href.to_string()).underline(true),
@@ -6144,14 +6178,15 @@ fn time_ago(ts: i64) -> String {
 
 /// Buffer-state dot colour for the session, shown in the status bar.
 fn session_state_color(s: &Session) -> Option<iced::Color> {
+    let p = theme::palette(s.theme);
     if s.externally_deleted {
-        return Some(theme::NORD11);
+        return Some(p.state_deleted);
     }
     if s.externally_modified {
-        return Some(theme::NORD12);
+        return Some(p.state_changed);
     }
     if s.buffer.revision != s.buffer.saved_revision {
-        return Some(theme::NORD9);
+        return Some(p.state_unsaved);
     }
     None
 }
@@ -6213,8 +6248,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
     }
 }
 
-fn nord_theme(_app: &App) -> iced::Theme {
-    iced::Theme::Nord
+/// The base widget theme, by session mode — dark keeps the built-in `Nord`, light is a custom
+/// theme generated from the core light palette (see [`theme::base_iced_theme`]).
+fn base_theme(app: &App) -> iced::Theme {
+    theme::base_iced_theme(app.session.theme)
 }
 
 /// Dial the daemon and bootstrap once, landing the outcome as [`Message::Booted`]. Used for the
@@ -6466,9 +6503,10 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
     iced::application(move || App::new(bootstrap.clone()), App::update, App::view)
         .title(App::title)
         .subscription(App::subscription)
-        // Everything we draw sets explicit Nord colours, but theme-inheriting surfaces (markdown
-        // hover body text, scrollbars) must not default to the Light theme.
-        .theme(nord_theme)
+        // Everything we draw sets explicit palette colours, but theme-inheriting surfaces
+        // (markdown hover body text, scrollbars) must track the session's mode rather than
+        // defaulting to iced's Light theme.
+        .theme(base_theme)
         // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
         .settings(iced::Settings {
             // Bundle JetBrains Mono for the editor (chrome stays on the default monospace). Registered

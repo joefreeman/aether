@@ -3606,8 +3606,8 @@ fn app_settings_wire_shape_and_defaults() {
     assert_eq!(AppSettings::default().wrap, WrapMode::Soft);
     assert!(AppSettings::default().ligatures);
 
-    // Wire shape: `wrap` serializes as the lowercase WrapMode tag; `ligatures` as a bool; the two
-    // font sizes as numbers under their own keys.
+    // Wire shape: `wrap` and `theme` serialize as their lowercase tags; `ligatures` as a bool;
+    // the two font sizes as numbers under their own keys.
     let s = AppSettings {
         wrap: WrapMode::None,
         ligatures: false,
@@ -3615,6 +3615,7 @@ fn app_settings_wire_shape_and_defaults() {
         ui_font_size: 12,
         hints: false,
         markdown_read: false,
+        theme: aether_protocol::settings::ThemeMode::Light,
     };
     assert_eq!(
         to_value(s).unwrap(),
@@ -3625,6 +3626,7 @@ fn app_settings_wire_shape_and_defaults() {
             "ui_font_size": 12,
             "hints": false,
             "markdown_read": false,
+            "theme": "light",
         })
     );
 
@@ -3643,6 +3645,11 @@ fn app_settings_wire_shape_and_defaults() {
     );
     assert!(parsed.hints, "hints default on");
     assert!(parsed.markdown_read, "markdown reading view defaults on");
+    assert_eq!(
+        parsed.theme,
+        aether_protocol::settings::ThemeMode::Dark,
+        "theme defaults dark"
+    );
 
     // The pre-split `font_size` key is not read back as either size — it's gone, and a file still
     // carrying it lands on the defaults rather than silently applying the old value to one of them.

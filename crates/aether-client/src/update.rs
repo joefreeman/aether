@@ -96,7 +96,7 @@ use aether_protocol::search::{
     SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{
-    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
+    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet, ThemeMode,
 };
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
@@ -6255,6 +6255,9 @@ impl Session {
         // The markdown-read default only affects future opens; the current buffer's presentation
         // isn't retroactively flipped.
         self.markdown_read_default = settings.markdown_read;
+        // Theme is shell-render-only too: the shells resolve `self.theme` to a role table each
+        // frame (web also stamps `data-theme`), so adopting the mode is enough.
+        self.theme = settings.theme;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
@@ -6315,6 +6318,15 @@ impl Session {
                 self.markdown_read_default = !self.markdown_read_default;
                 self.persist_app_settings()
             }
+            // Theme: shell-render-only like ligatures — flip the mode + persist; every shell
+            // re-resolves its role table on the next render.
+            AppSettingId::Theme => {
+                self.theme = match self.theme {
+                    ThemeMode::Dark => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                };
+                self.persist_app_settings()
+            }
         }
     }
 
@@ -6343,6 +6355,7 @@ impl Session {
             ui_font_size: self.ui_font_size,
             hints: self.hints_enabled,
             markdown_read: self.markdown_read_default,
+            theme: self.theme,
         }
     }
 

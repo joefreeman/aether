@@ -45,6 +45,11 @@ pub struct AppSettings {
     /// the editor either way. Client-side behaviour the server only stores.
     #[serde(default = "default_markdown_read")]
     pub markdown_read: bool,
+    /// Colour theme, app-wide across every client. Purely a client-side render choice the server
+    /// only stores: shells resolve the mode to a role→shade table (the client core's `theme`
+    /// module) at draw time.
+    #[serde(default = "default_theme")]
+    pub theme: ThemeMode,
 }
 
 fn default_wrap() -> WrapMode {
@@ -73,6 +78,19 @@ fn default_markdown_read() -> bool {
     true
 }
 
+/// Which colour theme the clients render with. One value for the whole app, like every other app
+/// setting — there is deliberately no per-client override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+pub const fn default_theme() -> ThemeMode {
+    ThemeMode::Dark
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
@@ -82,6 +100,7 @@ impl Default for AppSettings {
             ui_font_size: default_ui_font_size(),
             hints: default_hints(),
             markdown_read: default_markdown_read(),
+            theme: default_theme(),
         }
     }
 }

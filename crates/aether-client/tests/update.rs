@@ -4774,6 +4774,41 @@ fn app_settings_apply_and_toggle_ligatures() {
     assert_eq!(params["ligatures"], json!(true));
 }
 
+#[test]
+fn app_settings_apply_and_toggle_theme() {
+    use aether_client::update::Event;
+    use aether_protocol::settings::{AppSettings, ThemeMode};
+
+    // Theme defaults dark; a persisted `light` is adopted with no shell effect (render-only —
+    // the shells re-resolve their role table on the next frame).
+    let mut s = session();
+    assert_eq!(s.theme, ThemeMode::Dark);
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        theme: ThemeMode::Light,
+        ..AppSettings::default()
+    })));
+    assert_eq!(s.theme, ThemeMode::Light, "persisted theme is adopted");
+    assert!(fx.0.is_empty(), "theme is render-only — no shell action");
+
+    // The row renders as a "Light theme" toggle whose checked state tracks the mode, and
+    // toggling flips the mode back to dark + persists via settings/set.
+    s.open_app_settings();
+    let rows = s.app_setting_rows();
+    let idx = rows
+        .iter()
+        .position(|r| matches!(r.id, aether_client::session::AppSettingId::Theme))
+        .expect("a Theme row");
+    assert_eq!(
+        rows[idx].control,
+        aether_client::session::AppSettingControl::Toggle(true),
+        "checked while light"
+    );
+    let fx = s.app_settings_toggle(idx);
+    assert_eq!(s.theme, ThemeMode::Dark, "toggle flips back to dark");
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["theme"], json!("dark"));
+}
+
 // ---- workspace creation + settings (docs: workspace creation + workspace settings) -----------------
 
 #[test]

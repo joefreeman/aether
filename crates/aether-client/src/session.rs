@@ -13,6 +13,7 @@ use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
+use aether_protocol::settings::ThemeMode;
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
@@ -546,6 +547,8 @@ pub enum AppSettingId {
     Hints,
     /// Open markdown buffers as the reading view (docs/markdown-view.md §1.6).
     MarkdownRead,
+    /// Light vs dark colour theme (the toggle is "light on/off"; off is dark).
+    Theme,
 }
 
 /// Font-size presets the two font-size rows step through (px). Both defaults
@@ -825,6 +828,10 @@ pub struct Session {
     /// separately from [`Self::buffer_font_size`]: chrome density and code size are different
     /// preferences.
     pub ui_font_size: u32,
+    /// Colour theme — an app-wide setting (`Space .`), seeded from `settings/get` at boot and
+    /// synced via `settings/changed`. The shells resolve it to a role→shade table
+    /// ([`crate::theme::Theme::of`]) each render; the core just holds the mode.
+    pub theme: ThemeMode,
     /// Hints on/off — an app-wide setting (`Space .`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
     /// hint disappears (and observation stops) when off.
@@ -1257,6 +1264,7 @@ impl Session {
             ligatures: true,
             buffer_font_size: aether_protocol::settings::default_buffer_font_size(),
             ui_font_size: aether_protocol::settings::default_ui_font_size(),
+            theme: aether_protocol::settings::default_theme(),
             hints_enabled: true,
             diff_view: false,
             read: None,
@@ -1325,6 +1333,12 @@ impl Session {
                     label: "Markdown reading view",
                     control: AppSettingControl::Toggle(self.markdown_read_default),
                     hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
+                },
+                AppSettingRow {
+                    id: AppSettingId::Theme,
+                    label: "Light theme",
+                    control: AppSettingControl::Toggle(self.theme == ThemeMode::Light),
+                    hint: "Render every client in the light colour theme (off is dark)",
                 },
             ],
         }]

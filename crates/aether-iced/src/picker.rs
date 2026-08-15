@@ -23,6 +23,8 @@ struct Spinner {
     phase: f32,
     /// Diameter in px — the chrome body size, so the throbber tracks the text it sits beside.
     size: f32,
+    /// Dot colour (the palette's accent) — the alpha comet is applied per dot.
+    color: Color,
 }
 
 impl Spinner {
@@ -67,7 +69,7 @@ where
             let d = (self.phase - a).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
             let color = Color {
                 a: 0.15 + 0.85 * (1.0 - d),
-                ..theme::NORD8
+                ..self.color
             };
             renderer.fill_quad(
                 renderer::Quad {
@@ -251,11 +253,12 @@ pub fn overlay<'a>(
     scroll_y: f32,
     spinner_phase: f32,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let mut panel = column![];
 
     // Input row: query (or a dim per-kind placeholder) with beam cursor, match counts on the
-    // right. Sits on NORD0 against the panel's NORD1 (web's .picker-input-row). The explorer
+    // right. Sits on the editor bg against the panel bg (web's .picker-input-row). The explorer
     // leads with a `label: rel/` breadcrumb (workspace-relative, terminal format), flush
     // against the query; the placeholder only shows when there's no breadcrumb.
     let mut input = row![].align_y(iced::Alignment::Center);
@@ -264,7 +267,7 @@ pub fn overlay<'a>(
     if !chip_row.is_empty() {
         let mut chips_el = row![].spacing(6).align_y(iced::Alignment::Center);
         for (i, c) in chip_row.iter().enumerate() {
-            chips_el = chips_el.push(chip_el(c, i, state.chip_selected == Some(i), ui));
+            chips_el = chips_el.push(chip_el(c, i, state.chip_selected == Some(i), ui, p));
         }
         input = input.push(chips_el);
         input = input.push(iced::widget::Space::new().width(8));
@@ -275,14 +278,14 @@ pub fn overlay<'a>(
             text(pfx.clone())
                 .size(ui.body())
                 .font(SANS)
-                .color(theme::NORD8),
+                .color(p.accent),
         );
     }
     // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
     // placeholder is suppressed there.
     let show_placeholder = prefix.is_none() && chip_row.is_empty();
-    // The query: a real `text_input` synced to the core (web parity). NORD6 value, NORD8
-    // caret/selection, dim placeholder, no border/background (the input row's NORD0 is the box).
+    // The query: a real `text_input` synced to the core (web parity). Bright value, accent
+    // caret/selection, dim placeholder, no border/background (the input row's bg is the box).
     // The Explorer's tab-completion ghost: the common-prefix suffix `Tab` would append.
     let completion = state.explorer_completion().filter(|s| !s.is_empty());
     // A completion ghost is itself the "what typing does" hint, so it also suppresses the
@@ -303,13 +306,13 @@ pub fn overlay<'a>(
         // `text_input` has no intrinsic content width — `Shrink` collapses it to nothing
         // (the typed text wouldn't show). Fill the row up to the count instead.
         .width(Length::Fill)
-        .style(|_theme, _status| iced::widget::text_input::Style {
+        .style(move |_theme, _status| iced::widget::text_input::Style {
             background: iced::Background::Color(iced::Color::TRANSPARENT),
             border: iced::Border::default(),
-            icon: theme::NORD6,
-            placeholder: theme::NORD3,
-            value: theme::NORD6,
-            selection: theme::NORD8,
+            icon: p.fg_bright,
+            placeholder: p.fg_faint,
+            value: p.fg_bright,
+            selection: p.accent,
         });
     // With chips present — and only while no chip is yet selected (the input still owns focus) —
     // Left / Backspace at the *start* of the query select the rightmost chip instead of editing
@@ -344,7 +347,7 @@ pub fn overlay<'a>(
         let ghost_text = text(format!("{}{}", state.query, suffix))
             .size(ui.body())
             .font(SANS)
-            .color(theme::NORD3_BRIGHT)
+            .color(p.fg_dim)
             .shaping(iced::widget::text::Shaping::Advanced)
             .wrapping(iced::widget::text::Wrapping::None);
         let ghost_layer: Element<'a, PickerMsg> =
@@ -360,6 +363,7 @@ pub fn overlay<'a>(
             container(Spinner {
                 phase: spinner_phase,
                 size: ui.body(),
+                color: p.accent,
             })
             .padding(iced::Padding::ZERO.right(6)),
         );
@@ -380,13 +384,13 @@ pub fn overlay<'a>(
         text(counts)
             .size(ui.small())
             .font(SANS)
-            .color(theme::NORD3_BRIGHT),
+            .color(p.fg_dim),
     );
     // The settled empty-state line (or none) — wording + when-to-show are owned by the core so all
     // shells agree (e.g. "No diagnostics" for an unfiltered empty list, "No matches" under a query).
     let empty_note = state.empty_note();
     // Nothing renders below the input (no rows, no message, no editor line): round its bottom
-    // corners too, so the NORD0 row doesn't poke out of the panel's rounded border.
+    // corners too, so the input row's bg doesn't poke out of the panel's rounded border.
     let input_is_last = state.total_display_rows == 0
         && state.pending_create().is_none()
         && empty_note.is_none()
@@ -396,7 +400,7 @@ pub fn overlay<'a>(
             .width(Length::Fill)
             .padding([10, 12])
             .style(move |_| container::Style {
-                background: Some(theme::NORD0.into()),
+                background: Some(p.bg.into()),
                 // Round the top corners to nest inside the panel's radius — iced doesn't clip
                 // children to the parent's rounded border (the web uses overflow: hidden).
                 border: iced::Border {
@@ -414,14 +418,14 @@ pub fn overlay<'a>(
     // Chip-editor line (glob / dir), revealed below the input row so chips + query stay
     // visible while editing. The slot is ALWAYS present (zero-size when closed) — swapping
     // the tree shape would reset the scrollable's state below (keyed by tree position).
-    panel = panel.push(editor_line(state, roots, ui));
+    panel = panel.push(editor_line(state, roots, ui, p));
     // Separator below the input, only coloured when the list has anything to separate (the
     // web's `.picker-list.filled` border-top). The slot itself is always present.
     let filled = state.total_display_rows > 0;
     panel = panel.push(
         container(iced::widget::Space::new().width(Length::Fill).height(1)).style(move |_| {
             container::Style {
-                background: filled.then(|| theme::NORD3.into()),
+                background: filled.then(|| p.border_subtle.into()),
                 ..container::Style::default()
             }
         }),
@@ -454,10 +458,10 @@ pub fn overlay<'a>(
                 path_index,
                 relative_path,
             } => {
-                list = list.push(grep_header(roots, path_index, relative_path, ui));
+                list = list.push(grep_header(roots, path_index, relative_path, ui, p));
             }
             DisplayRow::Section { label } => {
-                list = list.push(section_header(label, ui));
+                list = list.push(section_header(label, ui, p));
             }
             DisplayRow::Item { abs, item } => {
                 let selected = abs == state.selected;
@@ -465,7 +469,7 @@ pub fn overlay<'a>(
                 // Two-level hierarchy (docs/picker-groups.md §9): the collapsible kinds'
                 // item rows indent under their group header, aligning with the header text
                 // past its disclosure-mark cell. Header rows start flush.
-                let mut content = render_item(item, roots, tether, hovered, ui);
+                let mut content = render_item(item, roots, tether, hovered, ui, p);
                 if state.kind.collapsible() && !matches!(item, PickerItem::Group { .. }) {
                     content = row![
                         iced::widget::Space::new().width(group_item_indent(ui)),
@@ -479,7 +483,7 @@ pub fn overlay<'a>(
                     .padding([3, 12])
                     .align_y(iced::alignment::Vertical::Center)
                     .style(move |_| container::Style {
-                        background: selected.then(|| theme::NORD2.into()),
+                        background: selected.then(|| p.bg_selection.into()),
                         ..container::Style::default()
                     });
                 list = list.push(
@@ -506,14 +510,14 @@ pub fn overlay<'a>(
                             style: iced::font::Style::Italic,
                             ..iced::Font::DEFAULT
                         })
-                        .color(theme::NORD8),
+                        .color(p.accent),
                 )
                 .width(Length::Fill)
                 .height(ui.row_h())
                 .padding([3, 12])
                 .align_y(iced::alignment::Vertical::Center)
                 .style(move |_| container::Style {
-                    background: selected.then(|| theme::NORD2.into()),
+                    background: selected.then(|| p.bg_selection.into()),
                     ..container::Style::default()
                 });
                 list = list.push(
@@ -596,7 +600,7 @@ pub fn overlay<'a>(
                 // A collapsible kind's pin stands in for the run's scrolled-off `Group` row —
                 // same chevron + count dressing (the span carries them for exactly this).
                 (Some(count), header) => {
-                    group_pin_header(roots, header, count, span.expanded.unwrap_or(false), ui)
+                    group_pin_header(roots, header, count, span.expanded.unwrap_or(false), ui, p)
                 }
                 (
                     None,
@@ -604,8 +608,8 @@ pub fn overlay<'a>(
                         path_index,
                         relative_path,
                     },
-                ) => grep_header(roots, *path_index, relative_path, ui),
-                (None, GroupHeader::Label { label }) => section_header(label.clone(), ui),
+                ) => grep_header(roots, *path_index, relative_path, ui, p),
+                (None, GroupHeader::Label { label }) => section_header(label.clone(), ui, p),
             };
             container(header)
                 .width(Length::Fill)
@@ -623,13 +627,13 @@ pub fn overlay<'a>(
 
     if let Some(note) = empty_note {
         // The web's `.picker-empty` styling (italic, dim, list-row padding) — but a notch
-        // brighter than its NORD3: that reads fine on the web panel, too faint here.
+        // brighter than its faint rung: that reads fine on the web panel, too faint here.
         panel = panel.push(
             container(
                 text(note)
                     .size(ui.body())
                     .font(SANS_ITALIC)
-                    .color(theme::NORD3_BRIGHT),
+                    .color(p.fg_dim),
             )
             .padding([6, 12]),
         );
@@ -639,10 +643,12 @@ pub fn overlay<'a>(
         .width(ui.at(720.0))
         // 1px inset keeps the border ring visible around the (otherwise covering) input row.
         .padding(1)
-        .style(|_| container::Style {
-            background: Some(theme::NORD1.into()),
+        .style(move |_| container::Style {
+            background: Some(p.bg_panel.into()),
             border: iced::Border {
-                color: theme::NORD3,
+                // Hairline chrome border — a step quieter than `overlay_border`'s brighter
+                // popover outline.
+                color: p.border_subtle,
                 width: 1.0,
                 radius: 6.0.into(),
             },
@@ -699,13 +705,19 @@ pub fn editor_path_id() -> iced::advanced::widget::Id {
 /// One filter chip: compact label on a raised background; selected inverts; exclude globs
 /// (leading `!`) tint red; only the whole-word chip underlines. Clicking selects (selection is
 /// virtual — focus never leaves the query, exactly like the keyboard path).
-fn chip_el<'a>(chip: &Chip, idx: usize, selected: bool, ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn chip_el<'a>(
+    chip: &Chip,
+    idx: usize,
+    selected: bool,
+    ui: theme::Ui,
+    p: &'static theme::Palette,
+) -> Element<'a, PickerMsg> {
     let exclude = chip.label.starts_with('!');
     let (bg, fg) = match (selected, exclude) {
-        (true, true) => (theme::NORD11, theme::NORD0),
-        (true, false) => (theme::NORD8, theme::NORD0),
-        (false, true) => (theme::NORD2, theme::NORD11),
-        (false, false) => (theme::NORD2, theme::NORD8),
+        (true, true) => (p.error, p.fg_on_accent),
+        (true, false) => (p.accent, p.fg_on_accent),
+        (false, true) => (p.bg_selection, p.error),
+        (false, false) => (p.bg_selection, p.accent),
     };
     let underline = matches!(chip.id, ChipId::Word);
     let spans: Vec<iced::widget::text::Span<'a>> =
@@ -755,8 +767,9 @@ pub(crate) fn field_with_ghost<'a>(
     hug: bool,
     boundary: Boundary,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
-    let color = if invalid { theme::NORD11 } else { theme::NORD6 };
+    let color = if invalid { p.error } else { p.fg_bright };
     // The gray layer behind: the typed text (its prefix is covered by the opaque input value)
     // followed by the suggestion suffix (the only part that shows through).
     let suffix = ghost.filter(|g| !g.is_empty()).unwrap_or_default();
@@ -784,7 +797,7 @@ pub(crate) fn field_with_ghost<'a>(
     let ghost_text = text(layer_str)
         .size(ui.body())
         .font(SANS)
-        .color(theme::NORD3_BRIGHT)
+        .color(p.fg_dim)
         .shaping(iced::widget::text::Shaping::Advanced)
         .wrapping(iced::widget::text::Wrapping::None);
     // The stack sizes to its base layer (the ghost). `text_input` scrolls its value left to keep
@@ -797,7 +810,7 @@ pub(crate) fn field_with_ghost<'a>(
     let ghost_layer: Element<'a, PickerMsg> =
         row![ghost_text, iced::widget::Space::new().width(CARET_SLACK)].into();
     // The controlled input on top: transparent background so the gray suffix shows through after
-    // the typed text; opaque NORD6 (or red) value covers the gray prefix; NORD8 caret/selection.
+    // the typed text; opaque bright (or red) value covers the gray prefix; accent caret/selection.
     // No placeholder on the input itself — the ghost layer draws it (see above).
     let field_inner = iced::widget::text_input("", &input.text)
         .id(id)
@@ -810,9 +823,9 @@ pub(crate) fn field_with_ghost<'a>(
             background: iced::Background::Color(iced::Color::TRANSPARENT),
             border: iced::Border::default(),
             icon: color,
-            placeholder: theme::NORD3_BRIGHT,
+            placeholder: p.fg_dim,
             value: color,
-            selection: theme::NORD8,
+            selection: p.accent,
         });
     // Forward the field's boundary key to the core's keymap instead of letting the focused input
     // swallow it (web/TUI parity).
@@ -857,6 +870,7 @@ fn editor_line<'a>(
     state: &'a PickerState,
     roots: &'a [String],
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let Some(ed) = &state.chip_editor else {
         return iced::widget::Space::new().width(0).height(0).into();
@@ -865,7 +879,7 @@ fn editor_line<'a>(
     let multi_root = ed.is_dir() && roots.len() > 1;
     let mut line = row![].spacing(6).align_y(iced::Alignment::Center);
     let tag = ed.field_tag();
-    line = line.push(text(tag).size(ui.body()).font(SANS).color(theme::NORD8));
+    line = line.push(text(tag).size(ui.body()).font(SANS).color(p.accent));
     if multi_root {
         let invalid = ed.root_invalid(&labels);
         // Group the root segment with its `:` separator at zero spacing, so the colon sits flush
@@ -889,6 +903,7 @@ fn editor_line<'a>(
                 true,
                 Boundary::ConfirmRoot,
                 ui,
+                p,
             ));
         } else {
             // Unfocused root: the chosen label in the breadcrumb blue — or the raw filter
@@ -901,14 +916,14 @@ fn editor_line<'a>(
                     .cloned()
                     .unwrap_or_default()
             };
-            let color = if invalid { theme::NORD11 } else { theme::NORD8 };
+            let color = if invalid { p.error } else { p.accent };
             root_group = root_group.push(text(display).size(ui.body()).font(SANS).color(color));
             if show_sep {
                 root_group = root_group.push(
                     text(":")
                         .size(ui.body())
                         .font(SANS)
-                        .color(theme::NORD3_BRIGHT),
+                        .color(p.fg_dim),
                 );
             }
         }
@@ -937,6 +952,7 @@ fn editor_line<'a>(
                 false,
                 Boundary::None,
                 ui,
+                p,
             ));
         } else {
             line = line.push(field_with_ghost(
@@ -950,14 +966,15 @@ fn editor_line<'a>(
                 false,
                 path_boundary,
                 ui,
+                p,
             ));
         }
     } else if !ed.input.text.is_empty() {
         // Unfocused path: plain text (red when invalid) — no suggestion until it's focused.
         let color = if ed.path_invalid() {
-            theme::NORD11
+            p.error
         } else {
-            theme::NORD6
+            p.fg_bright
         };
         line = line.push(
             text(ed.input.text.clone())
@@ -969,8 +986,8 @@ fn editor_line<'a>(
     container(line)
         .width(Length::Fill)
         .padding([6, 12])
-        .style(|_| container::Style {
-            background: Some(theme::NORD0.into()),
+        .style(move |_| container::Style {
+            background: Some(p.bg.into()),
             ..container::Style::default()
         })
         .into()
@@ -983,6 +1000,7 @@ fn grep_header<'a>(
     path_index: u32,
     relative_path: &str,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     // Multi-root workspaces prefix the disambiguated root label as `{label}: {path}` — the same
     // form the TUI and web clients use (and the grep filter chips / status bar). The path
@@ -1002,7 +1020,7 @@ fn grep_header<'a>(
         text(label)
             .size(ui.body())
             .font(SANS_BOLD)
-            .color(theme::NORD8)
+            .color(p.accent)
             // One row-height line only — a wrapped header would spill onto the row beneath and
             // break the sticky pinned-header overlay.
             .wrapping(iced::widget::text::Wrapping::None),
@@ -1011,8 +1029,8 @@ fn grep_header<'a>(
     .height(ui.row_h())
     .padding([3, 12])
     .align_y(iced::alignment::Vertical::Center)
-    .style(|_| container::Style {
-        background: Some(theme::NORD1.into()),
+    .style(move |_| container::Style {
+        background: Some(p.bg_panel.into()),
         ..container::Style::default()
     })
     .into()
@@ -1021,20 +1039,24 @@ fn grep_header<'a>(
 /// A section label (References' `Definition` / `References`, the Keybindings picker's group
 /// headings). Same footprint and chrome as [`grep_header`] but a label rather than a file path.
 /// Takes ownership (`Into<String>`) so the sticky pin can hand it a String built in a match arm.
-fn section_header<'a>(label: impl Into<String>, ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn section_header<'a>(
+    label: impl Into<String>,
+    ui: theme::Ui,
+    p: &'static theme::Palette,
+) -> Element<'a, PickerMsg> {
     container(
         text(label.into())
             .size(ui.body())
             .font(SANS_BOLD)
-            .color(theme::NORD8)
+            .color(p.accent)
             .wrapping(iced::widget::text::Wrapping::None),
     )
     .width(Length::Fill)
     .height(ui.row_h())
     .padding([3, 12])
     .align_y(iced::alignment::Vertical::Center)
-    .style(|_| container::Style {
-        background: Some(theme::NORD1.into()),
+    .style(move |_| container::Style {
+        background: Some(p.bg_panel.into()),
         ..container::Style::default()
     })
     .into()
@@ -1071,23 +1093,24 @@ fn group_pin_header<'a>(
     count: u32,
     expanded: bool,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     container(
         row![
-            disclosure_mark(expanded, ui),
+            disclosure_mark(expanded, ui, p),
             // Not bold (unlike the derived section headers): the indent under the header
-            // (docs/picker-groups.md §9.2) already carries the hierarchy, and NORD8 alone
+            // (docs/picker-groups.md §9.2) already carries the hierarchy, and the accent alone
             // marks the row as chrome.
             text(group_header_label(roots, header))
                 .size(ui.body())
                 .font(SANS)
-                .color(theme::NORD8)
+                .color(p.accent)
                 .wrapping(iced::widget::text::Wrapping::None),
             iced::widget::Space::new().width(Length::Fill),
             text(count.to_string())
                 .size(ui.small())
                 .font(SANS)
-                .color(theme::NORD3_BRIGHT)
+                .color(p.fg_dim)
                 .wrapping(iced::widget::text::Wrapping::None),
         ]
         .spacing(6)
@@ -1097,8 +1120,8 @@ fn group_pin_header<'a>(
     .height(ui.row_h())
     .padding([3, 12])
     .align_y(iced::alignment::Vertical::Center)
-    .style(|_| container::Style {
-        background: Some(theme::NORD1.into()),
+    .style(move |_| container::Style {
+        background: Some(p.bg_panel.into()),
         ..container::Style::default()
     })
     .into()
@@ -1107,12 +1130,16 @@ fn group_pin_header<'a>(
 /// The group header's disclosure chevron in a fixed-width cell — fixed so the header text
 /// starts at a known x, and the item rows' indent ([`GROUP_ITEM_INDENT`] = this cell + the
 /// row's 6px gap) lines their text up under it (docs/picker-groups.md §9).
-fn disclosure_mark<'a>(expanded: bool, ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn disclosure_mark<'a>(
+    expanded: bool,
+    ui: theme::Ui,
+    p: &'static theme::Palette,
+) -> Element<'a, PickerMsg> {
     container(
         text(if expanded { "▾" } else { "▸" })
             .size(ui.body())
             .font(SANS)
-            .color(theme::NORD8),
+            .color(p.accent),
     )
     .width(ui.at(MARK_CELL))
     .into()
@@ -1154,11 +1181,11 @@ fn glyph_cell<'a>(
 
 /// Right-aligned dim metadata (line numbers, ranges, paths). Never wraps — rows are exactly one
 /// display row tall, so a wrapped second line would spill into the row below.
-fn meta<'a>(s: String, ui: theme::Ui) -> Element<'a, PickerMsg> {
+fn meta<'a>(s: String, ui: theme::Ui, p: &'static theme::Palette) -> Element<'a, PickerMsg> {
     text(s)
         .size(ui.small())
         .font(SANS)
-        .color(theme::NORD3_BRIGHT)
+        .color(p.fg_dim)
         .wrapping(iced::widget::text::Wrapping::None)
         .into()
 }
@@ -1172,17 +1199,14 @@ fn git_change_summary<'a>(
     added: u32,
     removed: u32,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let staged = stage == DiffStage::Staged;
-    let added_color = if staged {
-        theme::GIT_STAGED_ADDED
-    } else {
-        theme::GIT_ADDED
-    };
+    let added_color = if staged { p.git_staged_added } else { p.git_added };
     let removed_color = if staged {
-        theme::GIT_STAGED_DELETED
+        p.git_staged_deleted
     } else {
-        theme::GIT_DELETED
+        p.git_deleted
     };
     let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::new();
     let count = |text: String, color| {
@@ -1197,7 +1221,7 @@ fn git_change_summary<'a>(
     }
     if added > 0 {
         if removed > 0 {
-            spans.push(count(" ".to_string(), theme::NORD4));
+            spans.push(count(" ".to_string(), p.fg));
         }
         spans.push(count(format!("+{added}"), added_color));
     }
@@ -1214,10 +1238,11 @@ fn render_item<'a>(
     tether: Option<aether_protocol::BufferId>,
     hovered: bool,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     match item {
         // A collapsible group's header row (docs/picker-groups.md) — a real, selectable row
-        // in the same NORD8 bold chrome as the derived headers, plus a disclosure mark and
+        // in the same accent chrome as the derived headers, plus a disclosure mark and
         // the run's right-aligned item count. The selection band comes from the row wrapper,
         // like any other item.
         PickerItem::Group {
@@ -1227,15 +1252,15 @@ fn render_item<'a>(
         } => {
             let label = group_header_label(roots, header);
             row![
-                disclosure_mark(*expanded, ui),
+                disclosure_mark(*expanded, ui, p),
                 // Not bold — see `group_pin_header` (the pin must render identically).
                 text(label)
                     .size(ui.body())
                     .font(SANS)
-                    .color(theme::NORD8)
+                    .color(p.accent)
                     .wrapping(iced::widget::text::Wrapping::None),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(count.to_string(), ui),
+                meta(count.to_string(), ui, p),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -1247,16 +1272,17 @@ fn render_item<'a>(
             match_indices,
             git_status,
         } => {
-            let mut r = row![dot_cell(git_status.map(git_status_color), ui)]
+            let mut r = row![dot_cell(git_status.map(|s| git_status_color(p, s)), ui)]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
             r = r.push(highlighted(
                 relative_path,
                 match_indices,
-                theme::NORD4,
+                p.fg,
                 SANS,
                 hovered,
-            ui,
+                ui,
+                p,
             ));
             // Multi-root workspaces: the root's label, dim, after the path (web/terminal style).
             if let Some(label) = root_label(roots, *path_index) {
@@ -1264,7 +1290,7 @@ fn render_item<'a>(
                     text(label)
                         .size(ui.body())
                         .font(SANS)
-                        .color(theme::NORD3_BRIGHT)
+                        .color(p.fg_dim)
                         .wrapping(iced::widget::text::Wrapping::None),
                 );
             }
@@ -1282,22 +1308,20 @@ fn render_item<'a>(
             let mut r = row![highlighted(
                 display,
                 match_indices,
-                theme::NORD4,
+                p.fg,
                 if *transient { SANS_ITALIC } else { SANS },
                 hovered,
                 ui,
+                p,
             )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
             // The session's tether: the status bar's dim `*` after the path (docs/tether.md —
             // closing this row exits the client). Upright even on a slanted transient row.
             if tether == Some(*buffer_id) {
-                r = r.push(
-                    text("*")
-                        .size(ui.body())
-                        .font(SANS)
-                        .color(theme::NORD3_BRIGHTER),
-                );
+                // `fg_muted`: the dim-but-legible rung between `fg_dim` and `fg` (dark stays
+                // the historic NORD3_BRIGHTER).
+                r = r.push(text("*").size(ui.body()).font(SANS).color(p.fg_muted));
             }
             // Multi-root workspaces: the root's label, dim, after the name — same placement as the
             // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
@@ -1306,13 +1330,13 @@ fn render_item<'a>(
                     text(label)
                         .size(ui.body())
                         .font(SANS)
-                        .color(theme::NORD3_BRIGHT)
+                        .color(p.fg_dim)
                         .wrapping(iced::widget::text::Wrapping::None),
                 );
             }
             // Buffer-state dot floats flush-right, matching the web picker and the status bar.
             r = r.push(iced::widget::Space::new().width(Length::Fill));
-            if let Some(color) = dirty_color(*status) {
+            if let Some(color) = dirty_color(p, *status) {
                 r = r.push(text("●").size(ui.state_dot()).font(SANS).color(color));
             }
             r.into()
@@ -1337,13 +1361,14 @@ fn render_item<'a>(
                 highlighted_owned(
                     truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
                     shifted,
-                    theme::NORD4,
+                    p.fg,
                     iced::Font::MONOSPACE,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 ),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(format!("{}", line + 1), ui),
+                meta(format!("{}", line + 1), ui, p),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -1373,13 +1398,14 @@ fn render_item<'a>(
                 highlighted_owned(
                     truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
                     shifted,
-                    theme::NORD4,
+                    p.fg,
                     iced::Font::MONOSPACE,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 ),
                 iced::widget::Space::new().width(Length::Fill),
-                git_change_summary(*stage, *added, *removed, ui),
+                git_change_summary(*stage, *added, *removed, ui, p),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -1397,19 +1423,20 @@ fn render_item<'a>(
         } => row![
             glyph_cell(
                 theme::diag_glyph(*severity),
-                theme::diagnostic_color(*severity),
+                theme::diagnostic_color(p.mode, *severity),
                 ui,
             ),
             highlighted(
                 message.split('\n').next().unwrap_or(message),
                 match_indices,
-                theme::NORD4,
+                p.fg,
                 SANS,
                 hovered,
-            ui,
+                ui,
+                p,
             ),
             iced::widget::Space::new().width(Length::Fill),
-            meta(diag_range_label(*line, *col, *end_line, *end_col), ui),
+            meta(diag_range_label(*line, *col, *end_line, *end_col), ui, p),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center)
@@ -1440,13 +1467,14 @@ fn render_item<'a>(
                 highlighted_owned(
                     truncate_chars(trimmed.trim_end(), REFERENCE_PREVIEW_MAX_CHARS),
                     shifted,
-                    theme::NORD4,
+                    p.fg,
                     iced::Font::MONOSPACE,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 ),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(loc, ui),
+                meta(loc, ui, p),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -1461,11 +1489,11 @@ fn render_item<'a>(
             // A status bullet for real changes; ignored entries dim their text instead.
             let changed = git_status.filter(|s| *s != GitStatus::Ignored);
             let base = if *git_status == Some(GitStatus::Ignored) {
-                theme::NORD3_BRIGHT
+                p.fg_dim
             } else if *is_dir {
-                theme::NORD8
+                p.accent
             } else {
-                theme::NORD4
+                p.fg
             };
             // The trailing `/` rides inside the name text (match indices point into `name`
             // chars, so appending is safe) — a separate widget would inherit the row gap.
@@ -1475,8 +1503,8 @@ fn render_item<'a>(
                 name.clone()
             };
             row![
-                dot_cell(changed.map(git_status_color), ui),
-                highlighted_owned(display, match_indices.clone(), base, SANS, hovered, ui),
+                dot_cell(changed.map(|s| git_status_color(p, s)), ui),
+                highlighted_owned(display, match_indices.clone(), base, SANS, hovered, ui, p),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -1497,7 +1525,7 @@ fn render_item<'a>(
                 .unwrap_or_default();
             row![
                 dot_cell(None, ui),
-                highlighted_owned(name, match_indices.clone(), theme::NORD8, SANS, hovered, ui),
+                highlighted_owned(name, match_indices.clone(), p.accent, SANS, hovered, ui, p),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -1515,13 +1543,14 @@ fn render_item<'a>(
                 highlighted_owned(
                     aether_client::labels::workspace_display(name),
                     Vec::new(),
-                    theme::NORD6,
+                    p.fg_bright,
                     SANS_ITALIC,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 )
             } else {
-                highlighted(name, match_indices, theme::NORD6, SANS, hovered, ui)
+                highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p)
             };
             // Trailing frost-blue dot when the workspace has unsaved buffers — the same right-aligned
             // dot the buffer picker shows, so the two pickers read alike.
@@ -1529,7 +1558,12 @@ fn render_item<'a>(
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
             if *unsaved_buffers > 0 {
-                r = r.push(text("●").size(ui.state_dot()).font(SANS).color(theme::NORD9));
+                r = r.push(
+                    text("●")
+                        .size(ui.state_dot())
+                        .font(SANS)
+                        .color(p.state_unsaved),
+                );
             }
             r.into()
         }
@@ -1547,9 +1581,9 @@ fn render_item<'a>(
             let busy =
                 matches!(status, aether_protocol::lsp::LspStatus::Ready) && !progress.is_empty();
             let color = if busy {
-                theme::NORD13
+                p.warning
             } else {
-                theme::lsp_status_color(status)
+                theme::lsp_status_color(p.mode, status)
             };
             let mut m = language.clone();
             if !root_label.is_empty() {
@@ -1560,9 +1594,9 @@ fn render_item<'a>(
             }
             row![
                 dot_cell(Some(color), ui),
-                highlighted(name, match_indices, theme::NORD6, SANS, hovered, ui),
+                highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(m, ui),
+                meta(m, ui, p),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -1589,22 +1623,23 @@ fn render_item<'a>(
                 r = r.push(iced::widget::Space::new().width(Length::Fixed((indent * 6) as f32)));
             }
             if *context {
-                r = r.push(meta(name.clone(), ui)); // dim, non-matching ancestor
+                r = r.push(meta(name.clone(), ui, p)); // dim, non-matching ancestor
             } else {
                 r = r.push(highlighted(
                     name,
                     match_indices,
-                    theme::NORD6,
+                    p.fg_bright,
                     SANS,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 ));
             }
             if !detail.is_empty() {
-                r = r.push(meta(truncate_chars(detail, PREVIEW_MAX_CHARS), ui));
+                r = r.push(meta(truncate_chars(detail, PREVIEW_MAX_CHARS), ui, p));
             }
             r = r.push(iced::widget::Space::new().width(Length::Fill));
-            r = r.push(meta(symbol_kind.label().to_string(), ui));
+            r = r.push(meta(symbol_kind.label().to_string(), ui, p));
             r.into()
         }
         PickerItem::Keybinding {
@@ -1629,29 +1664,32 @@ fn render_item<'a>(
             r = r.push(highlighted_owned(
                 desc.clone(),
                 seg.desc,
-                theme::NORD6,
+                p.fg_bright,
                 SANS,
                 hovered,
-            ui,
+                ui,
+                p,
             ));
             if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
                 r = r.push(highlighted_owned(
                     format!("({mode})"),
                     seg.mode.iter().map(|i| i + 1).collect(),
-                    theme::NORD3_BRIGHT,
+                    p.fg_dim,
                     SANS,
                     false,
-                ui,
+                    ui,
+                    p,
                 ));
             }
             r = r.push(iced::widget::Space::new().width(Length::Fill));
             r = r.push(highlighted_owned(
                 keys.clone(),
                 seg.keys,
-                theme::NORD8,
+                p.accent,
                 SANS,
                 false,
-            ui,
+                ui,
+                p,
             ));
             r.into()
         }
@@ -1676,13 +1714,14 @@ fn render_item<'a>(
                 highlighted_owned(
                     truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
                     shifted,
-                    theme::NORD4,
+                    p.fg,
                     iced::Font::MONOSPACE,
                     hovered,
-                ui,
+                    ui,
+                    p,
                 ),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(format!("{}", line + 1), ui),
+                meta(format!("{}", line + 1), ui, p),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)
@@ -1740,6 +1779,7 @@ fn highlighted<'a>(
     font: iced::Font,
     underline: bool,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     highlighted_owned(
         display.to_string(),
@@ -1748,6 +1788,7 @@ fn highlighted<'a>(
         font,
         underline,
         ui,
+        p,
     )
 }
 
@@ -1759,6 +1800,7 @@ fn highlighted_owned<'a>(
     font: iced::Font,
     underline: bool,
     ui: theme::Ui,
+    p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::new();
     let mut run = String::new();
@@ -1767,7 +1809,7 @@ fn highlighted_owned<'a>(
         if run.is_empty() {
             return;
         }
-        let color = if matched { theme::NORD13 } else { base };
+        let color = if matched { p.match_highlight } else { base };
         spans.push(
             iced::widget::span(std::mem::take(run))
                 .size(ui.body())
@@ -1826,22 +1868,23 @@ fn root_label(roots: &[String], path_index: u32) -> Option<String> {
         .cloned()
 }
 
-fn git_status_color(s: GitStatus) -> iced::Color {
+/// Status-bullet colour — the core's `git_status_bullet` mapping through the palette roles,
+/// plus the files picker's dim dot for ignored entries (the core carries no bullet for those).
+fn git_status_color(p: &theme::Palette, s: GitStatus) -> iced::Color {
     match s {
-        GitStatus::Conflicted | GitStatus::Deleted => theme::NORD11,
-        GitStatus::Modified => theme::NORD13,
-        GitStatus::Added => theme::NORD14,
-        GitStatus::Untracked => theme::NORD14,
-        GitStatus::Ignored => theme::NORD3_BRIGHT,
+        GitStatus::Conflicted | GitStatus::Deleted => p.git_deleted,
+        GitStatus::Modified => p.git_modified,
+        GitStatus::Added | GitStatus::Untracked => p.git_added,
+        GitStatus::Ignored => p.fg_dim,
     }
 }
 
 /// Buffer-state dot colour — same precedence/colours as the status bar.
-fn dirty_color(s: BufferDirtyState) -> Option<iced::Color> {
+fn dirty_color(p: &theme::Palette, s: BufferDirtyState) -> Option<iced::Color> {
     match s {
         BufferDirtyState::Clean => None,
-        BufferDirtyState::Unsaved => Some(theme::NORD9),
-        BufferDirtyState::ExternallyModified => Some(theme::NORD12),
-        BufferDirtyState::ExternallyDeleted => Some(theme::NORD11),
+        BufferDirtyState::Unsaved => Some(p.state_unsaved),
+        BufferDirtyState::ExternallyModified => Some(p.state_changed),
+        BufferDirtyState::ExternallyDeleted => Some(p.state_deleted),
     }
 }

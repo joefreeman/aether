@@ -322,6 +322,9 @@ pub async fn run(
     shell.spawn_boot_dial();
     shell.sync();
     crate::app::apply_cursor_style(&shell.state);
+    // The theme mode is thread-local in `ui`; stamp it from the session before every paint so
+    // a settings toggle (or the boot-time restore) takes effect on the next frame.
+    ui::set_theme_mode(shell.session.theme);
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
 
@@ -378,6 +381,7 @@ pub async fn run(
         }
         shell.sync();
         crate::app::apply_cursor_style(&shell.state);
+        ui::set_theme_mode(shell.session.theme);
         terminal.draw(|f| ui::draw(f, &shell.state))?;
         crate::app::refresh_terminal_title(&mut shell.state);
     }
@@ -2085,7 +2089,7 @@ impl Shell {
         let rows = self.read_cache.as_ref().expect("just filled").4.clone();
         // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
         // always marks the reading position; the interactive target inverts on top of it.
-        // An extended selection adds a third (§12): the NORD2 tint over the selected blocks'
+        // An extended selection adds a third (§12): the selection tint over the selected blocks'
         // rows — and suppresses the pill (display_target), one selection on screen at a time.
         let cursor_state = self.session.buffer.cursor;
         let block_focus = read.display_block_focus(&cursor_state);

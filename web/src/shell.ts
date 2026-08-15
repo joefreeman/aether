@@ -421,6 +421,9 @@ interface CoreView {
   /** Chrome text size in px (the synced `ui_font_size` app setting) — status bar, pickers,
    *  dialogs, hover, toasts, hints. */
   ui_font_size: number;
+  /** Colour theme (the synced `theme` app setting). The shell stamps it onto
+   *  `<html data-theme>`; theme.css switches its role variables (and `color-scheme`) on it. */
+  theme: "dark" | "light";
   window: BufferWindow | null;
   viewport_id: number | null;
   buffer: {
@@ -533,12 +536,15 @@ function basename(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
-/** Buffer-state accent colour for the status dot (ported from the old client): deleted-on-disk →
- *  red, externally-changed → orange, unsaved edits → frost blue, clean → none. */
+/** Buffer-state accent colour for the status dot (and the dirty favicon): deleted-on-disk /
+ *  externally-changed / unsaved edits, clean → none. Hexes mirror the `state_deleted` /
+ *  `state_changed` / `state_unsaved` roles of `Theme::DARK` / `Theme::LIGHT` in
+ *  crates/aether-client/src/theme.rs — keep in sync. */
 function bufferStateColor(v: CoreView): string | null {
-  if (v.externally_deleted) return "#bf616a";
-  if (v.externally_modified) return "#d08770";
-  if (v.buffer.revision !== v.buffer.saved_revision) return "#81a1c1";
+  const light = v.theme === "light";
+  if (v.externally_deleted) return "#bf616a"; // state-deleted (NORD11 in both themes)
+  if (v.externally_modified) return light ? "#ab5f38" : "#d08770"; // state-changed
+  if (v.buffer.revision !== v.buffer.saved_revision) return light ? "#5e81ac" : "#81a1c1"; // state-unsaved
   return null;
 }
 
@@ -952,6 +958,8 @@ export class Shell {
    *  The authoritative values are the core's `view.buffer_font_size` / `view.ui_font_size`. */
   private appliedBufferFontSize = 0;
   private appliedUiFontSize = 0;
+  /** The theme currently stamped on `<html data-theme>` — `render` restamps only on a change. */
+  private appliedTheme = "";
   /** The most recent `view()` — refreshed every `render()`, read by the geometry methods so they
    *  don't re-serialize the window on every scroll event. */
   private snapshot: CoreView | null = null;
@@ -2259,6 +2267,15 @@ export class Shell {
     this.onResize();
   }
 
+  /** Stamp the synced colour theme onto the document root: theme.css switches every role
+   *  variable (and `color-scheme`) on `[data-theme]`, so the whole page re-skins from CSS
+   *  alone. Only touches the DOM when the value changed (this runs on every render). */
+  private applyTheme(theme: CoreView["theme"]): void {
+    if (theme === this.appliedTheme) return;
+    this.appliedTheme = theme;
+    document.documentElement.dataset.theme = theme;
+  }
+
   /** Re-render the viewport at the just-toggled wrap mode. The core already flipped `Session.wrap`;
    *  this issues the geometry RPC (mirrors iced): zero the horizontal scroll, ask the server to
    *  re-render the existing viewport at the new wrap, adopt the window, then keep the cursor on-screen
@@ -2695,6 +2712,7 @@ export class Shell {
     this.snapshot = v;
     // Adopt the synced font sizes before drawing, so this paint uses the right cell metrics.
     this.applyFontSizes(v.buffer_font_size, v.ui_font_size);
+    this.applyTheme(v.theme);
     this.renderSearch(v);
     this.renderPrompt(v);
     this.renderPicker(v);

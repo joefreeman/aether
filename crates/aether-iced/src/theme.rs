@@ -1,44 +1,180 @@
-//! Nord palette — mirrors `web/src/theme.css` and `aether-tui/src/ui.rs` so all clients match.
+//! The iced shell's palette: the client core's role table ([`aether_client::theme::Theme`])
+//! converted to [`iced::Color`] once per mode. Call sites reference *roles* (`p.bg`, `p.accent`)
+//! rather than Nord shades, so the light theme is the same code path with a different table —
+//! the core owns both tables and the semantic mappings (syntax kind / diagnostic severity /
+//! LSP status → role); this module is only the `Rgb → Color` edge.
 
+use aether_client::theme::Theme;
+use aether_protocol::settings::ThemeMode;
 use iced::Color;
+use std::sync::LazyLock;
 
-const fn rgb(hex: u32) -> Color {
-    Color {
-        r: ((hex >> 16) & 0xff) as f32 / 255.0,
-        g: ((hex >> 8) & 0xff) as f32 / 255.0,
-        b: (hex & 0xff) as f32 / 255.0,
-        a: 1.0,
+/// Convert a core palette colour to iced's colour type — the one place `Rgb` crosses into iced.
+fn color(c: aether_client::theme::Rgb) -> Color {
+    Color::from_rgb8(c.r, c.g, c.b)
+}
+
+/// One theme's colour roles as `iced::Color` — field-for-field the core's [`Theme`] (minus the
+/// `syn_*` syntax roles, which only flow through [`highlight_color`]). Resolve once per view pass
+/// with [`palette`] and thread it alongside [`Ui`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// The mode this table renders — for the rare mode branches (the base widget theme,
+    /// [`highlight_color`] at draw time).
+    pub mode: ThemeMode,
+
+    // ---- Backgrounds ----
+    pub bg: Color,
+    pub bg_panel: Color,
+    pub bg_selection: Color,
+    pub bg_visual: Color,
+    pub fill_dim: Color,
+    pub sneak_prefix_bg: Color,
+    pub match_highlight: Color,
+    pub match_bracket: Color,
+    pub cursor_line_bg: Color,
+    pub overlay_border: Color,
+    pub border_subtle: Color,
+
+    // ---- Foregrounds ----
+    pub fg: Color,
+    pub fg_bright: Color,
+    pub fg_muted: Color,
+    pub fg_dim: Color,
+    pub fg_faint: Color,
+    pub fg_on_accent: Color,
+
+    // ---- Accents & status ----
+    pub accent: Color,
+    pub accent_alt: Color,
+    pub accent_deep: Color,
+    pub error: Color,
+    pub warning: Color,
+    pub info: Color,
+    pub ok: Color,
+
+    // ---- Buffer-state dot ----
+    pub state_deleted: Color,
+    pub state_changed: Color,
+    pub state_unsaved: Color,
+
+    // ---- Git ----
+    pub git_added: Color,
+    pub git_modified: Color,
+    pub git_deleted: Color,
+    pub git_staged_added: Color,
+    pub git_staged_modified: Color,
+    pub git_staged_deleted: Color,
+    pub git_added_bg: Color,
+    pub git_modified_bg: Color,
+    pub git_deleted_bg: Color,
+    pub git_staged_added_bg: Color,
+    pub git_staged_modified_bg: Color,
+    pub git_staged_deleted_bg: Color,
+    pub cursor_line_added_bg: Color,
+    pub cursor_line_modified_bg: Color,
+    pub cursor_line_staged_added_bg: Color,
+    pub cursor_line_staged_modified_bg: Color,
+
+    // ---- Markdown reading view ----
+    pub md_code_bg: Color,
+    pub md_table_stripe_bg: Color,
+    pub md_alert_important: Color,
+}
+
+impl Palette {
+    fn from_theme(t: &Theme) -> Palette {
+        Palette {
+            mode: t.mode,
+            bg: color(t.bg),
+            bg_panel: color(t.bg_panel),
+            bg_selection: color(t.bg_selection),
+            bg_visual: color(t.bg_visual),
+            fill_dim: color(t.fill_dim),
+            sneak_prefix_bg: color(t.sneak_prefix_bg),
+            match_highlight: color(t.match_highlight),
+            match_bracket: color(t.match_bracket),
+            cursor_line_bg: color(t.cursor_line_bg),
+            overlay_border: color(t.overlay_border),
+            border_subtle: color(t.border_subtle),
+            fg: color(t.fg),
+            fg_bright: color(t.fg_bright),
+            fg_muted: color(t.fg_muted),
+            fg_dim: color(t.fg_dim),
+            fg_faint: color(t.fg_faint),
+            fg_on_accent: color(t.fg_on_accent),
+            accent: color(t.accent),
+            accent_alt: color(t.accent_alt),
+            accent_deep: color(t.accent_deep),
+            error: color(t.error),
+            warning: color(t.warning),
+            info: color(t.info),
+            ok: color(t.ok),
+            state_deleted: color(t.state_deleted),
+            state_changed: color(t.state_changed),
+            state_unsaved: color(t.state_unsaved),
+            git_added: color(t.git_added),
+            git_modified: color(t.git_modified),
+            git_deleted: color(t.git_deleted),
+            git_staged_added: color(t.git_staged_added),
+            git_staged_modified: color(t.git_staged_modified),
+            git_staged_deleted: color(t.git_staged_deleted),
+            git_added_bg: color(t.git_added_bg),
+            git_modified_bg: color(t.git_modified_bg),
+            git_deleted_bg: color(t.git_deleted_bg),
+            git_staged_added_bg: color(t.git_staged_added_bg),
+            git_staged_modified_bg: color(t.git_staged_modified_bg),
+            git_staged_deleted_bg: color(t.git_staged_deleted_bg),
+            cursor_line_added_bg: color(t.cursor_line_added_bg),
+            cursor_line_modified_bg: color(t.cursor_line_modified_bg),
+            cursor_line_staged_added_bg: color(t.cursor_line_staged_added_bg),
+            cursor_line_staged_modified_bg: color(t.cursor_line_staged_modified_bg),
+            md_code_bg: color(t.md_code_bg),
+            md_table_stripe_bg: color(t.md_table_stripe_bg),
+            md_alert_important: color(t.md_alert_important),
+        }
     }
 }
 
-pub const NORD0: Color = rgb(0x2e3440); // main background
-pub const NORD1: Color = rgb(0x3b4252); // status line / panel
-pub const NORD2: Color = rgb(0x434c5e); // picker row highlight / chips
-pub const NORD3: Color = rgb(0x4c566a); // dim — hit/sneak fills, muted glyphs
-pub const NORD3_BRIGHT: Color = rgb(0x616e88); // lighter dim (legible secondary text on panels)
-/// Off-palette, brighter still — the syntax comment colour: NORD3 comments were ~1.4:1 against
-/// the reading view's NORD1 code panels; this reaches ~2.8:1 there (~3.5:1 on the editor) while
-/// staying below NORD9 keywords, so comments remain the dimmest rung of the ladder. Mirrors the
-/// web's `--nord3-brighter`.
-pub const NORD3_BRIGHTER: Color = rgb(0x7b88a1);
-pub const NORD4: Color = rgb(0xd8dee9); // main foreground
-pub const NORD6: Color = rgb(0xeceff4); // brightest text (search query, file label)
-pub const NORD7: Color = rgb(0x8fbcbb); // types
-pub const NORD8: Color = rgb(0x88c0d0); // functions, accents
-pub const NORD9: Color = rgb(0x81a1c1); // keywords, operators
-pub const NORD10: Color = rgb(0x5e81ac); // Frost — deep blue (active selection bg)
-pub const NORD11: Color = rgb(0xbf616a); // error
-pub const NORD12: Color = rgb(0xd08770); // attributes, macros
-pub const NORD13: Color = rgb(0xebcb8b); // string escapes, warnings
-pub const NORD14: Color = rgb(0xa3be8c); // strings
-pub const NORD15: Color = rgb(0xb48ead); // numbers, constants
+/// The role table for a mode, converted once and cached — resolve at the top of a view pass
+/// (`theme::palette(self.session.theme)`) and pass `&Palette` down like [`Ui`].
+pub fn palette(mode: ThemeMode) -> &'static Palette {
+    static DARK: LazyLock<Palette> =
+        LazyLock::new(|| Palette::from_theme(Theme::of(ThemeMode::Dark)));
+    static LIGHT: LazyLock<Palette> =
+        LazyLock::new(|| Palette::from_theme(Theme::of(ThemeMode::Light)));
+    match mode {
+        ThemeMode::Dark => &DARK,
+        ThemeMode::Light => &LIGHT,
+    }
+}
 
-/// Sneak typed-prefix band — a brighter, cooler slate than the word tint (NORD3), between it and
-/// the bright label cell in prominence.
-pub const SNEAK_PREFIX_BG: Color = rgb(0x616e88);
-
-/// Current-line tint — between NORD0 and NORD1 (see theme.css for the rationale).
-pub const CURSOR_LINE_BG: Color = rgb(0x343a48);
+/// The base iced widget theme for a mode — what theme-inheriting surfaces (markdown hover body
+/// text, scrollbar chrome) draw from. Dark keeps the built-in `Nord` theme so its derived chrome
+/// stays bit-identical to the pre-theme app; light generates a custom theme from the core light
+/// table's anchor roles, so inherited chrome matches the palette instead of iced's default Light.
+pub fn base_iced_theme(mode: ThemeMode) -> iced::Theme {
+    match mode {
+        ThemeMode::Dark => iced::Theme::Nord,
+        ThemeMode::Light => {
+            static LIGHT: LazyLock<iced::Theme> = LazyLock::new(|| {
+                let t = Theme::of(ThemeMode::Light);
+                iced::Theme::custom(
+                    "Aether Light",
+                    iced::theme::Palette {
+                        background: color(t.bg),
+                        text: color(t.fg),
+                        primary: color(t.accent),
+                        success: color(t.ok),
+                        warning: color(t.warning),
+                        danger: color(t.error),
+                    },
+                )
+            });
+            LIGHT.clone()
+        }
+    }
+}
 
 /// Scrollbar rail/thumb width for buffer-level and chrome scrollables — the editor's drawn bar,
 /// the reading view's document scroll, pickers, dialogs, and popovers. One step heavier than
@@ -47,22 +183,6 @@ pub const SCROLLBAR_W: f32 = 4.0;
 /// Thinner bar for panels *inside* content — the reading view's code blocks and tables, which
 /// pan horizontally within the document rather than scrolling the view itself.
 pub const SCROLLBAR_INLINE_W: f32 = 3.0;
-
-// Gutter change-bar colours (hue says what changed; dim variants mean "staged").
-pub const GIT_ADDED: Color = NORD14;
-pub const GIT_MODIFIED: Color = NORD13;
-pub const GIT_DELETED: Color = NORD11;
-pub const GIT_STAGED_ADDED: Color = rgb(0x6e8060);
-pub const GIT_STAGED_MODIFIED: Color = rgb(0x9e8a62);
-pub const GIT_STAGED_DELETED: Color = rgb(0x844c53);
-
-// Inline-diff line tints (and the phantom deleted rows' backgrounds), bright vs staged-dim.
-pub const GIT_ADDED_BG: Color = rgb(0x2d3a2d);
-pub const GIT_MODIFIED_BG: Color = rgb(0x3a3628);
-pub const GIT_DELETED_BG: Color = rgb(0x3b2226);
-pub const GIT_STAGED_ADDED_BG: Color = rgb(0x2f3631);
-pub const GIT_STAGED_MODIFIED_BG: Color = rgb(0x35342d);
-pub const GIT_STAGED_DELETED_BG: Color = rgb(0x33252a);
 
 /// Chrome sizing, derived from the `ui_font_size` app setting (`Space .`). Every size in the chrome
 /// — status bar, pickers, dialogs, hover, toasts, hints — goes through here, so the whole UI scales
@@ -154,57 +274,18 @@ impl Ui {
     }
 }
 
-// Cursor-line variants on changed lines under the diff view, so the cursorline doesn't hide
-// the change colour.
-pub const CURSOR_LINE_ADDED_BG: Color = rgb(0x3a4d3a);
-pub const CURSOR_LINE_MODIFIED_BG: Color = rgb(0x4a4632);
-pub const CURSOR_LINE_STAGED_ADDED_BG: Color = rgb(0x3a453c);
-pub const CURSOR_LINE_STAGED_MODIFIED_BG: Color = rgb(0x434138);
-
-/// Tree-sitter highlight kind → colour. Mirrors `render.ts::HL_CLASS` + theme.css (and
-/// `ui.rs::lookup_exact`). Unlisted kinds fall back by stripping trailing `.segments`
-/// (`"function.call"` → `"function"`); `None` means "default foreground".
-pub fn highlight_color(kind: &str) -> Option<Color> {
-    let mut k = kind;
-    loop {
-        if let Some(c) = lookup_exact(k) {
-            return c;
-        }
-        match k.rfind('.') {
-            Some(dot) => k = &k[..dot],
-            None => return None,
-        }
-    }
+/// Tree-sitter highlight kind → colour, via the core's [`Theme::syntax`] (dotted-prefix fallback
+/// included). `None` means "default foreground". Font attributes (bold/italic for markdown
+/// strong/emphasis) stay keyed on the kind name in `editor.rs::highlight_font`; this returns the
+/// colour only.
+pub fn highlight_color(mode: ThemeMode, kind: &str) -> Option<Color> {
+    Theme::of(mode).syntax(kind).and_then(|s| s.color).map(color)
 }
 
-fn lookup_exact(kind: &str) -> Option<Option<Color>> {
-    Some(match kind {
-        "keyword" | "variable.builtin" | "operator" | "tag" => Some(NORD9),
-        "string" | "text.literal" => Some(NORD14),
-        "string.escape" | "string.special" => Some(NORD13),
-        "comment" => Some(NORD3_BRIGHTER),
-        "number" | "boolean" | "constant" | "constant.builtin" => Some(NORD15),
-        "function" | "function.call" | "text.title" | "text.uri" | "text.reference" => Some(NORD8),
-        "function.macro" | "punctuation.special" | "attribute" | "label" => Some(NORD12),
-        "type" | "type.builtin" | "module" | "namespace" | "constructor" => Some(NORD7),
-        "variable.parameter" | "punctuation.bracket" | "punctuation.delimiter" | "property" => {
-            Some(NORD4)
-        }
-        "text.emphasis" | "text.strong" => None,
-        _ => return None,
-    })
-}
-
-pub fn diagnostic_color(severity: aether_protocol::viewport::DiagnosticSeverity) -> Color {
-    use aether_protocol::viewport::DiagnosticSeverity as S;
-    match severity {
-        S::Error => NORD11,
-        S::Warning => NORD13,
-        S::Information => NORD8,
-        // Near-white, not a hue: readable on the dark popover/status backgrounds and distinct
-        // from the coloured severities (was NORD8, which made it indistinguishable from info).
-        S::Hint => NORD4,
-    }
+/// The underline / message colour for a diagnostic severity, via the core's [`Theme::diagnostic`]
+/// (Hint is the plain foreground, not a hue).
+pub fn diagnostic_color(mode: ThemeMode, severity: aether_protocol::viewport::DiagnosticSeverity) -> Color {
+    color(Theme::of(mode).diagnostic(severity))
 }
 
 /// Severity glyph for the status-bar count, diagnostics picker, and hover popover, so all three
@@ -220,35 +301,103 @@ pub fn diag_glyph(severity: aether_protocol::viewport::DiagnosticSeverity) -> &'
     }
 }
 
-/// State colour for a language-server's status dot — mirrors `ui.rs::lsp_status_color` (and the
-/// web client's icon classes). A ready server with in-flight `$/progress` shows the busy colour;
-/// the caller checks `progress`.
-pub fn lsp_status_color(status: &aether_protocol::lsp::LspStatus) -> Color {
-    use aether_protocol::lsp::LspStatus as S;
-    match status {
-        S::Ready => NORD14,
-        S::Starting | S::Initializing | S::Restarting => NORD13,
-        S::Crashed { .. } => NORD11,
-        S::Stopped => NORD3,
-    }
+/// State colour for a language-server's status dot, via the core's [`Theme::lsp_status`]. A ready
+/// server with in-flight `$/progress` shows the busy colour; the caller checks `progress`.
+pub fn lsp_status_color(mode: ThemeMode, status: &aether_protocol::lsp::LspStatus) -> Color {
+    color(Theme::of(mode).lsp_status(status))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn c(hex: u32) -> Color {
+        Color::from_rgb8(
+            ((hex >> 16) & 0xff) as u8,
+            ((hex >> 8) & 0xff) as u8,
+            (hex & 0xff) as u8,
+        )
+    }
+
+    /// The dark palette must stay pixel-identical to the Nord constants this shell carried before
+    /// the role table existed.
     #[test]
-    fn fallback_strips_dotted_suffixes() {
-        // "function.method.call" isn't listed; it should fall back to "function".
+    fn dark_palette_pins_the_pre_theme_constants() {
+        let p = palette(ThemeMode::Dark);
+        assert_eq!(p.mode, ThemeMode::Dark);
+        assert_eq!(p.bg, c(0x2e3440)); // NORD0
+        assert_eq!(p.bg_panel, c(0x3b4252)); // NORD1
+        assert_eq!(p.bg_selection, c(0x434c5e)); // NORD2
+        assert_eq!(p.bg_visual, c(0x5e81ac)); // NORD10
+        assert_eq!(p.fill_dim, c(0x4c566a)); // NORD3
+        assert_eq!(p.sneak_prefix_bg, c(0x616e88)); // SNEAK_PREFIX_BG
+        assert_eq!(p.cursor_line_bg, c(0x343a48)); // CURSOR_LINE_BG
+        assert_eq!(p.fg, c(0xd8dee9)); // NORD4
+        assert_eq!(p.fg_bright, c(0xeceff4)); // NORD6
+        assert_eq!(p.fg_dim, c(0x616e88)); // NORD3_BRIGHT
+        assert_eq!(p.fg_faint, c(0x4c566a)); // NORD3
+        assert_eq!(p.fg_on_accent, c(0x2e3440)); // NORD0
+        assert_eq!(p.accent, c(0x88c0d0)); // NORD8
+        assert_eq!(p.accent_alt, c(0x81a1c1)); // NORD9
+        assert_eq!(p.accent_deep, c(0x5e81ac)); // NORD10
+        assert_eq!(p.error, c(0xbf616a)); // NORD11
+        assert_eq!(p.warning, c(0xebcb8b)); // NORD13
+        assert_eq!(p.ok, c(0xa3be8c)); // NORD14
+        // The roles that share a dark shade with a semantically unrelated role — pinned so the
+        // rename from the borrowed role can never shift dark rendering.
+        assert_eq!(p.match_highlight, c(0xebcb8b)); // NORD13 (= warning's dark shade)
+        assert_eq!(p.match_bracket, c(0xd08770)); // NORD12 (= syn_macro's dark shade)
+        assert_eq!(p.md_alert_important, c(0xb48ead)); // NORD15 (= syn_constant's dark shade)
+        assert_eq!(p.fg_muted, c(0x7b88a1)); // NORD3_BRIGHTER (= overlay_border's dark shade)
+        assert_eq!(p.border_subtle, c(0x4c566a)); // NORD3 (= fill_dim's dark shade)
+        assert_eq!(p.git_added, c(0xa3be8c)); // GIT_ADDED
+        assert_eq!(p.git_staged_added, c(0x6e8060)); // GIT_STAGED_ADDED
+        assert_eq!(p.git_staged_modified, c(0x9e8a62)); // GIT_STAGED_MODIFIED
+        assert_eq!(p.git_staged_deleted, c(0x844c53)); // GIT_STAGED_DELETED
+        assert_eq!(p.git_added_bg, c(0x2d3a2d)); // GIT_ADDED_BG
+        assert_eq!(p.cursor_line_added_bg, c(0x3a4d3a)); // CURSOR_LINE_ADDED_BG
+        assert_eq!(p.cursor_line_staged_modified_bg, c(0x434138));
+        assert_eq!(p.md_code_bg, c(0x3b4252)); // reading-view code panel (NORD1)
+    }
+
+    /// Light is a real second table, not dark re-served.
+    #[test]
+    fn light_palette_is_distinct() {
+        let d = palette(ThemeMode::Dark);
+        let l = palette(ThemeMode::Light);
+        assert_eq!(l.mode, ThemeMode::Light);
+        assert_ne!(l.bg, d.bg);
+        assert_ne!(l.fg, d.fg);
+        assert_ne!(l.warning, d.warning, "aurora yellow is unreadable on light");
+        assert_eq!(l.bg, c(0xeceff4)); // NORD6 — the ends swap
+        assert_eq!(l.fg, c(0x2e3440)); // NORD0
+    }
+
+    /// The mapping fns delegate to the core tables: dark answers must be the historic constants.
+    #[test]
+    fn mapping_fns_delegate_to_the_core() {
+        use aether_protocol::lsp::LspStatus;
+        use aether_protocol::viewport::DiagnosticSeverity as S;
+        let dark = ThemeMode::Dark;
+        // Dotted fallback lives in the core; the wrapper just converts.
         assert_eq!(
-            highlight_color("function.method.call"),
-            highlight_color("function")
+            highlight_color(dark, "function.method.call"),
+            highlight_color(dark, "function")
         );
-        assert!(highlight_color("function").is_some());
-        // Unknown kinds resolve to the default foreground.
-        assert_eq!(highlight_color("nonsense"), None);
-        // Emphasis is listed but has no colour of its own.
-        assert_eq!(highlight_color("text.emphasis"), None);
+        assert_eq!(highlight_color(dark, "function"), Some(c(0x88c0d0))); // NORD8
+        assert_eq!(highlight_color(dark, "comment"), Some(c(0x7b88a1))); // NORD3_BRIGHTER
+        assert_eq!(highlight_color(dark, "nonsense"), None);
+        // Emphasis carries attributes only — no colour, so the default foreground.
+        assert_eq!(highlight_color(dark, "text.emphasis"), None);
+        assert_eq!(diagnostic_color(dark, S::Error), c(0xbf616a)); // NORD11
+        assert_eq!(diagnostic_color(dark, S::Hint), c(0xd8dee9)); // NORD4 — fg, not a hue
+        assert_eq!(lsp_status_color(dark, &LspStatus::Ready), c(0xa3be8c)); // NORD14
+        assert_eq!(lsp_status_color(dark, &LspStatus::Stopped), c(0x4c566a)); // NORD3
+        // Light resolves through its own table.
+        assert_ne!(
+            highlight_color(ThemeMode::Light, "comment"),
+            highlight_color(dark, "comment")
+        );
     }
 
     /// At the default `ui_font_size` the scale reproduces the literals the chrome was hand-tuned

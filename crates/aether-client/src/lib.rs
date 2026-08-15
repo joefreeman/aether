@@ -26,5 +26,6 @@ pub mod picker;
 pub mod read_layout;
 pub mod scrollbar;
 pub mod session;
+pub mod theme;
 pub mod transport;
 pub mod update;
