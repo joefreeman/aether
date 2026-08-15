@@ -3,6 +3,9 @@
 //! [`shell::run`]; [`run`] is the single entry point the `ae` binary calls for the terminal client.
 
 mod app;
+/// CLI path resolution, shared with the `ae` binary: `ae --web`'s waiter resolves its file
+/// argument exactly like the shells' boot opens so the same launch lands on the same buffer.
+pub use app::resolve_cli_path;
 mod clipboard;
 mod connection;
 mod labels;

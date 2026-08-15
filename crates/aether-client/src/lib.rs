@@ -29,3 +29,4 @@ pub mod session;
 pub mod theme;
 pub mod transport;
 pub mod update;
+pub mod web_link;

@@ -2302,6 +2302,50 @@ impl Session {
         fx
     }
 
+    /// Copy the web client's URL for the current view (`Space Alt-z`): a file buffer becomes the
+    /// root-relative `?workspace=&root=&file=` link with the cursor as its 1-based `#L:C`
+    /// fragment (a shared-cursor link — the web boot jumps there); a scratch becomes a
+    /// `?workspace=&buffer=` link. Warns for the targets the web client can't address — an
+    /// ephemeral (no-workspace) context, or an external file outside every root — the same set
+    /// `ae --web` refuses. The shell prepends its own base URL and writes the clipboard
+    /// ([`ShellAction::CopyWebUrl`]); the toast is emitted here, like every copy gesture.
+    fn copy_web_url(&mut self) -> Effects {
+        use crate::web_link::{web_link, WebLinkTarget};
+        if self.workspace.is_empty() || aether_protocol::is_ephemeral_workspace_id(&self.workspace)
+        {
+            return Effects::toast("No web URL without a workspace", ToastKind::Warning);
+        }
+        let path_query = match self.buffer.path.as_deref() {
+            Some(path) => match strip_longest_root(path, &self.workspace_paths) {
+                Some((root, rel)) => {
+                    let at = self.buffer.cursor.position;
+                    web_link(
+                        Some(&self.workspace),
+                        WebLinkTarget::File {
+                            root,
+                            path: &rel,
+                            at: Some((at.line, at.col)),
+                        },
+                    )
+                }
+                None => {
+                    return Effects::toast(
+                        "No web URL for a file outside the workspace",
+                        ToastKind::Warning,
+                    )
+                }
+            },
+            None => web_link(
+                Some(&self.workspace),
+                WebLinkTarget::Buffer(self.buffer.buffer_id),
+            ),
+        };
+        // Grouped with the path copies: the copy gestures update one toast rather than stacking.
+        let mut fx = Effects::toast_grouped("Copied web URL", ToastKind::Success, "copy-path");
+        fx.push(Effect::ShellAction(ShellAction::CopyWebUrl { path_query }));
+        fx
+    }
+
     /// Open a file by absolute path as a transient preview — result-style navigation (picker
     /// selections, goto-definition). Records the jump origin onto the nav history first.
     ///
@@ -7391,6 +7435,7 @@ impl Session {
             }
             A::CopyRelativePath => self.copy_buffer_path(false),
             A::CopyAbsolutePath => self.copy_buffer_path(true),
+            A::CopyWebUrl => self.copy_web_url(),
             A::NewScratch => {
                 // Opening a fresh scratch is a buffer switch — record the origin so Alt-Left
                 // returns (folded into the open's `record_nav_from`).
@@ -9170,6 +9215,80 @@ mod tests {
                 .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
             "a directory Ctrl-click must not spawn a window"
         );
+    }
+
+    /// A workspace session on `/proj/src/a.rs` for the copy-web-url tests.
+    fn web_url_session() -> Session {
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        s.buffer.path = Some("/proj/src/a.rs".into());
+        s
+    }
+
+    /// The `path_query` of the [`ShellAction::CopyWebUrl`] a session emits, if any.
+    fn copied_web_url(fx: &Effects) -> Option<String> {
+        fx.0.iter().find_map(|e| match e {
+            Effect::ShellAction(ShellAction::CopyWebUrl { path_query }) => {
+                Some(path_query.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// `Space Alt-z` on a file buffer: the root-relative `?workspace=&file=` link the web boot
+    /// parses, with the cursor as its 1-based `#L:C` fragment, plus the confirmation toast.
+    /// The base is deliberately absent — the shell prepends its own.
+    #[test]
+    fn copy_web_url_emits_a_file_link_with_cursor_fragment() {
+        let mut s = web_url_session();
+        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        let fx = s.copy_web_url();
+        assert_eq!(
+            copied_web_url(&fx).as_deref(),
+            Some("?workspace=proj&file=src/a.rs#42:10")
+        );
+        assert!(
+            fx.0.iter().any(|e| matches!(e, Effect::Toast { message, kind: ToastKind::Success, .. }
+                if message == "Copied web URL")),
+            "a concise confirmation toast rides alongside"
+        );
+    }
+
+    /// A scratch buffer has no path but is web-addressable as a `?buffer=` link (the same form
+    /// the web client's own picker share links use for scratches).
+    #[test]
+    fn copy_web_url_links_a_scratch_by_buffer_id() {
+        let mut s = web_url_session();
+        s.buffer.path = None;
+        s.buffer.buffer_id = 7;
+        let fx = s.copy_web_url();
+        assert_eq!(
+            copied_web_url(&fx).as_deref(),
+            Some("?workspace=proj&buffer=7")
+        );
+    }
+
+    /// The targets the web client can't address — an external file outside every root, and any
+    /// buffer in an ephemeral (no-workspace) context — warn instead of copying a broken link.
+    /// Same set `ae --web` refuses.
+    #[test]
+    fn copy_web_url_warns_for_web_unaddressable_targets() {
+        let unaddressable = |s: &mut Session| {
+            let fx = s.copy_web_url();
+            assert_eq!(copied_web_url(&fx), None, "nothing lands on the clipboard");
+            assert!(
+                fx.0.iter()
+                    .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Warning, .. })),
+                "the refusal is audible"
+            );
+        };
+        let mut s = web_url_session();
+        s.buffer.path = Some("/elsewhere/b.rs".into());
+        unaddressable(&mut s);
+        let mut s = web_url_session();
+        s.workspace = format!("{}x", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
+        unaddressable(&mut s);
     }
 }
 

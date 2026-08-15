@@ -1926,6 +1926,12 @@ impl App {
                 spawn_target(&target);
                 Task::none()
             }
+            // Prepend the HTTP side of the address we dialed (same peek-routed port) and copy.
+            // The core already toasts.
+            A::CopyWebUrl { path_query } => iced::clipboard::write(format!(
+                "{}/{path_query}",
+                aether_client::web_link::http_base(&self.server_url)
+            )),
         }
     }
 
@@ -5995,9 +6001,12 @@ fn spawn_target(target: &WindowTarget) {
     };
     let mut cmd = std::process::Command::new(exe);
     // `--profile` (global) before the implicit `edit` so the sibling joins the same daemon.
+    // `--wait`: this spawn already detaches (below) — the sibling must not re-exec itself
+    // through the CLI's own non-tethered-GUI detach a second time.
     cmd.arg("--profile")
         .arg(crate::active_profile())
-        .arg("--gui");
+        .arg("--gui")
+        .arg("--wait");
     if let Some(ws) = &target.workspace {
         cmd.arg("--workspace").arg(ws);
     }

@@ -784,6 +784,9 @@ fn action_value(a: &ShellAction) -> Value {
         // The reading view's Enter on an external link/image: the shell opens a new tab
         // (scheme-checked TS-side, like hover links).
         ShellAction::OpenUrl(url) => json!({ "name": "open_url", "url": url }),
+        ShellAction::CopyWebUrl { path_query } => {
+            json!({ "name": "copy_web_url", "path_query": path_query })
+        }
         // A local image beside the buffer: the shell opens the confined asset route
         // (a browser can't open local paths; `absolute` is for the native shells).
         ShellAction::OpenBufferFile {

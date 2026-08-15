@@ -44,6 +44,13 @@ pub enum ShellAction {
     /// tab on the same URL (`window.open`) — its Ctrl-Enter is handled shell-side, so the picker
     /// path never reaches here on the web.
     NewWindow(WindowTarget),
+    /// Copy the web client's URL for the current view (`Space Alt-z`). `path_query` is the
+    /// `?workspace=…` query (+ optional `#L:C` fragment) from [`crate::web_link`]; the shell
+    /// prepends its own base and writes the clipboard — the native shells derive `http://…`
+    /// from the server address they dialed, the web shell uses its own origin (which may be a
+    /// port-forward the server's loopback address would misname). The confirmation toast rides
+    /// alongside from the core, like every copy gesture, so the shell adds none.
+    CopyWebUrl { path_query: String },
 }
 
 /// A resolved target for opening a *new* window ([`ShellAction::NewWindow`]). The core resolves

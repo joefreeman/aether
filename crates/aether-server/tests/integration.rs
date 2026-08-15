@@ -24816,6 +24816,64 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     drop(server);
 }
 
+/// The `ae --web` waiter's contract (docs/tether.md §6, `aether-ae/src/web.rs`): a client that
+/// activates a workspace and opens a buffer but never subscribes ANY viewport still receives the
+/// `buffer/closed` push when another client closes that buffer — membership in the active
+/// workspace's MRU alone routes it. This is what lets the headless waiter exit when the browser
+/// tab finishes the edit.
+#[tokio::test]
+async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let activate = WorkspaceActivateParams {
+        name: "test-proj".into(),
+        open_last: false,
+    };
+    let open = BufferOpenParams {
+        path_index: Some(0),
+        relative_path: Some("a.txt".into()),
+        ..Default::default()
+    };
+
+    // The waiter: activate + open, nothing else — no viewport, ever.
+    let (mut waiter, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut waiter, 1, &activate).await;
+    let buf = send_request::<BufferOpen>(&mut waiter, 2, &open)
+        .await
+        .buffer_id;
+
+    // The browser: attaches to the same buffer by path, edits done, closes it.
+    let (mut browser, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut browser, 1, &activate).await;
+    let same = send_request::<BufferOpen>(&mut browser, 2, &open)
+        .await
+        .buffer_id;
+    assert_eq!(same, buf, "open-by-path attaches to the waiter's buffer");
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut browser,
+        3,
+        &BufferCloseParams {
+            buffer_id: buf,
+            open_next: false,
+        },
+    )
+    .await;
+
+    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut waiter).await;
+    assert_eq!(pushed.buffer_id, buf, "the viewportless waiter is notified");
+
+    drop(server);
+}
+
 // -------- nav (back/forward history) --------------------------------------------------------------
 
 /// Open + viewport-subscribe a file, returning (buffer_id, viewport_id). Mirrors a client switching

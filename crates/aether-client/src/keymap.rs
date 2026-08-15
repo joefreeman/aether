@@ -403,6 +403,11 @@ pub enum Action {
     /// [`ShellAction::NewWindow`] it emits. The spawn names the workspace explicitly (`--workspace`),
     /// so the sibling never tethers to the file it lands on (docs/tether.md).
     NewWindow,
+    /// `Space Alt-z` — the share-link sibling of `Space z`: copy the web client's URL for the
+    /// current buffer to the clipboard (`?workspace=&root=&file=` with the cursor as its `#L:C`
+    /// fragment; `?buffer=` for a scratch). The shell prepends its own base
+    /// ([`ShellAction::CopyWebUrl`]).
+    CopyWebUrl,
 
     // ---- git ----
     ToggleDiffView,
@@ -1177,6 +1182,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
+    bind!(L, ch('z'), Exact(Mods::ALT), A::CopyWebUrl, "App", "Copy web URL"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),

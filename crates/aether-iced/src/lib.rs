@@ -47,6 +47,15 @@ pub fn run(
     profile: String,
 ) -> anyhow::Result<()> {
     let _ = PROFILE.set(profile);
+    // Prefer the integrated GPU on hybrid-graphics machines. iced/wgpu default to the
+    // HighPerformance adapter, which lands rendering on the discrete GPU even when every display
+    // is driven by the integrated one — a text editor gains nothing from that, and a discrete GPU
+    // with flaky power management can stall presentation fences and freeze the window outright.
+    // iced exposes no settings field for adapter choice; wgpu's env override is the only lever,
+    // so default it here (before iced spawns any threads) and let an explicit value win.
+    if std::env::var_os("WGPU_POWER_PREF").is_none() {
+        std::env::set_var("WGPU_POWER_PREF", "low");
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

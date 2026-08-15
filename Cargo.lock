@@ -29,12 +29,15 @@ name = "aether-ae"
 version = "0.3.0"
 dependencies = [
  "aether-client",
+ "aether-connection",
  "aether-iced",
+ "aether-protocol",
  "aether-server",
  "aether-tui",
  "anyhow",
  "clap",
  "libc",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]
@@ -45,6 +48,7 @@ version = "0.3.0"
 dependencies = [
  "aether-markdown",
  "aether-protocol",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

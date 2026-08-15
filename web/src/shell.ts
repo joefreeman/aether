@@ -148,7 +148,14 @@ function measureCell(buffer: HTMLElement): Cell {
 type ToastLevel = "info" | "error" | "warning" | "success";
 
 interface ShellActionDesc {
-  name: "scroll" | "place_cursor" | "toggle_wrap" | "new_window" | "open_url" | "open_buffer_file";
+  name:
+    | "scroll"
+    | "place_cursor"
+    | "toggle_wrap"
+    | "new_window"
+    | "open_url"
+    | "open_buffer_file"
+    | "copy_web_url";
   dir?: string;
   unit?: string;
   fraction?: number;
@@ -165,6 +172,9 @@ interface ShellActionDesc {
   workspace?: string;
   line?: number;
   col?: number;
+  /** copy_web_url only: the `?workspace=…` query (+ `#L:C` fragment) to append to our own
+   *  origin — the core can't know it (we may be reached through a port-forward). */
+  path_query?: string;
 }
 
 /** Every effect tag the core can emit (mirrors `effects_to_json` in crates/aether-web/src/lib.rs).
@@ -2219,6 +2229,13 @@ export class Shell {
         if (a.url && /^(https?|mailto):/i.test(a.url)) {
           window.open(a.url, "_blank", "noopener");
         }
+        break;
+      case "copy_web_url":
+        // `Space Alt-z`: our own origin is the base — we may be reached through a port-forward
+        // the server's loopback address would misname. The core already toasts the copy.
+        void navigator.clipboard
+          ?.writeText(`${location.origin}${location.pathname}${a.path_query ?? ""}`)
+          .catch(() => {});
         break;
       case "open_buffer_file":
         // A local image's Enter: the browser can't open the filesystem path, but the server's

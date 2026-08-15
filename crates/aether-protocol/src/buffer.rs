@@ -176,8 +176,11 @@ pub struct BufferCloseResult {
 /// Pushed to a client when a buffer it currently has open is closed by *another* client (a plain
 /// `buffer/close`, or a path/workspace deletion that tore the buffer down). The receiving client
 /// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when
-/// `None` — the same convention as [`BufferCloseResult`]. Only sent to clients that had a viewport
-/// on the buffer; the client that initiated the close learns the outcome from its RPC result
+/// `None` — the same convention as [`BufferCloseResult`]. Sent to clients with a viewport on the
+/// buffer *and* to clients whose active workspace holds it in its MRU without viewing it — the
+/// latter is what lets a tethered client (docs/tether.md), including the `ae --web` waiter, exit
+/// on a close it didn't witness; non-matching pushes are ignored client-side, so the broad
+/// audience is safe. The client that initiated the close learns the outcome from its RPC result
 /// instead.
 pub struct BufferClosed;
 impl NotificationMethod for BufferClosed {

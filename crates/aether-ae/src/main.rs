@@ -6,6 +6,7 @@
 //! - `ae server [OPTIONS]`               — run the editor server daemon
 //! - `ae [edit] [PATH]`                  — open a client, auto-detecting terminal vs GUI
 //! - `ae --gui [PATH]` / `ae --tui ...`  — force a specific client
+//! - `ae --web [PATH]`                   — open the browser client (see `web.rs`)
 //! - `ae -w NAME [PATH]`                 — open in a named workspace, overriding inference
 //!
 //! `edit` is the default command: a bare `ae` (or `ae file.rs`) runs it, so the common case needs
@@ -29,6 +30,8 @@
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+
+mod web;
 
 #[derive(Parser, Debug)]
 #[command(name = "ae", version, about = "Aether editor")]
@@ -106,10 +109,25 @@ struct EditArgs {
     #[arg(long)]
     tui: bool,
 
+    /// Open the browser client: launch the web editor's URL via the OS and (usually) exit.
+    /// The quick-edit shape (`ae --web file`, no `--workspace`) instead waits for the buffer
+    /// to be closed in the browser, keeping the `$EDITOR` contract — see `web.rs`.
+    #[arg(long, conflicts_with_all = ["gui", "tui", "buffer"])]
+    web: bool,
+
+    /// Stay attached to the terminal instead of detaching the GUI (a non-tethered `--gui` at a
+    /// terminal normally re-execs itself into the background and gives the prompt back).
+    /// A tethered launch (`ae --gui FILE`, no `--workspace`) always waits, flag or no flag.
+    /// Also the way to see the GUI's log output — a detached GUI discards it. No effect on the
+    /// terminal client (which always holds the terminal); refused with `--web`, where the
+    /// tether is the only thing a wait could mean.
+    #[arg(long, conflicts_with = "web")]
+    wait: bool,
+
     /// Workspace to open, overriding inference from PATH.
     ///
-    /// Config lives at `$XDG_CONFIG_HOME/aether/workspaces/<name>.toml`. Omit to infer from PATH;
-    /// with no PATH (or one outside every workspace), the picker opens.
+    /// Config lives at `$XDG_CONFIG_HOME/aether/profiles/<profile>/workspaces/<name>.toml`.
+    /// Omit to infer from PATH; with no PATH (or one outside every workspace), the picker opens.
     #[arg(short = 'w', long)]
     workspace: Option<String>,
 
@@ -151,6 +169,13 @@ fn main() -> anyhow::Result<()> {
 /// active profile's port (creating the profile on first use), make sure a server is up on it, then
 /// launch the terminal or GUI client pointed at it.
 fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
+    // A non-tethered `--gui` launch from a terminal detaches: re-exec ourselves with the hidden
+    // `--foreground` flag (setsid'd, like every other spawn here) and give the prompt back — the
+    // same lifetime rule as `--web`, where only the tether holds the process. Checked before the
+    // jump peel so the re-exec passes the path exactly as typed.
+    if should_detach_gui(&edit) {
+        return spawn_detached_gui(&edit);
+    }
     // Peel a `:LINE[:COL]` jump suffix off the path before anything resolves it (workspace inference
     // and the boot open both want the bare path). `None` jump for a plain path.
     let jump = match edit.path.take() {
@@ -170,6 +195,9 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
     ensure_server_running(port, idle_timeout_secs);
+    if edit.web {
+        return web::run(workspace, edit.path, jump, tether, version, port);
+    }
     let server_url = format!("ws://127.0.0.1:{port}");
     if want_gui(&edit) {
         run_gui(
@@ -186,6 +214,86 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
         // `--buffer` is a GUI-spawn internal; the terminal client has no window to seed with it.
         run_tui(workspace, edit.path, jump, tether, version, server_url)
     }
+}
+
+/// Whether this `--gui` launch should re-exec itself detached and give the prompt back. Only an
+/// *explicit* `--gui` typed at a terminal qualifies: `--wait` opts out; a tethered launch
+/// (quick-edit shape) stays in the foreground because the process's lifetime IS the `$EDITOR`
+/// contract; a desktop launch has no prompt to give back (and GNOME's startup notification
+/// tracks the launched process), so the detach is tty-gated; the re-exec'd child carries
+/// `--wait`; and a no-GUI build must fall through to `run_gui`'s readable bail instead of
+/// erroring into the void.
+fn should_detach_gui(edit: &EditArgs) -> bool {
+    use std::io::IsTerminal;
+    cfg!(feature = "gui")
+        && edit.gui
+        && !edit.wait
+        && !quick_edit_shape(edit)
+        && std::io::stdout().is_terminal()
+}
+
+/// The CLI shape that tethers (docs/tether.md §1): a file positional without an explicit
+/// `--workspace`. Directory args are sessions, not errands — the shells never tether them, so
+/// they detach like any other session launch. (A missing path is a file to create and tethers;
+/// a `PATH:LINE` jump suffix doesn't exist on disk either and lands in the same arm.)
+fn quick_edit_shape(edit: &EditArgs) -> bool {
+    match (&edit.path, &edit.workspace) {
+        (Some(path), None) => !std::path::Path::new(path).is_dir(),
+        _ => false,
+    }
+}
+
+/// Re-exec this launch as a detached GUI: the same full null-stdio + `setsid` treatment as the
+/// spawned server and the GUI's own window-spawns (and the same AppImage indirection). stderr
+/// goes to the void too — the GUI's tracing subscriber logs there for the life of the process,
+/// and a detached child spamming warnings over the shell prompt is worse than losing them
+/// (`--wait` is the escape hatch when the output matters). The one failure that would otherwise
+/// vanish entirely — a GUI that can't even boot — is caught by a short probe: if the child is
+/// already dead when we're about to give the prompt back, say so instead of exiting 0 into
+/// silence.
+fn spawn_detached_gui(edit: &EditArgs) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let exe = server_spawn_exe(
+        std::env::current_exe()?,
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    );
+    let mut cmd = Command::new(exe);
+    cmd.args(gui_respawn_args(edit))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach(&mut cmd);
+    let mut child = cmd.spawn().context("could not launch the detached GUI")?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if let Some(status) = child.try_wait().context("checking on the detached GUI")? {
+        anyhow::bail!("the GUI exited immediately ({status}) — run `ae --gui --wait` to see why");
+    }
+    Ok(())
+}
+
+/// The argv for the detached GUI re-exec. The explicit `edit` subcommand is load-bearing: a
+/// positional that happens to be named `server` or `profiles` must not re-parse as a subcommand.
+fn gui_respawn_args(edit: &EditArgs) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--profile".into(),
+        aether_server::active_profile().into(),
+        "edit".into(),
+        "--gui".into(),
+        "--wait".into(),
+    ];
+    if let Some(ws) = &edit.workspace {
+        args.push("--workspace".into());
+        args.push(ws.into());
+    }
+    if let Some(buffer) = edit.buffer {
+        args.push("--buffer".into());
+        args.push(buffer.to_string().into());
+    }
+    if let Some(path) = &edit.path {
+        args.push(path.into());
+    }
+    args
 }
 
 /// `ae profiles list` — show each profile, its recorded port, and whether its server is up.
@@ -676,6 +784,94 @@ mod tests {
             resolve_workspace(&edit).unwrap(),
             Some("myproj".to_string())
         );
+    }
+
+    #[test]
+    fn quick_edit_shape_is_file_positional_without_workspace() {
+        let file = EditArgs {
+            path: Some("notes.md".into()),
+            ..Default::default()
+        };
+        assert!(quick_edit_shape(&file), "a file positional tethers");
+
+        // A path that doesn't exist is a file to create — it tethers too (so it must stay
+        // foreground; the detach would orphan the $EDITOR contract). Jump-suffixed args
+        // (`file.rs:42`) don't exist on disk either and land in this same arm.
+        let missing = EditArgs {
+            path: Some("no/such/file.rs:42".into()),
+            ..Default::default()
+        };
+        assert!(quick_edit_shape(&missing));
+
+        // Naming the workspace opts out (a session, not an errand) — same rule as the tether.
+        let with_ws = EditArgs {
+            path: Some("notes.md".into()),
+            workspace: Some("proj".into()),
+            ..Default::default()
+        };
+        assert!(!quick_edit_shape(&with_ws));
+
+        // Directories never tether: they're sessions and detach like a bare `--gui`.
+        let dir = EditArgs {
+            path: Some(std::env::temp_dir().display().to_string()),
+            ..Default::default()
+        };
+        assert!(!quick_edit_shape(&dir));
+
+        assert!(!quick_edit_shape(&EditArgs::default()), "bare launch");
+    }
+
+    #[test]
+    fn gui_respawn_argv_keeps_the_explicit_edit_subcommand() {
+        // The re-exec must pass `edit` explicitly: a positional named like a subcommand
+        // (`ae --gui server`... a file called `server`) must not re-parse as `ae server`.
+        let edit = EditArgs {
+            gui: true,
+            workspace: Some("proj".into()),
+            path: Some("server".into()),
+            ..Default::default()
+        };
+        let args = gui_respawn_args(&edit);
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--profile",
+                aether_server::active_profile(),
+                "edit",
+                "--gui",
+                "--wait",
+                "--workspace",
+                "proj",
+                "server",
+            ]
+        );
+        // And the child must re-parse it back to the same shape (not a Server subcommand),
+        // with `--wait` set so it can't re-detach forever.
+        let cli = Cli::try_parse_from(std::iter::once("ae").chain(args)).unwrap();
+        match cli.command {
+            Some(Command::Edit(child)) => {
+                assert!(child.gui && child.wait);
+                assert_eq!(child.path.as_deref(), Some("server"));
+            }
+            other => panic!("re-exec argv must parse as the edit command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_conflicts_with_the_native_client_flags() {
+        // `--web` is a sibling of `--gui`/`--tui`; `--buffer` re-attaches are GUI-spawn
+        // internals with no web counterpart; and `--wait` would be a misleading no-op on a
+        // non-tethered web launch (there is no process to hold — the tether shape waits on its
+        // own). All four must refuse to combine rather than half-apply.
+        for conflicting in ["--gui", "--tui", "--buffer=3", "--wait"] {
+            assert!(
+                Cli::try_parse_from(["ae", "--web", conflicting]).is_err(),
+                "--web {conflicting} must be rejected"
+            );
+        }
+        assert!(Cli::try_parse_from(["ae", "--web", "notes.md"]).is_ok());
+        assert!(Cli::try_parse_from(["ae", "--gui", "--wait"]).is_ok());
     }
 
     #[test]

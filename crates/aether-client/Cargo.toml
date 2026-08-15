@@ -11,5 +11,7 @@ aether-markdown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Query-value escaping for web share links (`web_link`); no_std-friendly, wasm-safe.
+percent-encoding = "2"
 tracing = { workspace = true }
 unicode-width = { workspace = true }

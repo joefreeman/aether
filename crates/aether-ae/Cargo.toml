@@ -28,6 +28,12 @@ clap = { workspace = true, features = ["derive", "env"] }
 anyhow.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+# `ae --web`'s tether waiter is a tiny headless client: it opens the buffer over the same
+# RPC transport the native shells use and waits for the `buffer/closed` push.
+aether-connection = { workspace = true }
+aether-protocol = { workspace = true }
+serde_json = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 # `setsid` for detaching the auto-started server from the controlling terminal.
 libc = "0.2"

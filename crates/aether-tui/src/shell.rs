@@ -1445,6 +1445,17 @@ impl Shell {
             // new window") is GUI-only — a new OS window makes no sense for the terminal client,
             // which owns the one terminal it was launched in. Ignore it here.
             ShellAction::NewWindow(_) => {}
+            // The terminal has no browser, but it has a clipboard: prepend the HTTP side of the
+            // address we dialed (same peek-routed port) and copy. The core already toasts.
+            ShellAction::CopyWebUrl { path_query } => {
+                let url = format!(
+                    "{}/{path_query}",
+                    aether_client::web_link::http_base(&self.server_url)
+                );
+                if let Err(e) = clipboard::copy(&mut self.state.clipboard, url) {
+                    self.status(StatusMessage::error(format!("Copy failed: {e}")));
+                }
+            }
         }
     }
 
