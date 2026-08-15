@@ -1227,6 +1227,13 @@ pub struct Buffer {
     pub line_ending: LineEnding,
     pub last_modified_unix_ms: Option<u64>,
     pub syntax: Option<BufferSyntax>,
+    /// A background parse is producing this buffer's `syntax` (see `handlers::finish_pending_parse`).
+    /// Set by `load_from_file` when the file is too large to parse on the open round-trip; cleared
+    /// when the parse lands (or when there's nothing to parse). While pending, everything
+    /// tree-dependent degrades exactly as for a language without a grammar: `syntax` is `None`,
+    /// renders are unhighlighted, and `apply_edit` skips tree maintenance — the background task
+    /// re-checks `revision` and reparses until it catches up.
+    pub syntax_pending: bool,
     /// Detected (or defaulted) once on load; stable for the buffer's lifetime so further edits
     /// don't make the unit drift.
     pub indent_style: IndentStyle,
@@ -1334,9 +1341,18 @@ impl Buffer {
                 .map(|d| d.as_millis() as u64)
         });
         let language = detect_language(&canonical);
-        let syntax = language
+        // Large files defer the parse to a background task (`handlers::finish_pending_parse`) so
+        // the open round-trip returns in milliseconds; the first frame renders unhighlighted and a
+        // `viewport/lines_changed` push restyles it when the tree lands. Small files parse inline —
+        // the cost is a few ms and it keeps the first frame highlighted with no restyle flash.
+        let defer_parse = language
             .as_deref()
-            .and_then(|name| make_syntax(&text, name));
+            .is_some_and(|name| !sync_parse_affordable(name, text.len_bytes()));
+        let syntax = if defer_parse {
+            None
+        } else {
+            language.as_deref().and_then(|name| make_syntax(&text, name))
+        };
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Ok(Buffer {
             id,
@@ -1349,6 +1365,7 @@ impl Buffer {
             line_ending,
             last_modified_unix_ms,
             syntax,
+            syntax_pending: defer_parse,
             indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -1383,6 +1400,7 @@ impl Buffer {
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
             syntax,
+            syntax_pending: false,
             indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -1413,6 +1431,7 @@ impl Buffer {
             line_ending: LineEnding::Lf,
             last_modified_unix_ms: None,
             syntax,
+            syntax_pending: false,
             indent_style,
             // Treat empty scratch as "clean"; first edit makes it dirty.
             saved_revision: Some(0),
@@ -1532,9 +1551,13 @@ impl Buffer {
             }
             // Injection layers are recomputed from scratch after every edit. Cheap relative to
             // the parse itself for typical fence counts, and the alternative (tracking which
-            // layers were touched) would need its own diff bookkeeping.
-            let source: String = text.chunks().collect();
-            syntax.injections = syntax::compute_injections(syntax.config, &syntax.tree, &source);
+            // layers were touched) would need its own diff bookkeeping. Gated on the language
+            // actually declaring injections — the contiguous source copy is O(buffer) per edit.
+            if syntax.config.injection_query.is_some() {
+                let source: String = text.chunks().collect();
+                syntax.injections =
+                    syntax::compute_injections(syntax.config, &syntax.tree, &source);
+            }
         }
 
         self.revision
@@ -1745,7 +1768,23 @@ fn resolve_indent_style(text: &ropey::Rope, language: Option<&str>) -> IndentSty
     IndentStyle::Spaces(2)
 }
 
-fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
+/// Whether a full parse of `bytes` in `language` is cheap enough to run inline on the open
+/// round-trip. Plain grammars parse at roughly 10ms per 100 KB in release builds, so files up to
+/// [`SYNC_PARSE_LIMIT_BYTES`] stay synchronous — the first frame arrives highlighted and nothing
+/// restyles. Grammars with injections (markdown) additionally sub-parse every injection region,
+/// measured at ~2.5ms per KB on fence-dense documents, so their limit is far lower.
+fn sync_parse_affordable(language: &str, bytes: usize) -> bool {
+    const SYNC_PARSE_LIMIT_BYTES: usize = 128 * 1024;
+    const SYNC_PARSE_LIMIT_INJECTION_BYTES: usize = 8 * 1024;
+    let limit = match syntax::get_config(language) {
+        None => return true, // no grammar — nothing to parse, nothing to defer
+        Some(cfg) if cfg.injection_query.is_some() => SYNC_PARSE_LIMIT_INJECTION_BYTES,
+        Some(_) => SYNC_PARSE_LIMIT_BYTES,
+    };
+    bytes <= limit
+}
+
+pub(crate) fn make_syntax(text: &ropey::Rope, language: &str) -> Option<BufferSyntax> {
     let config = syntax::get_config(language)?;
     let mut parser = syntax::make_parser(config);
     let source: String = text.chunks().collect();

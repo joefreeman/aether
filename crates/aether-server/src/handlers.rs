@@ -2318,12 +2318,18 @@ async fn buffer_open_inner(
     // Resolve the Git baseline once (repo discovery + reading the committed blob) and diff the
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
-    let git = (!external).then(|| {
+    // Only *small* files resolve it on the open round-trip: blob decompression and the two
+    // full-file diffs are O(file), so past the limit the load runs in a background task
+    // ([`finish_git_baseline`]) and the gutter fills in via a `viewport/lines_changed` push —
+    // the same deal the deferred parse gets.
+    let git_deferred = !external && buf.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
+    let git = (!external && !git_deferred).then(|| {
         let git_baseline = crate::git::load_baseline(&canonical);
         let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
         let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
         (git_baseline, git_unstaged, git_both)
     });
+    let syntax_pending = buf.syntax_pending;
     s.buffers.insert(id, buf);
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
@@ -2451,11 +2457,134 @@ async fn buffer_open_inner(
     // Warm the document-symbol outline so `o` and `Space o` work as soon as possible. A no-op if
     // the server isn't ready yet — the `publishDiagnostics` hook refreshes once it is.
     spawn_document_symbol_refresh(state.clone(), id);
+    if syntax_pending {
+        tokio::spawn(finish_pending_parse(state.clone(), id));
+    }
+    if git_deferred {
+        tokio::spawn(finish_git_baseline(state.clone(), id, canonical.clone()));
+    }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     tracing::debug!(buffer_id = id, path = %canonical.display(), "buffer opened");
     Ok(result)
+}
+
+/// Files at or below this size resolve their Git baseline synchronously inside `buffer/open`, so
+/// the first frame already carries gutter markers and branch status; larger files defer to
+/// [`finish_git_baseline`]. 128 KB costs single-digit milliseconds (two blob decompressions plus
+/// two in-memory diffs) — the same order as the deferred-parse limit in `state::sync_parse_affordable`.
+const GIT_BASELINE_SYNC_LIMIT_BYTES: u64 = 128 * 1024;
+
+/// Complete a deferred Git baseline load: repo discovery and blob reads run on a blocking thread
+/// with no locks held, then the result attaches under the lock via [`attach_git_baseline`] — which
+/// diffs against the buffer's *current* text, so edits that landed while the blobs were loading
+/// are already accounted for. Every viewport on the buffer then gets a `viewport/lines_changed`
+/// push carrying the freshly-known hunks and branch status.
+async fn finish_git_baseline(
+    state: SharedState,
+    buffer_id: BufferId,
+    canonical: std::path::PathBuf,
+) {
+    let Ok(baseline) =
+        tokio::task::spawn_blocking(move || crate::git::load_baseline(&canonical)).await
+    else {
+        return;
+    };
+    let pushes = {
+        let mut s = state.lock().await;
+        if !s.buffers.contains_key(&buffer_id) {
+            return; // closed while the baseline was loading
+        }
+        attach_git_baseline(&mut s, buffer_id, baseline)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    tracing::debug!(buffer_id, "deferred git baseline attached");
+}
+
+/// Complete a deferred open parse (`Buffer::syntax_pending`): snapshot the rope (cheap — ropey
+/// clones share chunks), run the full tree-sitter parse on a blocking thread, and attach the
+/// result under the lock — but only if the buffer is still at the snapshotted revision. Edits that
+/// landed mid-parse make the tree stale, so the loop re-snapshots and parses again; it ends when a
+/// parse survives unchallenged or the buffer is gone. On attach, every viewport on the buffer
+/// (any client) gets a `viewport/lines_changed` re-render, restyling the unhighlighted first frame.
+async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
+    loop {
+        let (text, revision, language) = {
+            let mut s = state.lock().await;
+            let Some(buf) = s.buffers.get_mut(&buffer_id) else {
+                return; // closed while pending
+            };
+            if !buf.syntax_pending {
+                return; // superseded (e.g. a reload already attached a tree)
+            }
+            let Some(language) = buf.language.clone() else {
+                // Shouldn't happen — pending is only set for detected languages — but don't
+                // leave the flag stuck if it does.
+                buf.syntax_pending = false;
+                return;
+            };
+            (buf.text.clone(), buf.revision, language)
+        };
+        let parsed =
+            tokio::task::spawn_blocking(move || crate::state::make_syntax(&text, &language))
+                .await
+                .unwrap_or(None);
+        let pushes = {
+            let mut s = state.lock().await;
+            let Some(buf) = s.buffers.get_mut(&buffer_id) else {
+                return;
+            };
+            if !buf.syntax_pending {
+                return;
+            }
+            if buf.revision != revision {
+                continue; // buffer changed mid-parse — the tree is stale, go again
+            }
+            buf.syntax = parsed;
+            buf.syntax_pending = false;
+            collect_buffer_refresh_pushes(&s, buffer_id)
+        };
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+        tracing::debug!(buffer_id, "deferred parse attached");
+        return;
+    }
+}
+
+/// One `viewport/lines_changed` per viewport — any client — showing `buffer_id`, re-rendering each
+/// viewport's currently pushed range. For server-side changes that restyle a window without a
+/// content edit: a deferred open parse landing, a Git baseline attaching or refreshing. The
+/// buffer's current revision rides through unchanged.
+fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
+    let mut pushes: PendingPushes = Vec::new();
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return pushes;
+    };
+    for vp in s.viewports.values() {
+        if vp.buffer_id != buffer_id {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        let search = s.searches.get(&(vp.client_id, buffer_id));
+        let notif = build_lines_changed_notif(
+            buf,
+            vp,
+            buf.revision,
+            search,
+            buffer_both_hunks(s, buffer_id),
+            buffer_diagnostics(s, buffer_id),
+            buffer_git_status(s, buffer_id),
+            lines_changed_cursor(s, vp),
+        );
+        pushes.push((sender, notif));
+    }
+    pushes
 }
 
 // ---- git/* -------------------------------------------------------------------------------------
@@ -4056,44 +4185,33 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
     let Some(path) = buf.canonical_path.clone() else {
         return Vec::new();
     };
-    let revision = buf.revision;
-
-    // Re-read the committed baseline (the expensive part), then re-diff the live buffer against both
-    // the HEAD and index blobs (the latter also picks up staging done outside the editor).
+    // Re-read the committed baseline (the expensive part), then attach it — re-diffing the live
+    // buffer against both the HEAD and index blobs (the latter also picks up staging done outside
+    // the editor).
     let baseline = crate::git::load_baseline(&path);
+    attach_git_baseline(s, buffer_id, baseline)
+}
+
+/// Install a freshly-loaded Git baseline for `buffer_id`: diff the live buffer against it, replace
+/// the cached hunks, invalidate cached blame, and build `viewport/lines_changed` pushes for every
+/// viewport on the buffer so the gutter / inline diff refresh live. The diff runs against the
+/// buffer's *current* text, so a caller that loaded the baseline off the lock ([`finish_git_baseline`])
+/// needs no revision bookkeeping. No-op (empty) for a missing buffer.
+fn attach_git_baseline(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+    baseline: crate::git::GitBaseline,
+) -> PendingPushes {
+    let Some(buf) = s.buffers.get(&buffer_id) else {
+        return Vec::new();
+    };
     let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
     let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
     s.git_baseline.insert(buffer_id, baseline);
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
     s.git_both_hunks.insert(buffer_id, both);
-    s.git_blame.remove(&buffer_id); // committed history changed → recompute on next request
-
-    let buf = &s.buffers[&buffer_id];
-    let diagnostics = buffer_diagnostics(s, buffer_id);
-    let mut pushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(s, buffer_id),
-                diagnostics,
-                buffer_git_status(s, buffer_id),
-                lines_changed_cursor(s, vp),
-            ),
-        ));
-    }
-    pushes
+    s.git_blame.remove(&buffer_id); // committed history may have changed → recompute on request
+    collect_buffer_refresh_pushes(s, buffer_id)
 }
 
 // ---- buffer/search ------------------------------------------------------------------------------

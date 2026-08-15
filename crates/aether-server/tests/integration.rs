@@ -3090,6 +3090,326 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     drop(server);
 }
 
+/// A Rust file comfortably over the deferred-parse threshold (128 KB), all lines identical
+/// `fn f() { let s = "hi"; }` items so highlight assertions are position-stable.
+fn large_rust_source() -> String {
+    let line = "fn f() { let s = \"hi\"; }\n";
+    line.repeat(200 * 1024 / line.len())
+}
+
+/// Spin up a server with `big.rs` (over the deferred-parse threshold) opened and subscribed.
+/// Returns the subscribe result so tests can inspect the pre-parse window.
+async fn setup_deferred_parse_buffer() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer_id
+    ViewportSubscribeResult,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.rs"), large_rust_source()).unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("big.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(open.language.as_deref(), Some("rust"));
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    (server, ws, open.buffer_id, sub)
+}
+
+/// Read `viewport/lines_changed` pushes until one satisfies `pred` — a deferred parse or Git
+/// baseline landing. Skips pushes that don't match (the two background tasks race, and either
+/// may push first). Bounded: panics if no matching push arrives within a few seconds.
+async fn expect_lines_changed_where(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    what: &str,
+    pred: impl Fn(&ViewportLinesChangedParams) -> bool,
+) -> ViewportLinesChangedParams {
+    for _ in 0..20 {
+        let push = expect_notification_within::<ViewportLinesChanged>(
+            ws,
+            std::time::Duration::from_secs(15),
+        )
+        .await;
+        if pred(&push) {
+            return push;
+        }
+    }
+    panic!("no viewport/lines_changed push arrived where {what}");
+}
+
+/// Read `viewport/lines_changed` pushes until one carries highlight spans — the deferred-parse
+/// restyle.
+async fn expect_highlighted_lines_changed(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> ViewportLinesChangedParams {
+    expect_lines_changed_where(ws, "line 0 is highlighted", |push| {
+        push.replacement_lines
+            .first()
+            .and_then(|l| l.visual_rows.first())
+            .and_then(|r| r.segments.first())
+            .is_some_and(|s| !s.highlights.is_empty())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn deferred_parse_restyles_the_viewport_when_it_lands() {
+    let (server, mut ws, _buffer_id, sub) = setup_deferred_parse_buffer().await;
+
+    // Over the threshold, the open returns before the parse: the first window is unhighlighted.
+    let first_segs = &sub.window.lines[0].visual_rows[0].segments;
+    assert!(
+        first_segs.iter().all(|s| s.highlights.is_empty()),
+        "expected the pre-parse window to carry no highlight spans"
+    );
+
+    // The background parse lands and re-pushes the window, now highlighted, same revision.
+    let push = expect_highlighted_lines_changed(&mut ws).await;
+    assert_eq!(push.revision, 0, "content didn't change — revision rides through");
+    let highlights = &push.replacement_lines[0].visual_rows[0].segments[0].highlights;
+    let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
+    assert!(
+        fn_kw.is_some_and(|h| h.kind.contains("keyword")),
+        "expected 'fn' tagged keyword after the deferred parse, got {:?}",
+        fn_kw
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn deferred_parse_tracks_edits_landed_mid_parse() {
+    let (server, mut ws, buffer_id, _sub) = setup_deferred_parse_buffer().await;
+
+    // Edit immediately, while the background parse is (almost certainly) still chewing on the
+    // pre-edit snapshot: the completion must notice the revision moved and re-parse rather than
+    // attaching a stale tree. (If the parse happens to win the race the assertions still hold —
+    // the edit path re-renders with the fresh tree.)
+    let edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id,
+            text: "struct Zz; ".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let push = expect_highlighted_lines_changed(&mut ws).await;
+    assert_eq!(
+        push.revision, edit.revision,
+        "the highlighted window must be for the post-edit text"
+    );
+    // Line 0 is now `struct Zz; fn f() ...` — the parse the highlights came from must have seen
+    // the edited text, so `struct` (bytes 0..6) is tagged keyword.
+    let highlights = &push.replacement_lines[0].visual_rows[0].segments[0].highlights;
+    let struct_kw = highlights.iter().find(|h| h.start == 0 && h.end == 6);
+    assert!(
+        struct_kw.is_some_and(|h| h.kind.contains("keyword")),
+        "expected 'struct' tagged keyword from a post-edit parse, got {:?}",
+        struct_kw
+    );
+
+    drop(server);
+}
+
+/// Like `setup_deferred_parse_buffer`, but `big.rs` lives in a git repo with `committed` as its
+/// HEAD content and `on_disk` as the working-tree content the buffer loads. Over the deferral
+/// threshold, so both the parse and the git baseline arrive as background pushes.
+async fn setup_deferred_git_buffer(
+    committed: &str,
+    on_disk: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    u64, // buffer_id
+    ViewportSubscribeResult,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("big.rs"), committed).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("big.rs")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+    std::fs::write(dir.path().join("big.rs"), on_disk).unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+
+    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("big.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 5,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    (server, ws, open.buffer_id, sub)
+}
+
+#[tokio::test]
+async fn deferred_git_baseline_pushes_hunks_when_it_lands() {
+    let committed = large_rust_source();
+    // Same length, line 0 modified relative to HEAD.
+    let on_disk = committed.replacen("fn f()", "fn g()", 1);
+    let (server, mut ws, _buffer_id, sub) = setup_deferred_git_buffer(&committed, &on_disk).await;
+
+    // Over the threshold the open returns before the baseline: no branch status, no gutter.
+    assert!(
+        sub.window.git_status.is_none(),
+        "expected the pre-baseline window to carry no git status"
+    );
+    assert!(
+        sub.window.lines[0].diff_marker.is_none(),
+        "expected the pre-baseline window to carry no gutter markers"
+    );
+
+    // The background load lands and re-pushes the window with hunks and branch status.
+    let push = expect_lines_changed_where(&mut ws, "git decorations arrived", |p| {
+        p.replacement_lines[0].diff_marker.is_some()
+    })
+    .await;
+    assert_eq!(push.replacement_lines[0].diff_marker, Some(DiffMarker::Modified));
+    assert!(
+        push.git_status.is_some(),
+        "branch status rides the same push"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn deferred_git_baseline_diffs_against_edits_landed_mid_load() {
+    // Working tree matches HEAD exactly — the only change is the live edit below, made while the
+    // baseline is (almost certainly) still loading. The attach diffs against the buffer's
+    // *current* text, so the pushed gutter must show the edit. (If the load wins the race the
+    // edit path recomputes hunks itself — the assertions hold either way.)
+    let committed = large_rust_source();
+    let (server, mut ws, buffer_id, sub) = setup_deferred_git_buffer(&committed, &committed).await;
+    assert!(sub.window.git_status.is_none());
+
+    let _edit: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id,
+            text: "// live edit\n".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let push = expect_lines_changed_where(&mut ws, "the live edit's hunk arrived", |p| {
+        p.replacement_lines[0].diff_marker.is_some()
+    })
+    .await;
+    assert_eq!(
+        push.replacement_lines[0].diff_marker,
+        Some(DiffMarker::Added),
+        "line 0 is the inserted line — an Added hunk against the loaded baseline"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn match_bracket_motion_jumps_to_pair() {
     // Rust file so tree-sitter is active. Cursor on the `{` of `fn foo() {}`.

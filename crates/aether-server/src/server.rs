@@ -150,6 +150,10 @@ pub async fn run_with_listener(
         tokio::select! {
             res = listener.accept() => {
                 let (stream, addr) = res?;
+                // Nagle + the peer's delayed ACK turns any push-then-reply write pair into a
+                // ~40ms stall (the reply sits in the kernel until the pushed frame is ACKed).
+                // Interactive RPC wants every frame on the wire immediately.
+                let _ = stream.set_nodelay(true);
                 tracing::debug!(%addr, "TCP connection accepted");
                 let state = state.clone();
                 tokio::spawn(async move {

@@ -215,6 +215,12 @@ pub async fn connect(
         }
         Err(e) => return Err(ConnectError::Down(e.into())),
     };
+    // Disable Nagle: with it on, a small request written while an earlier frame is still
+    // unACKed sits in the kernel for the peer's delayed-ACK timer (~40ms). The server sets
+    // the same on its side; both directions matter for keystroke-paced RPC.
+    if let tokio_tungstenite::MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        let _ = stream.set_nodelay(true);
+    }
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     tokio::spawn(actor(ws, req_rx, inbound_tx));
