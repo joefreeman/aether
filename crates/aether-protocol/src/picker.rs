@@ -806,8 +806,10 @@ pub struct ScopedPath {
 /// GitChanges reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer
 /// reads `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`; Jumplist reads
 /// `globs`/`directories` (against each captured entry's file identity — and only when the capture
-/// spans in-root files at all, see `PickerViewResult::path_filterable`). Inapplicable fields are
-/// ignored, not errors — clients only offer the chips that apply.
+/// spans in-root files at all, see `PickerViewResult::path_filterable`); WorkspaceSymbols reads
+/// `globs`/`directories` (against each symbol's file — `directories` additionally prunes which
+/// projects' servers the query fans out to, see `docs/workspace-symbols.md`). Inapplicable fields
+/// are ignored, not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.

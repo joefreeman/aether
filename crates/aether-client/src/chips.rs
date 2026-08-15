@@ -100,9 +100,9 @@ pub struct Chip {
 /// Whether a filter chip applies to this picker kind (chords are clean no-ops elsewhere):
 /// Grep takes everything; Files the scope chips + changed-only + the hidden visibility chip
 /// (its index includes hidden files, so `Alt-.` hides them — but not `ignored`, which would need
-/// a re-walk); the Explorer both visibility chips + changed-only; the Jumplist the path-scope
-/// chips only. Static per kind — the Jumplist additionally gates on the captured data
-/// ([`crate::picker::PickerState::filter_available`] wraps this with the server's
+/// a re-walk); the Explorer both visibility chips + changed-only; the Jumplist and workspace
+/// symbols the path-scope chips only. Static per kind — the Jumplist additionally gates on the
+/// captured data ([`crate::picker::PickerState::filter_available`] wraps this with the server's
 /// `path_filterable` echo).
 pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
@@ -135,6 +135,12 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
         // and the git/visibility chips describe live workspace state, which a positional
         // snapshot doesn't have.
         PickerKind::Jumplist => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
+        // Path scoping over where symbols live (docs/workspace-symbols.md): the Dir chip also
+        // prunes which projects' servers are asked, server-side. Pattern chips don't apply —
+        // the *LSP server* ran the match, so case/word/regex here would quietly mean something
+        // different from what they mean in Grep. Ignored/hidden are meaningless (servers don't
+        // report gitignored files); changed/untracked deferred.
+        PickerKind::WorkspaceSymbols => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
         _ => false,
     }
 }
@@ -947,6 +953,23 @@ mod tests {
         // ...but path scopes are meaningless on one file.
         assert!(!filter_applies(GitChangesFile, ChipId::Dir(0)));
         assert!(!filter_applies(GitChangesFile, ChipId::Glob(0)));
+    }
+
+    #[test]
+    fn workspace_symbols_offers_path_scopes_but_no_pattern_or_git_chips() {
+        use PickerKind::WorkspaceSymbols;
+        // Path scoping applies — the Dir chip also prunes the server fan-out...
+        assert!(filter_applies(WorkspaceSymbols, ChipId::Dir(0)));
+        assert!(filter_applies(WorkspaceSymbols, ChipId::Glob(0)));
+        // ...but the LSP server ran the match, so the regex options would lie...
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Case));
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Word));
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Regex));
+        // ...and servers know nothing of gitignore or git state.
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Ignored));
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Hidden));
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Changed));
+        assert!(!filter_applies(WorkspaceSymbols, ChipId::Untracked));
     }
 
     #[test]

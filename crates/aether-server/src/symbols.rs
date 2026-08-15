@@ -94,6 +94,7 @@ pub fn parse_symbols(
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32;
 
+        let (path_index, display_path) = locate(&path, roots);
         let abs_path = path.display().to_string();
         // The file isn't open, so there's no rope to convert against — read it (once) and convert
         // the LSP column against the actual line text. A missing/unreadable file still yields a
@@ -109,7 +110,8 @@ pub fn parse_symbols(
         };
 
         out.push(WorkspaceSymbolCandidate {
-            display_path: display_path(&path, roots),
+            path_index,
+            display_path,
             abs_path: abs_path.clone(),
             line,
             col,
@@ -169,16 +171,56 @@ fn strip_markdown_inline(line: &str) -> String {
     out.trim().to_string()
 }
 
-/// Workspace-relative when the file lives inside a root, else the absolute path — symbols can come
-/// from dependencies and the standard library, where no root applies.
-fn display_path(path: &Path, roots: &[PathBuf]) -> String {
+/// Which workspace root contains the file (deepest wins, for nested roots) and the path to show:
+/// root-relative inside a root, absolute outside — symbols can come from dependencies and the
+/// standard library, where no root applies. The `(path_index, relative_path)` pair is also what
+/// the glob/dir filter chips are defined over, so an out-of-root symbol (`None`) is the pathless
+/// case any active path filter drops.
+fn locate(path: &Path, roots: &[PathBuf]) -> (Option<u32>, String) {
     roots
         .iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())
-        .and_then(|r| path.strip_prefix(r).ok())
-        .map(|rel| rel.display().to_string())
-        .unwrap_or_else(|| path.display().to_string())
+        .enumerate()
+        .filter(|(_, r)| path.starts_with(r))
+        .max_by_key(|(_, r)| r.components().count())
+        .and_then(|(i, r)| {
+            let rel = path.strip_prefix(r).ok()?;
+            Some((Some(i as u32), rel.display().to_string()))
+        })
+        .unwrap_or_else(|| (None, path.display().to_string()))
+}
+
+/// The absolute directories a picker's `Dir` chips scope to, resolved against the workspace roots.
+/// Empty when nothing is scoped.
+pub fn scoped_dirs(
+    filters: &aether_protocol::picker::PickerFilters,
+    roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    filters
+        .directories
+        .iter()
+        .filter_map(|d| {
+            let root = roots.get(d.path_index as usize)?;
+            Some(if d.relative_path.is_empty() {
+                root.clone()
+            } else {
+                root.join(&d.relative_path)
+            })
+        })
+        .collect()
+}
+
+/// Whether a language server rooted at `root` can contribute anything under `scopes`.
+///
+/// This is what makes the `Dir` chip *prune the fan-out* rather than merely filter its results
+/// (`docs/workspace-symbols.md`): a server whose root is disjoint from every scoped directory has
+/// nothing to say, so it isn't asked at all — one fewer round-trip, and one fewer slow project to
+/// wait on. Either containment direction counts: a scope inside the server's root, or a server root
+/// inside the scope.
+pub fn dir_scope_admits(root: &Path, scopes: &[PathBuf]) -> bool {
+    scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|s| s.starts_with(root) || root.starts_with(s))
 }
 
 /// The LSP `SymbolKind` enumeration (1-based), mirroring `parse_document_symbols`'s mapping.
@@ -319,6 +361,11 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
                         .get(client_id)
                         .and_then(|c| c.active_workspace.as_deref())
                         == Some(key.workspace.as_str())
+                    // Respect the picker's Dir chips: a scoped-out server was pruned from the
+                    // fan-out at query time, and readiness doesn't change what it can
+                    // contribute. (If the scope is later removed, `symbol_fanned` won't cover
+                    // the server and the ordinary re-fan-out picks it up.)
+                    && dir_scope_admits(&server.root, &scoped_dirs(&p.filters, &roots))
             })
             .map(|((client_id, _), p)| {
                 (
@@ -338,6 +385,17 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
                 .get_mut(&(*client_id, PickerKind::WorkspaceSymbols))
             {
                 p.add_symbol_query();
+                // This server has now been asked for the current query — record it, so a later
+                // filter-only change knows the accumulated candidates cover it
+                // (`symbol_fanout_covers`). A recorded query that doesn't match means the
+                // candidates' provenance is unknown (e.g. a below-minimum query never fanned
+                // out) — drop the record and let the next `picker/query` re-fan-out.
+                match &mut p.symbol_fanned {
+                    Some((q, fanned)) if *q == p.query => {
+                        fanned.push((server.root.clone(), server.language.clone()));
+                    }
+                    fanned => *fanned = None,
+                }
             }
         }
         pending
@@ -454,18 +512,35 @@ mod tests {
         assert_eq!(out.len(), PER_SERVER_LIMIT);
     }
 
-    /// Inside a root it's relative; outside — a dependency, the stdlib — it's absolute, because
-    /// there's no root to be relative to.
+    /// Inside a root: the containing root's index (deepest wins) + a root-relative path — the
+    /// pair the glob/dir chips filter over. Outside — a dependency, the stdlib — no index and
+    /// the absolute path, because there's no root to be relative to.
     #[test]
-    fn display_path_is_relative_only_inside_a_root() {
-        let roots = [PathBuf::from("/w/proj")];
+    fn locate_finds_the_containing_root() {
+        let roots = [PathBuf::from("/w/proj"), PathBuf::from("/w/proj/nested")];
         assert_eq!(
-            display_path(Path::new("/w/proj/src/a.rs"), &roots),
-            "src/a.rs"
+            locate(Path::new("/w/proj/src/a.rs"), &roots),
+            (Some(0), "src/a.rs".to_string())
         );
         assert_eq!(
-            display_path(Path::new("/elsewhere/dep.rs"), &roots),
-            "/elsewhere/dep.rs"
+            locate(Path::new("/w/proj/nested/b.rs"), &roots),
+            (Some(1), "b.rs".to_string()),
+            "the deepest containing root wins"
         );
+        assert_eq!(
+            locate(Path::new("/elsewhere/dep.rs"), &roots),
+            (None, "/elsewhere/dep.rs".to_string())
+        );
+    }
+
+    /// The `Dir` chip's fan-out pruning predicate: containment in either direction admits, and
+    /// no scope at all admits everyone.
+    #[test]
+    fn dir_scope_admits_by_containment() {
+        let root = Path::new("/w/frontend");
+        assert!(dir_scope_admits(root, &[]));
+        assert!(dir_scope_admits(root, &[PathBuf::from("/w/frontend/src")]));
+        assert!(dir_scope_admits(root, &[PathBuf::from("/w")]));
+        assert!(!dir_scope_admits(root, &[PathBuf::from("/w/backend")]));
     }
 }

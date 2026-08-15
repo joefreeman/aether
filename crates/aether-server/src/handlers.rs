@@ -12235,43 +12235,6 @@ pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
     pushes
 }
 
-/// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
-/// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
-/// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
-/// The absolute directories a picker's `Dir` chips scope to, resolved against the workspace roots.
-/// Empty when nothing is scoped.
-fn scoped_dirs(
-    filters: &aether_protocol::picker::PickerFilters,
-    roots: &[std::path::PathBuf],
-) -> Vec<std::path::PathBuf> {
-    filters
-        .directories
-        .iter()
-        .filter_map(|d| {
-            let root = roots.get(d.path_index as usize)?;
-            Some(if d.relative_path.is_empty() {
-                root.clone()
-            } else {
-                root.join(&d.relative_path)
-            })
-        })
-        .collect()
-}
-
-/// Whether a language server rooted at `root` can contribute anything under `scopes`.
-///
-/// This is what makes the `Dir` chip *prune the fan-out* rather than merely filter its results
-/// (`docs/workspace-symbols.md`): a server whose root is disjoint from every scoped directory has
-/// nothing to say, so it isn't asked at all — one fewer round-trip, and one fewer slow project to
-/// wait on. Either containment direction counts: a scope inside the server's root, or a server root
-/// inside the scope.
-fn dir_scope_admits(root: &std::path::Path, scopes: &[std::path::PathBuf]) -> bool {
-    scopes.is_empty()
-        || scopes
-            .iter()
-            .any(|s| s.starts_with(root) || root.starts_with(s))
-}
-
 /// Drop `workspace_id`'s project pins once no client has it active, reaping the servers that only
 /// the pins were keeping alive (`docs/projects.md`).
 ///
@@ -12290,6 +12253,9 @@ pub fn unpin_workspace_if_unused(s: &mut ServerState, workspace_id: &str) -> Pen
     refresh_lsp_server_pickers(s)
 }
 
+/// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
+/// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
+/// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
 pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
@@ -13670,17 +13636,17 @@ pub async fn picker_query(
     // a server whose root is disjoint from the scope can't contribute. The query minimum is
     // grep's: below it a per-keystroke LSP fan-out (uncancellable — see
     // `docs/workspace-symbols.md`) is pure churn.
-    let symbol_fanout = (matches!(params.kind, PickerKind::WorkspaceSymbols)
+    let mut symbol_fanout = (matches!(params.kind, PickerKind::WorkspaceSymbols)
         && params.query.len() >= grep::MIN_QUERY_LEN)
         .then(|| {
             let workspace = s.active_workspace(client_id)?;
             let roots = workspace.paths.clone();
-            let scopes = scoped_dirs(&params.filters, &roots);
+            let scopes = crate::symbols::scoped_dirs(&params.filters, &roots);
             let servers: Vec<_> = s
                 .lsp
                 .symbol_servers(&workspace.id)
                 .into_iter()
-                .filter(|srv| dir_scope_admits(&srv.root, &scopes))
+                .filter(|srv| crate::symbols::dir_scope_admits(&srv.root, &scopes))
                 .collect();
             Some((servers, roots))
         })
@@ -13724,14 +13690,42 @@ pub async fn picker_query(
         // Workspace symbols: the query is the search, so drop the prior answers and let the
         // fan-out (spawned below, off the lock) refill them server by server. Seeded here —
         // before any spawned request can land its merge (see `seed_symbol_fanout`).
+        //
+        // Except when the recorded fan-out already covers everything this one would ask
+        // (`symbol_fanout_covers`): the servers never see the filters — the Dir chip only
+        // prunes who gets asked — so a filter-only change (a chip edit, or its live preview
+        // keystrokes) re-asking the same servers with the same query would wipe and refetch
+        // the exact answers we're holding. Keep them and just rerank; the fan-out below is
+        // cancelled so nothing spawns and `ticking` stays off (grep's cache-hit shape).
         PickerKind::WorkspaceSymbols => {
-            picker.candidates = picker_state::PickerCandidates::WorkspaceSymbols(Vec::new());
-            picker.ranked.clear();
-            picker.seed_symbol_fanout(
-                symbol_fanout
-                    .as_ref()
-                    .map_or(0, |(servers, _)| servers.len()),
-            );
+            let covered = symbol_fanout.as_ref().is_some_and(|(servers, _)| {
+                picker.symbol_fanout_covers(
+                    servers
+                        .iter()
+                        .map(|srv| (srv.root.as_path(), srv.language.as_str())),
+                )
+            });
+            if covered {
+                symbol_fanout = None;
+                picker.rerank(matcher);
+            } else {
+                picker.candidates = picker_state::PickerCandidates::WorkspaceSymbols(Vec::new());
+                picker.ranked.clear();
+                picker.seed_symbol_fanout(
+                    symbol_fanout
+                        .as_ref()
+                        .map_or(0, |(servers, _)| servers.len()),
+                );
+                picker.symbol_fanned = symbol_fanout.as_ref().map(|(servers, _)| {
+                    (
+                        picker.query.clone(),
+                        servers
+                            .iter()
+                            .map(|srv| (srv.root.clone(), srv.language.clone()))
+                            .collect(),
+                    )
+                });
+            }
         }
         // Explorer: the query is a path. Re-list the directory it peeks into (anchor + the path
         // part) before reranking, so typing `src/` descends and `src/ma` filters `src`. Skip in
@@ -13898,6 +13892,7 @@ pub async fn picker_hide(
         picker.candidates.clear();
         picker.ranked.clear();
         picker.last_completed_search = None;
+        picker.symbol_fanned = None;
         picker.pending_async_load = None;
         picker.seed_symbol_fanout(0);
         picker.expanded = None;

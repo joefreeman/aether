@@ -1342,6 +1342,76 @@ fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
 }
 
 #[test]
+fn workspace_symbols_picker_offers_path_chips_and_removal_requeries() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::WorkspaceSymbols, None, None, false, None);
+
+    // Unlike the Jumplist there is no data gate — results are live and workspace-scoped, so
+    // Alt-g opens the glob editor straight away, and typing live-previews through the query.
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chip_editor.is_some());
+    let fx = s.chip_editor_set_input("*.rs".into());
+    let params = find_request(&fx, "picker/query").expect("the glob preview re-queries");
+    assert_eq!(params["filters"]["globs"], json!(["*.rs"]));
+
+    // Enter commits the chip.
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
+
+    // Left (at the empty query's start) selects the chip; Backspace removes it — and the
+    // removal must reach the server as a re-query with the filter gone, not just reshape the
+    // local chip row.
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chips.is_empty());
+    let params = find_request(&fx, "picker/query").expect("chip removal re-queries");
+    assert_eq!(params["filters"]["globs"], json!(null));
+
+    // The pattern chips never apply — the LSP server ran the match, not our regex engine.
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chips.is_empty());
+}
+
+#[test]
+fn jumplist_chip_removal_requeries() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::{PickerKind, PickerViewResult};
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Jumplist, None, None, false, None);
+    let view = PickerViewResult {
+        query: String::new(),
+        generation: 0,
+        total_candidates: 3,
+        effective_offset: 0,
+        effective_center_on: None,
+        directory_path: None,
+        directory_parent: None,
+        filters: Default::default(),
+        path_filterable: true,
+        update: None,
+    };
+    let _ = s.on_event(Event::PickerViewed {
+        initial: true,
+        result: Ok(view),
+    });
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.chip_editor_set_input("*.rs".into());
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
+
+    // Regression: removal used to reshape the chip row without telling the server, leaving the
+    // results filtered by a chip that was no longer showing.
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chips.is_empty());
+    let params = find_request(&fx, "picker/query").expect("chip removal re-queries");
+    assert_eq!(params["filters"]["globs"], json!(null));
+}
+
+#[test]
 fn lsp_picker_centers_on_the_current_buffers_server() {
     use aether_protocol::lsp::LspServerRef;
     use aether_protocol::picker::PickerKind;
@@ -2279,10 +2349,7 @@ fn repeat_prone_toasts_carry_a_group_so_they_coalesce_on_every_shell() {
     ));
     assert_eq!(
         first_toast(&fx),
-        Some((
-            "Jumplist is empty — Ctrl-j in a picker captures results".into(),
-            Some("jumplist".into())
-        )),
+        Some(("Jumplist is empty".into(), Some("jumplist".into()))),
     );
 
     // Stepping past the last entry: the boundary toast is keyed the same, so `]` at the end
@@ -4996,7 +5063,8 @@ fn workspace_symbols_empty_note_names_the_missing_projects() {
         "expected a no-projects note, got {note:?}",
     );
 
-    // With one declared, an empty result really is "no matches".
+    // With one declared, a fresh open shows just the input — the query *is* the search
+    // (like Grep), and nothing has been searched yet, so a note would read as a failed one.
     s.workspace_projects = vec![WorkspaceProject {
         path_index: 0,
         relative_path: "Cargo.toml".into(),
@@ -5005,6 +5073,18 @@ fn workspace_symbols_empty_note_names_the_missing_projects() {
     }];
     let _ = s.open_picker(PickerKind::WorkspaceSymbols, None, None, false, None);
     s.picker.as_mut().unwrap().ticking = false;
+    let note = s.picker.as_ref().unwrap().empty_note();
+    assert!(
+        note.is_none(),
+        "an unqueried picker hasn't searched — expected no note, got {note:?}",
+    );
+
+    // Only a *typed* query that settled empty really is "no matches".
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.query = "zzz".into();
+        p.ticking = false;
+    }
     let note = s.picker.as_ref().unwrap().empty_note();
     assert!(
         note.is_some_and(|n| n.contains("No symbols")),

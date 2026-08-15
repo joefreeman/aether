@@ -80,7 +80,7 @@ pub enum ContextId {
 pub enum PickerCmd {
     /// `Ctrl-d` in the Buffers picker.
     CloseBuffer,
-    /// `Alt-p` in the Files/Grep pickers.
+    /// `Alt-p` in the path-filterable pickers (Files/Grep/…).
     AddPathScope,
     /// `Alt-j` / `Alt-k` in any picker — move the highlight.
     MoveSelection,
@@ -327,8 +327,14 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "picker-close", tier: 4, contexts: &[C::Picker(PickerKind::Buffers)], keys: "Ctrl-d",
         trigger: Trigger::Picker(PickerCmd::CloseBuffer),
         text: "Use {} to close the selected buffer" },
+    // (Not the Jumplist, whose path chips are data-gated — the hint could name a chord that
+    // isn't available for the current capture.)
     HintDef { id: "picker-scope", tier: 4,
-        contexts: &[C::Picker(PickerKind::Files), C::Picker(PickerKind::Grep)], keys: "Alt-p",
+        contexts: &[
+            C::Picker(PickerKind::Files),
+            C::Picker(PickerKind::Grep),
+            C::Picker(PickerKind::WorkspaceSymbols),
+        ], keys: "Alt-p",
         trigger: Trigger::Picker(PickerCmd::AddPathScope),
         text: "Use {} to scope results to a path" },
     // The jumplist trio (docs/jumplist.md): capture from a result-shaped picker, step the

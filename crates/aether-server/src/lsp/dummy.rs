@@ -100,6 +100,11 @@ pub struct DummyLspConfig {
     /// the server returns *everything* regardless of query, which is how a test reproduces a server
     /// whose match rules differ from ours (rust-analyzer's `#` widening, say).
     pub symbol_query_filter: bool,
+    /// Test observability: counts the `workspace/symbol` requests this server *received*. The
+    /// Dir-chip fan-out-pruning tests assert a scoped-out server was never asked at all
+    /// (`docs/workspace-symbols.md`) — which inspecting results can't distinguish from being
+    /// asked and post-filtered.
+    pub symbol_requests: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Hold the `initialize` reply this long, keeping the server in `Starting` — for tests that
     /// exercise what happens while a server is still coming up (a real cold start, minus the
     /// multi-second wait).
@@ -234,6 +239,9 @@ where
                 respond(&mut writer, id, Value::Array(locs)).await;
             }
             "workspace/symbol" => {
+                if let Some(counter) = &config.symbol_requests {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let query = str_at(&msg, &["params", "query"]);
                 let syms: Vec<Value> = config
                     .workspace_symbols

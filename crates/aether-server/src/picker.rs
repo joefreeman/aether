@@ -387,6 +387,10 @@ impl SymbolCandidate {
 #[derive(Debug, Clone)]
 pub struct WorkspaceSymbolCandidate {
     pub abs_path: String,
+    /// The workspace root containing the file, or `None` for an out-of-root symbol. `Some` means
+    /// `display_path` is relative to that root — the `(path_index, relative_path)` pair the
+    /// glob/dir filter chips are defined over.
+    pub path_index: Option<u32>,
     /// Row label: workspace-relative when inside a root, else the absolute path.
     pub display_path: String,
     /// 0-based line of the symbol's name.
@@ -1216,6 +1220,14 @@ pub struct PickerState {
     /// valid — skip the wipe + respawn and just re-emit the current window. Cleared whenever a
     /// new search starts; set by the streaming coordinator's final-push branch.
     pub last_completed_search: Option<(String, PickerFilters)>,
+    /// WorkspaceSymbols only: the `(query, (root, language) server identities)` of the fan-out
+    /// that produced the current candidates — grep's `last_completed_search` in fan-out shape.
+    /// Filters aren't part of the key because they never reach the servers: the Dir chip only
+    /// *prunes* who gets asked, so a settled fan-out's candidates are valid for any filter set
+    /// whose admitted servers it covers ([`Self::symbol_fanout_covers`]) and the change is just
+    /// a rerank. Recorded when a fan-out spawns; a became-ready re-query appends itself
+    /// ([`crate::symbols::requery_ready_server`]).
+    pub symbol_fanned: Option<(String, Vec<(std::path::PathBuf, String)>)>,
     /// Collapsible kinds only (docs/picker-groups.md §9): the group key of the one expanded
     /// run — exactly one group shows its items whenever there are groups (accordion; the
     /// *selected* group under the two-level navigation model). The key is resolved against
@@ -1389,8 +1401,32 @@ impl PickerState {
             pending_async_load: None,
             pending_symbol_queries: 0,
             last_completed_search: None,
+            symbol_fanned: None,
             expanded: None,
         }
+    }
+
+    /// Whether the recorded fan-out ([`Self::symbol_fanned`]) already accounts for every server
+    /// `admitted` by the current filters, for the current query — i.e. a re-fan-out could not
+    /// produce anything the accumulated candidates don't already hold, so a filter-only change
+    /// can keep them and just rerank. Requires the fan-out to have *settled*: with answers still
+    /// outstanding, the generation bump the caller is processing would orphan them
+    /// (`merge_results` drops on generation mismatch) and the candidates would silently stay
+    /// partial.
+    pub fn symbol_fanout_covers<'a>(
+        &self,
+        admitted: impl Iterator<Item = (&'a std::path::Path, &'a str)>,
+    ) -> bool {
+        if self.pending_symbol_queries != 0 {
+            return false;
+        }
+        let Some((query, fanned)) = &self.symbol_fanned else {
+            return false;
+        };
+        *query == self.query
+            && admitted
+                .into_iter()
+                .all(|(root, language)| fanned.iter().any(|(r, l)| r == root && l == language))
     }
 
     /// Seed the WorkspaceSymbols fan-out counter for a fresh query: `n` `workspace/symbol`
@@ -1428,15 +1464,18 @@ impl PickerState {
         self.ranked.clear();
         let strategy = self.candidates.match_strategy();
         // Files: filter chips narrow the candidate set before (and independently of) the fuzzy
-        // match. Files, Git changes and the Jumplist all narrow by glob/dir chips before fuzzy
-        // matching (Git changes and the Jumplist share the path-scope half — Git changes is
-        // inherently changed-only; the Jumplist filters its captured entries' file identity).
-        // The other kinds filter elsewhere (Grep in the search worker, Explorer when the
-        // listing is built), so their predicate is always "pass".
+        // match. Files, Git changes, the Jumplist and workspace symbols all narrow by glob/dir
+        // chips before fuzzy matching (Git changes is inherently changed-only; the Jumplist and
+        // workspace symbols filter by file identity — the Dir chip additionally prunes the
+        // symbol *fan-out*, but that only skips servers with nothing in scope; this predicate
+        // is what actually narrows the rows). The other kinds filter elsewhere (Grep in the
+        // search worker, Explorer when the listing is built), so their predicate is always
+        // "pass".
         let files_filter = match &self.candidates {
             PickerCandidates::Files { .. }
             | PickerCandidates::GitChanges(_)
             | PickerCandidates::Jumplist(_)
+            | PickerCandidates::WorkspaceSymbols(_)
                 if !self.filters.is_default() =>
             {
                 Some(FilesFilter::new(&self.filters))
@@ -1464,6 +1503,15 @@ impl PickerState {
                         _ => ff.passes_pathless(),
                     }
                 }
+                PickerCandidates::WorkspaceSymbols(v) => match v[i].path_index {
+                    // In-root: `display_path` is the root-relative path.
+                    Some(pi) => ff.passes_path(pi, &v[i].display_path),
+                    // Out-of-root symbol (dependencies, the standard library) — the Jumplist's
+                    // pathless rule: any path narrowing drops it. Notably this includes
+                    // rust-analyzer's `#`/`*` widened results, which is the consistent reading —
+                    // globs and scopes speak about workspace files.
+                    None => ff.passes_pathless(),
+                },
                 _ => true,
             }
         };
@@ -2743,6 +2791,7 @@ mod tests {
         // trail; nothing is filtered.
         let cand = |path: &str, line: u32, name: &str| WorkspaceSymbolCandidate {
             abs_path: format!("/w/{path}"),
+            path_index: Some(0),
             display_path: path.into(),
             line,
             col: 0,
@@ -3461,6 +3510,120 @@ mod tests {
         s.query = "two".into();
         s.rerank(&mut m);
         assert_eq!(s.ranked, vec![1], "query narrows within the scoped set");
+    }
+
+    #[test]
+    fn workspace_symbols_rerank_filters_by_dir_and_glob_and_drops_out_of_root_symbols() {
+        use aether_protocol::picker::{PickerFilters, ScopedPath};
+        let cand = |path_index: Option<u32>, display: &str, name: &str| WorkspaceSymbolCandidate {
+            abs_path: match path_index {
+                Some(_) => format!("/w/{display}"),
+                None => display.to_string(),
+            },
+            path_index,
+            display_path: display.into(),
+            line: 0,
+            col: 0,
+            name: name.into(),
+            symbol_kind: aether_protocol::picker::SymbolKind::Function,
+            container: String::new(),
+        };
+        let cands = PickerCandidates::WorkspaceSymbols(vec![
+            cand(Some(0), "docs/guide.md", "Heading"),
+            cand(Some(0), "src/main.rs", "main"),
+            cand(Some(0), "src/util.rs", "helper"),
+            // Out-of-root (a dependency / stdlib symbol from rust-analyzer's widening).
+            cand(None, "/deps/lib.rs", "dep_fn"),
+        ]);
+        let mut m = make_matcher();
+
+        // No filters: everything passes in candidate (merge) order.
+        let mut s = PickerState::new(cands.clone());
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0, 1, 2, 3]);
+
+        // A directory scope keeps src's symbols and drops the rest — including the out-of-root
+        // symbol, which no root-relative scope can speak about.
+        let mut s = PickerState::new(cands.clone());
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+                is_file: false,
+            }],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![1, 2], "src symbols only, out-of-root dropped");
+
+        // A glob narrows by extension; the out-of-root symbol drops under any path filter.
+        let mut s = PickerState::new(cands.clone());
+        s.filters = PickerFilters {
+            globs: vec!["*.md".into()],
+            ..Default::default()
+        };
+        s.rerank(&mut m);
+        assert_eq!(s.ranked, vec![0], "only the markdown symbol survives");
+
+        // Filters compose with the rank-don't-filter query ordering: scope to src, query
+        // "helper" — both src rows survive (nucleo never filters symbols), best match first.
+        let mut s = PickerState::new(cands);
+        s.filters = PickerFilters {
+            directories: vec![ScopedPath {
+                path_index: 0,
+                relative_path: "src".into(),
+                is_file: false,
+            }],
+            ..Default::default()
+        };
+        s.query = "helper".into();
+        s.rerank(&mut m);
+        assert_eq!(
+            s.ranked,
+            vec![2, 1],
+            "scope narrows, the query only orders what's left"
+        );
+    }
+
+    #[test]
+    fn symbol_fanout_covers_needs_settled_same_query_and_every_admitted_server() {
+        use std::path::{Path, PathBuf};
+        let frontend = || (Path::new("/w/frontend"), "typescript");
+        let backend = || (Path::new("/w/backend"), "rust");
+
+        let mut s = PickerState::new(PickerCandidates::WorkspaceSymbols(Vec::new()));
+        s.query = "boot".into();
+        assert!(
+            !s.symbol_fanout_covers([frontend()].into_iter()),
+            "nothing recorded yet"
+        );
+
+        s.symbol_fanned = Some((
+            "boot".into(),
+            vec![
+                (PathBuf::from("/w/frontend"), "typescript".into()),
+                (PathBuf::from("/w/backend"), "rust".into()),
+            ],
+        ));
+        assert!(
+            s.symbol_fanout_covers([frontend()].into_iter()),
+            "a narrowed admitted set is covered — filter-only change reuses candidates"
+        );
+        assert!(s.symbol_fanout_covers([frontend(), backend()].into_iter()));
+
+        // A server the fan-out never asked (became ready after, or was scoped out) is a miss.
+        assert!(!s.symbol_fanout_covers([frontend(), (Path::new("/w/other"), "go")].into_iter()));
+
+        // A different query is a miss regardless of servers.
+        s.query = "bootstrap".into();
+        assert!(!s.symbol_fanout_covers([frontend()].into_iter()));
+        s.query = "boot".into();
+
+        // Answers still outstanding: the generation bump would orphan them, so no reuse.
+        s.seed_symbol_fanout(1);
+        assert!(!s.symbol_fanout_covers([frontend()].into_iter()));
+        assert!(s.note_symbol_merge(), "settles");
+        assert!(s.symbol_fanout_covers([frontend()].into_iter()));
     }
 
     #[test]

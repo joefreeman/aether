@@ -853,8 +853,9 @@ impl PickerState {
 
     /// The settled empty-state note for the rows area — the line to show when the result set is
     /// empty and not mid-search — or `None` when no note belongs: results exist, a search is still
-    /// running (the shell shows its own "Searching…"), an *unqueried* Grep (no search has run yet,
-    /// so a note would read as a failed one), or the Explorer's "+ Create …" row stands in.
+    /// running (the shell shows its own "Searching…"), an *unqueried* Grep or WorkspaceSymbols (no
+    /// search has run yet, so a note would read as a failed one), or the Explorer's "+ Create …"
+    /// row stands in.
     ///
     /// The single source of this wording across shells. A non-empty query that matched nothing is
     /// "No matches"; an empty query is the kind's "nothing here" line ("No diagnostics" / "No
@@ -864,7 +865,14 @@ impl PickerState {
         if self.ticking || self.total_matches != 0 || self.pending_create().is_some() {
             return None;
         }
-        if self.kind == PickerKind::Grep && self.query.is_empty() {
+        // The query-driven kinds haven't searched until something is typed — the query *is* the
+        // search — so a fresh open shows just the input, not a note claiming a search came back
+        // empty. WorkspaceSymbols keeps its no-projects state even then: "nothing can answer
+        // here yet" is worth saying before the first keystroke, and typing wouldn't change it.
+        if self.query.is_empty()
+            && (self.kind == PickerKind::Grep
+                || (self.kind == PickerKind::WorkspaceSymbols && self.workspace_has_projects))
+        {
             return None;
         }
         Some(match self.kind {
@@ -883,7 +891,7 @@ impl PickerState {
             PickerKind::Keybindings => "No keybindings",
             // Empty list, empty query: advertise how to fill it (a non-empty query that matched
             // nothing already took the "No matches" arm above).
-            PickerKind::Jumplist => "Nothing captured — Ctrl-j in a picker captures results",
+            PickerKind::Jumplist => "Nothing captured",
             _ => "No results",
         })
     }
@@ -1560,6 +1568,24 @@ mod tests {
         assert_eq!(
             settled(PickerKind::Grep, "foo").empty_note(),
             Some("No matches")
+        );
+        // WorkspaceSymbols is query-driven like Grep: a fresh open (empty query) shows just the
+        // input, and the note only appears once a typed query has settled empty — except the
+        // no-projects state, which is "this can't work here yet" and shows regardless of query.
+        let with_projects = |query: &str| {
+            let mut s = settled(PickerKind::WorkspaceSymbols, query);
+            s.workspace_has_projects = true;
+            s
+        };
+        assert_eq!(with_projects("").empty_note(), None);
+        assert_eq!(with_projects("foo").empty_note(), Some("No symbols found"));
+        assert_eq!(
+            settled(PickerKind::WorkspaceSymbols, "").empty_note(),
+            Some("No projects configured")
+        );
+        assert_eq!(
+            settled(PickerKind::WorkspaceSymbols, "foo").empty_note(),
+            Some("No projects configured")
         );
         // Still searching, or rows present → no note.
         let mut ticking = settled(PickerKind::Diagnostics, "");

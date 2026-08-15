@@ -172,6 +172,28 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
             }
             entries
         }
+        // Unlike DocumentSymbols there's no context-row mask to apply: workspace symbols rank
+        // without filtering (the LSP server did the matching — docs/workspace-symbols.md), so
+        // every ranked row is a real result and the snapshot takes them all, path chips already
+        // honoured by `rerank`.
+        PickerCandidates::WorkspaceSymbols(v) => ranked_entries(picker, |ci| {
+            let c = &v[ci];
+            JumplistEntry {
+                // In-root: `display_path` *is* the root-relative path. Out-of-root symbols
+                // (dependencies, the stdlib) have no parts — `assign_file_groups` then gives
+                // them their absolute-path `Label` header, the convention this picker set.
+                path_index: c.path_index,
+                relative_path: c.path_index.is_some().then(|| c.display_path.clone()),
+                abs_path: c.abs_path.clone(),
+                position: LogicalPosition {
+                    line: c.line,
+                    col: c.col,
+                },
+                anchor: None,
+                group: None,
+                display: c.name.clone(),
+            }
+        }),
         // Re-capture from the Jumplist picker itself: the candidates already *are* entries, so
         // the mapping is identity over the filtered ranked set — the list narrows in place.
         // (The caller preserves the original `source`/`query`; see `jumplist_capture`.)
@@ -611,6 +633,60 @@ mod tests {
             .enumerate()
             .map(|(i, e)| (i as u32, e))
             .collect()
+    }
+
+    /// The workspace-symbols capture arm: every shown row snapshots (rank-don't-filter means no
+    /// context-row mask), in-root candidates carry their `(path_index, display_path)` file
+    /// identity, out-of-root ones stay pathless for `assign_file_groups`' Label fallback.
+    /// Regression: the arm was missing entirely, so `Ctrl-j` in the picker always answered
+    /// "Nothing to capture".
+    #[test]
+    fn capture_snapshots_workspace_symbols_with_their_file_identity() {
+        use crate::picker::{make_matcher, PickerCandidates, PickerState, WorkspaceSymbolCandidate};
+        let cand = |path_index: Option<u32>, display: &str, abs: &str, line: u32, name: &str| {
+            WorkspaceSymbolCandidate {
+                abs_path: abs.into(),
+                path_index,
+                display_path: display.into(),
+                line,
+                col: 3,
+                name: name.into(),
+                symbol_kind: aether_protocol::picker::SymbolKind::Function,
+                container: String::new(),
+            }
+        };
+        let picker = PickerState::new(PickerCandidates::WorkspaceSymbols(vec![
+            cand(Some(0), "src/a.rs", "/w/src/a.rs", 9, "alpha"),
+            cand(Some(0), "src/a.rs", "/w/src/a.rs", 2, "beta"),
+            // Out-of-root (a dependency): no parts to carry.
+            cand(None, "/dep/x.rs", "/dep/x.rs", 1, "dep_fn"),
+        ]));
+        let (list, indices) = capture(&picker, &mut make_matcher()).expect("captures");
+        assert_eq!(list.source, PickerKind::WorkspaceSymbols);
+        assert_eq!(list.entries.len(), 3, "every shown row snapshots");
+
+        // Normalized: still ungrouped at this stage (`assign_file_groups` runs in the handler),
+        // so files order by path — /dep before /w — and within a file spatially (beta at line 2
+        // before alpha at 9), candidate indices travelling alongside.
+        let order: Vec<(&str, u32)> = list
+            .entries
+            .iter()
+            .map(|e| (e.display.as_str(), e.position.line))
+            .collect();
+        assert_eq!(order, vec![("dep_fn", 1), ("beta", 2), ("alpha", 9)]);
+        assert_eq!(indices, vec![2, 1, 0]);
+
+        let beta = &list.entries[1];
+        assert_eq!(beta.path_index, Some(0));
+        assert_eq!(beta.relative_path.as_deref(), Some("src/a.rs"));
+        assert_eq!(beta.abs_path, "/w/src/a.rs");
+        assert_eq!((beta.position.line, beta.position.col), (2, 3));
+        let dep = &list.entries[0];
+        assert_eq!(
+            (dep.path_index, dep.relative_path.as_deref()),
+            (None, None),
+            "out-of-root symbols stay pathless (Label header downstream)"
+        );
     }
 
     #[test]

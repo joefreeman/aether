@@ -21697,6 +21697,450 @@ async fn workspace_symbols_outside_a_root_show_an_absolute_path() {
     );
 }
 
+/// The group headers currently visible in a workspace-symbols window — one `Label` per file,
+/// with only the expanded group's `Symbol` rows interleaved. Both merges landing ⇔ both files'
+/// headers showing, which is how the scope test knows a fan-out has settled.
+fn symbol_group_labels(items: &[PickerItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::Label { label },
+                ..
+            } => Some(label.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Poll the workspace-symbols view (`PickerReset::Keep`) until `done` accepts its items —
+/// the fan-out merges asynchronously, and `send_request` eats the push notifications.
+async fn poll_symbol_view(
+    ws: &mut Ws,
+    base_id: u64,
+    done: impl Fn(&[PickerItem]) -> bool,
+) -> Vec<PickerItem> {
+    for i in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let view = send_request::<PickerView>(
+            ws,
+            base_id + i,
+            &PickerViewParams {
+                reset: PickerReset::Keep,
+                ..view_params(PickerKind::WorkspaceSymbols)
+            },
+        )
+        .await;
+        if let Some(items) = view.update.as_ref().and_then(|u| u.items.clone()) {
+            if done(&items) {
+                return items;
+            }
+        }
+    }
+    panic!("workspace-symbols view never reached the expected state");
+}
+
+/// The `Dir` chip prunes the LSP fan-out (`docs/workspace-symbols.md`): a project whose server
+/// root is disjoint from every scoped directory is not asked at all, not merely filtered out
+/// afterwards. And once a fan-out has settled, a filter-only change whose admitted servers it
+/// covers reuses the accumulated candidates — the servers never see filters, so re-asking would
+/// wipe and refetch the exact answers already held.
+#[tokio::test]
+async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_it() {
+    use aether_server::DummyLspConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = lay_out(&[
+        ("frontend/package.json", "{}"),
+        ("frontend/src/app.ts", "function front_helper() {}\n"),
+        ("backend/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ("backend/src/main.rs", "fn back_helper() {}\n"),
+    ]);
+    let front_asked = Arc::new(AtomicUsize::new(0));
+    let back_asked = Arc::new(AtomicUsize::new(0));
+    let front = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol(
+            "front_helper",
+            &dir.path().join("frontend/src/app.ts"),
+            0,
+            9,
+        )],
+        symbol_query_filter: true,
+        symbol_requests: Some(front_asked.clone()),
+        ..Default::default()
+    };
+    let back = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol(
+            "back_helper",
+            &dir.path().join("backend/src/main.rs"),
+            0,
+            3,
+        )],
+        symbol_query_filter: true,
+        symbol_requests: Some(back_asked.clone()),
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-scope",
+        vec![dir.path().to_path_buf()],
+        vec![
+            aether_server::ProjectRef {
+                root_index: 0,
+                relative_path: "frontend".into(),
+                language: Some("typescript".into()),
+            },
+            aether_server::ProjectRef {
+                root_index: 0,
+                relative_path: "backend".into(),
+                language: Some("rust".into()),
+            },
+        ],
+        vec![("typescript".into(), front), ("rust".into(), back)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "both pinned servers", |v| {
+        v.len() == 2 && v.iter().all(|s| s.ready && s.pinned)
+    })
+    .await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-scope".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let query = |generation: u64, filters: PickerFilters| PickerQueryParams {
+        kind: PickerKind::WorkspaceSymbols,
+        query: "helper".into(),
+        generation,
+        filters,
+    };
+    let scope_frontend = PickerFilters {
+        directories: vec![ScopedPath {
+            path_index: 0,
+            relative_path: "frontend".into(),
+            is_file: false,
+        }],
+        ..Default::default()
+    };
+
+    // Scoped from the start: only the frontend project's server is asked.
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _: () = send_request::<PickerQuery>(&mut ws, 3, &query(1, scope_frontend.clone())).await;
+    let items = poll_symbol_view(&mut ws, 100, |items| !items.is_empty()).await;
+    assert_eq!(symbol_group_labels(&items), vec!["frontend/src/app.ts"]);
+    // The dummy runs in-process, so a wrongly-sent backend request would have been received
+    // (and counted) well before the frontend merge we just observed; the beat is only slack.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(front_asked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        back_asked.load(Ordering::SeqCst),
+        0,
+        "a scoped-out project's server must not be asked at all"
+    );
+
+    // Dropping the scope admits a server the recorded fan-out never asked — full re-fan-out.
+    let _: () = send_request::<PickerQuery>(&mut ws, 4, &query(2, PickerFilters::default())).await;
+    let items = poll_symbol_view(&mut ws, 200, |items| symbol_group_labels(items).len() == 2).await;
+    assert_eq!(
+        symbol_group_labels(&items),
+        vec!["backend/src/main.rs", "frontend/src/app.ts"],
+        "both projects' symbols, grouped by file"
+    );
+    assert_eq!(front_asked.load(Ordering::SeqCst), 2);
+    assert_eq!(back_asked.load(Ordering::SeqCst), 1);
+
+    // A glob chip on the settled fan-out: covered — reranked in place, no LSP traffic, and the
+    // answer is synchronous (no polling: the query's reply means the rerank already happened).
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        5,
+        &query(
+            3,
+            PickerFilters {
+                globs: vec!["*.ts".into()],
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        6,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::WorkspaceSymbols)
+        },
+    )
+    .await;
+    let items = view.update.and_then(|u| u.items).unwrap_or_default();
+    assert_eq!(symbol_group_labels(&items), vec!["frontend/src/app.ts"]);
+
+    // Removing the chip is covered too — the fan-out asked both servers.
+    let _: () = send_request::<PickerQuery>(&mut ws, 7, &query(4, PickerFilters::default())).await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        8,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::WorkspaceSymbols)
+        },
+    )
+    .await;
+    let items = view.update.and_then(|u| u.items).unwrap_or_default();
+    assert_eq!(symbol_group_labels(&items).len(), 2);
+    assert_eq!(
+        (
+            front_asked.load(Ordering::SeqCst),
+            back_asked.load(Ordering::SeqCst)
+        ),
+        (2, 1),
+        "filter-only changes must not re-ask the servers"
+    );
+}
+
+/// A server reaching `Ready` while a *scoped* query is live respects the scope: the became-ready
+/// re-query (`requery_ready_server`) skips a server the `Dir` chip would have pruned from the
+/// fan-out — readiness doesn't change what it can contribute. Dropping the scope afterwards picks
+/// the server up through the ordinary re-fan-out (the recorded fan-out doesn't cover it).
+#[tokio::test]
+async fn ready_server_requery_respects_the_dir_scope() {
+    use aether_server::DummyLspConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = lay_out(&[
+        ("frontend/package.json", "{}"),
+        ("frontend/src/app.ts", "function front_helper() {}\n"),
+        ("backend/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ("backend/src/main.rs", "fn back_helper() {}\n"),
+    ]);
+    let front_asked = Arc::new(AtomicUsize::new(0));
+    let back_asked = Arc::new(AtomicUsize::new(0));
+    let front = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol(
+            "front_helper",
+            &dir.path().join("frontend/src/app.ts"),
+            0,
+            9,
+        )],
+        symbol_query_filter: true,
+        symbol_requests: Some(front_asked.clone()),
+        ..Default::default()
+    };
+    let back = DummyLspConfig {
+        workspace_symbols: vec![dummy_symbol(
+            "back_helper",
+            &dir.path().join("backend/src/main.rs"),
+            0,
+            3,
+        )],
+        symbol_query_filter: true,
+        symbol_requests: Some(back_asked.clone()),
+        // Still doing its handshake while the scoped query below is typed — the ready-requery
+        // path is the only way it could be asked.
+        initialize_delay: Some(std::time::Duration::from_millis(700)),
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-ready-scope",
+        vec![dir.path().to_path_buf()],
+        vec![
+            aether_server::ProjectRef {
+                root_index: 0,
+                relative_path: "frontend".into(),
+                language: Some("typescript".into()),
+            },
+            aether_server::ProjectRef {
+                root_index: 0,
+                relative_path: "backend".into(),
+                language: Some("rust".into()),
+            },
+        ],
+        vec![("typescript".into(), front), ("rust".into(), back)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the frontend server (backend still starting)", |v| {
+        v.iter().any(|s| s.language == "typescript" && s.ready)
+    })
+    .await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-ready-scope".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "helper".into(),
+            generation: 1,
+            filters: PickerFilters {
+                directories: vec![ScopedPath {
+                    path_index: 0,
+                    relative_path: "frontend".into(),
+                    is_file: false,
+                }],
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let items = poll_symbol_view(&mut ws, 100, |items| !items.is_empty()).await;
+    assert_eq!(symbol_group_labels(&items), vec!["frontend/src/app.ts"]);
+
+    // The backend server finishes starting with the scoped query still live. Its re-query must
+    // be skipped, not merely have its results filtered out afterwards.
+    await_lsp_state(&server, "the backend server", |v| {
+        v.iter().any(|s| s.language == "rust" && s.ready)
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(front_asked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        back_asked.load(Ordering::SeqCst),
+        0,
+        "readiness must not bypass the Dir scope"
+    );
+
+    // Dropping the scope admits it — the recorded fan-out never asked it, so this re-fans out.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        4,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "helper".into(),
+            generation: 2,
+            filters: PickerFilters::default(),
+        },
+    )
+    .await;
+    let items = poll_symbol_view(&mut ws, 200, |items| symbol_group_labels(items).len() == 2).await;
+    assert_eq!(
+        symbol_group_labels(&items),
+        vec!["backend/src/main.rs", "frontend/src/app.ts"]
+    );
+    assert_eq!(back_asked.load(Ordering::SeqCst), 1);
+}
+
+/// `Ctrl-j` in the workspace-symbols picker snapshots the shown rows into the jumplist.
+/// Regression: `jumplist::capture` had no `WorkspaceSymbols` arm, so every capture answered
+/// "Nothing to capture" even with results showing. The stored entries carry their file identity,
+/// so the Jumplist picker groups them under real `File` headers (not the root-directory bug the
+/// empty-sentinel path once had) and the highlighted row keeps its place.
+#[tokio::test]
+async fn workspace_symbols_capture_to_the_jumplist() {
+    use aether_server::DummyLspConfig;
+    let dir = lay_out(&[
+        ("Cargo.toml", "[package]\nname = \"p\"\n"),
+        ("src/a.rs", "fn helper_one() {}\n"),
+        ("src/b.rs", "fn helper_two() {}\n"),
+    ]);
+    let dummy = DummyLspConfig {
+        workspace_symbols: vec![
+            dummy_symbol("helper_one", &dir.path().join("src/a.rs"), 0, 3),
+            dummy_symbol("helper_two", &dir.path().join("src/b.rs"), 0, 3),
+        ],
+        symbol_query_filter: true,
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_projects(
+        "syms-capture",
+        vec![dir.path().to_path_buf()],
+        vec![project_ref(".")],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    await_lsp_state(&server, "the pinned server", |v| v.len() == 1 && v[0].ready).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "syms-capture".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            kind: PickerKind::WorkspaceSymbols,
+            query: "helper".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    let items = poll_symbol_view(&mut ws, 100, |items| symbol_group_labels(items).len() == 2).await;
+
+    // Capture with the first visible symbol row highlighted (the expanded first group's row).
+    let item = items
+        .iter()
+        .find(|i| matches!(i, PickerItem::Symbol { .. }))
+        .cloned()
+        .expect("a symbol row in the expanded group");
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        300,
+        &JumplistCaptureParams {
+            kind: PickerKind::WorkspaceSymbols,
+            item,
+        },
+    )
+    .await;
+    let captured = captured.expect("the workspace-symbols picker captures");
+    assert_eq!(captured.total, 2, "both shown symbols snapshot");
+    assert_eq!(
+        captured.index, 0,
+        "the highlighted row (first group's symbol) leads the normalized list"
+    );
+
+    // The Jumplist picker shows the entries under real per-file headers.
+    let view =
+        send_request::<PickerView>(&mut ws, 301, &view_params(PickerKind::Jumplist)).await;
+    let rows = view.update.and_then(|u| u.items).unwrap_or_default();
+    let files: Vec<String> = rows
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::File { relative_path, .. },
+                ..
+            } => Some(relative_path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["src/a.rs", "src/b.rs"],
+        "entries grouped by their real relative paths"
+    );
+}
+
 /// The server matched it, so it shows — even when our own fuzzy matcher wouldn't. This is what
 /// keeps rust-analyzer's `#`/`*` query conventions working: a literal fuzzy match of `foo#` against
 /// symbol names fails every row, and filtering on that would empty a picker that worked at the

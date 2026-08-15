@@ -712,11 +712,9 @@ impl Session {
                 )
             }
             // Grouped so repeatedly pressing `]` with nothing captured coalesces to one toast.
-            Event::JumplistStepped(Ok(JumplistStepResult::Empty), _, _) => Effects::toast_grouped(
-                "Jumplist is empty — Ctrl-j in a picker captures results",
-                ToastKind::Info,
-                "jumplist",
-            ),
+            Event::JumplistStepped(Ok(JumplistStepResult::Empty), _, _) => {
+                Effects::toast_grouped("Jumplist is empty", ToastKind::Info, "jumplist")
+            }
             Event::JumplistStepped(Err(e), _, _) => Effects::error(e),
 
             Event::PromptAccept => self.accept_prompt(),
@@ -3350,7 +3348,9 @@ impl Session {
             PickerKind::Grep
             | PickerKind::Files
             | PickerKind::GitChanges
-            | PickerKind::GitChangesFile => self.picker_query_changed(),
+            | PickerKind::GitChangesFile
+            | PickerKind::Jumplist
+            | PickerKind::WorkspaceSymbols => self.picker_query_changed(),
             PickerKind::Explorer => {
                 let filters = {
                     let Some(p) = &mut self.picker else {
@@ -3407,7 +3407,11 @@ impl Session {
         };
         if !matches!(
             p.kind,
-            PickerKind::Grep | PickerKind::Files | PickerKind::GitChanges | PickerKind::Jumplist
+            PickerKind::Grep
+                | PickerKind::Files
+                | PickerKind::GitChanges
+                | PickerKind::Jumplist
+                | PickerKind::WorkspaceSymbols
         ) {
             return Effects::none();
         }
@@ -3493,11 +3497,14 @@ impl Session {
         } else {
             ChipEditorField::Path
         };
-        // Grep / GitChanges / Jumplist may scope to a single file; the Files picker stays
-        // directory-only (narrowing a file list to one file is degenerate).
+        // Grep / GitChanges / Jumplist / workspace symbols may scope to a single file; the
+        // Files picker stays directory-only (narrowing a file list to one file is degenerate).
         let allow_files = matches!(
             p.kind,
-            PickerKind::Grep | PickerKind::GitChanges | PickerKind::Jumplist
+            PickerKind::Grep
+                | PickerKind::GitChanges
+                | PickerKind::Jumplist
+                | PickerKind::WorkspaceSymbols
         );
         let mut ed = ChipEditor::dir(
             current.map(|d| d.relative_path).unwrap_or_default(),
