@@ -593,7 +593,7 @@ pub fn compute_injections(
 /// are overlaid on top of the outer captures, so an embedded `rust` block in a markdown file gets
 /// rust highlighting in its content region.
 pub fn highlights_for_range(
-    config: &LanguageConfig,
+    config: &'static LanguageConfig,
     tree: &Tree,
     injections: &[InjectionLayer],
     source: &str,
@@ -669,7 +669,7 @@ pub fn highlights_for_range(
 /// by `#set! "priority"` first (default 100), then — among equal priority — longer captures are
 /// applied first so shorter, more-specific captures overwrite them.
 fn overlay_captures(
-    query: &Query,
+    query: &'static Query,
     tree: &Tree,
     bytes_for_query: &[u8],
     query_range: Range<usize>,
@@ -715,9 +715,6 @@ fn overlay_captures(
             let s = cap.node.start_byte().max(query_range.start);
             let e = cap.node.end_byte().min(query_range.end);
             if s < e {
-                // The underlying string data lives in a `'static` `Query` (held in `OnceLock`);
-                // the borrow checker can't see through `&Query`'s lifetime so we widen here.
-                let name: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(name) };
                 captures.push((s, e, m.pattern_index, name));
             }
         }
