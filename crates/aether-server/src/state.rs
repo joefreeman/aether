@@ -33,6 +33,12 @@ pub struct ServerState {
     /// in the same process without sharing watcher state.
     pub watcher: Option<Arc<crate::watcher::WatcherHandle>>,
     pub buffers: HashMap<BufferId, Buffer>,
+    /// Document content, shared by every buffer attached to the same file. A buffer is a
+    /// workspace's *view* of a document (`Buffer::document`); the rope, undo history, dirty
+    /// state, and parse live here so two workspaces holding the same path see the same pending
+    /// changes. Keyed by [`DocumentId`] — server-internal, never on the wire. A document is
+    /// dropped when its last buffer closes ([`Self::close_buffer`]).
+    pub documents: HashMap<DocumentId, Document>,
     /// Which workspace each open buffer belongs to. Populated when a buffer is created
     /// (`buffer/open`) and looked up when scoping per-buffer state to a workspace (e.g. on
     /// `workspace/activate`, when tearing down a client's state for the previously active workspace).
@@ -187,7 +193,14 @@ pub struct ServerState {
     pub port: Option<u16>,
     next_buffer_id: u64,
     next_viewport_id: u64,
+    next_document_id: u64,
 }
+
+/// Server-internal identity of a [`Document`]. Never leaves the process — the protocol speaks
+/// only [`BufferId`]s. A newtype (not a bare `u64`) so a document id can't be passed where a
+/// buffer id belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DocumentId(pub u64);
 
 /// Cached whole-file blame for a buffer, valid only while `revision` matches the buffer's. One
 /// entry per 0-based buffer line; `None` for lines with no blame (e.g. the trailing empty line).
@@ -416,6 +429,7 @@ impl ServerState {
             workspaces: HashMap::new(),
             watcher: None,
             buffers: HashMap::new(),
+            documents: HashMap::new(),
             buffer_workspaces: HashMap::new(),
             clients: HashMap::new(),
             viewports: HashMap::new(),
@@ -456,7 +470,90 @@ impl ServerState {
             port: None,
             next_buffer_id: 1,
             next_viewport_id: 1,
+            next_document_id: 1,
         }
+    }
+
+    /// The document a buffer views. Panics on an unknown buffer or a dangling document reference,
+    /// mirroring the `self.buffers[&id]` indexing convention at existing call sites — both are
+    /// server-internal invariant violations, not recoverable conditions.
+    pub fn doc_of(&self, buffer_id: BufferId) -> &Document {
+        &self.documents[&self.buffers[&buffer_id].document]
+    }
+
+    /// Mutable [`Self::doc_of`].
+    pub fn doc_of_mut(&mut self, buffer_id: BufferId) -> &mut Document {
+        let doc_id = self.buffers[&buffer_id].document;
+        self.documents.get_mut(&doc_id).expect("buffer references a live document")
+    }
+
+    /// Non-panicking [`Self::doc_of`], for paths where the buffer may already be gone.
+    pub fn try_doc_of(&self, buffer_id: BufferId) -> Option<&Document> {
+        self.documents.get(&self.buffers.get(&buffer_id)?.document)
+    }
+
+    /// Non-panicking [`Self::doc_of_mut`].
+    pub fn try_doc_of_mut(&mut self, buffer_id: BufferId) -> Option<&mut Document> {
+        let doc_id = self.buffers.get(&buffer_id)?.document;
+        self.documents.get_mut(&doc_id)
+    }
+
+    /// The live document loaded from `canonical`, if any — the cross-workspace sharing lookup.
+    pub fn document_for_path(&self, canonical: &Path) -> Option<DocumentId> {
+        self.documents
+            .values()
+            .find(|d| d.canonical_path.as_deref() == Some(canonical))
+            .map(|d| d.id)
+    }
+
+    /// Every buffer attached to `doc` — the edit fan-out audience. One entry per workspace
+    /// holding the document open.
+    pub fn buffers_of_document(&self, doc: DocumentId) -> Vec<BufferId> {
+        self.buffers
+            .iter()
+            .filter(|(_, b)| b.document == doc)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Buffer ids attached to the same document as `buffer_id`, including itself — the audience
+    /// a mutation through any one buffer must fan out to. Just `[buffer_id]` for an unknown
+    /// buffer, so per-buffer teardown paths stay well-defined mid-close.
+    pub fn doc_siblings(&self, buffer_id: BufferId) -> Vec<BufferId> {
+        match self.buffers.get(&buffer_id) {
+            Some(b) => self.buffers_of_document(b.document),
+            None => vec![buffer_id],
+        }
+    }
+
+    pub fn allocate_document_id(&mut self) -> DocumentId {
+        let id = DocumentId(self.next_document_id);
+        self.next_document_id += 1;
+        id
+    }
+
+    /// Insert a fresh buffer over its own new document (the 1:1 case): allocates the
+    /// [`DocumentId`], builds the document via `make_doc`, and stores both halves. Returns the
+    /// document id so callers can reach the content for follow-up tweaks.
+    pub fn insert_buffer_with_document(
+        &mut self,
+        buffer_id: BufferId,
+        scratch_number: Option<u32>,
+        transient: bool,
+        make_doc: impl FnOnce(DocumentId) -> Document,
+    ) -> DocumentId {
+        let doc_id = self.allocate_document_id();
+        self.documents.insert(doc_id, make_doc(doc_id));
+        self.buffers.insert(
+            buffer_id,
+            Buffer {
+                id: buffer_id,
+                document: doc_id,
+                scratch_number,
+                transient,
+            },
+        );
+        doc_id
     }
 
     /// Look up a loaded workspace by name. Returns `None` if the workspace hasn't been activated by
@@ -627,7 +724,7 @@ impl ServerState {
             .filter(|w| !self.workspace_active_anywhere(&w.id))
             .filter(|w| {
                 self.buffers_in_workspace(&w.id).into_iter().all(|id| {
-                    !self.buffers.get(&id).is_some_and(|b| b.dirty)
+                    !self.try_doc_of(id).is_some_and(|d| d.dirty)
                         && !self.viewports.values().any(|v| v.buffer_id == id)
                 })
             })
@@ -737,43 +834,80 @@ impl ServerState {
     /// buffer), on a path that is already a disk read — the picker's candidate list enumerates the
     /// workspaces directory to find its rows in the first place.
     pub fn unsaved_buffer_count(&self, workspace: &str) -> u32 {
-        let live: Vec<&Buffer> = self
+        let live: Vec<(&Buffer, &Document)> = self
             .buffer_workspaces
             .iter()
             .filter(|(_, p)| p.as_str() == workspace)
-            .filter_map(|(id, _)| self.buffers.get(id))
+            .filter_map(|(id, _)| {
+                let buf = self.buffers.get(id)?;
+                Some((buf, self.documents.get(&buf.document)?))
+            })
             .collect();
-        let dirty = live.iter().filter(|b| b.dirty).count() as u32;
+        let dirty = live.iter().filter(|(_, d)| d.dirty).count() as u32;
         let Some(root) = self.backups_path.as_deref() else {
             return dirty;
         };
-        let mut keys = crate::backup::workspace_keys(root, workspace);
-        for buf in live {
-            if let Some(path) = buf.canonical_path.as_deref() {
-                keys.files.remove(&crate::backup::path_key(path));
-            }
+        // Scratch half: list the workspace's scratch-backup dir, minus numbers a live buffer
+        // already accounts for.
+        let mut scratches = crate::backup::scratch_keys(root, workspace);
+        for (buf, _) in &live {
             if let Some(number) = buf.scratch_number {
-                keys.scratches.remove(&number);
+                scratches.remove(&number);
             }
         }
-        dirty + keys.files.len() as u32 + keys.scratches.len() as u32
+        // Files half: file backups are document-level (`files/<hash>`, no workspace in the key)
+        // and the hash is one-way, so the shared directory can't be attributed by listing. Go the
+        // other way: this workspace's *session entries* name its files — count each whose backup
+        // exists and that no live buffer here accounts for. A file backup recorded in no session
+        // was never restorable by activation anyway (only by recover-on-open), so not counting it
+        // against any workspace matches what activation can actually bring back.
+        let live_paths: std::collections::HashSet<&Path> = live
+            .iter()
+            .filter_map(|(_, d)| d.canonical_path.as_deref())
+            .collect();
+        let mut file_count = 0u32;
+        if let Some(sessions_path) = self.sessions_path.as_deref() {
+            if let Ok(sessions) = crate::config::load_workspace_sessions_at(sessions_path) {
+                if let Some(session) = sessions.workspaces.get(workspace) {
+                    for entry in &session.buffers {
+                        if let crate::config::SessionBuffer::File { path } = entry {
+                            if !live_paths.contains(path.as_path())
+                                && crate::backup::exists(&crate::backup::file_backup_path(
+                                    root, path,
+                                ))
+                            {
+                                file_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dirty + file_count + scratches.len() as u32
     }
 
-    /// Whether any dirty buffer's content exists **only** in memory — no on-disk backup would
+    /// Whether any dirty document's content exists **only** in memory — no on-disk backup would
     /// survive this process. True when backups are disabled entirely (in-process tests and
-    /// embeddings), and for dirty buffers in an *ephemeral* workspace, which is never backed up
-    /// (`flush_backups` skips it, like the session file does). The idle reaper consults this so an
-    /// auto-started server never reaps unsaved work it can't restore.
+    /// embeddings), and for a dirty *scratch* whose every attachment is ephemeral — its backup
+    /// key (`scratch/<workspace>/<number>`) dies with the context, so the flush skips it. A
+    /// dirty *file-backed* document is always protected when backups are on: its backup is
+    /// path-keyed and recover-on-open is workspace-agnostic, so even a tether context's edits
+    /// come back the next time the path is opened from anywhere. The idle reaper consults this
+    /// so an auto-started server never reaps unsaved work it can't restore.
     pub fn has_unprotected_unsaved_buffers(&self) -> bool {
         let backups_enabled = self.backups_path.is_some();
-        self.buffers.iter().any(|(id, b)| {
-            b.dirty
+        self.documents.values().any(|d| {
+            d.dirty
                 && !(backups_enabled
-                    && self
-                        .buffer_workspaces
-                        .get(id)
-                        .and_then(|w| self.workspaces.get(w))
-                        .is_some_and(|w| !w.is_ephemeral()))
+                    && (d.canonical_path.is_some()
+                        || self.buffers.iter().any(|(id, b)| {
+                            b.document == d.id
+                                && self
+                                    .buffer_workspaces
+                                    .get(id)
+                                    .and_then(|w| self.workspaces.get(w))
+                                    .is_some_and(|w| !w.is_ephemeral())
+                        })))
         })
     }
 
@@ -810,8 +944,10 @@ impl ServerState {
             .iter()
             .filter(|(id, b)| {
                 self.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(workspace)
-                    && b.canonical_path
-                        .as_deref()
+                    && self
+                        .documents
+                        .get(&b.document)
+                        .and_then(|d| d.canonical_path.as_deref())
                         .is_some_and(|p| p == canonical || p.starts_with(canonical))
             })
             .map(|(id, _)| *id)
@@ -826,12 +962,19 @@ impl ServerState {
     pub fn close_buffer(&mut self, id: BufferId) -> Option<crate::lsp::manager::LspServerKey> {
         // Notify any language server before we drop the buffer (needs its path).
         let lsp_uri = self
-            .buffers
-            .get(&id)
-            .and_then(|b| b.canonical_path.as_deref())
+            .try_doc_of(id)
+            .and_then(|d| d.canonical_path.as_deref())
             .map(crate::lsp::uri::path_to_uri);
         let stopped_server = lsp_uri.and_then(|uri| self.lsp.notify_close(id, &uri));
+        let doc_id = self.buffers.get(&id).map(|b| b.document);
         self.buffers.remove(&id);
+        // Drop the document once its last buffer is gone — content lives exactly as long as some
+        // workspace still holds it open.
+        if let Some(doc_id) = doc_id {
+            if !self.buffers.values().any(|b| b.document == doc_id) {
+                self.documents.remove(&doc_id);
+            }
+        }
         self.buffer_workspaces.remove(&id);
         self.viewports.retain(|_, v| v.buffer_id != id);
         self.cursors.retain(|(_, b), _| *b != id);
@@ -856,9 +999,11 @@ impl ServerState {
     /// Close every buffer in `candidates` that is transient and no longer shown by any viewport.
     /// This is the "hidden ⇒ close" half of transient buffers; callers pass the buffers a client
     /// just stopped viewing (viewport switch, workspace switch, disconnect) *after* dropping the
-    /// stale viewports. Dirty buffers are skipped as a guard — the first edit promotes, so a
-    /// dirty transient shouldn't exist. Returns the ids closed and the keys of language servers
-    /// torn down with them (so callers can refresh picker views).
+    /// stale viewports. A dirty document blocks the close as a guard — the first edit promotes,
+    /// so a dirty transient shouldn't exist — *unless* a sibling buffer in another workspace
+    /// still holds the document, in which case closing this attachment loses nothing. Returns
+    /// the ids closed and the keys of language servers torn down with them (so callers can
+    /// refresh picker views).
     pub fn close_orphaned_transients(
         &mut self,
         candidates: impl IntoIterator<Item = BufferId>,
@@ -866,10 +1011,13 @@ impl ServerState {
         let mut closed = Vec::new();
         let mut stopped = Vec::new();
         for id in candidates {
-            let eligible = self
-                .buffers
-                .get(&id)
-                .is_some_and(|b| b.transient && !b.dirty)
+            let has_sibling = self.buffers.get(&id).is_some_and(|b| {
+                self.buffers
+                    .values()
+                    .any(|o| o.document == b.document && o.id != id)
+            });
+            let eligible = self.buffers.get(&id).is_some_and(|b| b.transient)
+                && (has_sibling || !self.try_doc_of(id).is_some_and(|d| d.dirty))
                 && !self.viewports.values().any(|v| v.buffer_id == id);
             if !eligible {
                 continue;
@@ -948,12 +1096,14 @@ impl ServerState {
         history.redo.clear();
     }
 
-    /// Clear motion history for every client on the given buffer. Called on any buffer mutation
-    /// (text, delete, cut, join, undo, redo) — remembered positions could be invalid after the
-    /// buffer changes, and the user contract is "motion undo only goes back to the last edit".
+    /// Clear motion history for every client on the given buffer — and on every sibling buffer
+    /// sharing its document, since a mutation through one buffer invalidates remembered positions
+    /// on all of them. Called on any buffer mutation (text, delete, cut, join, undo, redo) — the
+    /// user contract is "motion undo only goes back to the last edit".
     pub fn clear_motion_history_for_buffer(&mut self, buffer_id: BufferId) {
+        let attached = self.doc_siblings(buffer_id);
         for ((_, b), h) in self.motion_history.iter_mut() {
-            if *b == buffer_id {
+            if attached.contains(b) {
                 h.clear();
             }
         }
@@ -1045,7 +1195,10 @@ impl ServerState {
             if buf.transient {
                 continue;
             }
-            if let Some(path) = buf.canonical_path.as_deref() {
+            let Some(doc) = self.documents.get(&buf.document) else {
+                continue;
+            };
+            if let Some(path) = doc.canonical_path.as_deref() {
                 if seen_paths.insert(path) {
                     out.push(SessionBuffer::File {
                         path: path.to_path_buf(),
@@ -1053,7 +1206,7 @@ impl ServerState {
                 }
             } else if let Some(number) = buf.scratch_number {
                 // Only dirty scratches carry content worth restoring (and therefore a backup).
-                if buf.dirty && seen_scratch.insert(number) {
+                if doc.dirty && seen_scratch.insert(number) {
                     out.push(SessionBuffer::Scratch { number });
                 }
             }
@@ -1112,11 +1265,13 @@ impl ServerState {
         self.tree_selection_history.remove(&(client_id, buffer_id));
     }
 
-    /// Clear selection-expansion history for every client on the given buffer. Called from
-    /// buffer mutation paths so a post-edit contract doesn't pop a stale (pre-edit) selection.
+    /// Clear selection-expansion history for every client on the given buffer and its document
+    /// siblings. Called from buffer mutation paths so a post-edit contract doesn't pop a stale
+    /// (pre-edit) selection.
     pub fn clear_tree_selection_history_for_buffer(&mut self, buffer_id: BufferId) {
+        let attached = self.doc_siblings(buffer_id);
         self.tree_selection_history
-            .retain(|(_, b), _| *b != buffer_id);
+            .retain(|(_, b), _| !attached.contains(b));
     }
 
     /// Remove all selection-expansion records for the given client. Used on disconnect.
@@ -1125,9 +1280,11 @@ impl ServerState {
             .retain(|(c, _), _| *c != client_id);
     }
 
-    /// Clear virtual column for every client on the given buffer. Called on any buffer mutation.
+    /// Clear virtual column for every client on the given buffer and its document siblings.
+    /// Called on any buffer mutation.
     pub fn clear_virtual_col_for_buffer(&mut self, buffer_id: BufferId) {
-        self.virtual_col.retain(|(_, b), _| *b != buffer_id);
+        let attached = self.doc_siblings(buffer_id);
+        self.virtual_col.retain(|(_, b), _| !attached.contains(b));
     }
 
     /// Locate an already-open buffer for the given canonical path, if any. Scoped to a workspace —
@@ -1139,7 +1296,8 @@ impl ServerState {
         canonical: &Path,
     ) -> Option<BufferId> {
         self.buffers.iter().find_map(|(id, b)| {
-            if b.canonical_path.as_deref() == Some(canonical)
+            if self.documents.get(&b.document).and_then(|d| d.canonical_path.as_deref())
+                == Some(canonical)
                 && self.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(workspace_name)
             {
                 Some(*id)
@@ -1156,7 +1314,10 @@ impl ServerState {
     pub fn buffers_for_path(&self, canonical: &Path) -> Vec<BufferId> {
         self.buffers
             .iter()
-            .filter(|(_, b)| b.canonical_path.as_deref() == Some(canonical))
+            .filter(|(_, b)| {
+                self.documents.get(&b.document).and_then(|d| d.canonical_path.as_deref())
+                    == Some(canonical)
+            })
             .map(|(id, _)| *id)
             .collect()
     }
@@ -1211,14 +1372,38 @@ impl ServerState {
     }
 }
 
+/// One workspace's handle on a [`Document`]: the unit the protocol addresses (`BufferId`), carrying
+/// only the state that describes this workspace's *relationship* to the content — the content
+/// itself (rope, undo, dirty, parse) lives on the shared document. Two workspaces holding the same
+/// file are two `Buffer`s over one `Document`.
 pub struct Buffer {
     pub id: BufferId,
-    pub canonical_path: Option<PathBuf>,
+    /// The shared document this buffer views. Multiple buffers (one per workspace) may reference
+    /// the same document; the document is dropped when the last one closes.
+    pub document: DocumentId,
     /// Small per-workspace display number for a scratch buffer (`(scratch N)`), assigned at creation
     /// as the lowest positive integer not in use by another scratch in the workspace — so the numbers
     /// stay small, stay stable for the buffer's life, and a freed number gets reused. `None` for
     /// file-backed buffers (which display their path instead).
     pub scratch_number: Option<u32>,
+    /// Transient buffers auto-close once no viewport shows them anymore (see
+    /// `viewport_subscribe` / `close_orphaned_transients`). Set at creation when the opening
+    /// client asked for it (picker/goto-def navigation, the bootstrap scratch); cleared —
+    /// "promoted" — by the buffer's first edit, a save, or a user-initiated reload. Never set
+    /// again after creation. Per-buffer, not per-document: an edit arriving through a *sibling*
+    /// buffer doesn't promote this one — if it goes hidden it just detaches, and the content
+    /// survives on the document.
+    pub transient: bool,
+}
+
+/// The shared content of one open file (or scratch): everything derived from *what the text is*
+/// rather than from any workspace's relationship to it. Owned by [`ServerState::documents`] and
+/// referenced by one or more [`Buffer`]s — see `Buffer` for the split.
+pub struct Document {
+    pub id: DocumentId,
+    /// The canonical path this document is loaded from (and the sharing key — one live document
+    /// per canonical path). `None` for a scratch.
+    pub canonical_path: Option<PathBuf>,
     pub text: ropey::Rope,
     pub revision: Revision,
     pub language: Option<String>,
@@ -1243,12 +1428,6 @@ pub struct Buffer {
     /// Buffer's on-disk file was removed externally. Set by the watcher, cleared by a save
     /// (which recreates the file) or by the file being recreated externally.
     pub externally_deleted: bool,
-    /// Transient buffers auto-close once no viewport shows them anymore (see
-    /// `viewport_subscribe` / `close_orphaned_transients`). Set at creation when the opening
-    /// client asked for it (picker/goto-def navigation, the bootstrap scratch); cleared —
-    /// "promoted" — by the buffer's first edit, a save, or a user-initiated reload. Never set
-    /// again after creation.
-    pub transient: bool,
     /// The `revision` last written to an on-disk backup ([`crate::backup`]), or `None` if no backup
     /// is currently on disk for this buffer. The flush task uses it to skip rewriting unchanged
     /// content and to delete a stale backup once the buffer goes clean. Purely server-internal —
@@ -1296,7 +1475,10 @@ pub enum EditKindTag {
 struct UndoEntry {
     rope: ropey::Rope,
     revision: Revision,
-    cursors: std::collections::HashMap<ClientId, CursorState>,
+    /// Cursor snapshot at the start of the group, across every buffer attached to the document —
+    /// keyed by `(client, buffer)` because one client can hold cursors on the same document
+    /// through two workspaces' buffers.
+    cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
 }
 
 struct ActiveGroup {
@@ -1309,7 +1491,7 @@ pub struct UndoOutcome {
     /// Cursor positions captured at the start of the rewound group. The undoing client uses
     /// theirs as the post-undo cursor; other clients clamp these or their existing positions
     /// to valid buffer offsets.
-    pub restored_cursors: std::collections::HashMap<ClientId, CursorState>,
+    pub restored_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,9 +1500,9 @@ pub enum LineEnding {
     Crlf,
 }
 
-impl Buffer {
-    /// Load a buffer from disk. Detects line endings, normalizes to LF in-memory.
-    pub fn load_from_file(id: BufferId, canonical: PathBuf) -> std::io::Result<Self> {
+impl Document {
+    /// Load a document from disk. Detects line endings, normalizes to LF in-memory.
+    pub fn load_from_file(id: DocumentId, canonical: PathBuf) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(&canonical)?;
         let line_ending = if content.contains("\r\n") {
             LineEnding::Crlf
@@ -1354,10 +1536,9 @@ impl Buffer {
             language.as_deref().and_then(|name| make_syntax(&text, name))
         };
         let indent_style = resolve_indent_style(&text, language.as_deref());
-        Ok(Buffer {
+        Ok(Document {
             id,
             canonical_path: Some(canonical),
-            scratch_number: None,
             text,
             revision: 0,
             language,
@@ -1373,26 +1554,24 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
-            transient: false,
             externally_deleted: false,
             backed_up_revision: None,
         })
     }
 
-    /// Empty buffer with a target file path attached but no file on disk yet. Used by
+    /// Empty document with a target file path attached but no file on disk yet. Used by
     /// `buffer/open` with `create_if_missing: true` — the file is created by `save_to_disk`
     /// on the first save. Language is auto-detected from the extension if not provided.
-    pub fn new_at_path(id: BufferId, canonical: PathBuf, language: Option<String>) -> Self {
+    pub fn new_at_path(id: DocumentId, canonical: PathBuf, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
         let language = language.or_else(|| detect_language(&canonical));
         let syntax = language
             .as_deref()
             .and_then(|name| make_syntax(&text, name));
         let indent_style = resolve_indent_style(&text, language.as_deref());
-        Buffer {
+        Document {
             id,
             canonical_path: Some(canonical),
-            scratch_number: None,
             text,
             revision: 0,
             language,
@@ -1408,22 +1587,22 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
-            transient: false,
             externally_deleted: false,
             backed_up_revision: None,
         }
     }
 
-    pub fn scratch(id: BufferId, language: Option<String>, scratch_number: u32) -> Self {
+    /// Content for a scratch buffer: empty, pathless. The scratch's per-workspace display number
+    /// lives on its [`Buffer`] — a scratch document is never shared.
+    pub fn scratch(id: DocumentId, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
         let syntax = language
             .as_deref()
             .and_then(|name| make_syntax(&text, name));
         let indent_style = resolve_indent_style(&text, language.as_deref());
-        Buffer {
+        Document {
             id,
             canonical_path: None,
-            scratch_number: Some(scratch_number),
             text,
             revision: 0,
             language,
@@ -1440,7 +1619,6 @@ impl Buffer {
             redo_stack: Vec::new(),
             active_group: None,
             externally_modified: false,
-            transient: false,
             externally_deleted: false,
             backed_up_revision: None,
         }
@@ -1467,15 +1645,16 @@ impl Buffer {
     /// `start_char`. Bumps `revision`, marks dirty, updates the parse tree incrementally, and
     /// manages the undo group (opening a new entry if grouping conditions broke).
     ///
-    /// `cursors_before_edit` is the per-client cursor map captured before this edit; it's
-    /// stored in the undo entry when a new group opens, so `Buffer::undo` can restore cursors.
+    /// `cursors_before_edit` is the `(client, buffer)` cursor map captured before this edit —
+    /// across every buffer attached to this document; it's stored in the undo entry when a new
+    /// group opens, so `Document::undo` can restore cursors.
     pub fn apply_edit(
         &mut self,
         start_char: usize,
         end_char: usize,
         insert_text: &str,
         kind: EditKindTag,
-        cursors_before_edit: std::collections::HashMap<ClientId, CursorState>,
+        cursors_before_edit: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Revision {
         let now = Instant::now();
 
@@ -1690,7 +1869,7 @@ impl Buffer {
 
     pub fn undo(
         &mut self,
-        current_cursors: std::collections::HashMap<ClientId, CursorState>,
+        current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
         let entry = self.undo_stack.pop()?;
         self.redo_stack.push(UndoEntry {
@@ -1711,7 +1890,7 @@ impl Buffer {
 
     pub fn redo(
         &mut self,
-        current_cursors: std::collections::HashMap<ClientId, CursorState>,
+        current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
         let entry = self.redo_stack.pop()?;
         self.undo_stack.push(UndoEntry {
@@ -1964,34 +2143,37 @@ mod workspace_state_tests {
 
         // Two live file-backed buffers; touch so the MRU front is b2.
         let b1 = s.allocate_buffer_id();
-        s.buffers
-            .insert(b1, Buffer::new_at_path(b1, PathBuf::from("/p/a.rs"), None));
+        s.insert_buffer_with_document(b1, None, false, |d| {
+            Document::new_at_path(d, PathBuf::from("/p/a.rs"), None)
+        });
         s.buffer_workspaces.insert(b1, "p".into());
         let b2 = s.allocate_buffer_id();
-        s.buffers
-            .insert(b2, Buffer::new_at_path(b2, PathBuf::from("/p/b.rs"), None));
+        s.insert_buffer_with_document(b2, None, false, |d| {
+            Document::new_at_path(d, PathBuf::from("/p/b.rs"), None)
+        });
         s.buffer_workspaces.insert(b2, "p".into());
         s.touch_mru(b1);
         s.touch_mru(b2);
 
         // A transient preview at the MRU front: must be excluded (previews don't persist).
         let bt = s.allocate_buffer_id();
-        let mut tbuf = Buffer::new_at_path(bt, PathBuf::from("/p/preview.rs"), None);
-        tbuf.transient = true;
-        s.buffers.insert(bt, tbuf);
+        s.insert_buffer_with_document(bt, None, true, |d| {
+            Document::new_at_path(d, PathBuf::from("/p/preview.rs"), None)
+        });
         s.buffer_workspaces.insert(bt, "p".into());
         s.touch_mru(bt);
 
         // A dirty scratch (must persist as a Scratch entry) and a clean scratch (must be dropped).
         let sc_dirty = s.allocate_buffer_id();
-        let mut scbuf = Buffer::scratch(sc_dirty, None, 1);
-        scbuf.restore_unsaved("unsaved scratch text"); // makes it dirty
-        s.buffers.insert(sc_dirty, scbuf);
+        s.insert_buffer_with_document(sc_dirty, Some(1), false, |d| {
+            let mut doc = Document::scratch(d, None);
+            doc.restore_unsaved("unsaved scratch text"); // makes it dirty
+            doc
+        });
         s.buffer_workspaces.insert(sc_dirty, "p".into());
         s.touch_mru(sc_dirty);
         let sc_clean = s.allocate_buffer_id();
-        s.buffers
-            .insert(sc_clean, Buffer::scratch(sc_clean, None, 2));
+        s.insert_buffer_with_document(sc_clean, Some(2), false, |d| Document::scratch(d, None));
         s.buffer_workspaces.insert(sc_clean, "p".into());
         s.touch_mru(sc_clean);
 
@@ -2182,8 +2364,10 @@ mod workspace_state_tests {
 
         let add = |s: &mut ServerState, path: &str| -> BufferId {
             let id = s.allocate_buffer_id();
-            s.buffers
-                .insert(id, Buffer::new_at_path(id, PathBuf::from(path), None));
+            let path = PathBuf::from(path);
+            s.insert_buffer_with_document(id, None, false, |d| {
+                Document::new_at_path(d, path, None)
+            });
             s.buffer_workspaces.insert(id, "proj".to_string());
             id
         };
@@ -2222,7 +2406,7 @@ mod workspace_state_tests {
 
         let add_scratch = |s: &mut ServerState, n: u32| {
             let id = s.allocate_buffer_id();
-            s.buffers.insert(id, Buffer::scratch(id, None, n));
+            s.insert_buffer_with_document(id, Some(n), false, |d| Document::scratch(d, None));
             s.buffer_workspaces.insert(id, "proj".to_string());
             id
         };
@@ -2230,10 +2414,9 @@ mod workspace_state_tests {
         add_scratch(&mut s, 2);
         // A file buffer (no scratch number) doesn't occupy a slot.
         let file = s.allocate_buffer_id();
-        s.buffers.insert(
-            file,
-            Buffer::new_at_path(file, PathBuf::from("/p/a.rs"), None),
-        );
+        s.insert_buffer_with_document(file, None, false, |d| {
+            Document::new_at_path(d, PathBuf::from("/p/a.rs"), None)
+        });
         s.buffer_workspaces.insert(file, "proj".to_string());
         assert_eq!(s.next_scratch_number("proj"), 3, "1 and 2 used → 3");
 
@@ -2255,9 +2438,11 @@ mod workspace_state_tests {
 
         let add = |s: &mut ServerState, workspace: &str, dirty: bool| -> BufferId {
             let id = s.allocate_buffer_id();
-            let mut buf = Buffer::scratch(id, None, 1);
-            buf.dirty = dirty;
-            s.buffers.insert(id, buf);
+            s.insert_buffer_with_document(id, Some(1), false, |d| {
+                let mut doc = Document::scratch(d, None);
+                doc.dirty = dirty;
+                doc
+            });
             s.buffer_workspaces.insert(id, workspace.to_string());
             id
         };
@@ -2281,17 +2466,33 @@ mod workspace_state_tests {
     }
 
     /// With backups enabled the count also sees unsaved work that *isn't loaded* — the state a
-    /// workspace is in after the daemon idle-reaped and nobody has activated it again. A backup
-    /// whose buffer is live counts once (via the buffer), not twice.
+    /// workspace is in after the daemon idle-reaped and nobody has activated it again. File
+    /// backups are document-level (`files/<hash>`) so they're attributed to workspaces through
+    /// session entries; scratch backups come from the workspace's own `scratch/<workspace>/`
+    /// listing. A backup whose buffer is live counts once (via the buffer), not twice.
     #[test]
     fn unsaved_buffer_count_includes_backups_for_unloaded_buffers() {
         let dir = tempfile::tempdir().unwrap();
+        let sessions_file = dir.path().join("sessions.json");
         let mut s = ServerState::new();
         s.backups_path = Some(dir.path().to_path_buf());
+        s.sessions_path = Some(sessions_file.clone());
         s.workspaces
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        // The session names /p/a.rs for workspace p — that's what attributes its shared backup.
+        let mut sessions = crate::config::WorkspaceSessions::default();
+        sessions.workspaces.insert(
+            "p".into(),
+            crate::config::WorkspaceSession {
+                last_activated_at: 1,
+                buffers: vec![crate::config::SessionBuffer::File {
+                    path: PathBuf::from("/p/a.rs"),
+                }],
+            },
+        );
+        crate::config::write_workspace_sessions_at(&sessions_file, &sessions).unwrap();
         crate::backup::write(
-            &crate::backup::file_backup_path(dir.path(), "p", Path::new("/p/a.rs")),
+            &crate::backup::file_backup_path(dir.path(), Path::new("/p/a.rs")),
             "unsaved a",
         )
         .unwrap();
@@ -2309,26 +2510,29 @@ mod workspace_state_tests {
 
         // Load one of them (what activation's eager restore does): still one unsaved buffer, not two.
         let id = s.allocate_buffer_id();
-        let mut buf = Buffer::new_at_path(id, PathBuf::from("/p/a.rs"), None);
-        buf.dirty = true;
-        s.buffers.insert(id, buf);
+        s.insert_buffer_with_document(id, None, false, |d| {
+            let mut doc = Document::new_at_path(d, PathBuf::from("/p/a.rs"), None);
+            doc.dirty = true;
+            doc
+        });
         s.buffer_workspaces.insert(id, "p".to_string());
         assert_eq!(s.unsaved_buffer_count("p"), 2, "1 live + 1 still on disk");
 
         // Saving it deletes the backup and clears the flag — the workspace reads clean again.
         crate::backup::delete(&crate::backup::file_backup_path(
             dir.path(),
-            "p",
             Path::new("/p/a.rs"),
         ));
         crate::backup::delete(&crate::backup::scratch_backup_path(dir.path(), "p", 3));
-        s.buffers.get_mut(&id).unwrap().dirty = false;
+        s.doc_of_mut(id).dirty = false;
         assert_eq!(s.unsaved_buffer_count("p"), 0);
     }
 
-    /// The idle reaper's guard: a dirty buffer pins the server open only when its content would die
-    /// with the process — backups disabled, or an ephemeral workspace (never backed up). A dirty
-    /// buffer in a named workspace with backups on is safe on disk, so it doesn't block the reap.
+    /// The idle reaper's guard: a dirty buffer pins the server open only when its content would
+    /// die with the process — backups disabled, or an ephemeral-only dirty *scratch* (its backup
+    /// key dies with the context). A dirty buffer in a named workspace with backups on is safe on
+    /// disk, so it doesn't block the reap — and so is a dirty *file* in an ephemeral workspace,
+    /// whose backup is path-keyed and recovered on the next open of that path from anywhere.
     #[test]
     fn unprotected_unsaved_buffers_are_the_ones_no_backup_covers() {
         let dir = tempfile::tempdir().unwrap();
@@ -2336,9 +2540,11 @@ mod workspace_state_tests {
         s.workspaces
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         let named = s.allocate_buffer_id();
-        let mut buf = Buffer::scratch(named, None, 1);
-        buf.dirty = true;
-        s.buffers.insert(named, buf);
+        s.insert_buffer_with_document(named, Some(1), false, |d| {
+            let mut doc = Document::scratch(d, None);
+            doc.dirty = true;
+            doc
+        });
         s.buffer_workspaces.insert(named, "p".to_string());
 
         assert!(
@@ -2351,16 +2557,33 @@ mod workspace_state_tests {
             "a named workspace's dirty buffer is on disk; the reaper may proceed"
         );
 
-        // The same edit in a temporary workspace has nowhere to be flushed to.
+        // A *scratch* edit in a temporary workspace has nowhere to be flushed to: its backup key
+        // is scratch/<workspace>/<n> and the ephemeral workspace id is never looked up again.
         let ephemeral = s.register_ephemeral_workspace();
         let temp = s.allocate_buffer_id();
-        let mut buf = Buffer::scratch(temp, None, 1);
-        buf.dirty = true;
-        s.buffers.insert(temp, buf);
-        s.buffer_workspaces.insert(temp, ephemeral);
+        s.insert_buffer_with_document(temp, Some(1), false, |d| {
+            let mut doc = Document::scratch(d, None);
+            doc.dirty = true;
+            doc
+        });
+        s.buffer_workspaces.insert(temp, ephemeral.clone());
         assert!(s.has_unprotected_unsaved_buffers());
-        s.buffers.get_mut(&temp).unwrap().dirty = false;
+        s.doc_of_mut(temp).dirty = false;
         assert!(!s.has_unprotected_unsaved_buffers(), "clean again");
+
+        // A *file* edit in a temporary workspace IS protected: the backup keys on the path alone
+        // (files/<hash>), so recover-on-open restores it after the context is gone.
+        let tether = s.allocate_buffer_id();
+        s.insert_buffer_with_document(tether, None, false, |d| {
+            let mut doc = Document::new_at_path(d, PathBuf::from("/tmp/tethered.txt"), None);
+            doc.dirty = true;
+            doc
+        });
+        s.buffer_workspaces.insert(tether, ephemeral);
+        assert!(
+            !s.has_unprotected_unsaved_buffers(),
+            "an ephemeral file-backed document is covered by its path-keyed backup"
+        );
     }
 
     /// A temporary workspace takes the opened file's parent directory as a root — the smallest one
@@ -2414,9 +2637,11 @@ mod workspace_state_tests {
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         let add_buffer = |s: &mut ServerState, workspace: &str, dirty: bool| -> BufferId {
             let id = s.allocate_buffer_id();
-            let mut buf = Buffer::new_at_path(id, PathBuf::from("/outside/f.rs"), None);
-            buf.dirty = dirty;
-            s.buffers.insert(id, buf);
+            s.insert_buffer_with_document(id, None, false, |d| {
+                let mut doc = Document::new_at_path(d, PathBuf::from("/outside/f.rs"), None);
+                doc.dirty = dirty;
+                doc
+            });
             s.buffer_workspaces.insert(id, workspace.to_string());
             id
         };

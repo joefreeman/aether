@@ -7,8 +7,8 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, EditKindTag, LineEnding, NavEntry, SearchEntry, ServerState, SharedState,
-    SneakCandidate, SneakEntry, Viewport,
+    BlameCache, Buffer, Document, DocumentId, EditKindTag, LineEnding, NavEntry, SearchEntry,
+    ServerState, SharedState, SneakCandidate, SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -560,11 +560,7 @@ pub async fn workspace_activate(
                         crate::state::DormantSource::Scratch { .. } => true,
                         crate::state::DormantSource::File(p) => {
                             backups_root.as_deref().is_some_and(|root| {
-                                crate::backup::exists(&crate::backup::file_backup_path(
-                                    root,
-                                    &params.name,
-                                    p,
-                                ))
+                                crate::backup::exists(&crate::backup::file_backup_path(root, p))
                             })
                         }
                     })
@@ -785,11 +781,7 @@ fn restore_dormant_sources(
         .filter_map(|entry| match entry {
             SessionBuffer::File { path } => {
                 let has_backup = backups_root.is_some_and(|root| {
-                    crate::backup::exists(&crate::backup::file_backup_path(
-                        root,
-                        workspace_name,
-                        path,
-                    ))
+                    crate::backup::exists(&crate::backup::file_backup_path(root, path))
                 });
                 (path.exists() || has_backup).then(|| DormantSource::File(path.clone()))
             }
@@ -813,7 +805,7 @@ fn restore_dormant_sources(
                 DormantSource::File(_) => None,
             })
             .collect();
-        if let Ok(dir) = std::fs::read_dir(root.join(workspace_name).join("scratch")) {
+        if let Ok(dir) = std::fs::read_dir(root.join("scratch").join(workspace_name)) {
             let mut recovered: Vec<u32> = dir
                 .flatten()
                 .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
@@ -830,37 +822,48 @@ fn restore_dormant_sources(
     sources
 }
 
-/// Delete every on-disk backup associated with `buf` in `workspace`. A buffer can in principle have
-/// both keys live at once (a scratch that was saved-as keeps its number *and* gains a path), so we
-/// clear both. Called at the explicit "this content is resolved" edges: save and close. No-op when
-/// backups aren't enabled.
-fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer) {
+/// Delete the on-disk backups this buffer's save/close resolves. A buffer can in principle have
+/// both keys live at once (a scratch that was saved-as keeps its number *and* gains a path), so
+/// both are considered. The scratch backup (per-workspace, never shared) always goes. The
+/// document-level file backup goes only when the document is clean or this is its last
+/// attachment — closing one workspace's view of a shared *dirty* document must not discard the
+/// content's backup out from under the surviving workspaces. Called at the explicit "this content
+/// is resolved" edges: save and close. No-op when backups aren't enabled.
+fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer, doc: &Document) {
     let Some(root) = s.backups_path.as_deref() else {
         return;
     };
-    if let Some(p) = buf.canonical_path.as_deref() {
-        crate::backup::delete(&crate::backup::file_backup_path(root, workspace, p));
+    if let Some(p) = doc.canonical_path.as_deref() {
+        let has_sibling = s
+            .buffers
+            .values()
+            .any(|o| o.document == doc.id && o.id != buf.id);
+        if !doc.dirty || !has_sibling {
+            crate::backup::delete(&crate::backup::file_backup_path(root, p));
+        }
     }
     if let Some(n) = buf.scratch_number {
         crate::backup::delete(&crate::backup::scratch_backup_path(root, workspace, n));
     }
 }
 
-/// Flush unsaved-buffer backups to disk: write a backup for every dirty buffer in a named workspace
-/// whose content changed since its last backup, and delete the backup for any buffer that's gone
-/// clean again (e.g. undone back to the saved state). This is the single writer of backup files —
-/// deliberately edit-source agnostic, so it captures every kind of edit (typing, format, revert,
-/// surround, …) without hooking each site. Best-effort: a no-op when backups aren't enabled
-/// (`backups_path` unset); logs rather than fails on I/O error. The (potentially large) rope clones
-/// and the file I/O happen off the lock; only the cheap `backed_up_revision` stamp is taken under it.
-/// See `docs/unsaved-persistence.md`.
+/// Flush unsaved-document backups to disk: write a backup for every dirty document with at least
+/// one attachment in a *named* workspace, once its content changed since its last backup, and
+/// delete the backup for any document that's gone clean again (e.g. undone back to the saved
+/// state). One write per document regardless of how many workspaces hold it — the backup is a
+/// property of the shared content, not of any workspace's view. This is the single writer of
+/// backup files — deliberately edit-source agnostic, so it captures every kind of edit (typing,
+/// format, revert, surround, …) without hooking each site. Best-effort: a no-op when backups
+/// aren't enabled (`backups_path` unset); logs rather than fails on I/O error. The (potentially
+/// large) rope clones and the file I/O happen off the lock; only the cheap `backed_up_revision`
+/// stamp is taken under it. See `docs/unsaved-persistence.md`.
 pub(crate) async fn flush_backups(state: &SharedState) {
     enum Action {
         Write(String, aether_protocol::Revision),
         Delete,
     }
     struct Job {
-        id: aether_protocol::BufferId,
+        doc: DocumentId,
         path: std::path::PathBuf,
         action: Action,
     }
@@ -870,29 +873,43 @@ pub(crate) async fn flush_backups(state: &SharedState) {
             return;
         };
         let mut jobs = Vec::new();
-        for (&id, workspace) in &s.buffer_workspaces {
-            // Named workspaces only — ephemeral throwaway contexts aren't persisted (like sessions).
-            if s.workspaces.get(workspace).is_none_or(|w| w.name.is_none()) {
-                continue;
-            }
-            let Some(buf) = s.buffers.get(&id) else {
-                continue;
+        for doc in s.documents.values() {
+            // Every *file-backed* document is backup-worthy, whatever kind of workspace holds
+            // it: the backup key is path-only (`files/<hash>`) and recover-on-open is
+            // workspace-agnostic, so content edited through an ephemeral tether context is
+            // restored the next time the file is opened from anywhere — the ephemeral workspace
+            // being gone by then doesn't matter. A *scratch* still needs a named-workspace
+            // attachment: its backup keys on `scratch/<workspace>/<number>`, and an ephemeral
+            // workspace id is minted per open and never looked up again.
+            let path = if let Some(p) = doc.canonical_path.as_deref() {
+                crate::backup::file_backup_path(&root, p)
+            } else {
+                let named_scratch = s.buffers.values().find_map(|b| {
+                    let n = b.scratch_number?;
+                    (b.document == doc.id).then_some(())?;
+                    let workspace = s.buffer_workspaces.get(&b.id)?;
+                    s.workspaces
+                        .get(workspace)
+                        .is_some_and(|w| w.name.is_some())
+                        .then(|| crate::backup::scratch_backup_path(&root, workspace, n))
+                });
+                let Some(path) = named_scratch else {
+                    continue;
+                };
+                path
             };
-            let Some(path) = buffer_backup_path(&root, workspace, buf) else {
-                continue;
-            };
-            if buf.dirty {
-                if buf.backed_up_revision != Some(buf.revision) {
-                    let content: String = buf.text.chunks().collect();
+            if doc.dirty {
+                if doc.backed_up_revision != Some(doc.revision) {
+                    let content: String = doc.text.chunks().collect();
                     jobs.push(Job {
-                        id,
+                        doc: doc.id,
                         path,
-                        action: Action::Write(content, buf.revision),
+                        action: Action::Write(content, doc.revision),
                     });
                 }
-            } else if buf.backed_up_revision.is_some() {
+            } else if doc.backed_up_revision.is_some() {
                 jobs.push(Job {
-                    id,
+                    doc: doc.id,
                     path,
                     action: Action::Delete,
                 });
@@ -903,28 +920,27 @@ pub(crate) async fn flush_backups(state: &SharedState) {
     if jobs.is_empty() {
         return;
     }
-    let mut stamps: Vec<(aether_protocol::BufferId, Option<aether_protocol::Revision>)> =
-        Vec::new();
+    let mut stamps: Vec<(DocumentId, Option<aether_protocol::Revision>)> = Vec::new();
     for job in jobs {
         match job.action {
             Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
-                Ok(()) => stamps.push((job.id, Some(rev))),
+                Ok(()) => stamps.push((job.doc, Some(rev))),
                 Err(e) => {
-                    tracing::warn!(buffer_id = job.id, error = %e, "failed to write buffer backup")
+                    tracing::warn!(document = job.doc.0, error = %e, "failed to write document backup")
                 }
             },
             Action::Delete => {
                 crate::backup::delete(&job.path);
-                stamps.push((job.id, None));
+                stamps.push((job.doc, None));
             }
         }
     }
     let mut s = state.lock().await;
-    for (id, stamp) in stamps {
-        if let Some(buf) = s.buffers.get_mut(&id) {
-            // Stamping a revision the buffer may have already moved past is fine: the next flush sees
-            // `revision != backed_up_revision` and rewrites.
-            buf.backed_up_revision = stamp;
+    for (doc_id, stamp) in stamps {
+        if let Some(doc) = s.documents.get_mut(&doc_id) {
+            // Stamping a revision the document may have already moved past is fine: the next
+            // flush sees `revision != backed_up_revision` and rewrites.
+            doc.backed_up_revision = stamp;
         }
     }
 }
@@ -1432,13 +1448,13 @@ pub async fn workspace_remove_root(
 
     // Find file-backed buffers under the removed root that aren't covered by any remaining
     // root. Scratch buffers (no path) are exempt; they stay alive.
-    let under_removed = |buf: &Buffer| -> bool {
+    let under_removed = |buf: &Document| -> bool {
         let Some(p) = buf.canonical_path.as_deref() else {
             return false;
         };
         p == canonical || p.starts_with(&canonical)
     };
-    let still_covered = |buf: &Buffer| -> bool {
+    let still_covered = |buf: &Document| -> bool {
         let Some(p) = buf.canonical_path.as_deref() else {
             return true;
         };
@@ -1450,15 +1466,18 @@ pub async fn workspace_remove_root(
         .buffers
         .iter()
         .filter(|(id, buf)| {
+            let Some(doc) = s.documents.get(&buf.document) else {
+                return false;
+            };
             s.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(&workspace_name)
-                && under_removed(buf)
-                && !still_covered(buf)
+                && under_removed(doc)
+                && !still_covered(doc)
         })
         .map(|(id, _)| *id)
         .collect();
     let dirty: Vec<BufferId> = affected
         .iter()
-        .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+        .filter(|id| s.try_doc_of(**id).map(|d| d.dirty).unwrap_or(false))
         .copied()
         .collect();
     if !dirty.is_empty() {
@@ -1691,7 +1710,7 @@ pub async fn workspace_delete(
     let dirty: Vec<BufferId> = s
         .buffers_in_workspace(&name)
         .into_iter()
-        .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+        .filter(|id| s.try_doc_of(*id).map(|d| d.dirty).unwrap_or(false))
         .collect();
     if !dirty.is_empty() {
         let mut err = RpcError::new(
@@ -1778,7 +1797,7 @@ pub async fn path_delete(
         let dirty: Vec<BufferId> = s
             .buffers_under_path(&workspace_name, &canonical)
             .into_iter()
-            .filter(|id| s.buffers.get(id).map(|b| b.dirty).unwrap_or(false))
+            .filter(|id| s.try_doc_of(*id).map(|d| d.dirty).unwrap_or(false))
             .collect();
         if !dirty.is_empty() {
             let mut err = RpcError::new(
@@ -1919,23 +1938,6 @@ fn open_scroll(
     client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied())
 }
 
-/// On-disk backup path for a buffer in `workspace`, or `None` if it can't be backed up (no path and
-/// no scratch number — shouldn't happen for a live buffer). File buffers key by their canonical
-/// path, scratches by their number. The caller is responsible for only invoking this for buffers in
-/// a *named* workspace (backups are scoped the same way sessions are).
-fn buffer_backup_path(
-    root: &std::path::Path,
-    workspace: &str,
-    buf: &Buffer,
-) -> Option<std::path::PathBuf> {
-    if let Some(p) = buf.canonical_path.as_deref() {
-        Some(crate::backup::file_backup_path(root, workspace, p))
-    } else {
-        buf.scratch_number
-            .map(|n| crate::backup::scratch_backup_path(root, workspace, n))
-    }
-}
-
 /// Materialize a dormant *scratch* buffer (selected by id from the picker, or landed on at activate):
 /// allocate a real buffer, restore its unsaved content from the backup keyed by `number`, and return
 /// the open result. Mirrors the fresh-scratch arm of [`buffer_open_inner`] plus the backup overlay.
@@ -1949,29 +1951,35 @@ async fn open_restored_scratch(
     let mut s = state.lock().await;
     let active_workspace_name = s.active_workspace_or_err(ctx.client_id)?.id.clone();
     let id = s.allocate_buffer_id();
-    let mut buf = Buffer::scratch(id, None, number);
+    let doc_id = s.allocate_document_id();
+    let mut doc = Document::scratch(doc_id, None);
     if let Some(root) = s.backups_path.clone() {
         let path = crate::backup::scratch_backup_path(&root, &active_workspace_name, number);
         if let Some((content, _mtime)) = crate::backup::read(&path) {
-            buf.restore_unsaved(&content);
+            doc.restore_unsaved(&content);
             // The on-disk backup already holds this content — don't let the flush rewrite it.
-            buf.backed_up_revision = Some(buf.revision);
+            doc.backed_up_revision = Some(doc.revision);
         }
     }
-    buf.transient = params.transient == Some(true);
-    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+    let buf = Buffer {
+        id,
+        document: doc_id,
+        scratch_number: Some(number),
+        transient: params.transient == Some(true),
+    };
+    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&doc, jt));
     let clamped_anchor = params
         .jump_to_anchor
-        .map(|a| motion::clamp_position(&buf, a));
+        .map(|a| motion::clamp_position(&doc, a));
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
     let scroll = open_scroll(&s, client_id, id, params.jump_to);
     let result = BufferOpenResult {
         buffer_id: id,
-        language: buf.language.clone(),
-        line_count: buf.line_count(),
-        byte_count: buf.byte_count(),
-        revision: buf.revision,
-        saved_revision: buf.saved_revision(),
+        language: doc.language.clone(),
+        line_count: doc.line_count(),
+        byte_count: doc.byte_count(),
+        revision: doc.revision,
+        saved_revision: doc.saved_revision(),
         path: None,
         scratch_number: Some(number),
         cursor,
@@ -1979,6 +1987,7 @@ async fn open_restored_scratch(
         lsp_server: None, // scratch buffers are never language-server-backed
         transient: buf.transient,
     };
+    s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
@@ -2041,21 +2050,22 @@ async fn buffer_open_inner(
         }
 
         let mut s = state.lock().await;
-        let buf = s
+        let scratch_number = s
             .buffers
             .get(&buffer_id)
-            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-        let language = buf.language.clone();
-        let line_count = buf.line_count();
-        let byte_count = buf.byte_count();
-        let revision = buf.revision;
-        let saved_revision = buf.saved_revision();
-        let path = buf.canonical_path.as_ref().map(|p| p.display().to_string());
-        let scratch_number = buf.scratch_number;
-        let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?
+            .scratch_number;
+        let doc = s.doc_of(buffer_id);
+        let language = doc.language.clone();
+        let line_count = doc.line_count();
+        let byte_count = doc.byte_count();
+        let revision = doc.revision;
+        let saved_revision = doc.saved_revision();
+        let path = doc.canonical_path.as_ref().map(|p| p.display().to_string());
+        let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
         let clamped_anchor = params
             .jump_to_anchor
-            .map(|a| motion::clamp_position(buf, a));
+            .map(|a| motion::clamp_position(doc, a));
         let cursor =
             resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump, clamped_anchor);
         let scroll = open_scroll(&s, client_id, buffer_id, params.jump_to);
@@ -2106,23 +2116,29 @@ async fn buffer_open_inner(
             (None, None) => {
                 let mut s = state.lock().await;
                 let id = s.allocate_buffer_id();
+                let doc_id = s.allocate_document_id();
                 let scratch_number = s.next_scratch_number(&active_workspace_name);
-                let mut buf = Buffer::scratch(id, params.language.clone(), scratch_number);
-                buf.transient = params.transient == Some(true);
-                let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+                let doc = Document::scratch(doc_id, params.language.clone());
+                let buf = Buffer {
+                    id,
+                    document: doc_id,
+                    scratch_number: Some(scratch_number),
+                    transient: params.transient == Some(true),
+                };
+                let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&doc, jt));
                 let clamped_anchor = params
                     .jump_to_anchor
-                    .map(|a| motion::clamp_position(&buf, a));
+                    .map(|a| motion::clamp_position(&doc, a));
                 let cursor =
                     resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
                 let scroll = open_scroll(&s, client_id, id, params.jump_to);
                 let result = BufferOpenResult {
                     buffer_id: id,
-                    language: buf.language.clone(),
-                    line_count: buf.line_count(),
-                    byte_count: buf.byte_count(),
+                    language: doc.language.clone(),
+                    line_count: doc.line_count(),
+                    byte_count: doc.byte_count(),
                     revision: 0,
-                    saved_revision: buf.saved_revision(),
+                    saved_revision: doc.saved_revision(),
                     path: None,
                     scratch_number: Some(scratch_number),
                     cursor,
@@ -2130,6 +2146,7 @@ async fn buffer_open_inner(
                     lsp_server: None, // scratch buffers are never language-server-backed
                     transient: buf.transient,
                 };
+                s.documents.insert(doc_id, doc);
                 s.buffers.insert(id, buf);
                 s.buffer_workspaces
                     .insert(id, active_workspace_name.clone());
@@ -2210,16 +2227,16 @@ async fn buffer_open_inner(
             )));
         }
         if let Some(existing) = s.buffer_for_path_in_workspace(&active_workspace_name, &canonical) {
-            let buf = &s.buffers[&existing];
-            let language = buf.language.clone();
-            let line_count = buf.line_count();
-            let byte_count = buf.byte_count();
-            let revision = buf.revision;
-            let saved_revision = buf.saved_revision();
-            let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(buf, jt));
+            let doc = s.doc_of(existing);
+            let language = doc.language.clone();
+            let line_count = doc.line_count();
+            let byte_count = doc.byte_count();
+            let revision = doc.revision;
+            let saved_revision = doc.saved_revision();
+            let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
             let clamped_anchor = params
                 .jump_to_anchor
-                .map(|a| motion::clamp_position(buf, a));
+                .map(|a| motion::clamp_position(doc, a));
             let cursor =
                 resolve_open_cursor(&mut s, client_id, existing, clamped_jump, clamped_anchor);
             let cursor = match client_id {
@@ -2254,56 +2271,73 @@ async fn buffer_open_inner(
 
     let mut s = state.lock().await;
     let id = s.allocate_buffer_id();
-    // Recover-on-open: unsaved content for this path may survive as a backup (hot-exit restore, or a
-    // crash that beat the session write). Backups are scoped to named workspaces, like sessions.
-    let backup = {
-        let named = s
-            .workspaces
-            .get(&active_workspace_name)
-            .is_some_and(|w| w.name.is_some());
-        match (named, s.backups_path.as_deref()) {
-            (true, Some(root)) => crate::backup::read(&crate::backup::file_backup_path(
-                root,
-                &active_workspace_name,
-                &canonical,
-            )),
-            _ => None,
-        }
-    };
-    let mut buf = if params.create_if_missing && !canonical.exists() {
-        // New file: empty buffer with the target path attached. Save will write to disk.
-        Buffer::new_at_path(id, canonical.clone(), params.language.clone())
-    } else {
-        match Buffer::load_from_file(id, canonical.clone()) {
-            Ok(b) => b,
-            // The file is gone but we still hold unsaved content for it — recover from the backup
-            // and flag it externally-deleted rather than failing the open.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && backup.is_some() => {
-                let mut b = Buffer::new_at_path(id, canonical.clone(), params.language.clone());
-                b.externally_deleted = true;
-                b
+    // Cross-workspace sharing: if any workspace already holds this file live, attach a new buffer
+    // to the *same* document rather than loading a second copy — both workspaces then see the same
+    // pending changes (rope, undo history, dirty state). The workspace-scoped dedup above didn't
+    // hit, so this buffer is this workspace's first view of it. Recover-on-open is skipped when
+    // attaching: the live document *is* the authoritative unsaved content.
+    let doc_id = match s.document_for_path(&canonical) {
+        Some(doc_id) => doc_id,
+        None => {
+            // Recover-on-open: unsaved content for this path may survive as a backup (hot-exit
+            // restore, or a crash that beat the session write). File backups are document-level
+            // (`files/<hash>`, no workspace in the key), so the content comes back no matter
+            // which workspace — even an ephemeral one — opens the path first.
+            let backup = s
+                .backups_path
+                .as_deref()
+                .and_then(|root| crate::backup::read(&crate::backup::file_backup_path(root, &canonical)));
+            let doc_id = s.allocate_document_id();
+            let mut doc = if params.create_if_missing && !canonical.exists() {
+                // New file: empty document with the target path attached. Save will write to disk.
+                Document::new_at_path(doc_id, canonical.clone(), params.language.clone())
+            } else {
+                match Document::load_from_file(doc_id, canonical.clone()) {
+                    Ok(d) => d,
+                    // The file is gone but we still hold unsaved content for it — recover from the
+                    // backup and flag it externally-deleted rather than failing the open.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && backup.is_some() => {
+                        let mut d = Document::new_at_path(
+                            doc_id,
+                            canonical.clone(),
+                            params.language.clone(),
+                        );
+                        d.externally_deleted = true;
+                        d
+                    }
+                    Err(e) => return Err(RpcError::file_io(e)),
+                }
+            };
+            // Overlay the backup: the disk content loaded above becomes the saved baseline; the
+            // backup becomes the live (dirty) text. A source file newer than the backup means it
+            // changed externally while we were down — surfaced via the same `externally_modified`
+            // flag as an in-session collision.
+            if let Some((content, backup_mtime)) = &backup {
+                doc.restore_unsaved(content);
+                doc.backed_up_revision = Some(doc.revision);
+                if doc
+                    .last_modified_unix_ms
+                    .is_some_and(|disk| disk > *backup_mtime)
+                {
+                    doc.externally_modified = true;
+                }
             }
-            Err(e) => return Err(RpcError::file_io(e)),
+            s.documents.insert(doc_id, doc);
+            doc_id
         }
     };
-    // Overlay the backup: the disk content loaded above becomes the saved baseline; the backup
-    // becomes the live (dirty) text. A source file newer than the backup means it changed externally
-    // while we were down — surfaced via the same `externally_modified` flag as an in-session collision.
-    if let Some((content, backup_mtime)) = &backup {
-        buf.restore_unsaved(content);
-        buf.backed_up_revision = Some(buf.revision);
-        if buf
-            .last_modified_unix_ms
-            .is_some_and(|disk| disk > *backup_mtime)
-        {
-            buf.externally_modified = true;
-        }
-    }
-    buf.transient = params.transient == Some(true);
-    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(&buf, jt));
+    let buf = Buffer {
+        id,
+        document: doc_id,
+        scratch_number: None,
+        transient: params.transient == Some(true),
+    };
+    let transient = buf.transient;
+    let doc = &s.documents[&doc_id];
+    let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
     let clamped_anchor = params
         .jump_to_anchor
-        .map(|a| motion::clamp_position(&buf, a));
+        .map(|a| motion::clamp_position(doc, a));
     // First-time open of this buffer: no prior cursor or scroll to surface — but the client could
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
@@ -2321,15 +2355,17 @@ async fn buffer_open_inner(
     // Only *small* files resolve it on the open round-trip: blob decompression and the two
     // full-file diffs are O(file), so past the limit the load runs in a background task
     // ([`finish_git_baseline`]) and the gutter fills in via a `viewport/lines_changed` push —
-    // the same deal the deferred parse gets.
-    let git_deferred = !external && buf.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
+    // the same deal the deferred parse gets. Computed per *buffer* even for a shared document:
+    // git is workspace-scoped, so each attachment resolves its own baseline.
+    let doc = &s.documents[&doc_id];
+    let git_deferred = !external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
     let git = (!external && !git_deferred).then(|| {
         let git_baseline = crate::git::load_baseline(&canonical);
-        let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &buf.text);
+        let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &doc.text);
         let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
         (git_baseline, git_unstaged, git_both)
     });
-    let syntax_pending = buf.syntax_pending;
+    let syntax_pending = doc.syntax_pending;
     s.buffers.insert(id, buf);
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
@@ -2376,7 +2412,7 @@ async fn buffer_open_inner(
         u64,
     )> = None;
     if !external && !untrusted_workspace {
-        if let Some(language) = s.buffers[&id].language.clone() {
+        if let Some(language) = s.doc_of(id).language.clone() {
             if let Some(spec) = crate::lsp::config::server_spec(&language) {
                 let roots = s
                     .workspaces
@@ -2399,8 +2435,8 @@ async fn buffer_open_inner(
                 }
                 s.lsp.register_doc(id, &key);
                 let uri = crate::lsp::uri::path_to_uri(&canonical);
-                let text = s.buffers[&id].text.to_string();
-                let version = s.buffers[&id].revision as i64;
+                let text = s.doc_of(id).text.to_string();
+                let version = s.doc_of(id).revision as i64;
                 s.lsp.notify_open(id, &key, &uri, &language, version, &text);
             }
         }
@@ -2410,30 +2446,29 @@ async fn buffer_open_inner(
         Some(c) => wrap_for_response(&s, c, id, cursor),
         None => cursor,
     };
-    let buf = &s.buffers[&id];
+    let doc = s.doc_of(id);
     let scroll = open_scroll(&s, client_id, id, params.jump_to);
     let result = BufferOpenResult {
         buffer_id: id,
-        language: buf.language.clone(),
-        line_count: buf.line_count(),
-        byte_count: buf.byte_count(),
-        revision: buf.revision,
-        saved_revision: buf.saved_revision(),
+        language: doc.language.clone(),
+        line_count: doc.line_count(),
+        byte_count: doc.byte_count(),
+        revision: doc.revision,
+        saved_revision: doc.saved_revision(),
         path: Some(canonical.display().to_string()),
         scratch_number: None,
         cursor,
         scroll,
         lsp_server: buffer_lsp_server_ref(&s, id),
-        transient: buf.transient,
+        transient,
     };
     s.touch_mru(id);
     let mut pushes = refresh_buffer_pickers(&mut s);
     // A restored buffer can come back externally-modified/-deleted (the source changed or vanished
     // while we were down). That state rides a `buffer/state` push, not the open result, so emit one
     // now — otherwise the client wouldn't learn until some later edit triggered a push.
-    if s.buffers
-        .get(&id)
-        .is_some_and(|b| b.externally_modified || b.externally_deleted)
+    if s.try_doc_of(id)
+        .is_some_and(|d| d.externally_modified || d.externally_deleted)
     {
         pushes.extend(collect_buffer_state_pushes(&s, id));
     }
@@ -2514,7 +2549,7 @@ async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
     loop {
         let (text, revision, language) = {
             let mut s = state.lock().await;
-            let Some(buf) = s.buffers.get_mut(&buffer_id) else {
+            let Some(buf) = s.try_doc_of_mut(buffer_id) else {
                 return; // closed while pending
             };
             if !buf.syntax_pending {
@@ -2534,7 +2569,7 @@ async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
                 .unwrap_or(None);
         let pushes = {
             let mut s = state.lock().await;
-            let Some(buf) = s.buffers.get_mut(&buffer_id) else {
+            let Some(buf) = s.try_doc_of_mut(buffer_id) else {
                 return;
             };
             if !buf.syntax_pending {
@@ -2545,7 +2580,13 @@ async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
             }
             buf.syntax = parsed;
             buf.syntax_pending = false;
-            collect_buffer_refresh_pushes(&s, buffer_id)
+            // The tree belongs to the shared document — restyle every attached buffer's
+            // viewports, not just the one this task was spawned for.
+            let mut pushes = PendingPushes::new();
+            for id in s.doc_siblings(buffer_id) {
+                pushes.extend(collect_buffer_refresh_pushes(&s, id));
+            }
+            pushes
         };
         for (sender, notif) in pushes {
             let _ = sender.send(notif).await;
@@ -2561,7 +2602,7 @@ async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
 /// buffer's current revision rides through unchanged.
 fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return pushes;
     };
     for vp in s.viewports.values() {
@@ -2600,8 +2641,7 @@ pub async fn git_blame_line(
 ) -> Result<GitBlameLineResult, RpcError> {
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     if buf.canonical_path.is_none() {
         return Ok(GitBlameLineResult {
@@ -2679,8 +2719,7 @@ pub async fn git_set_diff_view(
     }
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
@@ -2688,7 +2727,7 @@ pub async fn git_set_diff_view(
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let window = render_window(
         buf,
         first,
@@ -2743,7 +2782,7 @@ pub async fn git_navigate_hunk(
     // including a region reverted back to HEAD's content but staged differently (in the index
     // diff only).
     let anchors = {
-        let buf = &s.buffers[&params.buffer_id];
+        let buf = s.doc_of(params.buffer_id);
         let baseline = s.git_baseline.get(&params.buffer_id);
         let head = crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text);
         let unstaged =
@@ -2783,7 +2822,7 @@ pub async fn git_navigate_hunk(
         });
     };
 
-    let buf = &s.buffers[&params.buffer_id];
+    let buf = s.doc_of(params.buffer_id);
     let position = motion::clamp_position(
         buf,
         LogicalPosition {
@@ -2855,8 +2894,7 @@ pub async fn git_apply_hunk(
     };
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let (dirty, line_ending) = (buf.dirty, buf.line_ending);
     let buffer_text = buf.text.to_string();
@@ -2903,7 +2941,7 @@ pub async fn git_apply_hunk(
                 Some(content) => (content, ApplyHunkStatus::Staged),
                 None => {
                     let unstaged =
-                        crate::git::diff_hunks(Some(index_bytes), &s.buffers[&buffer_id].text);
+                        crate::git::diff_hunks(Some(index_bytes), &s.doc_of(buffer_id).text);
                     let sel_index = match sel {
                         crate::git::HunkSelection::WholeHunkAt(l) => {
                             crate::git::HunkSelection::WholeHunkAt(crate::git::map_line_to_old(
@@ -2973,65 +3011,29 @@ pub async fn git_apply_hunk(
 
             // Apply as one whole-document replacement (a single undo step) and refresh exactly
             // like `lsp/format` does.
-            let buf = &s.buffers[&buffer_id];
+            let buf = s.doc_of(buffer_id);
             let was_dirty = buf.dirty;
             let old_len = buf.text.len_chars();
-            let cursors_before: HashMap<ClientId, CursorState> = s
-                .cursors
-                .iter()
-                .filter_map(|((c, b), cs)| (*b == buffer_id).then_some((*c, *cs)))
-                .collect();
-            let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+            let cursors_before = document_cursor_snapshot(&s, buffer_id);
+            let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
             let revision =
                 buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Revert, cursors_before);
 
             // Clamp every cursor on the buffer into the reverted rope.
-            let cursor_ids: Vec<ClientId> = s
-                .cursors
-                .keys()
-                .filter_map(|(c, b)| (*b == buffer_id).then_some(*c))
-                .collect();
-            for cid in cursor_ids {
-                if let Some(cur) = s.cursors.get(&(cid, buffer_id)).copied() {
-                    let clamped = clamp_cursor(&s.buffers[&buffer_id], cur);
-                    s.cursors.insert((cid, buffer_id), clamped);
-                }
-            }
+            clamp_doc_cursors(&mut s, buffer_id);
             s.clear_motion_history_for_buffer(buffer_id);
             s.clear_tree_selection_history_for_buffer(buffer_id);
             s.clear_virtual_col_for_buffer(buffer_id);
 
             let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
             search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-            let new_line_count = s.buffers[&buffer_id].line_count();
+            let new_line_count = s.doc_of(buffer_id).line_count();
             // Also recomputes the cached hunks, so the pushed gutter markers are post-revert.
             refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
             notify_lsp_change(&mut s, buffer_id);
 
-            let buf_ref = &s.buffers[&buffer_id];
-            let mut pushes: PendingPushes = Vec::new();
-            for vp in s.viewports.values() {
-                if vp.buffer_id != buffer_id {
-                    continue;
-                }
-                let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-                    continue;
-                };
-                let search = s.searches.get(&(vp.client_id, buffer_id));
-                pushes.push((
-                    sender,
-                    build_lines_changed_notif(
-                        buf_ref,
-                        vp,
-                        revision,
-                        search,
-                        buffer_both_hunks(&s, buffer_id),
-                        buffer_diagnostics(&s, buffer_id),
-                        buffer_git_status(&s, buffer_id),
-                        lines_changed_cursor(&s, vp),
-                    ),
-                ));
-            }
+            let pushes: PendingPushes =
+                collect_doc_lines_changed_pushes(&s, buffer_id, revision);
             let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
             let result = outcome(&s, ApplyHunkStatus::Reverted);
@@ -3114,7 +3116,7 @@ impl CursorResolve {
 }
 
 fn lsp_cursor_request(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> CursorResolve {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return CursorResolve::NoServer;
     };
     let Some(path) = buf.canonical_path.as_deref() else {
@@ -3172,7 +3174,7 @@ fn buffer_lsp_server_ref(
 }
 
 /// A buffer line's text without its trailing newline; empty if `line` is past the end.
-fn line_text_no_newline(buf: &Buffer, line: u32) -> String {
+fn line_text_no_newline(buf: &Document, line: u32) -> String {
     if line as usize >= buf.text.len_lines() {
         return String::new();
     }
@@ -3370,7 +3372,7 @@ pub fn spawn_symbol_highlight_refresh(
             if s.symbol_highlight_gen.get(&key) != Some(&epoch) {
                 return;
             }
-            match s.buffers.get(&buffer_id) {
+            match s.try_doc_of(buffer_id) {
                 Some(buf) => parse_document_highlights(&raw, buf, req.encoding),
                 None => return,
             }
@@ -3451,7 +3453,7 @@ pub async fn lsp_navigate_diagnostic(
         });
     };
 
-    let buf = &s.buffers[&params.buffer_id];
+    let buf = s.doc_of(params.buffer_id);
     let position = motion::clamp_position(buf, target);
     let result = CursorState {
         position,
@@ -3540,7 +3542,7 @@ enum FormatResolve {
 }
 
 fn lsp_format_resolve(s: &ServerState, buffer_id: BufferId) -> FormatResolve {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return FormatResolve::Unsupported;
     };
     let Some(path) = buf.canonical_path.as_deref() else {
@@ -3642,7 +3644,7 @@ pub async fn lsp_format(
     };
 
     let mut s = state.lock().await;
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return Err(RpcError::buffer_not_found(buffer_id));
     };
     // Edits were computed against `req.revision`; if the buffer moved under us, they're stale.
@@ -3659,60 +3661,24 @@ pub async fn lsp_format(
     // Apply as one whole-document replacement (single undo step), then refresh like undo/redo.
     let was_dirty = buf.dirty;
     let old_len = buf.text.len_chars();
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, b), cs)| (*b == buffer_id).then_some((*c, *cs)))
-        .collect();
-    let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
+    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
     let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Format, cursors_before);
 
     // Clamp every cursor on the buffer into the reformatted rope.
-    let cursor_ids: Vec<ClientId> = s
-        .cursors
-        .keys()
-        .filter_map(|(c, b)| (*b == buffer_id).then_some(*c))
-        .collect();
-    for cid in cursor_ids {
-        if let Some(cur) = s.cursors.get(&(cid, buffer_id)).copied() {
-            let clamped = clamp_cursor(&s.buffers[&buffer_id], cur);
-            s.cursors.insert((cid, buffer_id), clamped);
-        }
-    }
+    clamp_doc_cursors(&mut s, buffer_id);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     notify_lsp_change(&mut s, buffer_id);
 
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
-        ));
-    }
+    let pushes: PendingPushes =
+        collect_doc_lines_changed_pushes(&s, buffer_id, revision);
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
     let result_cursor = s
@@ -3934,7 +3900,7 @@ fn parse_references(
 /// the cross-file reference/definition paths need). For `documentHighlight`, whose ranges are
 /// always in the current document.
 fn lsp_pos_to_logical(
-    buf: &Buffer,
+    buf: &Document,
     line: u32,
     character: u32,
     encoding: crate::lsp::position::PositionEncoding,
@@ -3950,7 +3916,7 @@ fn lsp_pos_to_logical(
 /// without a parseable range, and empty/degenerate ranges, are dropped.
 fn parse_document_highlights(
     v: &serde_json::Value,
-    buf: &Buffer,
+    buf: &Document,
     encoding: crate::lsp::position::PositionEncoding,
 ) -> Vec<(LogicalPosition, LogicalPosition)> {
     let serde_json::Value::Array(entries) = v else {
@@ -4179,7 +4145,7 @@ fn rope_byte_col(
 /// the file watcher when something under the repo's `.git` changes. Returns the pushes to send
 /// after the state lock is released. No-op (empty) for a scratch buffer or a missing buffer.
 pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return Vec::new();
     };
     let Some(path) = buf.canonical_path.clone() else {
@@ -4202,7 +4168,7 @@ fn attach_git_baseline(
     buffer_id: BufferId,
     baseline: crate::git::GitBaseline,
 ) -> PendingPushes {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return Vec::new();
     };
     let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
@@ -4226,7 +4192,7 @@ pub const SEARCH_MAX_MATCHES: usize = 10_000;
 /// query has an uppercase letter), forced-sensitive or forced-insensitive. `multi_line: true`
 /// throughout. Zero-width matches are skipped so patterns like `^` don't pin the cursor.
 pub fn compute_search_entry(
-    buf: &Buffer,
+    buf: &Document,
     query: &str,
     options: &MatchOptions,
 ) -> Result<SearchEntry, RpcError> {
@@ -4286,8 +4252,7 @@ pub async fn search_set(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
 
@@ -4362,7 +4327,7 @@ pub async fn search_set(
                 cursor = new_cursor;
             }
         }
-        let buf_ref = &s.buffers[&params.buffer_id];
+        let buf_ref = s.doc_of(params.buffer_id);
         let summary = summary_for(buf_ref, &entry, params.buffer_id, &cursor);
         entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
@@ -4438,8 +4403,7 @@ pub async fn sneak_update(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
 
@@ -4507,8 +4471,7 @@ pub async fn sneak_select(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let cursor = s.cursors.get(&key).copied().unwrap_or_default();
@@ -4638,8 +4601,7 @@ async fn search_navigate(
     let mut s = state.lock().await;
     let key = (client_id, buffer_id);
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let Some(entry) = s.searches.get(&key) else {
         // No active search — return a zero-summary with the current cursor untouched.
@@ -4748,7 +4710,7 @@ async fn search_navigate(
     s.record_motion(key, prev_cursor, new_cursor);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, buffer_id);
-    let buf_ref = &s.buffers[&buffer_id];
+    let buf_ref = s.doc_of(buffer_id);
     let summary = {
         let entry_ref = s.searches.get(&key).expect("active search just confirmed");
         summary_for(buf_ref, entry_ref, buffer_id, &new_cursor)
@@ -4806,7 +4768,7 @@ fn pos_tuple(p: LogicalPosition) -> (u32, u32) {
 
 /// Compute the `SearchSummary` for the given entry and cursor.
 fn summary_for(
-    buf: &Buffer,
+    buf: &Document,
     entry: &SearchEntry,
     buffer_id: BufferId,
     cursor: &CursorState,
@@ -4825,7 +4787,7 @@ fn summary_for(
 /// Single-char matches: the cursor's selection collapses to a 1-char point, and we match it
 /// against the match's single char. Comparing both endpoints means the counter only shows
 /// when the user is genuinely "on" a match — extending or shrinking the selection drops it.
-fn match_index_for_cursor(buf: &Buffer, entry: &SearchEntry, cursor: &CursorState) -> u32 {
+fn match_index_for_cursor(buf: &Document, entry: &SearchEntry, cursor: &CursorState) -> u32 {
     // The counter reflects the match the cursor *head* sits on: a match is "current" when the head
     // falls anywhere within it. This keeps the index live across all the ways a head lands on a
     // match — `/` and `?` entry, `n`/`Alt-n` re-selection, and `Shift-n`/`Shift-Alt-n` extension
@@ -4853,7 +4815,7 @@ fn collect_viewport_refresh(
     buffer_id: BufferId,
 ) -> PendingPushes {
     let mut pushes = Vec::new();
-    let buf = match s.buffers.get(&buffer_id) {
+    let buf = match s.try_doc_of(buffer_id) {
         Some(b) => b,
         None => return pushes,
     };
@@ -4932,7 +4894,7 @@ fn collect_cursor_search_update(
         .get(&(client_id, buffer_id))
         .copied()
         .unwrap_or_default();
-    let buf = s.buffers.get(&buffer_id)?;
+    let buf = s.try_doc_of(buffer_id)?;
     let new_idx = {
         let entry = s.searches.get(&(client_id, buffer_id))?;
         match_index_for_cursor(buf, entry, &cursor)
@@ -4965,29 +4927,33 @@ fn collect_cursor_search_update(
 /// as `revision != saved_revision`, so this notification is only needed when `saved_revision`
 /// changes or when the external-change flags flip.
 pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
-        return Vec::new();
-    };
-    let params = BufferStateParams {
-        buffer_id,
-        saved_revision: buf.saved_revision(),
-        saved_at_unix_ms: buf.last_modified_unix_ms,
-        externally_modified: buf.externally_modified,
-        externally_deleted: buf.externally_deleted,
-        transient: buf.transient,
-        // Lets a save-as rename follow to every other client viewing this shared buffer.
-        path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
-    };
-    let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
-    let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id == buffer_id {
-            clients.insert(vp.client_id);
+    let mut pushes = Vec::new();
+    // Fan out per attached buffer: the document state (saved revision, external flags, path) is
+    // shared, but each sibling's viewers hear it under their own buffer id — and with that
+    // buffer's own transient flag.
+    for id in s.doc_siblings(buffer_id) {
+        let Some(buf) = s.try_doc_of(id) else {
+            continue;
+        };
+        let transient = s.buffers.get(&id).map(|b| b.transient).unwrap_or(false);
+        let params = BufferStateParams {
+            buffer_id: id,
+            saved_revision: buf.saved_revision(),
+            saved_at_unix_ms: buf.last_modified_unix_ms,
+            externally_modified: buf.externally_modified,
+            externally_deleted: buf.externally_deleted,
+            transient,
+            // Lets a save-as rename follow to every other client viewing this shared buffer.
+            path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
+        };
+        let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+        let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
+        for vp in s.viewports.values() {
+            if vp.buffer_id == id {
+                clients.insert(vp.client_id);
+            }
         }
-    }
-    clients
-        .into_iter()
-        .filter_map(|cid| {
+        pushes.extend(clients.into_iter().filter_map(|cid| {
             let session = s.clients.get(&cid)?;
             Some((
                 session.outbound.clone(),
@@ -4997,8 +4963,9 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
                     params: json.clone(),
                 },
             ))
-        })
-        .collect()
+        }));
+    }
+    pushes
 }
 
 /// Promote a transient buffer to permanent. Called from every buffer-mutation handler (the
@@ -5039,28 +5006,31 @@ fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> Pend
     if !s.buffers.contains_key(&buffer_id) {
         return pushes;
     }
+    // Fan out over the document: a mutation through one buffer shifts byte positions for every
+    // sibling buffer sharing the content too.
+    let attached = s.doc_siblings(buffer_id);
     // A mutation shifts byte positions, so any symbol-highlight set is now stale. Drop it (and its
     // debounce generation, which invalidates any in-flight refresh); the client re-requests
     // highlights when its cursor lands after the edit. The re-rendered windows the mutation already
     // pushes read `searches` directly, so they correctly show no symbol highlights until then.
-    s.symbol_highlights.retain(|(_, b), _| *b != buffer_id);
-    s.symbol_highlight_gen.retain(|(_, b), _| *b != buffer_id);
+    s.symbol_highlights.retain(|(_, b), _| !attached.contains(b));
+    s.symbol_highlight_gen.retain(|(_, b), _| !attached.contains(b));
     let keys: Vec<(ClientId, BufferId)> = s
         .searches
         .keys()
-        .filter(|(_, b)| *b == buffer_id)
+        .filter(|(_, b)| attached.contains(b))
         .copied()
         .collect();
     for key in keys {
         let query = s.searches[&key].query.clone();
         let options = s.searches[&key].options;
-        let buf = &s.buffers[&buffer_id];
+        let buf = s.doc_of(key.1);
         let mut entry = match compute_search_entry(buf, &query, &options) {
             Ok(e) => e,
             Err(_) => continue,
         };
         let cursor = s.cursors.get(&key).copied().unwrap_or_default();
-        let summary = summary_for(buf, &entry, buffer_id, &cursor);
+        let summary = summary_for(buf, &entry, key.1, &cursor);
         entry.last_pushed_index = summary.current_index;
         s.searches.insert(key, entry);
         if let Some(sender) = s.clients.get(&key.0).map(|c| c.outbound.clone()) {
@@ -5078,7 +5048,7 @@ fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> Pend
 }
 
 /// Convert a buffer-wide byte offset to a `(line, col_bytes)` position.
-fn byte_to_logical(buf: &Buffer, byte_idx: usize) -> aether_protocol::LogicalPosition {
+fn byte_to_logical(buf: &Document, byte_idx: usize) -> aether_protocol::LogicalPosition {
     let char_idx = buf.text.byte_to_char(byte_idx);
     let line_idx = buf.text.char_to_line(char_idx);
     let line_start_char = buf.text.line_to_char(line_idx);
@@ -5212,9 +5182,13 @@ pub async fn buffer_close(
             if let Some(dormant) = s.take_dormant(&workspace, params.buffer_id) {
                 if let Some(root) = s.backups_path.as_deref() {
                     match &dormant.source {
-                        crate::state::DormantSource::File(p) => crate::backup::delete(
-                            &crate::backup::file_backup_path(root, &workspace, p),
-                        ),
+                        // Discarding a dormant file discards the document-level backup: unsaved
+                        // content is document-scoped now, so an explicit discard here discards it
+                        // for every workspace whose session references the same path — the same
+                        // way closing a shared live buffer with discard would.
+                        crate::state::DormantSource::File(p) => {
+                            crate::backup::delete(&crate::backup::file_backup_path(root, p))
+                        }
                         crate::state::DormantSource::Scratch { number } => crate::backup::delete(
                             &crate::backup::scratch_backup_path(root, &workspace, *number),
                         ),
@@ -5247,11 +5221,12 @@ pub async fn buffer_close(
     let owning_workspace = s.workspace_for_buffer(params.buffer_id).map(str::to_string);
     // Closing is an explicit discard: drop any unsaved backup now, so the content isn't resurrected
     // the next time this path is opened (recover-on-open). Done before teardown drops the buffer.
-    if let (Some(ws), Some(buf)) = (
+    if let (Some(ws), Some(buf), Some(doc)) = (
         owning_workspace.as_deref(),
         s.buffers.get(&params.buffer_id),
+        s.try_doc_of(params.buffer_id),
     ) {
-        delete_buffer_backups(&s, ws, buf);
+        delete_buffer_backups(&s, ws, buf, doc);
     }
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
@@ -5325,8 +5300,7 @@ fn buffer_path_ref(
     buffer_id: BufferId,
 ) -> (Option<u32>, Option<String>) {
     let Some(canonical) = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .and_then(|b| b.canonical_path.clone())
     else {
         return (None, None);
@@ -5395,7 +5369,7 @@ async fn navigate_to(
     let mut result = buffer_open(state, ctx, open_params).await?;
 
     let mut s = state.lock().await;
-    let restored = match s.buffers.get(&result.buffer_id) {
+    let restored = match s.try_doc_of(result.buffer_id) {
         Some(buf) => CursorState {
             position: motion::clamp_position(buf, entry.cursor.position),
             anchor: motion::clamp_position(buf, entry.cursor.anchor),
@@ -5503,8 +5477,7 @@ pub async fn buffer_copy(
     let client_id = ctx.client_id;
     let s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let cursor = s
         .cursors
@@ -5560,8 +5533,7 @@ pub async fn buffer_content(
 ) -> Result<BufferContentResult, RpcError> {
     let s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     Ok(BufferContentResult {
         revision: buf.revision,
@@ -5585,8 +5557,7 @@ pub async fn buffer_cut(
         .copied()
         .unwrap_or_default();
     let buf_ref = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let (start_char, end_char) = scope_range(buf_ref, &cursor, params.scope);
     let text = buf_ref.text.slice(start_char..end_char).to_string();
@@ -5595,19 +5566,9 @@ pub async fn buffer_cut(
     let old_first_line = start_pos.line;
     let old_last_line_excl = end_pos_exclusive.line.saturating_add(1);
 
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, b), cs)| {
-            if *b == params.buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let cursors_before = document_cursor_snapshot(&s, params.buffer_id);
 
-    let buf_mut = s.buffers.get_mut(&params.buffer_id).expect("just checked");
+    let buf_mut = s.try_doc_of_mut(params.buffer_id).expect("just checked");
     let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(
         start_char,
@@ -5630,9 +5591,9 @@ pub async fn buffer_cut(
 
     let mut search_summary_pushes = promote_transient(&mut s, params.buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, params.buffer_id));
-    let new_line_count = s.buffers[&params.buffer_id].line_count();
+    let new_line_count = s.doc_of(params.buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id, new_line_count);
-    let buf_ref = &s.buffers[&params.buffer_id];
+    let buf_ref = s.doc_of(params.buffer_id);
 
     let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
@@ -5694,7 +5655,7 @@ pub async fn buffer_cut(
 }
 
 /// Compute the `[start_char, end_char)` range for a copy/cut scope.
-fn scope_range(buf: &Buffer, cursor: &CursorState, scope: CopyScope) -> (usize, usize) {
+fn scope_range(buf: &Document, cursor: &CursorState, scope: CopyScope) -> (usize, usize) {
     match scope {
         CopyScope::Selection => {
             // The selection always covers at least 1 char (point: anchor == position). The
@@ -5765,8 +5726,7 @@ pub async fn buffer_save(
         (None, None) => {
             let s = state.lock().await;
             let buf = s
-                .buffers
-                .get(&params.buffer_id)
+                .try_doc_of(params.buffer_id)
                 .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
             buf.canonical_path
                 .clone()
@@ -5829,9 +5789,10 @@ pub async fn buffer_save(
     // actual write so the existence check can't race with the save (TOCTOU). In v1 single-
     // client this is theoretical, but folding the locks keeps the invariant tidy.
     //
-    // Conflict: target path already canonical-bound to a *different* buffer — refuse rather
-    // than silently transferring the path. Skipped when target matches the saving buffer's
-    // own current path (the in-place save case).
+    // Conflict: target path already live as a *different* document — in this workspace or any
+    // other — so saving onto it would fork the file (two documents over one inode). Refuse
+    // rather than silently transferring the path. Skipped when the target is the saving
+    // buffer's own document's path (the in-place save case).
     //
     // Would-overwrite: the file exists on disk but isn't this buffer's current path, and the
     // caller hasn't confirmed. The client retries with `overwrite: true` after asking.
@@ -5841,15 +5802,21 @@ pub async fn buffer_save(
     let (saved_at_unix_ms, revision) = {
         let mut s = state.lock().await;
         let active_workspace_name = s.active_workspace_or_err(ctx.client_id)?.id.clone();
-        if let Some(existing) = s.buffer_for_path_in_workspace(&active_workspace_name, &target) {
-            if existing != params.buffer_id {
-                return Err(RpcError::path_owned_by_buffer(existing));
+        if let Some(owner) = s.document_for_path(&target) {
+            if Some(owner) != s.buffers.get(&params.buffer_id).map(|b| b.document) {
+                // Blame a buffer the client can name: this workspace's if it has one, else any
+                // attachment of the owning document.
+                let existing = s
+                    .buffer_for_path_in_workspace(&active_workspace_name, &target)
+                    .or_else(|| s.buffers_of_document(owner).into_iter().next());
+                if let Some(existing) = existing {
+                    return Err(RpcError::path_owned_by_buffer(existing));
+                }
             }
         }
         if !params.overwrite && target.exists() {
             let own_path = s
-                .buffers
-                .get(&params.buffer_id)
+                .try_doc_of(params.buffer_id)
                 .and_then(|b| b.canonical_path.as_ref());
             if own_path.map(|p| p.as_path()) != Some(target.as_path()) {
                 return Err(RpcError::would_overwrite(target.display()));
@@ -5860,8 +5827,7 @@ pub async fn buffer_save(
         // above; the buffer's external-change state for its prior path is no longer relevant.
         if !params.overwrite {
             let buf = s
-                .buffers
-                .get(&params.buffer_id)
+                .try_doc_of(params.buffer_id)
                 .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
             let saving_in_place = buf
                 .canonical_path
@@ -5889,8 +5855,7 @@ pub async fn buffer_save(
             }
         }
         let buf = s
-            .buffers
-            .get_mut(&params.buffer_id)
+            .try_doc_of_mut(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let saved_at = buf.save_to_disk(target).map_err(RpcError::file_io)?;
         (saved_at, buf.revision)
@@ -5905,16 +5870,19 @@ pub async fn buffer_save(
         // rides the buffer/state push below, so we just flip it.
         if let Some(buf) = s.buffers.get_mut(&params.buffer_id) {
             buf.transient = false;
-            buf.backed_up_revision = None;
+        }
+        if let Some(doc) = s.try_doc_of_mut(params.buffer_id) {
+            doc.backed_up_revision = None;
         }
         // The content is now on disk — drop any unsaved backup (under both the file path and, for a
         // saved-as scratch, its old number). Cheap and immediate; the flush would otherwise clear it
         // on its next tick.
-        if let (Some(ws), Some(buf)) = (
+        if let (Some(ws), Some(buf), Some(doc)) = (
             s.workspace_for_buffer(params.buffer_id).map(str::to_string),
             s.buffers.get(&params.buffer_id),
+            s.try_doc_of(params.buffer_id),
         ) {
-            delete_buffer_backups(&s, &ws, buf);
+            delete_buffer_backups(&s, &ws, buf, doc);
         }
         let state_pushes = collect_buffer_state_pushes(&s, params.buffer_id);
         let picker_pushes = refresh_buffer_pickers(&mut s);
@@ -5954,8 +5922,7 @@ pub async fn buffer_reload(
     let mut s = state.lock().await;
     if !params.force {
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         if buf.dirty {
             return Err(RpcError::would_discard_changes(params.buffer_id));
@@ -6028,12 +5995,11 @@ pub(crate) fn reload_buffer_locked(
     s: &mut ServerState,
     buffer_id: BufferId,
 ) -> Result<(BufferReloadResult, PendingPushes), RpcError> {
-    let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
+    let was_dirty = s.try_doc_of(buffer_id).map(|b| b.dirty).unwrap_or(false);
 
     let saved_at_unix_ms = {
         let buf = s
-            .buffers
-            .get_mut(&buffer_id)
+            .try_doc_of_mut(buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
         if buf.canonical_path.is_none() {
             return Err(RpcError::buffer_has_no_path());
@@ -6041,60 +6007,21 @@ pub(crate) fn reload_buffer_locked(
         buf.reload_from_disk().map_err(RpcError::file_io)?
     };
 
-    // Clamp every cursor on this buffer to the new bounds — rope was swapped wholesale.
-    let cursor_ids: Vec<ClientId> = s
-        .cursors
-        .keys()
-        .filter_map(|(c, b)| if *b == buffer_id { Some(*c) } else { None })
-        .collect();
-    {
-        let buf = &s.buffers[&buffer_id];
-        let clamped: Vec<(ClientId, CursorState)> = cursor_ids
-            .iter()
-            .filter_map(|cid| {
-                let cursor = s.cursors.get(&(*cid, buffer_id)).copied()?;
-                Some((*cid, clamp_cursor(buf, cursor)))
-            })
-            .collect();
-        for (cid, cursor) in clamped {
-            s.cursors.insert((cid, buffer_id), cursor);
-        }
-    }
+    // Clamp every cursor on the document (this buffer and any workspace sibling) to the new
+    // bounds — rope was swapped wholesale.
+    clamp_doc_cursors(s, buffer_id);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let search_summary_pushes = refresh_searches_for_buffer(s, buffer_id);
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(s, buffer_id, new_line_count);
     // LSP: reload swapped the rope (manual or watcher-driven) — keep the server's analysis fresh.
     notify_lsp_change(s, buffer_id);
 
-    let revision = s.buffers[&buffer_id].revision;
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(s, buffer_id),
-                buffer_diagnostics(s, buffer_id),
-                buffer_git_status(s, buffer_id),
-                lines_changed_cursor(s, vp),
-            ),
-        ));
-    }
+    let revision = s.doc_of(buffer_id).revision;
+    let mut pushes: PendingPushes = collect_doc_lines_changed_pushes(s, buffer_id, revision);
 
     let state_pushes = collect_buffer_state_pushes(s, buffer_id);
     let picker_pushes = maybe_refresh_dirty(s, buffer_id, was_dirty);
@@ -6123,11 +6050,10 @@ pub async fn viewport_subscribe(
 
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let line_count = buf.line_count();
-    let buffer_id = buf.id;
+    let buffer_id = params.buffer_id;
 
     let (first, last_excl) = pushed_range(
         params.scroll.logical_line,
@@ -6139,7 +6065,7 @@ pub async fn viewport_subscribe(
     let sneak = s.sneaks.get(&(client_id, params.buffer_id));
     let hunks = buffer_both_hunks(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
-    let buf = &s.buffers[&params.buffer_id];
+    let buf = s.doc_of(params.buffer_id);
     // Gutter markers ride `hunks` regardless of the diff toggle; the inline view honours the
     // client's sticky setting. Hunks are seeded on open (`load_baseline`) and kept fresh per edit,
     // so they're accurate here without the recompute `git_set_diff_view` does.
@@ -6224,7 +6150,7 @@ pub async fn viewport_subscribe(
     // viewport that subscribes *after* the relevant change already happened would show stale state
     // until the next change. Returning it in the response (vs a follow-up push) keeps it atomic with
     // the window and free of any ordering race against the client's editor switch.
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let buffer_status = BufferStatusSnapshot {
         externally_modified: buf.externally_modified,
         externally_deleted: buf.externally_deleted,
@@ -6266,8 +6192,7 @@ pub async fn viewport_resize(
     );
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
@@ -6275,7 +6200,7 @@ pub async fn viewport_resize(
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let window = render_window(
         buf,
         first,
@@ -6326,8 +6251,7 @@ pub async fn viewport_scroll_to_row(
     );
     let hunks = buffer_both_hunks(&s, buffer_id);
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let deleted_rows = if diff_view {
@@ -6349,7 +6273,7 @@ pub async fn viewport_scroll_to_row(
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let window = render_window(
         buf,
         first,
@@ -6413,8 +6337,7 @@ pub async fn viewport_set_wrap(
     );
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
@@ -6422,7 +6345,7 @@ pub async fn viewport_set_wrap(
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let window = render_window(
         buf,
         first,
@@ -6476,8 +6399,7 @@ pub async fn viewport_scroll(
     );
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
@@ -6485,7 +6407,7 @@ pub async fn viewport_scroll(
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let window = render_window(
         buf,
         first,
@@ -6561,8 +6483,11 @@ fn pushed_range(scroll_line: u32, rows: u32, overscan: u32, line_count: u32) -> 
 /// restored lines never reach the client.
 fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, line_count: u32) {
     let max_line = line_count.saturating_sub(1);
+    // Every viewport on any buffer of the document: a mutation through one workspace's buffer
+    // moves the shared content under every sibling's viewports too.
+    let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values_mut() {
-        if vp.buffer_id != buffer_id {
+        if !attached.contains(&vp.buffer_id) {
             continue;
         }
         // A shrink can leave the viewport scrolled past EOF (a watcher reload of a rewritten
@@ -6574,7 +6499,7 @@ fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, 
             vp.scroll_logical_line = max_line;
             vp.scroll_sub_row = 0.0;
             s.last_scroll.insert(
-                (vp.client_id, buffer_id),
+                (vp.client_id, vp.buffer_id),
                 ScrollPosition {
                     logical_line: max_line,
                     sub_row: 0.0,
@@ -6590,7 +6515,9 @@ fn refresh_viewport_ranges_for_buffer(s: &mut ServerState, buffer_id: BufferId, 
         vp.first_logical_line = first;
         vp.last_logical_line_exclusive = last_excl;
     }
-    recompute_diff_hunks_if_viewed(s, buffer_id);
+    for id in attached {
+        recompute_diff_hunks_if_viewed(s, id);
+    }
 }
 
 /// Recompute the buffer's diff hunks after a mutation, when any client is viewing it. The gutter
@@ -6607,7 +6534,7 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
     if !viewed {
         return;
     }
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return;
     };
     let Some(baseline) = s.git_baseline.get(&buffer_id) else {
@@ -6778,7 +6705,7 @@ fn buffer_diagnostics(
 /// re-publishes diagnostics on its own after the `didChange`, which the `publishDiagnostics` hook
 /// then renders.
 fn notify_lsp_change(s: &mut ServerState, buffer_id: BufferId) {
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return;
     };
     let Some(uri) = buf
@@ -6790,7 +6717,11 @@ fn notify_lsp_change(s: &mut ServerState, buffer_id: BufferId) {
     };
     let revision = buf.revision as i64;
     let text = buf.text.to_string();
-    s.lsp.notify_change(buffer_id, &uri, revision, &text);
+    // Every buffer of the document syncs to its *own* workspace's language server — an edit
+    // through one workspace must reach the servers of every other workspace holding the file.
+    for id in s.doc_siblings(buffer_id) {
+        s.lsp.notify_change(id, &uri, revision, &text);
+    }
 }
 
 /// Build the diagnostics-picker candidates for `buffer_id`: one per diagnostic, sorted top-to-bottom
@@ -6801,8 +6732,7 @@ fn build_diagnostic_candidates(
     buffer_id: BufferId,
 ) -> Vec<picker_state::DiagnosticCandidate> {
     let Some(abs_path) = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .and_then(|b| b.canonical_path.as_deref())
         .map(|p| p.display().to_string())
     else {
@@ -7032,15 +6962,14 @@ async fn build_symbol_candidates(
     let (resolve, abs_path, cursor, text) = {
         let s = state.lock().await;
         let abs_path = s
-            .buffers
-            .get(&buffer_id)
+            .try_doc_of(buffer_id)
             .and_then(|b| b.canonical_path.clone());
         // The cursor's byte position (for centering on the enclosing symbol), in buffer coords —
         // not the LSP-encoded one in `req`.
         let cursor = s.cursors.get(&(client_id, buffer_id)).map(|c| c.position);
         // Snapshot of the live text for position conversion (a rope clone is cheap) — the server's
         // positions describe the synced buffer content, not whatever is on disk.
-        let text = s.buffers.get(&buffer_id).map(|b| b.text.clone());
+        let text = s.try_doc_of(buffer_id).map(|b| b.text.clone());
         (
             lsp_cursor_request(&s, client_id, buffer_id),
             abs_path,
@@ -7094,7 +7023,7 @@ struct LspDocSymbolRequest {
 }
 
 fn lsp_doc_symbol_request(s: &ServerState, buffer_id: BufferId) -> Option<LspDocSymbolRequest> {
-    let buf = s.buffers.get(&buffer_id)?;
+    let buf = s.try_doc_of(buffer_id)?;
     let path = buf.canonical_path.as_deref()?;
     let key = s.lsp.doc_server.get(&buffer_id)?;
     let handle = s.lsp.servers.get(key)?;
@@ -7388,8 +7317,7 @@ pub fn spawn_reference_resolve(
                 .get(&(client_id, buffer_id))
                 .map(|c| motion::ordered(c.position, c.anchor).0);
             let path = s
-                .buffers
-                .get(&buffer_id)
+                .try_doc_of(buffer_id)
                 .and_then(|b| b.canonical_path.as_deref())
                 .map(|p| p.display().to_string());
             (cursor, path)
@@ -7499,7 +7427,7 @@ pub fn set_diagnostics_and_refresh(
     if !s.buffers.contains_key(&buffer_id) {
         return Vec::new();
     }
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
     let revision = buf.revision;
     let diags = buffer_diagnostics(s, buffer_id);
     let counts = diagnostic_counts(diags);
@@ -7602,7 +7530,7 @@ fn diagnostic_spans_on_line(
 /// phantom rows (`deleted_rows`) count as occupied rows so the bottom of a diff still scrolls into
 /// view fully.
 fn compute_max_scroll(
-    buf: &Buffer,
+    buf: &Document,
     viewport_rows: u32,
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
@@ -7641,7 +7569,7 @@ fn compute_max_scroll(
 
 /// Number of real visual rows for one logical line (1 under no-wrap, else the wrapped count).
 fn line_visual_rows(
-    buf: &Buffer,
+    buf: &Document,
     line_idx: u32,
     no_wrap: bool,
     cols: u32,
@@ -7662,7 +7590,7 @@ fn line_visual_rows(
 /// `first` begins and the buffer's total visual-row height (real + diff phantom rows). O(lines);
 /// the no-wrap/no-diff case is O(1).
 fn compute_visual_extent(
-    buf: &Buffer,
+    buf: &Document,
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
@@ -7694,7 +7622,7 @@ fn compute_visual_extent(
 
 /// Display width (cols) of the widest line in the buffer — sizes a client's native horizontal
 /// scroller under no-wrap. O(buffer chars); only called when wrap is off.
-fn compute_max_line_width(buf: &Buffer, tab_width: u32) -> u32 {
+fn compute_max_line_width(buf: &Document, tab_width: u32) -> u32 {
     let mut max = 0u32;
     for i in 0..buf.line_count() {
         let mut text: String = buf.text.line(i as usize).chunks().collect();
@@ -7712,7 +7640,7 @@ fn compute_max_line_width(buf: &Buffer, tab_width: u32) -> u32 {
 
 /// The logical line whose visual-row span contains `target_row` (clamped to the last line).
 fn logical_line_at_visual_row(
-    buf: &Buffer,
+    buf: &Document,
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
@@ -7753,7 +7681,7 @@ struct WindowDecorations<'a> {
 }
 
 fn render_window(
-    buf: &Buffer,
+    buf: &Document,
     first: u32,
     last_excl: u32,
     geom: wrap::WrapGeometry,
@@ -7948,8 +7876,7 @@ pub async fn cursor_move(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8121,8 +8048,7 @@ pub async fn cursor_select_word(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let original = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8194,8 +8120,7 @@ async fn cursor_select_line_once(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8335,8 +8260,7 @@ pub async fn cursor_select_all(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8377,8 +8301,7 @@ pub async fn cursor_set(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&params.buffer_id)
+        .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8558,8 +8481,7 @@ async fn cursor_expand_once(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let key = (client_id, buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8654,7 +8576,7 @@ async fn cursor_contract_once(
 
 /// Char range `[start, end_excl)` covered by the cursor's current selection. Collapsed cursors
 /// (no anchor) yield a 1-char range so byte conversion produces a non-empty span.
-fn current_selection_char_range(buf: &Buffer, cursor: &CursorState) -> (usize, usize) {
+fn current_selection_char_range(buf: &Document, cursor: &CursorState) -> (usize, usize) {
     let (lo_pos, hi_pos) = motion::ordered(cursor.position, cursor.anchor);
     let total = buf.text.len_chars();
     let lo = motion::pos_to_char(buf, lo_pos).min(total);
@@ -8683,7 +8605,7 @@ struct TransformEdit {
 /// (Normal mode) it's exactly the selection — a point cursor being the single char under the
 /// block. Shared by the no-op precheck and `apply_edit`, so the two always agree.
 fn resolve_transform_case(
-    buf: &Buffer,
+    buf: &Document,
     cursor: &CursorState,
     kind: CaseKind,
     scan: bool,
@@ -8723,7 +8645,7 @@ fn resolve_transform_case(
 /// Whether the single chars immediately outside each end of the selection form a known delimiter
 /// pair — the precondition unsurround strips on. `current_selection_char_range` gives the
 /// selection as `[sc, ec)`, so the hugging chars are at `sc - 1` and `ec`; both must exist.
-fn has_enclosing_pair(buf: &Buffer, cursor: &CursorState) -> bool {
+fn has_enclosing_pair(buf: &Document, cursor: &CursorState) -> bool {
     let (sc, ec) = current_selection_char_range(buf, cursor);
     if sc < 1 || ec >= buf.text.len_chars() {
         return false;
@@ -8733,7 +8655,7 @@ fn has_enclosing_pair(buf: &Buffer, cursor: &CursorState) -> bool {
 
 /// Char range `[start, end)` of a line's content, excluding the trailing newline — the span a
 /// line-scoped surround/unsurround wraps or strips.
-fn line_content_char_range(buf: &Buffer, line: usize) -> (usize, usize) {
+fn line_content_char_range(buf: &Document, line: usize) -> (usize, usize) {
     let start = buf.text.line_to_char(line);
     let line_slice = buf.text.line(line);
     let len_chars = line_slice.len_chars();
@@ -8748,7 +8670,7 @@ fn line_content_char_range(buf: &Buffer, line: usize) -> (usize, usize) {
 
 /// Whether the cursor line's content begins and ends with a known delimiter pair — the precondition
 /// line-scoped unsurround strips on. Needs at least two content chars (the two delimiters).
-fn line_has_enclosing_pair(buf: &Buffer, line: usize) -> bool {
+fn line_has_enclosing_pair(buf: &Document, line: usize) -> bool {
     let (sc, ec) = line_content_char_range(buf, line);
     if ec < sc + 2 {
         return false;
@@ -8765,8 +8687,7 @@ async fn current_edit_result(
 ) -> Result<EditResult, RpcError> {
     let s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let revision = buf.revision;
     let cursor = s
@@ -8791,8 +8712,7 @@ pub async fn input_text(
     if let Some(edge) = params.at {
         let mut s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let key = (client_id, params.buffer_id);
         let current = s.cursors.get(&key).copied().unwrap_or_default();
@@ -8888,8 +8808,7 @@ pub async fn input_tab(
     let text = {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let cursor = s
             .cursors
@@ -8994,8 +8913,7 @@ pub async fn input_unsurround(
     {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let cursor = s
             .cursors
@@ -9033,8 +8951,7 @@ pub async fn input_transform_case(
     let is_noop = {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let cursor = s
             .cursors
@@ -9189,8 +9106,7 @@ pub async fn input_newline_and_indent(
     let indent = {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let cursor = s
             .cursors
@@ -9230,7 +9146,7 @@ pub async fn input_newline_and_indent(
 /// opener_bonus` — taken as `max` with the engine's answer. For complete code the engine
 /// already produces the right number, so the heuristic is a no-op; for incomplete code it
 /// recovers the level the parser couldn't.
-fn compute_smart_indent(buf: &Buffer, cursor_pos: LogicalPosition) -> String {
+fn compute_smart_indent(buf: &Document, cursor_pos: LogicalPosition) -> String {
     let unit = buf.indent_style.unit();
 
     let line_idx = cursor_pos.line as usize;
@@ -9301,7 +9217,7 @@ fn compute_smart_indent(buf: &Buffer, cursor_pos: LogicalPosition) -> String {
 
 /// Fallback indent for buffers without an indent query: copy the leading whitespace of the
 /// nearest preceding non-blank line. If no such line exists, return empty.
-fn previous_line_indent(buf: &Buffer, line_idx: usize) -> String {
+fn previous_line_indent(buf: &Document, line_idx: usize) -> String {
     let mut i = line_idx;
     loop {
         let line: String = buf.text.line(i).chunks().collect();
@@ -9352,8 +9268,7 @@ async fn apply_toggle_comment(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let cursor = s
         .cursors
@@ -9754,21 +9669,11 @@ async fn apply_toggle_comment(
         });
     };
 
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, bid), cs)| {
-            if *bid == buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
-    let was_dirty = s.buffers[&buffer_id].dirty;
+    let was_dirty = s.doc_of(buffer_id).dirty;
     let revision = {
-        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
         buf_mut.apply_edit(
             start_char,
             end_char,
@@ -9780,7 +9685,7 @@ async fn apply_toggle_comment(
     // Re-clamp the new cursor against the post-edit buffer (positions computed above used the
     // pre-edit buffer; if the edit shortened lines, clamp_position keeps them legal).
     let new_cursor = {
-        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
         let mut c = new_cursor;
         c.position = motion::clamp_position(buf_mut, c.position);
         c.anchor = motion::clamp_position(buf_mut, c.anchor);
@@ -9794,45 +9699,10 @@ async fn apply_toggle_comment(
     let edit_last_excl = edit_last_incl + 1;
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
-                edit_first,
-                edit_last_excl,
-            )
-        {
-            // Out-of-window edit: nothing to render for this viewport, but a whole-document
-            // consumer still needs the change signal (docs/markdown-view.md §3).
-            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
-        ));
-    }
+    let pushes: PendingPushes =
+        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.
@@ -9927,7 +9797,7 @@ fn classify_line_range(lines: &[String], prefix: Option<&str>) -> Option<LineCla
 /// trimmed so a wrap never swallows a bare `\n` (which would merge lines); `None` when every
 /// covered line is blank. A single-line range reduces to [`current_line_content_endpoints`].
 fn lines_content_endpoints(
-    buf: &Buffer,
+    buf: &Document,
     a: u32,
     b: u32,
 ) -> Option<(
@@ -9956,7 +9826,7 @@ fn lines_content_endpoints(
 /// can skip — otherwise a wrap on an empty line would replace its lone `\n` and merge the
 /// line with the next.
 fn current_line_content_endpoints(
-    buf: &Buffer,
+    buf: &Document,
     line_idx: u32,
 ) -> Option<(
     aether_protocol::LogicalPosition,
@@ -9978,7 +9848,7 @@ fn current_line_content_endpoints(
     ))
 }
 
-fn line_edit_char_range(buf: &Buffer, a: u32, b: u32) -> (usize, usize) {
+fn line_edit_char_range(buf: &Document, a: u32, b: u32) -> (usize, usize) {
     let len_lines = buf.text.len_lines() as u32;
     let len_chars = buf.text.len_chars();
     let start_char = buf.text.line_to_char(a as usize);
@@ -10169,7 +10039,7 @@ pub async fn input_dedent(
 /// under the block). Either way the operand must be a strictly valid integer. Shared by the no-op
 /// precheck in `adjust_number` and the edit itself in `apply_edit`.
 fn resolve_number_edit(
-    buf: &Buffer,
+    buf: &Document,
     cursor: &CursorState,
     delta: i64,
     scan: bool,
@@ -10221,8 +10091,7 @@ pub async fn input_adjust_number(
     {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let cursor = s
             .cursors
@@ -10262,8 +10131,7 @@ async fn apply_indent_or_dedent(
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let indent = buf.indent_style.unit();
     let cursor = s
@@ -10321,21 +10189,11 @@ async fn apply_indent_or_dedent(
         });
     }
 
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, bid), cs)| {
-            if *bid == buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
-    let was_dirty = s.buffers[&buffer_id].dirty;
+    let was_dirty = s.doc_of(buffer_id).dirty;
     let (revision, new_cursor) = {
-        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
             start_char,
             end_char,
@@ -10370,45 +10228,10 @@ async fn apply_indent_or_dedent(
     let edit_last_excl = b + 1;
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
-                edit_first,
-                edit_last_excl,
-            )
-        {
-            // Out-of-window edit: nothing to render for this viewport, but a whole-document
-            // consumer still needs the change signal (docs/markdown-view.md §3).
-            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
-        ));
-    }
+    let pushes: PendingPushes =
+        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.
@@ -10451,7 +10274,7 @@ pub async fn input_move_lines(
 /// reasoned); the paired `String` is `delete_block`'s clipboard payload. The paragraph-unit
 /// move skips the parse entirely — it is blank-line geometry, any file type.
 fn resolve_block_edit(
-    buf: &Buffer,
+    buf: &Document,
     cursor: &CursorState,
     op: &BlockOp,
 ) -> Result<(aether_markdown::edit::BlockEdit, Option<String>), aether_markdown::edit::Refusal> {
@@ -10520,8 +10343,7 @@ async fn block_edit_rpc(
     {
         let s = state.lock().await;
         let buf = s
-            .buffers
-            .get(&buffer_id)
+            .try_doc_of(buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
         let revision = buf.revision;
         let cursor = s
@@ -10637,8 +10459,7 @@ async fn input_move_lines_once(
     // Phase 1: read state and compute the edit while holding the lock.
     let mut s = state.lock().await;
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let cursor = s
         .cursors
@@ -10710,21 +10531,11 @@ async fn input_move_lines_once(
     };
 
     // Snapshot per-client cursors so undo can restore them.
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, bid), cs)| {
-            if *bid == buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
-    let was_dirty = s.buffers[&buffer_id].dirty;
+    let was_dirty = s.doc_of(buffer_id).dirty;
     let (revision, new_cursor) = {
-        let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
         let revision = buf_mut.apply_edit(
             edit_start,
             edit_end,
@@ -10760,45 +10571,10 @@ async fn input_move_lines_once(
 
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
-                edit_first,
-                edit_last_excl,
-            )
-        {
-            // Out-of-window edit: nothing to render for this viewport, but a whole-document
-            // consumer still needs the change signal (docs/markdown-view.md §3).
-            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
-        ));
-    }
+    let pushes: PendingPushes =
+        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.
@@ -10873,8 +10649,7 @@ async fn input_join_lines_once(
             .unwrap_or_default();
         let (a, b) = motion::ordered(cursor.position, cursor.anchor);
         let buf = s
-            .buffers
-            .get(&buffer_id)
+            .try_doc_of(buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
         let line_count = buf.line_count();
         let first = a.line;
@@ -10892,7 +10667,7 @@ async fn input_join_lines_once(
     if first_line >= last_line {
         // Nothing to join (we're on the last line).
         let s = state.lock().await;
-        let buf = &s.buffers[&buffer_id];
+        let buf = s.doc_of(buffer_id);
         return Ok(EditResult {
             revision: buf.revision,
             cursor: s
@@ -10907,7 +10682,7 @@ async fn input_join_lines_once(
     // to replace is `[end_of_trailing_ws_on_line_i, first_non_ws_on_line_i+1)` — replaced with
     // a single space. We do them in a single sweep on the rope.
     let s = state.lock().await;
-    let buf = &s.buffers[&buffer_id];
+    let buf = s.doc_of(buffer_id);
 
     // Build the full replacement: concatenate the lines, dropping each continuation's leading
     // whitespace (its indent) — nothing is inserted between them. Join deletes exactly what
@@ -10944,24 +10719,15 @@ async fn input_join_lines_once(
     };
     drop(s);
 
-    let cursors_before: HashMap<ClientId, CursorState> = {
+    let cursors_before = {
         let s = state.lock().await;
-        s.cursors
-            .iter()
-            .filter_map(|((c, b), cs)| {
-                if *b == buffer_id {
-                    Some((*c, *cs))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        document_cursor_snapshot(&s, buffer_id)
     };
 
     let (revision, new_cursor, was_dirty) = {
         let mut s = state.lock().await;
-        let was_dirty = s.buffers[&buffer_id].dirty;
-        let buf = s.buffers.get_mut(&buffer_id).expect("just checked");
+        let was_dirty = s.doc_of(buffer_id).dirty;
+        let buf = s.try_doc_of_mut(buffer_id).expect("just checked");
         let revision = buf.apply_edit(
             first_char,
             last_line_end_char,
@@ -10992,32 +10758,9 @@ async fn input_join_lines_once(
         let mut s = state.lock().await;
         let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
         search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-        let new_line_count = s.buffers[&buffer_id].line_count();
+        let new_line_count = s.doc_of(buffer_id).line_count();
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
-        let buf = &s.buffers[&buffer_id];
-        let mut pushes = Vec::new();
-        for vp in s.viewports.values() {
-            if vp.buffer_id != buffer_id {
-                continue;
-            }
-            let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-                continue;
-            };
-            let search = s.searches.get(&(vp.client_id, buffer_id));
-            pushes.push((
-                sender,
-                build_lines_changed_notif(
-                    buf,
-                    vp,
-                    revision,
-                    search,
-                    buffer_both_hunks(&s, buffer_id),
-                    buffer_diagnostics(&s, buffer_id),
-                    buffer_git_status(&s, buffer_id),
-                    lines_changed_cursor(&s, vp),
-                ),
-            ));
-        }
+        let pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         // LSP: full-document sync.
         notify_lsp_change(&mut s, buffer_id);
@@ -11047,6 +10790,23 @@ enum UndoDirection {
     Redo,
 }
 
+/// Snapshot every `(client, buffer)` cursor across all buffers attached to `buffer_id`'s document.
+/// This is what an undo entry stores — keyed by buffer, not just client, so undo can restore
+/// cursors on sibling buffers (the same document open in another workspace) too.
+fn document_cursor_snapshot(
+    s: &ServerState,
+    buffer_id: BufferId,
+) -> HashMap<(ClientId, BufferId), CursorState> {
+    let doc_id = s.buffers[&buffer_id].document;
+    let attached: std::collections::HashSet<BufferId> =
+        s.buffers_of_document(doc_id).into_iter().collect();
+    s.cursors
+        .iter()
+        .filter(|((_, b), _)| attached.contains(b))
+        .map(|(k, cs)| (*k, *cs))
+        .collect()
+}
+
 async fn apply_undo_or_redo(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -11058,23 +10818,12 @@ async fn apply_undo_or_redo(
     let mut s = state.lock().await;
 
     // Snapshot current cursors so the *other* direction's stack can restore them later.
-    let current_cursors: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, b), cs)| {
-            if *b == buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let current_cursors = document_cursor_snapshot(&s, buffer_id);
 
-    let was_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
+    let was_dirty = s.try_doc_of(buffer_id).map(|b| b.dirty).unwrap_or(false);
     let outcome = {
         let buf = s
-            .buffers
-            .get_mut(&buffer_id)
+            .try_doc_of_mut(buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
         match direction {
             UndoDirection::Undo => buf.undo(current_cursors),
@@ -11084,7 +10833,7 @@ async fn apply_undo_or_redo(
 
     let Some(outcome) = outcome else {
         // Nothing to undo/redo. Echo current cursor and revision back.
-        let buf = s.buffers.get(&buffer_id).expect("just checked");
+        let buf = s.try_doc_of(buffer_id).expect("just checked");
         let cursor = s
             .cursors
             .get(&(client_id, buffer_id))
@@ -11097,24 +10846,30 @@ async fn apply_undo_or_redo(
         });
     };
 
-    let buf = s.buffers.get(&buffer_id).expect("just modified");
+    let buf = s.try_doc_of(buffer_id).expect("just modified");
     let revision = buf.revision;
 
-    // Restore cursors from the snapshot, clamped to valid positions in the restored rope.
-    let mut new_cursors: HashMap<ClientId, CursorState> = HashMap::new();
-    for (cid, cursor) in &outcome.restored_cursors {
-        new_cursors.insert(*cid, clamp_cursor(buf, *cursor));
+    // Restore cursors from the snapshot, clamped to valid positions in the restored rope. Keys
+    // span every buffer attached to the document — sibling buffers' cursors restore too.
+    let mut new_cursors: HashMap<(ClientId, BufferId), CursorState> = HashMap::new();
+    for (key, cursor) in &outcome.restored_cursors {
+        new_cursors.insert(*key, clamp_cursor(buf, *cursor));
     }
-    // Clients with cursors on this buffer that weren't in the snapshot: just clamp their current
-    // cursor to the new buffer bounds.
-    let existing_cursor_ids: Vec<ClientId> = s
+    // Cursors on the document's buffers that weren't in the snapshot: just clamp their current
+    // position to the new buffer bounds.
+    let attached: std::collections::HashSet<BufferId> = s
+        .buffers_of_document(s.buffers[&buffer_id].document)
+        .into_iter()
+        .collect();
+    let existing_keys: Vec<(ClientId, BufferId)> = s
         .cursors
         .keys()
-        .filter_map(|(c, b)| if *b == buffer_id { Some(*c) } else { None })
+        .filter(|(_, b)| attached.contains(b))
+        .copied()
         .collect();
-    for cid in existing_cursor_ids {
-        if let std::collections::hash_map::Entry::Vacant(e) = new_cursors.entry(cid) {
-            if let Some(cursor) = s.cursors.get(&(cid, buffer_id)).copied() {
+    for key in existing_keys {
+        if let std::collections::hash_map::Entry::Vacant(e) = new_cursors.entry(key) {
+            if let Some(cursor) = s.cursors.get(&key).copied() {
                 e.insert(clamp_cursor(buf, cursor));
             }
         }
@@ -11123,18 +10878,18 @@ async fn apply_undo_or_redo(
     // re-select the undone text, breaking the no-selection-in-Insert invariant. Only the requesting
     // client's cursor is collapsed; the flag reflects *its* mode, not other clients'.
     if collapse_selection {
-        if let Some(cursor) = new_cursors.get_mut(&client_id) {
+        if let Some(cursor) = new_cursors.get_mut(&(client_id, buffer_id)) {
             cursor.anchor = cursor.position;
         }
     }
-    for (cid, cursor) in &new_cursors {
-        s.cursors.insert((*cid, buffer_id), *cursor);
+    for (key, cursor) in &new_cursors {
+        s.cursors.insert(*key, *cursor);
     }
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
     let undoing_cursor = new_cursors
-        .get(&client_id)
+        .get(&(client_id, buffer_id))
         .copied()
         .unwrap_or_else(CursorState::default);
 
@@ -11142,34 +10897,12 @@ async fn apply_undo_or_redo(
     // wholesale, so we can't be surgical about it.
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        pushes.push((
-            sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, buffer_id),
-                buffer_diagnostics(&s, buffer_id),
-                buffer_git_status(&s, buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
-        ));
-    }
+    let pushes: PendingPushes =
+        collect_doc_lines_changed_pushes(&s, buffer_id, revision);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
@@ -11191,7 +10924,7 @@ async fn apply_undo_or_redo(
     })
 }
 
-fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
+fn clamp_cursor(buf: &Document, cursor: CursorState) -> CursorState {
     let position = motion::clamp_position(buf, cursor.position);
     let anchor = motion::clamp_position(buf, cursor.anchor);
     CursorState {
@@ -11206,7 +10939,7 @@ fn clamp_cursor(buf: &Buffer, cursor: CursorState) -> CursorState {
 /// pair (if any) at the cursor's position and stamps it onto the state. `match_bracket` is
 /// never stored in `state.cursors`; it's purely a derived per-response field that drives the
 /// client's match-bracket highlight overlay.
-fn with_match_bracket(buf: &Buffer, mut cursor: CursorState) -> CursorState {
+fn with_match_bracket(buf: &Document, mut cursor: CursorState) -> CursorState {
     let Some(syntax) = buf.syntax.as_ref() else {
         return cursor;
     };
@@ -11240,7 +10973,7 @@ fn with_jumplist_position(
     if list.entries.is_empty() {
         return cursor;
     }
-    let Some(buf) = s.buffers.get(&buffer_id) else {
+    let Some(buf) = s.try_doc_of(buffer_id) else {
         return cursor;
     };
     let Some(current_abs) = buf
@@ -11285,8 +11018,7 @@ fn wrap_for_response(
     cursor: CursorState,
 ) -> CursorState {
     let with_brackets = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .map(|buf| with_match_bracket(buf, cursor))
         .unwrap_or(cursor);
     with_jumplist_position(s, client_id, buffer_id, with_brackets)
@@ -11413,8 +11145,7 @@ async fn apply_edit_reporting(
     let mut s = state.lock().await;
 
     let buf = s
-        .buffers
-        .get(&buffer_id)
+        .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let cursor = s
         .cursors
@@ -11836,20 +11567,10 @@ async fn apply_edit_reporting(
     };
 
     // Snapshot all per-client cursors on this buffer so the undo entry can restore them.
-    let cursors_before: HashMap<ClientId, CursorState> = s
-        .cursors
-        .iter()
-        .filter_map(|((c, b), cs)| {
-            if *b == buffer_id {
-                Some((*c, *cs))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
     // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
-    let buf_mut = s.buffers.get_mut(&buffer_id).expect("just checked");
+    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
     let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(start_char, end_char, &insert_text, kind_tag, cursors_before);
 
@@ -11914,47 +11635,14 @@ async fn apply_edit_reporting(
 
     // Recompute every viewport's pushed range against the new line count, so a mutation that
     // *grew* the buffer (e.g. typing a newline) extends the window to cover the new lines.
-    let new_line_count = s.buffers[&buffer_id].line_count();
+    let new_line_count = s.doc_of(buffer_id).line_count();
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
 
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
     let edit_last_excl = old_last_line.saturating_add(1);
-    let buf_ref = &s.buffers[&buffer_id];
-    let mut pushes: PendingPushes = Vec::new();
-    for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
-            continue;
-        }
-        if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
-                edit_first,
-                edit_last_excl,
-            )
-        {
-            // Out-of-window edit: nothing to render for this viewport, but a whole-document
-            // consumer still needs the change signal (docs/markdown-view.md §3).
-            push_buffer_changed(&s, vp, buffer_id, revision, &mut pushes);
-            continue;
-        }
-        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
-            continue;
-        };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(
-            buf_ref,
-            vp,
-            revision,
-            search,
-            buffer_both_hunks(&s, buffer_id),
-            buffer_diagnostics(&s, buffer_id),
-            buffer_git_status(&s, buffer_id),
-            lines_changed_cursor(&s, vp),
-        );
-        pushes.push((sender, notif));
-    }
+    let pushes: PendingPushes =
+        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
     // Re-push any open Buffers pickers only when the dirty flag flipped (typically the first
     // edit after a save). The picker row renders dirty + display only, so per-keystroke edits
@@ -12065,9 +11753,120 @@ fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
     Some(wrap_for_response(s, vp.client_id, vp.buffer_id, cursor))
 }
 
+/// Full-window `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
+/// document — the post-mutation broadcast for whole-document changes (undo/redo, format, revert,
+/// reload), where the rope was swapped wholesale. Decorations (search, hunks, diagnostics, git
+/// status) resolve per *viewport's* buffer, so each workspace's view renders its own overlays
+/// over the shared content.
+/// Range-gated `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
+/// document, after an in-place edit touching logical lines `[edit_first, edit_last_excl)`. A
+/// viewport whose pushed range misses the edit gets a revision-only `buffer/changed` instead —
+/// whole-document consumers still need the change signal (docs/markdown-view.md §3). Decorations
+/// resolve per *viewport's* buffer, so each workspace's view renders its own overlays.
+fn collect_doc_edit_pushes(
+    s: &ServerState,
+    buffer_id: BufferId,
+    revision: Revision,
+    edit_first: u32,
+    edit_last_excl: u32,
+) -> PendingPushes {
+    let mut pushes: PendingPushes = Vec::new();
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return pushes;
+    };
+    let attached = s.doc_siblings(buffer_id);
+    for vp in s.viewports.values() {
+        if !attached.contains(&vp.buffer_id) {
+            continue;
+        }
+        if !vp.diff_view
+            && !ranges_overlap(
+                vp.first_logical_line,
+                vp.last_logical_line_exclusive,
+                edit_first,
+                edit_last_excl,
+            )
+        {
+            push_buffer_changed(s, vp, vp.buffer_id, revision, &mut pushes);
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        let search = s.searches.get(&(vp.client_id, vp.buffer_id));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(
+                doc,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(s, vp.buffer_id),
+                buffer_diagnostics(s, vp.buffer_id),
+                buffer_git_status(s, vp.buffer_id),
+                lines_changed_cursor(s, vp),
+            ),
+        ));
+    }
+    pushes
+}
+
+/// Clamp every cursor on any buffer of `buffer_id`'s document into the current rope — the
+/// post-whole-document-replacement fixup (format, revert, reload, undo/redo fallback).
+fn clamp_doc_cursors(s: &mut ServerState, buffer_id: BufferId) {
+    let attached = s.doc_siblings(buffer_id);
+    let keys: Vec<(ClientId, BufferId)> = s
+        .cursors
+        .keys()
+        .filter(|(_, b)| attached.contains(b))
+        .copied()
+        .collect();
+    for key in keys {
+        if let Some(cur) = s.cursors.get(&key).copied() {
+            let clamped = clamp_cursor(s.doc_of(key.1), cur);
+            s.cursors.insert(key, clamped);
+        }
+    }
+}
+
+fn collect_doc_lines_changed_pushes(
+    s: &ServerState,
+    buffer_id: BufferId,
+    revision: Revision,
+) -> PendingPushes {
+    let mut pushes: PendingPushes = Vec::new();
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return pushes;
+    };
+    let attached = s.doc_siblings(buffer_id);
+    for vp in s.viewports.values() {
+        if !attached.contains(&vp.buffer_id) {
+            continue;
+        }
+        let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        let search = s.searches.get(&(vp.client_id, vp.buffer_id));
+        pushes.push((
+            sender,
+            build_lines_changed_notif(
+                doc,
+                vp,
+                revision,
+                search,
+                buffer_both_hunks(s, vp.buffer_id),
+                buffer_diagnostics(s, vp.buffer_id),
+                buffer_git_status(s, vp.buffer_id),
+                lines_changed_cursor(s, vp),
+            ),
+        ));
+    }
+    pushes
+}
+
 #[allow(clippy::too_many_arguments)] // one notification builder, 12 call sites
 fn build_lines_changed_notif(
-    buffer: &Buffer,
+    buffer: &Document,
     vp: &Viewport,
     revision: Revision,
     search: Option<&SearchEntry>,
@@ -12148,10 +11947,10 @@ fn build_buffer_candidates(
         if !belongs(&id) {
             continue;
         }
-        let Some(buf) = s.buffers.get(&id) else {
+        let (Some(buf), Some(doc)) = (s.buffers.get(&id), s.try_doc_of(id)) else {
             continue;
         };
-        out.push(buffer_candidate(buf, &roots));
+        out.push(buffer_candidate(buf, doc, &roots));
         seen.insert(id);
     }
     // Append any workspace buffers not in the MRU yet so the picker still surfaces them. Stable
@@ -12164,7 +11963,7 @@ fn build_buffer_candidates(
         .collect();
     leftovers.sort_unstable();
     for id in leftovers {
-        out.push(buffer_candidate(&s.buffers[&id], &roots));
+        out.push(buffer_candidate(&s.buffers[&id], s.doc_of(id), &roots));
     }
     // Dormant buffers (restored from the session, not yet loaded) come last — but only
     // those whose file isn't already open as a live buffer above (a stale dormant entry that was
@@ -12173,7 +11972,7 @@ fn build_buffer_candidates(
         .buffers
         .iter()
         .filter(|(id, _)| belongs(id))
-        .filter_map(|(_, b)| b.canonical_path.as_deref())
+        .filter_map(|(_, b)| s.documents.get(&b.document)?.canonical_path.as_deref())
         .collect();
     for d in &workspace.dormant_buffers {
         // A dormant *file* whose path is already open as a live buffer shouldn't double-show; a
@@ -12219,8 +12018,12 @@ fn dormant_candidate(
     }
 }
 
-fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state::BufferCandidate {
-    let display = match buf.canonical_path.as_deref() {
+fn buffer_candidate(
+    buf: &Buffer,
+    doc: &Document,
+    roots: &[std::path::PathBuf],
+) -> picker_state::BufferCandidate {
+    let display = match doc.canonical_path.as_deref() {
         Some(p) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
         None => format!(
@@ -12230,14 +12033,14 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
     };
     // The (root index, relative path) the client needs for an opener URL — `None` for scratch
     // buffers and files outside every root (display still falls back to the absolute path above).
-    let path = buf
+    let path = doc
         .canonical_path
         .as_deref()
         .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
     picker_state::BufferCandidate {
         buffer_id: buf.id,
         display,
-        status: buffer_dirty_state(buf),
+        status: buffer_dirty_state(doc),
         path,
         transient: buf.transient,
     }
@@ -12246,7 +12049,7 @@ fn buffer_candidate(buf: &Buffer, roots: &[std::path::PathBuf]) -> picker_state:
 /// Map a buffer's save/disk flags to the picker's [`BufferDirtyState`], highest precedence first:
 /// removed on disk → changed on disk → unsaved local edits → clean. Mirrors the editor status
 /// bar's dot so the picker and the status line always agree.
-fn buffer_dirty_state(buf: &Buffer) -> BufferDirtyState {
+fn buffer_dirty_state(buf: &Document) -> BufferDirtyState {
     if buf.externally_deleted {
         BufferDirtyState::ExternallyDeleted
     } else if buf.externally_modified {
@@ -12476,7 +12279,7 @@ pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
 /// mutation value and decides. No-op (no allocation, no rerank) when dirty didn't change —
 /// the typical hot path during a typing burst.
 fn maybe_refresh_dirty(s: &mut ServerState, buffer_id: BufferId, was_dirty: bool) -> PendingPushes {
-    let now_dirty = s.buffers.get(&buffer_id).map(|b| b.dirty).unwrap_or(false);
+    let now_dirty = s.try_doc_of(buffer_id).map(|b| b.dirty).unwrap_or(false);
     if now_dirty == was_dirty {
         Vec::new()
     } else {
@@ -13239,6 +13042,7 @@ pub async fn picker_view(
                     .buffers
                     .iter()
                     .filter_map(|(id, b)| {
+                        let b = s.documents.get(&b.document)?;
                         let abs = b.canonical_path.as_deref()?;
                         let (path_index, relative_path) =
                             crate::workspace_index::workspace_relative_parts(abs, &roots)?;
@@ -13285,8 +13089,7 @@ pub async fn picker_view(
                 Some(buffer_id) => {
                     let s = state.lock().await;
                     let roots = s.active_workspace_or_err(client_id)?.paths.clone();
-                    s.buffers
-                        .get(&buffer_id)
+                    s.try_doc_of(buffer_id)
                         .and_then(|b| {
                             let abs = b.canonical_path.as_deref()?;
                             let (path_index, relative_path) =
@@ -13371,11 +13174,10 @@ pub async fn picker_view(
                     cursor.position
                 };
                 let current_abs = s
-                    .buffers
-                    .get(&buffer_id)
+                    .try_doc_of(buffer_id)
                     .and_then(|b| b.canonical_path.as_deref())
                     .map(|p| p.to_string_lossy().into_owned());
-                let current_key = s.buffers.get(&buffer_id).and_then(|b| {
+                let current_key = s.try_doc_of(buffer_id).and_then(|b| {
                     let workspace = s.active_workspace(client_id)?;
                     b.canonical_path.as_deref().and_then(|p| {
                         crate::workspace_index::workspace_relative_parts(
@@ -13399,7 +13201,7 @@ pub async fn picker_view(
     let grep_selection_query: Option<String> =
         match (params.from_selection, params.kind, params.buffer_id) {
             (true, PickerKind::Grep, Some(buffer_id)) => {
-                s.buffers.get(&buffer_id).and_then(|buf| {
+                s.try_doc_of(buffer_id).and_then(|buf| {
                     let cursor = s
                         .cursors
                         .get(&(client_id, buffer_id))
@@ -14222,8 +14024,7 @@ pub async fn jumplist_step(
     let (mut target, open_params) = {
         let s = state.lock().await;
         let buffer = s
-            .buffers
-            .get(&params.buffer_id)
+            .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let Some(list) = s.jumplist.get(&client_id) else {
             return Ok(JumplistStepResult::Empty);
@@ -14386,10 +14187,10 @@ mod document_highlight_tests {
     use crate::lsp::position::PositionEncoding;
     use aether_protocol::LogicalPosition;
 
-    fn buf_with(text: &str) -> Buffer {
-        let mut buf = Buffer::scratch(1, None, 1);
-        buf.text = ropey::Rope::from_str(text);
-        buf
+    fn buf_with(text: &str) -> Document {
+        let mut doc = Document::scratch(DocumentId(1), None);
+        doc.text = ropey::Rope::from_str(text);
+        doc
     }
 
     fn pos(line: u32, col: u32) -> LogicalPosition {
@@ -14615,7 +14416,7 @@ mod restore_tests {
         let deleted_with_backup = root.join("gone_kept.rs");
         let deleted_no_backup = root.join("gone_dropped.rs");
         crate::backup::write(
-            &crate::backup::file_backup_path(&backups, "p", &deleted_with_backup),
+            &crate::backup::file_backup_path(&backups, &deleted_with_backup),
             "unsaved\n",
         )
         .unwrap();
@@ -14735,9 +14536,9 @@ mod next_buffer_tests {
 
         // A live buffer still wins over the dormant fallback.
         let live = st.allocate_buffer_id();
-        let mut buf = Buffer::scratch(live, None, 1);
-        buf.canonical_path = Some(std::path::PathBuf::from("/p/live.rs"));
-        st.buffers.insert(live, buf);
+        st.insert_buffer_with_document(live, None, false, |d| {
+            Document::new_at_path(d, std::path::PathBuf::from("/p/live.rs"), None)
+        });
         st.buffer_workspaces.insert(live, "p".to_string());
         st.touch_mru(live);
         assert_eq!(next_buffer_for_client(&st, client_id), Some(live));
@@ -14970,9 +14771,9 @@ mod subscribe_snapshot_tests {
         // a.rs is open with a diagnostic in the BUFFER-keyed set (line 42). The workspace picker is a
         // separate lens — it must ignore that set entirely and read only `path_diagnostics`.
         let buffer_id = st.allocate_buffer_id();
-        let mut buf = Buffer::scratch(buffer_id, None, 1);
-        buf.canonical_path = Some(root.join("src/a.rs"));
-        st.buffers.insert(buffer_id, buf);
+        st.insert_buffer_with_document(buffer_id, None, false, |d| {
+            Document::new_at_path(d, root.join("src/a.rs"), None)
+        });
         st.diagnostics
             .insert(buffer_id, vec![diag(42, DiagnosticSeverity::Error)]);
 
@@ -15100,11 +14901,13 @@ mod subscribe_snapshot_tests {
     ) -> (SharedState, ClientId, BufferId) {
         let mut st = ServerState::new();
         let buffer_id = st.allocate_buffer_id();
-        let mut buf = Buffer::scratch(buffer_id, None, 1);
-        buf.text = ropey::Rope::from_str("alpha\nbeta\n");
-        buf.externally_modified = externally_modified;
-        buf.externally_deleted = externally_deleted;
-        st.buffers.insert(buffer_id, buf);
+        st.insert_buffer_with_document(buffer_id, Some(1), false, |d| {
+            let mut doc = Document::scratch(d, None);
+            doc.text = ropey::Rope::from_str("alpha\nbeta\n");
+            doc.externally_modified = externally_modified;
+            doc.externally_deleted = externally_deleted;
+            doc
+        });
         if !diags.is_empty() {
             st.diagnostics.insert(buffer_id, diags);
         }

@@ -5,7 +5,7 @@
 //! grapheme-aware revision can come later.
 
 use crate::picker::SymbolCandidate;
-use crate::state::Buffer;
+use crate::state::Document;
 use crate::wrap::{self, RowInfo};
 use aether_protocol::cursor::{
     Direction, Granularity, Motion, SelectionEdge, VerticalDirection, WordBoundary,
@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthChar;
 
 /// Convert a (line, byte-col) position to an absolute char index in the rope. Clamped to valid
 /// positions in the buffer.
-pub fn pos_to_char(buf: &Buffer, pos: LogicalPosition) -> usize {
+pub fn pos_to_char(buf: &Document, pos: LogicalPosition) -> usize {
     let line_count = buf.text.len_lines().max(1);
     let line_idx = (pos.line as usize).min(line_count - 1);
     let line_start_char = buf.text.line_to_char(line_idx);
@@ -27,7 +27,7 @@ pub fn pos_to_char(buf: &Buffer, pos: LogicalPosition) -> usize {
 }
 
 /// Convert an absolute char index back to a (line, byte-col) position.
-pub fn char_to_pos(buf: &Buffer, char_idx: usize) -> LogicalPosition {
+pub fn char_to_pos(buf: &Document, char_idx: usize) -> LogicalPosition {
     let total = buf.text.len_chars();
     let char_idx = char_idx.min(total);
     let line_idx = buf.text.char_to_line(char_idx);
@@ -41,7 +41,7 @@ pub fn char_to_pos(buf: &Buffer, char_idx: usize) -> LogicalPosition {
     }
 }
 
-pub fn line_byte_len_excl_newline(buf: &Buffer, line_idx: u32) -> u32 {
+pub fn line_byte_len_excl_newline(buf: &Document, line_idx: u32) -> u32 {
     let slice = buf.text.line(line_idx as usize);
     line_byte_len_excl_newline_slice(slice)
 }
@@ -59,7 +59,7 @@ fn line_byte_len_excl_newline_slice(slice: ropey::RopeSlice<'_>) -> u32 {
 /// For a non-empty visible line this is the start byte of the last visible char (so the cursor
 /// "block" covers that char rather than the newline). For an empty line — only a newline, or
 /// the final line with no trailing newline and zero visible content — returns 0.
-pub fn line_last_char_byte_idx(buf: &Buffer, line_idx: u32) -> u32 {
+pub fn line_last_char_byte_idx(buf: &Document, line_idx: u32) -> u32 {
     let slice = buf.text.line(line_idx as usize);
     let len_excl_nl = line_byte_len_excl_newline_slice(slice) as usize;
     if len_excl_nl == 0 {
@@ -77,7 +77,7 @@ pub fn line_last_char_byte_idx(buf: &Buffer, line_idx: u32) -> u32 {
 
 /// Byte offset of the first non-blank (not space/tab) char on the line. The trailing newline
 /// stops the scan, so an all-blank line yields its line-end position and an empty line yields 0.
-fn first_nonblank_col(buf: &Buffer, line_idx: u32) -> u32 {
+fn first_nonblank_col(buf: &Document, line_idx: u32) -> u32 {
     let slice = buf.text.line(line_idx as usize);
     let mut byte_offset = 0usize;
     for c in slice.chars() {
@@ -89,7 +89,7 @@ fn first_nonblank_col(buf: &Buffer, line_idx: u32) -> u32 {
     byte_offset as u32
 }
 
-pub fn clamp_position(buf: &Buffer, pos: LogicalPosition) -> LogicalPosition {
+pub fn clamp_position(buf: &Document, pos: LogicalPosition) -> LogicalPosition {
     let line_count = buf.text.len_lines() as u32;
     let line = pos.line.min(line_count.saturating_sub(1));
     let col = pos.col.min(line_byte_len_excl_newline(buf, line));
@@ -108,7 +108,7 @@ pub fn ordered(a: LogicalPosition, b: LogicalPosition) -> (LogicalPosition, Logi
 /// of the motions this reads the whole selection, so it gets its own resolver taking both
 /// endpoints (`resolve_motion` only sees the cursor position).
 pub fn resolve_selection_edge(
-    buf: &Buffer,
+    buf: &Document,
     position: LogicalPosition,
     anchor: LogicalPosition,
     edge: SelectionEdge,
@@ -136,7 +136,7 @@ pub fn resolve_selection_edge(
     }
 }
 
-pub fn resolve_motion(buf: &Buffer, current: LogicalPosition, motion: &Motion) -> LogicalPosition {
+pub fn resolve_motion(buf: &Document, current: LogicalPosition, motion: &Motion) -> LogicalPosition {
     match motion {
         Motion::Char { direction, count } => {
             let cur_char = pos_to_char(buf, current);
@@ -353,7 +353,7 @@ fn find_char(
 /// visual column used by this call — the caller should stash it so repeated vertical motions
 /// don't drift across rows with different prefix widths (continuation marker + indent).
 pub fn resolve_visual_line(
-    buf: &Buffer,
+    buf: &Document,
     geom: wrap::WrapGeometry,
     current: LogicalPosition,
     virtual_col_in: Option<u32>,
@@ -470,7 +470,7 @@ pub fn resolve_visual_line(
 
 /// Resolve VisualLineStart: cursor to the first byte of its current visual row.
 pub fn resolve_visual_line_start(
-    buf: &Buffer,
+    buf: &Document,
     geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> LogicalPosition {
@@ -484,7 +484,7 @@ pub fn resolve_visual_line_start(
 
 /// Resolve VisualLineEnd: cursor to the last byte of its current visual row.
 pub fn resolve_visual_line_end(
-    buf: &Buffer,
+    buf: &Document,
     geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> LogicalPosition {
@@ -499,7 +499,7 @@ pub fn resolve_visual_line_end(
 }
 
 fn wrap_rows_for_cursor(
-    buf: &Buffer,
+    buf: &Document,
     geom: wrap::WrapGeometry,
     current: LogicalPosition,
 ) -> Vec<RowInfo> {
@@ -530,7 +530,7 @@ fn wrap_rows_for_cursor(
     }
 }
 
-fn line_text(buf: &Buffer, line_idx: u32) -> String {
+fn line_text(buf: &Document, line_idx: u32) -> String {
     let line = buf.text.line(line_idx as usize);
     let mut text: String = line.chunks().collect();
     if text.ends_with('\n') {
@@ -620,7 +620,7 @@ fn row_prefix_width(row: &RowInfo, marker_width: u32) -> u32 {
 /// `resolve_visual_line`) so that vertical hops over short or empty lines remember the cursor's
 /// original column. Multi-byte chars and double-wide chars are honoured.
 pub fn resolve_logical_line(
-    buf: &Buffer,
+    buf: &Document,
     current: LogicalPosition,
     virtual_col_in: Option<u32>,
     direction: Direction,
@@ -819,7 +819,7 @@ fn word_run_bounds(rope: &ropey::Rope, i: usize, boundary: WordBoundary) -> (usi
 /// double-click selects. Runs follow `WordBoundary::Word` categories (word chars / symbols /
 /// whitespace), except a newline never joins a run: clicking at end-of-line selects just the
 /// line-end position rather than a whitespace run spilling into the next line's indentation.
-pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, LogicalPosition) {
+pub fn word_run(buf: &Document, pos: LogicalPosition) -> (LogicalPosition, LogicalPosition) {
     let (start, end) = word_run_bounds(&buf.text, pos_to_char(buf, pos), WordBoundary::Word);
     (char_to_pos(buf, start), char_to_pos(buf, end))
 }
@@ -843,7 +843,7 @@ pub fn word_run(buf: &Buffer, pos: LogicalPosition) -> (LogicalPosition, Logical
 /// On advance, a hop moves the anchor to the next word's start; a grow leaves it. When there is no
 /// next word the selection stays put (a stable end state rather than a destructive no-op).
 pub fn resolve_select_word(
-    buf: &Buffer,
+    buf: &Document,
     position: LogicalPosition,
     anchor: LogicalPosition,
     boundary: WordBoundary,
@@ -883,7 +883,7 @@ pub fn resolve_select_word(
 /// `Line` produces the whole-line normal form (`col 0` … `line_end`) over the spanned lines. For
 /// a point selection the result is forward-oriented. Inputs must already be clamped.
 pub fn snap_selection(
-    buf: &Buffer,
+    buf: &Document,
     position: LogicalPosition,
     anchor: LogicalPosition,
     granularity: Granularity,
@@ -925,7 +925,7 @@ pub fn snap_selection(
 /// edge motions return `None` for the anchor (the handler keeps the existing one, i.e. extends).
 /// `symbols` is the buffer's cached outline; empty (still loading / no server) makes it a no-op.
 pub fn resolve_navigation_motion(
-    buf: &Buffer,
+    buf: &Document,
     symbols: &[SymbolCandidate],
     position: LogicalPosition,
     anchor: LogicalPosition,
@@ -1035,7 +1035,7 @@ fn enclosing_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option
 /// fall through to the next/previous symbol in the list, so repeated `Shift-o` grows the selection
 /// symbol by symbol.
 fn symbol_edge(
-    buf: &Buffer,
+    buf: &Document,
     symbols: &[SymbolCandidate],
     pos: LogicalPosition,
     to_end: bool,
@@ -1065,7 +1065,7 @@ fn symbol_edge(
 
 /// A symbol's last char: its `range_end` (an exclusive end position) stepped back one char,
 /// clamped so it never precedes the symbol's start.
-fn symbol_last_char(buf: &Buffer, sym: &SymbolCandidate) -> LogicalPosition {
+fn symbol_last_char(buf: &Document, sym: &SymbolCandidate) -> LogicalPosition {
     let start = pos_to_char(buf, sym.range_start);
     let end = pos_to_char(buf, sym.range_end);
     char_to_pos(buf, end.saturating_sub(1).max(start))
@@ -1166,7 +1166,7 @@ mod symbol_nav_tests {
     #[test]
     fn next_and_prev_select_the_identifier() {
         let o = outline();
-        let buf = Buffer::scratch(1, None, 1); // Next/Prev don't touch the buffer
+        let buf = Document::scratch(crate::state::DocumentId(1), None); // Next/Prev don't touch the buffer
         let next = |pos, anchor| {
             resolve_navigation_motion(
                 &buf,
@@ -1206,7 +1206,7 @@ mod symbol_nav_tests {
     #[test]
     fn next_and_prev_honour_count() {
         let o = outline();
-        let buf = Buffer::scratch(1, None, 1);
+        let buf = Document::scratch(crate::state::DocumentId(1), None);
         let nav = |count, forward| {
             let motion = if forward {
                 Motion::NextNavigationUnit { count }
@@ -1230,7 +1230,7 @@ mod symbol_nav_tests {
     #[test]
     fn extend_grows_the_selection_to_include_the_identifier() {
         let o = outline();
-        let buf = Buffer::scratch(1, None, 1);
+        let buf = Document::scratch(crate::state::DocumentId(1), None);
         let ext = |pos, anchor, count, forward| {
             let motion = if forward {
                 Motion::NextNavigationUnit { count }

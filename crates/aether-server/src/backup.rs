@@ -1,10 +1,14 @@
 //! On-disk backups of unsaved buffer contents (the hot-exit mechanism — see
 //! `docs/unsaved-persistence.md`).
 //!
-//! A backup file is *exactly* the buffer's text (LF-normalised, our internal form) — no header, no
-//! sidecar metadata. Identity is encoded in the path: file backups live under `<workspace>/files/`
-//! keyed by a hash of the canonical path; scratch backups under `<workspace>/scratch/` keyed by the
-//! per-workspace number. The `files/` vs `scratch/` split is the file-vs-scratch discriminant.
+//! A backup file is *exactly* the document's text (LF-normalised, our internal form) — no header,
+//! no sidecar metadata. Identity is encoded in the path. **File backups are document-level**:
+//! `files/<hash(canonical)>`, one per dirty document, with no workspace in the key — a document
+//! shared by several workspaces has exactly one backup, and recover-on-open finds it no matter
+//! which workspace opens the path first. **Scratch backups stay per-workspace**:
+//! `scratch/<workspace>/<number>` — a scratch's number *is* per-workspace identity and a scratch
+//! document is never shared. The two fixed top-level names also mean a workspace named "files"
+//! can't collide with the shared directory.
 //!
 //! External-change detection leans on the backup file's own mtime rather than a stored timestamp:
 //! see [`read`] and `docs/unsaved-persistence.md`.
@@ -12,55 +16,38 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-/// Backup path for a file-backed buffer: `<root>/<workspace>/files/<hash(canonical)>`. The hash is
+/// Backup path for a file-backed document: `<root>/files/<hash(canonical)>`. Workspace-agnostic —
+/// the unsaved content belongs to the document, not to any workspace viewing it. The hash is
 /// one-way (we never reverse it — the path comes from the open request or the session entry); a
 /// 64-bit key is ample at personal scale and collisions only ever cost a single buffer's recovery.
-pub fn file_backup_path(root: &Path, workspace: &str, canonical: &Path) -> PathBuf {
-    root.join(workspace).join("files").join(path_key(canonical))
+pub fn file_backup_path(root: &Path, canonical: &Path) -> PathBuf {
+    root.join("files").join(path_key(canonical))
 }
 
-/// Backup path for a scratch buffer: `<root>/<workspace>/scratch/<number>`. The number is the
+/// Backup path for a scratch buffer: `<root>/scratch/<workspace>/<number>`. The number is the
 /// scratch's stable per-workspace identity for the duration it holds unsaved content.
 pub fn scratch_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf {
-    root.join(workspace)
-        .join("scratch")
+    root.join("scratch")
+        .join(workspace)
         .join(number.to_string())
 }
 
-/// The backup keys a workspace currently holds on disk: the file-path hashes under `files/` and the
-/// numbers under `scratch/`. Each one is a buffer with unsaved content, whether or not that buffer
-/// is loaded — which is what lets the switcher flag unsaved work in a workspace nobody has activated
-/// yet (`ServerState::unsaved_buffer_count`). Empty (not an error) when the workspace has no backup
-/// directory, the usual case.
-pub fn workspace_keys(root: &Path, workspace: &str) -> WorkspaceBackupKeys {
-    let entries = |dir: PathBuf| -> Vec<String> {
-        std::fs::read_dir(dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                    // Skip a flush's in-flight temp file (`write` renames it into place).
-                    .filter(|name| !name.starts_with(".tmp-"))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let workspace_root = root.join(workspace);
-    WorkspaceBackupKeys {
-        files: entries(workspace_root.join("files")).into_iter().collect(),
-        scratches: entries(workspace_root.join("scratch"))
-            .iter()
-            .filter_map(|n| n.parse().ok())
-            .collect(),
-    }
-}
-
-/// What [`workspace_keys`] found: one entry per buffer with unsaved content on disk.
-#[derive(Debug, Default)]
-pub struct WorkspaceBackupKeys {
-    /// `path_key` hashes of file-backed buffers (see [`file_backup_path`]).
-    pub files: std::collections::HashSet<String>,
-    /// Scratch numbers (see [`scratch_backup_path`]).
-    pub scratches: std::collections::HashSet<u32>,
+/// The scratch numbers `workspace` currently holds backups for on disk. Each one is a scratch with
+/// unsaved content, whether or not it's loaded — which is what lets the switcher flag unsaved work
+/// in a workspace nobody has activated yet (`ServerState::unsaved_buffer_count`; file backups are
+/// attributed to workspaces through their session entries instead, since the file hash is one-way).
+/// Empty (not an error) when the workspace has no backup directory, the usual case.
+pub fn scratch_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32> {
+    std::fs::read_dir(root.join("scratch").join(workspace))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                // Skip a flush's in-flight temp file (`write` renames it into place).
+                .filter(|name| !name.starts_with(".tmp-"))
+                .filter_map(|n| n.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Deterministic hex key for a canonical path. Uses the std `DefaultHasher` (SipHash with fixed
@@ -134,17 +121,23 @@ mod tests {
     #[test]
     fn file_and_scratch_paths_live_in_distinct_subdirs() {
         let root = Path::new("/state/backups");
-        let f = file_backup_path(root, "work", Path::new("/work/a.rs"));
+        let f = file_backup_path(root, Path::new("/work/a.rs"));
         let s = scratch_backup_path(root, "work", 3);
-        assert!(f.starts_with(root.join("work").join("files")));
-        assert_eq!(s, root.join("work").join("scratch").join("3"));
+        assert!(f.starts_with(root.join("files")));
+        assert_eq!(s, root.join("scratch").join("work").join("3"));
+        // The fixed top-level names mean a workspace literally named "files" can't collide with
+        // the shared file-backup directory: its scratches live under scratch/files/.
+        assert_eq!(
+            scratch_backup_path(root, "files", 1),
+            root.join("scratch").join("files").join("1")
+        );
     }
 
     #[test]
     fn write_read_delete_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         // Nested path exercises the create-parent branch.
-        let path = file_backup_path(dir.path(), "work", Path::new("/work/a.rs"));
+        let path = file_backup_path(dir.path(), Path::new("/work/a.rs"));
         assert!(!exists(&path));
         write(&path, "hello\nworld\n").unwrap();
         assert!(exists(&path));

@@ -36,7 +36,7 @@ pub fn app_info(s: &crate::state::ServerState) -> AppInfo {
         idle_timeout_secs: s.idle_timeout.map(|d| d.as_secs()),
         clients: s.clients.len(),
         buffers_open: s.buffers.len(),
-        buffers_unsaved: s.buffers.values().filter(|b| b.dirty).count(),
+        buffers_unsaved: s.documents.values().filter(|d| d.dirty).count(),
         workspaces_active: s.workspaces.len(),
         paths: paths(),
     }

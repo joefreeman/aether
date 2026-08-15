@@ -354,9 +354,19 @@ async fn handle_event(state: &SharedState, event: Event) {
                 index_should_invalidate = true;
             }
 
-            // Plural: workspaces with overlapping roots can each have their own buffer for this
-            // path, and every one of them needs the reload/flag — not just the first found.
+            // Buffers for one path share one document (workspaces with overlapping roots attach
+            // to the same content), so handle the event once per *document* — the reload/flag
+            // helpers fan their pushes out to every attached buffer's viewers. Dedupe by
+            // document id defensively in case of a not-yet-unified pair.
+            let mut seen_docs: std::collections::HashSet<crate::state::DocumentId> =
+                std::collections::HashSet::new();
             for buf_id in s.buffers_for_path(path) {
+                let Some(doc_id) = s.buffers.get(&buf_id).map(|b| b.document) else {
+                    continue;
+                };
+                if !seen_docs.insert(doc_id) {
+                    continue;
+                }
                 handle_buffer_event(&mut s, buf_id, path, category, &mut pushes);
             }
         }
@@ -458,7 +468,7 @@ fn handle_buffer_event(
 ) {
     match category {
         Category::Remove => {
-            let Some(buf) = s.buffers.get_mut(&buf_id) else {
+            let Some(buf) = s.try_doc_of_mut(buf_id) else {
                 return;
             };
             if buf.externally_deleted {
@@ -477,7 +487,7 @@ fn handle_buffer_event(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64);
 
-            let (recorded_mtime, was_clean, was_deleted) = match s.buffers.get(&buf_id) {
+            let (recorded_mtime, was_clean, was_deleted) = match s.try_doc_of(buf_id) {
                 Some(b) => (b.last_modified_unix_ms, !b.dirty, b.externally_deleted),
                 None => return,
             };
@@ -495,7 +505,7 @@ fn handle_buffer_event(
                     }
                 }
             } else {
-                let Some(buf) = s.buffers.get_mut(&buf_id) else {
+                let Some(buf) = s.try_doc_of_mut(buf_id) else {
                     return;
                 };
                 let modified_changed = !buf.externally_modified;

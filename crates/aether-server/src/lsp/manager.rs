@@ -514,21 +514,21 @@ async fn bring_up(
             if s.lsp.servers[&key].open_buffers.contains(&bid) {
                 continue;
             }
-            let Some(buf) = s.buffers.get(&bid) else {
+            let Some(doc) = s.try_doc_of(bid) else {
                 continue;
             };
-            let Some(path) = buf.canonical_path.as_deref() else {
+            let Some(path) = doc.canonical_path.as_deref() else {
                 continue;
             };
             let doc_uri = uri::path_to_uri(path);
-            let text = buf.text.to_string();
-            let version = buf.revision as i64;
+            let text = doc.text.to_string();
+            let version = doc.revision as i64;
             // The buffer's *own* language, not the key's: keys carry a canonical language shared by
             // a whole spec group (`javascript` and `tsx` key as `typescript`), but `languageId` tells
             // the server how to parse this specific file — announcing a `.js` file as `typescript`
             // would change how tsserver treats it. Fall back to the key only for the (impossible in
             // practice) case of a registered buffer with no detected language.
-            let language_id = buf.language.as_deref().unwrap_or(&key.language);
+            let language_id = doc.language.as_deref().unwrap_or(&key.language);
             if lifecycle::did_open(&client, &doc_uri, language_id, version, &text).is_ok() {
                 s.lsp
                     .servers
@@ -788,7 +788,10 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
         // there's exactly one such buffer per server).
         let owner = key.workspace.as_str();
         let buffer_id = s.buffers.iter().find_map(|(id, b)| {
-            (b.canonical_path.as_deref() == Some(path.as_path())
+            (s.documents
+                .get(&b.document)
+                .and_then(|d| d.canonical_path.as_deref())
+                == Some(path.as_path())
                 && s.buffer_workspaces.get(id).map(String::as_str) == Some(owner))
             .then_some(*id)
         });
@@ -804,8 +807,8 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
                     .map(|h| h.position_encoding)
                     .unwrap_or(PositionEncoding::Utf16);
                 let diags = {
-                    let buf = &s.buffers[&buffer_id];
-                    super::diagnostics::from_lsp(&diags_json, &buf.text, encoding)
+                    let doc = s.doc_of(buffer_id);
+                    super::diagnostics::from_lsp(&diags_json, &doc.text, encoding)
                 };
                 pushes.extend(crate::handlers::set_diagnostics_and_refresh(
                     s, buffer_id, diags,

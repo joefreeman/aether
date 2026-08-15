@@ -174,9 +174,8 @@ async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
     let (parent, roots) = {
         let s = state.lock().await;
         let Some(parent) = s
-            .buffers
-            .get(&buffer_id)
-            .and_then(|b| b.canonical_path.as_ref())
+            .try_doc_of(buffer_id)
+            .and_then(|d| d.canonical_path.as_ref())
             .and_then(|p| p.parent())
             .map(std::path::Path::to_path_buf)
         else {

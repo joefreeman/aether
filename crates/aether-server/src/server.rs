@@ -510,7 +510,7 @@ impl Drop for RuntimeFileGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Buffer, ServerState};
+    use crate::state::{Document, ServerState};
     use std::path::PathBuf;
 
     /// A reapable server with no clients ever connecting shuts itself down once the idle timeout
@@ -541,9 +541,11 @@ mod tests {
         {
             let mut s = state.lock().await;
             let id: aether_protocol::BufferId = 1;
-            let mut buf = Buffer::new_at_path(id, PathBuf::from("/tmp/dirty.txt"), None);
-            buf.dirty = true;
-            s.buffers.insert(id, buf);
+            s.insert_buffer_with_document(id, None, false, |d| {
+                let mut doc = Document::new_at_path(d, PathBuf::from("/tmp/dirty.txt"), None);
+                doc.dirty = true;
+                doc
+            });
         }
         let handle = tokio::spawn(run_with_listener(
             listener,
@@ -567,7 +569,10 @@ mod tests {
     #[tokio::test]
     async fn only_an_unbacked_dirty_buffer_pins_the_server_open() {
         let backups = tempfile::tempdir().unwrap();
-        // One dirty buffer, in a named workspace (backed up) or an ephemeral one (not).
+        // One dirty *scratch*, in a named workspace (backed up) or an ephemeral one (not — its
+        // scratch/<workspace>/<n> backup key dies with the minted context). A dirty *file* would
+        // be protected in both: its backup keys on the path alone and recover-on-open restores
+        // it from any later open, so only the scratch case exercises the unprotected branch.
         let dirty_in = |ephemeral: bool| {
             let mut s = ServerState::new();
             s.backups_path = Some(backups.path().to_path_buf());
@@ -591,9 +596,11 @@ mod tests {
                 "p".to_string()
             };
             let id: aether_protocol::BufferId = 1;
-            let mut buf = Buffer::new_at_path(id, PathBuf::from("/tmp/dirty.txt"), None);
-            buf.dirty = true;
-            s.buffers.insert(id, buf);
+            s.insert_buffer_with_document(id, Some(1), false, |d| {
+                let mut doc = Document::scratch(d, None);
+                doc.dirty = true;
+                doc
+            });
             s.buffer_workspaces.insert(id, workspace);
             Arc::new(Mutex::new(s))
         };

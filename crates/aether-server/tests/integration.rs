@@ -18713,9 +18713,9 @@ async fn connect_and_open_watched(
     (ws, open.buffer_id)
 }
 
-/// Two workspaces sharing one root, one client on each, the same file open in both — two distinct
-/// buffers for one canonical path. The watcher must fan disk events out to both, not just the
-/// first buffer iteration happens to find.
+/// Two workspaces sharing one root, one client on each, the same file open in both — two buffers
+/// over one shared document. Disk events land on the document once, and the fixup fan-out must
+/// reach both workspaces' viewers, not just the buffer the watcher found first.
 async fn setup_overlapping_workspaces_watched_buffer(
     initial: &str,
 ) -> (
@@ -18828,6 +18828,391 @@ async fn save_in_one_workspace_reloads_other_workspaces_buffer() {
     .await;
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-a-hello\n");
 
+    drop(server);
+}
+
+// ---- shared documents across workspaces --------------------------------------------------------
+//
+// The same canonical path open in two workspaces is two buffers over ONE document: one rope, one
+// undo history, one dirty flag. Edits made through either workspace are the other's edits too —
+// no disk round-trip involved.
+
+/// Typing through workspace A's buffer streams straight into workspace B's viewport.
+#[tokio::test]
+async fn edit_in_one_workspace_streams_to_the_other_workspaces_viewport() {
+    let (server, mut ws_a, buf_a, mut ws_b, buf_b, _path) =
+        setup_overlapping_workspaces_watched_buffer("hello\n").await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "shared-".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    // B's viewport gets a live render of the shared post-edit content — no save, no watcher.
+    let push = expect_notification_within::<ViewportLinesChanged>(
+        &mut ws_b,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        push.replacement_lines[0].visual_rows[0].segments[0].text,
+        "shared-hello"
+    );
+    assert_eq!(buffer_text(&mut ws_b, 20, buf_b).await, "shared-hello\n");
+
+    drop(server);
+}
+
+/// The motivating case: open a file that already carries unsaved edits in another workspace, and
+/// the pending changes are simply there — dirty from the first frame.
+#[tokio::test]
+async fn open_in_second_workspace_sees_pending_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watched.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test_multi(vec![
+        ("proj-a".into(), vec![dir_path.clone()]),
+        ("proj-b".into(), vec![dir_path]),
+    ])
+    .await
+    .unwrap();
+
+    // A opens and edits — nothing is saved.
+    let (mut ws_a, buf_a) = connect_and_open_watched(&server.ws_url(), "proj-a").await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "pending-".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    // B opens the same path afterwards: same document, edits visible, dirty.
+    let (mut ws_b, buf_b) = connect_and_open_watched(&server.ws_url(), "proj-b").await;
+    assert_ne!(buf_a, buf_b, "each workspace still has its own buffer id");
+    assert_eq!(buffer_text(&mut ws_b, 20, buf_b).await, "pending-hello\n");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "hello\n",
+        "disk still holds the saved baseline — the shared state is in-memory"
+    );
+
+    drop(server);
+}
+
+/// The tether case: a client with no workspace (`ae file`) opens a path that a named workspace
+/// holds dirty — the ephemeral workspace's buffer attaches to the same document and sees the
+/// pending changes.
+#[tokio::test]
+async fn ephemeral_open_attaches_to_named_workspaces_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watched.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let server = spawn_for_test_multi(vec![("proj-a".into(), vec![dir_path.clone()])])
+        .await
+        .unwrap();
+
+    let (mut ws_a, buf_a) = connect_and_open_watched(&server.ws_url(), "proj-a").await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "pending-".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    // Second client, no workspace/activate: open-from-path lands in an ephemeral context.
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        1,
+        &WorkspaceOpenPathParams {
+            path: path.display().to_string(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert!(aether_protocol::is_ephemeral_workspace_id(
+        &opened.workspace.name
+    ));
+    let open_b = opened.opened.expect("open_path returns the opened buffer");
+    assert_ne!(open_b.buffer_id, buf_a);
+    assert_ne!(
+        open_b.revision, open_b.saved_revision,
+        "the shared document is dirty, so the new attachment opens dirty"
+    );
+    assert_eq!(
+        buffer_text(&mut ws_b, 2, open_b.buffer_id).await,
+        "pending-hello\n"
+    );
+
+    drop(server);
+}
+
+/// One undo history per document: undo through workspace B rewinds the edit workspace A made.
+#[tokio::test]
+async fn undo_from_other_workspace_rewinds_shared_history() {
+    let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
+        setup_overlapping_workspaces_watched_buffer("hello\n").await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "oops-".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let undo: UndoResult = send_request::<EditUndo>(
+        &mut ws_b,
+        11,
+        &UndoRedoParams {
+            buffer_id: buf_b,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert!(undo.applied, "B's undo rewinds A's edit — shared history");
+    assert_eq!(buffer_text(&mut ws_b, 20, buf_b).await, "hello\n");
+
+    // The document is back at its saved baseline, so B saves cleanly and disk stays pristine.
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws_b,
+        12,
+        &BufferSaveParams {
+            buffer_id: buf_b,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+
+    drop(server);
+}
+
+/// Closing one workspace's buffer detaches a view; the shared document (and its unsaved edits)
+/// lives on for the other workspace.
+#[tokio::test]
+async fn close_in_one_workspace_keeps_shared_document_alive() {
+    let (server, mut ws_a, buf_a, mut ws_b, buf_b, path) =
+        setup_overlapping_workspaces_watched_buffer("hello\n").await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "kept-".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws_a,
+        11,
+        &BufferCloseParams {
+            buffer_id: buf_a,
+            open_next: false,
+        },
+    )
+    .await;
+
+    // B still holds the document with the unsaved edit, and can save it.
+    assert_eq!(buffer_text(&mut ws_b, 20, buf_b).await, "kept-hello\n");
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws_b,
+        21,
+        &BufferSaveParams {
+            buffer_id: buf_b,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept-hello\n");
+
+    drop(server);
+}
+
+/// A document shared by two workspaces gets exactly ONE backup, under the document-level
+/// `files/<hash>` key — not one copy per workspace.
+#[tokio::test]
+async fn shared_dirty_document_writes_one_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("watched.txt"), "hello\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![
+            ("proj-a".to_string(), vec![root.clone()]),
+            ("proj-b".to_string(), vec![root.clone()]),
+        ],
+        Some(sessions_path),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    let (mut ws_a, buf_a) = connect_and_open_watched(&server.ws_url(), "proj-a").await;
+    let (_ws_b, _buf_b) = connect_and_open_watched(&server.ws_url(), "proj-b").await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws_a,
+        10,
+        &InputTextParams {
+            buffer_id: buf_a,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    wait_for_backup(&backups.join("files")).await;
+    let count = std::fs::read_dir(backups.join("files"))
+        .unwrap()
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+        .count();
+    assert_eq!(count, 1, "one document, one backup — however many workspaces");
+
+    drop(server);
+}
+
+/// Unsaved edits made through an *ephemeral* (tether, `ae file`) context are backed up too: the
+/// backup keys on the path alone, so after the server — and the ephemeral workspace with it — is
+/// gone, opening the same file from a named workspace restores the edits via recover-on-open.
+/// (The ephemeral context has no session, so recover-on-open is the only path back — that's the
+/// mechanism under test.)
+#[tokio::test]
+async fn ephemeral_file_edits_survive_restart_via_path_keyed_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let file = root.join("tethered.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        // No workspace/activate: the open lands in an ephemeral context, like `ae file`.
+        let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+            .await
+            .unwrap();
+        let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+            &mut ws,
+            1,
+            &WorkspaceOpenPathParams {
+                path: file.display().to_string(),
+                transient: None,
+                create_if_missing: false,
+            },
+        )
+        .await;
+        assert!(aether_protocol::is_ephemeral_workspace_id(
+            &opened.workspace.name
+        ));
+        let buf = opened.opened.expect("open_path returns the opened buffer");
+        send_request::<InputText>(
+            &mut ws,
+            2,
+            &InputTextParams {
+                buffer_id: buf.buffer_id,
+                text: "T-".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+        wait_for_backup(&backups.join("files")).await;
+        drop(ws);
+        drop(server);
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "hello\n",
+        "nothing was saved to disk"
+    );
+
+    // Restart; the ephemeral workspace is gone. Open the same path from a *named* workspace —
+    // the tether's unsaved edit is simply there, dirty.
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path),
+        Some(backups),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("tethered.txt".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_ne!(reopen.revision, reopen.saved_revision, "restored dirty");
+    assert_eq!(
+        buffer_text(&mut ws, 3, reopen.buffer_id).await,
+        "T-hello\n"
+    );
     drop(server);
 }
 
@@ -28284,7 +28669,7 @@ async fn unsaved_file_edits_restored_across_restart() {
             },
         )
         .await;
-        wait_for_backup(&backups.join("p").join("files")).await;
+        wait_for_backup(&backups.join("files")).await;
         drop(ws);
         drop(server);
     }
@@ -28396,7 +28781,7 @@ async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
             1,
             "the live dirty buffer counts once, not twice with its own backup"
         );
-        wait_for_backup(&backups.join("p").join("files")).await;
+        wait_for_backup(&backups.join("files")).await;
         drop(ws);
         drop(server);
     }
@@ -28510,7 +28895,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             },
         )
         .await;
-        wait_for_backup(&backups.join("p").join("files")).await;
+        wait_for_backup(&backups.join("files")).await;
         drop(ws);
         drop(server);
     }
@@ -28585,7 +28970,7 @@ async fn saving_clears_the_backup() {
     std::fs::write(root.join("a.rs"), "base\n").unwrap();
     let sessions_path = root.join("sessions.json");
     let backups = root.join("backups");
-    let files_dir = backups.join("p").join("files");
+    let files_dir = backups.join("files");
 
     let server = aether_server::spawn_for_test_multi_with_persistence(
         vec![("p".to_string(), vec![root.clone()])],
