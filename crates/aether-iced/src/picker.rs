@@ -471,7 +471,7 @@ pub fn overlay<'a>(
                 // item rows indent under their group header, aligning with the header text
                 // past its disclosure-mark cell. Header rows start flush.
                 let mut content = render_item(item, roots, tether, hovered, ui, p);
-                if state.kind.collapsible() && !matches!(item, PickerItem::Group { .. }) {
+                if state.collapsible && !matches!(item, PickerItem::Group { .. }) {
                     content = row![
                         iced::widget::Space::new().width(group_item_indent(ui)),
                         content
@@ -1694,10 +1694,10 @@ fn render_item<'a>(
             ));
             r.into()
         }
-        // A captured entry renders exactly like a grep row (quickfix-style; docs/jumplist.md §2.2):
-        // monospace trimmed preview on the left, right-aligned dim line number on the right — no
-        // dot, no dressing. Most sources are code lines (grep previews, hunk lines); leading
-        // whitespace strips and the indices shift with it.
+        // A captured entry renders like the kind of thing it points at (docs/jumplist.md §2.2):
+        // trimmed text on the left, right-aligned dim line number on the right — no dot, no
+        // dressing. Leading whitespace strips and the indices shift with it, since most sources
+        // are code lines (grep previews, hunk lines).
         PickerItem::JumplistEntry {
             line,
             display,
@@ -1711,18 +1711,33 @@ fn render_item<'a>(
                 .filter_map(|i| i.checked_sub(lead))
                 .filter(|i| (*i as usize) < PREVIEW_MAX_CHARS)
                 .collect();
+            // What the row *is* decides the face: a positioned entry shows a line of file
+            // content, which wants the buffer's monospace; a whole-target entry shows the target
+            // itself — a path, or `(scratch N)` — which reads as UI text and matches the
+            // Files/Buffers rows it was captured from. `line` is exactly that distinction: an
+            // entry with no position has no file content to show.
+            let face = if line.is_some() {
+                iced::Font::MONOSPACE
+            } else {
+                SANS
+            };
             row![
                 highlighted_owned(
                     truncate_chars(trimmed.trim_end(), PREVIEW_MAX_CHARS),
                     shifted,
                     p.fg,
-                    iced::Font::MONOSPACE,
+                    face,
                     hovered,
                     ui,
                     p,
                 ),
                 iced::widget::Space::new().width(Length::Fill),
-                meta(format!("{}", line + 1), ui, p),
+                // A whole-target entry (a captured file or buffer) has no line to show.
+                meta(
+                    line.map(|l| (l + 1).to_string()).unwrap_or_default(),
+                    ui,
+                    p
+                ),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center)

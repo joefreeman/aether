@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 /// navigate: the client follows up by opening the Jumplist picker framed on `index` (the same
 /// row stays highlighted), and Enter there jumps through the ordinary select path.
 ///
-/// Only the position-shaped kinds capture (`PickerKind::captures_to_jumplist`). Capturing from
+/// Only the jump-shaped kinds capture (`PickerKind::captures_to_jumplist`) — the position-shaped
+/// ones (a row is a location *in* a file) plus the file-shaped Files and Buffers (a row is a whole
+/// target, captured without a position). Capturing from
 /// the Jumplist picker itself replaces the list with the picker's current (typically
 /// query-narrowed) subset — iterative narrowing. Returns `None` when the picker has nothing to
 /// capture (empty filtered set) — the previously captured list, if any, is left untouched.
@@ -57,19 +59,22 @@ pub struct JumplistCaptureResult {
 /// Step through the jumplist from the cursor's current location — Normal-mode
 /// `]` / `[`. Cursor-derived: the server compares against the cursor selection's *outer* edge
 /// (max edge stepping forward, min edge backward), so an entry the cursor sits on is "current"
-/// and gets skipped — repeated presses always make progress. When the current file has no
-/// entries, it is virtually inserted into the list's file sequence by path comparison and the
-/// step lands on the adjacent file's first/last entry; a scratch buffer steps to the first/last
-/// entry overall.
+/// and gets skipped — repeated presses always make progress. A *whole-target* entry (one captured
+/// without a position, from the Files or Buffers picker) is always "current" for its own buffer, so
+/// a step out of it lands on the neighbouring entry: `]`/`[` walk a captured file list one file at
+/// a time. When the current file has no entries, it is virtually inserted into the list's target
+/// sequence by path comparison and the step lands on the adjacent target's first/last entry; a
+/// pathless buffer that isn't itself in the list steps to the first/last entry overall.
 ///
 /// The list does **not** cycle: stepping past the last entry (forward) or before the first
 /// (backward) is a no-op, reported as [`JumplistStepResult::AtEnd`] so the client can toast
 /// "last/first entry" rather than silently wrapping. A `count` that overshoots clamps to the
 /// boundary entry (still a move). [`JumplistStepResult::Empty`] means no list is captured.
 ///
-/// With `scope: CurrentFile` (`Alt-]` / `Alt-[`) the walk is restricted to entries in the step
+/// With `scope: CurrentFile` (`}` / `{`) the walk is restricted to entries in the step
 /// buffer's own file — no fall-through — and [`JumplistStepResult::NoneInFile`] reports a file
-/// that has no entries at all.
+/// that has no entries at all. A whole-target entry is never an in-file step (it has no position
+/// to step *to*), so a captured file list answers `NoneInFile` everywhere.
 pub struct JumplistStep;
 impl RpcMethod for JumplistStep {
     const NAME: &'static str = "jumplist/step";
@@ -129,9 +134,9 @@ pub enum JumplistStepResult {
     /// move. Which end is implied by the requested `direction` (forward = last, backward = first),
     /// so the client picks the toast without extra payload.
     AtEnd,
-    /// `CurrentFile` scope only: a list is captured but the step buffer's file has no entries in
-    /// it, so there's nothing to walk. (`Full` scope never yields this — it falls through to other
-    /// files.)
+    /// `CurrentFile` scope only: a list is captured but the step buffer's file has no positioned
+    /// entries in it, so there's nothing to walk. (`Full` scope never yields this — it falls
+    /// through to other files.)
     NoneInFile,
     /// No list is captured (or it captured empty) — the client toasts how to capture.
     Empty,
@@ -152,12 +157,22 @@ impl JumplistStepResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JumplistStepTarget {
     /// Absolute canonical path of the target file — feed into `buffer/open` when not using
-    /// the `open` composite.
-    pub path: String,
+    /// the `open` composite. `None` when the entry targets a *buffer* with no path (a scratch
+    /// captured from the Buffers picker), where `buffer_id` is the identity instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The target buffer's id, for the pathless entries described on `path`. `None` whenever
+    /// `path` is set — exactly one of the two identifies the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
     /// Position to land the cursor on. Same semantics as `PickerSelectResult::FileAt`: for an
     /// entry carrying a span this is the span's inclusive end, with `anchor` at its start, so
-    /// the jump lands the same selection the source picker's Enter would.
-    pub position: LogicalPosition,
+    /// the jump lands the same selection the source picker's Enter would. `None` for a
+    /// whole-target entry (captured from the Files or Buffers picker), which lands on the
+    /// cursor position last recorded for that buffer — the top of the file if there isn't one,
+    /// exactly as selecting the row in its source picker would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<LogicalPosition>,
     /// When `Some`, the *other* end of a selection to establish — anchor here, cursor at
     /// `position` (`buffer/open { jump_to_anchor }`). `None` lands a plain point cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]

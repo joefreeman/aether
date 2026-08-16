@@ -660,7 +660,7 @@ impl Session {
                     Some(PickerItem::JumplistEntry {
                         index: r.index,
                         // Only `index` identifies the row for centering; line/display unused.
-                        line: 0,
+                        line: None,
                         display: String::new(),
                         match_indices: Vec::new(),
                     }),
@@ -675,9 +675,12 @@ impl Session {
 
             Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
                 Some(open) => {
-                    // Jumplist steps are jump-shaped: a markdown target opens in the editor
-                    // (docs/markdown-view.md §1.6).
-                    self.open_route_jumped = true;
+                    // A step is jump-shaped exactly when its entry carries a position — the same
+                    // test `open_path_at` applies, so `]` and Enter on the same row present the
+                    // target identically (docs/markdown-view.md §1.6). A positioned entry (a grep
+                    // hit, a diagnostic) lands in the editor, where its line:col means something;
+                    // a whole-target entry is "open this file", so a markdown one reads.
+                    self.open_route_jumped = t.position.is_some();
                     self.adopt_navigation(open)
                 }
                 None => Effects::none(), // open:true is always sent; defensive
@@ -929,13 +932,17 @@ impl Session {
                         // it). Harmless for an initial open, which never set it.
                         p.refetch_in_flight = false;
                         p.offset = r.effective_offset;
+                        // Adopt the layout gate first: the centring reveal just below branches on
+                        // it, and for a Jumplist it can differ from the kind's default (a capture
+                        // from a file-shaped picker renders flat — docs/jumplist.md).
+                        p.collapsible = r.collapsible;
                         if let Some(center) = r.effective_center_on {
                             p.pending_center = Some(center);
                             // Collapsible centering (cursor-hit opens, file jumps) aligns the
                             // target to the top — its auto-expanded group's header sits just
                             // above and there's context below to read. The headerless kinds
                             // (GitChangesFile) have no header to clear, so minimal it is.
-                            p.reveal_on_update = Some(if p.kind.collapsible() {
+                            p.reveal_on_update = Some(if p.collapsible {
                                 Reveal::Top
                             } else {
                                 Reveal::Minimal
@@ -2013,18 +2020,22 @@ impl Session {
     }
 
     /// Decide the freshly adopted buffer's read/edit presentation (docs/markdown-view.md §1.6):
-    /// markdown buffers follow this session's per-buffer choice when one was made, else the
-    /// app-wide default — except jump-shaped opens (grep hits, references, jumplist steps), which
-    /// land in the editor. Everything else opens in the editor as always.
+    /// markdown buffers follow this session's live read-vs-source choice
+    /// ([`Session::read_on`]), with two overrides that outrank it, one each way:
+    ///
+    /// - A **jump-shaped** open (grep hit, reference, a positioned jumplist entry) lands in the
+    ///   editor — it is going to a `line:col`, which only means something over the source.
+    /// - An open carrying a **read anchor** (`[x](./other.md#section)`) lands in the reading
+    ///   view — the slug resolves against the rendered document, and landing anywhere else would
+    ///   silently drop it.
+    ///
+    /// Both are one-shot: neither flips the session's choice for the next document. Non-markdown
+    /// buffers open in the editor as always.
     fn sync_read_on_switch(&mut self) -> Effects {
         let jumped = std::mem::replace(&mut self.open_route_jumped, false);
         self.read = None;
         let is_md = self.buffer.language.as_deref() == Some("markdown");
-        let want = is_md
-            && match self.read_pref.get(&self.buffer.buffer_id) {
-                Some(explicit) => *explicit,
-                None => self.markdown_read_default && !jumped,
-            };
+        let want = is_md && (self.pending_read_anchor.is_some() || (self.read_on && !jumped));
         if want {
             self.begin_read()
         } else {
@@ -2049,7 +2060,7 @@ impl Session {
     /// so a refresh restores exactly what was on screen — the `#line:col` cursor restore in the
     /// same URL must not read as a jump-shaped open (docs/markdown-view.md §1.6).
     pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Effects {
-        self.read_pref.insert(self.buffer.buffer_id, read);
+        self.read_on = read;
         self.boot_read_presentation(false)
     }
 
@@ -2841,7 +2852,7 @@ impl Session {
         // into the neighbouring group: down off the last item enters the next group at its
         // first item, up off the first enters the previous at its last (still item level).
         // The very ends still stop (the step answers `run: None`).
-        if p.kind.collapsible() {
+        if p.collapsible {
             // Single-flight: a gesture is mid-reshape — swallow repeats rather than route
             // them against transient state (a second step would skip a group's items).
             if p.group_gesture_in_flight {
@@ -4146,7 +4157,7 @@ impl Session {
             // §9). On a header it's as shallow as it goes — a no-op, NOT a query wipe: the
             // unwind (clear query → pop chip) is Alt-Backspace's alone
             // (docs/picker-groups.md §3.1).
-            KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind.collapsible() => {
+            KeyCode::Char('h') if mods.alt && !mods.ctrl && p.collapsible => {
                 if !p.selection_at_item_level() {
                     return Effects::none();
                 }
@@ -4615,7 +4626,7 @@ impl Session {
             ) {
                 return self.explorer_enter_selected();
             }
-        } else if p.kind.collapsible() && !p.selection_at_item_level() {
+        } else if p.collapsible && !p.selection_at_item_level() {
             // From the selected group's header onto the run's first item (the selected group IS
             // the expanded one, so the row is right below). On a header that is *not* the open
             // group — a transient state after a re-rank clamped the selection — re-select that
@@ -6235,8 +6246,13 @@ impl Session {
         // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
         // rendering the corner hint when it's off.
         self.hints_enabled = settings.hints;
-        // The markdown-read default only affects future opens; the current buffer's presentation
-        // isn't retroactively flipped.
+        // The markdown-read setting is the *default* the session's live choice starts from, so
+        // changing it re-seeds that choice — otherwise turning the setting off would do nothing
+        // until the client restarted. Only future opens are affected either way; the current
+        // buffer's presentation isn't retroactively flipped.
+        if settings.markdown_read != self.markdown_read_default {
+            self.read_on = settings.markdown_read;
+        }
         self.markdown_read_default = settings.markdown_read;
         // Theme is shell-render-only too: the shells resolve `self.theme` to a role table each
         // frame (web also stamps `data-theme`), so adopting the mode is enough.
@@ -6296,9 +6312,10 @@ impl Session {
             // Hints: same flip (and toast) as `Space Alt-h`.
             AppSettingId::Hints => self.toggle_hints(),
             // Markdown reading view default: applies to future opens (`Space v` flips the
-            // current buffer); flip + persist.
+            // session's live choice without touching the setting); flip both + persist.
             AppSettingId::MarkdownRead => {
                 self.markdown_read_default = !self.markdown_read_default;
+                self.read_on = self.markdown_read_default;
                 self.persist_app_settings()
             }
             // Theme: shell-render-only like ligatures — flip the mode + persist; every shell
@@ -7560,7 +7577,7 @@ impl Session {
     /// buffer for the session; non-markdown buffers toast instead.
     fn toggle_read_view(&mut self) -> Effects {
         if self.read.is_some() {
-            self.read_pref.insert(self.buffer.buffer_id, false);
+            self.read_on = false;
             self.read = None;
             if self.mode == Mode::Read {
                 self.mode = Mode::Normal;
@@ -7568,14 +7585,16 @@ impl Session {
             // The editor window stayed subscribed throughout — just frame the reading position.
             return Effects::one(Effect::RevealCursor(RevealStyle::Jump));
         }
+        // A buffer with no reading view to show leaves the session choice alone: flipping global
+        // state from a buffer where you can't see it change is worse than doing nothing.
         if self.buffer.language.as_deref() != Some("markdown") {
             return Effects::toast_grouped(
-                "Reading view is for Markdown buffers",
+                "No reader view available",
                 ToastKind::Info,
                 "read-view",
             );
         }
-        self.read_pref.insert(self.buffer.buffer_id, true);
+        self.read_on = true;
         self.begin_read()
     }
 
@@ -8726,6 +8745,36 @@ mod tests {
         s.mode = Mode::Read;
         s.read = Some(ReadView::loading(s.buffer.buffer_id));
         s
+    }
+
+    /// A link anchor outranks the session's read-vs-source choice: `[x](./other.md#section)`
+    /// followed while the session is on *source* still lands in the reading view, because a
+    /// heading slug only resolves against the rendered document — landing in the editor would
+    /// silently drop it (`sync_read_on_switch`). One-shot: it doesn't flip the session choice.
+    #[test]
+    fn a_link_anchor_outranks_a_source_session_choice() {
+        let mut s = reading_session();
+        s.read_on = false; // `Space v` out to source
+        let _ = s.read_follow_link("./other.md#section-two");
+        assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
+
+        // The open lands on a markdown buffer: the armed anchor forces the reading view.
+        s.buffer.buffer_id += 1;
+        s.buffer.language = Some("markdown".into());
+        let fx = s.sync_read_on_switch();
+        assert!(s.read.is_some(), "the anchor forced the reading view");
+        assert!(!s.read_on, "without flipping the session's choice");
+        assert!(fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Request { method, .. } if *method == "buffer/content"
+        )));
+
+        // Without an anchor, the same switch honours the source choice.
+        let mut s = reading_session();
+        s.read_on = false;
+        s.buffer.language = Some("markdown".into());
+        let _ = s.sync_read_on_switch();
+        assert!(s.read.is_none(), "no anchor → the session choice stands");
     }
 
     /// Cross-file anchors (docs/markdown-view.md §2.4): following `[x](./other.md#section)`

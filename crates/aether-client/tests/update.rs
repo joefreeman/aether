@@ -946,6 +946,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+        collapsible: false,
         update: Some(update(Some(vec![]), 0)),
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -994,6 +995,7 @@ fn view_response_does_not_regress_a_query_typed_before_it() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+        collapsible: false,
         update: None,
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -1319,6 +1321,7 @@ fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: true,
+        collapsible: false,
         update: None,
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -1391,6 +1394,7 @@ fn jumplist_chip_removal_requeries() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: true,
+        collapsible: false,
         update: None,
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -3221,8 +3225,9 @@ fn jumplist_step_adopts_the_opened_entry() {
     };
     let _ = s.on_event(Event::JumplistStepped(
         Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
-            path: "/b.rs".into(),
-            position: LogicalPosition { line: 4, col: 9 },
+            path: Some("/b.rs".into()),
+            buffer_id: None,
+            position: Some(LogicalPosition { line: 4, col: 9 }),
             anchor: Some(LogicalPosition { line: 4, col: 2 }),
             index: 3,
             total: 17,
@@ -3295,6 +3300,8 @@ fn picker_view_response_renders_items_without_the_push() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+
+        collapsible: false,
         update: Some(update),
     };
     let _ = s.on_event(Event::PickerViewed {
@@ -3357,6 +3364,8 @@ fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total:
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+
+        collapsible: false,
         update: Some(update),
     };
     s.on_event(Event::PickerViewed {
@@ -8199,23 +8208,45 @@ fn read_ctrl_o_refused_stays_in_the_reading_view() {
 #[test]
 fn read_transitions_do_not_record_a_presentation_preference() {
     use aether_client::session::Mode;
-    // `Space v` back into the editor records "source"; the edit transitions must not — the
-    // buffer's remembered choice stays "read", so the next open still renders the view.
+    // `Space v` back into the editor is the explicit "source, please" signal and flips the
+    // session's choice; the §12 edit transitions must not — you can edit *in* the reading view,
+    // so dropping into Insert says nothing about how the next document should open.
     let mut s = read_session();
-    let buffer = s.buffer.buffer_id;
-    assert_eq!(s.read_preference(buffer), Some(true), "entry recorded read");
+    assert!(s.read_on(), "Space v into the view set the session choice");
     let _ = key(&mut s, 'i');
     assert_eq!(s.mode, Mode::Insert);
-    assert_eq!(
-        s.read_preference(buffer),
-        Some(true),
-        "the transition left the preference alone"
-    );
+    assert!(s.read_on(), "the transition left the choice alone");
     // Contrast: Space v out of Read is the explicit "I prefer source" signal.
     let mut s = read_session();
     let _ = leader(&mut s, 'v');
-    assert_eq!(s.read_preference(s.buffer.buffer_id), Some(false));
+    assert!(!s.read_on());
 }
+
+/// The choice is one session-wide flag, not a per-buffer memory: leaving one document for source
+/// means the next markdown document opens in source too (docs/markdown-view.md §1.6). The
+/// alternative — remembering per buffer — treats "I dropped into raw markdown to fix a link" as a
+/// durable property of that document, which it isn't.
+#[test]
+fn read_choice_is_session_wide_not_per_buffer() {
+    use aether_client::session::Mode;
+    let mut s = read_session();
+    let _ = leader(&mut s, 'v'); // out to source
+    assert!(!s.read_on());
+
+    // A different markdown document now opens in source as well.
+    let fx = s.open_path_at("/tmp/other.md".into(), None, None);
+    let (token, _m, _p) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 9, "language": "markdown", "line_count": 5, "byte_count": 40,
+            "revision": 0, "saved_revision": 0, "path": "/tmp/other.md",
+        })),
+    );
+    assert_eq!(s.mode, Mode::Normal, "session choice carries across buffers");
+    assert!(s.read.is_none());
+}
+
 
 #[test]
 fn read_ctrl_z_undoes_from_the_reading_view() {
@@ -8696,6 +8727,69 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
         )),
         "the content fetch rides the switch"
     );
+}
+
+/// `]`/`[` present a target exactly as Enter on the same jumplist row does: the *entry's shape*
+/// decides, not the route. A whole-target entry (captured from the Files/Buffers picker) has no
+/// position, so a markdown one reads; a positioned entry lands in the editor where its line:col
+/// means something. Regression: the step handler used to force the editor unconditionally, which
+/// disagreed with select once position-less entries existed (docs/jumplist.md).
+#[test]
+fn jumplist_step_presentation_follows_the_entry_shape() {
+    use aether_client::session::Mode;
+    use aether_client::update::Event;
+    use aether_protocol::buffer::BufferOpenResult;
+    use aether_protocol::cursor::Direction;
+    use aether_protocol::jumplist::{
+        JumplistStepResult, JumplistStepScope, JumplistStepTarget,
+    };
+    use aether_protocol::LogicalPosition;
+
+    let opened = |buffer_id: u64, path: &str| BufferOpenResult {
+        buffer_id,
+        language: Some("markdown".into()),
+        line_count: 5,
+        byte_count: 40,
+        revision: 0,
+        saved_revision: 0,
+        path: Some(path.into()),
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None,
+        transient: true,
+    };
+    let step = |position: Option<LogicalPosition>, buffer_id: u64, path: &str| {
+        Event::JumplistStepped(
+            Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
+                path: Some(path.into()),
+                buffer_id: None,
+                position,
+                anchor: None,
+                index: 1,
+                total: 2,
+                opened: Some(opened(buffer_id, path)),
+            }))),
+            Direction::Forward,
+            JumplistStepScope::Full,
+        )
+    };
+
+    // Whole-target entry → reading view, like selecting the row.
+    let mut s = md_session();
+    let _ = s.on_event(step(None, 7, "/tmp/notes.md"));
+    assert_eq!(s.mode, Mode::Read, "whole-target step → reading view");
+    assert!(s.read.is_some());
+
+    // Positioned entry (a grep hit in a markdown file) → editor.
+    let mut s = md_session();
+    let _ = s.on_event(step(
+        Some(LogicalPosition { line: 3, col: 0 }),
+        8,
+        "/tmp/doc.md",
+    ));
+    assert_eq!(s.mode, Mode::Normal, "positioned step → editor");
+    assert!(s.read.is_none());
 }
 
 #[test]

@@ -347,6 +347,11 @@ interface PickerView {
    *  ungrouped kinds. The shell opens one section + header row per span instead of re-deriving
    *  boundaries from item fields. */
   groups: GroupSpan[];
+  /** Whether this view renders as a collapsible accordion (docs/picker-groups.md §9): headers
+   *  arrive as real `group` window rows and the row space counts them. Core-owned, and a property
+   *  of the view rather than the kind — a Jumplist captured from the Files or Buffers picker has
+   *  no groups and renders flat (docs/jumplist.md). */
+  collapsible: boolean;
   total_matches: number;
   total_candidates: number;
   ticking: boolean;
@@ -901,7 +906,8 @@ function describePickerItem(
       return {
         primary: trimmed.trimEnd(),
         matches: item.match_indices?.map((i) => i - lead).filter((i) => i >= 0),
-        meta: `${item.line + 1}`,
+        // A whole-target entry (a captured file or buffer) has no line to show.
+        ...(item.line === undefined ? {} : { meta: `${item.line + 1}` }),
       };
     }
     case "group":
@@ -4332,12 +4338,7 @@ export class Shell {
     // window rows — the span interleave below is skipped (a span-derived header on top would
     // double it), inter-section gap pixels are off (headers are uniform rows), and the CSS
     // modifier restores the flex layout + pointer + selection band on the header rows.
-    const collapsible =
-      p.kind === "grep" ||
-      p.kind === "git_changes" ||
-      p.kind === "diagnostics_workspace" ||
-      p.kind === "workspace_symbols" ||
-      p.kind === "jumplist";
+    const collapsible = p.collapsible;
     list.classList.toggle("collapsible", collapsible);
     // Path budget for the row (chars), and the disambiguated root labels — both computed once.
     const ls = getComputedStyle(list);

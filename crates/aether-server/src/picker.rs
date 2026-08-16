@@ -33,6 +33,11 @@ pub struct BufferCandidate {
     /// Workspace-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
     pub path: Option<(u32, String)>,
+    /// The buffer's absolute canonical path; `None` only for scratch buffers. Wider than
+    /// [`Self::path`] (which stops at the workspace boundary) — the jumplist captures a
+    /// file-backed buffer by path so the entry outlives the buffer, and out-of-root ones need
+    /// an identity too.
+    pub abs_path: Option<String>,
     /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
     pub transient: bool,
 }
@@ -784,7 +789,9 @@ impl PickerCandidates {
             }
             PickerCandidates::Jumplist(v) => PickerItem::JumplistEntry {
                 index: idx as u32,
-                line: v[idx].position.line,
+                // `None` for a whole-target entry — no line to render, rather than a fictional
+                // line 1 (docs/jumplist.md).
+                line: v[idx].position.map(|p| p.line),
                 display: v[idx].display.clone(),
                 match_indices,
             },
@@ -1037,14 +1044,25 @@ impl PickerCandidates {
             // Informational — a shortcut row isn't a jump target and `select` never fires for
             // this kind (the client's Enter just closes the picker), like LspServers.
             PickerCandidates::Keybindings(_) => None,
-            // Entries land exactly as selecting the source row would: `position`/`anchor` were
-            // captured from the source picker's own select semantics.
+            // Entries land exactly as selecting the source row would — which is what decides the
+            // variant here: `position`/`anchor` were captured from the source picker's own select
+            // semantics, and a whole-target entry has none precisely because its source picker
+            // opens without jumping (`File`/`Buffer`, landing on the last-known cursor).
             PickerCandidates::Jumplist(v) => {
                 let e = &v[idx];
-                Some(PickerSelectResult::FileAt {
-                    path: e.abs_path.clone(),
-                    position: e.position,
-                    anchor: e.anchor,
+                Some(match (e.abs_path(), e.position) {
+                    (Some(path), Some(position)) => PickerSelectResult::FileAt {
+                        path: path.to_string(),
+                        position,
+                        anchor: e.anchor,
+                    },
+                    (Some(path), None) => PickerSelectResult::File {
+                        path: path.to_string(),
+                    },
+                    // Pathless: a captured scratch buffer, attached by id.
+                    (None, _) => PickerSelectResult::Buffer {
+                        buffer_id: e.target.buffer_id()?,
+                    },
                 })
             }
         }
@@ -1494,15 +1512,13 @@ impl PickerState {
                     ff.passes_path(v[i].path_index, &v[i].relative_path)
                         && !(ff.hide_untracked && v[i].untracked)
                 }
-                PickerCandidates::Jumplist(v) => {
-                    match (v[i].path_index, v[i].relative_path.as_deref()) {
-                        (Some(pi), Some(rp)) => ff.passes_path(pi, rp),
-                        // Out-of-workspace entry (references into dependencies): no root-relative
-                        // path for scopes/globs to speak about, so any active path filter
-                        // excludes it.
-                        _ => ff.passes_pathless(),
-                    }
-                }
+                PickerCandidates::Jumplist(v) => match v[i].target.relative_parts() {
+                    Some((pi, rp)) => ff.passes_path(pi, rp),
+                    // Out-of-workspace entry (references into dependencies) or a pathless one (a
+                    // captured scratch buffer): no root-relative path for scopes/globs to speak
+                    // about, so any active path filter excludes it.
+                    None => ff.passes_pathless(),
+                },
                 PickerCandidates::WorkspaceSymbols(v) => match v[i].path_index {
                     // In-root: `display_path` is the root-relative path.
                     Some(pi) => ff.passes_path(pi, &v[i].display_path),
@@ -1923,13 +1939,29 @@ impl PickerState {
         }
     }
 
-    /// The collapsible kinds' row-space layout ([`RowLayout`], docs/picker-groups.md); `None`
-    /// for every other kind. Derived per call from `ranked` — an O(n) walk, the same cost
+    /// Whether *this picker* renders as a collapsible accordion — the authority behind
+    /// `PickerViewResult::collapsible`, and what every server-side decision about group rows must
+    /// consult instead of [`PickerKind::collapsible`].
+    ///
+    /// The kind predicate is the rule; the exception is a Jumplist captured from a file-shaped
+    /// picker, whose entries are whole targets carrying no group (docs/jumplist.md). Grouping is
+    /// all-or-nothing per capture, so the first entry answers for the list — and an empty one has
+    /// no rows to key either way.
+    pub fn collapsible(&self) -> bool {
+        self.kind.collapsible()
+            && match &self.candidates {
+                PickerCandidates::Jumplist(v) => v.first().is_none_or(|e| e.group.is_some()),
+                _ => true,
+            }
+    }
+
+    /// The collapsible views' row-space layout ([`RowLayout`], docs/picker-groups.md); `None`
+    /// for the flat ones. Derived per call from `ranked` — an O(n) walk, the same cost
     /// [`Self::grouped_display_metrics`] pays per push for the derived-header kinds — never
     /// stored: `ranked` is rebuilt by streaming re-ranks and the layout must always describe
     /// the current permutation.
     pub fn row_layout(&self) -> Option<RowLayout> {
-        if !self.kind.collapsible() {
+        if !self.collapsible() {
             return None;
         }
         let mut runs: Vec<GroupRun> = Vec::new();
@@ -1937,7 +1969,7 @@ impl PickerState {
         for (pos, &ci) in self.ranked.iter().enumerate() {
             let key = self
                 .group_key_at(ci as usize)
-                .expect("collapsible kinds key every row");
+                .expect("collapsible views key every row");
             if last != Some(key) {
                 last = Some(key);
                 runs.push(GroupRun {
@@ -3366,10 +3398,12 @@ mod tests {
         use aether_protocol::picker::{GroupHeader, PickerFilters, ScopedPath};
         let entry = |rel: Option<&str>, abs: &str, line: u32, display: &str| {
             crate::jumplist::JumplistEntry {
-                path_index: rel.map(|_| 0),
-                relative_path: rel.map(str::to_string),
-                abs_path: abs.into(),
-                position: aether_protocol::LogicalPosition { line, col: 0 },
+                target: crate::jumplist::JumplistTarget::File {
+                    path_index: rel.map(|_| 0),
+                    relative_path: rel.map(str::to_string),
+                    abs_path: abs.into(),
+                },
+                position: Some(aether_protocol::LogicalPosition { line, col: 0 }),
                 anchor: None,
                 group: Some(match rel {
                     Some(r) => GroupHeader::File {

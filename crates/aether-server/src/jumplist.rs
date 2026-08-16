@@ -8,11 +8,25 @@
 //! picker's group header for status display / the Jumplist picker. Positions are snapshot
 //! coordinates — edits after capture make them stale, and that's accepted the same way the grep
 //! picker's persisted hits accept it (jumps clamp on `buffer/open`).
+//!
+//! There are two entry shapes, and most of the care in this module goes into keeping the second
+//! one from needing special cases at every call site:
+//!
+//! - **Positioned** — a location *inside* a file (grep hits, diagnostics, references, symbols,
+//!   hunks). Stepping walks these cursor-relative within a file, then falls through across files.
+//! - **Whole-target** — a file or buffer with no position at all, captured from the Files and
+//!   Buffers pickers. It opens where the cursor last sat in that buffer (`jump_to: None`, which
+//!   is exactly what selecting the row in its source picker does); it is always "current" for
+//!   its own buffer, so a step out of it lands on the neighbouring entry — `]`/`[` walk a
+//!   captured file list one file at a time; and it carries no group, since a per-file header
+//!   above a row that *is* that file would only repeat it. Grouping is all-or-nothing per
+//!   capture ([`Jumplist::grouped`]), and an ungrouped list renders flat rather than as a
+//!   collapsible accordion (docs/picker-groups.md).
 
 use crate::picker::{PickerCandidates, PickerState};
 use aether_protocol::cursor::Direction;
 use aether_protocol::picker::{GroupHeader, PickerKind};
-use aether_protocol::LogicalPosition;
+use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use std::collections::HashMap;
@@ -22,7 +36,101 @@ use std::collections::HashMap;
 pub struct Jumplist {
     pub source: PickerKind,
     pub query: String,
+    /// Whether the entries carry group headers — `PickerKind::groups_in_jumplist` for the source,
+    /// and uniform across the list (see the module note). Drives whether the capture handler runs
+    /// [`assign_file_groups`] and whether the Jumplist picker renders collapsible.
+    pub grouped: bool,
     pub entries: Vec<JumplistEntry>,
+}
+
+/// What a captured entry points at. A file is identified by its path (so the entry survives the
+/// buffer being closed, and can be scoped by the dir/glob chips); a buffer with no path — a
+/// scratch, the one row shape the Buffers picker offers that isn't a file — can only be
+/// identified by its live id, exactly as that picker's own `select` identifies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JumplistTarget {
+    File {
+        /// Workspace root index + root-relative path when the file is inside a root; `None` for
+        /// out-of-root files (references into dependencies). Lets the open route root-relative
+        /// when possible (matching how the source pickers open).
+        path_index: Option<u32>,
+        relative_path: Option<String>,
+        /// Absolute canonical path — always present, the file identity used for stepping.
+        abs_path: String,
+    },
+    /// A pathless buffer (scratch). Dies with the buffer: opening a closed id errors, the same
+    /// way selecting a stale row in the Buffers picker would.
+    Buffer { buffer_id: BufferId },
+}
+
+/// Where a step is being taken *from*: the current buffer's identity in the same terms entries
+/// use. Every buffer is one or the other — file-backed buffers (including external ones and
+/// files deleted underneath us) have a canonical path, and the rest are scratch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Location<'a> {
+    File(&'a str),
+    Buffer(BufferId),
+}
+
+/// Total order over targets, used both to sort a capture ([`normalize`]) and to virtually insert
+/// a *current* location that has no entries into the sequence ([`step_index`]). Files sort first,
+/// by path; pathless buffers follow, by id — which for scratch buffers is creation order, i.e.
+/// the order their `(scratch N)` numbers were handed out.
+type TargetKey<'a> = (u8, &'a str, BufferId);
+
+impl JumplistTarget {
+    /// The absolute path, for a file target.
+    pub fn abs_path(&self) -> Option<&str> {
+        match self {
+            JumplistTarget::File { abs_path, .. } => Some(abs_path),
+            JumplistTarget::Buffer { .. } => None,
+        }
+    }
+
+    /// The buffer id, for a pathless target.
+    pub fn buffer_id(&self) -> Option<BufferId> {
+        match self {
+            JumplistTarget::File { .. } => None,
+            JumplistTarget::Buffer { buffer_id } => Some(*buffer_id),
+        }
+    }
+
+    /// The workspace-relative parts, when the target is a file inside a root.
+    pub fn relative_parts(&self) -> Option<(u32, &str)> {
+        match self {
+            JumplistTarget::File {
+                path_index: Some(i),
+                relative_path: Some(rel),
+                ..
+            } => Some((*i, rel)),
+            _ => None,
+        }
+    }
+
+    fn sort_key(&self) -> TargetKey<'_> {
+        match self {
+            JumplistTarget::File { abs_path, .. } => (0, abs_path, 0),
+            JumplistTarget::Buffer { buffer_id } => (1, "", *buffer_id),
+        }
+    }
+
+    /// Whether this target *is* the buffer a step is being taken from.
+    fn matches(&self, location: Location<'_>) -> bool {
+        match (self, location) {
+            (JumplistTarget::File { abs_path, .. }, Location::File(p)) => abs_path == p,
+            (JumplistTarget::Buffer { buffer_id }, Location::Buffer(id)) => *buffer_id == id,
+            _ => false,
+        }
+    }
+}
+
+impl Location<'_> {
+    fn sort_key(&self) -> TargetKey<'_> {
+        match self {
+            Location::File(p) => (0, p, 0),
+            Location::Buffer(id) => (1, "", *id),
+        }
+    }
 }
 
 /// One captured result. `position`/`anchor` mirror `PickerSelectResult::FileAt` for the source
@@ -30,20 +138,18 @@ pub struct Jumplist {
 /// selection's other end (the span start) or `None` for a point landing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JumplistEntry {
-    /// Workspace root index + root-relative path when the file is inside a root; `None` for
-    /// out-of-root files (references into dependencies). Lets the open route root-relative
-    /// when possible (matching how the source pickers open).
-    pub path_index: Option<u32>,
-    pub relative_path: Option<String>,
-    /// Absolute canonical path — always present, the file identity used for stepping.
-    pub abs_path: String,
-    pub position: LogicalPosition,
+    /// The file or buffer this entry jumps to.
+    pub target: JumplistTarget,
+    /// Where in the target to land, or `None` for a whole-target entry (see the module note),
+    /// which opens on the target's last-known cursor instead.
+    pub position: Option<LogicalPosition>,
     pub anchor: Option<LogicalPosition>,
-    /// The source picker's group header for this row (file or section label). `None` only
-    /// while a capture is being assembled — the ungrouped source kinds (buffer diagnostics,
-    /// document symbols, single-file changes) leave it empty and [`assign_file_groups`] fills
-    /// it in. Every *stored* entry has one: the Jumplist picker is collapsible, and its row
-    /// space requires every row keyed (docs/picker-groups.md).
+    /// The source picker's group header for this row (file or section label). `None` throughout
+    /// for an ungrouped capture ([`Jumplist::grouped`]); for a grouped one it is `None` only
+    /// while the capture is being assembled — the flat source kinds (buffer diagnostics,
+    /// document symbols, single-file changes) leave it empty and [`assign_file_groups`] fills it
+    /// in, so that every stored entry has one. That totality is what the collapsible row space
+    /// requires of the views it *does* key (docs/picker-groups.md).
     pub group: Option<GroupHeader>,
     /// The source row's text — the Jumplist picker's row + fuzzy haystack.
     pub display: String,
@@ -52,12 +158,34 @@ pub struct JumplistEntry {
 impl JumplistEntry {
     /// The entry's spatial start — the span's first char for anchored entries, else the landing
     /// point. Stepping compares cursor edges against this (an entry is "after" the cursor when
-    /// its start is).
-    pub fn start(&self) -> LogicalPosition {
-        match self.anchor {
-            Some(a) if (a.line, a.col) < (self.position.line, self.position.col) => a,
-            _ => self.position,
-        }
+    /// its start is). `None` for a whole-target entry: it has no position to compare, which is
+    /// what makes it always "current" for its own buffer and never an in-file step.
+    pub fn start(&self) -> Option<LogicalPosition> {
+        let position = self.position?;
+        Some(match self.anchor {
+            Some(a) if (a.line, a.col) < (position.line, position.col) => a,
+            _ => position,
+        })
+    }
+
+    /// Shorthand for the common `target.abs_path()`.
+    pub fn abs_path(&self) -> Option<&str> {
+        self.target.abs_path()
+    }
+
+    /// Whether this entry belongs to the buffer a step / status stamp is being taken from.
+    pub fn matches_location(&self, location: Location<'_>) -> bool {
+        self.target.matches(location)
+    }
+}
+
+/// The step-origin identity of a buffer: its canonical path when it has one, else its id. The one
+/// place that decision is made, so stepping, framing and the status stamp can't disagree about
+/// what "the current target" means.
+pub fn location_of(canonical_path: Option<&str>, buffer_id: BufferId) -> Location<'_> {
+    match canonical_path {
+        Some(abs) => Location::File(abs),
+        None => Location::Buffer(buffer_id),
     }
 }
 
@@ -74,6 +202,48 @@ impl JumplistEntry {
 /// source ranking.
 pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist, Vec<u32>)> {
     let entries = match &picker.candidates {
+        // The file-shaped pickers: a row is a whole target, not a location in one. No position
+        // (the open lands on the target's last-known cursor, like selecting the row there would)
+        // and no group (see the module note) — the two together are what make a captured file
+        // list render and step as a flat sequence of files.
+        PickerCandidates::Files { files, .. } => ranked_entries(picker, |ci| {
+            let c = &files[ci];
+            JumplistEntry {
+                target: JumplistTarget::File {
+                    path_index: Some(c.path_index),
+                    relative_path: Some(c.relative_path.clone()),
+                    abs_path: c.abs.clone(),
+                },
+                position: None,
+                anchor: None,
+                group: None,
+                display: c.relative_path.clone(),
+            }
+        }),
+        // File-backed buffers capture as *file* targets: the path is the more durable identity
+        // (the entry survives the buffer closing, and the dir/glob chips can speak about it), and
+        // opening by path re-attaches the same document anyway. Only the pathless ones — scratch
+        // buffers — need the buffer id, which is how this picker's own `select` identifies them.
+        PickerCandidates::Buffers(v) => ranked_entries(picker, |ci| {
+            let c = &v[ci];
+            let target = match &c.abs_path {
+                Some(abs) => JumplistTarget::File {
+                    path_index: c.path.as_ref().map(|(i, _)| *i),
+                    relative_path: c.path.as_ref().map(|(_, rel)| rel.clone()),
+                    abs_path: abs.clone(),
+                },
+                None => JumplistTarget::Buffer {
+                    buffer_id: c.buffer_id,
+                },
+            };
+            JumplistEntry {
+                target,
+                position: None,
+                anchor: None,
+                group: None,
+                display: c.display.clone(),
+            }
+        }),
         PickerCandidates::Grep(v) => ranked_entries(picker, |ci| {
             let c = &v[ci];
             let start = LogicalPosition {
@@ -86,10 +256,12 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 col: last_col,
             };
             JumplistEntry {
-                path_index: Some(c.path_index),
-                relative_path: Some(c.relative_path.clone()),
-                abs_path: c.abs_path.clone(),
-                position,
+                target: JumplistTarget::File {
+                    path_index: Some(c.path_index),
+                    relative_path: Some(c.relative_path.clone()),
+                    abs_path: c.abs_path.clone(),
+                },
+                position: Some(position),
                 anchor: (position != start).then_some(start),
                 group: Some(GroupHeader::File {
                     path_index: c.path_index,
@@ -108,13 +280,15 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 let c = &v[ci];
                 let (path_index, relative_path) = relative_parts(c.path_index, &c.relative_path);
                 JumplistEntry {
-                    path_index,
-                    relative_path,
-                    abs_path: c.abs_path.clone(),
-                    position: LogicalPosition {
+                    target: JumplistTarget::File {
+                        path_index,
+                        relative_path,
+                        abs_path: c.abs_path.clone(),
+                    },
+                    position: Some(LogicalPosition {
                         line: c.line,
                         col: c.col,
-                    },
+                    }),
                     anchor: None,
                     group: None,
                     display: c.message.clone(),
@@ -132,10 +306,12 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 col: c.end_col,
             };
             JumplistEntry {
-                path_index: None,
-                relative_path: None,
-                abs_path: c.abs_path.clone(),
-                position: end,
+                target: JumplistTarget::File {
+                    path_index: None,
+                    relative_path: None,
+                    abs_path: c.abs_path.clone(),
+                },
+                position: Some(end),
                 anchor: (end != start).then_some(start),
                 group: Some(GroupHeader::Label {
                     label: if c.is_definition {
@@ -160,10 +336,12 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 entries.push((
                     ci,
                     JumplistEntry {
-                        path_index: None,
-                        relative_path: None,
-                        abs_path: c.abs_path.clone(),
-                        position: c.end,
+                        target: JumplistTarget::File {
+                            path_index: None,
+                            relative_path: None,
+                            abs_path: c.abs_path.clone(),
+                        },
+                        position: Some(c.end),
                         anchor: (c.end != c.start).then_some(c.start),
                         group: None,
                         display: c.name.clone(),
@@ -179,16 +357,18 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
         PickerCandidates::WorkspaceSymbols(v) => ranked_entries(picker, |ci| {
             let c = &v[ci];
             JumplistEntry {
-                // In-root: `display_path` *is* the root-relative path. Out-of-root symbols
-                // (dependencies, the stdlib) have no parts — `assign_file_groups` then gives
-                // them their absolute-path `Label` header, the convention this picker set.
-                path_index: c.path_index,
-                relative_path: c.path_index.is_some().then(|| c.display_path.clone()),
-                abs_path: c.abs_path.clone(),
-                position: LogicalPosition {
+                target: JumplistTarget::File {
+                    // In-root: `display_path` *is* the root-relative path. Out-of-root symbols
+                    // (dependencies, the stdlib) have no parts — `assign_file_groups` then gives
+                    // them their absolute-path `Label` header, the convention this picker set.
+                    path_index: c.path_index,
+                    relative_path: c.path_index.is_some().then(|| c.display_path.clone()),
+                    abs_path: c.abs_path.clone(),
+                },
+                position: Some(LogicalPosition {
                     line: c.line,
                     col: c.col,
-                },
+                }),
                 anchor: None,
                 group: None,
                 display: c.name.clone(),
@@ -204,14 +384,16 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 let c = &v[ci];
                 let (path_index, relative_path) = relative_parts(c.path_index, &c.relative_path);
                 JumplistEntry {
-                    path_index,
-                    relative_path,
-                    abs_path: c.abs_path.clone(),
+                    target: JumplistTarget::File {
+                        path_index,
+                        relative_path,
+                        abs_path: c.abs_path.clone(),
+                    },
                     // Query-aware, like select: land on the matched line, not the hunk anchor.
-                    position: LogicalPosition {
+                    position: Some(LogicalPosition {
                         line: c.select_line(re.as_ref()),
                         col: 0,
-                    },
+                    }),
                     anchor: None,
                     // Both the workspace-wide and buffer-locked pickers group by file in the
                     // jumplist (`assign_file_groups`) — see the module note on grouping.
@@ -227,11 +409,18 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
     }
     let mut entries = entries;
     normalize(&mut entries);
+    // A re-capture from the Jumplist picker maps entries through unchanged, so it inherits their
+    // grouping rather than re-deriving it from a source kind that is only "Jumplist".
+    let grouped = match picker.kind {
+        PickerKind::Jumplist => entries.first().is_some_and(|(_, e)| e.group.is_some()),
+        kind => kind.groups_in_jumplist(),
+    };
     let (candidate_indices, entries): (Vec<u32>, Vec<JumplistEntry>) = entries.into_iter().unzip();
     Some((
         Jumplist {
             source: picker.kind,
             query: picker.query.clone(),
+            grouped,
             entries,
         },
         candidate_indices,
@@ -268,23 +457,36 @@ fn relative_parts(path_index: u32, relative_path: &str) -> (Option<u32>, Option<
 ///   Out-of-workspace files keep `None` parts and open by absolute path.
 pub fn assign_file_groups(entries: &mut [JumplistEntry], roots: &[std::path::PathBuf]) {
     for e in entries {
-        if e.relative_path.is_none() {
-            if let Some((i, rel)) = crate::workspace_index::workspace_relative_parts(
-                std::path::Path::new(&e.abs_path),
-                roots,
-            ) {
-                e.path_index = Some(i);
-                e.relative_path = Some(rel);
+        if let JumplistTarget::File {
+            path_index,
+            relative_path,
+            abs_path,
+        } = &mut e.target
+        {
+            if relative_path.is_none() {
+                if let Some((i, rel)) = crate::workspace_index::workspace_relative_parts(
+                    std::path::Path::new(abs_path),
+                    roots,
+                ) {
+                    *path_index = Some(i);
+                    *relative_path = Some(rel);
+                }
             }
         }
         if e.group.is_none() {
-            e.group = Some(match (e.path_index, e.relative_path.clone()) {
-                (Some(path_index), Some(relative_path)) => GroupHeader::File {
+            e.group = Some(match e.target.relative_parts() {
+                Some((path_index, relative_path)) => GroupHeader::File {
                     path_index,
-                    relative_path,
+                    relative_path: relative_path.to_string(),
                 },
-                _ => GroupHeader::Label {
-                    label: e.abs_path.clone(),
+                // Out-of-workspace files label by absolute path; a pathless buffer (which only
+                // reaches here if an ungrouped source ever grew a group) by its own row text.
+                None => GroupHeader::Label {
+                    label: e
+                        .target
+                        .abs_path()
+                        .unwrap_or(e.display.as_str())
+                        .to_string(),
                 },
             });
         }
@@ -293,18 +495,19 @@ pub fn assign_file_groups(entries: &mut [JumplistEntry], roots: &[std::path::Pat
 
 /// Whether a captured list is worth path-scoping — echoed as `PickerViewResult::path_filterable`
 /// to gate the Jumplist picker's dir/glob chips client-side. True when the entries span more than
-/// one file *and* at least one sits inside a workspace root: a single-file list is all-or-nothing
+/// one target *and* at least one sits inside a workspace root: a single-file list is all-or-nothing
 /// under a path filter (the same reason `GitChangesFile` offers no scope chips), and an
 /// all-external list has no root-relative paths for scopes or globs to match. Callers pass stored
 /// entries (post-[`assign_file_groups`], so in-root entries have their relative parts filled).
 pub fn path_filterable(entries: &[JumplistEntry]) -> bool {
-    let mut first_file = None;
-    let mut multi_file = false;
+    let mut first: Option<TargetKey> = None;
+    let mut multi_target = false;
     let mut any_in_root = false;
     for e in entries {
-        multi_file |= *first_file.get_or_insert(&e.abs_path) != &e.abs_path;
-        any_in_root |= e.relative_path.is_some();
-        if multi_file && any_in_root {
+        let key = e.target.sort_key();
+        multi_target |= *first.get_or_insert(key) != key;
+        any_in_root |= e.target.relative_parts().is_some();
+        if multi_target && any_in_root {
             return true;
         }
     }
@@ -358,12 +561,14 @@ fn grep_match_last_char_col(line_text: &str, col: u32, len: u32) -> u32 {
     }
 }
 
-/// Normalize capture order: group runs in first-appearance order, files within a group in path
-/// order, entries within a file in position order. For the kinds whose ranking already
-/// preserves document order (grep, changes) this is an identity transform; it only bites where
-/// a fuzzy query score-ranked the rows (diagnostics, references) — spatial stepping wants
-/// document order regardless of match score. Stable, so exact ties keep their ranked order.
-/// Entries ride with their source candidate index (untouched, just carried).
+/// Normalize capture order: group runs in first-appearance order, targets within a group in
+/// [`TargetKey`] order (files by path, then pathless buffers by id), entries within a target in
+/// position order. For the kinds whose ranking already preserves document order (grep, changes)
+/// this is an identity transform; it only bites where a fuzzy query score-ranked the rows
+/// (diagnostics, references, and the file-shaped captures, whose ranking is a fuzzy score over
+/// paths) — stepping is spatial, and wants document order regardless of match score. Stable, so
+/// exact ties keep their ranked order. Entries ride with their source candidate index (untouched,
+/// just carried).
 fn normalize(entries: &mut Vec<(u32, JumplistEntry)>) {
     let mut group_rank: HashMap<Option<GroupKey>, usize> = HashMap::new();
     let ranks: Vec<usize> = entries
@@ -377,10 +582,12 @@ fn normalize(entries: &mut Vec<(u32, JumplistEntry)>) {
         ranks.into_iter().zip(entries.drain(..)).collect();
     decorated.sort_by(|(ra, (_, a)), (rb, (_, b))| {
         ra.cmp(rb)
-            .then_with(|| a.abs_path.cmp(&b.abs_path))
+            .then_with(|| a.target.sort_key().cmp(&b.target.sort_key()))
             .then_with(|| {
-                let (sa, sb) = (a.start(), b.start());
-                (sa.line, sa.col).cmp(&(sb.line, sb.col))
+                // Position-less entries (there is at most one per target) sort ahead of any
+                // positioned sibling, which only arises if a source ever mixed the two shapes.
+                let key = |e: &JumplistEntry| e.start().map(|s| (s.line, s.col));
+                key(a).cmp(&key(b))
             })
     });
     entries.extend(decorated.into_iter().map(|(_, pair)| pair));
@@ -401,19 +608,20 @@ fn group_key(g: &Option<GroupHeader>) -> Option<GroupKey> {
 
 /// Resolve one `jumplist/step`: the index of the entry `count` steps in `direction` from the
 /// cursor, or `None` when the cursor is already at the boundary in that direction (the list does
-/// **not** cycle). `current_abs` is the current buffer's canonical path (`None` for a scratch
-/// buffer); `edge` is the cursor selection's *outer* edge in the step direction (max edge
-/// forward, min backward), so an entry the cursor sits on is "current" and gets skipped —
-/// repeated presses make progress.
+/// **not** cycle). `current` is the step buffer's identity; `edge` is the cursor selection's
+/// *outer* edge in the step direction (max edge forward, min backward), so an entry the cursor
+/// sits on is "current" and gets skipped — repeated presses make progress.
 ///
 /// Directional rules, generalizing the old grep navigation:
-/// - Current file has entries: the first entry (list order) strictly past `edge`; when the
-///   cursor is past them all, the entry after the file's last occurrence — or `None` if that
-///   was already the last entry overall.
-/// - Current file absent: virtual insertion by path comparison — the first entry of the file
-///   that would sort immediately after (before) it, or `None` when nothing sorts that way.
-/// - Scratch buffer: the first (forward) / last (backward) entry overall — entering the list
-///   from outside, always a move.
+/// - Current target has entries: the first entry (list order) strictly past `edge`; when the
+///   cursor is past them all, the entry after the target's last occurrence — or `None` if that
+///   was already the last entry overall. A whole-target entry is never "past" the cursor, so a
+///   list of them steps one target per press.
+/// - Current target absent: virtual insertion by [`TargetKey`] comparison — the first entry of
+///   the target that would sort immediately after (before) it, or `None` when nothing sorts
+///   that way.
+/// - Pathless buffer not in the list: the first (forward) / last (backward) entry overall —
+///   entering the list from outside, always a move.
 ///
 /// A `count` past the boundary clamps to the last/first entry (still a move); only a bare step
 /// that can't advance at all yields `None`. `entries` must be non-empty (a captured list always
@@ -421,14 +629,14 @@ fn group_key(g: &Option<GroupHeader>) -> Option<GroupKey> {
 pub fn step_index(
     entries: &[JumplistEntry],
     direction: Direction,
-    current_abs: Option<&str>,
+    current: Location<'_>,
     edge: LogicalPosition,
     count: u32,
 ) -> Option<usize> {
     let len = entries.len();
     let first = match direction {
-        Direction::Forward => step_forward(entries, current_abs, edge)?,
-        Direction::Backward => step_backward(entries, current_abs, edge)?,
+        Direction::Forward => step_forward(entries, current, edge)?,
+        Direction::Backward => step_backward(entries, current, edge)?,
     };
     let extra = count.saturating_sub(1) as usize;
     Some(match direction {
@@ -446,58 +654,51 @@ pub enum InFileStep {
     NoneInFile,
 }
 
-/// Resolve one `Alt-]` / `Alt-[`: step within the current buffer's file only (`Alt-]` = forward,
-/// `Alt-[` = backward), never falling through to another file. `current_abs` is the buffer's
-/// canonical path (`None` for a scratch buffer — no file, so [`InFileStep::NoneInFile`]); `edge`
-/// is the cursor selection's outer edge in the step direction, so the entry the cursor sits on is
-/// skipped. A `count` past the file's first/last entry clamps to it. Returns:
+/// Resolve one `}` / `{`: step within the current buffer's own entries only (`}` = forward,
+/// `{` = backward), never falling through to another file. `current` is the buffer's identity;
+/// `edge` is the cursor selection's outer edge in the step direction, so the entry the cursor
+/// sits on is skipped. A `count` past the file's first/last entry clamps to it. Returns:
 /// - [`InFileStep::Moved`] with the list index of the target,
 /// - [`InFileStep::AtEnd`] when the file has entries but none lie past the cursor that way,
-/// - [`InFileStep::NoneInFile`] when the file (or a scratch buffer) has no entries.
+/// - [`InFileStep::NoneInFile`] when the buffer has no *positioned* entries — nothing captured
+///   for it at all, or only a whole-target entry, which has no interior to walk.
 pub fn step_in_file(
     entries: &[JumplistEntry],
     direction: Direction,
-    current_abs: Option<&str>,
+    current: Location<'_>,
     edge: LogicalPosition,
     count: u32,
 ) -> InFileStep {
-    let Some(cur) = current_abs else {
-        return InFileStep::NoneInFile;
-    };
-    // List indices of this file's entries, in list order (already position-sorted within a file
-    // by `normalize`).
-    let in_file: Vec<usize> = entries
+    // List indices of this buffer's positioned entries, in list order (already position-sorted
+    // within a target by `normalize`), each with the start the cursor compares against.
+    let in_file: Vec<(usize, LogicalPosition)> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.abs_path == cur)
-        .map(|(i, _)| i)
+        .filter(|(_, e)| e.target.matches(current))
+        .filter_map(|(i, e)| e.start().map(|s| (i, s)))
         .collect();
     if in_file.is_empty() {
         return InFileStep::NoneInFile;
     }
     let extra = count.saturating_sub(1) as usize;
-    let past = |i: usize| {
-        let s = entries[i].start();
-        (s.line, s.col)
-    };
     match direction {
         Direction::Forward => {
             let Some(pos) = in_file
                 .iter()
-                .position(|&i| past(i) > (edge.line, edge.col))
+                .position(|(_, s)| (s.line, s.col) > (edge.line, edge.col))
             else {
                 return InFileStep::AtEnd;
             };
-            InFileStep::Moved(in_file[(pos + extra).min(in_file.len() - 1)])
+            InFileStep::Moved(in_file[(pos + extra).min(in_file.len() - 1)].0)
         }
         Direction::Backward => {
             let Some(pos) = in_file
                 .iter()
-                .rposition(|&i| past(i) < (edge.line, edge.col))
+                .rposition(|(_, s)| (s.line, s.col) < (edge.line, edge.col))
             else {
                 return InFileStep::AtEnd;
             };
-            InFileStep::Moved(in_file[pos.saturating_sub(extra)])
+            InFileStep::Moved(in_file[pos.saturating_sub(extra)].0)
         }
     }
 }
@@ -506,109 +707,152 @@ pub fn step_in_file(
 /// nothing follows — `picker/view`'s `center_on_cursor` resolution, so `Space j` opens framed
 /// on "where you are" in the list. *Inclusive*, unlike [`step_index`]'s skip-current strictness:
 /// the entry the cursor sits on is the answer, so reopening the picker right after a jump
-/// highlights the entry just landed on. Same directional rules as stepping otherwise (in-file
-/// first, then the file's last occurrence + 1, virtual insertion by path for absent files,
-/// scratch → the first entry). `entries` must be non-empty.
+/// highlights the entry just landed on. A whole-target entry for the current buffer is the
+/// strongest form of that — being *in* the buffer is being on the entry, wherever the cursor
+/// sits. Same directional rules as stepping otherwise (in-file first, then the target's last
+/// occurrence + 1, virtual insertion by [`TargetKey`] for absent targets, an absent pathless
+/// buffer → the first entry). `entries` must be non-empty.
 pub fn nearest_index(
     entries: &[JumplistEntry],
-    current_abs: Option<&str>,
+    current: Location<'_>,
     edge: LogicalPosition,
 ) -> usize {
     let len = entries.len();
-    let Some(cur) = current_abs else {
-        return 0;
-    };
     let mut last_in_file = None;
     for (i, e) in entries.iter().enumerate() {
-        if e.abs_path != cur {
+        if !e.target.matches(current) {
             continue;
         }
-        let s = e.start();
-        if (s.line, s.col) >= (edge.line, edge.col) {
-            return i;
+        match e.start() {
+            None => return i,
+            Some(s) if (s.line, s.col) >= (edge.line, edge.col) => return i,
+            Some(_) => last_in_file = Some(i),
         }
-        last_in_file = Some(i);
     }
     if let Some(last) = last_in_file {
         return (last + 1) % len;
     }
-    entries
-        .iter()
-        .position(|e| e.abs_path.as_str() > cur)
-        .unwrap_or(0)
+    virtual_insert(entries, current, Direction::Forward).unwrap_or(0)
 }
 
 fn step_forward(
     entries: &[JumplistEntry],
-    current_abs: Option<&str>,
+    current: Location<'_>,
     edge: LogicalPosition,
 ) -> Option<usize> {
     let len = entries.len();
-    let Some(cur) = current_abs else {
-        return Some(0);
-    };
     let mut last_in_file = None;
     for (i, e) in entries.iter().enumerate() {
-        if e.abs_path != cur {
+        if !e.target.matches(current) {
             continue;
         }
-        let s = e.start();
-        if (s.line, s.col) > (edge.line, edge.col) {
-            return Some(i);
+        // A whole-target entry never lies past the cursor: it *is* where the cursor is, so it
+        // counts as current and the step falls through to the next entry.
+        if let Some(s) = e.start() {
+            if (s.line, s.col) > (edge.line, edge.col) {
+                return Some(i);
+            }
         }
         last_in_file = Some(i);
     }
     if let Some(last) = last_in_file {
-        // Past this file's entries: the next entry overall, or nothing if this was the last.
+        // Past this target's entries: the next entry overall, or nothing if this was the last.
         return (last + 1 < len).then_some(last + 1);
     }
-    entries.iter().position(|e| e.abs_path.as_str() > cur)
+    virtual_insert(entries, current, Direction::Forward)
 }
 
 fn step_backward(
     entries: &[JumplistEntry],
-    current_abs: Option<&str>,
+    current: Location<'_>,
     edge: LogicalPosition,
 ) -> Option<usize> {
-    let len = entries.len();
-    let Some(cur) = current_abs else {
-        return Some(len - 1);
-    };
     let mut first_in_file = None;
     for (i, e) in entries.iter().enumerate().rev() {
-        if e.abs_path != cur {
+        if !e.target.matches(current) {
             continue;
         }
-        let s = e.start();
-        if (s.line, s.col) < (edge.line, edge.col) {
-            return Some(i);
+        if let Some(s) = e.start() {
+            if (s.line, s.col) < (edge.line, edge.col) {
+                return Some(i);
+            }
         }
         first_in_file = Some(i);
     }
     if let Some(first) = first_in_file {
-        // Before this file's entries: the previous entry overall, or nothing if this was the first.
-        // (`then`, not `then_some`, so `first - 1` isn't evaluated when `first == 0`.)
+        // Before this target's entries: the previous entry overall, or nothing if this was the
+        // first. (`then`, not `then_some`, so `first - 1` isn't evaluated when `first == 0`.)
         return (first > 0).then(|| first - 1);
     }
-    entries.iter().rposition(|e| e.abs_path.as_str() < cur)
+    virtual_insert(entries, current, Direction::Backward)
+}
+
+/// Where a location with no entries of its own lands: the first entry of the target that sorts
+/// immediately after it (forward) or before it (backward). A *pathless* buffer instead enters the
+/// list at its end — it sorts after every file, so path comparison would only ever say "nothing
+/// that way", and entering from outside should always be a move (the long-standing scratch rule).
+fn virtual_insert(
+    entries: &[JumplistEntry],
+    current: Location<'_>,
+    direction: Direction,
+) -> Option<usize> {
+    let key = current.sort_key();
+    match (current, direction) {
+        (Location::Buffer(_), Direction::Forward) => Some(0),
+        (Location::Buffer(_), Direction::Backward) => Some(entries.len() - 1),
+        (Location::File(_), Direction::Forward) => {
+            entries.iter().position(|e| e.target.sort_key() > key)
+        }
+        (Location::File(_), Direction::Backward) => {
+            entries.iter().rposition(|e| e.target.sort_key() < key)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(abs: &str, line: u32, col: u32) -> JumplistEntry {
-        JumplistEntry {
+    fn file_target(abs: &str) -> JumplistTarget {
+        JumplistTarget::File {
             path_index: Some(0),
             relative_path: Some(abs.trim_start_matches('/').into()),
             abs_path: abs.into(),
-            position: LogicalPosition { line, col },
+        }
+    }
+
+    fn entry(abs: &str, line: u32, col: u32) -> JumplistEntry {
+        JumplistEntry {
+            target: file_target(abs),
+            position: Some(LogicalPosition { line, col }),
             anchor: None,
             group: Some(GroupHeader::File {
                 path_index: 0,
                 relative_path: abs.trim_start_matches('/').into(),
             }),
             display: format!("{abs}:{line}:{col}"),
+        }
+    }
+
+    /// A whole-file entry — the Files/Buffers capture shape: no position, no group.
+    fn whole_file(abs: &str) -> JumplistEntry {
+        JumplistEntry {
+            target: file_target(abs),
+            position: None,
+            anchor: None,
+            group: None,
+            display: abs.trim_start_matches('/').into(),
+        }
+    }
+
+    /// A whole-*buffer* entry — a scratch row from the Buffers picker.
+    fn scratch(buffer_id: BufferId) -> JumplistEntry {
+        JumplistEntry {
+            target: JumplistTarget::Buffer { buffer_id },
+            position: None,
+            anchor: None,
+            group: None,
+            display: format!("(scratch {buffer_id})"),
         }
     }
 
@@ -668,25 +912,104 @@ mod tests {
         // Normalized: still ungrouped at this stage (`assign_file_groups` runs in the handler),
         // so files order by path — /dep before /w — and within a file spatially (beta at line 2
         // before alpha at 9), candidate indices travelling alongside.
-        let order: Vec<(&str, u32)> = list
+        let order: Vec<(&str, Option<u32>)> = list
             .entries
             .iter()
-            .map(|e| (e.display.as_str(), e.position.line))
+            .map(|e| (e.display.as_str(), e.position.map(|p| p.line)))
             .collect();
-        assert_eq!(order, vec![("dep_fn", 1), ("beta", 2), ("alpha", 9)]);
+        assert_eq!(
+            order,
+            vec![("dep_fn", Some(1)), ("beta", Some(2)), ("alpha", Some(9))]
+        );
         assert_eq!(indices, vec![2, 1, 0]);
+        assert!(list.grouped, "a position-shaped source captures grouped");
 
         let beta = &list.entries[1];
-        assert_eq!(beta.path_index, Some(0));
-        assert_eq!(beta.relative_path.as_deref(), Some("src/a.rs"));
-        assert_eq!(beta.abs_path, "/w/src/a.rs");
-        assert_eq!((beta.position.line, beta.position.col), (2, 3));
+        assert_eq!(beta.target.relative_parts(), Some((0, "src/a.rs")));
+        assert_eq!(beta.abs_path(), Some("/w/src/a.rs"));
+        let pos = beta.position.expect("positioned");
+        assert_eq!((pos.line, pos.col), (2, 3));
         let dep = &list.entries[0];
         assert_eq!(
-            (dep.path_index, dep.relative_path.as_deref()),
-            (None, None),
+            dep.target.relative_parts(),
+            None,
             "out-of-root symbols stay pathless (Label header downstream)"
         );
+    }
+
+    /// The Files picker captures whole-target entries: no position (the open lands on the
+    /// buffer's last-known cursor, like selecting the row there) and no group, which is what
+    /// makes the Jumplist picker render the capture flat.
+    #[test]
+    fn capture_snapshots_files_as_ungrouped_whole_file_entries() {
+        use crate::picker::{make_matcher, PickerCandidates, PickerState};
+        use crate::workspace_index::CachedFile;
+        let file = |rel: &str| CachedFile {
+            abs: format!("/w/{rel}"),
+            path_index: 0,
+            relative_path: rel.into(),
+        };
+        let picker = PickerState::new(PickerCandidates::Files {
+            files: std::sync::Arc::new(vec![file("src/b.rs"), file("src/a.rs")]),
+            git_status: std::sync::Arc::new(vec![None, None]),
+        });
+        let (list, _) = capture(&picker, &mut make_matcher()).expect("captures");
+        assert!(!list.grouped, "a file-shaped source captures ungrouped");
+        // Normalized into path order, not the picker's ranking.
+        let rows: Vec<&str> = list.entries.iter().map(|e| e.display.as_str()).collect();
+        assert_eq!(rows, vec!["src/a.rs", "src/b.rs"]);
+        for e in &list.entries {
+            assert_eq!(e.position, None, "whole-file entries carry no position");
+            assert_eq!(e.group, None, "and no group header");
+        }
+        assert_eq!(
+            list.entries[0].target.relative_parts(),
+            Some((0, "src/a.rs")),
+            "the file identity is carried, so the dir/glob chips can scope it"
+        );
+    }
+
+    /// The Buffers picker splits by identity: a file-backed buffer captures by *path* (durable,
+    /// scopeable, survives the buffer closing), a scratch one by buffer id.
+    #[test]
+    fn capture_splits_buffers_into_file_and_buffer_targets() {
+        use crate::picker::{make_matcher, BufferCandidate, PickerCandidates, PickerState};
+        use aether_protocol::picker::BufferDirtyState;
+        let picker = PickerState::new(PickerCandidates::Buffers(vec![
+            BufferCandidate {
+                buffer_id: 4,
+                display: "src/a.rs".into(),
+                status: BufferDirtyState::Clean,
+                path: Some((0, "src/a.rs".into())),
+                abs_path: Some("/w/src/a.rs".into()),
+                transient: false,
+            },
+            BufferCandidate {
+                buffer_id: 9,
+                display: "(scratch 1)".into(),
+                status: BufferDirtyState::Unsaved,
+                path: None,
+                abs_path: None,
+                transient: false,
+            },
+        ]));
+        let (list, _) = capture(&picker, &mut make_matcher()).expect("captures");
+        assert!(!list.grouped);
+        // Files sort ahead of pathless buffers (`TargetKey`), whatever the picker's MRU order.
+        assert_eq!(
+            list.entries[0].target,
+            JumplistTarget::File {
+                path_index: Some(0),
+                relative_path: Some("src/a.rs".into()),
+                abs_path: "/w/src/a.rs".into(),
+            }
+        );
+        assert_eq!(
+            list.entries[1].target,
+            JumplistTarget::Buffer { buffer_id: 9 },
+            "only the pathless row needs the buffer id"
+        );
+        assert_eq!(list.entries[1].display, "(scratch 1)");
     }
 
     #[test]
@@ -700,7 +1023,7 @@ mod tests {
         normalize(&mut e);
         let order: Vec<(&str, u32)> = e
             .iter()
-            .map(|(_, e)| (e.abs_path.as_str(), e.position.line))
+            .map(|(_, e)| (e.abs_path().unwrap(), e.position.unwrap().line))
             .collect();
         // /b appeared first, so its group leads; /a's entries come position-sorted.
         assert_eq!(order, vec![("/b", 5), ("/a", 2), ("/a", 9)]);
@@ -716,7 +1039,7 @@ mod tests {
             labeled("/m", 3, "Definition"),
         ]);
         normalize(&mut e);
-        let order: Vec<&str> = e.iter().map(|(_, e)| e.abs_path.as_str()).collect();
+        let order: Vec<&str> = e.iter().map(|(_, e)| e.abs_path().unwrap()).collect();
         // "References" appeared first so it stays first; within it, files sort by path.
         assert_eq!(order, vec!["/a", "/z", "/m"]);
     }
@@ -726,17 +1049,17 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         // From /a:1 (on the first entry) → the next in-file entry.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/a"), pos(1, 0), 1),
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(1, 0), 1),
             Some(1)
         );
         // Past /a's entries → the next file's first.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/a"), pos(5, 0), 1),
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(5, 0), 1),
             Some(2)
         );
         // Past /b's entries → no wrap; stepping stops at the end.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/b"), pos(2, 0), 1),
+            step_index(&e, Direction::Forward, Location::File("/b"), pos(2, 0), 1),
             None
         );
     }
@@ -745,16 +1068,16 @@ mod tests {
     fn step_backward_mirrors_and_stops() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/a"), pos(5, 0), 1),
+            step_index(&e, Direction::Backward, Location::File("/a"), pos(5, 0), 1),
             Some(0)
         );
         // Before /a's entries → no wrap; stepping stops at the start.
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/a"), pos(1, 0), 1),
+            step_index(&e, Direction::Backward, Location::File("/a"), pos(1, 0), 1),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/b"), pos(2, 0), 1),
+            step_index(&e, Direction::Backward, Location::File("/b"), pos(2, 0), 1),
             Some(1)
         );
     }
@@ -764,20 +1087,20 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/c", 2, 0)];
         // /b sits between /a and /c.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/b"), pos(0, 0), 1),
+            step_index(&e, Direction::Forward, Location::File("/b"), pos(0, 0), 1),
             Some(1)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/b"), pos(0, 0), 1),
+            step_index(&e, Direction::Backward, Location::File("/b"), pos(0, 0), 1),
             Some(0)
         );
         // Past either end (a file that sorts after / before every entry): no wrap, stop.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/z"), pos(0, 0), 1),
+            step_index(&e, Direction::Forward, Location::File("/z"), pos(0, 0), 1),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/A"), pos(0, 0), 1),
+            step_index(&e, Direction::Backward, Location::File("/A"), pos(0, 0), 1),
             None
         );
     }
@@ -785,30 +1108,114 @@ mod tests {
     #[test]
     fn step_scratch_buffer_enters_the_list_at_the_ends() {
         let e = vec![entry("/a", 1, 0), entry("/b", 2, 0)];
+        // A pathless buffer with nothing captured for it sorts past every file, so it enters the
+        // list from outside rather than virtually inserting — always a move, either direction.
         assert_eq!(
-            step_index(&e, Direction::Forward, None, pos(0, 0), 1),
+            step_index(&e, Direction::Forward, Location::Buffer(7), pos(0, 0), 1),
             Some(0)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, None, pos(0, 0), 1),
+            step_index(&e, Direction::Backward, Location::Buffer(7), pos(0, 0), 1),
             Some(1)
         );
+    }
+
+    /// A captured file list steps one file per press, from anywhere in the file: a whole-target
+    /// entry is never "past" the cursor, so the walk always falls through to the neighbour.
+    #[test]
+    fn step_walks_a_whole_file_list_one_target_at_a_time() {
+        let e = vec![whole_file("/a"), whole_file("/b"), whole_file("/c")];
+        // Deep inside /b — the cursor position is irrelevant to a whole-target entry.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::File("/b"), pos(40, 3), 1),
+            Some(2)
+        );
+        assert_eq!(
+            step_index(&e, Direction::Backward, Location::File("/b"), pos(40, 3), 1),
+            Some(0)
+        );
+        // Still stops at the ends rather than cycling.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::File("/c"), pos(0, 0), 1),
+            None
+        );
+        assert_eq!(
+            step_index(&e, Direction::Backward, Location::File("/a"), pos(0, 0), 1),
+            None
+        );
+        // And a count still advances and clamps.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 9),
+            Some(2)
+        );
+    }
+
+    /// A captured scratch buffer is a target like any other: stepping *into* it works by path
+    /// order (it sorts after every file), and stepping out of it lands on its neighbour.
+    #[test]
+    fn step_walks_into_and_out_of_a_captured_scratch_buffer() {
+        let e = vec![whole_file("/a"), scratch(9), scratch(12)];
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 1),
+            Some(1)
+        );
+        // Sitting in scratch 9: forward to the next scratch, backward to the file.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::Buffer(9), pos(0, 0), 1),
+            Some(2)
+        );
+        assert_eq!(
+            step_index(&e, Direction::Backward, Location::Buffer(9), pos(0, 0), 1),
+            Some(0)
+        );
+        // The last scratch is the end of the list.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::Buffer(12), pos(0, 0), 1),
+            None
+        );
+    }
+
+    /// `}`/`{` have nothing to walk in a file list — every entry is the whole file, so there is
+    /// no interior. The client's `NoneInFile` toast points back at `]`.
+    #[test]
+    fn step_in_file_finds_nothing_to_walk_in_a_whole_file_list() {
+        let e = vec![whole_file("/a"), whole_file("/b")];
+        assert_eq!(
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 1),
+            InFileStep::NoneInFile
+        );
+        assert_eq!(
+            step_in_file(&e, Direction::Backward, Location::File("/a"), pos(9, 0), 1),
+            InFileStep::NoneInFile
+        );
+    }
+
+    /// Reopening the picker (`Space j`) while inside a captured file frames *that* file's row,
+    /// wherever the cursor sits in it — being in the buffer is being on the entry.
+    #[test]
+    fn nearest_index_frames_the_current_buffers_whole_target_entry() {
+        let e = vec![whole_file("/a"), whole_file("/b"), scratch(9)];
+        assert_eq!(nearest_index(&e, Location::File("/b"), pos(40, 3)), 1);
+        assert_eq!(nearest_index(&e, Location::File("/a"), pos(0, 0)), 0);
+        assert_eq!(nearest_index(&e, Location::Buffer(9), pos(0, 0)), 2);
+        // A buffer that isn't in the list still frames the top, as before.
+        assert_eq!(nearest_index(&e, Location::Buffer(4), pos(0, 0)), 0);
     }
 
     #[test]
     fn step_count_advances_and_clamps() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/a"), pos(0, 0), 2),
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 2),
             Some(1)
         );
         // Count past the end clamps to the last entry (no wrap) — still a move.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/a"), pos(0, 0), 4),
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 4),
             Some(2)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Some("/b"), pos(2, 0), 2),
+            step_index(&e, Direction::Backward, Location::File("/b"), pos(2, 0), 2),
             Some(0)
         );
     }
@@ -820,10 +1227,10 @@ mod tests {
         let e = vec![entry("/a", 3, 2), spanned.clone(), entry("/a", 3, 12)];
         // Cursor edge at the span's start (col 4): the entry counts as current, step past it.
         assert_eq!(
-            step_index(&e, Direction::Forward, Some("/a"), pos(3, 4), 1),
+            step_index(&e, Direction::Forward, Location::File("/a"), pos(3, 4), 1),
             Some(2)
         );
-        assert_eq!(spanned.start(), pos(3, 4));
+        assert_eq!(spanned.start(), Some(pos(3, 4)));
     }
 
     #[test]
@@ -832,26 +1239,26 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/b", 2, 0), entry("/a", 5, 0)];
         // Forward from the top of /a → its first entry, skipping /b entirely.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/a"), pos(0, 0), 1),
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 1),
             InFileStep::Moved(0)
         );
         // From /a:1 → /a's next entry (index 2), still not /b.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/a"), pos(1, 0), 1),
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(1, 0), 1),
             InFileStep::Moved(2)
         );
         // On /a's last entry → no fall-through to /b; stops at the file's end.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/a"), pos(5, 0), 1),
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(5, 0), 1),
             InFileStep::AtEnd
         );
         // Backward from /a's last → its first; before the first → stop.
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Some("/a"), pos(5, 0), 1),
+            step_in_file(&e, Direction::Backward, Location::File("/a"), pos(5, 0), 1),
             InFileStep::Moved(0)
         );
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Some("/a"), pos(1, 0), 1),
+            step_in_file(&e, Direction::Backward, Location::File("/a"), pos(1, 0), 1),
             InFileStep::AtEnd
         );
     }
@@ -861,12 +1268,12 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0)];
         // /b has no captured entries.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/b"), pos(0, 0), 1),
+            step_in_file(&e, Direction::Forward, Location::File("/b"), pos(0, 0), 1),
             InFileStep::NoneInFile
         );
         // A scratch buffer (no path) likewise has nothing in "its" file.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, None, pos(0, 0), 1),
+            step_in_file(&e, Direction::Forward, Location::Buffer(7), pos(0, 0), 1),
             InFileStep::NoneInFile
         );
     }
@@ -877,16 +1284,16 @@ mod tests {
         // Forward 2 from the top → the second entry (first-past-edge, then one more); a larger
         // count clamps to the last.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/a"), pos(0, 0), 2),
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 2),
             InFileStep::Moved(1)
         );
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Some("/a"), pos(0, 0), 9),
+            step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 9),
             InFileStep::Moved(2)
         );
         // Backward 9 from the last clamps to the first.
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Some("/a"), pos(9, 0), 9),
+            step_in_file(&e, Direction::Backward, Location::File("/a"), pos(9, 0), 9),
             InFileStep::Moved(0)
         );
     }
@@ -896,16 +1303,16 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         // Inclusive: sitting exactly on an entry's start resolves to that entry (unlike
         // stepping, which skips it).
-        assert_eq!(nearest_index(&e, Some("/a"), pos(1, 0)), 0);
+        assert_eq!(nearest_index(&e, Location::File("/a"), pos(1, 0)), 0);
         // Between entries: the next one at-or-after.
-        assert_eq!(nearest_index(&e, Some("/a"), pos(2, 0)), 1);
+        assert_eq!(nearest_index(&e, Location::File("/a"), pos(2, 0)), 1);
         // Past the file's entries: the entry after its last occurrence.
-        assert_eq!(nearest_index(&e, Some("/a"), pos(9, 0)), 2);
+        assert_eq!(nearest_index(&e, Location::File("/a"), pos(9, 0)), 2);
         // Past everything: wraps to the first entry overall.
-        assert_eq!(nearest_index(&e, Some("/b"), pos(9, 0)), 0);
+        assert_eq!(nearest_index(&e, Location::File("/b"), pos(9, 0)), 0);
         // File not in the list: virtual insertion by path; scratch buffers take the top.
-        assert_eq!(nearest_index(&e, Some("/ab"), pos(0, 0)), 2);
-        assert_eq!(nearest_index(&e, None, pos(0, 0)), 0);
+        assert_eq!(nearest_index(&e, Location::File("/ab"), pos(0, 0)), 2);
+        assert_eq!(nearest_index(&e, Location::Buffer(7), pos(0, 0)), 0);
     }
 
     #[test]
@@ -932,10 +1339,12 @@ mod tests {
     /// A headerless, path-less entry (the buffer-scoped diagnostics shape) with an `abs_path`.
     fn headerless(abs: &str) -> JumplistEntry {
         JumplistEntry {
-            path_index: None,
-            relative_path: None,
-            abs_path: abs.into(),
-            position: pos(3, 0),
+            target: JumplistTarget::File {
+                path_index: None,
+                relative_path: None,
+                abs_path: abs.into(),
+            },
+            position: Some(pos(3, 0)),
             anchor: None,
             group: None,
             display: "unused variable `x`".into(),
@@ -948,8 +1357,7 @@ mod tests {
         let mut entries = vec![headerless("/ws/src/lib.rs")];
         assign_file_groups(&mut entries, &roots);
         // Relative parts derived from abs_path — so the open resolves the file, not `root + ""`.
-        assert_eq!(entries[0].path_index, Some(0));
-        assert_eq!(entries[0].relative_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(entries[0].target.relative_parts(), Some((0, "src/lib.rs")));
         // And a File header so the picker shows which file the row belongs to.
         assert_eq!(
             entries[0].group,
@@ -977,6 +1385,10 @@ mod tests {
             headerless("/dep/b.rs")
         ]));
         assert!(!path_filterable(&[]));
+        // A captured file list is the ordinary multi-file case — chips apply.
+        assert!(path_filterable(&[whole_file("/a"), whole_file("/b")]));
+        // Pathless buffers are distinct targets but have nothing for a scope to match.
+        assert!(!path_filterable(&[scratch(9), scratch(12)]));
     }
 
     #[test]
@@ -991,11 +1403,11 @@ mod tests {
         assign_file_groups(&mut entries, &roots);
         // An existing header (references' Label) is preserved; parts are still derived.
         assert!(matches!(entries[0].group, Some(GroupHeader::Label { .. })));
-        assert_eq!(entries[0].relative_path.as_deref(), Some("a.rs"));
+        assert_eq!(entries[0].target.relative_parts(), Some((0, "a.rs")));
         // Out-of-workspace: no parts to derive (opens by absolute path), but grouping is total —
         // the collapsible picker keys every row — so the absolute path becomes the header.
-        assert_eq!(entries[1].path_index, None);
-        assert_eq!(entries[1].relative_path, None);
+        assert_eq!(entries[1].target.relative_parts(), None);
+
         assert_eq!(
             entries[1].group,
             Some(GroupHeader::Label {

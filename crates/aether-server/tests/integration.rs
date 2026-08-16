@@ -16036,9 +16036,9 @@ async fn jumplist_step_within_file_falls_through_then_stops_at_end() {
         .await
         .moved()
         .expect("a captured list resolves the next entry");
-    assert!(target.path.ends_with("src/main.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/main.rs"));
     assert_eq!(target.anchor, Some(LogicalPosition { line: 1, col: 4 }));
-    assert_eq!(target.position, LogicalPosition { line: 1, col: 9 });
+    assert_eq!(target.position, Some(LogicalPosition { line: 1, col: 9 }));
     assert_eq!((target.index, target.total), (2, 3));
 
     // Cursor sitting on the last hit (line 2) — forward falls off the end of main.rs and, with
@@ -16057,9 +16057,9 @@ async fn jumplist_step_within_file_falls_through_then_stops_at_end() {
         .await
         .moved()
         .expect("hit in earlier file");
-    assert!(target.path.ends_with("src/lib.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/lib.rs"));
     assert_eq!(target.anchor, Some(LogicalPosition { line: 0, col: 3 }));
-    assert_eq!(target.position, LogicalPosition { line: 0, col: 8 });
+    assert_eq!(target.position, Some(LogicalPosition { line: 0, col: 8 }));
 
     drop(server);
 }
@@ -16175,7 +16175,7 @@ async fn jumplist_step_virtually_inserts_files_not_in_the_list() {
         .await
         .moved()
         .expect("forward jumps to the next file's entry");
-    assert!(target.path.ends_with("src/lib.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/lib.rs"));
     assert_eq!((target.index, target.total), (1, 3));
 
     let outcome = step_results(&mut ws, 24, buffer_id, Direction::Backward).await;
@@ -16201,7 +16201,7 @@ async fn jumplist_step_in_file_stays_in_the_current_file_and_stops() {
         .await
         .moved()
         .expect("steps to the file's first entry");
-    assert!(target.path.ends_with("src/main.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/main.rs"));
     assert_eq!((target.index, target.total), (2, 3));
 
     // On main.rs's first hit, scoped forward → its second hit (entry 3).
@@ -16210,7 +16210,7 @@ async fn jumplist_step_in_file_stays_in_the_current_file_and_stops() {
         .await
         .moved()
         .expect("steps to the file's next entry");
-    assert!(target.path.ends_with("src/main.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/main.rs"));
     assert_eq!((target.index, target.total), (3, 3));
 
     // On main.rs's last hit, scoped forward stops — it does NOT fall through to a later file
@@ -16348,6 +16348,265 @@ async fn cursor_carries_jumplist_position_when_selection_covers_an_entry() {
     )
     .await;
     assert!(st.jumplist_position.is_none());
+
+    drop(server);
+}
+
+/// Capture the workspace's *files* into the jumplist (`Ctrl-j` in the Files picker) with
+/// `relative_path` as the highlighted row. The rows are whole targets — no position — so the
+/// captured list is ungrouped and steps one file at a time (docs/jumplist.md).
+async fn capture_files(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    relative_path: &str,
+) -> JumplistCaptureResult {
+    let r: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        ws,
+        request_id,
+        &JumplistCaptureParams {
+            kind: PickerKind::Files,
+            item: PickerItem::File {
+                path_index: 0,
+                relative_path: relative_path.into(),
+                match_indices: vec![],
+                git_status: None,
+            },
+        },
+    )
+    .await;
+    r.expect("the workspace has files, capture snapshots them")
+}
+
+/// A Files-picker capture is a list of whole targets: the Jumplist picker renders it **flat**
+/// (no group rows, `collapsible: false`) with no line numbers, and `]`/`[` walk it one file per
+/// press regardless of where the cursor sits — the file-list shape of the jumplist.
+#[tokio::test]
+async fn jumplist_captured_from_the_files_picker_is_flat_and_steps_by_file() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    // The Files picker has to have been viewed for the capture to have candidates.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Files)
+        },
+    )
+    .await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    // Park the cursor deep inside main.rs — a whole-target entry ignores it.
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
+
+    let captured = capture_files(&mut ws, 22, "src/main.rs").await;
+    assert_eq!(
+        captured.total, 3,
+        "README.md, src/lib.rs and src/main.rs all captured"
+    );
+
+    // The view is flat: no group rows, no group spans, and every row carries a bare path with
+    // no line number.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        23,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    assert!(
+        !view.collapsible,
+        "a file-shaped capture has nothing to group by, so the view renders flat"
+    );
+    let update = view.update.expect("the view carries its initial window");
+    assert!(
+        update.groups.is_empty(),
+        "no group spans pushed for a flat view, got {:?}",
+        update.groups
+    );
+    let items = update.items();
+    assert!(
+        !items.iter().any(|i| matches!(i, PickerItem::Group { .. })),
+        "no selectable header rows either, got {items:?}"
+    );
+    let rows: Vec<(&str, Option<u32>)> = items
+        .iter()
+        .map(|i| match i {
+            PickerItem::JumplistEntry { display, line, .. } => (display.as_str(), *line),
+            other => panic!("expected a JumplistEntry, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("README.md", None),
+            ("src/lib.rs", None),
+            ("src/main.rs", None)
+        ],
+        "one row per file in path order, none carrying a line number"
+    );
+
+    // Stepping walks files. From main.rs (the last in path order) `[` lands on lib.rs — one
+    // press, one file, whatever line the cursor was on.
+    let outcome = step_results(&mut ws, 24, buffer_id, Direction::Backward).await;
+    let target = outcome.moved().expect("a captured list steps");
+    assert!(
+        target.path.as_deref().unwrap().ends_with("src/lib.rs"),
+        "got {:?}",
+        target.path
+    );
+    assert_eq!(
+        target.position, None,
+        "a whole-target entry lands on the buffer's own cursor, not a captured position"
+    );
+    assert_eq!((target.index, target.total), (2, 3));
+
+    // And `}` has nothing to walk *within* a file — the client toasts "] steps across files".
+    let outcome = step_in_file(&mut ws, 25, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::NoneInFile),
+        "whole-target entries have no interior to step, got {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// Selecting (or stepping to) a whole-target entry opens the file *where the cursor last was* in
+/// it — `buffer/open` with no `jump_to`, which is exactly what the Files picker's own select
+/// does. A file this client has never opened lands at the top.
+#[tokio::test]
+async fn jumplist_step_to_a_captured_file_restores_its_last_cursor() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Files)
+        },
+    )
+    .await;
+    // Leave a cursor in lib.rs, then move to main.rs.
+    let lib = open_test_buffer(&mut ws, 20, "src/lib.rs").await;
+    set_point_cursor(&mut ws, 21, lib, LogicalPosition { line: 1, col: 3 }).await;
+    let main = open_test_buffer(&mut ws, 22, "src/main.rs").await;
+    set_point_cursor(&mut ws, 23, main, LogicalPosition { line: 0, col: 0 }).await;
+    let _ = capture_files(&mut ws, 24, "src/main.rs").await;
+
+    let target: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        25,
+        &JumplistStepParams {
+            buffer_id: main,
+            direction: Direction::Backward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    let opened = target
+        .moved()
+        .expect("steps")
+        .opened
+        .expect("the composite opens the target");
+    assert_eq!(opened.buffer_id, lib);
+    assert_eq!(
+        opened.cursor.position,
+        LogicalPosition { line: 1, col: 3 },
+        "the open restored this client's own cursor rather than jumping to line 0"
+    );
+    // The status stamp reads "file k of N" for a whole-target entry: being in the buffer is
+    // being on the entry, whatever the cursor does next.
+    let rp = opened
+        .cursor
+        .jumplist_position
+        .expect("the current buffer is a captured target");
+    assert_eq!((rp.current, rp.total), (2, 3));
+
+    drop(server);
+}
+
+/// The Buffers picker captures too, and its one pathless row shape — a scratch buffer — rides as
+/// a *buffer* target: stepping to it attaches by id, exactly as selecting it in that picker does.
+#[tokio::test]
+async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
+    let (server, mut ws) = setup_grep_workspace().await;
+    let main = open_test_buffer(&mut ws, 10, "src/main.rs").await;
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        12,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Buffers)
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        13,
+        &JumplistCaptureParams {
+            kind: PickerKind::Buffers,
+            item: PickerItem::Buffer {
+                buffer_id: main,
+                display: "src/main.rs".into(),
+                status: Default::default(),
+                match_indices: vec![],
+                path_index: Some(0),
+                relative_path: Some("src/main.rs".into()),
+                transient: false,
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        captured.expect("open buffers capture").total,
+        2,
+        "the file buffer and the scratch"
+    );
+
+    // From the file buffer, `]` steps to the scratch — pathless targets sort after files, and
+    // the step identifies it by buffer id rather than a path.
+    let outcome = step_results(&mut ws, 14, main, Direction::Forward).await;
+    let target = outcome.moved().expect("steps");
+    assert_eq!(target.path, None, "a scratch buffer has no path");
+    assert_eq!(target.buffer_id, Some(scratch.buffer_id));
+    assert_eq!(target.position, None);
+
+    // Stepping back off it reaches the file again — the scratch is a first-class entry, not an
+    // outside-the-list origin.
+    let outcome = step_results(&mut ws, 15, scratch.buffer_id, Direction::Backward).await;
+    let target = outcome.moved().expect("steps");
+    assert!(
+        target.path.as_deref().unwrap().ends_with("src/main.rs"),
+        "got {:?}",
+        target.path
+    );
+    // And forward off the last entry stops, as ever.
+    let outcome = step_results(&mut ws, 16, scratch.buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "got {outcome:?}"
+    );
 
     drop(server);
 }
@@ -16536,8 +16795,8 @@ async fn jumplist_capture_from_git_changes_picker() {
         .await
         .moved()
         .expect("captured hunks step");
-    assert!(target.path.ends_with("new.rs"));
-    assert_eq!(target.position, LogicalPosition { line: 0, col: 0 });
+    assert!(target.path.as_deref().unwrap().ends_with("new.rs"));
+    assert_eq!(target.position, Some(LogicalPosition { line: 0, col: 0 }));
     assert_eq!(target.anchor, None, "hunk entries land a point");
     assert_eq!((target.index, target.total), (2, 2));
 
@@ -16607,7 +16866,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
         panic!("expected JumplistEntry, got {:?}", items[2]);
     };
     assert_eq!(*index, 1);
-    assert_eq!(*line, 1);
+    assert_eq!(*line, Some(1));
     assert!(
         display.contains("needle"),
         "row text is the source line: {display}"
@@ -16617,7 +16876,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
             &items[3],
             PickerItem::JumplistEntry {
                 index: 2,
-                line: 2,
+                line: Some(2),
                 ..
             }
         ),
@@ -16672,7 +16931,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
             item: PickerItem::JumplistEntry {
                 index: 1,
                 // Identity is `index`; line/display are ignored on capture.
-                line: 0,
+                line: None,
                 display: String::new(),
                 match_indices: vec![],
             },
@@ -16707,7 +16966,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
         .moved()
         .expect("narrowed list steps");
         assert!(
-            target.path.ends_with("src/main.rs"),
+            target.path.as_deref().unwrap().ends_with("src/main.rs"),
             "lib.rs is out of the narrowed list"
         );
         current = target.opened.expect("composite opens").buffer_id;
@@ -16826,7 +17085,7 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
             kind: PickerKind::Jumplist,
             item: PickerItem::JumplistEntry {
                 index: 1,
-                line: 0,
+                line: Some(0),
                 display: String::new(),
                 match_indices: vec![],
             },
@@ -16959,7 +17218,7 @@ async fn jumplist_step_backward_skips_currently_selected_entry() {
         .await
         .moved()
         .expect("backward should step past the current entry");
-    assert!(target.path.ends_with("src/lib.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/lib.rs"));
     assert_eq!(target.anchor, Some(LogicalPosition { line: 0, col: 3 }));
 
     // Forward from the same selection skips past the trailing edge (col 9) and lands on the
@@ -16968,7 +17227,7 @@ async fn jumplist_step_backward_skips_currently_selected_entry() {
         .await
         .moved()
         .expect("forward should step past the current entry");
-    assert!(target.path.ends_with("src/main.rs"));
+    assert!(target.path.as_deref().unwrap().ends_with("src/main.rs"));
     assert_eq!(target.anchor, Some(LogicalPosition { line: 2, col: 4 }));
 
     drop(server);
@@ -24555,8 +24814,8 @@ async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
         .moved()
         .expect("step resolves the diagnostic entry (no directory error)");
     assert!(
-        target.path.ends_with("main.rs"),
-        "step opens the file, got {}",
+        target.path.as_deref().unwrap().ends_with("main.rs"),
+        "step opens the file, got {:?}",
         target.path
     );
     assert!(

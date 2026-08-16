@@ -11315,6 +11315,11 @@ fn with_match_bracket(buf: &Document, mut cursor: CursorState) -> CursorState {
 /// point entry — same strictness as `match_index_for_cursor` uses to gate the in-buffer `A/B`
 /// counter. Any motion that grows, shrinks, or shifts the selection drops the indicator on the
 /// next response.
+///
+/// A *whole-target* entry (docs/jumplist.md — captured from the Files or Buffers picker) has no
+/// position to match against, so the weaker rule applies: being in its buffer at all is being on
+/// it. The counter then reads as "file k of N", which is what a captured file list means, and it
+/// survives moving around inside the file rather than blinking out on the first motion.
 fn with_jumplist_position(
     s: &ServerState,
     client_id: ClientId,
@@ -11330,13 +11335,11 @@ fn with_jumplist_position(
     let Some(buf) = s.try_doc_of(buffer_id) else {
         return cursor;
     };
-    let Some(current_abs) = buf
+    let current_abs = buf
         .canonical_path
         .as_deref()
-        .map(|p| p.to_string_lossy().into_owned())
-    else {
-        return cursor;
-    };
+        .map(|p| p.to_string_lossy().into_owned());
+    let location = crate::jumplist::location_of(current_abs.as_deref(), buffer_id);
     // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
     // `match_index_for_cursor`). Entry coordinates may be stale after edits; `pos_to_char`
     // clamps, same acceptance as jumping to a stale entry.
@@ -11346,11 +11349,14 @@ fn with_jumplist_position(
     let sel_end_char = anchor_char.max(pos_char);
     let total = list.entries.len() as u32;
     if let Some(idx) = list.entries.iter().position(|e| {
-        if e.abs_path != current_abs {
+        if !e.matches_location(location) {
             return false;
         }
-        let e_start_char = motion::pos_to_char(buf, e.start());
-        let e_end_char = motion::pos_to_char(buf, e.position).max(e_start_char);
+        let (Some(start), Some(position)) = (e.start(), e.position) else {
+            return true; // whole-target: the buffer alone identifies it
+        };
+        let e_start_char = motion::pos_to_char(buf, start);
+        let e_end_char = motion::pos_to_char(buf, position).max(e_start_char);
         sel_start_char == e_start_char && sel_end_char == e_end_char
     }) {
         cursor.jumplist_position = Some(JumplistPosition {
@@ -12368,6 +12374,10 @@ fn dormant_candidate(
         display,
         status,
         path,
+        abs_path: match &d.source {
+            crate::state::DormantSource::File(p) => Some(p.to_string_lossy().into_owned()),
+            crate::state::DormantSource::Scratch { .. } => None,
+        },
         transient: false,
     }
 }
@@ -12396,6 +12406,10 @@ fn buffer_candidate(
         display,
         status: buffer_dirty_state(doc),
         path,
+        abs_path: doc
+            .canonical_path
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned()),
         transient: buf.transient,
     }
 }
@@ -13244,8 +13258,11 @@ struct CursorCentering {
     /// `None` for a buffer outside every root.
     workspace_key: Option<(u32, String)>,
     /// The buffer's absolute path — the jumplist keys entries by it, since its files can sit
-    /// outside every root.
+    /// outside every root. `None` for a scratch buffer, which `buffer_id` then identifies.
     abs_path: Option<String>,
+    /// The buffer itself — the jumplist's identity for a pathless (scratch) buffer, which can be
+    /// a captured target in its own right (`crate::jumplist::location_of`).
+    buffer_id: BufferId,
 }
 
 pub async fn picker_view(
@@ -13544,6 +13561,7 @@ pub async fn picker_view(
                     leading_edge,
                     workspace_key: current_key,
                     abs_path: current_abs,
+                    buffer_id,
                 })
             }
             _ => None,
@@ -13749,12 +13767,13 @@ pub async fn picker_view(
                 Some(CursorCentering {
                     leading_edge,
                     abs_path,
+                    buffer_id,
                     ..
                 }),
                 picker_state::PickerCandidates::Jumplist(entries),
             ) if !entries.is_empty() => {
-                let idx =
-                    crate::jumplist::nearest_index(entries, abs_path.as_deref(), *leading_edge);
+                let location = crate::jumplist::location_of(abs_path.as_deref(), *buffer_id);
+                let idx = crate::jumplist::nearest_index(entries, location, *leading_edge);
                 Some(picker.candidates.make_item(idx, Vec::new()))
             }
             _ => None,
@@ -13772,7 +13791,7 @@ pub async fn picker_view(
         // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames
         // a visible row rather than a collapsed header (docs/picker-groups.md). Centering on a
         // `Group` row just frames the header; it expands nothing.
-        if picker.kind.collapsible() && !matches!(item, PickerItem::Group { .. }) {
+        if picker.collapsible() && !matches!(item, PickerItem::Group { .. }) {
             if let Some(group_key) = picker.group_key_of_item(item) {
                 picker.expanded = Some(group_key);
             }
@@ -13835,6 +13854,7 @@ pub async fn picker_view(
         directory_parent,
         filters: picker.filters.clone(),
         path_filterable,
+        collapsible: picker.collapsible(),
         // Carry the window on the response too — see `PickerViewResult::update`. The push below
         // stays for redundancy (and for the async grep walk's later updates).
         update: update.clone(),
@@ -14193,12 +14213,12 @@ pub async fn picker_set_group(
     let ServerState {
         pickers, matcher, ..
     } = &mut *s;
-    // A missing slot or a non-collapsible kind is a benign no-op (`run: None`), matching
+    // A missing slot or a non-collapsible view is a benign no-op (`run: None`), matching
     // `picker/query`'s lenient style — the picker may have raced a close.
     let Some(picker) = pickers.get_mut(&(client_id, params.kind)) else {
         return Ok(PickerSetGroupResult { run: None });
     };
-    if !params.kind.collapsible() {
+    if !picker.collapsible() {
         return Ok(PickerSetGroupResult { run: None });
     }
     // Resolve the target group against the current ranking FIRST: acting on one that
@@ -14257,12 +14277,23 @@ fn jumplist_open_params(
     entry: &crate::jumplist::JumplistEntry,
     origin: BufferId,
 ) -> BufferOpenParams {
-    let mut path_index = entry.path_index;
-    let mut relative_path = entry.relative_path.clone();
+    // A pathless entry (a captured scratch buffer) attaches by id, exactly as the Buffers
+    // picker's own select does — there is no path to route through the workspace.
+    let Some(abs_path) = entry.abs_path() else {
+        return BufferOpenParams {
+            buffer_id: entry.target.buffer_id(),
+            record_nav_from: Some(origin),
+            ..Default::default()
+        };
+    };
+    let (mut path_index, mut relative_path) = match entry.target.relative_parts() {
+        Some((i, rel)) => (Some(i), Some(rel.to_string())),
+        None => (None, None),
+    };
     if relative_path.is_none() {
         if let Some(workspace) = s.active_workspace(client_id) {
             if let Some((i, rel)) = crate::workspace_index::workspace_relative_parts(
-                std::path::Path::new(&entry.abs_path),
+                std::path::Path::new(abs_path),
                 &workspace.paths,
             ) {
                 path_index = Some(i);
@@ -14270,12 +14301,15 @@ fn jumplist_open_params(
             }
         }
     }
-    let absolute_path = relative_path.is_none().then(|| entry.abs_path.clone());
+    let absolute_path = relative_path.is_none().then(|| abs_path.to_string());
     BufferOpenParams {
         path_index,
         relative_path,
         absolute_path,
-        jump_to: Some(entry.position),
+        // `None` for a whole-target entry: the open then restores the cursor (and scroll) this
+        // client last had in that buffer, or the top of the file if it has never opened it —
+        // which is precisely what selecting the row in the Files/Buffers picker does.
+        jump_to: entry.position,
         jump_to_anchor: entry.anchor,
         transient: Some(true),
         record_nav_from: Some(origin),
@@ -14322,14 +14356,20 @@ pub async fn jumplist_capture(
     };
     // Give every entry its file identity: derive workspace-relative parts from `abs_path` (so the
     // open resolves the file rather than the root directory) and a group header for the headerless
-    // buffer-scoped sources (so the picker shows which file each row belongs to). Unconditional —
-    // the Jumplist picker's collapsible row space keys every row, so grouping must be total even
-    // with no roots to relativize against (out-of-workspace entries get absolute-path labels).
-    let roots = s
-        .active_workspace(client_id)
-        .map(|w| w.paths.clone())
-        .unwrap_or_default();
-    crate::jumplist::assign_file_groups(&mut list.entries, &roots);
+    // buffer-scoped sources (so the picker shows which file each row belongs to). Runs even with
+    // no roots to relativize against (out-of-workspace entries get absolute-path labels): a
+    // grouped list's row space is collapsible, and that keys *every* row.
+    //
+    // Skipped entirely for an ungrouped capture (the file-shaped pickers, whose rows are whole
+    // targets already carrying their parts): it would attach a per-file header above each row
+    // that *is* that file, and flip the view to a collapsible accordion of one-row groups.
+    if list.grouped {
+        let roots = s
+            .active_workspace(client_id)
+            .map(|w| w.paths.clone())
+            .unwrap_or_default();
+        crate::jumplist::assign_file_groups(&mut list.entries, &roots);
+    }
     // A re-capture from the Jumplist picker narrows the list but keeps describing what the
     // entries are entries *of*: the original source kind and query, not the narrowing query
     // typed into the Jumplist picker.
@@ -14390,6 +14430,7 @@ pub async fn jumplist_step(
             .canonical_path
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned());
+        let location = crate::jumplist::location_of(current_abs.as_deref(), params.buffer_id);
         // Use the outer edge of the cursor's selection so an entry the cursor currently sits
         // on is treated as "current" and skipped. Without this, `[` from a freshly-jumped
         // entry (where the selection covers its span) would land back on the same entry
@@ -14415,7 +14456,7 @@ pub async fn jumplist_step(
             JumplistStepScope::Full => match crate::jumplist::step_index(
                 &list.entries,
                 params.direction,
-                current_abs.as_deref(),
+                location,
                 edge,
                 count,
             ) {
@@ -14426,7 +14467,7 @@ pub async fn jumplist_step(
             JumplistStepScope::CurrentFile => match crate::jumplist::step_in_file(
                 &list.entries,
                 params.direction,
-                current_abs.as_deref(),
+                location,
                 edge,
                 count,
             ) {
@@ -14439,7 +14480,8 @@ pub async fn jumplist_step(
         };
         let entry = &list.entries[idx];
         let target = JumplistStepTarget {
-            path: entry.abs_path.clone(),
+            path: entry.abs_path().map(str::to_string),
+            buffer_id: entry.target.buffer_id(),
             position: entry.position,
             anchor: entry.anchor,
             index: idx as u32 + 1,

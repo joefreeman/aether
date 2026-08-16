@@ -59,6 +59,11 @@ pub struct PickerState {
     /// first span of a non-empty window always has `start == 0` (a window beginning mid-group
     /// repeats the split group's header).
     pub groups: Vec<GroupSpan>,
+    /// Whether this view renders as a collapsible accordion — mirrored from the core, which takes
+    /// it from `picker/view` rather than the kind (a Jumplist captured from the Files or Buffers
+    /// picker is flat; docs/jumplist.md). Drives the row-space math, the item indent and the
+    /// sticky pin.
+    pub collapsible: bool,
     /// First *view row* rendered by the picker pane — an index into the window's expanded rows
     /// ([`crate::ui::picker_window_rows`]: header / gap / item rows), not an item index, so the
     /// grouped kinds scroll one screen row at a time. Slides forward / backward on selection moves

@@ -1653,7 +1653,7 @@ pub fn collapsible_pin<'a>(
     top: usize,
 ) -> Option<&'a GroupSpan> {
     let kind = state.picker.kind?;
-    if !kind.collapsible() || !pins_group_header(kind) {
+    if !state.picker.collapsible || !pins_group_header(kind) {
         return None;
     }
     let PickerRow::Item(i) = rows.get(top)? else {
@@ -1939,7 +1939,7 @@ pub fn picker_hit(state: &AppState, cols: u16, rows: u16, row: u16, col: u16) ->
     if picker_empty_message(&state.picker).is_some() {
         return PickerHit::Chrome;
     }
-    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    let collapsible = state.picker.collapsible;
     let view_rows = picker_window_rows(state.picker.items.len(), &state.picker.groups, collapsible);
     let top = state.picker.visible_start.min(view_rows.len());
     let pane_row = (row - layout.results.y) as usize;
@@ -2618,7 +2618,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     // over-fetched cache that lets us scroll without an RPC.
     let pane_height = area.height as usize;
     let groups = &state.picker.groups;
-    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    let collapsible = state.picker.collapsible;
     let rows = picker_window_rows(state.picker.items.len(), groups, collapsible);
     let top = state.picker.visible_start.min(rows.len());
     let end = (top + pane_height).min(rows.len());
@@ -2763,7 +2763,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_picker_scrollbar(f: &mut Frame, state: &AppState, area: Rect) {
-    let collapsible = state.picker.kind.is_some_and(PickerKind::collapsible);
+    let collapsible = state.picker.collapsible;
     // Collapsible kinds scroll row space (headers are rows), so the bar spans the row total.
     let total = if collapsible {
         state
@@ -2822,7 +2822,7 @@ fn picker_item_spans(
         ..
     } = item
     {
-        return preview_row_spans(*line, preview, match_indices, highlighted, max_width);
+        return preview_row_spans(Some(*line), preview, match_indices, highlighted, max_width);
     }
     // A captured entry renders exactly like a grep hit — trimmed preview + right-aligned dim line
     // number — so the two read alike (docs/jumplist.md §2.2). No dot, no dressing.
@@ -3465,7 +3465,7 @@ fn push_styled_with_match_indices(
 /// dim colour — mirroring the web client's layout. An overflowing preview is cut with a dim `…`
 /// so the line number (plus at least a 2-col gap) always stays visible, whatever its digit count.
 fn preview_row_spans(
-    line: u32,
+    line: Option<u32>,
     preview: &str,
     match_indices: &[u32],
     highlighted: bool,
@@ -3489,8 +3489,14 @@ fn preview_row_spans(
         .filter_map(|i| i.checked_sub(lead_chars))
         .collect();
 
-    let line_str = (line + 1).to_string();
-    let preview_budget = max_width.saturating_sub(gap + line_str.width());
+    // A whole-target jumplist entry (a captured file or buffer) has no line to show — the row is
+    // the whole width, with no trailing number and no gap reserved for one.
+    let line_str = line.map(|l| (l + 1).to_string()).unwrap_or_default();
+    let preview_budget = if line_str.is_empty() {
+        max_width
+    } else {
+        max_width.saturating_sub(gap + line_str.width())
+    };
 
     // Truncate the preview from the right when it overflows, marking the cut with a `…` (which
     // takes one of the budget's columns); drop match indices that fall past the cut.
@@ -3530,7 +3536,9 @@ fn preview_row_spans(
         " ".repeat(max_width.saturating_sub(used)),
         base,
     ));
-    spans.push(Span::styled(line_str, dim_style));
+    if !line_str.is_empty() {
+        spans.push(Span::styled(line_str, dim_style));
+    }
     spans
 }
 
@@ -7368,6 +7376,7 @@ mod tests {
         let picker = crate::picker::PickerState {
             open: true,
             kind: Some(PickerKind::Grep),
+            collapsible: true,
             items,
             groups,
             total_matches: 8,
@@ -7465,6 +7474,7 @@ mod tests {
         let state = picker_app(crate::picker::PickerState {
             open: true,
             kind: Some(PickerKind::Grep),
+            collapsible: true,
             total_matches: 4,
             total_display_rows: Some(4),
             items,
@@ -7511,6 +7521,7 @@ mod tests {
         let state = picker_app(crate::picker::PickerState {
             open: true,
             kind: Some(PickerKind::Grep),
+            collapsible: true,
             items,
             groups: vec![GroupSpan {
                 start: 0,
@@ -8085,7 +8096,7 @@ mod tests {
 
     #[test]
     fn grep_hit_line_number_right_aligned() {
-        let spans = preview_row_spans(41, "let x = 1;", &[], false, 30);
+        let spans = preview_row_spans(Some(41), "let x = 1;", &[], false, 30);
         let text = spans_text(&spans);
         assert!(text.starts_with("let x = 1;"));
         assert!(text.ends_with("42"));
@@ -8220,7 +8231,7 @@ mod tests {
         // their dim spans (here: the grep line number, the file row's root label) to `fg_muted`:
         // legible on the selection band, but still visibly dimmer than the full-foreground
         // primary text (a root label matching the path's colour reads as part of the path).
-        let num = preview_row_spans(41, "let x = 1;", &[], true, 30);
+        let num = preview_row_spans(Some(41), "let x = 1;", &[], true, 30);
         assert_eq!(num.last().unwrap().style.fg, Some(c(th().fg_muted)));
         let labels = vec!["alpha".to_string(), "beta".to_string()];
         let file = file_item_spans(1, "src/main.rs", &[], None, &labels, true, 40);
@@ -8235,7 +8246,7 @@ mod tests {
     #[test]
     fn grep_hit_truncates_long_preview_keeping_line_number() {
         let preview = "a very long line of code that cannot possibly fit in the row";
-        let spans = preview_row_spans(99, preview, &[], false, 24);
+        let spans = preview_row_spans(Some(99), preview, &[], false, 24);
         let text = spans_text(&spans);
         assert!(text.contains('…'));
         assert!(text.ends_with("100"));
@@ -8246,7 +8257,7 @@ mod tests {
     fn grep_hit_strips_leading_whitespace_and_shifts_matches() {
         // Match on "hel" at chars 4..7 of the untrimmed preview; after stripping the 4-char
         // indent the highlight must land on the same letters.
-        let spans = preview_row_spans(0, "    helper();", &[4, 5, 6], false, 40);
+        let spans = preview_row_spans(Some(0), "    helper();", &[4, 5, 6], false, 40);
         let text = spans_text(&spans);
         assert!(text.starts_with("helper();"));
         let hl: String = spans
@@ -8259,7 +8270,7 @@ mod tests {
 
     #[test]
     fn grep_hit_drops_matches_inside_stripped_whitespace() {
-        let spans = preview_row_spans(0, "    x", &[1, 2], false, 40);
+        let spans = preview_row_spans(Some(0), "    x", &[1, 2], false, 40);
         assert!(spans
             .iter()
             .all(|s| s.style.fg != Some(c(th().match_highlight))));
@@ -8272,7 +8283,7 @@ mod tests {
         // line number, exactly like grep. Same (line, text, matches) → byte-identical spans.
         let item = PickerItem::JumplistEntry {
             index: 0,
-            line: 40,
+            line: Some(40),
             display: "    helper();".into(),
             match_indices: vec![4, 5, 6],
         };
@@ -8290,8 +8301,29 @@ mod tests {
             .collect();
         assert_eq!(hl, "hel", "matches shift onto the same letters");
         // Identical to the equivalent grep hit — the shared renderer guarantees consistency.
-        let grep = preview_row_spans(40, "    helper();", &[4, 5, 6], false, 40);
+        let grep = preview_row_spans(Some(40), "    helper();", &[4, 5, 6], false, 40);
         assert_eq!(text, spans_text(&grep));
+    }
+
+    /// A whole-target entry — a file or buffer captured from the Files/Buffers picker
+    /// (docs/jumplist.md) — has no line to show, so the row renders the path alone with no
+    /// trailing number and no reserved gap for one.
+    #[test]
+    fn jumplist_whole_target_row_renders_without_a_line_number() {
+        let item = PickerItem::JumplistEntry {
+            index: 0,
+            line: None,
+            display: "src/main.rs".into(),
+            match_indices: vec![],
+        };
+        let spans = picker_item_spans(&item, &[], None, false, 40);
+        let text = spans_text(&spans);
+        assert_eq!(
+            text.trim_end(),
+            "src/main.rs",
+            "the path alone, no line number: {text:?}"
+        );
+        assert_eq!(text.width(), 40, "still padded to the full row width");
     }
 
     /// The Buffers picker marks the session's tether with the status bar's dim ` *` after the

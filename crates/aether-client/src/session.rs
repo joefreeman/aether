@@ -841,12 +841,17 @@ pub struct Session {
     pub diff_view: bool,
     /// The markdown reading view of the current buffer, when active (docs/markdown-view.md).
     pub read: Option<ReadView>,
-    /// Per-buffer read/edit choice for this session: an explicit `Space v` toggle is remembered,
-    /// so switching back to a buffer restores how you left it. Buffers with no entry follow
-    /// [`Self::markdown_read_default`] (and the open-route rules, §1.6).
-    pub(crate) read_pref: std::collections::HashMap<BufferId, bool>,
+    /// This session's live read-vs-source choice for markdown, flipped by `Space v`. Session
+    /// state, not a per-buffer memory: reaching for source is a *task* ("show me the raw
+    /// markdown to fix this link"), not a property of a document — editing works in the reading
+    /// view itself (§12), so being mid-edit is no reason to want source. Seeded from
+    /// [`Self::markdown_read_default`] and re-seeded whenever that setting changes; `Space v`
+    /// deliberately does **not** write through to the setting, which is app-wide and shared with
+    /// every other client.
+    pub(crate) read_on: bool,
     /// App-wide "open markdown as reading view" setting (`Space .`), seeded from `settings/get`
-    /// and synced via `settings/changed`.
+    /// and synced via `settings/changed`. The persisted *default* [`Self::read_on`] starts from,
+    /// not the live state.
     pub markdown_read_default: bool,
     /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and
     /// consumed by `adopt_switch`: jump-shaped opens land in the editor, not the reading view
@@ -1282,7 +1287,7 @@ impl Session {
             hints_enabled: true,
             diff_view: false,
             read: None,
-            read_pref: std::collections::HashMap::new(),
+            read_on: true,
             markdown_read_default: true,
             open_route_jumped: false,
             pending_read_anchor: None,
@@ -1369,11 +1374,10 @@ impl Session {
             .collect()
     }
 
-    /// The remembered read-vs-source presentation choice for `buffer` (`Space v` records it;
-    /// the §12 edit transitions deliberately don't). Exposed read-only so tests can pin that
-    /// contract.
-    pub fn read_preference(&self, buffer: BufferId) -> Option<bool> {
-        self.read_pref.get(&buffer).copied()
+    /// This session's live read-vs-source choice (`Space v` flips it; the §12 edit transitions
+    /// deliberately don't). Exposed read-only so tests can pin that contract.
+    pub fn read_on(&self) -> bool {
+        self.read_on
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The

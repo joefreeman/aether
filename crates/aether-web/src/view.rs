@@ -215,6 +215,11 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // the shell renders one header row per span instead of re-deriving boundaries
                 // from item fields.
                 "groups": p.groups.iter().map(jv).collect::<Vec<_>>(),
+                // Whether this view is a collapsible accordion (docs/picker-groups.md §9). A
+                // property of the view, not the kind — a Jumplist captured from the Files or
+                // Buffers picker renders flat (docs/jumplist.md) — so the shell reads this
+                // rather than keeping its own list of collapsible kinds.
+                "collapsible": p.collapsible,
                 "total_matches": p.total_matches,
                 "total_candidates": p.total_candidates,
                 // The web throbber is CSS-animated off `ticking` (the braille `spinner_glyph` is for

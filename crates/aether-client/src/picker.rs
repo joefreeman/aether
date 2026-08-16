@@ -180,6 +180,12 @@ pub struct PickerState {
     /// Gates the dir/glob chip chords via [`Self::filter_available`]; false until the first view
     /// result lands, so early chords are clean no-ops.
     pub path_filterable: bool,
+    /// Whether this picker renders as a collapsible accordion — the `picker/view` echo of
+    /// `PickerViewResult::collapsible`, and the authority every group-row decision reads (shells
+    /// included) in place of [`PickerKind::collapsible`]. Seeded from the kind so the pre-response
+    /// frame lays out the same way, then corrected by the first view: a Jumplist captured from
+    /// the Files or Buffers picker has no groups and renders flat (docs/jumplist.md).
+    pub collapsible: bool,
 }
 
 /// Braille throbber frames for the "still searching" spinner (left of the picker's count).
@@ -221,6 +227,7 @@ impl PickerState {
             refetch_chases_selection: false,
             loaded: false,
             path_filterable: false,
+            collapsible: kind.collapsible(),
         }
     }
 
@@ -575,7 +582,7 @@ impl PickerState {
                 // The centred row decides the level (docs/picker-groups.md §9): a cursor-
                 // anchored open lands on an entry/hunk — item level; a header anchor stays
                 // group level.
-                if self.kind.collapsible() {
+                if self.collapsible {
                     self.level = if matches!(self.items[pos], PickerItem::Group { .. }) {
                         PickerLevel::Group
                     } else {
@@ -608,7 +615,7 @@ impl PickerState {
     /// window rows. `total_display_rows` is that row total (it falls back to `total_matches`
     /// on adoption for the flat kinds, so this is safe before the first grouped push).
     fn selectable_rows(&self) -> u32 {
-        if self.kind.collapsible() {
+        if self.collapsible {
             self.total_display_rows
         } else {
             self.total_matches
@@ -646,7 +653,7 @@ impl PickerState {
     /// `picker/set_group { step }`, routed by the caller before it gets here; called at group
     /// level this is a no-op.
     pub fn move_selection(&mut self, delta: i64) -> Option<u32> {
-        if self.kind.collapsible() {
+        if self.collapsible {
             if !self.selection_at_item_level() {
                 return None; // group level (or incoherent/empty): nothing moves locally
             }
@@ -700,7 +707,7 @@ impl PickerState {
         let mut spans = self.groups.iter().peekable();
         for (i, item) in self.items.iter().enumerate() {
             while let Some(span) = spans.next_if(|s| s.start as usize <= i) {
-                if self.kind.collapsible() {
+                if self.collapsible {
                     continue; // headers are the `Group` rows themselves
                 }
                 rows.push(match &span.header {
@@ -783,7 +790,7 @@ impl PickerState {
     /// data. Zero for flat kinds, empty results, and the collapsible kinds — their headers are
     /// uniform window rows (docs/picker-groups.md), not gap-separated decorations.
     pub fn total_gap_count(&self) -> u32 {
-        if self.groups.is_empty() || self.kind.collapsible() {
+        if self.groups.is_empty() || self.collapsible {
             return 0;
         }
         self.total_display_rows
@@ -797,7 +804,7 @@ impl PickerState {
     /// (a group ending inside the window would BE the window's leading group). Zero for flat
     /// kinds.
     pub fn gaps_above_window(&self) -> u32 {
-        if self.groups.is_empty() || self.kind.collapsible() {
+        if self.groups.is_empty() || self.collapsible {
             return 0;
         }
         self.window_base().saturating_sub(self.offset)

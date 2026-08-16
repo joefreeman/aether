@@ -2382,6 +2382,7 @@ impl Shell {
         p.offset = core.offset;
         p.items = core.items.clone();
         p.groups = core.groups.clone();
+        p.collapsible = core.collapsible;
         p.total_matches = core.total_matches;
         p.total_candidates = core.total_candidates;
         p.ticking = core.ticking;
@@ -2439,7 +2440,7 @@ impl Shell {
         // boundary — the item-index math jumped a header + gap there. `picker_scroll_step` also
         // carries the on-screen position across a recentering refetch (and preserves it through
         // the empty-items frames a fast scroll produces, rather than snapping to the top).
-        let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups, core.kind.collapsible());
+        let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups, core.collapsible);
         let pin = crate::ui::pins_group_header(core.kind) && !p.groups.is_empty();
         self.picker_scroll = crate::ui::picker_scroll_step(
             &rows,

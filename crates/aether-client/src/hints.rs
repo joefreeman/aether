@@ -341,6 +341,8 @@ pub static CURRICULUM: &[HintDef] = &[
     // captured entries, reopen the list as a picker.
     HintDef { id: "jumplist-capture", tier: 4,
         contexts: &[
+            C::Picker(PickerKind::Files),
+            C::Picker(PickerKind::Buffers),
             C::Picker(PickerKind::Grep),
             C::Picker(PickerKind::Diagnostics),
             C::Picker(PickerKind::DiagnosticsWorkspace),
@@ -1229,7 +1231,10 @@ mod tests {
         e.on_tick(Some(C::Picker(PickerKind::Buffers)), T0 + 1_000, true);
         let id = displayed(&e, C::Picker(PickerKind::Buffers))
             .expect("a picker hint shows without tier progress");
-        assert!(matches!(id, "picker-close" | "picker-nav"), "got {id}");
+        assert!(
+            matches!(id, "picker-close" | "picker-nav" | "jumplist-capture"),
+            "got {id}"
+        );
         // A picker with no dedicated hint still gets the shared vocabulary via AnyPicker.
         e.on_tick(Some(C::Picker(PickerKind::Workspaces)), T0 + 2_000, true);
         assert_eq!(
@@ -1237,10 +1242,10 @@ mod tests {
             Some("picker-nav")
         );
         // And the picker-command follow path rotates whichever hint the Buffers corner shows.
-        let cmd = if id == "picker-close" {
-            PickerCmd::CloseBuffer
-        } else {
-            PickerCmd::MoveSelection
+        let cmd = match id {
+            "picker-close" => PickerCmd::CloseBuffer,
+            "jumplist-capture" => PickerCmd::CaptureJumplist,
+            _ => PickerCmd::MoveSelection,
         };
         let evs = e.observe_picker(cmd, Some(C::Picker(PickerKind::Buffers)), true);
         assert!(evs.contains(&WireEvent {
@@ -1423,7 +1428,10 @@ mod tests {
         let (mut e, _) = engine();
         let files = C::Picker(PickerKind::Files);
         e.note_input();
-        e.retired.insert("picker-scope"); // isolate the Files pool to nav + dismiss
+        // Isolate the Files pool to nav + dismiss — this test is about their ordering, not about
+        // which other hints the picker offers.
+        e.retired.insert("picker-scope");
+        e.retired.insert("jumplist-capture");
 
         // The help hint has displayed, and Alt-j/k has been *used* once (long ago — its hint
         // scores full recency) but never shown and not demonstrated. Mere use must not count

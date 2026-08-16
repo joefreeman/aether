@@ -122,10 +122,12 @@ pub enum PickerKind {
     WorkspaceSymbols,
     /// The client's jumplist (`Space j`, docs/jumplist.md), one row per
     /// captured entry, fuzzy-matched on the entry's display text, grouped by the entries'
-    /// carried source headers (file or section label; capture guarantees every entry one —
-    /// out-of-workspace files get their absolute path as a label). Collapsible
-    /// ([`Self::collapsible`]): a centred open expands the cursor-nearest entry's group,
-    /// the rest sit collapsed. Rebuilt from the live list on every open — nothing to resume, the
+    /// carried source headers (file or section label; a grouped capture gives every entry one —
+    /// out-of-workspace files get their absolute path as a label). Collapsible when grouped,
+    /// which is a property of the *capture*, not the kind: a centred open expands the
+    /// cursor-nearest entry's group and the rest sit collapsed, but a capture from the
+    /// file-shaped pickers ([`Self::groups_in_jumplist`]) renders flat instead — see
+    /// [`PickerViewResult::collapsible`]. Rebuilt from the live list on every open — nothing to resume, the
     /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
     /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
     Jumplist,
@@ -171,6 +173,11 @@ impl PickerKind {
     /// items. The [`Self::groups_by_file`] kinds plus WorkspaceSymbols and Jumplist today, but
     /// deliberately a separate predicate: the two can diverge. The remaining grouped kinds
     /// (References, Keybindings) keep derived, non-selectable, always-expanded headers.
+    ///
+    /// **This is the default, not the authority.** [`Self::Jumplist`] is collapsible only when
+    /// its captured entries carry groups — a capture from Files or Buffers is flat — so the
+    /// server answers per view in [`PickerViewResult::collapsible`], which is what clients
+    /// render from. Use this predicate only where no view response is in hand yet.
     pub fn collapsible(self) -> bool {
         matches!(
             self,
@@ -217,15 +224,19 @@ impl PickerKind {
         self == PickerKind::Jumplist || self.is_git_changes()
     }
 
-    /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose
-    /// rows are jump targets into files (docs/jumplist.md). Excludes the file-shaped kinds
-    /// (Files, Buffers) and the non-jump kinds (Explorer, Workspaces, LspServers, Keybindings).
-    /// Includes [`Self::Jumplist`] itself: capturing there replaces the list with the picker's
+    /// Whether `jumplist/capture` (picker `Ctrl-j`) applies (docs/jumplist.md) — the
+    /// position-shaped kinds, whose rows are jump targets *into* a file, plus the file-shaped
+    /// [`Self::Files`] and [`Self::Buffers`], whose rows are whole targets with no position (they
+    /// capture as position-less entries and open where the cursor last sat). Excludes the
+    /// non-jump kinds (Explorer, Workspaces, LspServers, Keybindings). Includes
+    /// [`Self::Jumplist`] itself: capturing there replaces the list with the picker's
     /// currently-filtered subset — iterative narrowing.
     pub fn captures_to_jumplist(self) -> bool {
         matches!(
             self,
-            PickerKind::Grep
+            PickerKind::Files
+                | PickerKind::Buffers
+                | PickerKind::Grep
                 | PickerKind::Diagnostics
                 | PickerKind::DiagnosticsWorkspace
                 | PickerKind::References
@@ -233,6 +244,20 @@ impl PickerKind {
                 | PickerKind::WorkspaceSymbols
                 | PickerKind::Jumplist
         ) || self.is_git_changes()
+    }
+
+    /// Whether a jumplist captured *from* this kind carries group headers. The position-shaped
+    /// sources group by file (or keep their section labels); the file-shaped ones
+    /// ([`Self::Files`], [`Self::Buffers`]) have exactly one entry per target, so a per-file
+    /// header would just repeat its own row — they capture ungrouped and the Jumplist picker
+    /// renders them flat ([`PickerViewResult::collapsible`]). Grouping is all-or-nothing per
+    /// capture: that uniformity is what keeps the collapsible row space's "every row is keyed"
+    /// invariant true whenever the view *is* collapsible.
+    ///
+    /// [`Self::Jumplist`] isn't listed — a re-capture inherits whatever the entries already
+    /// carry rather than consulting this.
+    pub fn groups_in_jumplist(self) -> bool {
+        self.captures_to_jumplist() && !matches!(self, PickerKind::Files | PickerKind::Buffers)
     }
 }
 
@@ -673,12 +698,15 @@ pub enum PickerItem {
         /// 0-based position in the captured list.
         index: u32,
         /// 0-based line of the entry's landing position, rendered right-aligned and dim like a
-        /// grep hit's line number (shells add 1 for display). Every source is position-shaped, so
-        /// this is always meaningful.
-        line: u32,
+        /// grep hit's line number (shells add 1 for display). `None` for a *whole-target* entry —
+        /// a file or buffer captured without a position (the Files and Buffers pickers), which
+        /// opens wherever the cursor last sat — where a line number would be a fiction. Shells
+        /// render nothing in its place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
         /// The source row's text (grep line, diagnostic message, reference preview, symbol
-        /// name, hunk preview) — rendered verbatim (leading whitespace stripped like a grep
-        /// preview), and the fuzzy haystack.
+        /// name, hunk preview, file path) — rendered verbatim (leading whitespace stripped like
+        /// a grep preview), and the fuzzy haystack.
         display: String,
         /// Char offsets into `display` covered by fuzzy matches.
         #[serde(default)]
@@ -1048,6 +1076,15 @@ pub struct PickerViewResult {
     /// Always `false` for the other kinds — their chip availability is static per kind.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub path_filterable: bool,
+    /// Whether *this view* renders as a collapsible accordion (docs/picker-groups.md): group
+    /// headers as selectable [`PickerItem::Group`] rows, two-level selection, the row space
+    /// counting headers. Normally a per-kind constant ([`PickerKind::collapsible`]) — the second
+    /// data gate after [`Self::path_filterable`], and for the same reason: a Jumplist captured
+    /// from a *file-shaped* picker (Files, Buffers) has one entry per file and nothing to group
+    /// by, so it renders flat, while the same kind captured from Grep renders grouped. Clients
+    /// must read this rather than the kind predicate; the kind is only the pre-response default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsible: bool,
     /// The initial result window (items at `effective_offset`). Mirrors the `picker/update` push
     /// the server also emits, but riding the response lets the client render items atomically with
     /// adopting `generation`/`effective_offset`. The separate push can arrive *before* this

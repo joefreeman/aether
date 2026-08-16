@@ -397,8 +397,10 @@ export type PickerItem =
       kind: "jumplist_entry";
       /** 0-based position in the jumplist — the row's identity. */
       index: number;
-      /** 0-based landing line — the right-aligned dim line number, like a grep hit. */
-      line: number;
+      /** 0-based landing line — the right-aligned dim line number, like a grep hit. Absent for a
+       *  whole-target entry (a file or buffer captured without a position, docs/jumplist.md),
+       *  which renders with no number at all. */
+      line?: number;
       /** The captured entry's flat display text (docs/jumplist.md §2.2). */
       display: string;
       match_indices?: number[];

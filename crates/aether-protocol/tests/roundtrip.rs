@@ -3264,6 +3264,8 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+
+        collapsible: false,
         update: None,
     };
     let v = to_value(&r).unwrap();
@@ -3300,6 +3302,8 @@ fn picker_view_result_directory_fields_serialized() {
         directory_parent: Some("/proj".into()),
         filters: Default::default(),
         path_filterable: true,
+
+        collapsible: false,
         update: None,
     };
     let v = to_value(&r).unwrap();
@@ -3399,6 +3403,8 @@ fn picker_view_result_filters_serialized_when_non_default() {
             ..Default::default()
         },
         path_filterable: false,
+
+        collapsible: false,
         update: None,
     };
     let v = to_value(&r).unwrap();
@@ -3928,8 +3934,9 @@ fn jumplist_wire_shapes() {
     // Step result: `Moved` is internally tagged (`status`), so the target's fields sit alongside
     // the tag. `anchor: None` and `opened: None` stay off the wire.
     let t = JumplistStepTarget {
-        path: "/proj/src/main.rs".into(),
-        position: LogicalPosition { line: 4, col: 9 },
+        path: Some("/proj/src/main.rs".into()),
+        buffer_id: None,
+        position: Some(LogicalPosition { line: 4, col: 9 }),
         anchor: Some(LogicalPosition { line: 4, col: 2 }),
         index: 3,
         total: 17,
@@ -3945,6 +3952,44 @@ fn jumplist_wire_shapes() {
             "anchor": {"line": 4, "col": 2},
             "index": 3,
             "total": 17,
+        })
+    );
+    // A whole-target step (a captured file or buffer, docs/jumplist.md): no position on the wire,
+    // and a pathless one identifies by `buffer_id` instead — exactly one of the two is present.
+    let whole_file = JumplistStepTarget {
+        path: Some("/proj/src/main.rs".into()),
+        buffer_id: None,
+        position: None,
+        anchor: None,
+        index: 1,
+        total: 4,
+        opened: None,
+    };
+    assert_eq!(
+        to_value(JumplistStepResult::Moved(Box::new(whole_file))).unwrap(),
+        json!({
+            "status": "moved",
+            "path": "/proj/src/main.rs",
+            "index": 1,
+            "total": 4,
+        })
+    );
+    let scratch = JumplistStepTarget {
+        path: None,
+        buffer_id: Some(9),
+        position: None,
+        anchor: None,
+        index: 2,
+        total: 4,
+        opened: None,
+    };
+    assert_eq!(
+        to_value(JumplistStepResult::Moved(Box::new(scratch))).unwrap(),
+        json!({
+            "status": "moved",
+            "buffer_id": 9,
+            "index": 2,
+            "total": 4,
         })
     );
     // The boundary / empty outcomes are bare tags.
@@ -3982,7 +4027,7 @@ fn jumplist_wire_shapes() {
     // The Jumplist picker's row shape: positional identity, line number, flat display text.
     let v = to_value(PickerItem::JumplistEntry {
         index: 4,
-        line: 5,
+        line: Some(5),
         display: "let x = 1;".into(),
         match_indices: vec![0, 1],
     })
@@ -3990,6 +4035,19 @@ fn jumplist_wire_shapes() {
     assert_eq!(
         v,
         json!({ "kind": "jumplist_entry", "index": 4, "line": 5, "display": "let x = 1;", "match_indices": [0, 1] })
+    );
+    // A whole-target row (captured from the Files or Buffers picker) carries no line at all —
+    // the shells render nothing in its place rather than a fictional line 1.
+    let v = to_value(PickerItem::JumplistEntry {
+        index: 0,
+        line: None,
+        display: "src/main.rs".into(),
+        match_indices: vec![],
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "kind": "jumplist_entry", "index": 0, "display": "src/main.rs", "match_indices": [] })
     );
     assert_eq!(to_value(PickerKind::Jumplist).unwrap(), json!("jumplist"));
 }
