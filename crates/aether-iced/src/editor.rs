@@ -85,7 +85,8 @@ pub struct Content<'a> {
     /// Horizontal scroll in px — only ever non-zero under `WrapMode::None`.
     pub scroll_x_px: f32,
     /// Cursor-line blame, drawn as dim virtual text after the line: `(line, "author · age")`.
-    pub blame: Option<(u32, &'a str)>,
+    /// Owned: the label is formatted per view ("3w ago" needs a clock).
+    pub blame: Option<(u32, String)>,
     pub tab_width: u32,
     /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
     /// `!=`, … from the JetBrains Mono font); off uses `Basic` (no ligatures, same metrics).
@@ -932,8 +933,8 @@ where
                 }
 
                 // Cursor-line blame: dim virtual text after the line's last row.
-                if let Some((bline, btext)) = self.content.blame {
-                    if line.logical_line == bline && row_idx + 1 == n_rows {
+                if let Some((bline, btext)) = &self.content.blame {
+                    if line.logical_line == *bline && row_idx + 1 == n_rows {
                         let end = cells.last().map(|c| c.dcol + c.width).unwrap_or(0);
                         draw_run(
                             renderer,

@@ -2890,30 +2890,71 @@ fn undo_result_updates_revision_and_cursor() {
 }
 
 #[test]
-fn edit_without_cursor_motion_still_rerequests_symbol_highlights() {
+fn symbol_highlight_follow_is_subscription_shaped() {
     use aether_protocol::lsp::LspServerRef;
     let mut s = session();
+    s.buffer.buffer_id = 1;
     s.buffer.lsp_server = Some(LspServerRef {
         language: "rust".into(),
         workspace_root: "/p".into(),
     });
 
-    // A comment toggle with the caret in the indent edits the buffer but leaves the cursor
-    // where it was. The server drops the (now stale) symbol-highlight set on every mutation,
-    // so the client must re-request it on the revision bump even though nothing moved.
-    let fx = ctrl(&mut s, 'y');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "input/toggle_comment");
-    let fx = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "revision": 3,
-            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
-        })),
-    );
-    let params =
-        find_request(&fx, "lsp/document_highlight").expect("edit re-requests symbol highlights");
+    // The first step in an LSP-backed Normal-mode buffer subscribes exactly once…
+    let fx = key(&mut s, 'j');
+    let params = find_request(&fx, "lsp/document_highlight").expect("first step subscribes");
     assert_eq!(params["active"], true);
+
+    // …and further moves and edits send nothing: the server re-arms the debounced refresh from
+    // its own cursor updates (every edit lands there too, which also covers "the server dropped
+    // the stale set on mutation" — the old per-move/per-edit re-request is gone).
+    let fx = key(&mut s, 'j');
+    assert!(
+        find_request(&fx, "lsp/document_highlight").is_none(),
+        "no per-move request"
+    );
+    let fx = ctrl(&mut s, 'y'); // toggle comment: an edit without cursor motion
+    assert!(
+        find_request(&fx, "lsp/document_highlight").is_none(),
+        "no per-edit request"
+    );
+
+    // Entering Insert unsubscribes (stale highlights must not linger)…
+    let fx = key(&mut s, 'i');
+    let params = find_request(&fx, "lsp/document_highlight").expect("Insert unsubscribes");
+    assert_eq!(params["active"], false);
+    // …and returning to Normal re-subscribes.
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "lsp/document_highlight").expect("Normal re-subscribes");
+    assert_eq!(params["active"], true);
+}
+
+#[test]
+fn blame_follow_tracks_mode_transitions_only() {
+    let mut s = session();
+    s.buffer.buffer_id = 1;
+    s.buffer.path = Some("/p/a.rs".into());
+
+    // Landing in a file-backed Normal-mode buffer enables blame follow once…
+    let fx = key(&mut s, 'j');
+    let params = find_request(&fx, "git/set_blame_follow").expect("first step follows");
+    assert_eq!(params["enabled"], true);
+
+    // …moves send nothing (the server watches its own cursor)…
+    let fx = key(&mut s, 'j');
+    assert!(
+        find_request(&fx, "git/set_blame_follow").is_none(),
+        "no per-move request"
+    );
+
+    // …Insert unfollows (typing must not thrash server-side blame recomputes)…
+    let fx = key(&mut s, 'i');
+    let params = find_request(&fx, "git/set_blame_follow").expect("Insert unfollows");
+    assert_eq!(params["enabled"], false);
+
+    // …and Normal re-follows.
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/set_blame_follow").expect("Normal re-follows");
+    assert_eq!(params["enabled"], true);
 }
 
 #[test]
@@ -6956,9 +6997,12 @@ fn hints_state_fetch_failure_is_loud() {
     );
     assert!(s.hint_view().is_none(), "the engine stays dormant");
 
-    // With hints off the failure is irrelevant — stay quiet.
+    // With hints off the failure is irrelevant — stay quiet. (Drain the one-time decoration
+    // subscribe the first step of any file-backed session emits, so the assertion below sees
+    // only what this event produced.)
     let mut s = hint_session();
     s.hints_enabled = false;
+    let _ = s.on_event(Event::Noop);
     let fx = s.on_event(Event::HintsStateLoaded(Err("method not found".into())));
     assert!(fx.0.is_empty());
 }

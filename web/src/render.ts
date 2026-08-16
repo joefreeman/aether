@@ -518,8 +518,10 @@ export interface RenderOpts {
   diffView: boolean;
 }
 
-/** Repaint the whole buffer area from the current window + cursor. */
-export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
+/** Repaint the whole buffer area from the current window + cursor. `container` is the shell's
+ *  buffer surface — a shadow root in the browser (see `Shell.bufferSurface`), a plain element in
+ *  tests; both satisfy the `:scope > .buffer-spacer` lookup and `replaceChildren` used below. */
+export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOpts): void {
   const { window, cursor, insertMode, awaitingKey, contentWidthPx, spacerHeightPx, contentTopPx, blame, diffView } = opts;
   // The cursor's appearance is decided once here: an underscore while waiting for the next key of a
   // chord (overriding mode), else a bar in Insert, else a block. `makeSpan` just appends this class.

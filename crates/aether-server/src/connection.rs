@@ -24,7 +24,9 @@ use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
-use aether_protocol::git::{GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetDiffView};
+use aether_protocol::git::{
+    GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetBlameFollow, GitSetDiffView,
+};
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
@@ -490,6 +492,7 @@ async fn dispatch(
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),
         GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),
         GitSetDiffView::NAME => run!(GitSetDiffView, handlers::git_set_diff_view),
+        GitSetBlameFollow::NAME => run!(GitSetBlameFollow, handlers::git_set_blame_follow),
         GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),

@@ -47,8 +47,9 @@ use aether_protocol::envelope::RpcMethod;
 use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
-    GitBlameLineParams, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
+    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitNavigateHunk,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams,
     GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
@@ -197,13 +198,6 @@ pub enum Event {
     HoverInfo(Result<LspHoverResult, String>),
     FormatDone(Result<LspFormatResult, String>),
     CommitLookup(Result<CommitDetails, String>),
-    /// Cursor-line blame resolved; `text` is pre-formatted by the shell ("author · 3w ago"
-    /// needs a clock, which the core deliberately lacks).
-    BlameLine {
-        buffer_id: aether_protocol::BufferId,
-        line: u32,
-        text: Option<String>,
-    },
     HunkNav(Result<GitNavigateHunkResult, String>),
     HunkApplied {
         action: HunkAction,
@@ -349,79 +343,84 @@ impl Session {
     /// Dispatch one core event. The shell feeds these from its bridge variant and executes
     /// the returned effects.
     ///
-    /// Wraps [`Self::dispatch_event`] to drive LSP symbol highlighting (see
-    /// [`Self::after_step_highlight`]). Cursor moves arrive here as `CursorMsg` results, so this
-    /// covers motions, edits, jumps, and undo; the synchronous search-clear paths are caught by the
-    /// twin wrapper on [`Self::on_key`].
+    /// Wraps [`Self::dispatch_event`] to keep the server-side cursor-following decorations in
+    /// sync (see [`Self::sync_decoration_follow`]); the twin wrapper on [`Self::on_key`] covers
+    /// the key paths.
     pub fn on_event(&mut self, event: Event) -> Effects {
-        let before = self.highlight_trigger_state();
         let fx = self.dispatch_event(event);
         // Events move the hint context too (a picker/view result opens the picker overlay, a
         // buffer switch lands, …) — keep the corner in sync outside the key path as well.
         let fx = fx.and(self.sync_hint_context());
-        self.after_step_highlight(fx, before)
+        fx.and(self.sync_decoration_follow())
     }
 
-    /// Snapshot of the inputs that decide whether a step should re-request symbol highlights: the
-    /// cursor position, the buffer revision, whether a search is active, and the mode.
-    fn highlight_trigger_state(&self) -> (LogicalPosition, u64, bool, Mode) {
-        (
-            self.buffer.cursor.position,
-            self.buffer.revision,
-            self.search.active,
-            self.mode,
-        )
-    }
+    /// After a reducer step, reconcile the server's cursor-following decorations — the symbol
+    /// highlight set and the cursor-line blame label — with the session's mode/search/buffer.
+    /// Follow is **subscription-shaped**: while enabled for a buffer, the server re-resolves the
+    /// decoration itself (debounced) on every cursor change, so nothing is sent per move — only
+    /// on transitions (mode changes, search start/end, buffer switches), where the previous
+    /// subscription is dropped and the new one raised. Both toggles arm an immediate refresh
+    /// server-side, so entering Normal mode (or landing in a buffer) paints without waiting for
+    /// a move. Run by both reducer entry points so every transition is covered exactly once.
+    fn sync_decoration_follow(&mut self) -> Effects {
+        let buffer_id = self.buffer.buffer_id;
+        let mut fx = Effects::none();
 
-    /// After a reducer step, keep the symbol highlight set in sync with the cursor and mode. Leaving
-    /// Normal mode (into Insert or the search prompt) clears the set so a stale highlight can't
-    /// linger; otherwise the set is re-requested when the cursor landed somewhere new, the buffer
-    /// was edited (the server drops the now-stale set on every mutation, so it needs re-resolving
-    /// even when the cursor stayed put — e.g. a line-comment toggle with the cursor in the indent),
-    /// a search just ended (its highlights were dropped and the symbol set should return), or we
-    /// just came back to Normal mode. One trigger shared by both reducer entry points so every such
-    /// transition is covered exactly once; the server debounces and only paints when no search is
-    /// active.
-    fn after_step_highlight(
-        &mut self,
-        fx: Effects,
-        before: (LogicalPosition, u64, bool, Mode),
-    ) -> Effects {
-        let (before_pos, before_rev, before_search, before_mode) = before;
-        if before_mode == Mode::Normal && self.mode != Mode::Normal {
-            return fx.and(self.set_document_highlight(false));
+        // Blame label: Normal mode on a file-backed buffer. Insert mode unfollows so typing
+        // never has the server recomputing whole-file blame in the pauses.
+        let want_blame = (self.mode == Mode::Normal && buffer_id != 0 && self.buffer.path.is_some())
+            .then_some(buffer_id);
+        if self.blame_follow_on != want_blame {
+            if let Some(old) = self.blame_follow_on {
+                fx = fx.and(self.request::<GitSetBlameFollow>(
+                    GitSetBlameFollowParams {
+                        buffer_id: old,
+                        enabled: false,
+                    },
+                    |_r| Event::Noop,
+                ));
+            }
+            if let Some(new) = want_blame {
+                fx = fx.and(self.request::<GitSetBlameFollow>(
+                    GitSetBlameFollowParams {
+                        buffer_id: new,
+                        enabled: true,
+                    },
+                    |_r| Event::Noop,
+                ));
+            }
+            self.blame_follow_on = want_blame;
         }
-        let moved = self.buffer.cursor.position != before_pos;
-        let edited = self.buffer.revision != before_rev;
-        let search_ended = before_search && !self.search.active;
-        let entered_normal = before_mode != Mode::Normal && self.mode == Mode::Normal;
-        if moved || edited || search_ended || entered_normal {
-            fx.and(self.set_document_highlight(true))
-        } else {
-            fx
-        }
-    }
 
-    /// Sync the server-side symbol highlight set for the current buffer (fire-and-forget; the result
-    /// rides `viewport/lines_changed`). `active` resolves and paints the symbol under the cursor;
-    /// `!active` clears it. Painting is gated to Normal mode with no active search — a search owns
-    /// the highlight layer, and in Insert mode the symbol is mid-edit, so re-highlighting on every
-    /// keystroke would just be noise. Either way it's gated to buffers that actually have a language
-    /// server, so plain-text buffers never round-trip.
-    fn set_document_highlight(&mut self, active: bool) -> Effects {
-        if self.buffer.lsp_server.is_none() {
-            return Effects::none();
+        // Symbol highlights: Normal mode, no active search (a search owns the highlight layer),
+        // and only for buffers with a language server, so plain-text buffers never round-trip.
+        let want_hl = (self.mode == Mode::Normal
+            && !self.search.active
+            && buffer_id != 0
+            && self.buffer.lsp_server.is_some())
+        .then_some(buffer_id);
+        if self.highlight_follow_on != want_hl {
+            if let Some(old) = self.highlight_follow_on {
+                fx = fx.and(self.request::<LspDocumentHighlight>(
+                    LspDocumentHighlightParams {
+                        buffer_id: old,
+                        active: false,
+                    },
+                    |_r| Event::Noop,
+                ));
+            }
+            if let Some(new) = want_hl {
+                fx = fx.and(self.request::<LspDocumentHighlight>(
+                    LspDocumentHighlightParams {
+                        buffer_id: new,
+                        active: true,
+                    },
+                    |_r| Event::Noop,
+                ));
+            }
+            self.highlight_follow_on = want_hl;
         }
-        if active && (self.mode != Mode::Normal || self.search.active) {
-            return Effects::none();
-        }
-        self.request::<LspDocumentHighlight>(
-            LspDocumentHighlightParams {
-                buffer_id: self.buffer.buffer_id,
-                active,
-            },
-            |_r| Event::Noop,
-        )
+        fx
     }
 
     fn dispatch_event(&mut self, event: Event) -> Effects {
@@ -881,17 +880,6 @@ impl Session {
                 Effects::toast(note, ToastKind::Info)
             }
             Event::CommitLookup(Err(e)) => Effects::error(format!("Commit info failed: {e}")),
-
-            Event::BlameLine {
-                buffer_id,
-                line,
-                text,
-            } => {
-                if buffer_id == self.buffer.buffer_id && line == self.buffer.cursor.position.line {
-                    self.blame = text.map(|t| (line, t));
-                }
-                Effects::none()
-            }
 
             Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more changes"),
             Event::HunkNav(Err(e)) => Effects::error(e),
@@ -1626,7 +1614,10 @@ impl Session {
                 // resubscribe replaces it.
                 self.viewport_id = None;
                 self.blame = None;
-                self.blame_requested = None;
+                // Server-side follow state died with the old connection; forget ours so the
+                // post-reconnect sync re-subscribes from scratch.
+                self.blame_follow_on = None;
+                self.highlight_follow_on = None;
                 self.prompt = None;
                 self.picker = None;
                 let buffer_id = self.buffer.buffer_id;
@@ -2054,7 +2045,6 @@ impl Session {
         self.viewport_id = None;
         self.drag = None;
         self.blame = None;
-        self.blame_requested = None;
         self.prompt = None;
         self.search = SearchState::default();
         self.buffer = buffer_info(open, &self.workspace_paths);
@@ -4762,6 +4752,18 @@ impl Session {
                 let read_fx = self.maybe_refresh_read(self.buffer.buffer_id, p.revision);
                 Effects::one(Effect::WindowAdopted).and(read_fx)
             }
+            GitBlameChanged::NAME => {
+                // The blame-follow push (`git/set_blame_follow`): the settled cursor line's
+                // blame. Stale pushes for a previous buffer are discarded; a `None` blame
+                // clears the label (no repo / untracked / past EOF).
+                let Ok(p) = serde_json::from_value::<GitBlameChangedParams>(n.params) else {
+                    return Effects::none();
+                };
+                if p.buffer_id == self.buffer.buffer_id {
+                    self.blame = p.blame.map(|b| (p.line, b));
+                }
+                Effects::none()
+            }
             BufferChanged::NAME => {
                 // The revision-only change signal for edits outside the pushed window — the
                 // reading view's cue to re-fetch (docs/markdown-view.md §3). Editor rendering
@@ -6734,10 +6736,9 @@ impl Session {
         // Every key is hint-relevant activity (the idle gate), and dispatch may have moved the
         // hint context (opened an overlay, left Insert) — re-sync so the corner follows.
         self.hints.note_input();
-        let before = self.highlight_trigger_state();
         let fx = self.dispatch_key(code, mods, text, visible_rows);
         let fx = fx.and(self.sync_hint_context());
-        self.after_step_highlight(fx, before)
+        fx.and(self.sync_decoration_follow())
     }
 
     fn dispatch_key(

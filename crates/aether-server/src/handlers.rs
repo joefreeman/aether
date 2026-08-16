@@ -33,9 +33,10 @@ use aether_protocol::directory::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameLineParams,
-    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetDiffViewParams, HunkAction, HunkDirection,
+    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
+    GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
+    GitChangeCounts, GitNavigateHunkParams, GitNavigateHunkResult, GitSetBlameFollowParams,
+    GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -1876,7 +1877,7 @@ fn resolve_open_cursor(
             jumplist_position: None,
         };
         if let Some(c) = client_id {
-            s.cursors.insert((c, buffer_id), new);
+            set_cursor(s, (c, buffer_id), new);
         }
         new
     } else {
@@ -2649,32 +2650,7 @@ pub async fn git_blame_line(
             commit_info: None,
         }); // scratch buffer
     }
-    let revision = buf.revision;
-
-    let stale = s
-        .git_blame
-        .get(&params.buffer_id)
-        .is_none_or(|c| c.revision != revision);
-    if stale {
-        // Blame via the cached repo (no rediscovery). `None` repo (untracked / no repo) → empty.
-        // The `buf`/`git_baseline` borrows end at the `compute_blame` call; `lines` is owned, so
-        // the `git_blame` mutation below is free of them.
-        let lines = match s
-            .git_baseline
-            .get(&params.buffer_id)
-            .and_then(|b| b.repo.as_ref())
-        {
-            Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        s.git_blame
-            .insert(params.buffer_id, BlameCache { revision, lines });
-    }
-
-    let blame = s
-        .git_blame
-        .get(&params.buffer_id)
-        .and_then(|c| c.lines.get(params.line as usize).cloned().flatten());
+    let blame = cursor_line_blame(&mut s, params.buffer_id, params.line);
     // Composite post-step (docs/protocol-composites.md, G): resolve the commit's details in
     // the same round-trip. Best-effort — an unresolvable hash just yields `None`.
     let commit_info = match &blame {
@@ -2686,6 +2662,164 @@ pub async fn git_blame_line(
         _ => None,
     };
     Ok(GitBlameLineResult { blame, commit_info })
+}
+
+/// Resolve one line's blame from the per-revision whole-file cache, (re)computing the cache when
+/// stale. Shared by the `git/blame_line` request (the commit-details popover) and the
+/// blame-follow refresher (`spawn_blame_refresh`). `None` for a missing buffer, no repo, an
+/// untracked file, or a line past end-of-file.
+fn cursor_line_blame(
+    s: &mut ServerState,
+    buffer_id: BufferId,
+    line: u32,
+) -> Option<aether_protocol::git::BlameInfo> {
+    let buf = s.try_doc_of(buffer_id)?;
+    let revision = buf.revision;
+    let stale = s
+        .git_blame
+        .get(&buffer_id)
+        .is_none_or(|c| c.revision != revision);
+    if stale {
+        // Blame via the cached repo (no rediscovery). `None` repo (untracked / no repo) → empty.
+        // The `buf`/`git_baseline` borrows end at the `compute_blame` call; `lines` is owned, so
+        // the `git_blame` mutation below is free of them.
+        let lines = match s.git_baseline.get(&buffer_id).and_then(|b| b.repo.as_ref()) {
+            Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        s.git_blame.insert(buffer_id, BlameCache { revision, lines });
+    }
+    s.git_blame
+        .get(&buffer_id)
+        .and_then(|c| c.lines.get(line as usize).cloned().flatten())
+}
+
+/// Settle window for blame-follow pushes. Matches [`SYMBOL_HIGHLIGHT_DEBOUNCE`] so both
+/// cursor-following decorations land together once the cursor rests, and a held `j` produces no
+/// blame traffic at all.
+const BLAME_FOLLOW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// `git/set_blame_follow` — toggle server-driven cursor-line blame for `(client, buffer)`.
+/// Enabling arms an immediate (still debounced) refresh so the label appears without waiting for
+/// a cursor move; disabling drops all follow state — the client clears its own label locally.
+pub async fn git_set_blame_follow(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitSetBlameFollowParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.client_id;
+    let key = (client_id, params.buffer_id);
+    let armed = {
+        let mut s = state.lock().await;
+        if params.enabled {
+            s.blame_follow.insert(key);
+            // Forget the last push so the first settle always delivers a label — re-enabling
+            // after an Insert round-trip must refresh even at an unchanged position.
+            s.blame_last_pushed.remove(&key);
+            let gen = s.blame_follow_gen.entry(key).or_insert(0);
+            *gen += 1;
+            Some(*gen)
+        } else {
+            s.blame_follow.remove(&key);
+            s.blame_follow_gen.remove(&key);
+            s.blame_last_pushed.remove(&key);
+            None
+        }
+    };
+    if let Some(epoch) = armed {
+        spawn_blame_refresh(state.clone(), client_id, params.buffer_id, epoch);
+    }
+    Ok(())
+}
+
+/// The debounced body of blame-follow: wait out the settle window, then — if this is still the
+/// latest arming — resolve the followed cursor's line, look up its blame (per-revision cache),
+/// and push `git/blame_changed` unless the settled `(line, revision)` matches the last push.
+/// Mirrors [`spawn_symbol_highlight_refresh`].
+pub fn spawn_blame_refresh(
+    state: SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    epoch: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(BLAME_FOLLOW_DEBOUNCE).await;
+        let key = (client_id, buffer_id);
+        let (sender, notif) = {
+            let mut s = state.lock().await;
+            if s.blame_follow_gen.get(&key) != Some(&epoch) || !s.blame_follow.contains(&key) {
+                return; // superseded by a newer move, or unfollowed while we slept
+            }
+            // No cursor entry yet (followed straight after open, before any cursor RPC) reads
+            // as the origin — matching every other handler's missing-cursor default.
+            let line = s.cursors.get(&key).map(|c| c.position.line).unwrap_or(0);
+            let Some(buf) = s.try_doc_of(buffer_id) else {
+                return;
+            };
+            if buf.canonical_path.is_none() {
+                return; // scratch buffer — never has blame
+            }
+            let revision = buf.revision;
+            if s.blame_last_pushed.get(&key) == Some(&(line, revision)) {
+                return; // blame is deterministic per (line, revision): nothing new to say
+            }
+            let blame = cursor_line_blame(&mut s, buffer_id, line);
+            s.blame_last_pushed.insert(key, (line, revision));
+            let Some(sender) = s.clients.get(&client_id).map(|c| c.outbound.clone()) else {
+                return;
+            };
+            let params = GitBlameChangedParams {
+                buffer_id,
+                line,
+                blame,
+            };
+            (
+                sender,
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: GitBlameChanged::NAME.into(),
+                    params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+                },
+            )
+        };
+        let _ = sender.send(notif).await;
+    });
+}
+
+/// Drain cursor-change events from [`set_cursor`] and re-arm the debounced refresh of each
+/// cursor-following decoration (blame label, symbol highlights). A dedicated task — rather than
+/// arming at the `set_cursor` call sites — because arming spawns with a `SharedState` clone,
+/// which the deeply-nested handler paths that move cursors don't have in scope.
+pub async fn cursor_follow_loop(
+    state: SharedState,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(ClientId, BufferId)>,
+) {
+    while let Some(key) = rx.recv().await {
+        let (blame_epoch, hl_epoch) = {
+            let mut s = state.lock().await;
+            let blame = s.blame_follow.contains(&key).then(|| {
+                let gen = s.blame_follow_gen.entry(key).or_insert(0);
+                *gen += 1;
+                *gen
+            });
+            // An active search owns the highlight layer (the enable handler refuses too);
+            // don't fight it from the follow side even if the unfollow is still in flight.
+            let hl = (s.symbol_highlight_follow.contains(&key)
+                && !s.searches.contains_key(&key))
+            .then(|| {
+                let epoch = next_symbol_hl_epoch();
+                s.symbol_highlight_gen.insert(key, epoch);
+                epoch
+            });
+            (blame, hl)
+        };
+        if let Some(epoch) = blame_epoch {
+            spawn_blame_refresh(state.clone(), key.0, key.1, epoch);
+        }
+        if let Some(epoch) = hl_epoch {
+            spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch);
+        }
+    }
 }
 
 /// Toggle the inline diff view for a viewport. Turning it on recomputes the buffer's hunks (they
@@ -2842,7 +2976,7 @@ pub async fn git_navigate_hunk(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, result);
+    set_cursor(&mut s, key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -3292,7 +3426,9 @@ pub async fn lsp_document_highlight(
     if !params.active {
         let pushes = {
             let mut s = state.lock().await;
-            // Invalidate any in-flight refresh, then clear — repainting only if something showed.
+            // Stop following, invalidate any in-flight refresh, then clear — repainting only if
+            // something showed.
+            s.symbol_highlight_follow.remove(&key);
             s.symbol_highlight_gen.remove(&key);
             if s.symbol_highlights.remove(&key).is_none() {
                 return Ok(());
@@ -3315,6 +3451,9 @@ pub async fn lsp_document_highlight(
         if !s.lsp.doc_server.contains_key(&buffer_id) {
             return Ok(());
         }
+        // Follow from here on: `set_cursor` re-arms this refresh on every cursor change, so the
+        // client never re-sends this request per move.
+        s.symbol_highlight_follow.insert(key);
         let epoch = next_symbol_hl_epoch();
         s.symbol_highlight_gen.insert(key, epoch);
         epoch
@@ -3467,7 +3606,7 @@ pub async fn lsp_navigate_diagnostic(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, result);
+    set_cursor(&mut s, key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -4177,6 +4316,20 @@ fn attach_git_baseline(
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
     s.git_both_hunks.insert(buffer_id, both);
     s.git_blame.remove(&buffer_id); // committed history may have changed → recompute on request
+    // The blame label's push dedupe keys on (line, revision) — both unchanged by an external
+    // commit — so forget the last pushes and re-arm every follower, or the label would go stale.
+    let followers: Vec<_> = s
+        .blame_follow
+        .iter()
+        .filter(|(_, b)| *b == buffer_id)
+        .copied()
+        .collect();
+    for key in followers {
+        s.blame_last_pushed.remove(&key);
+        if let Some(tx) = &s.cursor_moved_tx {
+            let _ = tx.send(key);
+        }
+    }
     collect_buffer_refresh_pushes(s, buffer_id)
 }
 
@@ -4320,7 +4473,7 @@ pub async fn search_set(
                     jumplist_position: None,
                 };
                 let prev_cursor = cursor;
-                s.cursors.insert(key, new_cursor);
+                set_cursor(&mut s, key, new_cursor);
                 s.record_motion(key, prev_cursor, new_cursor);
                 s.virtual_col.remove(&key);
                 s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -4517,7 +4670,7 @@ pub async fn sneak_select(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, new_cursor);
+    set_cursor(&mut s, key, new_cursor);
     s.record_motion(key, cursor, new_cursor);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -4706,7 +4859,7 @@ async fn search_navigate(
         jumplist_position: None,
     };
     let prev_cursor = s.cursors.get(&key).copied().unwrap_or_default();
-    s.cursors.insert(key, new_cursor);
+    set_cursor(&mut s, key, new_cursor);
     s.record_motion(key, prev_cursor, new_cursor);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, buffer_id);
@@ -4805,6 +4958,20 @@ fn match_index_for_cursor(buf: &Document, entry: &SearchEntry, cursor: &CursorSt
         })
         .map(|i| (i as u32).saturating_add(1))
         .unwrap_or(0)
+}
+
+/// The single write path for a client's cursor on a buffer. Every handler that moves, edits,
+/// clamps, or restores a cursor lands here, so the server can re-arm the cursor-following
+/// decorations (blame label, symbol highlights) itself — clients never report cursor movement,
+/// they only toggle following on mode/search transitions. The send is a no-op unless the pair
+/// actually follows something (and in bare-state unit tests, where no follow loop runs).
+fn set_cursor(s: &mut ServerState, key: (ClientId, BufferId), new: CursorState) {
+    s.cursors.insert(key, new);
+    if s.blame_follow.contains(&key) || s.symbol_highlight_follow.contains(&key) {
+        if let Some(tx) = &s.cursor_moved_tx {
+            let _ = tx.send(key);
+        }
+    }
 }
 
 /// Build one `viewport/lines_changed` notification per viewport owned by `client_id` that's
@@ -5584,7 +5751,7 @@ pub async fn buffer_cut(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert((client_id, params.buffer_id), new_cursor);
+    set_cursor(&mut s, (client_id, params.buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(params.buffer_id);
     s.clear_tree_selection_history_for_buffer(params.buffer_id);
     s.clear_virtual_col_for_buffer(params.buffer_id);
@@ -8104,7 +8271,7 @@ pub async fn cursor_move(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, new_state);
+    set_cursor(&mut s, key, new_state);
     s.record_motion(key, current, new_state);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     match new_virtual_col {
@@ -8159,7 +8326,7 @@ pub async fn cursor_select_word(
     }
     let new_state = working;
 
-    s.cursors.insert(key, new_state);
+    set_cursor(&mut s, key, new_state);
     s.record_motion(key, original, new_state);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     s.virtual_col.remove(&key);
@@ -8286,7 +8453,7 @@ async fn cursor_select_line_once(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, new_state);
+    set_cursor(&mut s, key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -8326,7 +8493,7 @@ pub async fn cursor_swap_anchor(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, new_state);
+    set_cursor(&mut s, key, new_state);
     s.record_motion(key, current, new_state);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -8367,7 +8534,7 @@ pub async fn cursor_select_all(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, result);
+    set_cursor(&mut s, key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -8401,7 +8568,7 @@ pub async fn cursor_set(
         match_bracket: None,
         jumplist_position: None,
     };
-    s.cursors.insert(key, result);
+    set_cursor(&mut s, key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -8460,7 +8627,7 @@ async fn cursor_undo_once(
         history.redo.remove(0);
     }
 
-    s.cursors.insert(key, prev);
+    set_cursor(&mut s, key, prev);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
@@ -8520,7 +8687,7 @@ async fn cursor_redo_once(
         history.undo.pop_front();
     }
 
-    s.cursors.insert(key, next);
+    set_cursor(&mut s, key, next);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
     let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
@@ -8612,7 +8779,7 @@ async fn cursor_expand_once(
         jumplist_position: None,
     };
 
-    s.cursors.insert(key, new_cursor);
+    set_cursor(&mut s, key, new_cursor);
     s.record_motion(key, current, new_cursor);
     s.virtual_col.remove(&key);
     s.tree_selection_history
@@ -8649,7 +8816,7 @@ async fn cursor_contract_once(
         return Ok(wrap_for_response(&s, client_id, buffer_id, cur));
     };
     let current = s.cursors.get(&key).copied().unwrap_or_default();
-    s.cursors.insert(key, prev);
+    set_cursor(&mut s, key, prev);
     s.record_motion(key, current, prev);
     s.virtual_col.remove(&key);
     let search_update = collect_cursor_search_update(&mut s, client_id, buffer_id);
@@ -8810,7 +8977,7 @@ pub async fn input_text(
             match_bracket: None,
             jumplist_position: None,
         };
-        s.cursors.insert(key, collapsed);
+        set_cursor(&mut s, key, collapsed);
         s.record_motion(key, current, collapsed);
         s.virtual_col.remove(&key);
         s.clear_tree_selection_history(client_id, params.buffer_id);
@@ -9778,7 +9945,7 @@ async fn apply_toggle_comment(
         c.anchor = motion::clamp_position(buf_mut, c.anchor);
         c
     };
-    s.cursors.insert((client_id, buffer_id), new_cursor);
+    set_cursor(&mut s, (client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
@@ -10306,7 +10473,7 @@ async fn apply_indent_or_dedent(
         };
         (revision, new_cursor)
     };
-    s.cursors.insert((client_id, buffer_id), new_cursor);
+    set_cursor(&mut s, (client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
@@ -10645,7 +10812,7 @@ async fn input_move_lines_once(
         };
         (revision, new_cursor)
     };
-    s.cursors.insert((client_id, buffer_id), new_cursor);
+    set_cursor(&mut s, (client_id, buffer_id), new_cursor);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
@@ -10833,7 +11000,7 @@ async fn input_join_lines_once(
             match_bracket: None,
             jumplist_position: None,
         };
-        s.cursors.insert((client_id, buffer_id), new_cursor);
+        set_cursor(&mut s, (client_id, buffer_id), new_cursor);
         s.clear_motion_history_for_buffer(buffer_id);
         s.clear_tree_selection_history_for_buffer(buffer_id);
         s.clear_virtual_col_for_buffer(buffer_id);
@@ -10970,7 +11137,7 @@ async fn apply_undo_or_redo(
         }
     }
     for (key, cursor) in &new_cursors {
-        s.cursors.insert(*key, *cursor);
+        set_cursor(&mut s, *key, *cursor);
     }
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
@@ -11710,7 +11877,7 @@ async fn apply_edit_reporting(
             jumplist_position: None,
         }
     };
-    s.cursors.insert((client_id, buffer_id), new_cursor_state);
+    set_cursor(&mut s, (client_id, buffer_id), new_cursor_state);
     s.clear_motion_history_for_buffer(buffer_id);
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
@@ -11911,7 +12078,7 @@ fn clamp_doc_cursors(s: &mut ServerState, buffer_id: BufferId) {
     for key in keys {
         if let Some(cur) = s.cursors.get(&key).copied() {
             let clamped = clamp_cursor(s.doc_of(key.1), cur);
-            s.cursors.insert(key, clamped);
+            set_cursor(s, key, clamped);
         }
     }
 }

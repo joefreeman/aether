@@ -49,7 +49,14 @@ pub fn build_view(s: &Session) -> Value {
         "lsp": s.lsp.as_ref().map(jv),
         "externally_modified": s.externally_modified,
         "externally_deleted": s.externally_deleted,
-        "blame": s.blame.as_ref().map(|(line, text)| json!({ "line": line, "text": text })),
+        // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
+        // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
+        "blame": s.blame.as_ref().map(|(line, b)| json!({
+            "line": line,
+            "author": b.author,
+            "timestamp": b.timestamp,
+            "is_uncommitted": b.is_uncommitted,
+        })),
         "count": s.count,
         "pending": pending(&s.pending),
         "sneak_active": s.sneak.is_some(),

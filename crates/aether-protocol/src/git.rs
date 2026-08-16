@@ -6,7 +6,7 @@
 //! the user just typed reports as uncommitted rather than misattributing to the previous author.
 
 use crate::cursor::CursorState;
-use crate::envelope::RpcMethod;
+use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::viewport::ViewportWindowResult;
 use crate::{BufferId, ViewportId};
 use serde::{Deserialize, Serialize};
@@ -176,6 +176,53 @@ pub enum ApplyHunkStatus {
     DirtyBuffer,
     /// The buffer isn't in a Git repository (or the index write failed).
     Unavailable,
+}
+
+// ---- git/set_blame_follow -----------------------------------------------------------------------
+
+/// Toggle server-driven cursor-line blame for one buffer. While enabled, the server watches this
+/// client's cursor on the buffer and — after a short settle window — pushes [`GitBlameChanged`]
+/// whenever the settled cursor line's blame differs from the last push. This replaces the old
+/// client-polled label flow (a `git/blame_line` request per cursor move): the cursor is
+/// server-authoritative, so a per-move request told the server nothing it didn't already know.
+///
+/// The toggle is client-owned because the display gating is modal state the server doesn't have:
+/// clients enable it in blame-displaying contexts (Normal mode, file-backed buffer) and disable
+/// it on leaving them, which is also what spares the server whole-file blame recomputes during
+/// Insert-mode typing. [`GitBlameLine`] remains for the on-demand commit-details popover.
+pub struct GitSetBlameFollow;
+impl RpcMethod for GitSetBlameFollow {
+    const NAME: &'static str = "git/set_blame_follow";
+    type Params = GitSetBlameFollowParams;
+    type Result = ();
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitSetBlameFollowParams {
+    pub buffer_id: BufferId,
+    pub enabled: bool,
+}
+
+// ---- git/blame_changed (notification) -----------------------------------------------------------
+
+/// Server push: the followed cursor line's blame (see [`GitSetBlameFollow`]). Sent only when the
+/// settled `(line, revision)` differs from the last push, so holding `j` produces no blame
+/// traffic until the cursor rests.
+pub struct GitBlameChanged;
+impl NotificationMethod for GitBlameChanged {
+    const NAME: &'static str = "git/blame_changed";
+    type Params = GitBlameChangedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitBlameChangedParams {
+    pub buffer_id: BufferId,
+    /// The 0-based buffer line the blame is for — the client's settled cursor line at resolve
+    /// time. Echoed so a client that has already moved on can discard the stale label.
+    pub line: u32,
+    /// `None` when the line has no blame: no repo, untracked file, or past end-of-file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blame: Option<BlameInfo>,
 }
 
 // ---- git/blame_line -----------------------------------------------------------------------------

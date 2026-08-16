@@ -14,7 +14,7 @@ use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 /// Edits within this window join the active undo group.
 const GROUP_TIME_WINDOW: Duration = Duration::from_millis(500);
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -79,6 +79,27 @@ pub struct ServerState {
     /// refresh applies its result only while the generation still matches — a newer cursor move (or a
     /// buffer mutation) supersedes any in-flight round-trip. Mirrors the picker async-load epoch.
     pub symbol_highlight_gen: HashMap<(ClientId, BufferId), u64>,
+    /// `(client, buffer)` pairs whose symbol highlights follow the cursor: while present, every
+    /// cursor change re-arms the debounced refresh server-side (`lsp/document_highlight
+    /// {active: true}` subscribes; `false` unsubscribes and clears). The client only speaks on
+    /// mode/search transitions — never per move.
+    pub symbol_highlight_follow: HashSet<(ClientId, BufferId)>,
+    /// `(client, buffer)` pairs whose cursor-line blame follows the cursor (`git/set_blame_follow`).
+    /// While present, cursor changes arm a debounced [`crate::handlers::spawn_blame_refresh`] that
+    /// pushes `git/blame_changed` when the settled line's blame differs from the last push.
+    pub blame_follow: HashSet<(ClientId, BufferId)>,
+    /// Debounce generation for blame follow — same supersession scheme as
+    /// [`Self::symbol_highlight_gen`].
+    pub blame_follow_gen: HashMap<(ClientId, BufferId), u64>,
+    /// The `(line, revision)` of the last `git/blame_changed` push per follower, so a settle that
+    /// resolves to the same pair (e.g. the cursor moved within a line) pushes nothing. Cleared
+    /// when the underlying blame is invalidated externally (HEAD change) so the label refreshes.
+    pub blame_last_pushed: HashMap<(ClientId, BufferId), (u32, Revision)>,
+    /// Fan-in for cursor changes: [`crate::handlers::set_cursor`] (the single cursor write path)
+    /// sends the key here whenever a *followed* cursor changes; the server's follow loop debounces
+    /// and refreshes the cursor-tracking decorations. `None` only in unit tests that construct a
+    /// bare state.
+    pub cursor_moved_tx: Option<tokio::sync::mpsc::UnboundedSender<(ClientId, BufferId)>>,
     /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
     /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
@@ -441,6 +462,11 @@ impl ServerState {
             sneaks: HashMap::new(),
             symbol_highlights: HashMap::new(),
             symbol_highlight_gen: HashMap::new(),
+            symbol_highlight_follow: HashSet::new(),
+            blame_follow: HashSet::new(),
+            blame_follow_gen: HashMap::new(),
+            blame_last_pushed: HashMap::new(),
+            cursor_moved_tx: None,
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
@@ -985,6 +1011,10 @@ impl ServerState {
         self.sneaks.retain(|(_, b), _| *b != id);
         self.symbol_highlights.retain(|(_, b), _| *b != id);
         self.symbol_highlight_gen.retain(|(_, b), _| *b != id);
+        self.symbol_highlight_follow.retain(|(_, b)| *b != id);
+        self.blame_follow.retain(|(_, b)| *b != id);
+        self.blame_follow_gen.retain(|(_, b), _| *b != id);
+        self.blame_last_pushed.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
@@ -1119,6 +1149,10 @@ impl ServerState {
         self.symbol_highlights.retain(|(c, _), _| *c != client_id);
         self.symbol_highlight_gen
             .retain(|(c, _), _| *c != client_id);
+        self.symbol_highlight_follow.retain(|(c, _)| *c != client_id);
+        self.blame_follow.retain(|(c, _)| *c != client_id);
+        self.blame_follow_gen.retain(|(c, _), _| *c != client_id);
+        self.blame_last_pushed.retain(|(c, _), _| *c != client_id);
     }
 
     /// Remove all sneak sessions for the given client. Used on disconnect.
@@ -1363,6 +1397,10 @@ impl ServerState {
         self.sneaks.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlights.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
+        self.symbol_highlight_follow.retain(|&(c, b)| !in_proj(&c, &b));
+        self.blame_follow.retain(|&(c, b)| !in_proj(&c, &b));
+        self.blame_follow_gen.retain(|(c, b), _| !in_proj(c, b));
+        self.blame_last_pushed.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
         // workspace so wipe them all on switch. The jumplist goes with them: its

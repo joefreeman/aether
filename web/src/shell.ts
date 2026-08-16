@@ -16,6 +16,11 @@
 //! blame is wired — see `maybeBlame`.)
 
 import "./theme.css";
+// The same stylesheet as text, to adopt into the buffer's shadow root (see `bufferSurface`): style
+// rules don't cross a shadow boundary, so the rows need their own copy. Costs ~7kB gzipped in the
+// bundle; adopting the whole sheet rather than a buffer-only subset avoids a second file to keep in
+// sync with the theme (`--role` custom properties still inherit through the boundary as normal).
+import themeCss from "./theme.css?inline";
 import init, { WasmSession, hover_key } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
@@ -30,7 +35,6 @@ import type {
   BufferWindow,
   CursorState,
   DiagnosticCounts,
-  GitBlameLineResult,
   GroupHeader,
   GroupSpan,
   LogicalPosition,
@@ -76,6 +80,11 @@ function timeAgo(unixSecs: number): string {
   else if (secs < 31_536_000) [n, unit] = [secs / 604_800, "w"];
   else [n, unit] = [secs / 31_536_000, "y"];
   return `${Math.floor(n)}${unit} ago`;
+}
+
+/** The EOL blame label from the raw fields the core view carries (server blame-follow push). */
+function formatBlame(b: { author: string; timestamp: number; is_uncommitted: boolean }): string {
+  return b.is_uncommitted ? "uncommitted" : `${b.author} · ${timeAgo(b.timestamp)}`;
 }
 
 const PLACEHOLDER: Record<PickerKind, string> = {
@@ -447,7 +456,8 @@ interface CoreView {
     saved_revision: number;
     transient: boolean;
   };
-  blame: { line: number; text: string } | null;
+  /** Raw blame for the followed cursor line (server `git/blame_changed` push); formatted here. */
+  blame: { line: number; author: string; timestamp: number; is_uncommitted: boolean } | null;
   count: number | null;
   pending: unknown | null;
   sneak_active: boolean;
@@ -973,6 +983,13 @@ export class Shell {
   /** The most recent `view()` — refreshed every `render()`, read by the geometry methods so they
    *  don't re-serialize the window on every scroll event. */
   private snapshot: CoreView | null = null;
+  /** The buffer rows' host element and its CLOSED shadow root — see `bufferSurface` for why.
+   *  Both null until the first editor paint, and re-created whenever the host leaves the DOM (the
+   *  reading view replaces `#buffer`'s children wholesale). */
+  private bufferHost: HTMLElement | null = null;
+  private bufferShadow: ShadowRoot | null = null;
+  /** The adopted copy of `theme.css` for the shadow root, built once and shared. */
+  private static bufferSheet: CSSStyleSheet | null = null;
   /** Pending coalesced-render frame (see `scheduleRender`); null when none is queued. */
   private renderRaf: number | null = null;
   /** Set by the `RevealPickerSelection` effect: the next picker render scrolls the highlighted row
@@ -1044,11 +1061,6 @@ export class Shell {
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
   private viewportEpoch = 0;
   private fetchInFlight = false;
-  /** Dedupe for the cursor-line blame request — `(buffer, line, revision)` it last fired for, so a
-   *  re-render with the cursor on the same line (and buffer unedited) doesn't re-fetch. Includes the
-   *  buffer id because the core (and our blame state) reset on a buffer switch, which the TUI/iced
-   *  shells get for free by sharing the core's `blame_requested`. */
-  private blameRequested: { bufferId: number; line: number; revision: number } | null = null;
   /** True while the markdown reading view owns the buffer element (docs/markdown-view.md). */
   private readActive = false;
   /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
@@ -1544,7 +1556,7 @@ export class Shell {
     // and the session connected. The engine's own idle gate covers an unattended-but-visible tab.
     window.setInterval(() => {
       if (!this.session || !this.connected || document.visibilityState !== "visible") return;
-      this.runEffects(this.session.on_hint_tick(Date.now()) as CoreEffect[], true);
+      this.hintTick();
     }, 2000);
     // The editor owns the whole keyboard, so suppress browser keyup defaults too (e.g. Firefox
     // decides menu-bar focus on the Alt keyup). Hard-reserved combos ignore this and still work.
@@ -1912,7 +1924,7 @@ export class Shell {
     // intermediate queries flood them), so rendering synchronously per push falls badly behind —
     // each render re-serializes the whole wasm view + reconciles the DOM. Apply every push to core
     // state immediately, but paint at most once per frame (the native client coalesces the same way).
-    this.runEffects(this.session.on_event(method, params) as CoreEffect[], true);
+    this.runEffects(this.session.on_event(method, params) as CoreEffect[]);
   }
 
   /** Connection-state changes from the transport. `client.ts` owns the socket reconnect (backoff);
@@ -2007,7 +2019,14 @@ export class Shell {
   /** Execute one batch of effects, then repaint from the fresh view. Async effects (Request, the
    *  geometry reveals) repaint again when they settle. `coalesce` defers the final paint to the next
    *  animation frame so a burst (streaming server pushes) collapses into one render. */
-  private runEffects(effects: CoreEffect[], coalesce = false): void {
+  private runEffects(effects: CoreEffect[]): void {
+    this.dispatchEffects(effects);
+    this.scheduleRender();
+  }
+
+  /** The effect switch alone, no repaint — for the hint tick, which repaints only when the
+   *  visible hint actually changed (see `hintTick`). Everything else goes through `runEffects`. */
+  private dispatchEffects(effects: CoreEffect[]): void {
     for (const e of effects) {
       switch (e.tag) {
         case "Request":
@@ -2073,9 +2092,7 @@ export class Shell {
         case "HintTickNow":
           // The hints snapshot just adopted: stamp the clock into the engine now, so the first
           // hint shows immediately instead of waiting out the slow interval (docs/hints.md).
-          if (this.session) {
-            this.runEffects(this.session.on_hint_tick(Date.now()) as CoreEffect[], true);
-          }
+          this.hintTick();
           break;
         // Deferred to later milestones (browser tab — no process to exit, reconnect handled by a
         // page reload). Explicit no-ops so the exhaustive `default` below stays a drift detector.
@@ -2101,12 +2118,25 @@ export class Shell {
         }
       }
     }
-    if (coalesce) this.scheduleRender();
-    else this.render();
   }
 
-  /** Paint at most once per animation frame. Used for streaming server pushes so a flood collapses
-   *  into one render; any direct `render()` in the meantime cancels the pending frame. */
+  /** Advance the hint engine's clock, repainting only when the displayed hint changed. The tick
+   *  fires every 2s for the lifetime of the tab, and most ticks are pure timer bookkeeping — an
+   *  unconditional repaint would rebuild the whole buffer DOM each time on an idle editor
+   *  (visible as periodic node churn in the devtools inspector). */
+  private hintTick(): void {
+    if (!this.session) return;
+    const before = this.session.hint_probe() as string | null | undefined;
+    this.dispatchEffects(this.session.on_hint_tick(Date.now()) as CoreEffect[]);
+    if ((this.session.hint_probe() as string | null | undefined) !== before) this.scheduleRender();
+  }
+
+  /** Paint at most once per animation frame — every `runEffects` funnels here, so a keypress, its
+   *  RPC response, and the blame follow-up (three separate effect batches) collapse into a single
+   *  paint per frame instead of three full-window rebuilds. Measured on a 2k-line file: a 20-press
+   *  `j` burst went from 62 renders / 750ms to settle down to a handful of frames. The cost is a
+   *  ≤1-frame deferral of `render()`'s focus re-park and `snapshot` refresh, well under human
+   *  inter-key time; any direct `render()` in the meantime cancels the pending frame. */
   private scheduleRender(): void {
     if (this.renderRaf !== null) return;
     this.renderRaf = requestAnimationFrame(() => {
@@ -2595,14 +2625,40 @@ export class Shell {
     }
   }
 
+  /** The last glide's target + start time, for the burst detector below. */
+  private smoothGlide: { target: number; at: number } | null = null;
+  /** While `performance.now()` is below this, reveals snap instead of glide. */
+  private snapUntil = 0;
+
   private scrollTopTo(top: number, smooth: boolean): void {
     const target = Math.max(0, top);
-    const delta = Math.abs(target - this.bufferEl.scrollTop);
+    const el = this.bufferEl;
+    const delta = Math.abs(target - el.scrollTop);
     const maxSmooth = this.visibleRows() * this.cell.h * 1.5;
-    if (smooth && delta > 0 && delta <= maxSmooth && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      this.bufferEl.scrollTo({ top: target, behavior: "smooth" });
+    const now = performance.now();
+    // Burst detector: `behavior: "smooth"` is an eased, interruptible animation — a new glide
+    // issued while the previous one is still in flight restarts the easing from zero velocity,
+    // so under key repeat (~30ms) the viewport crawls behind the cursor and then free-runs
+    // after release. When a glide would interrupt an unfinished glide, snap instead and keep
+    // snapping while calls arrive in quick succession; a ~350ms pause brings the glide back,
+    // so unhurried single presses keep the smooth feel.
+    const g = this.smoothGlide;
+    const glideInFlight = g !== null && now - g.at < 400 && Math.abs(el.scrollTop - g.target) > 1;
+    if (glideInFlight || now < this.snapUntil) {
+      this.snapUntil = now + 350;
+    }
+    if (
+      smooth &&
+      now >= this.snapUntil &&
+      delta > 0 &&
+      delta <= maxSmooth &&
+      !matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      this.smoothGlide = { target, at: now };
+      el.scrollTo({ top: target, behavior: "smooth" });
     } else {
-      this.bufferEl.scrollTop = target;
+      this.smoothGlide = null;
+      if (delta > 0) el.scrollTop = target;
     }
   }
 
@@ -2661,7 +2717,10 @@ export class Shell {
   private mouseToPos(e: MouseEvent): { line: number; col: number } | null {
     // Use the element under the pointer (not e.target): during a window-level drag, e.target may be
     // outside the buffer, but the coordinates still resolve to the row under the cursor.
-    const rowEl = document.elementFromPoint(e.clientX, e.clientY)?.closest(".row") as HTMLElement | null;
+    // Rows live in the buffer's shadow root, where `document.elementFromPoint` would only ever
+    // resolve to its host — ask the root itself (see `bufferSurface`).
+    const root = this.bufferShadow ?? document;
+    const rowEl = root.elementFromPoint(e.clientX, e.clientY)?.closest(".row") as HTMLElement | null;
     if (!rowEl || rowEl.dataset.line === undefined) return null;
     const line = Number(rowEl.dataset.line);
     const rowByte = Number(rowEl.dataset.byte);
@@ -2712,6 +2771,57 @@ export class Shell {
   }
 
   // ---- render ---------------------------------------------------------------------------------
+
+  /** The container the buffer rows are painted into: a **closed** shadow root inside `#buffer`.
+   *
+   *  Every paint replaces the whole `.buffer-content` subtree (~1,000 nodes). In the light DOM that
+   *  hands a document-wide `MutationObserver` — which browser extensions install freely — a subtree
+   *  to re-scan on every keypress. Measured with a password-manager extension installed: 12fps and
+   *  metronomic ~240ms main-thread stalls that swallow key repeats. MutationObserver does not cross
+   *  a shadow boundary, and `mode: "closed"` withholds the root from scripts that would otherwise
+   *  walk to it via `host.shadowRoot`, so the same workload runs at 58fps with the extension active.
+   *
+   *  Consequences to keep in mind when touching buffer DOM:
+   *  - `document.elementFromPoint` resolves to the *host*, so hit-testing must go through this root
+   *    (`posFromEvent`), and `e.target` on a click inside is retargeted to `#buffer`.
+   *  - Style rules don't cross the boundary either — hence the adopted stylesheet. Inherited
+   *    properties and custom properties do cross, so `#buffer`'s font/tab-size/`--role` variables
+   *    still reach the rows.
+   *  - The reading view stays in the light DOM: it needs real `e.target` resolution, and it doesn't
+   *    repaint per keypress, so it was never part of the problem. It clears `#buffer`'s children
+   *    wholesale, which is why the host is re-created here whenever it's been detached. */
+  private bufferSurface(): ShadowRoot {
+    if (this.bufferShadow && this.bufferHost?.isConnected) return this.bufferShadow;
+    const host = document.createElement("div");
+    host.className = "buffer-host";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const sheet = Shell.bufferStyleSheet();
+    if (sheet) shadow.adoptedStyleSheets = [sheet];
+    else {
+      const style = document.createElement("style"); // no constructable stylesheets — inline it
+      style.textContent = themeCss;
+      shadow.appendChild(style);
+    }
+    // `replaceChildren`, not `appendChild`: the reading view renders into `#buffer`'s light DOM and
+    // detaches this host on its way in, so returning to the editor must clear that document out —
+    // appending would stack the rows underneath a stale (and now monospaced) markdown render.
+    this.bufferEl.replaceChildren(host);
+    this.bufferHost = host;
+    this.bufferShadow = shadow;
+    return shadow;
+  }
+
+  /** The shared constructed stylesheet for `bufferSurface`, or null where unsupported. */
+  private static bufferStyleSheet(): CSSStyleSheet | null {
+    if (Shell.bufferSheet) return Shell.bufferSheet;
+    if (typeof CSSStyleSheet !== "function" || !("replaceSync" in CSSStyleSheet.prototype)) {
+      return null;
+    }
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(themeCss);
+    Shell.bufferSheet = sheet;
+    return sheet;
+  }
 
   private render(): void {
     // A direct paint supersedes any frame queued by scheduleRender — drop it so we don't double-render.
@@ -2805,11 +2915,10 @@ export class Shell {
       return;
     }
     if (!v.window) return;
-    this.maybeBlame(v); // fire-and-forget; updates the core + re-renders when the label lands
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
     // Coding ligatures: the `ligatures` app setting flips the JetBrains Mono `calt`/`liga` features.
     this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
-    renderBuffer(this.bufferEl, {
+    renderBuffer(this.bufferSurface(), {
       window: v.window,
       cursor: v.buffer.cursor,
       insertMode: v.mode === "insert",
@@ -2817,38 +2926,15 @@ export class Shell {
       contentWidthPx: v.wrap === "none" ? this.cell.w * (v.window.max_line_width + 2) : 0,
       spacerHeightPx: v.window.total_visual_rows * this.cell.h + BUFFER_PAD * 2,
       contentTopPx: v.window.first_visual_row * this.cell.h + BUFFER_PAD,
-      blame: v.blame && v.mode === "normal" ? v.blame.text : null,
+      // The blame data arrives via the server's `git/blame_changed` push (blame follow) and
+      // rides the core view; format the label here — "3w ago" needs a wall clock. Shown on the
+      // cursor line in Normal mode only, and only when the followed line is still the cursor's.
+      blame:
+        v.blame && v.mode === "normal" && v.blame.line === v.buffer.cursor.position.line
+          ? formatBlame(v.blame)
+          : null,
       diffView: v.diff_view,
     });
-  }
-
-  /** End-of-line git blame for the cursor line, mirroring the TUI/iced shells' `maybe_blame`:
-   *  only in Normal mode and only for a file with a path, deduped by `(buffer, line, revision)`.
-   *  The label is formatted here — "author · 3w ago" needs a wall clock, which the sans-IO core
-   *  deliberately lacks — then handed to the core via `set_blame`, which keeps it only while it
-   *  still matches the cursor line. Best-effort: a failed/declined blame just leaves the line bare. */
-  private maybeBlame(v: CoreView): void {
-    if (v.mode !== "normal" || v.buffer.path === null) return;
-    const bufferId = v.buffer.buffer_id;
-    const line = v.buffer.cursor.position.line;
-    const revision = v.buffer.revision;
-    const prev = this.blameRequested;
-    if (prev && prev.bufferId === bufferId && prev.line === line && prev.revision === revision) return;
-    this.blameRequested = { bufferId, line, revision };
-    this.client
-      .rpc<GitBlameLineResult>("git/blame_line", { buffer_id: bufferId, line, include_commit_info: false })
-      .then(
-        (res) => {
-          const b = res.blame;
-          const text = !b
-            ? undefined
-            : b.is_uncommitted
-              ? "uncommitted"
-              : `${b.author} · ${timeAgo(b.timestamp)}`;
-          this.runEffects(this.session.set_blame(bufferId, line, text) as CoreEffect[]);
-        },
-        () => {}, // blame is non-essential; swallow failures (no repo, RPC error, disconnect)
-      );
   }
 
   /** Whether a keydown is plain text-editing (the native <input> should handle it and sync via its
@@ -4075,7 +4161,7 @@ export class Shell {
       if (el.parentElement !== document.body) document.body.appendChild(el);
       return;
     }
-    const spacer = this.bufferEl.querySelector(".buffer-spacer") as HTMLElement | null;
+    const spacer = this.bufferShadow?.querySelector(".buffer-spacer") as HTMLElement | null;
     if (!spacer) return;
     el.scrollTop = 0;
     this.hoverOpen = true;
@@ -4102,7 +4188,7 @@ export class Shell {
     const spacer = el.parentElement;
     if (!spacer) return;
     const sr = spacer.getBoundingClientRect();
-    const cur = this.bufferEl.querySelector(".cursor") as HTMLElement | null;
+    const cur = this.bufferShadow?.querySelector(".cursor") as HTMLElement | null;
     const margin = 4;
     let lineTop: number, lineH: number, lineLeft: number;
     if (cur) {
@@ -4170,7 +4256,7 @@ export class Shell {
     if (!this.session || !this.snapshot?.picker) return;
     const first = Math.max(0, Math.floor(this.pickerListEl.scrollTop / this.pickerRowH));
     const fx = this.session.picker_scrolled(first) as CoreEffect[];
-    if (fx.length) this.runEffects(fx, true);
+    if (fx.length) this.runEffects(fx);
   }
 
   private renderPickerList(p: PickerView, v: CoreView): void {

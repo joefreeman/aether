@@ -20,7 +20,8 @@ use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Requ
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
     GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameChanged, GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams,
+    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -20235,6 +20236,104 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         line0.diff_emphasis.is_empty(),
         "intra-line emphasis is diff-view-only, like the phantom rows"
     );
+
+    drop(server);
+}
+
+/// Blame follow (`git/set_blame_follow`): the server watches this client's cursor itself and
+/// pushes `git/blame_changed` after the settle window — no per-move client requests. Enabling
+/// arms an immediate refresh; cursor moves re-arm through the `set_cursor` chokepoint; settles
+/// that resolve to the same `(line, revision)` push nothing (asserted indirectly: the push after
+/// a same-line column move plus a line move is the landing line's, exactly once).
+#[tokio::test]
+async fn blame_follow_pushes_on_enable_and_cursor_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+
+    let server = spawn_for_test("blame-follow-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "blame-follow-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Enable follow: the armed refresh pushes line 0's blame with no cursor move at all.
+    let () = send_request::<GitSetBlameFollow>(
+        &mut ws,
+        3,
+        &GitSetBlameFollowParams {
+            buffer_id: open.buffer_id,
+            enabled: true,
+        },
+    )
+    .await;
+    let push =
+        expect_notification_within::<GitBlameChanged>(&mut ws, std::time::Duration::from_secs(10))
+            .await;
+    assert_eq!(push.buffer_id, open.buffer_id);
+    assert_eq!(push.line, 0);
+    let blame = push.blame.expect("committed line has blame");
+    assert_eq!(blame.author, "Test");
+    assert!(!blame.is_uncommitted);
+
+    // A same-line column move (no blame change) followed by a line move: exactly one push
+    // arrives, for the landing line — the same-line settle was deduped on (line, revision).
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 2,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await; // let the settle pass
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        5,
+        &CursorMoveParams {
+            buffer_id: open.buffer_id,
+            motion: Motion::LogicalLine {
+                direction: Direction::Forward,
+                count: 1,
+                preserve_col: false,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    let push =
+        expect_notification_within::<GitBlameChanged>(&mut ws, std::time::Duration::from_secs(10))
+            .await;
+    assert_eq!(push.line, 1, "the one push is for the landing line");
 
     drop(server);
 }

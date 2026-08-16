@@ -18,7 +18,8 @@ use aether_protocol::envelope::{
 use aether_protocol::git::{
     ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
     GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitNavigateHunk,
-    GitNavigateHunkParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameChanged, GitBlameChangedParams, GitNavigateHunkParams, GitSetBlameFollow,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
@@ -210,6 +211,46 @@ fn git_blame_line_result_roundtrip() {
         commit_info: None,
     };
     assert_eq!(to_value(&none).unwrap(), json!({"blame": null}));
+}
+
+#[test]
+fn git_blame_follow_shapes() {
+    // The subscription toggle…
+    let p = GitSetBlameFollowParams {
+        buffer_id: 3,
+        enabled: true,
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({"buffer_id": 3, "enabled": true}));
+    assert_eq!(GitSetBlameFollow::NAME, "git/set_blame_follow");
+
+    // …and the push it buys. `blame: None` (no repo / untracked / past EOF) drops off the wire.
+    let with = GitBlameChangedParams {
+        buffer_id: 3,
+        line: 41,
+        blame: Some(BlameInfo {
+            commit: "a1b2c3d".into(),
+            author: "Ada".into(),
+            timestamp: 1_700_000_000,
+            is_uncommitted: false,
+        }),
+    };
+    let v = to_value(&with).unwrap();
+    assert_eq!(v["buffer_id"], 3);
+    assert_eq!(v["line"], 41);
+    assert_eq!(v["blame"]["author"], "Ada");
+    let back: GitBlameChangedParams = from_value(v).unwrap();
+    assert_eq!(back.blame.unwrap().commit, "a1b2c3d");
+
+    let without = GitBlameChangedParams {
+        buffer_id: 3,
+        line: 41,
+        blame: None,
+    };
+    assert_eq!(
+        to_value(&without).unwrap(),
+        json!({"buffer_id": 3, "line": 41})
+    );
+    assert_eq!(GitBlameChanged::NAME, "git/blame_changed");
 }
 
 #[test]

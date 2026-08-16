@@ -25,7 +25,7 @@ use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
-use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
+
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
@@ -2322,53 +2322,11 @@ impl App {
     }
 
     /// After a cursor move: fetch around the cursor when it left the loaded window, otherwise
-    /// scroll the minimum to reveal it (web's `ensureCursorVisible` + `revealCursor`).
+    /// scroll the minimum to reveal it (web's `ensureCursorVisible` + `revealCursor`). The
+    /// cursor-line blame needs nothing here — the server follows the cursor itself and pushes
+    /// `git/blame_changed` (see `git/set_blame_follow`).
     fn ensure_cursor_visible(&mut self, style: RevealStyle) -> Task<Message> {
-        let blame = self.maybe_blame();
-        let reveal = self.ensure_cursor_visible_inner(style);
-        Task::batch([blame, reveal])
-    }
-
-    /// Keep the cursor-line blame fresh: re-request when the cursor changed lines or the
-    /// buffer changed underneath it. Scratch buffers (no path) show none.
-    fn maybe_blame(&mut self) -> Task<Message> {
-        let line = self.session.buffer.cursor.position.line;
-        let key = (line, self.session.buffer.revision);
-        if self.session.buffer.path.is_none() {
-            self.session.blame = None;
-            return Task::none();
-        }
-        if self.session.blame_requested == Some(key) {
-            return Task::none();
-        }
-        self.session.blame_requested = Some(key);
-        if self.session.blame.as_ref().is_some_and(|(l, _)| *l != line) {
-            self.session.blame = None; // stale line's text shouldn't linger while the request flies
-        }
-        let buffer_id = self.session.buffer.buffer_id;
-        self.rpc::<GitBlameLine>(
-            GitBlameLineParams {
-                buffer_id,
-                line,
-                include_commit_info: false,
-            },
-            move |result| {
-                // Format here: "3w ago" needs a clock, which the core deliberately lacks.
-                let text = result.ok().and_then(|r| r.blame).map(|b| {
-                    if b.is_uncommitted {
-                        "uncommitted".into()
-                    } else {
-                        format!("{} · {}", b.author, time_ago(b.timestamp))
-                    }
-                });
-                Message::Core(CoreEvent::BlameLine {
-                    buffer_id,
-                    line,
-                    text,
-                })
-            },
-        );
-        Task::none()
+        self.ensure_cursor_visible_inner(style)
     }
 
     fn ensure_cursor_visible_inner(&mut self, style: RevealStyle) -> Task<Message> {
@@ -2562,11 +2520,12 @@ impl App {
                         diff_view: self.session.diff_view,
                         scroll_px: self.scroll_px,
                         scroll_x_px: self.scroll_x_px,
-                        blame: self
-                            .session
-                            .blame
-                            .as_ref()
-                            .map(|(line, text)| (*line, text.as_str())),
+                        // Normal-mode only (matching the other shells); formatted per view —
+                        // "3w ago" needs a clock, which the core deliberately lacks.
+                        blame: (self.session.mode == Mode::Normal)
+                            .then_some(self.session.blame.as_ref())
+                            .flatten()
+                            .map(|(line, b)| (*line, format_blame(b))),
                         tab_width: TAB_WIDTH,
                         ligatures: self.session.ligatures,
                         font_size: self.session.buffer_font_size as f32,
@@ -6168,6 +6127,15 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
 }
 
 /// `3w ago`-style age from a unix timestamp (seconds).
+/// The EOL blame label for a pushed [`aether_protocol::git::BlameInfo`].
+fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
+    if b.is_uncommitted {
+        "uncommitted".into()
+    } else {
+        format!("{} · {}", b.author, time_ago(b.timestamp))
+    }
+}
+
 fn time_ago(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

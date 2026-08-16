@@ -25,7 +25,7 @@ use aether_client::session::{
     Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
-use aether_protocol::git::{GitBlameLine, GitBlameLineParams};
+
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
     ViewportScrollToRow, ViewportScrollToRowParams, ViewportSubscribe, ViewportSubscribeParams,
@@ -78,8 +78,6 @@ enum Continuation {
     Subscribed,
     /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`).
     Window,
-    /// Cursor-line blame, formatted at dispatch ("author · 3w ago" needs a clock).
-    Blame { buffer_id: u64, line: u32 },
 }
 
 /// How long a floating toast (bottom-right) stays before it auto-dismisses — matching the web/native
@@ -376,7 +374,6 @@ pub async fn run(
         // No buffer/window exists until a connection lands; these are no-ops while connecting but
         // gated explicitly so a dummy-handle call can never slip out.
         if shell.session.conn == ConnState::Connected {
-            shell.maybe_blame();
             shell.maybe_fetch();
         }
         shell.sync();
@@ -611,7 +608,6 @@ impl Shell {
                     self.fetch_in_flight = false;
                     self.refetch_queued = false;
                 }
-                Continuation::Blame { .. } => {}
             }
         }
     }
@@ -686,26 +682,6 @@ impl Shell {
                         }
                     }
                 }
-            }
-            Continuation::Blame { buffer_id, line } => {
-                let text =
-                    crate::connection::parse_reply::<aether_protocol::git::GitBlameLineResult>(
-                        method, result,
-                    )
-                    .ok()
-                    .and_then(|r| r.blame)
-                    .map(|b| {
-                        if b.is_uncommitted {
-                            "uncommitted".into()
-                        } else {
-                            format!("{} · {}", b.author, time_ago(b.timestamp))
-                        }
-                    });
-                self.dispatch(CoreEvent::BlameLine {
-                    buffer_id,
-                    line,
-                    text,
-                });
             }
         }
     }
@@ -1751,35 +1727,6 @@ impl Shell {
         self.scroll_to_row(row.saturating_sub(above));
     }
 
-    // ---- blame (formatted shell-side: "3w ago" needs a clock) ----------------------------
-
-    fn maybe_blame(&mut self) {
-        if self.session.mode != Mode::Normal {
-            return;
-        }
-        let line = self.session.buffer.cursor.position.line;
-        let key = (line, self.session.buffer.revision);
-        if self.session.buffer.path.is_none() {
-            self.session.blame = None;
-            return;
-        }
-        if self.session.blame_requested == Some(key) {
-            return;
-        }
-        self.session.blame_requested = Some(key);
-        if self.session.blame.as_ref().is_some_and(|(l, _)| *l != line) {
-            self.session.blame = None;
-        }
-        let buffer_id = self.session.buffer.buffer_id;
-        let id = self.handle.send::<GitBlameLine>(GitBlameLineParams {
-            buffer_id,
-            line,
-            include_commit_info: false,
-        });
-        self.inflight
-            .insert(id, Continuation::Blame { buffer_id, line });
-    }
-
     // ---- reconnect (the dial loop; policy lives in the core) ------------------------------
 
     /// Recovery when a reconnect succeeds but there's no workspace to restore: either none was
@@ -2357,9 +2304,11 @@ impl Shell {
             },
             sneak_active: s.sneak.is_some(),
             search: self.search_view(),
+            // Formatted at sync time — "3w ago" needs a clock, which the core deliberately
+            // lacks; the data itself arrives via the server's blame-follow push.
             blame: BlameState {
                 line: s.blame.as_ref().map(|(l, _)| *l),
-                text: s.blame.as_ref().map(|(_, t)| t.clone()),
+                text: s.blame.as_ref().map(|(_, b)| format_blame(b)),
             },
             transient: s.buffer.transient,
             tethered: s.tethered(),
@@ -2917,6 +2866,15 @@ async fn dial(
         restore: Some((activated.workspace, open)),
         restarted: false,
     })
+}
+
+/// The EOL blame label for a pushed [`aether_protocol::git::BlameInfo`].
+fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
+    if b.is_uncommitted {
+        "uncommitted".into()
+    } else {
+        format!("{} · {}", b.author, time_ago(b.timestamp))
+    }
 }
 
 /// Coarse relative age for the blame line ("3w ago").

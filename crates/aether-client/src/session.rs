@@ -863,10 +863,17 @@ pub struct Session {
     pub externally_modified: bool,
     pub externally_deleted: bool,
     pub drag: Option<(LogicalPosition, Granularity)>,
-    /// Cursor-line blame, rendered as dim text after the line: `(line, "author · age")`.
-    pub blame: Option<(u32, String)>,
-    /// The `(line, revision)` the in-flight/most-recent blame request was for.
-    pub blame_requested: Option<(u32, u64)>,
+    /// Cursor-line blame for the EOL label, as pushed by the server's blame follow
+    /// (`git/blame_changed`): the followed line plus its raw [`BlameInfo`]. Shells format at
+    /// render time ("author · 3w ago" needs a clock, which the core deliberately lacks).
+    pub blame: Option<(u32, aether_protocol::git::BlameInfo)>,
+    /// The buffer whose cursor-line blame the server currently follows for us
+    /// (`git/set_blame_follow`), or `None`. Synced by `sync_decoration_follow` on mode/buffer
+    /// transitions — never per cursor move.
+    pub blame_follow_on: Option<aether_protocol::BufferId>,
+    /// The buffer whose symbol highlights the server currently follows
+    /// (`lsp/document_highlight`), or `None`. Same transition-only sync.
+    pub highlight_follow_on: Option<aether_protocol::BufferId>,
     /// A modal confirm / save-as dialog; owns the keyboard while open.
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
@@ -1278,7 +1285,8 @@ impl Session {
             externally_deleted: false,
             drag: None,
             blame: None,
-            blame_requested: None,
+            blame_follow_on: None,
+            highlight_follow_on: None,
             prompt: None,
             picker: None,
             workspace_settings: None,

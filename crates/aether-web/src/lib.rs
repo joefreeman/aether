@@ -117,6 +117,16 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.on_hint_tick(now_ms as u64)))
     }
 
+    /// The displayed corner hint's identity (`keys` + `text` joined on a NUL), or `None` when no
+    /// hint shows. A cheap probe — no window marshalling — so the shell's 2s hint tick can compare
+    /// before/after and skip repainting when the tick changed nothing visible (an unconditional
+    /// repaint rebuilds the buffer DOM every 2s on an idle editor).
+    pub fn hint_probe(&self) -> Option<String> {
+        self.inner
+            .hint_view()
+            .map(|h| format!("{}\u{0}{}", h.keys, h.text))
+    }
+
     /// A server push (a JSON-RPC notification): `method` + `params` JSON. Returns `Effect[]`.
     pub fn on_event(&mut self, method: String, params: JsValue) -> Result<JsValue, JsValue> {
         let params: Value = from_js(params)?;
@@ -417,23 +427,6 @@ impl WasmSession {
         ))
     }
 
-    /// Deliver the cursor-line blame the shell fetched and formatted. Like the TUI/iced shells'
-    /// `maybe_blame`, the label ("author · 3w ago") is built shell-side because the sans-IO core
-    /// deliberately lacks a clock (docs/protocol-composites.md, G); `text` is `null`/absent when the
-    /// line has no blame. `buffer_id` is a JS number (`BufferId` ids stay well within f64). The core
-    /// keeps it only if it still matches the current buffer + cursor line. Returns `Effect[]`.
-    pub fn set_blame(
-        &mut self,
-        buffer_id: f64,
-        line: u32,
-        text: Option<String>,
-    ) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.on_event(Event::BlameLine {
-            buffer_id: buffer_id as u64,
-            line,
-            text,
-        })))
-    }
 }
 
 /// Rebuild a [`PasteKind`] from the JSON descriptor `paste_value` emitted with `Effect::ReadClipboard`.
@@ -920,31 +913,44 @@ mod tests {
         assert!(fx.is_empty());
     }
 
-    #[test]
-    fn set_blame_surfaces_on_the_cursor_line() {
-        // A fresh session sits on buffer 0, line 0 — the blame the shell hands over matches the
-        // cursor line, so the core keeps it and the view exposes it for the renderer. Proves the
-        // `set_blame` boundary (shell-formatted label → core → view) end to end.
-        let mut s = WasmSession::new();
-        s.inner.on_event(Event::BlameLine {
-            buffer_id: s.inner.buffer.buffer_id,
-            line: 0,
-            text: Some("ada · 3w ago".into()),
-        });
-        let v = view::build_view(&s.inner);
-        assert_eq!(v["blame"]["line"], 0);
-        assert_eq!(v["blame"]["text"], "ada · 3w ago");
+    fn blame_push(buffer_id: u64, line: u32, author: &str) -> Event {
+        Event::ServerPush(aether_protocol::envelope::Notification {
+            jsonrpc: aether_protocol::envelope::JsonRpc,
+            method: "git/blame_changed".into(),
+            params: serde_json::json!({
+                "buffer_id": buffer_id,
+                "line": line,
+                "blame": {
+                    "commit": "abc1234",
+                    "author": author,
+                    "timestamp": 1_700_000_000,
+                    "is_uncommitted": false,
+                },
+            }),
+        })
     }
 
     #[test]
-    fn set_blame_for_another_line_is_dropped() {
-        // Blame fetched for a line the cursor has since left is discarded, never shown stale.
+    fn blame_push_surfaces_raw_fields_in_the_view() {
+        // The server's blame-follow push lands in the core and the view exposes the raw fields
+        // for the TS shell to format ("3w ago" needs the shell's clock). Proves the
+        // push → core → view boundary end to end.
         let mut s = WasmSession::new();
-        s.inner.on_event(Event::BlameLine {
-            buffer_id: s.inner.buffer.buffer_id,
-            line: 7,
-            text: Some("grace · 1d ago".into()),
-        });
+        let buffer_id = s.inner.buffer.buffer_id;
+        s.inner.on_event(blame_push(buffer_id, 0, "ada"));
+        let v = view::build_view(&s.inner);
+        assert_eq!(v["blame"]["line"], 0);
+        assert_eq!(v["blame"]["author"], "ada");
+        assert_eq!(v["blame"]["is_uncommitted"], false);
+    }
+
+    #[test]
+    fn blame_push_for_another_buffer_is_dropped() {
+        // A push that raced a buffer switch (still keyed to the previous buffer) is discarded,
+        // never shown against the wrong file.
+        let mut s = WasmSession::new();
+        let other = s.inner.buffer.buffer_id + 1;
+        s.inner.on_event(blame_push(other, 0, "grace"));
         assert!(view::build_view(&s.inner)["blame"].is_null());
     }
 

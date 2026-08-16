@@ -131,11 +131,13 @@ pub struct LspBufferParams {
 // ---- lsp/document_highlight ---------------------------------------------------------------------
 
 /// Highlight every occurrence of the symbol under the cursor (`textDocument/documentHighlight`).
-/// Cursor-relative and fire-and-forget: the server resolves the symbol, stores the occurrence
-/// ranges keyed by `(client, buffer)`, and pushes the refreshed viewport — the occurrences ride
+/// Cursor-relative and **subscription-shaped**: `active: true` enables following for the buffer —
+/// the server re-resolves the symbol itself (debounced) whenever this client's cursor moves, so
+/// the client never re-sends this per move. The server stores the occurrence ranges keyed by
+/// `(client, buffer)` and pushes the refreshed viewport — the occurrences ride
 /// `viewport/lines_changed` as ordinary match highlights (the same styling as search matches), so
-/// there's nothing to return. The client fires this as the cursor settles, but only when no search
-/// is active: a search owns the highlight layer, and the server drops any symbol set while one is.
+/// there's nothing to return. The client toggles on mode/search transitions only: a search owns
+/// the highlight layer, and the server drops any symbol set while one is.
 pub struct LspDocumentHighlight;
 impl RpcMethod for LspDocumentHighlight {
     const NAME: &'static str = "lsp/document_highlight";
@@ -146,9 +148,11 @@ impl RpcMethod for LspDocumentHighlight {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LspDocumentHighlightParams {
     pub buffer_id: BufferId,
-    /// `true` resolves and paints the symbol under the cursor; `false` clears any existing set for
-    /// the buffer. The client sends `false` when it leaves Normal mode (Insert, or the search
-    /// prompt before a query masks the set), where a stale symbol highlight must not linger.
+    /// `true` enables following: the symbol under the cursor is resolved and painted now and
+    /// re-resolved on every subsequent cursor move (server-debounced) until disabled. `false`
+    /// stops following and clears any existing set for the buffer. The client sends `false` when
+    /// it leaves Normal mode (Insert, or the search prompt before a query masks the set), where a
+    /// stale symbol highlight must not linger.
     pub active: bool,
 }
 

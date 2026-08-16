@@ -146,6 +146,14 @@ pub async fn run_with_listener(
         tokio::spawn(aggregate_flush_loop(state.clone()));
     }
 
+    // Cursor-following decorations (blame label, symbol highlights): `handlers::set_cursor`
+    // funnels every followed cursor change into this channel; the loop debounces and refreshes.
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.lock().await.cursor_moved_tx = Some(tx);
+        tokio::spawn(crate::handlers::cursor_follow_loop(state.clone(), rx));
+    }
+
     loop {
         tokio::select! {
             res = listener.accept() => {
