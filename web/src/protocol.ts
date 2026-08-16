@@ -70,12 +70,20 @@ export interface SneakTarget {
 
 export type VirtualRowKind = "deleted";
 
+/** One intra-line diff emphasis range: byte offsets within the owning line's / row's text. */
+export interface EmphasisRange {
+  start: number;
+  end: number;
+}
+
 export interface VirtualRow {
   text: string;
   kind: VirtualRowKind;
   /** Staged (text is HEAD's, already replaced in the index) vs unstaged (text is the index's).
    *  Omitted on the wire when "unstaged". */
   stage?: DiffStage;
+  /** Intra-line emphasis on this removed line (the parts its paired buffer line replaced). */
+  emphasis?: EmphasisRange[];
 }
 
 export type DiffMarker = "added" | "modified" | "deleted";
@@ -112,6 +120,8 @@ export interface LogicalLineRender {
   diff_marker?: DiffMarker | null;
   /** Qualifies diff_marker in the combined view; omitted when "unstaged". */
   diff_stage?: DiffStage;
+  /** Intra-line diff emphasis (diff view only): sub-ranges of the line a Modified hunk changed. */
+  diff_emphasis?: EmphasisRange[];
   diagnostics?: DiagnosticSpan[];
   sneak_targets?: SneakTarget[];
 }

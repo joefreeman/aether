@@ -52,6 +52,13 @@ pub struct LogicalLineRender {
     /// marker / tint colour split. Omitted from the wire when `Unstaged`.
     #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
     pub diff_stage: DiffStage,
+    /// Intra-line diff emphasis: the byte ranges within this logical line that a Modified hunk
+    /// actually changed against its paired baseline line, rendered as a stronger tint over the
+    /// line's `diff_marker` background. Only populated while the viewport's inline diff view is
+    /// on (like `virtual_rows_above`); empty when the whole line changed too much to pick out
+    /// sub-ranges, so a range-less modified line renders exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diff_emphasis: Vec<EmphasisRange>,
     /// Language-server diagnostics intersecting this logical line, as byte ranges within the line
     /// (already converted from the server's LSP position encoding). A diagnostic spanning multiple
     /// lines contributes one entry — carrying the full message — to each line it touches, so the
@@ -120,6 +127,15 @@ impl DiffStage {
     }
 }
 
+/// One intra-line diff emphasis range: byte offsets (within the logical line's or virtual row's
+/// text) of a sub-line region the change actually touched. Word-grain, non-overlapping, sorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmphasisRange {
+    pub start: u32,
+    /// Exclusive.
+    pub end: u32,
+}
+
 /// A rendered row that doesn't correspond to any buffer line — see
 /// [`LogicalLineRender::virtual_rows_above`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +148,11 @@ pub struct VirtualRow {
     /// would restore.
     #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
     pub stage: DiffStage,
+    /// Intra-line emphasis on the old side: the byte ranges of this removed baseline line that
+    /// its paired buffer line replaced (the counterpart of the pair's
+    /// [`LogicalLineRender::diff_emphasis`]). Empty for whole-line changes and pure deletions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emphasis: Vec<EmphasisRange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

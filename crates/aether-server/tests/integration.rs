@@ -56,7 +56,7 @@ use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
-use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker};
+use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker, EmphasisRange};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
@@ -20231,6 +20231,99 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     // inline diff toggle.
     assert!(line0.virtual_rows_above.is_empty());
     assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert!(
+        line0.diff_emphasis.is_empty(),
+        "intra-line emphasis is diff-view-only, like the phantom rows"
+    );
+
+    drop(server);
+}
+
+/// With the diff view on, a modified line carries intra-line emphasis: the changed word on the
+/// buffer line (`diff_emphasis`) and its old-side counterpart on the phantom row (`emphasis`).
+#[tokio::test]
+async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    // Commit one content, then rewrite the file on disk: the buffer opens with "total" where
+    // HEAD has "count" — a single-word modification on line 0.
+    git_commit_file(dir.path(), "edit.rs", "let count = 1;\nsame\n");
+    std::fs::write(dir.path().join("edit.rs"), "let total = 1;\nsame\n").unwrap();
+
+    let server = spawn_for_test("intraline-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "intraline-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("edit.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+
+    let line0 = sub
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 0)
+        .expect("line 0 in window");
+    // New side: "total" occupies bytes [4, 9) of "let total = 1;".
+    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line0.diff_emphasis, vec![EmphasisRange { start: 4, end: 9 }]);
+    // Old side: "count" at the same offsets within the phantom row's "let count = 1;".
+    assert_eq!(line0.virtual_rows_above.len(), 1);
+    assert_eq!(line0.virtual_rows_above[0].text, "let count = 1;");
+    assert_eq!(
+        line0.virtual_rows_above[0].emphasis,
+        vec![EmphasisRange { start: 4, end: 9 }]
+    );
+    // The untouched line 1 carries neither marker nor emphasis.
+    let line1 = sub
+        .window
+        .lines
+        .iter()
+        .find(|l| l.logical_line == 1)
+        .unwrap();
+    assert_eq!(line1.diff_marker, None);
+    assert!(line1.diff_emphasis.is_empty());
 
     drop(server);
 }

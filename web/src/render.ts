@@ -10,6 +10,7 @@ import type {
   CursorState,
   DiagnosticSeverity,
   DiffStage,
+  EmphasisRange,
   LogicalLineRender,
   LogicalPosition,
   VisualRow,
@@ -81,6 +82,8 @@ interface CellStyle {
   sel: boolean;
   cursor: boolean;
   bracket: boolean;
+  /** Inside an intra-line diff emphasis range (stronger change fill, under search/sel). */
+  emph: boolean;
   /** Inside a sneak candidate word (quiet tint). */
   sneak: boolean;
   /** Inside a sneak typed-prefix chip (bright; blanked unless it's the label cell). */
@@ -97,6 +100,7 @@ function sameStyle(a: CellStyle, b: CellStyle): boolean {
     a.sel === b.sel &&
     a.cursor === b.cursor &&
     a.bracket === b.bracket &&
+    a.emph === b.emph &&
     a.sneak === b.sneak &&
     a.chip === b.chip &&
     a.sneakLabel === b.sneakLabel
@@ -130,6 +134,9 @@ function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
   if (style.hl) classes.push(style.hl);
   if (style.bracket) classes.push("match-bracket");
   if (style.diag) classes.push("diag-" + style.diag);
+  // Emphasis is NOT a class here: renderVisualRow wraps each contiguous emphasized run in a
+  // single `.diff-emph` wrapper span, so the rounded band is one box (per-span classes would
+  // notch the rounding at every internal syntax-colour boundary).
   if (style.search) classes.push("search-hit");
   if (style.sneak) classes.push("sneak-target");
   if (style.sel) classes.push("sel");
@@ -235,6 +242,7 @@ function renderVisualRow(
   const hl: (string | null)[] = new Array(n).fill(null);
   const diag: (DiagnosticSeverity | null)[] = new Array(n).fill(null);
   const search: boolean[] = new Array(n).fill(false);
+  const emph: boolean[] = new Array(n).fill(false);
   const sneak: boolean[] = new Array(n).fill(false);
   const chip: boolean[] = new Array(n).fill(false);
   const sneakLabel: (string | null)[] = new Array(n).fill(null);
@@ -273,6 +281,10 @@ function renderVisualRow(
   }
   for (const m of line.search_matches ?? []) {
     markRange(byteStart, n, m.start - row.byte_offset, m.end - row.byte_offset, (i) => (search[i] = true));
+  }
+  // Intra-line diff emphasis (diff view only; the server omits it otherwise).
+  for (const r of line.diff_emphasis ?? []) {
+    markRange(byteStart, n, r.start - row.byte_offset, r.end - row.byte_offset, (i) => (emph[i] = true));
   }
   // Sneak word-jump targets: tint each candidate word, and put its label on the first cell — but
   // only when the word's start actually falls in this row (so a word wrapped from a previous row
@@ -335,16 +347,33 @@ function renderVisualRow(
     sel: selected[k],
     cursor: cursor[k],
     bracket: bracket[k],
+    emph: emph[k],
     sneak: sneak[k],
     chip: chip[k],
     sneakLabel: sneakLabel[k],
   });
+  // Consecutive emphasized runs collect into one `.diff-emph` wrapper span (the rounded band is
+  // a single box that way); everything else appends to the row text directly.
+  let emphWrap: HTMLElement | null = null;
+  const sink = (node: Node, inEmph: boolean) => {
+    if (inEmph) {
+      if (!emphWrap) {
+        emphWrap = document.createElement("span");
+        emphWrap.className = "diff-emph";
+        textEl.appendChild(emphWrap);
+      }
+      emphWrap.appendChild(node);
+    } else {
+      emphWrap = null;
+      textEl.appendChild(node);
+    }
+  };
   let i = 0;
   while (i < n) {
     // A selected tab keeps its literal `\t` (so CSS `tab-size` preserves its width) in its own
     // span, which overlays the `→` glyph via `.ws-tab::before`.
     if (wsGlyph[i] === "tab") {
-      textEl.appendChild(wsSpan("\t", cellAt(i), "tab", cursorClass));
+      sink(wsSpan("\t", cellAt(i), "tab", cursorClass), emph[i]);
       i++;
       continue;
     }
@@ -354,9 +383,9 @@ function renderVisualRow(
     while (j < n && wsGlyph[j] === g && g !== "tab" && sameStyle(style, cellAt(j))) j++;
     if (g === "dot") {
       // Trailing spaces → `·`, width-neutral, in NORD3 over the selection blue.
-      textEl.appendChild(wsSpan("·".repeat(j - i), style, "dot", cursorClass));
+      sink(wsSpan("·".repeat(j - i), style, "dot", cursorClass), style.emph);
     } else {
-      textEl.appendChild(makeSpan(cps.slice(i, j).join(""), style, cursorClass));
+      sink(makeSpan(cps.slice(i, j).join(""), style, cursorClass), style.emph);
     }
     i = j;
   }
@@ -384,6 +413,7 @@ function renderVisualRow(
       sel: selTrailing,
       cursor: cursorAtEnd,
       bracket: false,
+      emph: false,
       sneak: false,
       chip: false,
       sneakLabel: null,
@@ -424,7 +454,7 @@ function gutter(
   return g;
 }
 
-function phantomRow(text: string, stage: DiffStage): HTMLElement {
+function phantomRow(text: string, stage: DiffStage, emphasis: EmphasisRange[]): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row deleted-phantom";
   const g = document.createElement("span");
@@ -436,7 +466,31 @@ function phantomRow(text: string, stage: DiffStage): HTMLElement {
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
-  content.textContent = text;
+  if (emphasis.length === 0) {
+    content.textContent = text;
+  } else {
+    // Split the text at the emphasis boundaries; the changed sub-ranges get the stronger fill.
+    // Ranges are byte offsets from the server — decode to code points like the buffer rows.
+    const { cps, byteStart } = decodeRow(text);
+    const n = cps.length;
+    const inEmph: boolean[] = new Array(n).fill(false);
+    for (const r of emphasis) markRange(byteStart, n, r.start, r.end, (i) => (inEmph[i] = true));
+    let i = 0;
+    while (i < n) {
+      let j = i + 1;
+      while (j < n && inEmph[j] === inEmph[i]) j++;
+      const run = cps.slice(i, j).join("");
+      if (inEmph[i]) {
+        const span = document.createElement("span");
+        span.className = "diff-emph";
+        span.textContent = run;
+        content.appendChild(span);
+      } else {
+        content.appendChild(document.createTextNode(run));
+      }
+      i = j;
+    }
+  }
   rowEl.appendChild(content);
   return rowEl;
 }
@@ -478,7 +532,8 @@ export function renderBuffer(container: HTMLElement, opts: RenderOpts): void {
 
   const frag = document.createDocumentFragment();
   for (const line of window.lines) {
-    for (const v of line.virtual_rows_above ?? []) frag.appendChild(phantomRow(v.text, v.stage ?? "unstaged"));
+    for (const v of line.virtual_rows_above ?? [])
+      frag.appendChild(phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? []));
 
     const L = line.logical_line;
     const cursorByte = cursor.position.line === L ? cursor.position.col : null;

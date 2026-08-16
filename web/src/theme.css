@@ -80,6 +80,13 @@
   --git-staged-added-bg: #2f3631;
   --git-staged-modified-bg: #35342d;
   --git-staged-deleted-bg: #33252a;
+  /* Intra-line diff emphasis: a stronger wash of the kind hue over the matching line tint
+     (modified lines and phantom deleted rows only), saturated enough to survive the cursor-line
+     variant backgrounds too */
+  --git-modified-emph-bg: #665b41;
+  --git-deleted-emph-bg: #65363c;
+  --git-staged-modified-emph-bg: #544e3d;
+  --git-staged-deleted-emph-bg: #503339;
   /* Cursorline variants on changed lines, so the cursorline doesn't hide the change colour */
   --cursor-line-added-bg: #3a4d3a;
   --cursor-line-modified-bg: #4a4632;
@@ -169,6 +176,10 @@
   --git-staged-added-bg: #e3ecdf;
   --git-staged-modified-bg: #ebe7d8;
   --git-staged-deleted-bg: #efe0e2;
+  --git-modified-emph-bg: #e3c366;
+  --git-deleted-emph-bg: #f1abb0;
+  --git-staged-modified-emph-bg: #e4d29a;
+  --git-staged-deleted-emph-bg: #f0c1c6;
   --cursor-line-added-bg: #d3e4cb;
   --cursor-line-modified-bg: #e6dfc0;
   --cursor-line-staged-added-bg: #dde7d8;
@@ -585,6 +596,13 @@ html, body, #app {
 .row.modified-bg.staged { background: var(--git-staged-modified-bg); }
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--git-deleted); }
 .row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }
+/* Intra-line diff emphasis fill, resolved per row kind/stage via a custom property so the
+   .diff-emph rule itself stays single-class — search-hit/sel/cursor later in source order still
+   paint over it, mirroring the terminal's stacking. */
+.row { --diff-emph-bg: var(--git-modified-emph-bg); }
+.row.staged { --diff-emph-bg: var(--git-staged-modified-emph-bg); }
+.row.deleted-phantom { --diff-emph-bg: var(--git-deleted-emph-bg); }
+.row.deleted-phantom.staged { --diff-emph-bg: var(--git-staged-deleted-emph-bg); }
 /* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
    distinct from the status line's NORD1. Ordered after the diff tints so it wins on the cursor's
    changed line. On a changed line under the diff view, a green/olive variant keeps the diff colour
@@ -636,6 +654,35 @@ html, body, #app {
 .content { flex: 1 1 auto; }
 .cont-marker { color: var(--fg-faint); }
 
+/* Intra-line diff emphasis: one `.diff-emph` wrapper per contiguous emphasized run (built in
+   render.ts — the syntax/search/selection spans nest inside it). The band is a rounded pseudo
+   behind the wrapper's children: nested span backgrounds (search fill, selection, cursor) paint
+   over it naturally, and the 1px inset + 1px horizontal overhang float it inside the line tint
+   without clipping glyph ink (the inline content box hugs ascenders/descenders tightly, so any
+   larger inset cuts bracket tops and descenders). z-index: 0 on the wrapper traps the -1 pseudo
+   above the row background. */
+.diff-emph {
+  position: relative;
+  z-index: 0;
+}
+.diff-emph::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 1px;
+  bottom: 1px;
+  left: -1px;
+  right: -1px;
+  border-radius: 3px;
+  background: var(--diff-emph-bg);
+}
+/* Comments are the dimmest rung and would sink into the vivid fill — same lift as inside a
+   search hit. (Descendant form: the hl span nests inside the wrapper.) */
+.diff-emph .hl-comment { color: var(--fg); }
+/* On a phantom row the base text is the deleted red; the emphasized (replaced) words switch to
+   the normal foreground so they stay legible on the vivid fill — the fg flip is part of the
+   signal (mirrors the terminal and iced clients). */
+.deleted-phantom .diff-emph { color: var(--fg); }
 /* Matches the terminal: a search match is a quiet NORD3 fill — the brightest of Nord's Polar Night
    shades, so it stays visible on the NORD1 current-line tint while sitting below the selection. The
    selection paints over it in the more saturated NORD10, and the cursor over that. Precedence is

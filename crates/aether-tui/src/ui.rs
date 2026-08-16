@@ -15,7 +15,8 @@ use aether_protocol::search::SearchMatchRange;
 use aether_protocol::settings::ThemeMode;
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, Highlight, VisualRow, WrapMode,
+    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, Highlight,
+    VisualRow, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
@@ -4779,7 +4780,8 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
-            let mut spans = deleted_virtual_row_spans(&vrow.text, viewport_cols, vrow.stage);
+            let mut spans =
+                deleted_virtual_row_spans(&vrow.text, viewport_cols, vrow.stage, &vrow.emphasis);
             // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
             spans.insert(
                 0,
@@ -4894,6 +4896,8 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             });
             let matches_on_row =
                 matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
+            let emphasis_on_row =
+                emphasis_on_visual_row(vrow.byte_offset, row_text_len, &render.diff_emphasis);
             let diags_on_row =
                 diagnostics_on_visual_row(vrow.byte_offset, row_text_len, &render.diagnostics);
             let brackets_on_row = bracket_positions_on_visual_row(
@@ -4918,6 +4922,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 .iter()
                 .filter(|b| **b >= scroll_col)
                 .map(|b| b - scroll_col)
+                .collect();
+            // Intra-line diff emphasis, horizontally scroll-adjusted like the brackets (no-op
+            // under soft wrap where scroll_col is 0).
+            let clipped_emphasis: Vec<(u32, u32)> = emphasis_on_row
+                .iter()
+                .filter(|&&(_, e)| e > scroll_col)
+                .map(|&(s, e)| (s.saturating_sub(scroll_col), e - scroll_col))
                 .collect();
             // Sneak targets, row-relative then horizontally scroll-adjusted (no-op when scroll_col
             // is 0). The label is dropped if its cell scrolled out of view.
@@ -4967,6 +4978,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 &clipped_highlights,
                 clipped_sel,
                 &clipped_matches,
+                &clipped_emphasis,
+                stage_color(
+                    render.diff_stage,
+                    c(th().git_modified_emph_bg),
+                    c(th().git_staged_modified_emph_bg),
+                ),
                 &clipped_brackets,
                 &clipped_diags,
                 &clipped_sneak,
@@ -5040,24 +5057,79 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 /// The content spans of one inline-diff phantom row: the removed baseline line, red on a dark-red
-/// fill that spans the content width so the deletion reads as a distinct band. Tabs expand to
-/// spaces for stable width; content wider than the viewport is clipped. The gutter cell is added
-/// separately by [`prepend_gutter`].
-fn deleted_virtual_row_spans(text: &str, width: u16, stage: DiffStage) -> Vec<Span<'static>> {
-    let expanded = text.replace('\t', &" ".repeat(TAB_WIDTH as usize));
-    let mut shown: String = expanded.chars().take(width as usize).collect();
-    let used = shown.chars().count();
-    shown.push_str(&" ".repeat((width as usize).saturating_sub(used)));
-    let style = if stage == DiffStage::Staged {
-        Style::default()
-            .fg(c(th().git_staged_deleted))
-            .bg(c(th().git_staged_deleted_bg))
+/// fill that spans the content width so the deletion reads as a distinct band; the intra-line
+/// `emphasis` ranges (the parts the paired buffer line actually replaced) sit on a stronger red
+/// fill. Tabs expand to spaces for stable width; content wider than the viewport is clipped. The
+/// gutter cell is added separately by [`prepend_gutter`].
+fn deleted_virtual_row_spans(
+    text: &str,
+    width: u16,
+    stage: DiffStage,
+    emphasis: &[EmphasisRange],
+) -> Vec<Span<'static>> {
+    let (fg, bg, emph_bg) = if stage == DiffStage::Staged {
+        (
+            c(th().git_staged_deleted),
+            c(th().git_staged_deleted_bg),
+            c(th().git_staged_deleted_emph_bg),
+        )
     } else {
-        Style::default()
-            .fg(c(th().git_deleted))
-            .bg(c(th().git_deleted_bg))
+        (
+            c(th().git_deleted),
+            c(th().git_deleted_bg),
+            c(th().git_deleted_emph_bg),
+        )
     };
-    vec![Span::styled(shown, style)]
+    let in_emphasis = |byte: usize| {
+        emphasis
+            .iter()
+            .any(|r| (r.start as usize) <= byte && byte < r.end as usize)
+    };
+    // Walk chars (expanding tabs) and group into runs by emphasis, tracking the *original* byte
+    // position so the ranges keep meaning after expansion.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_emph = false;
+    let mut used = 0usize;
+    // Emphasized runs get the vivid fill with the *normal* foreground: the red-on-red of the
+    // base row is too low-contrast on the stronger fill, and the fg switch is itself part of
+    // the signal (matching the web's `.deleted-phantom .diff-emph` rule).
+    let flush = |spans: &mut Vec<Span<'static>>, run: &mut String, emph: bool| {
+        if !run.is_empty() {
+            let (fill, ink) = if emph { (emph_bg, c(th().fg)) } else { (bg, fg) };
+            spans.push(Span::styled(
+                std::mem::take(run),
+                Style::default().fg(ink).bg(fill),
+            ));
+        }
+    };
+    for (i, ch) in text.char_indices() {
+        if used >= width as usize {
+            break;
+        }
+        let emph = in_emphasis(i);
+        if emph != run_emph {
+            flush(&mut spans, &mut run, run_emph);
+            run_emph = emph;
+        }
+        if ch == '\t' {
+            let n = (TAB_WIDTH as usize).min(width as usize - used);
+            run.push_str(&" ".repeat(n));
+            used += n;
+        } else {
+            run.push(ch);
+            used += 1;
+        }
+    }
+    flush(&mut spans, &mut run, run_emph);
+    // Pad to the content width so the band reaches the right edge (in the base fill).
+    if used < width as usize {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().fg(fg).bg(bg),
+        ));
+    }
+    spans
 }
 
 /// A solid change-bar cell in the given color (`GUTTER_WIDTH` cols).
@@ -5267,6 +5339,27 @@ fn matches_on_visual_row(
         .collect()
 }
 
+/// Clip intra-line diff emphasis ranges to this visual row (row-relative), like
+/// [`matches_on_visual_row`].
+fn emphasis_on_visual_row(
+    row_byte_offset: u32,
+    row_text_len: u32,
+    emphasis: &[EmphasisRange],
+) -> Vec<(u32, u32)> {
+    if row_text_len == 0 {
+        return Vec::new();
+    }
+    let row_end = row_byte_offset + row_text_len;
+    emphasis
+        .iter()
+        .filter_map(|r| {
+            let s = r.start.max(row_byte_offset);
+            let e = r.end.min(row_end);
+            (s < e).then(|| (s - row_byte_offset, e - row_byte_offset))
+        })
+        .collect()
+}
+
 /// Clip sneak word-jump targets to this visual row, returning row-relative `(start, end, label)`.
 /// The label rides on the entry only when the word's true start falls within the row (so a word
 /// continuing from a previous wrapped row keeps its highlight but not a stray label).
@@ -5458,6 +5551,8 @@ fn build_spans(
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
     matches: &[(u32, u32)],
+    emphasis: &[(u32, u32)],
+    emphasis_bg: Color,
     match_brackets: &[u32],
     diagnostics: &[(u32, u32, DiagnosticSeverity)],
     sneak: &[(u32, u32, u32, Option<char>)],
@@ -5485,6 +5580,15 @@ fn build_spans(
         let e = (*e as usize).min(trunc_len);
         for in_match in &mut byte_in_match[s..e] {
             *in_match = true;
+        }
+    }
+
+    let mut byte_in_emphasis: Vec<bool> = vec![false; trunc_len];
+    for (s, e) in emphasis {
+        let s = (*s as usize).min(trunc_len);
+        let e = (*e as usize).min(trunc_len);
+        for in_emph in &mut byte_in_emphasis[s..e] {
+            *in_emph = true;
         }
     }
 
@@ -5540,6 +5644,16 @@ fn build_spans(
         // search and selection so those (which use bg) still win when stacked.
         if byte_is_match_bracket[byte_idx] {
             style = style.fg(c(th().match_bracket)).add_modifier(Modifier::BOLD);
+        }
+        // Intra-line diff emphasis: the stronger change fill under everything that follows —
+        // search, sneak, and selection all paint over it, mirroring how the whole-line tint
+        // stacks (`apply_line_tint` skips spans that carry their own bg, so this survives it).
+        // Comment-coloured text gets the same legibility lift as inside a search fill.
+        if byte_in_emphasis[byte_idx] {
+            style = style.bg(emphasis_bg);
+            if style.fg == Some(c(th().fg_faint)) || style.fg == Some(c(th().syn_comment)) {
+                style = style.fg(c(th().fg));
+            }
         }
         // Search match: the quiet dim fill behind the normal syntax text — visible on the
         // current-line tint while still sitting clearly below the more saturated visual
@@ -8604,6 +8718,72 @@ mod tests {
     }
 
     #[test]
+    fn build_spans_paints_diff_emphasis_under_search_and_selection() {
+        // Emphasis on [0,6), a search match on [2,4), selection on [4,5): both paint over the
+        // emphasis fill, which keeps the remaining cells.
+        let emph_bg = c(th().git_modified_emph_bg);
+        let cells = cells_of(&build_spans(
+            "abcdef",
+            &[],
+            Some((4, 5)),
+            &[(2, 4)],
+            &[(0, 6)],
+            emph_bg,
+            &[],
+            &[],
+            &[],
+            80,
+        ));
+        assert_eq!(cells[0].2, Some(emph_bg), "plain emphasis cell");
+        assert_eq!(cells[2].2, Some(c(th().fill_dim)), "search wins over emphasis");
+        assert_eq!(cells[4].2, Some(c(th().bg_visual)), "selection wins over emphasis");
+        assert_eq!(cells[5].2, Some(emph_bg));
+    }
+
+    #[test]
+    fn deleted_virtual_row_spans_split_on_emphasis() {
+        use aether_protocol::viewport::EmphasisRange;
+        // "old code" with "code" emphasized: base red fill outside, stronger fill inside, padding
+        // after the text keeps the base fill.
+        let spans = deleted_virtual_row_spans(
+            "old code",
+            12,
+            DiffStage::Unstaged,
+            &[EmphasisRange { start: 4, end: 8 }],
+        );
+        let cells = cells_of(&spans);
+        assert_eq!(cells.len(), 12, "padded to the content width");
+        assert_eq!(cells[0].2, Some(c(th().git_deleted_bg)));
+        assert_eq!(cells[4].2, Some(c(th().git_deleted_emph_bg)));
+        assert_eq!(cells[7].2, Some(c(th().git_deleted_emph_bg)));
+        assert_eq!(cells[8].2, Some(c(th().git_deleted_bg)), "padding on base fill");
+        // Emphasized runs switch to the normal fg (legible on the vivid fill); the rest keeps
+        // the deleted red.
+        assert_eq!(cells[0].1, Some(c(th().git_deleted)));
+        assert_eq!(cells[4].1, Some(c(th().fg)));
+        assert_eq!(cells[8].1, Some(c(th().git_deleted)));
+    }
+
+    #[test]
+    fn deleted_virtual_row_spans_expand_tabs_inside_emphasis() {
+        use aether_protocol::viewport::EmphasisRange;
+        // Emphasis over the tab (byte 1): its expanded cells all take the emphasis fill, and the
+        // byte→cell mapping stays anchored to original byte positions.
+        let spans = deleted_virtual_row_spans(
+            "a\tb",
+            10,
+            DiffStage::Unstaged,
+            &[EmphasisRange { start: 1, end: 2 }],
+        );
+        let cells = cells_of(&spans);
+        assert_eq!(cells[0].2, Some(c(th().git_deleted_bg)));
+        for i in 1..(1 + TAB_WIDTH as usize) {
+            assert_eq!(cells[i].2, Some(c(th().git_deleted_emph_bg)), "tab cell {i}");
+        }
+        assert_eq!(cells[1 + TAB_WIDTH as usize].2, Some(c(th().git_deleted_bg)));
+    }
+
+    #[test]
     fn build_spans_paints_sneak_label_and_bands_the_prefix() {
         // "function", whole word [0,8), query "fu" → prefix [0,2), label 'j'.
         let sneak = [(0u32, 8u32, 2u32, Some('j'))];
@@ -8612,6 +8792,8 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
+            c(th().git_modified_emph_bg),
             &[],
             &[],
             &sneak,
@@ -8636,7 +8818,7 @@ mod tests {
     #[test]
     fn build_spans_underlines_diagnostic_in_severity_color() {
         let diags = [(2u32, 4u32, DiagnosticSeverity::Warning)];
-        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], &diags, &[], 80));
+        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], c(th().git_modified_emph_bg), &[], &diags, &[], 80));
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
                 assert!(underlined, "cell {col} underlined");
@@ -8654,7 +8836,7 @@ mod tests {
             (0u32, 3u32, DiagnosticSeverity::Hint),
             (1u32, 2u32, DiagnosticSeverity::Error),
         ];
-        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], &diags, &[], 80));
+        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], c(th().git_modified_emph_bg), &[], &diags, &[], 80));
         assert_eq!(cells[1].1, Some(c(th().error)), "overlap shows error red");
         assert_eq!(
             cells[0].1,

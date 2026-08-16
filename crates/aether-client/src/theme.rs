@@ -172,6 +172,13 @@ pub struct Theme {
     pub git_staged_added_bg: Rgb,
     pub git_staged_modified_bg: Rgb,
     pub git_staged_deleted_bg: Rgb,
+    // Intra-line diff emphasis: a stronger fill over the corresponding line tint marking the
+    // sub-line ranges a change actually touched. Only Modified lines and phantom deleted rows
+    // carry emphasis, so there is no added variant. Sits below search/selection fills.
+    pub git_modified_emph_bg: Rgb,
+    pub git_deleted_emph_bg: Rgb,
+    pub git_staged_modified_emph_bg: Rgb,
+    pub git_staged_deleted_emph_bg: Rgb,
     // Cursorline variants on changed lines, so the cursorline doesn't hide the change colour.
     pub cursor_line_added_bg: Rgb,
     pub cursor_line_modified_bg: Rgb,
@@ -244,6 +251,15 @@ impl Theme {
         git_staged_added_bg: rgb(0x2f3631),
         git_staged_modified_bg: rgb(0x35342d),
         git_staged_deleted_bg: rgb(0x33252a),
+        // Emphasis must read against BOTH the plain tint and the cursor-line variant of its kind
+        // (the first-pass values sat almost on the cursor-line tints and vanished there). Derived
+        // as the kind hue mixed further into its own tint (NORD13 into the modified tint, NORD11
+        // into the phantom bg) so the fill reads as a stronger wash of the same glass, not a
+        // solid pigment.
+        git_modified_emph_bg: rgb(0x665b41),
+        git_deleted_emph_bg: rgb(0x65363c),
+        git_staged_modified_emph_bg: rgb(0x544e3d),
+        git_staged_deleted_emph_bg: rgb(0x503339),
         cursor_line_added_bg: rgb(0x3a4d3a),
         cursor_line_modified_bg: rgb(0x4a4632),
         cursor_line_staged_added_bg: rgb(0x3a453c),
@@ -306,6 +322,10 @@ impl Theme {
         git_staged_added_bg: rgb(0xe3ecdf),
         git_staged_modified_bg: rgb(0xebe7d8),
         git_staged_deleted_bg: rgb(0xefe0e2),
+        git_modified_emph_bg: rgb(0xe3c366),
+        git_deleted_emph_bg: rgb(0xf1abb0),
+        git_staged_modified_emph_bg: rgb(0xe4d29a),
+        git_staged_deleted_emph_bg: rgb(0xf0c1c6),
         cursor_line_added_bg: rgb(0xd3e4cb),
         cursor_line_modified_bg: rgb(0xe6dfc0),
         cursor_line_staged_added_bg: rgb(0xdde7d8),

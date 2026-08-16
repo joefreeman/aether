@@ -271,6 +271,250 @@ pub(crate) fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
     hunks
 }
 
+// ---- intra-line diff --------------------------------------------------------------------------
+//
+// Word-grain emphasis for the inline diff view: given the old and new text of one paired line in
+// a Modified hunk, pick out the sub-line ranges that actually changed. libgit2 stops at line
+// grain, so this is our own three-stage pass: trim the common prefix/suffix, LCS over word
+// tokens on what's left, then merge nearby runs and snap them outward to word boundaries so the
+// result reads as changed *words*, not confetti.
+
+/// Byte ranges (start, exclusive end) within one side's text. Char-boundary aligned, sorted,
+/// non-overlapping.
+pub(crate) type EmphasisSpans = Vec<(u32, u32)>;
+
+/// Lines longer than this skip intra-line analysis (minified JS etc.) — the whole-line tint is
+/// already right, and the LCS isn't worth the cycles on the render path.
+const INTRALINE_MAX_BYTES: usize = 4096;
+/// Token-pair budget for the LCS table; above it the changed middle is emitted as one span per
+/// side rather than diffed further.
+const INTRALINE_MAX_CELLS: usize = 10_000;
+/// Unchanged gaps of at most this many bytes between two changed runs are absorbed, so
+/// `a.b` → `x.y` emphasizes once, not twice.
+const INTRALINE_JOIN_GAP: usize = 2;
+
+/// Compare one old/new line pair and return the changed byte ranges on each side.
+///
+/// `None` means "no usable intra-line story": the pair changed too much (rewritten lines render
+/// as today's whole-line tint rather than near-total emphasis) or is too long to analyse. Either
+/// side's spans may be empty — a pure in-line insertion has nothing to emphasize on the old side.
+pub(crate) fn intraline_emphasis(old: &str, new: &str) -> Option<(EmphasisSpans, EmphasisSpans)> {
+    if old.len() > INTRALINE_MAX_BYTES || new.len() > INTRALINE_MAX_BYTES {
+        return None;
+    }
+    let prefix = common_prefix_bytes(old, new);
+    let suffix = common_suffix_bytes(&old[prefix..], &new[prefix..]);
+    let old_mid = &old[prefix..old.len() - suffix];
+    let new_mid = &new[prefix..new.len() - suffix];
+    if old_mid.is_empty() && new_mid.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+
+    let old_tokens = tokenize(old_mid);
+    let new_tokens = tokenize(new_mid);
+    let whole = |mid: &str| -> Vec<(usize, usize)> {
+        if mid.is_empty() {
+            Vec::new()
+        } else {
+            vec![(0, mid.len())]
+        }
+    };
+    let (mut old_spans, mut new_spans) =
+        if old_tokens.len() * new_tokens.len() > INTRALINE_MAX_CELLS {
+            // Middle too busy to diff — one span per side is still better than nothing.
+            (whole(old_mid), whole(new_mid))
+        } else {
+            let (old_matched, new_matched) =
+                lcs_matches(old_mid, &old_tokens, new_mid, &new_tokens);
+            (
+                changed_spans_of(&old_tokens, &old_matched),
+                changed_spans_of(&new_tokens, &new_matched),
+            )
+        };
+    merge_close(&mut old_spans, INTRALINE_JOIN_GAP);
+    merge_close(&mut new_spans, INTRALINE_JOIN_GAP);
+
+    // Mostly-rewritten pair: near-total emphasis is noisier than the plain tint. Bail while the
+    // spans are still tight (pre-snap), using whole-line lengths so a long shared prefix/suffix
+    // counts in the pair's favour.
+    let changed: usize = old_spans
+        .iter()
+        .chain(new_spans.iter())
+        .map(|(s, e)| e - s)
+        .sum();
+    if changed * 5 > (old.len() + new.len()) * 3 {
+        return None;
+    }
+
+    let offset_and_snap = |spans: Vec<(usize, usize)>, text: &str| -> EmphasisSpans {
+        let mut out: Vec<(usize, usize)> = spans
+            .into_iter()
+            .map(|(s, e)| (s + prefix, e + prefix))
+            .collect();
+        snap_to_words(&mut out, text);
+        out.into_iter()
+            .map(|(s, e)| (s as u32, e as u32))
+            .collect()
+    };
+    Some((offset_and_snap(old_spans, old), offset_and_snap(new_spans, new)))
+}
+
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    let mut n = 0;
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca != cb {
+            break;
+        }
+        n += ca.len_utf8();
+    }
+    n
+}
+
+fn common_suffix_bytes(a: &str, b: &str) -> usize {
+    let mut n = 0;
+    for (ca, cb) in a.chars().rev().zip(b.chars().rev()) {
+        if ca != cb {
+            break;
+        }
+        n += ca.len_utf8();
+    }
+    n
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte range of each token: a run of word chars, a run of whitespace, or a single other char.
+fn tokenize(text: &str) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Class {
+        Word,
+        Space,
+        Other,
+    }
+    let class = |c: char| {
+        if is_word_char(c) {
+            Class::Word
+        } else if c.is_whitespace() {
+            Class::Space
+        } else {
+            Class::Other
+        }
+    };
+    let mut tokens: Vec<(usize, usize)> = Vec::new();
+    let mut prev_class = Class::Other;
+    for (i, c) in text.char_indices() {
+        let cls = class(c);
+        match tokens.last_mut() {
+            Some((_, end)) if cls == prev_class && cls != Class::Other => {
+                *end = i + c.len_utf8();
+            }
+            _ => tokens.push((i, i + c.len_utf8())),
+        }
+        prev_class = cls;
+    }
+    tokens
+}
+
+/// Longest common subsequence over tokens (compared by text), returning per-token "kept" flags
+/// for each side. Classic O(n·m) table — bounded by [`INTRALINE_MAX_CELLS`] at the call site.
+fn lcs_matches(
+    old_text: &str,
+    old_tokens: &[(usize, usize)],
+    new_text: &str,
+    new_tokens: &[(usize, usize)],
+) -> (Vec<bool>, Vec<bool>) {
+    let n = old_tokens.len();
+    let m = new_tokens.len();
+    fn tok(text: &str, (s, e): (usize, usize)) -> &str {
+        &text[s..e]
+    }
+    let mut table = vec![0u16; (n + 1) * (m + 1)];
+    let idx = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[idx(i, j)] = if tok(old_text, old_tokens[i]) == tok(new_text, new_tokens[j]) {
+                table[idx(i + 1, j + 1)] + 1
+            } else {
+                table[idx(i + 1, j)].max(table[idx(i, j + 1)])
+            };
+        }
+    }
+    let mut old_matched = vec![false; n];
+    let mut new_matched = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if tok(old_text, old_tokens[i]) == tok(new_text, new_tokens[j]) {
+            old_matched[i] = true;
+            new_matched[j] = true;
+            i += 1;
+            j += 1;
+        } else if table[idx(i + 1, j)] >= table[idx(i, j + 1)] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    (old_matched, new_matched)
+}
+
+/// Byte spans of the unmatched-token runs, adjacent unmatched tokens coalesced.
+fn changed_spans_of(tokens: &[(usize, usize)], matched: &[bool]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (t, &(s, e)) in tokens.iter().enumerate() {
+        if matched[t] {
+            continue;
+        }
+        match spans.last_mut() {
+            Some((_, end)) if *end == s => *end = e,
+            _ => spans.push((s, e)),
+        }
+    }
+    spans
+}
+
+/// Absorb unchanged gaps of at most `gap` bytes between consecutive spans.
+fn merge_close(spans: &mut Vec<(usize, usize)>, gap: usize) {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for &(s, e) in spans.iter() {
+        match merged.last_mut() {
+            Some((_, end)) if s <= *end + gap => *end = (*end).max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    *spans = merged;
+}
+
+/// Extend each span outward to word boundaries (a span edge inside `foo|bar` grows to cover the
+/// whole word), then re-merge anything the growth made overlap. Keeps the emphasis word-grain
+/// when the prefix/suffix trim split a word.
+fn snap_to_words(spans: &mut Vec<(usize, usize)>, text: &str) {
+    for (s, e) in spans.iter_mut() {
+        while *s > 0 {
+            let prev = text[..*s].chars().next_back();
+            let cur = text[*s..].chars().next();
+            match (prev, cur) {
+                (Some(p), Some(c)) if is_word_char(p) && is_word_char(c) => {
+                    *s -= p.len_utf8();
+                }
+                _ => break,
+            }
+        }
+        while *e < text.len() {
+            let prev = text[..*e].chars().next_back();
+            let cur = text[*e..].chars().next();
+            match (prev, cur) {
+                (Some(p), Some(c)) if is_word_char(p) && is_word_char(c) => {
+                    *e += c.len_utf8();
+                }
+                _ => break,
+            }
+        }
+    }
+    merge_close(spans, 0);
+}
+
 /// Which changes a hunk operation (stage / unstage / revert) targets, in **new-side** 0-based
 /// line coordinates of the diff being operated on (buffer lines for stage/revert, index lines
 /// for unstage).
@@ -948,6 +1192,97 @@ mod tests {
 
     fn rope(s: &str) -> ropey::Rope {
         ropey::Rope::from_str(s)
+    }
+
+    // ---- intra-line emphasis --------------------------------------------------------------------
+
+    #[test]
+    fn intraline_single_word_change() {
+        let (old, new) = intraline_emphasis("let count = 1;", "let total = 1;").unwrap();
+        assert_eq!(old, vec![(4, 9)]); // "count"
+        assert_eq!(new, vec![(4, 9)]); // "total"
+    }
+
+    #[test]
+    fn intraline_insertion_has_empty_old_side() {
+        let (old, new) = intraline_emphasis("foo(a, c)", "foo(a, b, c)").unwrap();
+        assert_eq!(old, vec![]);
+        assert_eq!(new, vec![(7, 10)]); // "b, " (", b" re-anchored by the suffix trim)
+    }
+
+    #[test]
+    fn intraline_deletion_has_empty_new_side() {
+        let (old, new) = intraline_emphasis("foo(a, b, c)", "foo(a, c)").unwrap();
+        assert_eq!(new, vec![]);
+        assert_eq!(old.len(), 1);
+    }
+
+    #[test]
+    fn intraline_multiple_ranges() {
+        let (old, new) =
+            intraline_emphasis("if alpha and gamma:", "if beta and delta:").unwrap();
+        assert_eq!(old, vec![(3, 8), (13, 18)]); // "alpha", "gamma"
+        assert_eq!(new, vec![(3, 7), (12, 17)]); // "beta", "delta"
+    }
+
+    #[test]
+    fn intraline_small_gaps_merge() {
+        // Both idents around the unchanged "." change: one merged range, not two.
+        let (old, new) = intraline_emphasis("return a.b;", "return xx.yy;").unwrap();
+        assert_eq!(old, vec![(7, 10)]); // "a.b" as one run
+        assert_eq!(new, vec![(7, 12)]); // "xx.yy" as one run
+    }
+
+    #[test]
+    fn intraline_rewritten_line_bails() {
+        assert_eq!(
+            intraline_emphasis("return compute(items)", "self.cache.clear()"),
+            None,
+            "mostly-rewritten pairs render as the plain whole-line tint"
+        );
+    }
+
+    #[test]
+    fn intraline_identical_pair_has_no_emphasis() {
+        assert_eq!(
+            intraline_emphasis("same text", "same text"),
+            Some((vec![], vec![]))
+        );
+    }
+
+    #[test]
+    fn intraline_overlong_line_bails() {
+        let long = "x".repeat(INTRALINE_MAX_BYTES + 1);
+        assert_eq!(intraline_emphasis(&long, "x"), None);
+    }
+
+    #[test]
+    fn intraline_snaps_to_word_boundaries() {
+        // Shared prefix "user_" would otherwise leave a mid-word emphasis start.
+        let (old, new) = intraline_emphasis("let user_name = 1;", "let user_email = 1;").unwrap();
+        assert_eq!(old, vec![(4, 13)]); // the whole "user_name"
+        assert_eq!(new, vec![(4, 14)]); // the whole "user_email"
+    }
+
+    #[test]
+    fn intraline_multibyte_ranges_stay_on_char_boundaries() {
+        // Appending "s" to "café": the prefix trim stops mid-word after the 2-byte "é", and the
+        // word snap must grow the span back over it without splitting the char.
+        let (old, new) = intraline_emphasis("greet café now", "greet cafés now").unwrap();
+        assert_eq!(old, vec![], "pure insertion: nothing removed on the old side");
+        assert_eq!(new, vec![(6, 12)]); // the whole "cafés"
+        for (s, e) in &new {
+            assert!("greet cafés now".is_char_boundary(*s as usize));
+            assert!("greet cafés now".is_char_boundary(*e as usize));
+        }
+    }
+
+    #[test]
+    fn intraline_whitespace_only_change() {
+        // Widened gap: the two inserted spaces are the emphasis; nothing changed on the old side.
+        let (old, new) = intraline_emphasis("a b", "a   b").unwrap();
+        assert_eq!(old, vec![]);
+        assert_eq!(new, vec![(2, 4)]);
     }
 
     // ---- commit-time formatting (no repo needed) ------------------------------------------------

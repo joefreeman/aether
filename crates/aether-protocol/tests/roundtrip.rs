@@ -41,7 +41,8 @@ use aether_protocol::sneak::{
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
-    LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow, VirtualRowKind,
+    EmphasisRange, LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow,
+    VirtualRowKind,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -264,6 +265,7 @@ fn logical_line_render_virtual_rows_shape() {
         virtual_rows_above: vec![],
         diff_marker: None,
         diff_stage: DiffStage::Unstaged,
+        diff_emphasis: vec![],
         diagnostics: vec![],
         sneak_targets: vec![],
     };
@@ -271,6 +273,10 @@ fn logical_line_render_virtual_rows_shape() {
     assert!(
         v.get("virtual_rows_above").is_none(),
         "empty omitted from wire"
+    );
+    assert!(
+        v.get("diff_emphasis").is_none(),
+        "empty diff_emphasis omitted from wire"
     );
     assert!(
         v.get("sneak_targets").is_none(),
@@ -297,9 +303,11 @@ fn logical_line_render_virtual_rows_shape() {
             text: "old line".into(),
             kind: VirtualRowKind::Deleted,
             stage: DiffStage::Staged,
+            emphasis: vec![EmphasisRange { start: 4, end: 8 }],
         }],
         diff_marker: Some(DiffMarker::Modified),
         diff_stage: DiffStage::Staged,
+        diff_emphasis: vec![EmphasisRange { start: 0, end: 3 }],
         diagnostics: vec![DiagnosticSpan {
             start: 4,
             end: 9,
@@ -312,8 +320,12 @@ fn logical_line_render_virtual_rows_shape() {
     assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
     assert_eq!(v["virtual_rows_above"][0]["kind"], "deleted");
     assert_eq!(v["virtual_rows_above"][0]["stage"], "staged");
+    assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["start"], 4);
+    assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["end"], 8);
     assert_eq!(v["diff_marker"], "modified");
     assert_eq!(v["diff_stage"], "staged");
+    assert_eq!(v["diff_emphasis"][0]["start"], 0);
+    assert_eq!(v["diff_emphasis"][0]["end"], 3);
     assert_eq!(v["diagnostics"][0]["start"], 4);
     assert_eq!(v["diagnostics"][0]["end"], 9);
     assert_eq!(v["diagnostics"][0]["severity"], "error");
@@ -322,8 +334,13 @@ fn logical_line_render_virtual_rows_shape() {
     assert_eq!(back.virtual_rows_above.len(), 1);
     assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
     assert_eq!(back.virtual_rows_above[0].stage, DiffStage::Staged);
+    assert_eq!(
+        back.virtual_rows_above[0].emphasis,
+        vec![EmphasisRange { start: 4, end: 8 }]
+    );
     assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
     assert_eq!(back.diff_stage, DiffStage::Staged);
+    assert_eq!(back.diff_emphasis, vec![EmphasisRange { start: 0, end: 3 }]);
     assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
 }
 

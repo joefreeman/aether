@@ -403,6 +403,7 @@ mod tests {
             virtual_rows_above: vec![],
             diff_marker: None,
             diff_stage: Default::default(),
+            diff_emphasis: vec![],
             diagnostics: vec![],
             sneak_targets: vec![],
         }
@@ -550,11 +551,13 @@ mod tests {
                 text: "removed 1".into(),
                 kind: VirtualRowKind::Deleted,
                 stage: Default::default(),
+                emphasis: vec![],
             },
             VirtualRow {
                 text: "removed 2".into(),
                 kind: VirtualRowKind::Deleted,
                 stage: Default::default(),
+                emphasis: vec![],
             },
         ];
         let w = window(10, 20, vec![l10, line(11, vec![row(0, 0, "next")])]);

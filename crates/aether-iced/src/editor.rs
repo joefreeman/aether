@@ -405,6 +405,14 @@ where
                 fill(renderer, r, c);
             }
         };
+        // Rounded variant for the intra-line diff-emphasis band (the only rounded fill in the
+        // buffer). A left-clamped band loses its rounding on the clipped edge; acceptable — it
+        // only happens mid-glyph under horizontal scroll.
+        let fill_content_rounded = |renderer: &mut Renderer, r: Rectangle, c: Color, rad: f32| {
+            if let Some(r) = clamp_left(r, content_left) {
+                fill_rounded(renderer, r, c, rad);
+            }
+        };
 
         let mut abs_row = window.first_visual_row;
         for line in &window.lines {
@@ -446,19 +454,82 @@ where
                     },
                     bar,
                 );
-                let text = v
-                    .text
-                    .replace('\t', &" ".repeat(self.content.tab_width as usize));
-                draw_text_run(
-                    renderer,
-                    text,
-                    Point::new(text_x(0), y),
-                    cell,
-                    fg,
-                    EDITOR_FONT,
-                    content_clip,
-                    text_shaping,
-                );
+                // Intra-line emphasis: a stronger red fill over the removed sub-ranges, whose
+                // text switches to the normal foreground (red-on-red is illegible on the vivid
+                // fill; matches the terminal and the web's `.deleted-phantom .diff-emph`). Byte →
+                // column mirrors the flat tab expansion applied to the text runs.
+                let col_of = |byte: usize| -> u32 {
+                    let mut col = 0u32;
+                    for (i, ch) in v.text.char_indices() {
+                        if i >= byte {
+                            break;
+                        }
+                        col += if ch == '\t' {
+                            self.content.tab_width
+                        } else {
+                            1
+                        };
+                    }
+                    col
+                };
+                if !v.emphasis.is_empty() {
+                    let emph_bg = if staged {
+                        p.git_staged_deleted_emph_bg
+                    } else {
+                        p.git_deleted_emph_bg
+                    };
+                    let inset = emphasis_inset(cell.height);
+                    for r in &v.emphasis {
+                        let (s, e) = (col_of(r.start as usize), col_of(r.end as usize));
+                        if e > s {
+                            fill_content_rounded(
+                                renderer,
+                                Rectangle {
+                                    x: text_x(s) - 1.0,
+                                    y: y + inset,
+                                    width: (e - s) as f32 * cell.width + 2.0,
+                                    height: cell.height - 2.0 * inset,
+                                },
+                                emph_bg,
+                                emphasis_radius(cell.height),
+                            );
+                        }
+                    }
+                }
+                // The row's text as segments split at the emphasis boundaries (one run when
+                // there's no emphasis), each at its own column so the runs stay aligned.
+                let mut segments: Vec<(usize, usize, bool)> = Vec::new();
+                let mut pos = 0usize;
+                for r in &v.emphasis {
+                    let (s, e) = (
+                        (r.start as usize).min(v.text.len()),
+                        (r.end as usize).min(v.text.len()),
+                    );
+                    if s > pos {
+                        segments.push((pos, s, false));
+                    }
+                    if e > s {
+                        segments.push((s, e, true));
+                    }
+                    pos = pos.max(e);
+                }
+                if pos < v.text.len() {
+                    segments.push((pos, v.text.len(), false));
+                }
+                for (s, e, emph) in segments {
+                    let seg = v.text[s..e]
+                        .replace('\t', &" ".repeat(self.content.tab_width as usize));
+                    draw_text_run(
+                        renderer,
+                        seg,
+                        Point::new(text_x(col_of(s)), y),
+                        cell,
+                        if emph { p.fg } else { fg },
+                        EDITOR_FONT,
+                        content_clip,
+                        text_shaping,
+                    );
+                }
             }
 
             let n_rows = line.visual_rows.len();
@@ -512,6 +583,37 @@ where
                 };
                 if let Some(bg) = row_bg {
                     fill(renderer, row_bounds, bg);
+                }
+
+                // Intra-line diff emphasis: the stronger change fill over the line tint, under
+                // the search/selection/cursor fills below (same stacking as the terminal). The
+                // spans are kept — the text pass lifts comment-coloured glyphs inside them, and
+                // the fill is deliberately vivid enough to survive the cursor-line variant tint.
+                let emph_spans: Vec<(u32, u32)> = line
+                    .diff_emphasis
+                    .iter()
+                    .filter_map(|r| grid::byte_range_span(&cells, r.start, r.end))
+                    .collect();
+                if !emph_spans.is_empty() {
+                    let emph_bg = if staged {
+                        p.git_staged_modified_emph_bg
+                    } else {
+                        p.git_modified_emph_bg
+                    };
+                    let inset = emphasis_inset(cell.height);
+                    for &(s, e) in &emph_spans {
+                        fill_content_rounded(
+                            renderer,
+                            Rectangle {
+                                x: text_x(s) - 1.0,
+                                y: y + inset,
+                                width: (e - s) as f32 * cell.width + 2.0,
+                                height: cell.height - 2.0 * inset,
+                            },
+                            emph_bg,
+                            emphasis_radius(cell.height),
+                        );
+                    }
                 }
 
                 // Search-match fills: the quiet dim fill, under selection and cursor (matching
@@ -684,6 +786,7 @@ where
                 // rule; every other syntax colour reads fine on the fill).
                 let in_hit = |dcol: u32| {
                     hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
+                        || emph_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
                         || sneak_spans
                             .iter()
                             .any(|&(s, e, _, _)| dcol >= s && dcol < e)
@@ -1143,6 +1246,39 @@ fn clamp_left(mut r: Rectangle, left: f32) -> Option<Rectangle> {
         r.width -= d;
     }
     Some(r)
+}
+
+/// Vertical inset of the intra-line diff-emphasis band: the band floats inside the full-height
+/// line tint instead of cutting a full-height column out of it (matches the web's inset
+/// `.diff-emph` band; the terminal can't do this at cell granularity). Scales with the line
+/// height so it holds up across buffer font sizes.
+fn emphasis_inset(cell_height: f32) -> f32 {
+    (cell_height * 0.10).round().max(1.0)
+}
+
+/// Corner radius of the emphasis band (the pill look; web uses a fixed 3px).
+fn emphasis_radius(cell_height: f32) -> f32 {
+    (cell_height * 0.16).clamp(2.0, 4.0)
+}
+
+/// [`fill`] with rounded corners — the emphasis band's pill shape.
+fn fill_rounded<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    bounds: Rectangle,
+    color: Color,
+    radius: f32,
+) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            border: iced::Border {
+                radius: radius.into(),
+                ..Default::default()
+            },
+            ..renderer::Quad::default()
+        },
+        color,
+    );
 }
 
 fn fill<Renderer: renderer::Renderer>(renderer: &mut Renderer, bounds: Rectangle, color: Color) {

@@ -78,7 +78,7 @@ use aether_protocol::sneak::{
     SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
 };
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, LogicalLineRange,
+    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, LogicalLineRange,
     LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
     ViewportSubscribeResult, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
@@ -6254,8 +6254,9 @@ pub async fn viewport_scroll_to_row(
         .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
+    // Row-count use only — no emphasis needed to resolve a visual row to a line.
     let deleted_rows = if diff_view {
-        deleted_rows_by_anchor(hunks, line_count)
+        deleted_rows_by_anchor(hunks, line_count, None)
     } else {
         HashMap::new()
     };
@@ -6559,19 +6560,24 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
 fn deleted_rows_by_anchor(
     hunks: &[crate::git::DiffHunk],
     line_count: u32,
+    intraline: Option<&IntralineEmphasis>,
 ) -> HashMap<u32, Vec<VirtualRow>> {
     let mut map: HashMap<u32, Vec<VirtualRow>> = HashMap::new();
     let last_line = line_count.saturating_sub(1);
-    for h in hunks {
+    for (hunk_idx, h) in hunks.iter().enumerate() {
         if h.deleted.is_empty() {
             continue;
         }
         let anchor = h.anchor_line.min(last_line);
         let rows = map.entry(anchor).or_default();
-        rows.extend(h.deleted.iter().map(|text| VirtualRow {
+        rows.extend(h.deleted.iter().enumerate().map(|(row_idx, text)| VirtualRow {
             text: text.clone(),
             kind: VirtualRowKind::Deleted,
             stage: h.stage,
+            emphasis: intraline
+                .and_then(|m| m.rows.get(&(hunk_idx, row_idx)))
+                .cloned()
+                .unwrap_or_default(),
         }));
     }
     for rows in map.values_mut() {
@@ -6580,6 +6586,79 @@ fn deleted_rows_by_anchor(
         }
     }
     map
+}
+
+/// Intra-line diff emphasis for the window being rendered: for each old/new line pair of a
+/// Modified hunk, the sub-line byte ranges that actually changed (see
+/// [`crate::git::intraline_emphasis`]). Computed only while the diff view is on, and only for
+/// pairs that can appear in the window — the phantom rows all sit at the hunk's anchor, the new
+/// side on `anchor + i` — so cost scales with what's on screen, not with the diff.
+#[derive(Default)]
+struct IntralineEmphasis {
+    /// Old-side ranges, keyed by (index into the hunk slice, index into that hunk's `deleted`).
+    rows: HashMap<(usize, usize), Vec<EmphasisRange>>,
+    /// New-side ranges, keyed by buffer line.
+    lines: HashMap<u32, Vec<EmphasisRange>>,
+}
+
+fn intraline_for_window(
+    hunks: &[crate::git::DiffHunk],
+    buf: &Document,
+    first: u32,
+    last_excl: u32,
+) -> IntralineEmphasis {
+    use crate::git::ChangeKind;
+    let mut out = IntralineEmphasis::default();
+    // Where a staged and an unstaged hunk pair up the same buffer line, the unstaged layer wins
+    // (matching `diff_markers_by_line`): the line's tint is unstaged, so its emphasis is too.
+    let mut line_stage: HashMap<u32, DiffStage> = HashMap::new();
+    for (hunk_idx, h) in hunks.iter().enumerate() {
+        if !matches!(h.kind, ChangeKind::Modified) {
+            continue;
+        }
+        let anchor_in_window = h.anchor_line >= first && h.anchor_line < last_excl;
+        let pairs = (h.deleted.len() as u32).min(h.new_lines);
+        for i in 0..pairs {
+            let line = h.anchor_line + i;
+            let line_in_window = line >= first && line < last_excl;
+            // The pair matters if its new side is in the window, or its phantom row is (all of a
+            // hunk's phantom rows render at the anchor).
+            if (!line_in_window && !anchor_in_window) || line >= buf.line_count() {
+                continue;
+            }
+            let old = &h.deleted[i as usize];
+            let mut new: String = buf.text.line(line as usize).chunks().collect();
+            if new.ends_with('\n') {
+                new.pop();
+            }
+            // A bail (`None`: rewritten / overlong pair) renders the same as an identical pair —
+            // no emphasis — so both fold to empty spans here.
+            let (old_spans, new_spans) =
+                crate::git::intraline_emphasis(old, &new).unwrap_or_default();
+            let to_ranges = |spans: crate::git::EmphasisSpans| -> Vec<EmphasisRange> {
+                spans
+                    .into_iter()
+                    .map(|(start, end)| EmphasisRange { start, end })
+                    .collect()
+            };
+            if !old_spans.is_empty() {
+                out.rows
+                    .insert((hunk_idx, i as usize), to_ranges(old_spans));
+            }
+            if line_in_window {
+                let unstaged_present = line_stage.get(&line) == Some(&DiffStage::Unstaged);
+                if !(unstaged_present && h.stage == DiffStage::Staged) {
+                    if new_spans.is_empty() {
+                        out.lines.remove(&line);
+                    } else {
+                        out.lines.insert(line, to_ranges(new_spans));
+                    }
+                    line_stage.insert(line, h.stage);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The Git change marker (and its stage) for each affected buffer line, for the gutter
@@ -7708,8 +7787,13 @@ fn render_window(
     // known — independent of the diff-view toggle. Phantom "deleted" rows, by contrast, only
     // appear while the diff view is on.
     let markers = diff_markers_by_line(hunks, buf.line_count());
+    let intraline = if diff_view {
+        intraline_for_window(hunks, buf, first, last_excl)
+    } else {
+        IntralineEmphasis::default()
+    };
     let deleted_rows = if diff_view {
-        deleted_rows_by_anchor(hunks, buf.line_count())
+        deleted_rows_by_anchor(hunks, buf.line_count(), Some(&intraline))
     } else {
         HashMap::new()
     };
@@ -7759,6 +7843,9 @@ fn render_window(
         if let Some((marker, stage)) = markers.get(&i).copied() {
             render.diff_marker = Some(marker);
             render.diff_stage = stage;
+        }
+        if let Some(spans) = intraline.lines.get(&i) {
+            render.diff_emphasis = spans.clone();
         }
         render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
         lines.push(render);
@@ -14596,7 +14683,7 @@ mod diff_anchor_tests {
             hunk(ChangeKind::Deleted, 4, 0, &["gone one", "gone two"]),
             hunk(ChangeKind::Added, 7, 2, &[]), // additions contribute no phantom rows
         ];
-        let map = deleted_rows_by_anchor(&hunks, 100);
+        let map = deleted_rows_by_anchor(&hunks, 100, None);
         assert_eq!(map.get(&1).map(Vec::len), Some(1));
         assert_eq!(map[&1][0].text, "old beta");
         assert_eq!(map[&1][0].kind, VirtualRowKind::Deleted);
@@ -14610,10 +14697,73 @@ mod diff_anchor_tests {
         // A deletion anchored past the last line (e.g. removed the file's tail) clamps onto the
         // final line index so it still renders (above the trailing empty line of the buffer).
         let hunks = vec![hunk(ChangeKind::Deleted, 9, 0, &["tail"])];
-        let map = deleted_rows_by_anchor(&hunks, 5); // line_count = 5 → last index 4
+        let map = deleted_rows_by_anchor(&hunks, 5, None); // line_count = 5 → last index 4
         assert!(!map.contains_key(&9));
         assert_eq!(map.get(&4).map(Vec::len), Some(1));
         assert_eq!(map[&4][0].text, "tail");
+    }
+
+    fn doc_with(text: &str) -> Document {
+        let mut doc = Document::scratch(DocumentId(1), None);
+        doc.text = ropey::Rope::from_str(text);
+        doc
+    }
+
+    #[test]
+    fn intraline_pairs_modified_lines_and_rides_the_rows() {
+        // Line 1 modified: "count" → "total". The pair's emphasis lands on the buffer line (new
+        // side) and, via `deleted_rows_by_anchor`, on the phantom row (old side).
+        let buf = doc_with("aaa\nlet total = 1;\nccc\n");
+        let hunks = vec![hunk(ChangeKind::Modified, 1, 1, &["let count = 1;"])];
+        let intra = intraline_for_window(&hunks, &buf, 0, 3);
+        let count = EmphasisRange { start: 4, end: 9 };
+        assert_eq!(intra.lines.get(&1), Some(&vec![count])); // "total" (same cols)
+        assert_eq!(intra.rows.get(&(0, 0)), Some(&vec![count])); // "count"
+
+        let map = deleted_rows_by_anchor(&hunks, 3, Some(&intra));
+        assert_eq!(map[&1][0].emphasis, vec![count]);
+    }
+
+    #[test]
+    fn intraline_leaves_unpaired_extra_lines_alone() {
+        // Modified hunk with 1 old line and 2 new: only the first new line pairs; the second is
+        // effectively an addition and gets no emphasis.
+        let buf = doc_with("let total = 1;\nbrand new line\n");
+        let hunks = vec![hunk(ChangeKind::Modified, 0, 2, &["let count = 1;"])];
+        let intra = intraline_for_window(&hunks, &buf, 0, 2);
+        assert!(intra.lines.contains_key(&0));
+        assert!(!intra.lines.contains_key(&1));
+    }
+
+    #[test]
+    fn intraline_skips_pairs_fully_outside_the_window() {
+        let buf = doc_with("aaa\nlet total = 1;\nccc\n");
+        let hunks = vec![hunk(ChangeKind::Modified, 1, 1, &["let count = 1;"])];
+        // Window [2, 3): neither the pair's line (1) nor its anchor (1) is visible.
+        let intra = intraline_for_window(&hunks, &buf, 2, 3);
+        assert!(intra.lines.is_empty());
+        assert!(intra.rows.is_empty());
+    }
+
+    #[test]
+    fn intraline_unstaged_pair_wins_the_line_over_staged() {
+        // The same buffer line paired by a staged and an unstaged Modified hunk (modified,
+        // staged, modified again): the line's emphasis follows the unstaged top layer, matching
+        // the marker/tint rule.
+        let buf = doc_with("let total = 1;\n");
+        let mut staged = hunk(ChangeKind::Modified, 0, 1, &["let count = 1;"]);
+        staged.stage = DiffStage::Staged;
+        let unstaged = hunk(ChangeKind::Modified, 0, 1, &["let sum = 1;"]);
+        // Staged listed first (compose order); the unstaged result must still win.
+        let intra = intraline_for_window(&[staged, unstaged], &buf, 0, 1);
+        // "sum" (3 bytes) → "total": emphasis derives from the unstaged pair on the new side.
+        assert_eq!(
+            intra.lines.get(&0),
+            Some(&vec![EmphasisRange { start: 4, end: 9 }])
+        );
+        // Both phantom rows keep their own old-side emphasis regardless.
+        assert!(intra.rows.contains_key(&(0, 0)));
+        assert!(intra.rows.contains_key(&(1, 0)));
     }
 
     #[test]
@@ -14685,7 +14835,7 @@ mod diff_anchor_tests {
         let unstaged = hunk(ChangeKind::Deleted, 1, 0, &["index text"]);
         let mut staged_elsewhere = hunk(ChangeKind::Deleted, 5, 0, &["solo head text"]);
         staged_elsewhere.stage = DiffStage::Staged;
-        let map = deleted_rows_by_anchor(&[staged, unstaged, staged_elsewhere], 10);
+        let map = deleted_rows_by_anchor(&[staged, unstaged, staged_elsewhere], 10, None);
         let rows = &map[&1];
         assert_eq!(
             rows.len(),
