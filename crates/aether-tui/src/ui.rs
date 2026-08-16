@@ -3248,11 +3248,16 @@ fn section_header_spans(label: &str, max_width: usize) -> Vec<Span<'static>> {
 
 /// Dim foreground for secondary text on a picker row (root labels, line numbers, locations,
 /// metadata tails). The faint shade neighbours the selection background (adjacent Polar Night
-/// shades in dark) and all but vanishes on it, so the highlighted row brightens its dim spans
-/// to the full foreground — the
-/// same treatment the web client gives `.picker-row.selected` metadata.
+/// shades in dark) and all but vanishes on it, so the highlighted row lifts its dim spans one
+/// rung — to `fg_muted`, legible on the selection band yet still clearly subordinate to the
+/// full-foreground primary text — the same treatment the web client gives
+/// `.picker-row.selected` metadata.
 fn picker_dim_fg(highlighted: bool) -> Color {
-    c(if highlighted { th().fg } else { th().fg_faint })
+    c(if highlighted {
+        th().fg_muted
+    } else {
+        th().fg_faint
+    })
 }
 
 /// Background for a picker result row: the selection band when highlighted, else the panel
@@ -8063,15 +8068,21 @@ mod tests {
     }
 
     #[test]
-    fn picker_dim_spans_brighten_on_highlighted_row() {
+    fn picker_dim_spans_stay_muted_on_highlighted_row() {
         // The faint shade is illegible on the selection background — highlighted rows lift
-        // their dim spans (here: the grep line number, the file row's root label) to the full
-        // foreground.
+        // their dim spans (here: the grep line number, the file row's root label) to `fg_muted`:
+        // legible on the selection band, but still visibly dimmer than the full-foreground
+        // primary text (a root label matching the path's colour reads as part of the path).
         let num = preview_row_spans(41, "let x = 1;", &[], true, 30);
-        assert_eq!(num.last().unwrap().style.fg, Some(c(th().fg)));
+        assert_eq!(num.last().unwrap().style.fg, Some(c(th().fg_muted)));
         let labels = vec!["alpha".to_string(), "beta".to_string()];
         let file = file_item_spans(1, "src/main.rs", &[], None, &labels, true, 40);
-        assert_eq!(file.last().unwrap().style.fg, Some(c(th().fg)));
+        assert_eq!(file.last().unwrap().style.fg, Some(c(th().fg_muted)));
+        assert_ne!(
+            file.last().unwrap().style.fg,
+            file[1].style.fg,
+            "root label must stay distinct from the path on the selected row"
+        );
     }
 
     #[test]

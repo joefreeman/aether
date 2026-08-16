@@ -1130,7 +1130,9 @@ a.picker-row:not(.selected):hover .picker-main {
 }
 .picker-prefix { color: var(--match-highlight); flex: 0 0 auto; }
 /* References location prefix (`path:line`): dim, and allowed to ellipsize up to ~half the row so a
-   long path can't crowd out the preview. Brightens on the selected row, like the meta column. */
+   long path can't crowd out the preview. The faint shade all but vanishes on the selection band, so
+   the selected row lifts it one rung to `--fg-muted` — legible there, but still clearly dimmer than
+   the preview text (like the meta column and the terminal UI's `picker_dim_fg`). */
 .picker-prefix.picker-loc {
   color: var(--fg-faint);
   max-width: 55%;
@@ -1138,7 +1140,7 @@ a.picker-row:not(.selected):hover .picker-main {
   text-overflow: ellipsis;
   margin-right: 0.4em;
 }
-.picker-row.selected .picker-prefix.picker-loc { color: var(--fg); }
+.picker-row.selected .picker-prefix.picker-loc { color: var(--fg-muted); }
 .sev-error { color: var(--error); }
 .sev-warning { color: var(--warning); }
 .sev-information { color: var(--info); }
@@ -1259,11 +1261,12 @@ a.picker-row:not(.selected):hover .picker-main {
 /* The line number never shrinks away under a long code line: size to content, pushed to the right
    edge (the preview is the flexible cell and ellipsizes instead). */
 .picker-row.grep-hit .picker-meta { flex: 0 0 auto; margin-left: auto; }
+/* `--fg-muted` holds on the selected row too — legible on the selection band, and still visibly
+   dimmer than the primary text (no brightening: metadata matching the label's colour would read
+   as part of the label). Same treatment as the terminal UI's `picker_dim_fg`. */
 .picker-meta { color: var(--fg-muted); flex: 1 1 auto; text-align: right; overflow: hidden; text-overflow: ellipsis; }
-.picker-row.selected .picker-meta { color: var(--fg); }
 /* Keybinding chords read as the row's value, in the frost blue the native client uses (and the
-   old help dialog's key column used). After the `.selected` rule so it wins on selected rows too
-   (same specificity, later order) — the native client doesn't dim the chord on selection either. */
+   old help dialog's key column used). */
 .picker-row.keybinding .picker-meta { color: var(--accent); }
 .picker .match { color: var(--match-highlight); font-weight: bold; }
 .picker-row.selected .match { color: var(--match-highlight); }
