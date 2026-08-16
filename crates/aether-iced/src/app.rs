@@ -377,6 +377,8 @@ pub enum Message {
     Core(CoreEvent),
     /// Keyboard modifier state changed — stashed in `App::modifiers` for click-time reads (Ctrl-click).
     ModifiersChanged(keyboard::Modifiers),
+    /// The window was resized — stashed in `App::window_size` for chrome that spans it.
+    WindowResized(Size),
     /// The picker's jumplist scrolled natively (absolute y in px).
     PickerScrolled(f32),
     /// Pointer entered (`Some(abs)`) or left (`None`-if-still-current, see mapping) a row.
@@ -430,6 +432,13 @@ pub struct App {
     server_started_at: u64,
     cell: Option<Size>,
     view_size: Size,
+    /// The window's own size, tracked from `window::Event::Resized`.
+    ///
+    /// Distinct from [`Self::view_size`], which is the *editor's* layout — full-width in the code
+    /// view, but a centred prose column in the Markdown reading view, and not republished at all
+    /// while that view is up. Chrome that spans the window (the status bar) has to measure the
+    /// window; budgeting it against `view_size` truncated by a column width that never changed.
+    window_size: Size,
     /// Live keyboard modifier state, kept current from `ModifiersChanged` in every phase. Read at
     /// click time for Ctrl-click on picker rows — iced's `mouse_area::on_press` carries no modifiers.
     modifiers: keyboard::Modifiers,
@@ -529,6 +538,7 @@ impl App {
             server_started_at,
             cell: None,
             view_size: Size::ZERO,
+            window_size: Size::ZERO,
             modifiers: keyboard::Modifiers::default(),
             scroll_px: 0.0,
             scroll_x_px: 0.0,
@@ -685,6 +695,8 @@ impl App {
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
             }
+            // Window geometry for the chrome that spans it — see `App::window_size`.
+            Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size)),
             _ => None,
         });
         let mut subs = vec![keys];
@@ -721,6 +733,12 @@ impl App {
         // picker row reads it, and a `mouse_area` press hands over no modifiers of its own.
         if let Message::ModifiersChanged(m) = message {
             self.modifiers = m;
+            return Task::none();
+        }
+        // Handled in every phase, like the modifiers above: the boot chooser has a status row too,
+        // and a window resized before the first buffer opens must still be measured.
+        if let Message::WindowResized(size) = message {
+            self.window_size = size;
             return Task::none();
         }
         // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
@@ -947,7 +965,7 @@ impl App {
             Message::Editor(ev) => self.on_editor_event(ev),
             Message::Key { code, mods, text } => self.on_key(code, mods, text),
             // Handled upstream in `update` (tracked in every phase); listed here only for exhaustiveness.
-            Message::ModifiersChanged(_) => Task::none(),
+            Message::ModifiersChanged(_) | Message::WindowResized(_) => Task::none(),
 
             Message::HintTick => {
                 let fx = self.session.on_hint_tick(Self::now_unix_ms());
@@ -4023,29 +4041,55 @@ impl App {
     /// mode lives in the cursor shape). Left: state dot, `[workspace] file` (italic when
     /// transient), git cluster. Right: grep position, diagnostic counts, cursor position, LSP
     /// health dot.
+    /// Width to budget window-spanning chrome against. The window's own size once it has reported
+    /// one, falling back to the editor's layout until then — iced publishes a `Resized` when the
+    /// surface is first configured, but a zero here would blank the breadcrumb for that first frame.
+    fn chrome_width(&self) -> f32 {
+        if self.window_size.width > 0.0 {
+            self.window_size.width
+        } else {
+            self.view_size.width
+        }
+    }
+
     fn status_bar(&self) -> Element<'_, Message> {
         let ui = self.ui();
         let p = self.palette();
-        let t = |s: String, color: iced::Color| text(s).size(ui.body()).font(SANS).color(color);
+        // `Wrapping::None` on every piece: `text` wraps at word boundaries by default, so a status
+        // row whose content outgrew its width didn't overflow — it silently became two lines and
+        // pushed the editor up. One line is the whole contract of this row.
+        let t = |s: String, color: iced::Color| {
+            text(s)
+                .size(ui.body())
+                .font(SANS)
+                .color(color)
+                .wrapping(iced::widget::text::Wrapping::None)
+        };
 
+        // Char widths of everything pushed, accumulated as we go: the breadcrumb at the end of the
+        // left segment gets whatever the fixed content leaves, and iced has no column grid to ask.
+        let mut used = 0usize;
         let mut left = row![];
         if let Some(color) = self.buffer_state_color() {
             // Through `state_dot` (== body size), the one knob the picker rows share.
             left = left.push(text("● ").size(ui.state_dot()).font(SANS).color(color));
+            used += 2;
         }
         // Persisted workspace → `[name] ` prefix. No workspace (boot/connecting/chooser) or an
         // ephemeral "(no workspace)" context → no prefix, so the bar shows just the file label
         // rather than a stray `[]` or a `[(no workspace)]` that reads like a real workspace.
         if crate::labels::shows_workspace_chrome(&self.session.workspace) {
-            left = left.push(t(format!("[{}] ", self.session.workspace), p.fg));
+            let prefix = format!("[{}] ", self.session.workspace);
+            used += prefix.chars().count();
+            left = left.push(t(prefix, p.fg));
         }
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / ui.char_width()) as usize).max(12);
-        let name = text(crate::labels::truncate_path(
-            &self.session.buffer.label,
-            budget,
-        ))
+        let label = crate::labels::truncate_path(&self.session.buffer.label, budget);
+        used += label.chars().count();
+        let name = text(label)
+        .wrapping(iced::widget::text::Wrapping::None)
         .size(ui.body())
         .color(p.fg)
         .font(
@@ -4063,25 +4107,36 @@ impl App {
             // `fg_muted`: the dim-but-legible rung (dark stays the historic NORD3_BRIGHTER) —
             // see the buffer picker's tether star.
             left = left.push(t(" *".into(), p.fg_muted));
+            used += 2;
         }
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
-        // the staged count in parens, each omitted when zero.
+        // the staged count in parens, each omitted when zero. Introduced, like every following
+        // section, by a dim `·` divider.
         if let Some(gs) = self
             .session
             .window
             .as_ref()
             .and_then(|w| w.git_status.as_ref())
         {
-            if let Some(branch) = &gs.branch {
-                left = left.push(t(format!("   ⎇  {branch}"), p.accent_alt));
-            }
             let u = &gs.unstaged;
             let s = &gs.staged;
-            for (sigil, color, un, st) in [
+            let classes = [
                 ("+", p.git_added, u.added, s.added),
                 ("~", p.git_modified, u.modified, s.modified),
                 ("-", p.git_deleted, u.deleted, s.deleted),
-            ] {
+            ];
+            // One divider for the whole cluster, so it has to be decided before the first piece —
+            // a repo with no branch name still shows its counts and still wants dividing.
+            if gs.branch.is_some() || classes.iter().any(|(_, _, un, st)| *un > 0 || *st > 0) {
+                left = left.push(section_divider(&self.ui(), p));
+                used += DIVIDER_COLS;
+            }
+            if let Some(branch) = &gs.branch {
+                let seg = format!("⎇  {branch}");
+                used += seg.chars().count();
+                left = left.push(t(seg, p.accent_alt));
+            }
+            for (sigil, color, un, st) in classes {
                 if un == 0 && st == 0 {
                     continue;
                 }
@@ -4092,27 +4147,33 @@ impl App {
                 if st > 0 {
                     tok.push_str(&format!("({st})"));
                 }
+                used += tok.chars().count() + 2;
                 left = left.push(t(format!("  {tok}"), color));
             }
         }
 
         let mut right = row![].spacing(10);
+        // Same accumulation as the left segment: the breadcrumb is sized from what's left over, so
+        // the right segment has to declare how much room it's taking. `spacing(10)` between
+        // children is roughly two chars at any body size.
+        let mut right_used = 0usize;
+        let gap = |used: &mut usize, s: &str| {
+            *used += s.chars().count() + 2;
+        };
         // Committed-search counter, only while the cursor sits on a match (web convention).
         if self.session.search.active {
             if let Some(s) = self.session.search.summary.as_ref() {
                 if s.current_index > 0 && s.total > 0 {
-                    right = right.push(t(
-                        format!("{}/{}", s.current_index, format_total(s)),
-                        p.fg,
-                    ));
+                    let seg = format!("{}/{}", s.current_index, format_total(s));
+                    gap(&mut right_used, &seg);
+                    right = right.push(t(seg, p.fg));
                 }
             }
         }
         if let Some(results) = self.session.buffer.cursor.jumplist_position {
-            right = right.push(t(
-                format!("({}/{})", results.current, results.total),
-                p.fg,
-            ));
+            let seg = format!("({}/{})", results.current, results.total);
+            gap(&mut right_used, &seg);
+            right = right.push(t(seg, p.fg));
         }
         // Diagnostic counts, as a tight cluster left of the position. Text glyphs stand in for
         // the web client's SVG icons (same forms as the TUI).
@@ -4126,15 +4187,16 @@ impl App {
                 (self.session.diagnostics.hints, S::Hint),
             ] {
                 if n > 0 {
-                    diag = diag.push(t(
-                        format!("{} {n}", theme::diag_glyph(sev)),
-                        theme::diagnostic_color(p.mode, sev),
-                    ));
+                    let seg = format!("{} {n}", theme::diag_glyph(sev));
+                    gap(&mut right_used, &seg);
+                    diag = diag.push(t(seg, theme::diagnostic_color(p.mode, sev)));
                 }
             }
             right = right.push(diag);
         }
-        right = right.push(t(self.position_label(), p.fg));
+        let position = self.position_label();
+        gap(&mut right_used, &position);
+        right = right.push(t(position, p.fg));
         // LSP health dot: state-coloured; a ready server with in-flight progress shows busy.
         if let Some(lsp) = &self.session.lsp {
             let color = if matches!(lsp.status, LspStatus::Ready) && !lsp.progress.is_empty() {
@@ -4143,12 +4205,45 @@ impl App {
                 theme::lsp_status_color(p.mode, &lsp.status)
             };
             right = right.push(t("•".into(), color));
+            right_used += 3;
         }
 
+        // The LSP outline breadcrumb closes the left segment, on whatever the fixed content leaves.
+        // Last because it's the only element that changes as the cursor moves — anything to its
+        // right would slide about as you navigate.
+        //
+        // Laid out segment by segment rather than as one string: `›` needs air either side, and a
+        // space glyph in a proportional face doesn't give enough.
+        //
+        // No separator surcharge on the budget: the core sizes each `›` as the 3 chars of
+        // `CRUMB_SEPARATOR`, and glyph-plus-two-gaps is deliberately tuned to land at about that
+        // width, so the estimate it already makes is the right one.
+        let parts = aether_client::labels::truncate_symbol_path_parts(
+            &self.session.symbol_path,
+            crumb_budget_cols(self.chrome_width(), &ui, used + right_used),
+        );
+        if let Some((innermost, ancestors)) = parts.split_last() {
+            left = left.push(section_divider(&ui, p));
+            for a in ancestors {
+                left = left.push(t(a.clone(), p.fg_muted));
+                left = left.push(crumb_separator(&ui, p));
+            }
+            left = left.push(t(innermost.clone(), p.fg));
+        }
+
+        // The *left* segment is the Fill child and the clipping one, not the row as a whole. iced's
+        // flex lays Shrink children out first and gives Fill the remainder, so `right` (the position
+        // indicator and language-server dot) always gets its natural width and can never be pushed
+        // off the end — clipping the whole row instead meant an overlong breadcrumb shoved the
+        // position out of the window entirely, losing the more useful of the two.
         container(
-            row![left, iced::widget::Space::new().width(Length::Fill), right,].width(Length::Fill),
+            row![
+                container(left).width(Length::Fill).clip(true),
+                right,
+            ]
+            .width(Length::Fill),
         )
-        .padding([2, 8])
+        .padding([2, STATUS_PAD_X as u16])
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(p.bg_panel.into()),
@@ -6548,6 +6643,100 @@ fn window_settings() -> iced::window::Settings {
     }
 }
 
+/// Air either side of a status-bar separator, as a fraction of the body size — spacer *widgets*,
+/// never spaces in a string. The status bar is set in a proportional face, where the space glyph is
+/// narrow enough that ` › ` and ` · ` both read as unseparated; the terminal shell gets a full cell
+/// either side for free and needs none of this. Proportional to the body size so the spacing holds
+/// as `ui_font_size` scales.
+///
+/// The section divider is the wider of the two: it separates whole groups, while `›` separates names
+/// inside one group, and the hierarchy should be legible without reading the glyphs.
+/// What a section divider costs the status bar's char budget: one glyph plus two gaps, which at any
+/// body size is about five average chars.
+const DIVIDER_COLS: usize = 5;
+
+/// Average advance to price status-bar characters at, as a fraction of the body size — see
+/// [`App::crumb_budget_cols`] for why this is wider than `Ui::char_width`.
+const STATUS_CHAR_RATIO: f32 = 0.55;
+
+/// Columns held back from the breadcrumb so estimate error can't accumulate into an overrun.
+const STATUS_SAFETY_COLS: usize = 4;
+
+/// Horizontal padding on the status bar container, per side.
+const STATUS_PAD_X: f32 = 8.0;
+
+/// Columns the breadcrumb may use in a `bar_width`-wide status bar, given the columns the rest of
+/// the row has already claimed.
+///
+/// Deliberately pessimistic on two counts, because the failure modes are not symmetric: eliding a
+/// crumb early costs a word of context, while outgrowing the row has no graceful outcome in a
+/// proportional layout — before `Wrapping::None` it silently became a second line, and now it gets
+/// clipped. So characters are priced at [`STATUS_CHAR_RATIO`], wider than `Ui::char_width`'s typical
+/// 0.5em (chrome text is capital- and punctuation-heavy, and this text in particular is symbol names
+/// and headings), and [`STATUS_SAFETY_COLS`] are held back so per-character error accumulated across
+/// a long left segment can't tip the row over.
+fn crumb_budget_cols(bar_width: f32, ui: &theme::Ui, claimed: usize) -> usize {
+    let usable = (bar_width - 2.0 * STATUS_PAD_X).max(0.0);
+    let cols = (usable / (ui.body() * STATUS_CHAR_RATIO)) as usize;
+    cols.saturating_sub(claimed + DIVIDER_COLS + STATUS_SAFETY_COLS)
+}
+
+const SECTION_GAP_RATIO: f32 = 0.9;
+const CRUMB_GAP_RATIO: f32 = 0.55;
+
+/// Spacer width either side of a section divider, in px. Matches the browser shell's
+/// `.status-left { gap }`, so the two clients divide their sections identically.
+fn section_gap(ui: &theme::Ui) -> f32 {
+    (ui.body() * SECTION_GAP_RATIO).round()
+}
+
+/// Spacer width either side of a breadcrumb `›`, in px. Matches the browser shell's
+/// `.status-crumb-sep { margin }`.
+fn crumb_gap(ui: &theme::Ui) -> f32 {
+    (ui.body() * CRUMB_GAP_RATIO).round()
+}
+
+/// One separator glyph in the muted shade, with `gap` px of spacer either side.
+fn separator<'a>(
+    glyph: &'a str,
+    gap: f32,
+    ui: &theme::Ui,
+    p: &theme::Palette,
+) -> Element<'a, Message> {
+    let space = || iced::widget::Space::new().width(gap);
+    row![
+        space(),
+        text(glyph)
+            .size(ui.body())
+            .font(SANS)
+            .color(p.fg_muted)
+            .wrapping(iced::widget::text::Wrapping::None),
+        space(),
+    ]
+    .into()
+}
+
+/// The dim `·` dividing the status bar's left-hand sections (file label, Git cluster, breadcrumb).
+/// The terminal shell draws the same divider with one cell either side.
+fn section_divider<'a>(ui: &theme::Ui, p: &theme::Palette) -> Element<'a, Message> {
+    separator(
+        aether_client::labels::SECTION_SEPARATOR,
+        section_gap(ui),
+        ui,
+        p,
+    )
+}
+
+/// One breadcrumb `›` between two crumb names.
+fn crumb_separator<'a>(ui: &theme::Ui, p: &theme::Palette) -> Element<'a, Message> {
+    separator(
+        aether_client::labels::CRUMB_SEPARATOR.trim(),
+        crumb_gap(ui),
+        ui,
+        p,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6564,6 +6753,117 @@ mod tests {
         ui().row_h()
     }
     use aether_protocol::picker::{PickerItem, PickerUpdateParams};
+
+    /// Regression: a three-level chain on a bar with a workspace prefix, a path and a Git cluster
+    /// used to be handed a budget it couldn't actually render, and the row silently wrapped to two
+    /// lines. The budget must elide, and what survives must fit the columns it was given.
+    #[test]
+    fn breadcrumb_budget_elides_before_the_row_overflows() {
+        use aether_client::labels::{truncate_symbol_path_parts, CRUMB_SEPARATOR};
+        let chain: Vec<aether_protocol::lsp::SymbolCrumb> =
+            ["Test 1 — text & structure", "Heading levels", "Third level"]
+                .iter()
+                .map(|n| aether_protocol::lsp::SymbolCrumb {
+                    name: (*n).to_string(),
+                    kind: aether_protocol::picker::SymbolKind::String,
+                })
+                .collect();
+        // `[aether] docs/test1.md` + `⎇  main` on the left, a position indicator on the right.
+        let claimed = "[aether] docs/test1.md".chars().count()
+            + DIVIDER_COLS
+            + "⎇  main".chars().count()
+            + "12:5".chars().count();
+
+        let budget = crumb_budget_cols(660.0, &ui(), claimed);
+        let parts = truncate_symbol_path_parts(&chain, budget);
+        // A leading `…` *is* the elision — outermost crumbs were dropped.
+        assert_eq!(
+            parts.first().map(String::as_str),
+            Some("…"),
+            "the full chain is what overflowed; it must elide: {parts:?}"
+        );
+        let rendered: usize = parts.iter().map(|p| p.chars().count()).sum::<usize>()
+            + CRUMB_SEPARATOR.chars().count() * parts.len().saturating_sub(1);
+        assert!(rendered <= budget, "{rendered} cols in a {budget}-col budget");
+
+        // A bar with room to spare still shows the whole chain — the fix must not over-elide.
+        let roomy = crumb_budget_cols(2000.0, &ui(), claimed);
+        let whole = truncate_symbol_path_parts(&chain, roomy);
+        assert_eq!(whole.len(), chain.len());
+        assert_ne!(whole.first().map(String::as_str), Some("…"));
+
+        // And a bar too narrow for anything else yields nothing rather than a stray marker.
+        assert!(crumb_budget_cols(120.0, &ui(), claimed) < 8);
+    }
+
+    /// Regression: the budget was measured against `view_size` — the *editor's* layout, which in the
+    /// Markdown reading view is a centred prose column that stops being republished. The breadcrumb
+    /// therefore elided by exactly the same amount at every window size: unnecessarily on a wide
+    /// window, and not nearly enough on a narrow one. It has to track the bar.
+    #[test]
+    fn breadcrumb_budget_tracks_the_bar_width() {
+        use aether_client::labels::truncate_symbol_path_parts;
+        let chain: Vec<aether_protocol::lsp::SymbolCrumb> = [
+            "Setext Heading (H2)",
+            "Heading levels",
+            "Third level",
+            "Fourth level",
+            "Fifth level",
+            "Sixth level",
+        ]
+        .iter()
+        .map(|n| aether_protocol::lsp::SymbolCrumb {
+            name: (*n).to_string(),
+            kind: aether_protocol::picker::SymbolKind::String,
+        })
+        .collect();
+        let claimed = 30;
+
+        let narrow = crumb_budget_cols(900.0, &ui(), claimed);
+        let wide = crumb_budget_cols(1900.0, &ui(), claimed);
+        assert!(
+            wide > narrow,
+            "a wider bar must buy more columns: {narrow} vs {wide}"
+        );
+
+        // Wide: the whole chain, no elision marker — this is the window that was truncating for no
+        // reason. Narrow: it must actually elide rather than run off the end.
+        let on_wide = truncate_symbol_path_parts(&chain, wide);
+        assert_eq!(on_wide.len(), chain.len());
+        assert_ne!(on_wide.first().map(String::as_str), Some("…"));
+        assert_eq!(
+            truncate_symbol_path_parts(&chain, narrow)
+                .first()
+                .map(String::as_str),
+            Some("…")
+        );
+    }
+
+    /// The status bar's separators are spaced by *spacer widgets*, sized to match the browser
+    /// shell's CSS — a space glyph in this proportional face collapses to nothing, which is what
+    /// made the first attempt read as `a·b` and `a›b`. At the default 13px body that's the web's
+    /// 12px `.status-left` gap and its 0.55em `.status-crumb-sep` margin.
+    #[test]
+    fn status_separators_are_spaced_like_the_web_shell() {
+        let d = ui();
+        assert_eq!(section_gap(&d), 12.0);
+        assert_eq!(crumb_gap(&d), 7.0);
+        // A divider must stay the wider of the two: it separates whole groups, where `›` separates
+        // names inside one group, and that hierarchy should read without parsing the glyphs.
+        assert!(section_gap(&d) > crumb_gap(&d));
+        // Both scale with `ui_font_size`, so the spacing holds when the chrome is zoomed (±1px of
+        // rounding at each end — the ratio is the contract, not the exact pixel).
+        let big = theme::Ui::new(26);
+        for (base, scaled) in [
+            (section_gap(&d), section_gap(&big)),
+            (crumb_gap(&d), crumb_gap(&big)),
+        ] {
+            assert!(
+                (scaled - base * 2.0).abs() <= 1.0,
+                "doubling the body size should about double the gap: {base} -> {scaled}"
+            );
+        }
+    }
 
     /// The info dialog is capped to leave its own top offset clear at both ends, so it can't run
     /// off a short window — the bug that made it clip before it was made scrollable.

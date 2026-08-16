@@ -9,7 +9,7 @@ use aether_client::session::{AppSettingControl, ConnState};
 use aether_client::theme::{Rgb, Theme};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::GitStatus;
-use aether_protocol::lsp::{LspProgress, LspStatus};
+use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::search::SearchMatchRange;
 use aether_protocol::settings::ThemeMode;
@@ -5977,6 +5977,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             status_dot,
             git_spans,
             &conn_status,
+            &state.symbol_path,
             right_spans,
             area.width as usize,
         ))
@@ -6195,7 +6196,8 @@ struct StatusLabel<'a> {
 /// `left_pre` (workspace/file) in the base style, an optional colored status message after a `    `
 /// separator, then padding pushing the right segment flush to the row edge. When the row is too
 /// narrow:
-/// - the status text truncates first (`…`), preserving the dot and workspace/file;
+/// - the breadcrumb goes first (it's the only element with a real substitute — the outline picker);
+/// - the status text truncates next (`…`), preserving the dot and workspace/file;
 /// - if even `left_pre` can't fit, that gets truncated and the status is dropped entirely.
 ///
 /// The right segment is never truncated — the cursor position is more useful than the message.
@@ -6204,6 +6206,7 @@ fn build_editor_status_spans(
     status_dot: Option<Span<'static>>,
     left_badges: Vec<Span<'static>>,
     status: &crate::app::StatusMessage,
+    symbol_path: &[SymbolCrumb],
     right_spans: Vec<Span<'static>>,
     total_width: usize,
 ) -> Vec<Span<'static>> {
@@ -6268,30 +6271,59 @@ fn build_editor_status_spans(
             ));
         }
         used += workspace_prefix.width() + file_label.width() + tether_mark.width();
-        // Git cluster sits after the file label, set off by a 3-space gap.
+        // Each following section is introduced by a dim ` · `, which is exactly as wide as the
+        // 3-space gap it replaced — the divider is free.
+        let separator = || {
+            Span::styled(
+                format!(" {} ", aether_client::labels::SECTION_SEPARATOR),
+                base_style.fg(c(th().fg_muted)),
+            )
+        };
+        const SEP_W: usize = 3;
+        // Git cluster sits after the file label.
         let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
-        if badge_w > 0 && used + 3 + badge_w <= left_max {
-            spans.push(Span::styled("   ".to_string(), base_style));
-            used += 3;
+        if badge_w > 0 && used + SEP_W + badge_w <= left_max {
+            spans.push(separator());
+            used += SEP_W;
             for s in left_badges {
                 used += s.content.width();
                 spans.push(s);
             }
         }
-        // Status message (now the connection indicator) after a 3-space separator — matching the
-        // file→git gap — truncated to whatever's left.
+        // Status message (now the connection indicator), truncated to whatever's left. Divided like
+        // the rest: it sits in the same run of sections, so an undivided gap here would read as a
+        // gap in the pattern rather than as emphasis.
         if !status.is_empty() {
-            let separator = "   ";
-            let remaining = left_max.saturating_sub(used + separator.width());
+            let remaining = left_max.saturating_sub(used + SEP_W);
             if remaining > 0 {
                 let text = if status.text.width() <= remaining {
                     status.text.clone()
                 } else {
                     truncate_to_width(&status.text, remaining)
                 };
-                used += separator.width() + text.width();
-                spans.push(Span::styled(separator.to_string(), base_style));
+                used += SEP_W + text.width();
+                spans.push(separator());
                 spans.push(Span::styled(text, status_message_style(status)));
+            }
+        }
+        // The LSP outline breadcrumb closes the left segment, taking whatever the file, git cluster
+        // and connection indicator leave. Last because it's the only element that changes as the
+        // cursor moves: anything to its right would slide about as you navigate. It also yields
+        // first when the row is tight — `Space o` shows the same information on demand.
+        if !symbol_path.is_empty() {
+            let budget = left_max.saturating_sub(used + SEP_W);
+            let text = aether_client::labels::truncate_symbol_path(symbol_path, budget);
+            if !text.is_empty() {
+                let (ancestors, innermost) = aether_client::labels::split_symbol_path(&text);
+                used += SEP_W + text.width();
+                spans.push(separator());
+                if !ancestors.is_empty() {
+                    spans.push(Span::styled(
+                        ancestors.to_string(),
+                        base_style.fg(c(th().fg_muted)),
+                    ));
+                }
+                spans.push(Span::styled(innermost.to_string(), base_style));
             }
         }
     }
@@ -7212,6 +7244,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+            symbol_path: Vec::new(),
         }
     }
 
@@ -8384,6 +8417,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![Span::raw("12:5")],
             30,
         );
@@ -8408,6 +8442,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![],
             30,
         );
@@ -8428,6 +8463,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![],
             30,
         );
@@ -8453,6 +8489,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![],
             30,
         );
@@ -8475,6 +8512,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![],
             30,
         );
@@ -8498,6 +8536,7 @@ mod tests {
             Some(dot),
             Vec::new(),
             &status,
+            &[],
             vec![],
             30,
         );
@@ -8525,6 +8564,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![Span::raw("12:5")],
             60,
         );
@@ -8542,9 +8582,9 @@ mod tests {
     }
 
     #[test]
-    fn editor_status_spans_connection_indicator_left_with_three_space_gap() {
-        // The connection indicator rides the left status slot: capitalised, no icon, a 3-space gap
-        // after the file label (matching the file→git gap), yellow for reconnecting.
+    fn editor_status_spans_connection_indicator_left_with_section_divider() {
+        // The connection indicator rides the left status slot: capitalised, no icon, introduced by
+        // the same dim ` · ` divider every other left-hand section gets, yellow for reconnecting.
         let status = crate::app::StatusMessage {
             text: "Reconnecting...".to_string(),
             kind: crate::app::StatusKind::Warning,
@@ -8559,13 +8599,14 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![Span::raw("12:5")],
             60,
         );
         let text = spans_text(&spans);
         assert!(
-            text.contains("file.rs   Reconnecting..."),
-            "3-space gap before the indicator: {text:?}"
+            text.contains("file.rs · Reconnecting..."),
+            "divider before the indicator: {text:?}"
         );
         let span = spans
             .iter()
@@ -8594,6 +8635,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![Span::raw("12:5")],
             12,
         );
@@ -8625,6 +8667,7 @@ mod tests {
             None,
             Vec::new(),
             &status,
+            &[],
             vec![Span::raw("12:5")],
             25,
         );
@@ -8635,6 +8678,100 @@ mod tests {
             "filename end survives elision: {text:?}"
         );
         assert_eq!(spans_total_width(&spans), 25);
+    }
+
+    fn crumb(name: &str) -> SymbolCrumb {
+        SymbolCrumb {
+            name: name.to_string(),
+            kind: aether_protocol::picker::SymbolKind::Function,
+        }
+    }
+
+    /// The breadcrumb closes the left segment — after the file label, before the padding — and the
+    /// right segment still lands flush at the row edge.
+    #[test]
+    fn editor_status_spans_render_the_symbol_breadcrumb() {
+        let status = crate::app::StatusMessage::default();
+        let path = vec![crumb("impl Foo"), crumb("fn bar")];
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "",
+                file_label: "file.rs",
+                transient: false,
+                tethered: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            &path,
+            vec![Span::raw("12:5")],
+            60,
+        );
+        let text = spans_text(&spans);
+        assert!(text.starts_with("file.rs"), "{text:?}");
+        assert!(text.contains("impl Foo › fn bar"), "{text:?}");
+        assert!(text.ends_with("12:5"));
+        assert_eq!(spans_total_width(&spans), 60);
+    }
+
+    /// All three left-hand sections — file label, Git cluster, breadcrumb — are divided by the same
+    /// dim ` · `, and it costs exactly what the plain 3-space gap it replaced did.
+    #[test]
+    fn editor_status_spans_divide_sections_with_a_dot() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "",
+                file_label: "file.rs",
+                transient: false,
+                tethered: false,
+            },
+            None,
+            vec![Span::raw("⎇  main")],
+            &status,
+            &[crumb("impl Foo"), crumb("fn bar")],
+            vec![Span::raw("12:5")],
+            70,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("file.rs · ⎇  main · impl Foo › fn bar"),
+            "one divider per section join: {text:?}"
+        );
+        // Dividers are chrome, not content: muted, never the body colour.
+        let sep = spans
+            .iter()
+            .find(|s| s.content.trim() == "·")
+            .expect("divider span present");
+        assert_eq!(sep.style.fg, Some(c(th().fg_muted)));
+        assert_eq!(spans_total_width(&spans), 70);
+    }
+
+    /// It's also the first thing to go: a row with no slack keeps the file label, the position and
+    /// the git cluster, and simply drops the breadcrumb rather than squeezing the rest.
+    #[test]
+    fn editor_status_spans_drop_the_breadcrumb_on_a_narrow_row() {
+        let status = crate::app::StatusMessage::default();
+        let path = vec![crumb("impl Foo"), crumb("fn bar")];
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "",
+                file_label: "file.rs",
+                transient: false,
+                tethered: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            &path,
+            vec![Span::raw("12:5")],
+            20,
+        );
+        let text = spans_text(&spans);
+        assert!(!text.contains('›'), "breadcrumb dropped whole: {text:?}");
+        assert!(text.starts_with("file.rs"));
+        assert!(text.ends_with("12:5"));
+        assert_eq!(spans_total_width(&spans), 20);
     }
 
     fn dspan(start: u32, end: u32, severity: DiagnosticSeverity) -> DiagnosticSpan {

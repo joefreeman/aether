@@ -10,7 +10,7 @@ use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::CommitInfo;
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use aether_protocol::input::SurroundTarget;
-use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
+use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::ThemeMode;
@@ -860,6 +860,13 @@ pub struct Session {
     pub(crate) pending_read_anchor: Option<String>,
     pub diagnostics: DiagnosticCounts,
     pub lsp: Option<LspServerStatus>,
+    /// The document-outline symbols enclosing the cursor, outermost first — the status bar's
+    /// breadcrumb. Server-derived (it owns the outline and the cursor); seeded by
+    /// `viewport/subscribe` and kept live by `lsp/symbol_path_changed`, which only fires when the
+    /// cursor crosses a symbol boundary. Empty with no language server, before the first outline
+    /// lands, or between top-level symbols. Shells truncate it themselves — see
+    /// [`crate::labels::truncate_symbol_path`].
+    pub symbol_path: Vec<SymbolCrumb>,
     pub externally_modified: bool,
     pub externally_deleted: bool,
     pub drag: Option<(LogicalPosition, Granularity)>,
@@ -1280,6 +1287,7 @@ impl Session {
             open_route_jumped: false,
             pending_read_anchor: None,
             diagnostics: DiagnosticCounts::default(),
+            symbol_path: Vec::new(),
             lsp: None,
             externally_modified: false,
             externally_deleted: false,

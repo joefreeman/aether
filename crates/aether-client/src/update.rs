@@ -79,6 +79,7 @@ use aether_protocol::lsp::{
     LspFormatResult, LspGotoDefinition, LspGotoDefinitionResult, LspHover, LspHoverResult,
     LspNavigateDiagnostic, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
     LspRestartServer, LspRestartServerParams, LspServerStatus, LspStatusChanged,
+    LspSymbolPathChanged, LspSymbolPathChangedParams,
 };
 use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavStep, NavStepParams};
@@ -1995,6 +1996,9 @@ impl Session {
         self.count = None;
         self.diagnostics = DiagnosticCounts::default();
         self.lsp = None;
+        // Cleared, not carried: the resubscribe answers with the new buffer's path, and showing
+        // the old file's `fn foo` against the new file's name for that round trip would be a lie.
+        self.symbol_path = Vec::new();
         self.externally_modified = false;
         self.externally_deleted = false;
         self.window = None;
@@ -2139,6 +2143,7 @@ impl Session {
         self.viewport_id = Some(res.viewport_id);
         self.diagnostics = res.buffer_status.diagnostics;
         self.lsp = res.buffer_status.lsp_status;
+        self.symbol_path = res.buffer_status.symbol_path;
         self.externally_modified = res.buffer_status.externally_modified;
         self.externally_deleted = res.buffer_status.externally_deleted;
         self.window = Some(res.window);
@@ -4743,6 +4748,16 @@ impl Session {
                 if let Ok(p) = serde_json::from_value::<LspDiagnosticsChangedParams>(n.params) {
                     if p.buffer_id == self.buffer.buffer_id {
                         self.diagnostics = p.counts;
+                    }
+                }
+                Effects::none()
+            }
+            LspSymbolPathChanged::NAME => {
+                if let Ok(p) = serde_json::from_value::<LspSymbolPathChangedParams>(n.params) {
+                    // Buffer-guarded like the diagnostics push: a path for the buffer we just
+                    // switched away from would otherwise label the new one.
+                    if p.buffer_id == self.buffer.buffer_id {
+                        self.symbol_path = p.path;
                     }
                 }
                 Effects::none()

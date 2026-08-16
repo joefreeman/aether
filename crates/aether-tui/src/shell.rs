@@ -1841,6 +1841,7 @@ impl Shell {
             m.insert(s.buffer.buffer_id, s.diagnostics);
             m
         };
+        st.symbol_path = s.symbol_path.clone();
 
         st.editor = editor;
         st.read = read;
@@ -3106,6 +3107,7 @@ fn make_state(
         lsp_status: Default::default(),
         hover: None,
         diagnostic_counts: Default::default(),
+        symbol_path: Vec::new(),
     }
 }
 

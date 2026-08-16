@@ -3,7 +3,7 @@
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitBufferStatus;
-use crate::lsp::{DiagnosticCounts, LspServerStatus};
+use crate::lsp::{DiagnosticCounts, LspServerStatus, SymbolCrumb};
 use crate::search::SearchMatchRange;
 use crate::sneak::SneakTarget;
 use crate::{BufferId, Revision, ViewportId};
@@ -286,6 +286,12 @@ pub struct BufferStatusSnapshot {
     /// unbacked buffer (no server configured / no workspace root / not yet started).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_status: Option<LspServerStatus>,
+    /// The document-outline symbols enclosing this client's cursor, outermost first — the status
+    /// bar's breadcrumb. Seeded here because subscribing is the act of *showing* a buffer, and the
+    /// outline may have been cached long before (switching back to an already-open buffer pushes
+    /// nothing). Live updates then flow through `lsp/symbol_path_changed`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbol_path: Vec<SymbolCrumb>,
 }
 
 // ---- viewport/resize ----------------------------------------------------------------------------

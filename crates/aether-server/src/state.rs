@@ -6,6 +6,7 @@ use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use crate::workspace_index::WorkspaceIndex;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
+use aether_protocol::lsp::SymbolCrumb;
 use aether_protocol::picker::{MatchOptions, PickerKind};
 use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewportId};
@@ -95,6 +96,12 @@ pub struct ServerState {
     /// resolves to the same pair (e.g. the cursor moved within a line) pushes nothing. Cleared
     /// when the underlying blame is invalidated externally (HEAD change) so the label refreshes.
     pub blame_last_pushed: HashMap<(ClientId, BufferId), (u32, Revision)>,
+    /// The status-bar breadcrumb last pushed to each `(client, buffer)`: the names+kinds of the
+    /// outline symbols enclosing that client's cursor, outermost first. Purely a change-detector —
+    /// the follow loop recomputes the chain on every cursor move but pushes only when it differs
+    /// from this, so moving *within* a function is silent. Seeded by `viewport/subscribe` (which
+    /// answers with the same value) and cleared on close/disconnect.
+    pub symbol_path_sent: HashMap<(ClientId, BufferId), Vec<SymbolCrumb>>,
     /// Fan-in for cursor changes: [`crate::handlers::set_cursor`] (the single cursor write path)
     /// sends the key here whenever a *followed* cursor changes; the server's follow loop debounces
     /// and refreshes the cursor-tracking decorations. `None` only in unit tests that construct a
@@ -466,6 +473,7 @@ impl ServerState {
             blame_follow: HashSet::new(),
             blame_follow_gen: HashMap::new(),
             blame_last_pushed: HashMap::new(),
+            symbol_path_sent: HashMap::new(),
             cursor_moved_tx: None,
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
@@ -1015,6 +1023,7 @@ impl ServerState {
         self.blame_follow.retain(|(_, b)| *b != id);
         self.blame_follow_gen.retain(|(_, b), _| *b != id);
         self.blame_last_pushed.retain(|(_, b), _| *b != id);
+        self.symbol_path_sent.retain(|(_, b), _| *b != id);
         self.last_scroll.retain(|(_, b), _| *b != id);
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
@@ -1153,6 +1162,7 @@ impl ServerState {
         self.blame_follow.retain(|(c, _)| *c != client_id);
         self.blame_follow_gen.retain(|(c, _), _| *c != client_id);
         self.blame_last_pushed.retain(|(c, _), _| *c != client_id);
+        self.symbol_path_sent.retain(|(c, _), _| *c != client_id);
     }
 
     /// Remove all sneak sessions for the given client. Used on disconnect.
@@ -1401,6 +1411,7 @@ impl ServerState {
         self.blame_follow.retain(|&(c, b)| !in_proj(&c, &b));
         self.blame_follow_gen.retain(|(c, b), _| !in_proj(c, b));
         self.blame_last_pushed.retain(|(c, b), _| !in_proj(c, b));
+        self.symbol_path_sent.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
         // workspace so wipe them all on switch. The jumplist goes with them: its

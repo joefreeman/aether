@@ -292,6 +292,41 @@ pub struct LspDiagnosticsChangedParams {
     pub counts: DiagnosticCounts,
 }
 
+// ---- lsp/symbol_path_changed (notification) -----------------------------------------------------
+
+/// Pushed when the chain of document-outline symbols enclosing this client's cursor changes — the
+/// status bar's "where am I" breadcrumb. Per *client*, not per buffer: it's derived from that
+/// client's cursor, so two clients on the same buffer get different paths.
+///
+/// Change-driven rather than riding every cursor response: the path only changes when the cursor
+/// crosses a symbol boundary, which is rare next to the keystroke rate. The seed for a
+/// freshly-shown buffer arrives in [`crate::viewport::BufferStatusSnapshot::symbol_path`]; this
+/// notification carries every change after that, including the outline landing late (the language
+/// server answers `textDocument/documentSymbol` a beat after the buffer opens, while the cursor
+/// sits still).
+pub struct LspSymbolPathChanged;
+impl NotificationMethod for LspSymbolPathChanged {
+    const NAME: &'static str = "lsp/symbol_path_changed";
+    type Params = LspSymbolPathChangedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LspSymbolPathChangedParams {
+    pub buffer_id: BufferId,
+    /// Outermost first, innermost last. Empty when the cursor is outside every symbol, the outline
+    /// hasn't loaded, or the buffer has no language server.
+    pub path: Vec<SymbolCrumb>,
+}
+
+/// One step of the cursor's enclosing-symbol chain. Structured rather than pre-joined into a
+/// string: only the shell knows its own width budget, so truncation is the client's job (see
+/// `aether_client::labels::truncate_symbol_path`), and `kind` lets it colour or tag a crumb.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolCrumb {
+    pub name: String,
+    pub kind: crate::picker::SymbolKind,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticCounts {
     pub errors: u32,

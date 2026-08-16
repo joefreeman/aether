@@ -232,6 +232,9 @@ pub struct AppState {
     pub hover: Option<HoverPopup>,
     /// Per-buffer diagnostic counts from `lsp/diagnostics_changed`, for the status-bar summary.
     pub diagnostic_counts: std::collections::HashMap<BufferId, DiagnosticCounts>,
+    /// The LSP outline symbols enclosing the cursor, outermost first — the status bar's breadcrumb.
+    /// Mirrored from the core, which owns it; the row truncates it to whatever width is left.
+    pub symbol_path: Vec<aether_protocol::lsp::SymbolCrumb>,
 }
 
 /// The reading view's render model (docs/markdown-view.md §2.8): rows from the core's
@@ -995,6 +998,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+            symbol_path: Vec::new(),
         };
         assert_eq!(terminal_title(&state), "Aether");
     }
@@ -1028,6 +1032,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+            symbol_path: Vec::new(),
         };
         assert_eq!(terminal_title(&state), "[demo]");
         // Once a buffer exists, the title grows to include the file label.
@@ -1064,6 +1069,7 @@ mod tests {
             lsp_status: std::collections::HashMap::new(),
             hover: None,
             diagnostic_counts: std::collections::HashMap::new(),
+            symbol_path: Vec::new(),
         };
         // Clean buffer → no dot.
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");

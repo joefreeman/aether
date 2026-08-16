@@ -1019,15 +1019,35 @@ fn prev_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usiz
         .map(|(i, _)| i)
 }
 
-/// Index of the innermost symbol whose range contains `pos` — deepest depth, then latest start,
-/// matching the picker's cursor-highlight rule. Used by [`symbol_edge`].
-fn enclosing_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usize> {
-    symbols
+/// Indices of every symbol whose range contains `pos`, outermost first — the cursor's scope chain,
+/// as the status-bar breadcrumb shows it (`impl Foo` › `fn bar`).
+///
+/// Sorted by `(depth, start)` rather than trusting list order: the outline is flattened depth-first
+/// so ancestors *do* precede descendants, but a flat `SymbolInformation` server's depths are
+/// reconstructed from range containment (`assign_depth_by_containment`), which re-sorts. Sorting on
+/// the same key both consumers use keeps the two paths agreeing.
+///
+/// Siblings never both contain `pos` in a well-formed outline, so this is the ancestor chain; a
+/// server that reports overlapping siblings degrades to "deepest wins", which is what the picker's
+/// cursor highlight already does.
+pub(crate) fn enclosing_chain(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Vec<usize> {
+    let mut hits: Vec<usize> = symbols
         .iter()
         .enumerate()
         .filter(|(_, s)| s.contains(pos))
-        .max_by_key(|(_, s)| (s.depth, s.range_start.line, s.range_start.col))
         .map(|(i, _)| i)
+        .collect();
+    hits.sort_by_key(|&i| {
+        let s = &symbols[i];
+        (s.depth, s.range_start.line, s.range_start.col)
+    });
+    hits
+}
+
+/// Index of the innermost symbol whose range contains `pos` — deepest depth, then latest start,
+/// matching the picker's cursor-highlight rule. Used by [`symbol_edge`].
+fn enclosing_symbol(symbols: &[SymbolCandidate], pos: LogicalPosition) -> Option<usize> {
+    enclosing_chain(symbols, pos).pop()
 }
 
 /// Resolve `StartOfNavigationUnit` / `EndOfNavigationUnit` against the outline: land on the
@@ -1122,6 +1142,39 @@ mod symbol_nav_tests {
 
     fn at(line: u32) -> LogicalPosition {
         LogicalPosition { line, col: 0 }
+    }
+
+    /// The breadcrumb chain: every containing symbol, outermost first. Inside `fn b` that's the
+    /// `impl S` wrapper then `fn b` itself.
+    #[test]
+    fn enclosing_chain_is_ordered_outermost_first() {
+        let o = outline();
+        assert_eq!(enclosing_chain(&o, at(11)), vec![1, 3]);
+        // Inside the impl but between its members — the wrapper alone, not the nearest sibling.
+        assert_eq!(enclosing_chain(&o, at(14)), vec![1, 3]);
+        // A top-level symbol with no parent is a one-element chain.
+        assert_eq!(enclosing_chain(&o, at(25)), vec![5]);
+    }
+
+    /// Between top-level symbols the chain is empty — the honest answer, and what makes the status
+    /// bar go blank rather than sticking to whatever you last visited.
+    #[test]
+    fn enclosing_chain_is_empty_outside_every_symbol() {
+        assert!(enclosing_chain(&outline(), at(21)).is_empty());
+    }
+
+    /// The chain's last element is exactly what the `o` motion and the picker highlight resolve to,
+    /// so the breadcrumb can never disagree with where a navigation lands.
+    #[test]
+    fn enclosing_chain_ends_at_the_enclosing_symbol() {
+        let o = outline();
+        for line in [1, 6, 11, 16, 21, 25] {
+            assert_eq!(
+                enclosing_chain(&o, at(line)).pop(),
+                enclosing_symbol(&o, at(line)),
+                "line {line}"
+            );
+        }
     }
 
     #[test]

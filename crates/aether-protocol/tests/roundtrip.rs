@@ -387,7 +387,8 @@ fn logical_line_render_virtual_rows_shape() {
 
 #[test]
 fn buffer_status_snapshot_shape() {
-    use aether_protocol::lsp::{DiagnosticCounts, LspServerStatus, LspStatus};
+    use aether_protocol::lsp::{DiagnosticCounts, LspServerStatus, LspStatus, SymbolCrumb};
+    use aether_protocol::picker::SymbolKind;
 
     // A clean, unbacked buffer: flags false, empty diagnostics and no LSP status drop off the wire.
     let empty = BufferStatusSnapshot::default();
@@ -396,6 +397,7 @@ fn buffer_status_snapshot_shape() {
     assert_eq!(v["externally_deleted"], false);
     assert!(v.get("diagnostics").is_none(), "empty counts omitted");
     assert!(v.get("lsp_status").is_none(), "no server → omitted");
+    assert!(v.get("symbol_path").is_none(), "empty breadcrumb omitted");
 
     // A populated snapshot serializes every component, and round-trips back.
     let full = BufferStatusSnapshot {
@@ -414,19 +416,35 @@ fn buffer_status_snapshot_shape() {
             status: LspStatus::Ready,
             progress: Vec::new(),
         }),
+        symbol_path: vec![
+            SymbolCrumb {
+                name: "impl Foo".into(),
+                kind: SymbolKind::Class,
+            },
+            SymbolCrumb {
+                name: "fn bar".into(),
+                kind: SymbolKind::Method,
+            },
+        ],
     };
     let v = to_value(&full).unwrap();
     assert_eq!(v["externally_modified"], true);
     assert_eq!(v["diagnostics"]["errors"], 2);
     assert_eq!(v["lsp_status"]["name"], "rust-analyzer");
+    // Outermost first, and the kind rides each crumb as a snake_case tag.
+    assert_eq!(v["symbol_path"][0]["name"], "impl Foo");
+    assert_eq!(v["symbol_path"][1]["name"], "fn bar");
+    assert_eq!(v["symbol_path"][1]["kind"], "method");
     let back: BufferStatusSnapshot = from_value(v).unwrap();
     assert!(back.externally_modified);
     assert_eq!(back.diagnostics.errors, 2);
+    assert_eq!(back.symbol_path.len(), 2);
     assert_eq!(back.lsp_status.unwrap().language, "rust");
 
     // Absent on the wire (older server) → defaults, so deserialization never fails.
     let bare: BufferStatusSnapshot = from_value(json!({})).unwrap();
     assert!(bare.diagnostics.is_empty() && bare.lsp_status.is_none());
+    assert!(bare.symbol_path.is_empty());
 }
 
 #[test]

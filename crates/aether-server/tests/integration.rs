@@ -30156,3 +30156,176 @@ async fn toggle_task_refuses_when_the_cursor_is_not_inside_a_task_item() {
     assert_eq!(c.text, "Intro.\n\n- [ ] open\n\nOutro.\n", "box untouched");
     drop(server);
 }
+
+/// The status-bar breadcrumb (`lsp/symbol_path_changed`): the outline arrives a beat after the
+/// buffer opens, so the *push* — not the subscribe snapshot — is what first fills the bar, and it
+/// carries the enclosing chain outermost-first.
+///
+/// The dummy answers `documentSymbol` with a flat list whose ranges nest, which is the
+/// `SymbolInformation` shape real servers without hierarchy support send; the server's
+/// `assign_depth_by_containment` rebuilds the tree, so this also pins that the breadcrumb works for
+/// flat servers and not just hierarchical ones.
+#[tokio::test]
+async fn symbol_path_pushes_the_enclosing_chain_when_the_outline_lands() {
+    use aether_protocol::lsp::{LspSymbolPathChanged, LspSymbolPathChangedParams};
+    use aether_server::{DummyDocSymbol, DummyLspConfig, DummyRange};
+    use std::time::Duration;
+
+    // impl Foo { fn bar { … } }, spanning lines 0..=4 with `fn bar` inside it at 1..=3.
+    let content = "impl Foo {\n    fn bar() {\n        let x = 1;\n    }\n}\n";
+    let dir = lay_out(&[("main.rs", content)]);
+    let outer = DummyRange {
+        line: 0,
+        character: 0,
+        end_line: 4,
+        end_character: 1,
+    };
+    let inner = DummyRange {
+        line: 1,
+        character: 4,
+        end_line: 3,
+        end_character: 5,
+    };
+    let dummy = DummyLspConfig {
+        document_symbols: vec![
+            DummyDocSymbol {
+                name: "impl Foo".into(),
+                kind: 5, // Class
+                range: outer,
+                selection: DummyRange::on(0, 5, 8),
+            },
+            DummyDocSymbol {
+                name: "fn bar".into(),
+                kind: 6, // Method
+                range: inner,
+                selection: DummyRange::on(1, 7, 10),
+            },
+        ],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "crumbs",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+
+    // Cursor inside `fn bar`'s body. The outline may or may not have landed yet, so the assertion
+    // is on the push, which fires either way (on arrival, or on this cursor move once it's cached).
+    set_cursor(&mut ws, 11, buffer_id, 2, 8).await;
+    let deep: LspSymbolPathChangedParams =
+        expect_notification_within::<LspSymbolPathChanged>(&mut ws, Duration::from_secs(10)).await;
+    assert_eq!(deep.buffer_id, buffer_id);
+    let names: Vec<&str> = deep.path.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["impl Foo", "fn bar"],
+        "outermost first, innermost last"
+    );
+
+    // Out of `fn bar` but still inside the impl: the chain sheds its innermost crumb.
+    set_cursor(&mut ws, 12, buffer_id, 4, 0).await;
+    let shallow: LspSymbolPathChangedParams =
+        expect_notification_within::<LspSymbolPathChanged>(&mut ws, Duration::from_secs(10)).await;
+    let names: Vec<&str> = shallow.path.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["impl Foo"]);
+
+    drop(server);
+}
+
+/// Re-subscribing to a buffer whose outline was cached long ago answers with the breadcrumb in the
+/// `viewport/subscribe` snapshot. Without this seed the bar would stay blank until the next symbol
+/// boundary crossing — the push only fires on *change*, and switching buffers isn't one.
+#[tokio::test]
+async fn symbol_path_seeds_the_subscribe_snapshot() {
+    use aether_protocol::lsp::{LspSymbolPathChanged, LspSymbolPathChangedParams};
+    use aether_server::{DummyDocSymbol, DummyLspConfig, DummyRange};
+    use std::time::Duration;
+
+    let content = "fn solo() {\n    let x = 1;\n}\n";
+    let dir = lay_out(&[("main.rs", content)]);
+    let dummy = DummyLspConfig {
+        document_symbols: vec![DummyDocSymbol {
+            name: "fn solo".into(),
+            kind: 12,
+            range: DummyRange {
+                line: 0,
+                character: 0,
+                end_line: 2,
+                end_character: 1,
+            },
+            selection: DummyRange::on(0, 3, 7),
+        }],
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("crumb-seed", dir.path(), "main.rs", vec![("rust".into(), dummy)])
+            .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    set_cursor(&mut ws, 11, buffer_id, 1, 4).await;
+    // Wait for the outline to be cached (the push is the observable signal that it is).
+    let _: LspSymbolPathChangedParams =
+        expect_notification_within::<LspSymbolPathChanged>(&mut ws, Duration::from_secs(10)).await;
+
+    // A fresh viewport on the same buffer — what a buffer switch back does.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        12,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 100,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let names: Vec<&str> = sub
+        .buffer_status
+        .symbol_path
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["fn solo"]);
+
+    drop(server);
+}

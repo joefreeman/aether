@@ -13,6 +13,7 @@
 //! parenthesized parent component, then grandparent, etc., until every label is unique. Single-root
 //! workspaces have nothing to disambiguate, so the label is empty and the prefix is omitted.
 
+use aether_protocol::lsp::SymbolCrumb;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -202,6 +203,99 @@ pub fn truncate_path(label: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
+/// Separator between breadcrumb steps. A single narrow glyph with space either side, distinct from
+/// the `/` of a path so a breadcrumb never reads as one.
+pub const CRUMB_SEPARATOR: &str = " › ";
+
+/// Separator between the status bar's left-hand sections — file label, Git cluster, breadcrumb. Bare
+/// glyph: each shell supplies its own padding (a cell either side in the terminal, the flex gap in
+/// the browser, a spacer widget in the GUI). Painted in the muted shade so it reads as structure
+/// rather than content, and deliberately a *middle dot* — the fatter `●`/`•` already mean
+/// buffer-state and language-server health in this same row.
+pub const SECTION_SEPARATOR: &str = "·";
+
+/// Minimum width worth spending on a breadcrumb. Below this the only thing that fits is the elision
+/// marker plus a stub, which says less than the empty space it replaces.
+const CRUMB_MIN_WIDTH: usize = 8;
+
+/// Render the cursor's enclosing-symbol chain (outermost first) into `max_chars`, as the status bar
+/// shows it: `impl LspManager › fn symbol_servers`.
+///
+/// The ladder mirrors [`truncate_path`]'s, and inverts it twice — because a scope chain is read from
+/// the *inside out*, where a path is read from the outside in:
+///
+///  1. Whole chain, if it fits.
+///  2. Drop *leading* crumbs into a single `…`, keeping as many innermost ones as fit
+///     (`…› fn symbol_servers`). Unlike [`truncate_path`], the first element is never preserved: the
+///     outermost scope is the least informative crumb, and the file label sitting to the left of
+///     this in the status bar has already established the top-level context.
+///  3. Floor: the innermost crumb alone still overflows, so char-cut it keeping its *start*
+///     (`resolve_navigation_m…`). Again the opposite of [`truncate_path`], which keeps the tail —
+///     filenames disambiguate at the end, identifiers at the beginning.
+///
+/// Empty when the chain is empty or the budget is too small to say anything ([`CRUMB_MIN_WIDTH`]).
+/// Char-based, matching the rest of this module and the shells' char-budget estimates.
+pub fn truncate_symbol_path(crumbs: &[SymbolCrumb], max_chars: usize) -> String {
+    truncate_symbol_path_parts(crumbs, max_chars).join(CRUMB_SEPARATOR)
+}
+
+/// The same ladder as [`truncate_symbol_path`], as the display segments rather than one joined
+/// string — the leading `…` is its own segment when crumbs were dropped, and the last segment is
+/// always the innermost (possibly head-cut) crumb. Empty vec for "show nothing".
+///
+/// Two renderings of one result: the terminal shell joins these with [`CRUMB_SEPARATOR`] because a
+/// cell is a cell, while the proportional shells (GUI and browser) lay the segments out themselves
+/// so they can put real space either side of the `›` — a space glyph in a proportional face is too
+/// tight, and a joined string has no way to say "more room here".
+pub fn truncate_symbol_path_parts(crumbs: &[SymbolCrumb], max_chars: usize) -> Vec<String> {
+    if crumbs.is_empty() || max_chars < CRUMB_MIN_WIDTH {
+        return Vec::new();
+    }
+    let width = |s: &str| s.chars().count();
+    let sep_w = width(CRUMB_SEPARATOR);
+    let names: Vec<&str> = crumbs.iter().map(|c| c.name.as_str()).collect();
+    let owned = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect();
+
+    // Rung 1: everything.
+    if width(&names.join(CRUMB_SEPARATOR)) <= max_chars {
+        return owned(&names);
+    }
+
+    // Rung 2: keep the longest innermost run that fits behind a `…` marker. The marker stands in for
+    // the dropped crumbs *and* their separator, so it costs `…` plus one separator.
+    let marker_w = 1 + sep_w;
+    for take in (1..names.len()).rev() {
+        let tail = &names[names.len() - take..];
+        let w: usize = tail.iter().map(|c| width(c)).sum::<usize>() + sep_w * (take - 1);
+        if marker_w + w <= max_chars {
+            let mut parts = vec!["…".to_string()];
+            parts.extend(tail.iter().map(|s| (*s).to_string()));
+            return parts;
+        }
+    }
+
+    // Rung 3 (floor): the innermost crumb alone. Whole if it fits — a name in full says more than a
+    // cut one plus the `…›` hint that there was more — otherwise head-cut.
+    let last = names.last().expect("non-empty");
+    if width(last) <= max_chars {
+        return vec![(*last).to_string()];
+    }
+    let head: String = last.chars().take(max_chars.saturating_sub(1)).collect();
+    vec![format!("{head}…")]
+}
+
+/// Split a rendered breadcrumb ([`truncate_symbol_path`]) into `(ancestors, innermost)`, where
+/// `ancestors` keeps its trailing separator so the two concatenate back to the input. Every shell
+/// paints `ancestors` in the muted shade and `innermost` in the body colour: the chain reads as
+/// chrome, the symbol you're actually in reads as content. `ancestors` is empty when only one crumb
+/// survived truncation.
+pub fn split_symbol_path(rendered: &str) -> (&str, &str) {
+    match rendered.rfind(CRUMB_SEPARATOR) {
+        Some(i) => rendered.split_at(i + CRUMB_SEPARATOR.len()),
+        None => ("", rendered),
+    }
+}
+
 /// The window/terminal title's *body* for `(workspace, buffer label)`: `None` before a workspace is
 /// active (the title is then just the app name), otherwise `[workspace]` or `[workspace] label`. The
 /// `[…]` is omitted entirely when there's no real workspace — a connecting/chooser state (so no
@@ -247,6 +341,84 @@ mod tests {
 
     fn s(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn crumbs(names: &[&str]) -> Vec<SymbolCrumb> {
+        names
+            .iter()
+            .map(|n| SymbolCrumb {
+                name: (*n).to_string(),
+                kind: aether_protocol::picker::SymbolKind::Function,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn symbol_path_fits_whole() {
+        let c = crumbs(&["impl Foo", "fn bar"]);
+        assert_eq!(truncate_symbol_path(&c, 40), "impl Foo › fn bar");
+    }
+
+    /// Rung 2: the outermost crumbs collapse into `…›` and the innermost survives whole. The
+    /// *first* crumb is never the one kept — that's the deliberate inversion of `truncate_path`.
+    #[test]
+    fn symbol_path_drops_outermost_first() {
+        let c = crumbs(&["mod outer", "impl Foo", "fn bar"]);
+        assert_eq!(truncate_symbol_path(&c, 29), "mod outer › impl Foo › fn bar");
+        assert_eq!(truncate_symbol_path(&c, 25), "… › impl Foo › fn bar");
+        assert_eq!(truncate_symbol_path(&c, 20), "… › fn bar");
+    }
+
+    /// Rung 3: one crumb too wide for the budget keeps its *head* — identifiers disambiguate at the
+    /// start, so `resolve_naviga…` beats `…gation_motion`.
+    #[test]
+    fn symbol_path_head_cuts_the_innermost() {
+        let c = crumbs(&["resolve_navigation_motion"]);
+        assert_eq!(truncate_symbol_path(&c, 12), "resolve_nav…");
+    }
+
+    /// A budget that can't fit the marker still prefers the bare innermost name over cutting it:
+    /// the full identifier says more than a stub plus a "there was more" hint.
+    #[test]
+    fn symbol_path_prefers_whole_innermost_over_marker() {
+        let c = crumbs(&["SomeVeryLongTypeName", "fn bar"]);
+        assert_eq!(truncate_symbol_path(&c, 9), "fn bar");
+    }
+
+    /// The parts form is the same ladder, unjoined — the `…` is its own segment so a proportional
+    /// shell can space it like any other crumb, and joining reproduces `truncate_symbol_path`.
+    #[test]
+    fn symbol_path_parts_are_the_joined_form_unjoined() {
+        let c = crumbs(&["mod outer", "impl Foo", "fn bar"]);
+        for budget in [8, 12, 20, 25, 29, 40] {
+            let parts = truncate_symbol_path_parts(&c, budget);
+            assert_eq!(
+                parts.join(CRUMB_SEPARATOR),
+                truncate_symbol_path(&c, budget),
+                "budget {budget}"
+            );
+        }
+        assert_eq!(
+            truncate_symbol_path_parts(&c, 25),
+            vec!["…", "impl Foo", "fn bar"]
+        );
+        assert!(truncate_symbol_path_parts(&c, 4).is_empty());
+    }
+
+    #[test]
+    fn symbol_path_empty_below_min_width() {
+        let c = crumbs(&["fn bar"]);
+        assert_eq!(truncate_symbol_path(&c, 7), "");
+        assert_eq!(truncate_symbol_path(&[], 80), "");
+    }
+
+    /// Char-based, not byte-based: a multi-byte name must not overshoot its column budget.
+    #[test]
+    fn symbol_path_counts_chars_not_bytes() {
+        let c = crumbs(&["日本語識別子テスト"]);
+        let out = truncate_symbol_path(&c, 8);
+        assert_eq!(out.chars().count(), 8);
+        assert_eq!(out, "日本語識別子テ…");
     }
 
     #[test]

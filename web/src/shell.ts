@@ -556,6 +556,20 @@ function basename(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
+/** What a section divider costs the char budget: the glyph plus `.status-left`'s gap either side,
+ *  which is about five average chars. Mirrors `DIVIDER_COLS` in the GUI shell. */
+const DIVIDER_COLS = 5;
+
+/** The dim `·` dividing the status bar's left-hand sections (file label, git cluster, breadcrumb).
+ *  Its own flex child, so `.status-left`'s gap supplies the space either side — the native shells
+ *  draw the same divider with their own spacers. */
+function sectionDivider(): HTMLElement {
+  const el = document.createElement("span");
+  el.className = "status-section-sep";
+  el.textContent = "\u00b7";
+  return el;
+}
+
 /** Buffer-state accent colour for the status dot (and the dirty favicon): deleted-on-disk /
  *  externally-changed / unsaved edits, clean → none. Hexes mirror the `state_deleted` /
  *  `state_changed` / `state_unsaved` roles of `Theme::DARK` / `Theme::LIGHT` in
@@ -4598,6 +4612,10 @@ export class Shell {
     }
     const proj = showsWorkspaceChrome(v.workspace) ? `[${v.workspace}] ` : "";
     fileGroup.append(proj);
+    // Char widths of everything with a fixed size, accumulated as we build: the breadcrumb at the
+    // end of the left segment gets whatever's left, and there's no column grid to ask. Approximate
+    // (the bar is proportional) — the same approximation `labelBudget` below already makes.
+    let used = (color ? 2 : 0) + [...proj].length;
     const name = document.createElement("span");
     if (v.buffer.transient) name.className = "status-transient"; // preview buffers slant
     // The file label takes at most the left half of the bar, segment-elided so the filename
@@ -4609,6 +4627,7 @@ export class Shell {
         [...proj].length,
     );
     name.textContent = truncatePath(v.buffer.label, undefined, labelBudget).display;
+    used += [...name.textContent].length;
     fileGroup.append(name);
     left.append(fileGroup);
     // Git group: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
@@ -4620,6 +4639,7 @@ export class Shell {
         const b = document.createElement("span");
         b.className = "status-git git-branch";
         b.textContent = `⎇  ${gs.branch}`;
+        used += [...b.textContent].length + 2;
         gitGroup.append(b);
       }
       const u = gs.unstaged;
@@ -4637,18 +4657,26 @@ export class Shell {
         const el = document.createElement("span");
         el.className = `status-git ${cls}`;
         el.textContent = tok;
+        used += [...tok].length + 1;
         gitGroup.append(el);
       }
-      if (gitGroup.childElementCount > 0) left.append(gitGroup);
+      if (gitGroup.childElementCount > 0) {
+        used += DIVIDER_COLS;
+        left.append(sectionDivider(), gitGroup);
+      }
     }
 
     const right = document.createElement("span");
     right.className = "status-right";
+    // Same accumulation as the left segment: the breadcrumb sizes itself from what's left over, so
+    // the right segment has to declare what it's taking (plus its inter-group gap).
+    let rightUsed = 0;
     if (v.search.active) {
       const label = searchCountLabel(v.search.summary);
       if (label) {
         const c = document.createElement("span");
         c.textContent = label;
+        rightUsed += [...label].length + 2;
         right.append(c);
       }
     }
@@ -4656,6 +4684,7 @@ export class Shell {
     if (results) {
       const g = document.createElement("span");
       g.textContent = `(${results.current}/${results.total})`;
+      rightUsed += [...g.textContent].length + 2;
       right.append(g);
     }
     const dc = v.diagnostics;
@@ -4672,19 +4701,63 @@ export class Shell {
         const d = document.createElement("span");
         d.className = cls;
         d.append(statusIcon(kind), ` ${n}`);
+        rightUsed += String(n).length + 4; // icon + count + gap
         diagGroup.append(d);
       }
     }
     if (diagGroup.childElementCount > 0) right.append(diagGroup);
     const pos = document.createElement("span");
     pos.textContent = positionLabel(v);
+    rightUsed += [...pos.textContent].length + 2;
     right.append(pos);
     const lsp = lspIcon(v.lsp);
     if (lsp) {
       const g = document.createElement("span");
       g.className = lsp.cls;
       g.append(statusIcon(lsp.kind, lsp.spin));
+      rightUsed += 3;
       right.append(g);
+    }
+
+    // The LSP outline breadcrumb closes the left segment, on whatever the fixed content leaves.
+    // Last because it's the only element that changes as the cursor moves — anything to its right
+    // would slide about as you navigate. The core owns the truncation ladder (labels.rs); we only
+    // measure the budget, so all three clients elide identically.
+    //
+    // It hands back segments, not a joined string, so each `›` can be its own element with a real
+    // margin — a space glyph in the proportional bar font sets it far too tight. The budget pays a
+    // char per separator to cover that extra margin, which the char estimate can't see.
+    const cols = charBudget(
+      this.statusEl.clientWidth,
+      `${barStyle.fontSize} ${barStyle.fontFamily}`,
+    );
+    // No separator surcharge on the budget: the core sizes each `›` as the 3 chars of its
+    // `CRUMB_SEPARATOR`, and `.status-crumb-sep`'s glyph-plus-margins is tuned to land at about
+    // that width, so the estimate it already makes is the right one.
+    const parts = this.session.symbol_path_parts(
+      Math.max(0, cols - used - rightUsed - DIVIDER_COLS),
+    ) as string[];
+    if (parts.length > 0) {
+      const crumbs = document.createElement("span");
+      crumbs.className = "status-crumbs";
+      parts.forEach((part, i) => {
+        if (i > 0) {
+          const sep = document.createElement("span");
+          sep.className = "status-crumb-sep";
+          sep.textContent = "›";
+          crumbs.append(sep);
+        }
+        // Every crumb but the innermost is chrome: the chain locates you, the last one *is* you.
+        if (i < parts.length - 1) {
+          const a = document.createElement("span");
+          a.className = "status-crumb-ancestors";
+          a.textContent = part;
+          crumbs.append(a);
+        } else {
+          crumbs.append(part);
+        }
+      });
+      left.append(sectionDivider(), crumbs);
     }
 
     this.statusEl.replaceChildren(left, right);

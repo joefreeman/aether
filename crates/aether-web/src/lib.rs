@@ -127,6 +127,24 @@ impl WasmSession {
             .map(|h| format!("{}\u{0}{}", h.keys, h.text))
     }
 
+    /// The status bar's LSP outline breadcrumb, truncated to `max_chars` and returned as its display
+    /// segments (outermost first, innermost last; a leading `…` is its own segment). Empty when
+    /// there's nothing to show — no language server, outline not loaded, cursor between symbols, or
+    /// a budget too small to say anything.
+    ///
+    /// A method rather than a field on `view()`: the truncation ladder lives once in
+    /// `aether_client::labels`, and only the shell knows how many chars fit in its bar, so it
+    /// measures and asks. Called during the status render, which already re-runs on every view.
+    ///
+    /// Segments rather than one string so the shell can put a real margin either side of the `›` —
+    /// see `.status-crumb-sep` in theme.css.
+    pub fn symbol_path_parts(&self, max_chars: u32) -> Vec<String> {
+        aether_client::labels::truncate_symbol_path_parts(
+            &self.inner.symbol_path,
+            max_chars as usize,
+        )
+    }
+
     /// A server push (a JSON-RPC notification): `method` + `params` JSON. Returns `Effect[]`.
     pub fn on_event(&mut self, method: String, params: JsValue) -> Result<JsValue, JsValue> {
         let params: Value = from_js(params)?;

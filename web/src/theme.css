@@ -354,6 +354,19 @@ html, body, #app {
 .status-right { flex: 0 0 auto; display: flex; gap: 10px; align-items: center; }
 .status-diag-group { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; } /* tight diagnostic cluster on the right, by the position */
 .status-transient { font-style: italic; } /* preview buffer: the status-bar file label slants */
+/* LSP outline breadcrumb, last in the left segment. `flex: 0 1 auto` + `min-width: 0` let it be the
+   group that gives way when the bar is squeezed; the core's char budget already elides it, so the
+   ellipsis here is only a safety net for the estimate's error (same role it plays on .status-file). */
+.status-crumbs { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-crumb-ancestors { color: var(--fg-muted); } /* the chain reads as chrome; the innermost symbol as content */
+/* Each `›` is its own element purely so it can carry this margin: a space glyph in the bar's
+   proportional face sets the separator far too tight against the names either side. `em`, so the
+   air scales with `ui_font_size`. Sized so glyph-plus-margins ≈ the 3 chars the core budgets for
+   `CRUMB_SEPARATOR` — keep them in step, or the breadcrumb outgrows its measured budget. */
+.status-crumb-sep { color: var(--fg-muted); margin: 0 0.55em; }
+/* Divider between the left segment's sections. `flex: 0 0 auto` so it never absorbs the squeeze
+   that `.status-crumbs` is there to take. */
+.status-section-sep { flex: 0 0 auto; color: var(--fg-muted); }
 .picker-italic { font-style: italic; } /* preview buffer rows in the buffers picker */
 .status-git { white-space: nowrap; } /* git change counts; spacing comes from the group's flex gap */
 .git-added { color: var(--git-added); }

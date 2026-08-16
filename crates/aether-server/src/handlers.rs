@@ -61,6 +61,7 @@ use aether_protocol::lsp::{
     LspDiagnosticsChangedParams, LspDocumentHighlightParams, LspFormatResult,
     LspGotoDefinitionResult, LspHoverResult, LspLocation, LspNavigateDiagnosticParams,
     LspNavigateDiagnosticResult, LspReadiness, LspRestartServerParams, LspStatus,
+    LspSymbolPathChanged, LspSymbolPathChangedParams, SymbolCrumb,
 };
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
@@ -2795,7 +2796,7 @@ pub async fn cursor_follow_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(ClientId, BufferId)>,
 ) {
     while let Some(key) = rx.recv().await {
-        let (blame_epoch, hl_epoch) = {
+        let (blame_epoch, hl_epoch, symbol_path_pushes) = {
             let mut s = state.lock().await;
             let blame = s.blame_follow.contains(&key).then(|| {
                 let gen = s.blame_follow_gen.entry(key).or_insert(0);
@@ -2811,13 +2812,21 @@ pub async fn cursor_follow_loop(
                 s.symbol_highlight_gen.insert(key, epoch);
                 epoch
             });
-            (blame, hl)
+            // Resolved inline, not spawned: the breadcrumb is a lookup in the cached outline, so
+            // there's nothing to debounce and no round-trip to supersede. Recomputed from the
+            // *current* cursor rather than anything carried on the event, so a burst of moves
+            // collapses onto the latest position by construction.
+            let crumbs = collect_symbol_path_pushes(&mut s, key.1);
+            (blame, hl, crumbs)
         };
         if let Some(epoch) = blame_epoch {
             spawn_blame_refresh(state.clone(), key.0, key.1, epoch);
         }
         if let Some(epoch) = hl_epoch {
             spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch);
+        }
+        for (sender, notif) in symbol_path_pushes {
+            let _ = sender.send(notif).await;
         }
     }
 }
@@ -4967,7 +4976,12 @@ fn match_index_for_cursor(buf: &Document, entry: &SearchEntry, cursor: &CursorSt
 /// actually follows something (and in bare-state unit tests, where no follow loop runs).
 fn set_cursor(s: &mut ServerState, key: (ClientId, BufferId), new: CursorState) {
     s.cursors.insert(key, new);
-    if s.blame_follow.contains(&key) || s.symbol_highlight_follow.contains(&key) {
+    // The status-bar breadcrumb follows unconditionally (there's no toggle for it), but only for a
+    // buffer that actually has an outline — a plain-text buffer costs nothing here.
+    let follows = s.blame_follow.contains(&key)
+        || s.symbol_highlight_follow.contains(&key)
+        || s.document_symbols.contains_key(&key.1);
+    if follows {
         if let Some(tx) = &s.cursor_moved_tx {
             let _ = tx.send(key);
         }
@@ -6317,12 +6331,18 @@ pub async fn viewport_subscribe(
     // viewport that subscribes *after* the relevant change already happened would show stale state
     // until the next change. Returning it in the response (vs a follow-up push) keeps it atomic with
     // the window and free of any ordering race against the client's editor switch.
+    // Record what we're about to answer with as the last-sent breadcrumb, so the follow loop's
+    // first push after this is a real change rather than a duplicate of the seed.
+    let symbol_path = symbol_path_for(&s, client_id, buffer_id);
+    s.symbol_path_sent
+        .insert((client_id, buffer_id), symbol_path.clone());
     let buf = s.doc_of(buffer_id);
     let buffer_status = BufferStatusSnapshot {
         externally_modified: buf.externally_modified,
         externally_deleted: buf.externally_deleted,
         diagnostics: diagnostic_counts(buffer_diagnostics(&s, buffer_id)),
         lsp_status: s.lsp.status_for_buffer(buffer_id),
+        symbol_path,
     };
     drop(s);
     for (sender, notif) in pushes {
@@ -7307,9 +7327,19 @@ pub async fn refresh_document_symbols(state: &SharedState, buffer_id: BufferId) 
             return; // keep any previous cache rather than blanking it on a transient failure
         }
     };
-    let mut s = state.lock().await;
-    if s.buffers.contains_key(&buffer_id) {
+    let pushes = {
+        let mut s = state.lock().await;
+        if !s.buffers.contains_key(&buffer_id) {
+            return;
+        }
         s.document_symbols.insert(buffer_id, symbols);
+        // The outline typically lands a beat *after* the buffer opens, with the cursor sitting
+        // still — no cursor response to ride, so the breadcrumb would stay blank until the next
+        // keypress without this.
+        collect_symbol_path_pushes(&mut s, buffer_id)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
     }
 }
 
@@ -7319,6 +7349,76 @@ pub fn spawn_document_symbol_refresh(state: SharedState, buffer_id: BufferId) {
     tokio::spawn(async move {
         refresh_document_symbols(&state, buffer_id).await;
     });
+}
+
+/// The status-bar breadcrumb for `(client, buffer)`: the outline symbols enclosing that client's
+/// cursor, outermost first (`impl Foo` › `fn bar`). Empty when the buffer has no cached outline —
+/// no language server, or the first `textDocument/documentSymbol` hasn't landed — or the cursor
+/// sits outside every symbol, which is the honest answer between two top-level items.
+///
+/// Cheap enough to run inline under the lock (a linear scan of the cached outline, no I/O), unlike
+/// the blame and symbol-highlight followers that spawn for an LSP round-trip.
+///
+/// The cached outline goes stale between refreshes — it's re-fetched on open and on
+/// `publishDiagnostics`, so ranges drift as you type until the server re-analyses. That's the same
+/// staleness the `o` motion already navigates by, so the breadcrumb and the motion always agree
+/// with each other, which matters more than either agreeing with the un-analysed text.
+fn symbol_path_for(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> Vec<SymbolCrumb> {
+    let (Some(symbols), Some(cursor)) = (
+        s.document_symbols.get(&buffer_id),
+        s.cursors.get(&(client_id, buffer_id)),
+    ) else {
+        return Vec::new();
+    };
+    crate::cursor::enclosing_chain(symbols, cursor.position)
+        .into_iter()
+        .map(|i| SymbolCrumb {
+            name: symbols[i].name.clone(),
+            kind: symbols[i].symbol_kind,
+        })
+        .collect()
+}
+
+/// Recompute the breadcrumb for every client viewing `buffer_id`, pushing `lsp/symbol_path_changed`
+/// to those whose path actually changed. Moving *within* a function changes nothing, so the common
+/// case is a scan and no push at all.
+///
+/// Mutates `symbol_path_sent` as it goes: a caller that collects these and drops them would
+/// suppress the *next* genuine change, so send what this returns.
+fn collect_symbol_path_pushes(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
+    let mut clients: Vec<ClientId> = s
+        .viewports
+        .values()
+        .filter(|vp| vp.buffer_id == buffer_id)
+        .map(|vp| vp.client_id)
+        .collect();
+    clients.sort_unstable();
+    clients.dedup();
+
+    let mut pushes = Vec::new();
+    for client_id in clients {
+        let path = symbol_path_for(s, client_id, buffer_id);
+        let key = (client_id, buffer_id);
+        // "Never sent" reads as empty, so a buffer that never gets an outline (no server) stays
+        // silent instead of pushing one empty path per open.
+        if s.symbol_path_sent.get(&key).map(Vec::as_slice).unwrap_or(&[]) == path.as_slice() {
+            continue;
+        }
+        s.symbol_path_sent.insert(key, path.clone());
+        let Some(sender) = s.clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((
+            sender,
+            Notification {
+                jsonrpc: JsonRpc,
+                method: LspSymbolPathChanged::NAME.into(),
+                params: serde_json::to_value(LspSymbolPathChangedParams { buffer_id, path })
+                    .unwrap_or(serde_json::Value::Null),
+            },
+        ));
+    }
+    pushes
 }
 
 /// Monotonic token minted per async-resolve picker open (References, DocumentSymbols), stored on
