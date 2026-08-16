@@ -20,3 +20,9 @@ tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 unicode-width = { workspace = true }
 ureq = { workspace = true }
+
+# The `application:openURLs:` delegate — see src/mac_open.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-foundation = { workspace = true }

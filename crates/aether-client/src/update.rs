@@ -4511,6 +4511,22 @@ impl Session {
         Effects::none()
     }
 
+    /// Open a file the *operating system* handed us: macOS "Open With" / a Dock drop delivering
+    /// `application:openURLs:` to an already-running client (docs/client-core.md), and whatever
+    /// Linux's desktop integration eventually sends. `path` is absolute — the OS resolved it.
+    ///
+    /// Deliberately the same path as the `Space Alt-w` overlay's commit, so a file arriving from the
+    /// desktop behaves exactly like one the user typed: a real (non-transient) buffer, its workspace
+    /// context resolved server-side, and a fresh ephemeral context when no workspace is active —
+    /// which is the case when the launch landed on the boot chooser.
+    ///
+    /// Not [`Self::open_path_at`]: that opens a *transient preview* for result-style navigation
+    /// (picker rows, goto-definition), which would evaporate the moment the buffer was hidden. A
+    /// file someone deliberately opened from their file manager is not a preview.
+    pub fn open_path_from_os(&mut self, path: String) -> Effects {
+        self.commit_open_path(path)
+    }
+
     /// Submit the open-from-path overlay: open `path` (absolute, or a leading `~/`) via
     /// `workspace/open_path`. The server resolves the workspace context — internal if it's under
     /// the active workspace's roots, an external buffer if not, a fresh ephemeral context if no
@@ -9135,6 +9151,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A file handed to us by the desktop (macOS "Open With") opens like the `Space Alt-w` overlay
+    /// commit: `workspace/open_path`, non-transient, existing-files-only — and it takes over from
+    /// whatever overlay happened to be up, since the user's attention just moved to the new file.
+    #[test]
+    fn open_path_from_os_opens_a_real_buffer_and_drops_any_prompt() {
+        let mut s = Session::placeholder();
+        s.workspace = "proj".into();
+        s.workspace_paths = vec!["/proj".into()];
+        s.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(
+            "half-typed".into(),
+        )));
+
+        let fx = s.open_path_from_os("/elsewhere/notes.md".into());
+        let params =
+            fx.0.iter()
+                .find_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "workspace/open_path" => {
+                        Some(params.clone())
+                    }
+                    _ => None,
+                })
+                .expect("an OS-delivered file rides workspace/open_path");
+        assert_eq!(params["path"], serde_json::json!("/elsewhere/notes.md"));
+        // Not a preview: it must survive being hidden.
+        assert_eq!(params["transient"], serde_json::Value::Null);
+        // The OS only hands us files that exist; a create here would mint buffers for typos.
+        assert_eq!(params["create_if_missing"], serde_json::json!(false));
+        assert!(s.prompt.is_none(), "the overlay gives way to the new file");
     }
 
     #[test]

@@ -1,3 +1,13 @@
+# Desktop entry for the Linux packages (installed by the AppImage build, and by hand on a
+# tarball install). The basename must stay `uk.joef.Aether` — it has to match the iced window's
+# Wayland app_id / X11 WM_CLASS for the shell to associate a running window with this entry, its
+# icon, and (on GNOME) to group every Aether window into one application for Alt-`.
+#
+# StartupNotify is deliberately absent: startup notification is a handshake, and the launcher keeps
+# showing "starting" feedback until the app completes it by consuming the activation token it was
+# handed. iced never reads that token (it wires up none of winit's `startup_notify` API), so
+# declaring `true` here would buy a hanging spinner and nothing else. Revisit if iced gains
+# activation-token support — at which point new windows would also start getting focus properly.
 [Desktop Entry]
 Type=Application
 Name=Aether
@@ -6,4 +16,29 @@ Exec=ae %f
 Icon=uk.joef.Aether
 Terminal=false
 Categories=Development;TextEditor;
-MimeType=text/plain;
+# One type per language Aether has a tree-sitter grammar for, plus `text/plain` and
+# `inode/directory`. Add a language's type here when its grammar lands.
+#
+# Why list them at all when they nearly all inherit from `text/plain`: GIO splits "Open With" into
+# apps registered for the *exact* type (recommended, listed first) and apps registered for a parent
+# type (fallback, buried under "Other Applications"). With `text/plain` alone, `gio mime text/rust`
+# reports "No recommended applications" and Aether sits in the fallback bucket for every source
+# file — and `xdg-mime default` has no per-type registration to bind to.
+#
+# Types are the ones shared-mime-info actually reports for each extension, not the ones you would
+# guess. Absent by design: TypeScript, whose `.ts`/`.tsx` resolve to `text/vnd.trolltech.linguist`
+# (Qt Linguist) and `application/x-tiled-tsx` (Tiled) — claiming those would offer Aether for
+# unrelated formats. `.jsx`, `.cjs`, `.hrl`, `.zsh`, `.qv`, `.tf` and Dockerfiles have no type of
+# their own and are covered by `text/plain`.
+#
+# `inode/directory` because `ae DIR` opens that directory as a workspace — it makes Aether an
+# option for "Open With" on a folder. It cannot become the default handler unless someone
+# explicitly sets it.
+MimeType=text/plain;text/markdown;text/rust;text/html;text/css;text/javascript;text/x-python;text/x-go;text/x-elixir;text/x-erlang;application/json;application/toml;application/yaml;application/sql;application/x-shellscript;inode/directory;
+Actions=new-window;
+
+# Right-click the dash/dock icon → "New Window". Clicking the icon while Aether is running focuses
+# the existing window, so this is the only launcher-side way to ask for another one.
+[Desktop Action new-window]
+Name=New Window
+Exec=ae

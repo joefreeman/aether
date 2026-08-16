@@ -208,7 +208,6 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
             tether,
             version,
             server_url,
-            aether_server::active_profile().to_string(),
         )
     } else {
         // `--buffer` is a GUI-spawn internal; the terminal client has no window to seed with it.
@@ -685,13 +684,10 @@ fn run_gui(
     tether: bool,
     version: String,
     server_url: String,
-    profile: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(
-        workspace, path, jump, buffer, tether, version, server_url, profile,
-    )
+    aether_iced::run(workspace, path, jump, buffer, tether, version, server_url)
 }
 
 #[cfg(not(feature = "gui"))]
@@ -704,7 +700,6 @@ fn run_gui(
     _tether: bool,
     _version: String,
     _server_url: String,
-    _profile: String,
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "this build of `ae` was compiled without GUI support — rebuild with `--features gui`, \

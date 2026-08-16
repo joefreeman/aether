@@ -28,8 +28,27 @@
     </ul>
   </description>
   <launchable type="desktop-id">uk.joef.Aether.desktop</launchable>
+  <!-- Mirrors the desktop entry's MimeType= line: software centres read the media types from here,
+       file managers read them from there, and the two drifting apart is how an app ends up
+       advertised for formats it doesn't open. Keep them in step. -->
   <provides>
     <binary>ae</binary>
+    <mediatype>text/plain</mediatype>
+    <mediatype>text/markdown</mediatype>
+    <mediatype>text/rust</mediatype>
+    <mediatype>text/html</mediatype>
+    <mediatype>text/css</mediatype>
+    <mediatype>text/javascript</mediatype>
+    <mediatype>text/x-python</mediatype>
+    <mediatype>text/x-go</mediatype>
+    <mediatype>text/x-elixir</mediatype>
+    <mediatype>text/x-erlang</mediatype>
+    <mediatype>application/json</mediatype>
+    <mediatype>application/toml</mediatype>
+    <mediatype>application/yaml</mediatype>
+    <mediatype>application/sql</mediatype>
+    <mediatype>application/x-shellscript</mediatype>
+    <mediatype>inode/directory</mediatype>
   </provides>
   <url type="homepage">https://github.com/joefreeman/aether</url>
   <url type="vcs-browser">https://github.com/joefreeman/aether</url>

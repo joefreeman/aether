@@ -8946,8 +8946,9 @@ mod tests {
         );
         let cells = cells_of(&spans);
         assert_eq!(cells[0].2, Some(c(th().git_deleted_bg)));
-        for i in 1..(1 + TAB_WIDTH as usize) {
-            assert_eq!(cells[i].2, Some(c(th().git_deleted_emph_bg)), "tab cell {i}");
+        // `n` counts within the tab: cell 0 is the tab's first expanded cell.
+        for (n, cell) in cells[1..=TAB_WIDTH as usize].iter().enumerate() {
+            assert_eq!(cell.2, Some(c(th().git_deleted_emph_bg)), "tab cell {n}");
         }
         assert_eq!(cells[1 + TAB_WIDTH as usize].2, Some(c(th().git_deleted_bg)));
     }

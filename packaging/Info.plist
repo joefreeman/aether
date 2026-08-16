@@ -42,5 +42,59 @@
     <string>public.app-category.developer-tools</string>
     <key>NSHumanReadableCopyright</key>
     <string>© Joe Freeman</string>
+    <!--
+      The document types Finder will offer Aether for. Without these the app declares no types at
+      all and Finder never lists it under "Open With" — the "can't open text files from Finder"
+      symptom.
+
+      Two tiers, both `Editor` (we edit what we open, we don't just view it):
+      - Text and source, ranked `Alternate`: offered in "Open With", but not claiming to be the
+        system default for anything — an editor that quietly steals every .txt and .json on
+        install is a bad guest.
+      - `public.data` / `public.item`, ranked `None`: never offered or suggested, but selectable
+        via "Open With ▸ Other…" for any file at all. That's the CLI editor's contract — `ae` will
+        happily open a file whatever its extension, and Finder shouldn't be stricter.
+
+      Declaring the types only gets Aether *listed*. Finder passes the chosen file by Apple event
+      (`application:openURLs:`), never in argv — the delegate that receives it lives in
+      crates/aether-iced/src/mac_open.rs, and without it a file chosen here would be silently
+      dropped. The two are a pair: adding a type below extends what that delegate gets handed.
+    -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Text Document</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.plain-text</string>
+                <string>public.utf8-plain-text</string>
+                <string>public.source-code</string>
+                <string>public.script</string>
+                <string>public.shell-script</string>
+                <string>public.xml</string>
+                <string>public.json</string>
+                <string>public.yaml</string>
+                <string>net.daringfireball.markdown</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Any File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>None</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.data</string>
+                <string>public.item</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

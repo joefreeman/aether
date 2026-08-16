@@ -112,3 +112,12 @@ iced = { version = "0.14", features = ["tokio", "advanced", "markdown", "image",
 # Remote images in the markdown reading view (docs/markdown-view.md §2.8): a small blocking
 # HTTP client (rustls), run under spawn_blocking from the fetch task.
 ureq = "2"
+
+# macOS "Open With" (crates/aether-iced/src/mac_open.rs): Finder delivers a chosen file as an
+# Apple event, so the GUI has to register an `NSApplicationDelegate` to receive it. These are the
+# 0.6/0.3 generation, already in the tree via iced's own deps (arboard, mundy); winit uses the
+# older 0.5/0.2 pair alongside, which is fine — they are the same Objective-C classes either way.
+# Only the AppKit/Foundation pieces the delegate names are enabled.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSObject", "NSString", "NSURL"] }

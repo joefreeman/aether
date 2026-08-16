@@ -24721,9 +24721,8 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
 /// dummy LSP that publishes one canned diagnostic — deterministic, no real server.
 #[tokio::test]
 async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
-    use aether_protocol::picker::{
-        GroupHeader, PickerKind, PickerView, PickerViewParams, PickerViewResult,
-    };
+    // `PickerViewParams` is already in scope from the file-level import.
+    use aether_protocol::picker::{GroupHeader, PickerKind, PickerView, PickerViewResult};
     use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
     let dir = lay_out(&[(
         "main.rs",

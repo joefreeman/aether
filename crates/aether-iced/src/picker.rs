@@ -246,7 +246,9 @@ const SANS: iced::Font = iced::Font {
 /// multi-root workspaces, like the other clients). `scroll_y` is the shell-tracked scroll
 /// offset of the jumplist (for the sticky-header pin). The query is a controlled
 /// `text_input` synced to the core via [`PickerMsg::Query`].
+#[allow(clippy::too_many_arguments)]
 pub fn overlay<'a>(
+    window: iced::window::Id,
     state: &'a PickerState,
     roots: &'a [String],
     tether: Option<aether_protocol::BufferId>,
@@ -299,7 +301,7 @@ pub fn overlay<'a>(
     // `alt_passthrough` keeps Alt-nav chords (Alt-j/k/l) out of the query input (winit delivers
     // `Alt+letter` as text on some platforms, which the focused input would otherwise insert).
     let q_input = iced::widget::text_input(ph, &state.query)
-        .id(query_input_id())
+        .id(query_input_id(window))
         .on_input(PickerMsg::Query)
         .font(SANS)
         .size(ui.body())
@@ -419,7 +421,7 @@ pub fn overlay<'a>(
     // Chip-editor line (glob / dir), revealed below the input row so chips + query stay
     // visible while editing. The slot is ALWAYS present (zero-size when closed) — swapping
     // the tree shape would reset the scrollable's state below (keyed by tree position).
-    panel = panel.push(editor_line(state, roots, ui, p));
+    panel = panel.push(editor_line(window, state, roots, ui, p));
     // Separator below the input, only coloured when the list has anything to separate (the
     // web's `.picker-list.filled` border-top). The slot itself is always present.
     let filled = state.total_display_rows > 0;
@@ -543,7 +545,7 @@ pub fn overlay<'a>(
     );
 
     let scroll = iced::widget::scrollable(list)
-        .id(list_id())
+        .id(list_id(window))
         .width(Length::Fill)
         .height(list_height(state, ui))
         .direction(iced::widget::scrollable::Direction::Vertical(
@@ -683,24 +685,24 @@ const SANS_BOLD: iced::Font = iced::Font {
 };
 
 /// The results scrollable's id, for programmatic `scroll_to` (keyboard reveals).
-pub fn list_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("picker-results")
+pub fn list_id(window: iced::window::Id) -> iced::advanced::widget::Id {
+    crate::app::scoped_id(window, "picker-results")
 }
 
 /// The query `text_input`'s id — must match `OverlayField::PickerQuery::id()` so the shell's
 /// focus task lands on it when the picker opens.
-pub fn query_input_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("overlay-picker-query")
+pub fn query_input_id(window: iced::window::Id) -> iced::advanced::widget::Id {
+    crate::app::scoped_id(window, "overlay-picker-query")
 }
 
 /// The chip editor's root-filter `text_input` id — must match `OverlayField::ChipRoot::id()`.
-pub fn editor_root_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("overlay-chip-root")
+pub fn editor_root_id(window: iced::window::Id) -> iced::advanced::widget::Id {
+    crate::app::scoped_id(window, "overlay-chip-root")
 }
 
 /// The chip editor's path/glob `text_input` id — must match `OverlayField::ChipPath::id()`.
-pub fn editor_path_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("overlay-chip-path")
+pub fn editor_path_id(window: iced::window::Id) -> iced::advanced::widget::Id {
+    crate::app::scoped_id(window, "overlay-chip-path")
 }
 
 /// One filter chip: compact label on a raised background; selected inverts; exclude globs
@@ -868,6 +870,7 @@ pub(crate) fn field_with_ghost<'a>(
 /// then for multi-root dir editors a root typeahead segment, a `:` separator (shown once the
 /// path is in play), and the root-relative path with directory ghost suggestions.
 fn editor_line<'a>(
+    window: iced::window::Id,
     state: &'a PickerState,
     roots: &'a [String],
     ui: theme::Ui,
@@ -896,7 +899,7 @@ fn editor_line<'a>(
                 &ed.root_filter,
                 ghost,
                 invalid,
-                editor_root_id(),
+                editor_root_id(window),
                 "",
                 // Drawn inside the segment so it sits flush against the typed text.
                 if show_sep { ":" } else { "" },
@@ -946,7 +949,7 @@ fn editor_line<'a>(
                 &ed.input,
                 None,
                 false,
-                editor_path_id(),
+                editor_path_id(window),
                 "*.rs · !*_test.rs · src/**",
                 "",
                 PickerMsg::EditorPath,
@@ -960,7 +963,7 @@ fn editor_line<'a>(
                 &ed.input,
                 ghost,
                 ed.path_invalid(),
-                editor_path_id(),
+                editor_path_id(window),
                 "",
                 "",
                 PickerMsg::EditorPath,

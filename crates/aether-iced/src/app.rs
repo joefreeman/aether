@@ -41,7 +41,7 @@ use aether_protocol::workspace::{
 };
 use aether_protocol::{BufferId, LogicalPosition};
 use iced::widget::{column, container, row, text};
-use iced::{keyboard, Element, Event, Length, Size, Subscription, Task};
+use iced::{keyboard, window, Element, Event, Length, Size, Subscription, Task};
 
 const TAB_WIDTH: u32 = 4;
 
@@ -87,7 +87,7 @@ pub struct ConnectingBootstrap {
     pub buffer_id: Option<BufferId>,
     /// Tether the client to the buffer `file` opens (docs/tether.md): the quick-edit invocation —
     /// a file positional without an explicit `--workspace` — where closing that buffer exits the
-    /// window. Window-spawns ([`spawn_target`]) always name the workspace, so they never set it.
+    /// window. Windows opened from inside the editor ([`Shell::open_target`]) never tether.
     pub tether: bool,
     pub client_version: String,
     /// The (profile-resolved) WebSocket address every dial and reconnect targets.
@@ -245,9 +245,18 @@ pub enum OverlayField {
 }
 
 impl OverlayField {
-    /// The stable widget id for this field's `text_input`, for `.id()` + `operation::focus`.
-    fn id(self) -> iced::advanced::widget::Id {
-        iced::advanced::widget::Id::new(match self {
+    /// The widget id for this field's `text_input` in `window`, for `.id()` + `operation::focus`.
+    ///
+    /// Scoped to the window because iced applies a widget operation to *every* window's UI: two
+    /// windows sharing an id means focusing one picker's query input focuses the other's too, and
+    /// a scroll-to in one scrolls both. Stable for a given window, which is all `operation::focus`
+    /// needs — nothing persists an id across runs.
+    fn id(self, window: window::Id) -> iced::advanced::widget::Id {
+        scoped_id(window, self.name())
+    }
+
+    fn name(self) -> &'static str {
+        match self {
             OverlayField::PickerQuery => "overlay-picker-query",
             OverlayField::Search => "overlay-search",
             OverlayField::SaveAs => "overlay-saveas",
@@ -260,8 +269,14 @@ impl OverlayField {
             OverlayField::WorkspaceAddProjectLanguage => "overlay-workspace-addproject-language",
             OverlayField::ChipRoot => "overlay-chip-root",
             OverlayField::ChipPath => "overlay-chip-path",
-        })
+        }
     }
+}
+
+/// A widget id belonging to one window — `name` qualified by the window it is rendered in. See
+/// [`OverlayField::id`] for why every id in this shell is scoped this way.
+pub(crate) fn scoped_id(window: window::Id, name: &str) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("{name}#{window}"))
 }
 
 /// The hover popover's body: plain severity-coloured blocks (diagnostics, commit details) or
@@ -338,6 +353,23 @@ pub enum Message {
     RpcResult(u64, Result<serde_json::Value, crate::connection::RpcError>),
     /// A Markdown link in the hover popover was clicked — open it in the OS handler.
     OpenLink(String),
+    /// This window asked for another one (`Space z`, or Ctrl-Enter on a picker row). Emitted by the
+    /// app, handled by [`Shell::update`] — a window can't open its sibling, only the shell that owns
+    /// the map can.
+    OpenWindow(WindowTarget),
+    /// This window is done (`Space q`, or a save-and-quit). Closes the window; the *process* exits
+    /// when the last one does. Same reason as [`Message::OpenWindow`] for going via the shell.
+    CloseWindow,
+    /// The *desktop* asked us to open a file: macOS "Open With", a Dock drop, or the document that
+    /// launched us (`crate::mac_open`). Absolute — the OS resolved it. Multi-selections arrive as
+    /// one of these per file.
+    ///
+    /// macOS-only for now because it is the only platform that delivers a document *out of band*;
+    /// a Linux file manager puts the path in `argv` (`Exec=ae %f`), which the CLI already handles.
+    /// The rest of the plumbing (`pending_os_opens`, `App::drain_os_opens`) is platform-neutral,
+    /// ready for a D-Bus `org.freedesktop.Application.Open` to feed it.
+    #[cfg(target_os = "macos")]
+    OpenFromOs(std::path::PathBuf),
     /// A click on a reading-view block/item: focus it — the source byte is the clicked
     /// element's span start, and the core turns it into the cursor move focus derives from
     /// (docs/markdown-view.md §2.3).
@@ -400,6 +432,11 @@ type RpcContinuation = Box<
 >;
 
 pub struct App {
+    /// The window this app draws in — one [`App`] per window, each with its own connection (and so
+    /// its own server-side client id). Held because every widget id this shell builds is scoped by
+    /// it: iced applies widget operations to all windows, so unscoped ids would make two windows'
+    /// pickers focus and scroll in lockstep ([`OverlayField::id`]).
+    window: window::Id,
     /// Set while the app is in the boot-connecting state (`ConnState::Connecting`): the CLI args
     /// the dial task needs, retained so a failed attempt can retry. Cleared the moment a
     /// connection lands and the real session/chooser is installed. While `Some`, input is parked
@@ -516,16 +553,22 @@ pub struct App {
     /// `operation::focus` so typing lands in the right field the moment an overlay opens (and
     /// moves between the workspace-settings name/add inputs as the core's selection changes).
     focused_field: Option<OverlayField>,
+    /// Files the desktop asked us to open ([`Message::OpenFromOs`]) before the connection landed.
+    /// A cold "Open With" launch delivers its document during boot — long before there is a session
+    /// to open it in — so it waits here and is drained the moment one exists. Empty at all other
+    /// times: once connected, an open runs straight through.
+    pending_os_opens: Vec<std::path::PathBuf>,
 }
 
 impl App {
-    pub fn new(b: Bootstrap) -> (Self, Task<Message>) {
+    pub fn new(window: window::Id, b: Bootstrap) -> (Self, Task<Message>) {
         let shell = |session: Session,
                      handle: Handle,
                      inbound: InboundRx,
                      client_version: String,
                      server_url: String,
                      server_started_at: u64| App {
+            window,
             boot_args: None,
             boot_attempt: 0,
             session,
@@ -571,6 +614,7 @@ impl App {
             toasts: Vec::new(),
             next_toast: 0,
             focused_field: None,
+            pending_os_opens: Vec::new(),
         };
         match b {
             // Launch immediately, connectionless: a placeholder session flagged `Connecting`
@@ -636,13 +680,29 @@ impl App {
         }
     }
 
+    /// Open everything the desktop handed us while we were still connecting, oldest first (a
+    /// multi-file "Open With" arrives in selection order, and the last one opened is the one left
+    /// on screen — which matches how the file manager ordered them). A no-op in the ordinary case,
+    /// where nothing was ever parked.
+    fn drain_os_opens(&mut self) -> Effects {
+        let mut fx = Effects::none();
+        for path in std::mem::take(&mut self.pending_os_opens) {
+            fx = fx.and(self.session.open_path_from_os(path.display().to_string()));
+        }
+        fx
+    }
+
     /// `[workspace] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
         crate::labels::window_title(&self.session.workspace, &self.session.buffer.label)
     }
 
-    pub fn subscription(&self) -> Subscription<Message> {
-        let keys = iced::event::listen_with(|event, status, _window| match event {
+    /// Keyboard, modifier and resize events for *every* window, each tagged with the window it
+    /// belongs to. Program-wide rather than per-window: iced builds one subscription set for the
+    /// whole daemon, and `listen_with` takes a plain `fn` pointer that could not capture a window
+    /// id in any case — so the routing rides on the id the event already carries.
+    fn input_subscription() -> Subscription<ShellMessage> {
+        iced::event::listen_with(|event, status, window| match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modified_key,
@@ -684,41 +744,40 @@ impl App {
                     || code == KeyCode::Tab
                     || code == KeyCode::BackTab
                     || mods.alt;
-                forward.then(|| Message::Key {
-                    code,
-                    mods,
-                    text: text.map(|t| t.to_string()),
+                forward.then(|| {
+                    ShellMessage::Window(
+                        window,
+                        Message::Key {
+                            code,
+                            mods,
+                            text: text.map(|t| t.to_string()),
+                        },
+                    )
                 })
             }
             // Track modifier state for click-time reads (Ctrl-click on picker rows). `ModifiersChanged`
             // self-heals on focus loss, so the state can't get stuck held.
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
-                Some(Message::ModifiersChanged(m))
+                Some(ShellMessage::Window(window, Message::ModifiersChanged(m)))
             }
             // Window geometry for the chrome that spans it — see `App::window_size`.
-            Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size)),
+            Event::Window(iced::window::Event::Resized(size)) => {
+                Some(ShellMessage::Window(window, Message::WindowResized(size)))
+            }
             _ => None,
-        });
-        let mut subs = vec![keys];
-        // Frame ticks drive the scroll easing and the picker's search throbber; subscribe to them
-        // only while one of those is actually animating — and never while disconnected, where a
-        // picker throbber stuck mid-search (the server stopped answering) would otherwise pin the
-        // 60fps redraw loop for the whole reconnect window.
-        let animating =
-            self.scroll_anim.is_some() || self.read_scroll_anim.is_some() || self.picker_ticking();
-        if animating && self.session.conn == ConnState::Connected {
-            subs.push(iced::window::frames().map(Message::AnimTick));
-        }
-        // The hint engine's clock (docs/hints.md): a slow tick while a session with hints on is
-        // connected — including the boot chooser, which is just the Workspaces picker over a
-        // placeholder session. The engine's own idle gate handles unattended windows, so this
-        // needs no focus tracking; with hints off there are no wakeups at all.
-        if self.session.hints_enabled && self.session.conn == ConnState::Connected {
-            subs.push(
-                iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::HintTick),
-            );
-        }
-        Subscription::batch(subs)
+        })
+    }
+
+    /// Whether this window has something moving that needs frame ticks.
+    fn is_animating(&self) -> bool {
+        (self.scroll_anim.is_some() || self.read_scroll_anim.is_some() || self.picker_ticking())
+            && self.session.conn == ConnState::Connected
+    }
+
+    /// Whether this window wants the hint engine's slow clock — including the boot chooser, which
+    /// is just the Workspaces picker over a placeholder session.
+    fn wants_hint_ticks(&self) -> bool {
+        self.session.hints_enabled && self.session.conn == ConnState::Connected
     }
 
     /// Whether a picker search is still streaming (drives the throbber animation).
@@ -841,7 +900,7 @@ impl App {
         }
         self.focused_field = want;
         match want {
-            Some(field) => iced::widget::operation::focus(field.id()),
+            Some(field) => iced::widget::operation::focus(field.id(self.window)),
             // The focus left every overlay field — e.g. a filter chip just got selected, so the
             // query input must stop owning the keyboard. `focus(None)` is not a thing; actively
             // *unfocus* the previously-focused widget, otherwise it keeps focus (and its caret).
@@ -904,6 +963,9 @@ impl App {
                 // `ae file:line` launch is jump-shaped and lands in the editor.
                 let jumped = jump_boot;
                 let startup = startup.and(self.session.boot_read_presentation(jumped));
+                // A document the desktop handed us during boot wins over the workspace's MRU
+                // buffer — it is the reason this window exists.
+                let startup = startup.and(self.drain_os_opens());
                 Task::batch([
                     pump(b.inbound),
                     self.subscribe_task(),
@@ -918,10 +980,24 @@ impl App {
                 self.inbound = b.inbound.clone();
                 self.inflight.clear();
                 self.pending_subscribe = None;
-                let chooser = self.enter_chooser();
+                // An "Open With" launch on a machine with no workspace to restore lands on its
+                // document, not on the chooser: the user already said what they wanted to open.
+                //
+                // Order matters. The boot placeholder is still `Connecting`, and the core drops
+                // every RPC in that state — so a live session has to replace it *before* the
+                // document can be opened on it. `enter_chooser` installs one as a side effect; the
+                // document path skips the chooser entirely and installs its own.
+                let launched_with_document = !self.pending_os_opens.is_empty();
+                let chooser = if launched_with_document {
+                    self.session = Session::placeholder();
+                    Task::none()
+                } else {
+                    self.enter_chooser()
+                };
+                let opens = self.drain_os_opens();
                 // Fetch the app settings + hint snapshot on this connection: the chooser shows
                 // the first hint a fresh install ever sees (docs/hints.md).
-                let startup = self.session.startup();
+                let startup = self.session.startup().and(opens);
                 let startup = self.run_core(startup);
                 Task::batch([pump(b.inbound), chooser, startup])
             }
@@ -966,6 +1042,8 @@ impl App {
             Message::Key { code, mods, text } => self.on_key(code, mods, text),
             // Handled upstream in `update` (tracked in every phase); listed here only for exhaustiveness.
             Message::ModifiersChanged(_) | Message::WindowResized(_) => Task::none(),
+            // Intercepted by `Shell::update`, which owns the window map — an app never sees these.
+            Message::OpenWindow(_) | Message::CloseWindow => Task::none(),
 
             Message::HintTick => {
                 let fx = self.session.on_hint_tick(Self::now_unix_ms());
@@ -1121,6 +1199,17 @@ impl App {
                 open_link(&url);
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
+            Message::OpenFromOs(path) => {
+                // A document delivered during boot has no session to land in yet; park it for
+                // `drain_os_opens` (see `pending_os_opens`). Connected, it opens immediately.
+                if self.boot_args.is_some() {
+                    self.pending_os_opens.push(path);
+                    return Task::none();
+                }
+                let fx = self.session.open_path_from_os(path.display().to_string());
+                self.run_core(fx)
+            }
             Message::ReadClick(byte) => {
                 // The clicked element is on screen by definition — remember the target so the
                 // focus-reveal snap skips this landing instead of jolting the scroll.
@@ -1222,7 +1311,7 @@ impl App {
                     }
                     self.read_anim_last = y;
                     tasks.push(iced::widget::operation::scroll_to(
-                        read_scroll_id(),
+                        read_scroll_id(self.window),
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
                     ));
                 }
@@ -1437,13 +1526,13 @@ impl App {
                     // and never reveals, which is why only the subdir case lost its cursor. Reveals
                     // fire on open-centring and nav, never on typing, so this can't fight an edit.
                     if let Some(field) = self.desired_focus() {
-                        tasks.push(iced::widget::operation::focus(field.id()));
+                        tasks.push(iced::widget::operation::focus(field.id(self.window)));
                     }
                 }
                 Effect::PickerScrollReset => {
                     self.picker_scroll_y = 0.0;
                     tasks.push(iced::widget::operation::scroll_to(
-                        crate::picker::list_id(),
+                        crate::picker::list_id(self.window),
                         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                     ));
                 }
@@ -1452,7 +1541,9 @@ impl App {
                     let fx = self.session.on_hint_tick(Self::now_unix_ms());
                     tasks.push(self.run_core(fx));
                 }
-                Effect::Exit => tasks.push(iced::exit()),
+                // Close *this* window, not the process — the shell exits once the last one goes
+                // (`Shell::update`). `Task::done` because only the shell owns the window map.
+                Effect::Exit => tasks.push(Task::done(Message::CloseWindow)),
                 Effect::ToChooser => tasks.push(self.enter_chooser()),
                 Effect::ReadClipboard(kind) => tasks.push(self.read_clipboard(kind)),
                 Effect::ShellAction(action) => tasks.push(self.run_shell_action(action)),
@@ -1500,7 +1591,7 @@ impl App {
                         // panels), so no source-derived approximation survives contact.
                         self.read_reveal_snap = fresh;
                         tasks.push(
-                            iced::advanced::widget::operate(ReadRevealProbe::default())
+                            iced::advanced::widget::operate(ReadRevealProbe::reveal(self.window))
                                 .map(Message::ReadRevealMeasured),
                         );
                     }
@@ -1682,7 +1773,7 @@ impl App {
                 }
                 Some(HoverAction::Scroll { dir, unit }) => {
                     return iced::widget::operation::scroll_by(
-                        hover_scroll_id(),
+                        hover_scroll_id(self.window),
                         iced::widget::scrollable::AbsoluteOffset {
                             x: 0.0,
                             y: hover_scroll_px(dir, unit, self.cell),
@@ -1725,7 +1816,7 @@ impl App {
             if chip_after != chip_before {
                 task = Task::batch([
                     task,
-                    iced::widget::operation::move_cursor_to_end(field.id()),
+                    iced::widget::operation::move_cursor_to_end(field.id(self.window)),
                 ]);
             }
         }
@@ -1735,7 +1826,9 @@ impl App {
         if query_before.is_some() && query_after.is_some() && query_after != query_before {
             task = Task::batch([
                 task,
-                iced::widget::operation::move_cursor_to_end(crate::picker::query_input_id()),
+                iced::widget::operation::move_cursor_to_end(crate::picker::query_input_id(
+                    self.window,
+                )),
             ]);
         }
         // A filter chip was added or removed (an `Alt`-chord toggle, or deleting the last chip):
@@ -1746,7 +1839,7 @@ impl App {
         // caret to the end, which is harmless for a chip toggle — not an in-query caret action.)
         if self.picker_chip_count() != chips_before {
             if let Some(field) = self.desired_focus() {
-                task = Task::batch([task, iced::widget::operation::focus(field.id())]);
+                task = Task::batch([task, iced::widget::operation::focus(field.id(self.window))]);
             }
         }
         task
@@ -1868,7 +1961,7 @@ impl App {
                             step
                         };
                         return iced::widget::operation::scroll_by(
-                            read_code_scroll_id(),
+                            read_code_scroll_id(self.window),
                             iced::widget::scrollable::AbsoluteOffset { x: dx, y: 0.0 },
                         );
                     }
@@ -1915,10 +2008,10 @@ impl App {
                 // Reading view: edge-matched placement of the focused block — measured
                 // against real widget geometry by the reveal probe, in explicit mode.
                 if self.session.read.is_some() {
-                    return iced::advanced::widget::operate(ReadRevealProbe {
-                        place: Some(place),
-                        ..Default::default()
-                    })
+                    return iced::advanced::widget::operate(ReadRevealProbe::placing(
+                        self.window,
+                        place,
+                    ))
                     .map(Message::ReadRevealMeasured);
                 }
                 let task = self.place_cursor(place);
@@ -1940,10 +2033,8 @@ impl App {
                 );
                 Task::none()
             }
-            A::NewWindow(target) => {
-                spawn_target(&target);
-                Task::none()
-            }
+            // Handed to the shell, which owns the window map (`Shell::open_window`).
+            A::NewWindow(target) => Task::done(Message::OpenWindow(target)),
             // Prepend the HTTP side of the address we dialed (same peek-routed port) and copy.
             // The core already toasts.
             A::CopyWebUrl { path_query } => iced::clipboard::write(format!(
@@ -2014,7 +2105,7 @@ impl App {
         let Some(p) = &self.session.picker else {
             return Task::none();
         };
-        reveal_picker_selection(p, &mut self.picker_scroll_y, reveal, ui)
+        reveal_picker_selection(self.window, p, &mut self.picker_scroll_y, reveal, ui)
     }
 
     // ---- search ---------------------------------------------------------------------------
@@ -2286,7 +2377,7 @@ impl App {
             self.read_scroll_anim = None;
             self.read_anim_last = target;
             iced::widget::operation::scroll_to(
-                read_scroll_id(),
+                read_scroll_id(self.window),
                 iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
             )
         }
@@ -2562,6 +2653,7 @@ impl App {
         if let Some(picker) = &self.session.picker {
             layers.push(
                 Element::from(crate::picker::overlay(
+                    self.window,
                     picker,
                     &self.session.workspace_paths,
                     self.session.tether,
@@ -2718,7 +2810,7 @@ impl App {
             |fieldkind: OverlayField, value: &str, placeholder: &str| -> Element<'_, Message> {
                 // No fixed height: a size-13 `text_input` needs ~17px, so clamping the row to 15 clipped
                 // the text. Both states are the same widget now, so the box height is already consistent.
-                overlay_input(fieldkind, placeholder, value, ui, p)
+                overlay_input(self.window, fieldkind, placeholder, value, ui, p)
             };
 
         // A boxed, optionally-highlighted input/row container.
@@ -2973,7 +3065,7 @@ impl App {
                         &ed.root_filter,
                         ed.root_ghost(&labels).map(|(_, suffix)| suffix),
                         invalid,
-                        OverlayField::WorkspaceAddProjectRoot.id(),
+                        OverlayField::WorkspaceAddProjectRoot.id(self.window),
                         "",
                         ":",
                         PickerMsg::EditorRoot,
@@ -3018,7 +3110,7 @@ impl App {
                     &ed.input,
                     ed.path_ghost(),
                     ed.path_invalid(),
-                    OverlayField::WorkspaceAddProject.id(),
+                    OverlayField::WorkspaceAddProject.id(self.window),
                     "",
                     "",
                     PickerMsg::EditorPath,
@@ -3052,7 +3144,7 @@ impl App {
                         &s.add_project_language,
                         s.language_ghost(),
                         s.language_invalid(),
-                        OverlayField::WorkspaceAddProjectLanguage.id(),
+                        OverlayField::WorkspaceAddProjectLanguage.id(self.window),
                         "language",
                         "",
                         PickerMsg::EditorExtra,
@@ -3284,7 +3376,7 @@ impl App {
         let chips = self.session.search.option_chips();
         let input = {
             let inner = iced::widget::text_input("Search", &self.session.search.query)
-                .id(OverlayField::Search.id())
+                .id(OverlayField::Search.id(self.window))
                 .on_input(SearchInputMsg::Typed)
                 .font(SANS)
                 .size(ui.body())
@@ -3596,7 +3688,7 @@ impl App {
                             &ed.root_filter,
                             ghost,
                             invalid,
-                            OverlayField::SaveAsRoot.id(),
+                            OverlayField::SaveAsRoot.id(self.window),
                             "",
                             ":",
                             PickerMsg::EditorRoot,
@@ -3636,7 +3728,7 @@ impl App {
                     &ed.input,
                     ed.path_ghost(),
                     ed.path_invalid(),
-                    OverlayField::SaveAs.id(),
+                    OverlayField::SaveAs.id(self.window),
                     "",
                     "",
                     PickerMsg::EditorPath,
@@ -3689,7 +3781,7 @@ impl App {
                 // `on_input` produces `String` (a `Clone` message, which `text_input` requires),
                 // then the element is mapped to `Message`, mirroring the search bar.
                 let inner = iced::widget::text_input("path to open", &field.text)
-                    .id(OverlayField::OpenPath.id())
+                    .id(OverlayField::OpenPath.id(self.window))
                     .on_input(|s| s)
                     .font(SANS)
                     .size(ui.body())
@@ -3926,7 +4018,7 @@ impl App {
         // padding lives inside the scrollable so its scrollbar sits against the popover edge.
         let boxed = container(
             iced::widget::scrollable(container(body).padding([8, 10]))
-                .id(hover_scroll_id())
+                .id(hover_scroll_id(self.window))
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
                         .width(theme::SCROLLBAR_W)
@@ -4395,6 +4487,7 @@ const SANS_BOLD_UI: iced::Font = iced::Font {
 /// not, so it's built in the tiny `Clone` [`Typed`] space and `.map`'d to `Message` (the same
 /// indirection the picker/prompt overlays use for their Clone-only button messages).
 fn overlay_input<'a>(
+    window: window::Id,
     field: OverlayField,
     placeholder: &str,
     value: &str,
@@ -4405,7 +4498,7 @@ fn overlay_input<'a>(
     // `Alt+letter` as text on some platforms, which a focused `text_input` would otherwise insert.
     crate::alt_filter::alt_passthrough(
         iced::widget::text_input(placeholder, value)
-            .id(field.id())
+            .id(field.id(window))
             .on_input(Typed)
             .font(SANS)
             .size(ui.body())
@@ -4737,22 +4830,22 @@ fn read_heading_size(level: u8, body: f32) -> f32 {
     }
 }
 
-fn read_scroll_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("read-view")
+fn read_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
+    scoped_id(window, "read-view")
 }
 
 /// The container wrapping the block that carries the reading-position bar this frame — the
 /// [`ReadRevealProbe`]'s measurement anchor. Exactly one per view (the focused band, or the
 /// focused list item's wrapper).
-fn read_focus_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("read-focus")
+fn read_focus_id(window: window::Id) -> iced::advanced::widget::Id {
+    scoped_id(window, "read-focus")
 }
 
 /// The *focused* code panel's horizontal scrollable — Left/Right pan it
 /// (docs/markdown-view.md §2.3); at most one panel carries the id per frame, and the
 /// `scroll_by` no-ops when the focus isn't a code block.
-fn read_code_scroll_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("read-code-scroll")
+fn read_code_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
+    scoped_id(window, "read-code-scroll")
 }
 
 /// Sentinel link payload (`{prefix}{span.start}`) for rich-text runs whose click should
@@ -4770,8 +4863,9 @@ const READ_ARM_PREFIX: &str = "aether-arm:";
 /// soon as images and code panels made block heights non-uniform. Safe to run from the reveal
 /// task: the winit runtime executes widget operations *after* rebuilding the view, so the
 /// probe always measures the freshly focused block.
-#[derive(Default)]
 struct ReadRevealProbe {
+    /// The window being measured — the ids it matches are scoped to it.
+    window: window::Id,
     /// The read scrollable's `(viewport, current translation, content bounds)`.
     viewport: Option<(iced::Rectangle, iced::Vector, iced::Rectangle)>,
     focus: Option<iced::Rectangle>,
@@ -4780,6 +4874,26 @@ struct ReadRevealProbe {
     /// [`ViewportPlace::READ_GAP`] between the view's edge and the block's matching edge
     /// (top-to-top for `Upper`, bottom-to-bottom for `Lower`).
     place: Option<ViewportPlace>,
+}
+
+impl ReadRevealProbe {
+    /// Reveal mode: leave a comfortably visible block alone, otherwise rest it ~20% down.
+    fn reveal(window: window::Id) -> Self {
+        Self {
+            window,
+            viewport: None,
+            focus: None,
+            place: None,
+        }
+    }
+
+    /// Explicit edge-matched placement (`;` / `Alt-;`): always reposition.
+    fn placing(window: window::Id, place: ViewportPlace) -> Self {
+        Self {
+            place: Some(place),
+            ..Self::reveal(window)
+        }
+    }
 }
 
 impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
@@ -4791,7 +4905,7 @@ impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
     }
 
     fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
-        if id == Some(&read_focus_id()) {
+        if id == Some(&read_focus_id(self.window)) {
             self.focus = Some(bounds);
         }
     }
@@ -4804,7 +4918,7 @@ impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
         translation: iced::Vector,
         _state: &mut dyn iced::advanced::widget::operation::Scrollable,
     ) {
-        if id == Some(&read_scroll_id()) {
+        if id == Some(&read_scroll_id(self.window)) {
             self.viewport = Some((bounds, translation, content_bounds));
         }
     }
@@ -4923,7 +5037,7 @@ impl App {
         }
         Element::from(
             iced::widget::scrollable(container(col).width(Length::Fill).padding([24, 0]))
-                .id(read_scroll_id())
+                .id(read_scroll_id(self.window))
                 // Styled explicitly — the default scrollbar is 10px of chrome; the document
                 // scroll is buffer-level, so it gets the editor tier.
                 .direction(iced::widget::scrollable::Direction::Vertical(
@@ -5107,7 +5221,11 @@ impl App {
                     .on_press(ReadMsg::Click(item.span.start));
                     // The focused item anchors the reveal probe (item grain, not the list).
                     col = col.push(if item_focused {
-                        Element::from(container(area).width(Length::Fill).id(read_focus_id()))
+                        Element::from(
+                            container(area)
+                                .width(Length::Fill)
+                                .id(read_focus_id(self.window)),
+                        )
                     } else {
                         area.into()
                     });
@@ -5262,7 +5380,7 @@ impl App {
                     .width(Length::Fill);
                 // The focused panel is Left/Right's pan target (see `read_code_scroll_id`).
                 let scroll = if block == Some(*span) {
-                    scroll.id(read_code_scroll_id())
+                    scroll.id(read_code_scroll_id(self.window))
                 } else {
                     scroll
                 };
@@ -5327,7 +5445,7 @@ impl App {
         // reflow the block as the reading position moved past it.
         let anchored = container(el).width(Length::Fill);
         if block == Some(b.span()) {
-            anchored.id(read_focus_id()).into()
+            anchored.id(read_focus_id(self.window)).into()
         } else {
             anchored.into()
         }
@@ -6039,96 +6157,9 @@ fn open_link(url: &str) {
         .spawn();
 }
 
-/// Spawn a detached `ae --gui` sibling seeded from a [`WindowTarget`] — the body behind
-/// [`ShellAction::NewWindow`] (both the `Space z` duplicate and "open picker item in a new
-/// window"; the core builds the target either way). The sibling dials the same daemon (`--profile`),
-/// so buffers are shared server-side. Best-effort: a spawn failure is logged, not surfaced (the user
-/// simply gets no new window).
-fn spawn_target(target: &WindowTarget) {
-    let Some(exe) = window_spawn_exe(
-        std::env::current_exe().ok(),
-        std::env::var_os("APPIMAGE"),
-        std::env::var_os("APPDIR"),
-    ) else {
-        tracing::warn!("cannot open a new window: current exe path is unavailable");
-        return;
-    };
-    let mut cmd = std::process::Command::new(exe);
-    // `--profile` (global) before the implicit `edit` so the sibling joins the same daemon.
-    // `--wait`: this spawn already detaches (below) — the sibling must not re-exec itself
-    // through the CLI's own non-tethered-GUI detach a second time.
-    cmd.arg("--profile")
-        .arg(crate::active_profile())
-        .arg("--gui")
-        .arg("--wait");
-    if let Some(ws) = &target.workspace {
-        cmd.arg("--workspace").arg(ws);
-    }
-    match &target.open {
-        // `PATH:LINE:COL` — 1-based on the CLI (the editor convention `ae src/main.rs:42:10`), which
-        // `split_path_and_jump` parses back. No `:L:C` when there's no jump.
-        WindowOpen::Path { path, at } => {
-            cmd.arg(match at {
-                Some((line, col)) => format!("{path}:{}:{}", line + 1, col + 1),
-                None => path.clone(),
-            });
-        }
-        WindowOpen::Buffer(id) => {
-            cmd.arg("--buffer").arg(id.to_string());
-        }
-        WindowOpen::Workspace => {}
-    }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    detach(&mut cmd);
-    if let Err(e) = cmd.spawn() {
-        tracing::warn!("failed to spawn new window: {e}");
-    }
-}
-
-/// The executable to spawn a sibling window from. Three cases:
-/// - **AppImage** (`current` inside `$APPDIR`): the image itself, not the transient FUSE mount
-///   that belongs to *this* launch — the sibling gets its own mount and lifetime (mirrors the
-///   `ae` binary's `server_spawn_exe`; the `starts_with` guard keeps an APPIMAGE var merely
-///   inherited from some other AppImage'd parent from hijacking the spawn).
-/// - **Linux**: `/proc/self/exe` — the binary we are *running*, not its (possibly stale) path.
-///   `current_exe()` reads that link textually, and once a `cargo build` has replaced the
-///   on-disk file it yields `…/ae (deleted)`, which ENOENTs on spawn — the "new window
-///   silently does nothing after a rebuild" bug. Exec'ing the link itself resolves to the
-///   live inode, so the sibling is the *same build* as this window.
-/// - **Elsewhere**: `current_exe()`, unchanged.
-fn window_spawn_exe(
-    current: Option<std::path::PathBuf>,
-    appimage: Option<std::ffi::OsString>,
-    appdir: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
-    if let (Some(image), Some(dir)) = (appimage, appdir) {
-        if current.as_ref().is_some_and(|c| c.starts_with(&dir)) {
-            return Some(image.into());
-        }
-    }
-    if cfg!(target_os = "linux") {
-        return Some("/proc/self/exe".into());
-    }
-    current
-}
-
-/// Put a spawned window in its own process group, so a signal sent to *our* foreground group (a
-/// terminal Ctrl-C) doesn't reach it — the GUI sibling lives or dies on its own. std's
-/// `process_group` keeps this libc-free; on non-Unix the null stdio already decouples the child.
-#[cfg(unix)]
-fn detach(cmd: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn detach(_cmd: &mut std::process::Command) {}
-
 /// The hover popover's scrollable id, for programmatic `scroll_by` (keyboard panning).
-fn hover_scroll_id() -> iced::advanced::widget::Id {
-    iced::advanced::widget::Id::new("hover-scroll")
+fn hover_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
+    scoped_id(window, "hover-scroll")
 }
 
 /// Vertical scroll delta (px) for a resolved popover [`HoverAction::Scroll`]: a line is one cell
@@ -6151,6 +6182,7 @@ fn hover_scroll_px(dir: ScrollDir, unit: ScrollUnit, cell: Option<Size>) -> f32 
 /// Scroll the picker's jumplist so the highlighted row is in view. `Minimal` moves the
 /// least distance; `Top` aligns the row to the top unless it's already fully visible.
 fn reveal_picker_selection(
+    window: window::Id,
     p: &PickerState,
     scroll_y: &mut f32,
     reveal: Reveal,
@@ -6161,7 +6193,7 @@ fn reveal_picker_selection(
     };
     *scroll_y = y;
     iced::widget::operation::scroll_to(
-        crate::picker::list_id(),
+        crate::picker::list_id(window),
         iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
     )
 }
@@ -6569,60 +6601,269 @@ fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::Pa
     }
 }
 
-/// Run the iced application. `main` hands it a `Connecting` bootstrap — the app dials from within
-/// and renders an immersive "Connecting…" state until the daemon answers.
+/// Every window this process is showing, keyed by window id — the daemon's state.
+///
+/// Windows are in-process, not separate `ae --gui` launches. That is what makes them one
+/// *application* to the desktop: macOS scopes Cmd-` to an `NSApplication`, so a window per process
+/// gave a Dock tile per window and nothing to cycle between. Each window still dials its own
+/// connection and gets its own server-side client id, so nothing changes on the server side of the
+/// wire; the sharing is per-document and already handled there.
+struct Shell {
+    windows: std::collections::HashMap<window::Id, App>,
+    /// Carried for the windows opened later, which dial the same daemon on the same handshake.
+    client_version: String,
+    server_url: String,
+}
+
+/// A [`Message`] addressed to one window, plus the shell's own window-lifecycle events.
+///
+/// The size gap between the variants is deliberate: `Message` is a few hundred bytes and is what
+/// iced's queue already carries, so wrapping it costs the window id and nothing else. Boxing to
+/// even the variants out would add an allocation per keystroke to spare a handful of bytes on the
+/// rare lifecycle messages.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum ShellMessage {
+    Window(window::Id, Message),
+    /// A window has finished closing (`iced::window::close_events`).
+    Closed(window::Id),
+    /// The hint engine's clock ticked — one subscription for the process, fanned out in `update`.
+    HintTick,
+}
+
+impl Shell {
+    fn new(bootstrap: Bootstrap) -> (Self, Task<ShellMessage>) {
+        let (client_version, server_url) = match &bootstrap {
+            Bootstrap::Connecting(b) => (b.client_version.clone(), b.server_url.clone()),
+            Bootstrap::Session(b) => (b.client_version.clone(), b.server_url.clone()),
+            Bootstrap::Choose(b) => (b.client_version.clone(), b.server_url.clone()),
+        };
+        let mut shell = Shell {
+            windows: std::collections::HashMap::new(),
+            client_version,
+            server_url,
+        };
+        let open = shell.open(bootstrap);
+        (shell, open)
+    }
+
+    /// Open a window on `bootstrap` and register its app. The window id exists as soon as
+    /// `window::open` is called, so the app can be keyed by it immediately — `open` only reports
+    /// when the window is actually on screen, which nothing here has to wait for.
+    fn open(&mut self, bootstrap: Bootstrap) -> Task<ShellMessage> {
+        let (id, open) = iced::window::open(window_settings());
+        let (app, task) = App::new(id, bootstrap);
+        let _ = self.windows.insert(id, app);
+        Task::batch([
+            open.discard(),
+            task.map(move |m| ShellMessage::Window(id, m)),
+        ])
+    }
+
+    /// `Space z` / Ctrl-Enter on a picker row: another window on the same daemon, seeded from the
+    /// target the core resolved. It boots exactly like a fresh launch would (dial, then adopt),
+    /// which is why the target maps onto a `Connecting` bootstrap rather than a bespoke path.
+    ///
+    /// Never tethered: the tether is the CLI's `$EDITOR` contract (docs/tether.md §1), and a window
+    /// opened from inside the editor is not an errand someone is waiting on.
+    fn open_target(&mut self, target: WindowTarget) -> Task<ShellMessage> {
+        let (file, jump_to, buffer_id) = match target.open {
+            WindowOpen::Path { path, at } => (
+                Some(path),
+                at.map(|(line, col)| aether_protocol::LogicalPosition { line, col }),
+                None,
+            ),
+            WindowOpen::Buffer(id) => (None, None, Some(id)),
+            WindowOpen::Workspace => (None, None, None),
+        };
+        self.open(Bootstrap::Connecting(ConnectingBootstrap {
+            workspace: target.workspace,
+            file,
+            jump_to,
+            buffer_id,
+            tether: false,
+            client_version: self.client_version.clone(),
+            server_url: self.server_url.clone(),
+        }))
+    }
+
+    fn update(&mut self, message: ShellMessage) -> Task<ShellMessage> {
+        match message {
+            // Window-scoped requests the app can't service itself: only the shell owns the map.
+            ShellMessage::Window(_, Message::OpenWindow(target)) => self.open_target(target),
+            ShellMessage::Window(id, Message::CloseWindow) => iced::window::close(id),
+            ShellMessage::Window(id, message) => match self.windows.get_mut(&id) {
+                Some(app) => app
+                    .update(message)
+                    .map(move |m| ShellMessage::Window(id, m)),
+                // A reply that outlived its window (an RPC landing after the user closed it).
+                None => Task::none(),
+            },
+            ShellMessage::HintTick => {
+                let ticks: Vec<_> = self
+                    .windows
+                    .iter_mut()
+                    .filter(|(_, app)| app.wants_hint_ticks())
+                    .map(|(id, app)| {
+                        let id = *id;
+                        app.update(Message::HintTick)
+                            .map(move |m| ShellMessage::Window(id, m))
+                    })
+                    .collect();
+                Task::batch(ticks)
+            }
+            ShellMessage::Closed(id) => {
+                // Dropping the app drops its connection, which ends its inbound pump.
+                let _ = self.windows.remove(&id);
+                // A daemon keeps running with no windows; an editor shouldn't.
+                if self.windows.is_empty() {
+                    iced::exit()
+                } else {
+                    Task::none()
+                }
+            }
+        }
+    }
+
+    fn view(&self, window: window::Id) -> Element<'_, ShellMessage> {
+        match self.windows.get(&window) {
+            Some(app) => Element::from(app.view()).map(move |m| ShellMessage::Window(window, m)),
+            // Between `window::open` and the app landing there is nothing to draw.
+            None => iced::widget::Space::new().into(),
+        }
+    }
+
+    fn title(&self, window: window::Id) -> String {
+        self.windows
+            .get(&window)
+            .map(App::title)
+            .unwrap_or_else(|| "Aether".into())
+    }
+
+    fn theme(&self, window: window::Id) -> iced::Theme {
+        self.windows
+            .get(&window)
+            .map(base_theme)
+            .unwrap_or_else(|| theme::base_iced_theme(aether_protocol::settings::ThemeMode::Dark))
+    }
+
+    /// Subscriptions are per-*program*, not per-window, so everything here is global and routed by
+    /// the window id the event carries. That is also forced: `listen_with`/`listen_raw` take a plain
+    /// `fn` pointer, which cannot capture a window id even if we wanted per-window recipes.
+    fn subscription(&self) -> Subscription<ShellMessage> {
+        let mut subs = vec![
+            App::input_subscription(),
+            iced::window::close_events().map(ShellMessage::Closed),
+        ];
+        // Files the desktop asks us to open (macOS "Open With"). Unconditional — the delegate can
+        // deliver at any moment, including during the boot connect, and this is the only listener,
+        // so iced builds the stream exactly once (see `mac_open::opened_files`).
+        //
+        // Goes to the *newest* window, which is the one the OS just activated or launched.
+        #[cfg(target_os = "macos")]
+        if let Some(window) = self.newest_window() {
+            subs.push(
+                Subscription::run(crate::mac_open::opened_files)
+                    .map(move |p| ShellMessage::Window(window, Message::OpenFromOs(p))),
+            );
+        }
+        // Frame ticks drive scroll easing and the picker's search throbber. One subscription for
+        // the whole process, delivered to the window whose redraw it was; subscribed while *any*
+        // window is animating, and never while disconnected, where a throbber stuck mid-search
+        // would otherwise pin the 60fps redraw loop for the whole reconnect window.
+        if self.windows.values().any(App::is_animating) {
+            subs.push(iced::event::listen_raw(
+                |event, _status, window| match event {
+                    Event::Window(iced::window::Event::RedrawRequested(at)) => {
+                        Some(ShellMessage::Window(window, Message::AnimTick(at)))
+                    }
+                    _ => None,
+                },
+            ));
+        }
+        // The hint engine's clock (docs/hints.md): one slow tick for the process, fanned out by
+        // `Shell::update` to each window that wants it. The engine's own idle gate handles
+        // unattended windows, so this needs no focus tracking; with hints off there are no wakeups.
+        if self.windows.values().any(App::wants_hint_ticks) {
+            subs.push(
+                iced::time::every(std::time::Duration::from_secs(2))
+                    .map(|_| ShellMessage::HintTick),
+            );
+        }
+        Subscription::batch(subs)
+    }
+
+    /// The most recently opened window — where a file the desktop hands us should land.
+    #[cfg(target_os = "macos")]
+    fn newest_window(&self) -> Option<window::Id> {
+        self.windows.keys().max().copied()
+    }
+}
+
+/// Run the iced daemon. `main` hands it a `Connecting` bootstrap for the first window; the app
+/// dials from within and renders an immersive "Connecting…" state until the daemon answers.
 pub fn run(bootstrap: Bootstrap) -> iced::Result {
-    iced::application(move || App::new(bootstrap.clone()), App::update, App::view)
-        .title(App::title)
-        .subscription(App::subscription)
-        // Everything we draw sets explicit palette colours, but theme-inheriting surfaces
-        // (markdown hover body text, scrollbars) must track the session's mode rather than
-        // defaulting to iced's Light theme.
-        .theme(base_theme)
-        // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
-        .settings(iced::Settings {
-            // Bundle JetBrains Mono for the editor (chrome stays on the default monospace). Registered
-            // here so `Font::with_name("JetBrains Mono")` resolves; the editor toggles its ligatures
-            // via shaping mode (see `editor::EDITOR_FONT`). All four faces (Regular/Bold/Italic/
-            // Bold-Italic) are bundled so each weight/slant request resolves within the family —
-            // without the matching face, cosmic-text falls back to a non-monospace family for
-            // `text.strong` / `text.emphasis` runs.
-            fonts: vec![
-                include_bytes!("../fonts/JetBrainsMono-Regular.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/JetBrainsMono-Bold.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/JetBrainsMono-Italic.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")
-                    .as_slice()
-                    .into(),
-                // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body
-                // face (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold+Bold so
-                // heading and strong runs resolve inside the family rather than falling back.
-                include_bytes!("../fonts/SourceSerif4-Regular.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/SourceSerif4-It.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/SourceSerif4-Semibold.ttf")
-                    .as_slice()
-                    .into(),
-                include_bytes!("../fonts/SourceSerif4-Bold.ttf")
-                    .as_slice()
-                    .into(),
-            ],
-            default_font: iced::Font::MONOSPACE,
-            default_text_size: iced::Pixels(14.0),
-            antialiasing: true,
-            ..iced::Settings::default()
-        })
-        .window(window_settings())
-        .run()
+    iced::daemon(
+        move || {
+            // The boot closure runs after iced has built the winit event loop and before it starts
+            // pumping it — the one moment the macOS delegate can be installed and still catch the
+            // launch's own "Open With" event (crate::mac_open).
+            #[cfg(target_os = "macos")]
+            crate::mac_open::install();
+            Shell::new(bootstrap.clone())
+        },
+        Shell::update,
+        Shell::view,
+    )
+    .title(Shell::title)
+    .subscription(Shell::subscription)
+    // Everything we draw sets explicit palette colours, but theme-inheriting surfaces
+    // (markdown hover body text, scrollbars) must track the session's mode rather than
+    // defaulting to iced's Light theme.
+    .theme(Shell::theme)
+    // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
+    .settings(iced::Settings {
+        // Bundle JetBrains Mono for the editor (chrome stays on the default monospace). Registered
+        // here so `Font::with_name("JetBrains Mono")` resolves; the editor toggles its ligatures
+        // via shaping mode (see `editor::EDITOR_FONT`). All four faces (Regular/Bold/Italic/
+        // Bold-Italic) are bundled so each weight/slant request resolves within the family —
+        // without the matching face, cosmic-text falls back to a non-monospace family for
+        // `text.strong` / `text.emphasis` runs.
+        fonts: vec![
+            include_bytes!("../fonts/JetBrainsMono-Regular.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/JetBrainsMono-Bold.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/JetBrainsMono-Italic.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")
+                .as_slice()
+                .into(),
+            // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body
+            // face (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold+Bold so
+            // heading and strong runs resolve inside the family rather than falling back.
+            include_bytes!("../fonts/SourceSerif4-Regular.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSerif4-It.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSerif4-Semibold.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSerif4-Bold.ttf")
+                .as_slice()
+                .into(),
+        ],
+        default_font: iced::Font::MONOSPACE,
+        default_text_size: iced::Pixels(14.0),
+        antialiasing: true,
+        ..iced::Settings::default()
+    })
+    .run()
 }
 
 /// Initial window settings: size, and on Linux the application id ("uk.joef.Aether") that becomes
@@ -7201,6 +7442,7 @@ mod tests {
     #[test]
     fn overlay_field_ids_are_distinct() {
         use std::collections::HashSet;
+        let w = window::Id::unique();
         let fields = [
             OverlayField::PickerQuery,
             OverlayField::Search,
@@ -7211,19 +7453,32 @@ mod tests {
             OverlayField::ChipRoot,
             OverlayField::ChipPath,
         ];
-        let ids: HashSet<_> = fields.iter().map(|f| f.id()).collect();
+        let ids: HashSet<_> = fields.iter().map(|f| f.id(w)).collect();
         assert_eq!(ids.len(), fields.len(), "overlay field ids must be unique");
         // The id is stable across calls (so re-focus targets the same widget).
-        assert_eq!(OverlayField::Search.id(), OverlayField::Search.id());
+        assert_eq!(OverlayField::Search.id(w), OverlayField::Search.id(w));
+    }
+
+    /// Widget ids are per *window*. iced applies a widget operation to every window's UI, so two
+    /// windows sharing an id would focus both pickers' query inputs at once and scroll both lists
+    /// in lockstep — the multi-window bug that is invisible until a second window exists.
+    #[test]
+    fn widget_ids_differ_between_windows() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        assert_ne!(OverlayField::Search.id(a), OverlayField::Search.id(b));
+        assert_ne!(crate::picker::list_id(a), crate::picker::list_id(b));
+        assert_ne!(read_scroll_id(a), read_scroll_id(b));
+        assert_ne!(hover_scroll_id(a), hover_scroll_id(b));
     }
 
     /// The picker query `text_input`'s id (set in `picker.rs`) must equal the shell's focus
-    /// target id, or opening the picker wouldn't focus its query input.
+    /// target id *for the same window*, or opening the picker wouldn't focus its query input.
     #[test]
     fn picker_query_id_matches_focus_target() {
+        let w = window::Id::unique();
         assert_eq!(
-            crate::picker::query_input_id(),
-            OverlayField::PickerQuery.id()
+            crate::picker::query_input_id(w),
+            OverlayField::PickerQuery.id(w)
         );
     }
 
@@ -7231,45 +7486,164 @@ mod tests {
     /// or `sync_focus` would never land on the active chip-editor segment.
     #[test]
     fn chip_editor_ids_match_focus_targets() {
-        assert_eq!(crate::picker::editor_root_id(), OverlayField::ChipRoot.id());
-        assert_eq!(crate::picker::editor_path_id(), OverlayField::ChipPath.id());
+        let w = window::Id::unique();
+        assert_eq!(
+            crate::picker::editor_root_id(w),
+            OverlayField::ChipRoot.id(w)
+        );
+        assert_eq!(
+            crate::picker::editor_path_id(w),
+            OverlayField::ChipPath.id(w)
+        );
     }
 
-    /// The new-window spawn must survive the running binary being rebuilt: on Linux it execs
-    /// `/proc/self/exe` (the live inode), never the textual `current_exe()` path — which reads
-    /// `…/ae (deleted)` after a `cargo build` and ENOENTs. AppImage launches spawn the image.
+    fn connecting_bootstrap() -> Bootstrap {
+        Bootstrap::Connecting(ConnectingBootstrap {
+            workspace: None,
+            file: None,
+            jump_to: None,
+            buffer_id: None,
+            tether: false,
+            client_version: "test".into(),
+            server_url: "ws://127.0.0.1:2385".into(),
+        })
+    }
+
+    /// `Space z` / Ctrl-Enter seeds the new window from the target the core resolved: the same
+    /// workspace, the same file, the same 0-based jump — and never tethered, because the tether is
+    /// the CLI's `$EDITOR` contract, not something a window opened from inside the editor inherits.
     #[test]
-    fn window_spawn_exe_survives_rebuilds_and_prefers_the_appimage() {
-        let current = Some(std::path::PathBuf::from("/tmp/.mount_ae123/usr/bin/ae"));
-        // Inside the AppImage mount: spawn the image (its own mount + lifetime).
+    fn opening_a_target_seeds_the_new_window_from_it() {
+        let (mut shell, _boot) = Shell::new(connecting_bootstrap());
+        assert_eq!(shell.windows.len(), 1, "the launch opens one window");
+
+        let _ = shell.open_target(WindowTarget {
+            workspace: Some("aether".into()),
+            open: WindowOpen::Path {
+                path: "/proj/src/main.rs".into(),
+                at: Some((41, 9)),
+            },
+        });
+        assert_eq!(shell.windows.len(), 2);
+
+        let opened = shell
+            .windows
+            .values()
+            .find_map(|app| app.boot_args.as_ref().filter(|a| a.file.is_some()))
+            .expect("the new window boots into a connect seeded with the file");
+        assert_eq!(opened.workspace.as_deref(), Some("aether"));
+        assert_eq!(opened.file.as_deref(), Some("/proj/src/main.rs"));
         assert_eq!(
-            window_spawn_exe(
-                current.clone(),
-                Some("/home/u/Applications/aether.AppImage".into()),
-                Some("/tmp/.mount_ae123".into()),
-            ),
-            Some("/home/u/Applications/aether.AppImage".into())
+            opened.jump_to,
+            Some(aether_protocol::LogicalPosition { line: 41, col: 9 }),
+            "the jump rides as structured position, not a `path:line:col` string"
         );
-        // An inherited APPIMAGE var from some other AppImage'd parent doesn't hijack the spawn.
-        let plain = Some(std::path::PathBuf::from("/home/u/.cargo/bin/ae"));
-        let via_proc = window_spawn_exe(
-            plain.clone(),
-            Some("/somewhere/other.AppImage".into()),
-            Some("/tmp/.mount_other".into()),
+        assert!(!opened.tether, "an in-editor window is nobody's errand");
+        // Same daemon: a second window must not invent its own address.
+        assert_eq!(opened.server_url, "ws://127.0.0.1:2385");
+    }
+
+    /// `Space z` reaches the shell as a message *from* a window, because an app can't open its own
+    /// sibling. The shell must intercept it rather than routing it into the app that sent it.
+    #[test]
+    fn a_windows_open_request_is_intercepted_by_the_shell() {
+        let (mut shell, _boot) = Shell::new(connecting_bootstrap());
+        let id = *shell.windows.keys().next().unwrap();
+
+        let _ = shell.update(ShellMessage::Window(
+            id,
+            Message::OpenWindow(WindowTarget {
+                workspace: Some("aether".into()),
+                open: WindowOpen::Workspace,
+            }),
+        ));
+        assert_eq!(shell.windows.len(), 2, "the request opened a window");
+
+        // A close request only *asks*; the window leaves the map when iced reports it closed, so
+        // late messages still have somewhere to land in the meantime.
+        let _ = shell.update(ShellMessage::Window(id, Message::CloseWindow));
+        assert_eq!(shell.windows.len(), 2);
+    }
+
+    /// Closing a window drops it (and with it its connection); the process only ends when the last
+    /// one goes — a daemon would otherwise sit there running with nothing on screen.
+    #[test]
+    fn closing_windows_drops_them_and_empties_on_the_last() {
+        let (mut shell, _boot) = Shell::new(connecting_bootstrap());
+        let _ = shell.open_target(WindowTarget {
+            workspace: None,
+            open: WindowOpen::Workspace,
+        });
+        let ids: Vec<_> = shell.windows.keys().copied().collect();
+        assert_eq!(ids.len(), 2);
+
+        let _ = shell.update(ShellMessage::Closed(ids[0]));
+        assert_eq!(
+            shell.windows.len(),
+            1,
+            "one window closing leaves the other alone"
         );
-        if cfg!(target_os = "linux") {
-            assert_eq!(via_proc, Some("/proc/self/exe".into()));
-            // The stale-path trap: even a "(deleted)" current_exe is irrelevant on Linux.
-            assert_eq!(
-                window_spawn_exe(
-                    Some("/home/u/proj/target/debug/ae (deleted)".into()),
-                    None,
-                    None
-                ),
-                Some("/proc/self/exe".into())
-            );
-        } else {
-            assert_eq!(via_proc, plain);
-        }
+        let _ = shell.update(ShellMessage::Closed(ids[1]));
+        assert!(
+            shell.windows.is_empty(),
+            "the last close empties the shell — the branch that exits the process"
+        );
+    }
+
+    /// An RPC reply can land after its window is gone (close while a request is in flight). Routing
+    /// must drop it, not index into a missing window.
+    #[test]
+    fn messages_for_a_closed_window_are_dropped() {
+        let (mut shell, _boot) = Shell::new(connecting_bootstrap());
+        let id = *shell.windows.keys().next().unwrap();
+        let _ = shell.update(ShellMessage::Closed(id));
+        let _ = shell.update(ShellMessage::Window(id, Message::HintTick));
+    }
+
+    /// A document the desktop hands us during boot ("Open With" on a cold launch) arrives long
+    /// before there is a session to open it in, so it parks — and the drain must then open every
+    /// parked file, in order, exactly once.
+    #[test]
+    fn parked_os_opens_drain_into_open_path_requests() {
+        let (mut app, _dial) = App::new(
+            window::Id::unique(),
+            Bootstrap::Connecting(ConnectingBootstrap {
+                workspace: None,
+                file: None,
+                jump_to: None,
+                buffer_id: None,
+                tether: false,
+                client_version: "test".into(),
+                server_url: "ws://127.0.0.1:0".into(),
+            }),
+        );
+        app.pending_os_opens.push("/docs/one.md".into());
+        app.pending_os_opens.push("/docs/two.md".into());
+
+        // The drain only ever runs against a *live* session: the core drops every RPC while the
+        // connection is still coming up, so draining onto the boot placeholder would lose the file.
+        app.session.conn = ConnState::Connected;
+        let fx = app.drain_os_opens();
+        let opened: Vec<_> =
+            fx.0.iter()
+                .filter_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "workspace/open_path" => {
+                        Some(params["path"].clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            opened,
+            [
+                serde_json::json!("/docs/one.md"),
+                serde_json::json!("/docs/two.md")
+            ],
+            "every parked file opens, in the order the OS delivered them"
+        );
+        assert!(
+            app.pending_os_opens.is_empty(),
+            "the queue drains, so a later boot event can't reopen them"
+        );
     }
 }

@@ -8,6 +8,8 @@ mod app;
 mod connection;
 mod editor;
 mod input;
+#[cfg(target_os = "macos")]
+mod mac_open;
 mod picker;
 mod theme;
 
@@ -18,21 +20,9 @@ pub(crate) use aether_client::{chips, grid, keymap, labels};
 
 use anyhow::anyhow;
 
-/// The active profile name, stashed once at [`run`] so the "open another window" path
-/// (`Space z`) can spawn a sibling `ae --gui` pointed at the *same* profile — and thus the same
-/// daemon. Process-global because it never changes over a run; mirrors how the server holds its own
-/// active profile rather than threading it through every call.
-static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The profile this GUI client is running under (defaulting if [`run`] never set it — only the
-/// case in tests, which don't spawn windows). Used to build the `--profile` arg of a spawned window.
-pub(crate) fn active_profile() -> &'static str {
-    PROFILE.get().map(String::as_str).unwrap_or("default")
-}
-
 /// Run the native GUI client to completion. `workspace`/`file` are the (optional) CLI positionals,
-/// `version` is the handshake version string, `server_url` is the (profile-resolved) WebSocket
-/// address to dial, and `profile` is the active profile name (recorded for window-spawning). iced
+/// `version` is the handshake version string and `server_url` is the (profile-resolved) WebSocket
+/// address to dial — which is all a second window needs, since windows are in-process now. iced
 /// owns the main thread and manages its own tokio runtime, so unlike the terminal client this is a
 /// synchronous call (not awaited on a runtime the caller provides).
 #[allow(clippy::too_many_arguments)]
@@ -44,9 +34,7 @@ pub fn run(
     tether: bool,
     version: String,
     server_url: String,
-    profile: String,
 ) -> anyhow::Result<()> {
-    let _ = PROFILE.set(profile);
     // Prefer the integrated GPU on hybrid-graphics machines. iced/wgpu default to the
     // HighPerformance adapter, which lands rendering on the discrete GPU even when every display
     // is driven by the integrated one — a text editor gains nothing from that, and a discrete GPU
