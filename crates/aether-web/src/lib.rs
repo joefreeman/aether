@@ -444,7 +444,6 @@ impl WasmSession {
             self.inner.on_event(Event::ClipboardRead(kind, text)),
         ))
     }
-
 }
 
 /// Rebuild a [`PasteKind`] from the JSON descriptor `paste_value` emitted with `Effect::ReadClipboard`.

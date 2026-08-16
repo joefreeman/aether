@@ -1302,7 +1302,10 @@ mod tests {
         let mut stale = update(PickerKind::DocumentSymbols, 2, 46, 90, 200);
         stale.center_on = Some(Box::new(centered_item()));
         assert!(!s.apply_update(stale));
-        assert_eq!(s.offset, 0, "a stale push's re-framed offset must not stick");
+        assert_eq!(
+            s.offset, 0,
+            "a stale push's re-framed offset must not stick"
+        );
         assert!(s.pending_center.is_none());
         assert!(s.ticking, "nothing applied — still loading");
         // The live push for the new generation (window reset to the top) applies and settles.

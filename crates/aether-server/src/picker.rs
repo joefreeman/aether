@@ -3511,7 +3511,11 @@ mod tests {
             ..Default::default()
         };
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![1, 2], "src symbols only, out-of-root dropped");
+        assert_eq!(
+            s.ranked,
+            vec![1, 2],
+            "src symbols only, out-of-root dropped"
+        );
 
         // A glob narrows by extension; the out-of-root symbol drops under any path filter.
         let mut s = PickerState::new(cands.clone());

@@ -15,8 +15,8 @@ use aether_protocol::search::SearchMatchRange;
 use aether_protocol::settings::ThemeMode;
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, Highlight,
-    VisualRow, WrapMode,
+    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, Highlight, VisualRow,
+    WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
@@ -5104,7 +5104,11 @@ fn deleted_virtual_row_spans(
     // the signal (matching the web's `.deleted-phantom .diff-emph` rule).
     let flush = |spans: &mut Vec<Span<'static>>, run: &mut String, emph: bool| {
         if !run.is_empty() {
-            let (fill, ink) = if emph { (emph_bg, c(th().fg)) } else { (bg, fg) };
+            let (fill, ink) = if emph {
+                (emph_bg, c(th().fg))
+            } else {
+                (bg, fg)
+            };
             spans.push(Span::styled(
                 std::mem::take(run),
                 Style::default().fg(ink).bg(fill),
@@ -8904,8 +8908,16 @@ mod tests {
             80,
         ));
         assert_eq!(cells[0].2, Some(emph_bg), "plain emphasis cell");
-        assert_eq!(cells[2].2, Some(c(th().fill_dim)), "search wins over emphasis");
-        assert_eq!(cells[4].2, Some(c(th().bg_visual)), "selection wins over emphasis");
+        assert_eq!(
+            cells[2].2,
+            Some(c(th().fill_dim)),
+            "search wins over emphasis"
+        );
+        assert_eq!(
+            cells[4].2,
+            Some(c(th().bg_visual)),
+            "selection wins over emphasis"
+        );
         assert_eq!(cells[5].2, Some(emph_bg));
     }
 
@@ -8925,7 +8937,11 @@ mod tests {
         assert_eq!(cells[0].2, Some(c(th().git_deleted_bg)));
         assert_eq!(cells[4].2, Some(c(th().git_deleted_emph_bg)));
         assert_eq!(cells[7].2, Some(c(th().git_deleted_emph_bg)));
-        assert_eq!(cells[8].2, Some(c(th().git_deleted_bg)), "padding on base fill");
+        assert_eq!(
+            cells[8].2,
+            Some(c(th().git_deleted_bg)),
+            "padding on base fill"
+        );
         // Emphasized runs switch to the normal fg (legible on the vivid fill); the rest keeps
         // the deleted red.
         assert_eq!(cells[0].1, Some(c(th().git_deleted)));
@@ -8950,7 +8966,10 @@ mod tests {
         for (n, cell) in cells[1..=TAB_WIDTH as usize].iter().enumerate() {
             assert_eq!(cell.2, Some(c(th().git_deleted_emph_bg)), "tab cell {n}");
         }
-        assert_eq!(cells[1 + TAB_WIDTH as usize].2, Some(c(th().git_deleted_bg)));
+        assert_eq!(
+            cells[1 + TAB_WIDTH as usize].2,
+            Some(c(th().git_deleted_bg))
+        );
     }
 
     #[test]
@@ -8988,7 +9007,18 @@ mod tests {
     #[test]
     fn build_spans_underlines_diagnostic_in_severity_color() {
         let diags = [(2u32, 4u32, DiagnosticSeverity::Warning)];
-        let cells = underline_cols(&build_spans("abcdef", &[], None, &[], &[], c(th().git_modified_emph_bg), &[], &diags, &[], 80));
+        let cells = underline_cols(&build_spans(
+            "abcdef",
+            &[],
+            None,
+            &[],
+            &[],
+            c(th().git_modified_emph_bg),
+            &[],
+            &diags,
+            &[],
+            80,
+        ));
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
                 assert!(underlined, "cell {col} underlined");
@@ -9006,7 +9036,18 @@ mod tests {
             (0u32, 3u32, DiagnosticSeverity::Hint),
             (1u32, 2u32, DiagnosticSeverity::Error),
         ];
-        let cells = underline_cols(&build_spans("xyz", &[], None, &[], &[], c(th().git_modified_emph_bg), &[], &diags, &[], 80));
+        let cells = underline_cols(&build_spans(
+            "xyz",
+            &[],
+            None,
+            &[],
+            &[],
+            c(th().git_modified_emph_bg),
+            &[],
+            &diags,
+            &[],
+            80,
+        ));
         assert_eq!(cells[1].1, Some(c(th().error)), "overlap shows error red");
         assert_eq!(
             cells[0].1,

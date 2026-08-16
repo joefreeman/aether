@@ -364,8 +364,9 @@ impl Session {
 
         // Blame label: Normal mode on a file-backed buffer. Insert mode unfollows so typing
         // never has the server recomputing whole-file blame in the pauses.
-        let want_blame = (self.mode == Mode::Normal && buffer_id != 0 && self.buffer.path.is_some())
-            .then_some(buffer_id);
+        let want_blame =
+            (self.mode == Mode::Normal && buffer_id != 0 && self.buffer.path.is_some())
+                .then_some(buffer_id);
         if self.blame_follow_on != want_blame {
             if let Some(old) = self.blame_follow_on {
                 fx = fx.and(self.request::<GitSetBlameFollow>(
@@ -9262,9 +9263,7 @@ mod tests {
     /// The `path_query` of the [`ShellAction::CopyWebUrl`] a session emits, if any.
     fn copied_web_url(fx: &Effects) -> Option<String> {
         fx.0.iter().find_map(|e| match e {
-            Effect::ShellAction(ShellAction::CopyWebUrl { path_query }) => {
-                Some(path_query.clone())
-            }
+            Effect::ShellAction(ShellAction::CopyWebUrl { path_query }) => Some(path_query.clone()),
             _ => None,
         })
     }
@@ -9282,8 +9281,10 @@ mod tests {
             Some("?workspace=proj&file=src/a.rs#42:10")
         );
         assert!(
-            fx.0.iter().any(|e| matches!(e, Effect::Toast { message, kind: ToastKind::Success, .. }
-                if message == "Copied web URL")),
+            fx.0.iter().any(
+                |e| matches!(e, Effect::Toast { message, kind: ToastKind::Success, .. }
+                if message == "Copied web URL")
+            ),
             "a concise confirmation toast rides alongside"
         );
     }
@@ -9311,8 +9312,13 @@ mod tests {
             let fx = s.copy_web_url();
             assert_eq!(copied_web_url(&fx), None, "nothing lands on the clipboard");
             assert!(
-                fx.0.iter()
-                    .any(|e| matches!(e, Effect::Toast { kind: ToastKind::Warning, .. })),
+                fx.0.iter().any(|e| matches!(
+                    e,
+                    Effect::Toast {
+                        kind: ToastKind::Warning,
+                        ..
+                    }
+                )),
                 "the refusal is audible"
             );
         };

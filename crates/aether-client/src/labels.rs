@@ -364,7 +364,10 @@ mod tests {
     #[test]
     fn symbol_path_drops_outermost_first() {
         let c = crumbs(&["mod outer", "impl Foo", "fn bar"]);
-        assert_eq!(truncate_symbol_path(&c, 29), "mod outer › impl Foo › fn bar");
+        assert_eq!(
+            truncate_symbol_path(&c, 29),
+            "mod outer › impl Foo › fn bar"
+        );
         assert_eq!(truncate_symbol_path(&c, 25), "… › impl Foo › fn bar");
         assert_eq!(truncate_symbol_path(&c, 20), "… › fn bar");
     }

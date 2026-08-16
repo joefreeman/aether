@@ -67,9 +67,8 @@ use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
-    PickerReset, PickerSelectParams, PickerSelectResult,
-    PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
-    PickerViewResult,
+    PickerReset, PickerSelectParams, PickerSelectResult, PickerSetGroupParams,
+    PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -2285,10 +2284,9 @@ async fn buffer_open_inner(
             // restore, or a crash that beat the session write). File backups are document-level
             // (`files/<hash>`, no workspace in the key), so the content comes back no matter
             // which workspace — even an ephemeral one — opens the path first.
-            let backup = s
-                .backups_path
-                .as_deref()
-                .and_then(|root| crate::backup::read(&crate::backup::file_backup_path(root, &canonical)));
+            let backup = s.backups_path.as_deref().and_then(|root| {
+                crate::backup::read(&crate::backup::file_backup_path(root, &canonical))
+            });
             let doc_id = s.allocate_document_id();
             let mut doc = if params.create_if_missing && !canonical.exists() {
                 // New file: empty document with the target path attached. Save will write to disk.
@@ -2688,7 +2686,8 @@ fn cursor_line_blame(
             Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
             None => Vec::new(),
         };
-        s.git_blame.insert(buffer_id, BlameCache { revision, lines });
+        s.git_blame
+            .insert(buffer_id, BlameCache { revision, lines });
     }
     s.git_blame
         .get(&buffer_id)
@@ -2805,13 +2804,12 @@ pub async fn cursor_follow_loop(
             });
             // An active search owns the highlight layer (the enable handler refuses too);
             // don't fight it from the follow side even if the unfollow is still in flight.
-            let hl = (s.symbol_highlight_follow.contains(&key)
-                && !s.searches.contains_key(&key))
-            .then(|| {
-                let epoch = next_symbol_hl_epoch();
-                s.symbol_highlight_gen.insert(key, epoch);
-                epoch
-            });
+            let hl = (s.symbol_highlight_follow.contains(&key) && !s.searches.contains_key(&key))
+                .then(|| {
+                    let epoch = next_symbol_hl_epoch();
+                    s.symbol_highlight_gen.insert(key, epoch);
+                    epoch
+                });
             // Resolved inline, not spawned: the breadcrumb is a lookup in the cached outline, so
             // there's nothing to debounce and no round-trip to supersede. Recomputed from the
             // *current* cursor rather than anything carried on the event, so a burst of moves
@@ -3175,8 +3173,7 @@ pub async fn git_apply_hunk(
             refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
             notify_lsp_change(&mut s, buffer_id);
 
-            let pushes: PendingPushes =
-                collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+            let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
             let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
             let result = outcome(&s, ApplyHunkStatus::Reverted);
@@ -3825,8 +3822,7 @@ pub async fn lsp_format(
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     notify_lsp_change(&mut s, buffer_id);
 
-    let pushes: PendingPushes =
-        collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
     let result_cursor = s
@@ -4190,9 +4186,7 @@ fn push_symbol(
     // Inclusive last char of the name span (see `lsp_range_end_inclusive`); a point when there's no
     // distinct span.
     let name_end = name_range
-        .map(|r| {
-            lsp_range_end_inclusive(r, name_pos, |l, ch| rope_byte_col(text, l, ch, encoding))
-        })
+        .map(|r| lsp_range_end_inclusive(r, name_pos, |l, ch| rope_byte_col(text, l, ch, encoding)))
         .unwrap_or(name_pos);
     // The enclosing extent for cursor-containment; fall back to a zero-width span at the name.
     let range_start = full_range
@@ -4325,8 +4319,8 @@ fn attach_git_baseline(
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
     s.git_both_hunks.insert(buffer_id, both);
     s.git_blame.remove(&buffer_id); // committed history may have changed → recompute on request
-    // The blame label's push dedupe keys on (line, revision) — both unchanged by an external
-    // commit — so forget the last pushes and re-arm every follower, or the label would go stale.
+                                    // The blame label's push dedupe keys on (line, revision) — both unchanged by an external
+                                    // commit — so forget the last pushes and re-arm every follower, or the label would go stale.
     let followers: Vec<_> = s
         .blame_follow
         .iter()
@@ -5194,8 +5188,10 @@ fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> Pend
     // debounce generation, which invalidates any in-flight refresh); the client re-requests
     // highlights when its cursor lands after the edit. The re-rendered windows the mutation already
     // pushes read `searches` directly, so they correctly show no symbol highlights until then.
-    s.symbol_highlights.retain(|(_, b), _| !attached.contains(b));
-    s.symbol_highlight_gen.retain(|(_, b), _| !attached.contains(b));
+    s.symbol_highlights
+        .retain(|(_, b), _| !attached.contains(b));
+    s.symbol_highlight_gen
+        .retain(|(_, b), _| !attached.contains(b));
     let keys: Vec<(ClientId, BufferId)> = s
         .searches
         .keys()
@@ -6757,14 +6753,16 @@ fn deleted_rows_by_anchor(
         }
         let anchor = h.anchor_line.min(last_line);
         let rows = map.entry(anchor).or_default();
-        rows.extend(h.deleted.iter().enumerate().map(|(row_idx, text)| VirtualRow {
-            text: text.clone(),
-            kind: VirtualRowKind::Deleted,
-            stage: h.stage,
-            emphasis: intraline
-                .and_then(|m| m.rows.get(&(hunk_idx, row_idx)))
-                .cloned()
-                .unwrap_or_default(),
+        rows.extend(h.deleted.iter().enumerate().map(|(row_idx, text)| {
+            VirtualRow {
+                text: text.clone(),
+                kind: VirtualRowKind::Deleted,
+                stage: h.stage,
+                emphasis: intraline
+                    .and_then(|m| m.rows.get(&(hunk_idx, row_idx)))
+                    .cloned()
+                    .unwrap_or_default(),
+            }
         }));
     }
     for rows in map.values_mut() {
@@ -7401,7 +7399,12 @@ fn collect_symbol_path_pushes(s: &mut ServerState, buffer_id: BufferId) -> Pendi
         let key = (client_id, buffer_id);
         // "Never sent" reads as empty, so a buffer that never gets an outline (no server) stays
         // silent instead of pushing one empty path per open.
-        if s.symbol_path_sent.get(&key).map(Vec::as_slice).unwrap_or(&[]) == path.as_slice() {
+        if s.symbol_path_sent
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            == path.as_slice()
+        {
             continue;
         }
         s.symbol_path_sent.insert(key, path.clone());
@@ -11255,8 +11258,7 @@ async fn apply_undo_or_redo(
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
-    let pushes: PendingPushes =
-        collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
@@ -13572,18 +13574,16 @@ pub async fn picker_view(
     // split-borrow takes `s`. An empty selection (empty buffer) leaves grep unseeded.
     let grep_selection_query: Option<String> =
         match (params.from_selection, params.kind, params.buffer_id) {
-            (true, PickerKind::Grep, Some(buffer_id)) => {
-                s.try_doc_of(buffer_id).and_then(|buf| {
-                    let cursor = s
-                        .cursors
-                        .get(&(client_id, buffer_id))
-                        .copied()
-                        .unwrap_or_default();
-                    let (start, end) = scope_range(buf, &cursor, CopyScope::Selection);
-                    let text = buf.text.slice(start..end).to_string();
-                    (!text.is_empty()).then_some(text)
-                })
-            }
+            (true, PickerKind::Grep, Some(buffer_id)) => s.try_doc_of(buffer_id).and_then(|buf| {
+                let cursor = s
+                    .cursors
+                    .get(&(client_id, buffer_id))
+                    .copied()
+                    .unwrap_or_default();
+                let (start, end) = scope_range(buf, &cursor, CopyScope::Selection);
+                let text = buf.text.slice(start..end).to_string();
+                (!text.is_empty()).then_some(text)
+            }),
             _ => None,
         };
     // Filled by the from-selection hydration below, then drained into a search spawn after the lock.
@@ -15614,7 +15614,8 @@ mod lsp_parse_tests {
                 ]
             }
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
+        let syms =
+            parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "Parser");
         assert_eq!(
@@ -15652,7 +15653,8 @@ mod lsp_parse_tests {
                 "location": {"uri": "file:///p/a.rs", "range": {"start": {"line": 5, "character": 3}, "end": {"line": 5, "character": 9}}}
             }
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
+        let syms =
+            parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "helper");
         assert_eq!(
@@ -15702,7 +15704,8 @@ mod lsp_parse_tests {
             {"name": "body", "kind": 8, "location": loc((7, 2), (23, 9))},
             {"name": "h1", "kind": 8, "location": loc((8, 4), (8, 20))},
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.html", PositionEncoding::Utf8, &ropey::Rope::new());
+        let syms =
+            parse_document_symbols(&v, "/p/a.html", PositionEncoding::Utf8, &ropey::Rope::new());
         let depth = |name: &str| syms.iter().find(|c| c.name == name).unwrap().depth;
         assert_eq!(depth("html"), 0);
         assert_eq!(depth("head"), 1);
@@ -15715,13 +15718,20 @@ mod lsp_parse_tests {
     #[test]
     fn document_symbols_null_and_bad_entries_skipped() {
         // null / non-array → empty; entries missing name or position are skipped, not fatal.
-        assert!(parse_document_symbols(&json!(null), "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new()).is_empty());
+        assert!(parse_document_symbols(
+            &json!(null),
+            "/p/a.rs",
+            PositionEncoding::Utf8,
+            &ropey::Rope::new()
+        )
+        .is_empty());
         let v = json!([
             {"name": "ok", "kind": 13, "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}},
             {"kind": 13, "selectionRange": {"start": {"line": 1, "character": 0}}},
             {"name": "no_pos", "kind": 13},
         ]);
-        let syms = parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
+        let syms =
+            parse_document_symbols(&v, "/p/a.rs", PositionEncoding::Utf8, &ropey::Rope::new());
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "ok");
     }

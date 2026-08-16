@@ -43,9 +43,7 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::nav::{NavGoto, NavStep};
 use aether_protocol::path::PathDelete;
-use aether_protocol::picker::{
-    PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView,
-};
+use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};

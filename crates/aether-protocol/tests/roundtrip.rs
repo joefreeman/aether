@@ -17,8 +17,8 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitChangeCounts, GitNavigateHunk,
-    GitBlameChanged, GitBlameChangedParams, GitNavigateHunkParams, GitSetBlameFollow,
+    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitBlameLineResult,
+    GitChangeCounts, GitNavigateHunk, GitNavigateHunkParams, GitSetBlameFollow,
     GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
@@ -41,9 +41,8 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
-    EmphasisRange, LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow,
-    VirtualRowKind,
+    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
+    LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow, VirtualRowKind,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -220,7 +219,10 @@ fn git_blame_follow_shapes() {
         buffer_id: 3,
         enabled: true,
     };
-    assert_eq!(to_value(&p).unwrap(), json!({"buffer_id": 3, "enabled": true}));
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"buffer_id": 3, "enabled": true})
+    );
     assert_eq!(GitSetBlameFollow::NAME, "git/set_blame_follow");
 
     // …and the push it buys. `blame: None` (no repo / untracked / past EOF) drops off the wire.

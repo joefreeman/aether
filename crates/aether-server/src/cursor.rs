@@ -136,7 +136,11 @@ pub fn resolve_selection_edge(
     }
 }
 
-pub fn resolve_motion(buf: &Document, current: LogicalPosition, motion: &Motion) -> LogicalPosition {
+pub fn resolve_motion(
+    buf: &Document,
+    current: LogicalPosition,
+    motion: &Motion,
+) -> LogicalPosition {
     match motion {
         Motion::Char { direction, count } => {
             let cur_char = pos_to_char(buf, current);

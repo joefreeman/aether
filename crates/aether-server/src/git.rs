@@ -319,18 +319,18 @@ pub(crate) fn intraline_emphasis(old: &str, new: &str) -> Option<(EmphasisSpans,
             vec![(0, mid.len())]
         }
     };
-    let (mut old_spans, mut new_spans) =
-        if old_tokens.len() * new_tokens.len() > INTRALINE_MAX_CELLS {
-            // Middle too busy to diff — one span per side is still better than nothing.
-            (whole(old_mid), whole(new_mid))
-        } else {
-            let (old_matched, new_matched) =
-                lcs_matches(old_mid, &old_tokens, new_mid, &new_tokens);
-            (
-                changed_spans_of(&old_tokens, &old_matched),
-                changed_spans_of(&new_tokens, &new_matched),
-            )
-        };
+    let (mut old_spans, mut new_spans) = if old_tokens.len() * new_tokens.len()
+        > INTRALINE_MAX_CELLS
+    {
+        // Middle too busy to diff — one span per side is still better than nothing.
+        (whole(old_mid), whole(new_mid))
+    } else {
+        let (old_matched, new_matched) = lcs_matches(old_mid, &old_tokens, new_mid, &new_tokens);
+        (
+            changed_spans_of(&old_tokens, &old_matched),
+            changed_spans_of(&new_tokens, &new_matched),
+        )
+    };
     merge_close(&mut old_spans, INTRALINE_JOIN_GAP);
     merge_close(&mut new_spans, INTRALINE_JOIN_GAP);
 
@@ -352,11 +352,12 @@ pub(crate) fn intraline_emphasis(old: &str, new: &str) -> Option<(EmphasisSpans,
             .map(|(s, e)| (s + prefix, e + prefix))
             .collect();
         snap_to_words(&mut out, text);
-        out.into_iter()
-            .map(|(s, e)| (s as u32, e as u32))
-            .collect()
+        out.into_iter().map(|(s, e)| (s as u32, e as u32)).collect()
     };
-    Some((offset_and_snap(old_spans, old), offset_and_snap(new_spans, new)))
+    Some((
+        offset_and_snap(old_spans, old),
+        offset_and_snap(new_spans, new),
+    ))
 }
 
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
@@ -1219,8 +1220,7 @@ mod tests {
 
     #[test]
     fn intraline_multiple_ranges() {
-        let (old, new) =
-            intraline_emphasis("if alpha and gamma:", "if beta and delta:").unwrap();
+        let (old, new) = intraline_emphasis("if alpha and gamma:", "if beta and delta:").unwrap();
         assert_eq!(old, vec![(3, 8), (13, 18)]); // "alpha", "gamma"
         assert_eq!(new, vec![(3, 7), (12, 17)]); // "beta", "delta"
     }
@@ -1269,7 +1269,11 @@ mod tests {
         // Appending "s" to "café": the prefix trim stops mid-word after the 2-byte "é", and the
         // word snap must grow the span back over it without splitting the char.
         let (old, new) = intraline_emphasis("greet café now", "greet cafés now").unwrap();
-        assert_eq!(old, vec![], "pure insertion: nothing removed on the old side");
+        assert_eq!(
+            old,
+            vec![],
+            "pure insertion: nothing removed on the old side"
+        );
         assert_eq!(new, vec![(6, 12)]); // the whole "cafés"
         for (s, e) in &new {
             assert!("greet cafés now".is_char_boundary(*s as usize));

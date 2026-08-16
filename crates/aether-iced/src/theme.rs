@@ -287,12 +287,18 @@ impl Ui {
 /// strong/emphasis) stay keyed on the kind name in `editor.rs::highlight_font`; this returns the
 /// colour only.
 pub fn highlight_color(mode: ThemeMode, kind: &str) -> Option<Color> {
-    Theme::of(mode).syntax(kind).and_then(|s| s.color).map(color)
+    Theme::of(mode)
+        .syntax(kind)
+        .and_then(|s| s.color)
+        .map(color)
 }
 
 /// The underline / message colour for a diagnostic severity, via the core's [`Theme::diagnostic`]
 /// (Hint is the plain foreground, not a hue).
-pub fn diagnostic_color(mode: ThemeMode, severity: aether_protocol::viewport::DiagnosticSeverity) -> Color {
+pub fn diagnostic_color(
+    mode: ThemeMode,
+    severity: aether_protocol::viewport::DiagnosticSeverity,
+) -> Color {
     color(Theme::of(mode).diagnostic(severity))
 }
 
@@ -351,8 +357,8 @@ mod tests {
         assert_eq!(p.error, c(0xbf616a)); // NORD11
         assert_eq!(p.warning, c(0xebcb8b)); // NORD13
         assert_eq!(p.ok, c(0xa3be8c)); // NORD14
-        // The roles that share a dark shade with a semantically unrelated role — pinned so the
-        // rename from the borrowed role can never shift dark rendering.
+                                       // The roles that share a dark shade with a semantically unrelated role — pinned so the
+                                       // rename from the borrowed role can never shift dark rendering.
         assert_eq!(p.match_highlight, c(0xebcb8b)); // NORD13 (= warning's dark shade)
         assert_eq!(p.match_bracket, c(0xd08770)); // NORD12 (= syn_macro's dark shade)
         assert_eq!(p.md_alert_important, c(0xb48ead)); // NORD15 (= syn_constant's dark shade)
@@ -401,7 +407,7 @@ mod tests {
         assert_eq!(diagnostic_color(dark, S::Hint), c(0xd8dee9)); // NORD4 — fg, not a hue
         assert_eq!(lsp_status_color(dark, &LspStatus::Ready), c(0xa3be8c)); // NORD14
         assert_eq!(lsp_status_color(dark, &LspStatus::Stopped), c(0x4c566a)); // NORD3
-        // Light resolves through its own table.
+                                                                              // Light resolves through its own table.
         assert_ne!(
             highlight_color(ThemeMode::Light, "comment"),
             highlight_color(dark, "comment")

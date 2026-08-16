@@ -518,8 +518,8 @@ where
                     segments.push((pos, v.text.len(), false));
                 }
                 for (s, e, emph) in segments {
-                    let seg = v.text[s..e]
-                        .replace('\t', &" ".repeat(self.content.tab_width as usize));
+                    let seg =
+                        v.text[s..e].replace('\t', &" ".repeat(self.content.tab_width as usize));
                     draw_text_run(
                         renderer,
                         seg,
@@ -568,9 +568,7 @@ where
                 let row_bg = match (on_cursor_line, diff_bg, line.diff_marker, staged) {
                     (false, bg, ..) => bg,
                     (true, None, ..) => Some(p.cursor_line_bg),
-                    (true, Some(_), Some(DiffMarker::Added), false) => {
-                        Some(p.cursor_line_added_bg)
-                    }
+                    (true, Some(_), Some(DiffMarker::Added), false) => Some(p.cursor_line_added_bg),
                     (true, Some(_), Some(DiffMarker::Modified), false) => {
                         Some(p.cursor_line_modified_bg)
                     }

@@ -1005,7 +1005,10 @@ fn view_response_does_not_regress_a_query_typed_before_it() {
     {
         let p = s.picker.as_ref().unwrap();
         assert_eq!(p.query, "f", "typed query survives the late response");
-        assert_eq!(p.generation, 1, "claimed generation survives the late response");
+        assert_eq!(
+            p.generation, 1,
+            "claimed generation survives the late response"
+        );
     }
     // The query's own push (the server adopted generation 1) applies and settles the picker.
     let sym = |line: u32, name: &str| PickerItem::Symbol {
@@ -1041,7 +1044,11 @@ fn view_response_does_not_regress_a_query_typed_before_it() {
         params: serde_json::to_value(&push).unwrap(),
     }));
     let p = s.picker.as_ref().unwrap();
-    assert_eq!(p.items.len(), 2, "the query's push applies under the claimed generation");
+    assert_eq!(
+        p.items.len(),
+        2,
+        "the query's push applies under the claimed generation"
+    );
     assert!(!p.ticking);
 }
 
@@ -8243,10 +8250,13 @@ fn read_choice_is_session_wide_not_per_buffer() {
             "revision": 0, "saved_revision": 0, "path": "/tmp/other.md",
         })),
     );
-    assert_eq!(s.mode, Mode::Normal, "session choice carries across buffers");
+    assert_eq!(
+        s.mode,
+        Mode::Normal,
+        "session choice carries across buffers"
+    );
     assert!(s.read.is_none());
 }
-
 
 #[test]
 fn read_ctrl_z_undoes_from_the_reading_view() {
@@ -8740,9 +8750,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
     use aether_client::update::Event;
     use aether_protocol::buffer::BufferOpenResult;
     use aether_protocol::cursor::Direction;
-    use aether_protocol::jumplist::{
-        JumplistStepResult, JumplistStepScope, JumplistStepTarget,
-    };
+    use aether_protocol::jumplist::{JumplistStepResult, JumplistStepScope, JumplistStepTarget};
     use aether_protocol::LogicalPosition;
 
     let opened = |buffer_id: u64, path: &str| BufferOpenResult {

@@ -18,10 +18,10 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameLine,
-    GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitBlameChanged, GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -45,9 +45,9 @@ use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavSt
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, GroupHeader, MatchOptions, PickerFilters, PickerHide,
     PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset,
-    PickerSelect, PickerSelectParams,
-    PickerSelectResult, PickerSetGroup, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
-    PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
+    PickerSelect, PickerSelectParams, PickerSelectResult, PickerSetGroup, PickerSetGroupParams,
+    PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
+    ScopedPath,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -3216,7 +3216,10 @@ async fn deferred_parse_restyles_the_viewport_when_it_lands() {
 
     // The background parse lands and re-pushes the window, now highlighted, same revision.
     let push = expect_highlighted_lines_changed(&mut ws).await;
-    assert_eq!(push.revision, 0, "content didn't change — revision rides through");
+    assert_eq!(
+        push.revision, 0,
+        "content didn't change — revision rides through"
+    );
     let highlights = &push.replacement_lines[0].visual_rows[0].segments[0].highlights;
     let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
     assert!(
@@ -3366,7 +3369,10 @@ async fn deferred_git_baseline_pushes_hunks_when_it_lands() {
         p.replacement_lines[0].diff_marker.is_some()
     })
     .await;
-    assert_eq!(push.replacement_lines[0].diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(
+        push.replacement_lines[0].diff_marker,
+        Some(DiffMarker::Modified)
+    );
     assert!(
         push.git_status.is_some(),
         "branch status rides the same push"
@@ -19309,7 +19315,10 @@ async fn shared_dirty_document_writes_one_backup() {
         .flatten()
         .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
         .count();
-    assert_eq!(count, 1, "one document, one backup — however many workspaces");
+    assert_eq!(
+        count, 1,
+        "one document, one backup — however many workspaces"
+    );
 
     drop(server);
 }
@@ -19408,10 +19417,7 @@ async fn ephemeral_file_edits_survive_restart_via_path_keyed_backup() {
     )
     .await;
     assert_ne!(reopen.revision, reopen.saved_revision, "restored dirty");
-    assert_eq!(
-        buffer_text(&mut ws, 3, reopen.buffer_id).await,
-        "T-hello\n"
-    );
+    assert_eq!(buffer_text(&mut ws, 3, reopen.buffer_id).await, "T-hello\n");
     drop(server);
 }
 
@@ -20604,7 +20610,10 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
         .expect("line 0 in window");
     // New side: "total" occupies bytes [4, 9) of "let total = 1;".
     assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
-    assert_eq!(line0.diff_emphasis, vec![EmphasisRange { start: 4, end: 9 }]);
+    assert_eq!(
+        line0.diff_emphasis,
+        vec![EmphasisRange { start: 4, end: 9 }]
+    );
     // Old side: "count" at the same offsets within the phantom row's "let count = 1;".
     assert_eq!(line0.virtual_rows_above.len(), 1);
     assert_eq!(line0.virtual_rows_above[0].text, "let count = 1;");
@@ -22928,7 +22937,8 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
     };
 
     // Scoped from the start: only the frontend project's server is asked.
-    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _ =
+        send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
     let _: () = send_request::<PickerQuery>(&mut ws, 3, &query(1, scope_frontend.clone())).await;
     let items = poll_symbol_view(&mut ws, 100, |items| !items.is_empty()).await;
     assert_eq!(symbol_group_labels(&items), vec!["frontend/src/app.ts"]);
@@ -23064,9 +23074,11 @@ async fn ready_server_requery_respects_the_dir_scope() {
     )
     .await
     .unwrap();
-    await_lsp_state(&server, "the frontend server (backend still starting)", |v| {
-        v.iter().any(|s| s.language == "typescript" && s.ready)
-    })
+    await_lsp_state(
+        &server,
+        "the frontend server (backend still starting)",
+        |v| v.iter().any(|s| s.language == "typescript" && s.ready),
+    )
     .await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -23081,7 +23093,8 @@ async fn ready_server_requery_respects_the_dir_scope() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _ =
+        send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         3,
@@ -23179,7 +23192,8 @@ async fn workspace_symbols_capture_to_the_jumplist() {
         },
     )
     .await;
-    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
+    let _ =
+        send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::WorkspaceSymbols)).await;
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         3,
@@ -23216,8 +23230,7 @@ async fn workspace_symbols_capture_to_the_jumplist() {
     );
 
     // The Jumplist picker shows the entries under real per-file headers.
-    let view =
-        send_request::<PickerView>(&mut ws, 301, &view_params(PickerKind::Jumplist)).await;
+    let view = send_request::<PickerView>(&mut ws, 301, &view_params(PickerKind::Jumplist)).await;
     let rows = view.update.and_then(|u| u.items).unwrap_or_default();
     let files: Vec<String> = rows
         .iter()
@@ -30533,9 +30546,13 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
         }],
         ..Default::default()
     };
-    let (server, mut ws) =
-        open_and_subscribe_with_lsp("crumb-seed", dir.path(), "main.rs", vec![("rust".into(), dummy)])
-            .await;
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "crumb-seed",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         10,

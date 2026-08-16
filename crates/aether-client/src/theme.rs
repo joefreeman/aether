@@ -242,9 +242,9 @@ impl Theme {
         git_added: NORD14,
         git_modified: NORD13,
         git_deleted: NORD11,
-        git_staged_added: rgb(0x6e8060), // dimmed NORD14
+        git_staged_added: rgb(0x6e8060),    // dimmed NORD14
         git_staged_modified: rgb(0x9e8a62), // dimmed NORD13
-        git_staged_deleted: rgb(0x844c53), // dimmed NORD11
+        git_staged_deleted: rgb(0x844c53),  // dimmed NORD11
         git_added_bg: rgb(0x2d3a2d),
         git_modified_bg: rgb(0x3a3628),
         git_deleted_bg: rgb(0x3b2226),
@@ -290,17 +290,17 @@ impl Theme {
         sneak_prefix_bg: rgb(0xc4cedb), // darker than fill_dim: prominence inverts on light
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
         match_bracket: rgb(0xab5f38),   // = syn_macro today; free to diverge
-        cursor_line_bg: rgb(0xe4e9f0), // ~40% from NORD6 toward NORD5
+        cursor_line_bg: rgb(0xe4e9f0),  // ~40% from NORD6 toward NORD5
         overlay_border: rgb(0xaab4c4),
         border_subtle: rgb(0xd8dfe8), // = fill_dim today; borders can darken independently
         fg: NORD0,
         fg_bright: rgb(0x242933), // a step below NORD0, as NORD6 sits a step above NORD4
-        fg_muted: rgb(0x8892a4), // = syn_comment today; free to diverge
+        fg_muted: rgb(0x8892a4),  // = syn_comment today; free to diverge
         fg_dim: NORD3,
         fg_faint: rgb(0xaeb7c6),
         fg_on_accent: NORD6,
         ghost_text: rgb(0x8a94a6),
-        accent: rgb(0x3e7a8f),   // NORD8 darkened (~1.9:1 on NORD6 as-is)
+        accent: rgb(0x3e7a8f), // NORD8 darkened (~1.9:1 on NORD6 as-is)
         accent_alt: NORD10,
         accent_deep: NORD10,
         error: NORD11,
@@ -525,9 +525,6 @@ mod tests {
         assert_eq!(t.lsp_status(&LspStatus::Ready), t.ok);
         assert_eq!(t.lsp_status(&LspStatus::Stopped), t.fg_faint);
         assert_eq!(t.git_status_bullet(GitStatus::Ignored), None);
-        assert_eq!(
-            t.git_status_bullet(GitStatus::Untracked),
-            Some(t.git_added)
-        );
+        assert_eq!(t.git_status_bullet(GitStatus::Untracked), Some(t.git_added));
     }
 }

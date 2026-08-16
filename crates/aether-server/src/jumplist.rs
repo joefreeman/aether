@@ -886,7 +886,9 @@ mod tests {
     /// "Nothing to capture".
     #[test]
     fn capture_snapshots_workspace_symbols_with_their_file_identity() {
-        use crate::picker::{make_matcher, PickerCandidates, PickerState, WorkspaceSymbolCandidate};
+        use crate::picker::{
+            make_matcher, PickerCandidates, PickerState, WorkspaceSymbolCandidate,
+        };
         let cand = |path_index: Option<u32>, display: &str, abs: &str, line: u32, name: &str| {
             WorkspaceSymbolCandidate {
                 abs_path: abs.into(),

@@ -276,12 +276,7 @@ pub fn overlay<'a>(
     }
     let prefix = explorer_prefix(state, roots);
     if let Some(pfx) = &prefix {
-        input = input.push(
-            text(pfx.clone())
-                .size(ui.body())
-                .font(SANS)
-                .color(p.accent),
-        );
+        input = input.push(text(pfx.clone()).size(ui.body()).font(SANS).color(p.accent));
     }
     // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
     // placeholder is suppressed there.
@@ -383,12 +378,7 @@ pub fn overlay<'a>(
     } else {
         format!("{}", state.total_matches)
     };
-    input = input.push(
-        text(counts)
-            .size(ui.small())
-            .font(SANS)
-            .color(p.fg_dim),
-    );
+    input = input.push(text(counts).size(ui.small()).font(SANS).color(p.fg_dim));
     // The settled empty-state line (or none) — wording + when-to-show are owned by the core so all
     // shells agree (e.g. "No diagnostics" for an unfiltered empty list, "No matches" under a query).
     let empty_note = state.empty_note();
@@ -632,13 +622,8 @@ pub fn overlay<'a>(
         // The web's `.picker-empty` styling (italic, dim, list-row padding) — but a notch
         // brighter than its faint rung: that reads fine on the web panel, too faint here.
         panel = panel.push(
-            container(
-                text(note)
-                    .size(ui.body())
-                    .font(SANS_ITALIC)
-                    .color(p.fg_dim),
-            )
-            .padding([6, 12]),
+            container(text(note).size(ui.body()).font(SANS_ITALIC).color(p.fg_dim))
+                .padding([6, 12]),
         );
     }
 
@@ -923,12 +908,7 @@ fn editor_line<'a>(
             let color = if invalid { p.error } else { p.accent };
             root_group = root_group.push(text(display).size(ui.body()).font(SANS).color(color));
             if show_sep {
-                root_group = root_group.push(
-                    text(":")
-                        .size(ui.body())
-                        .font(SANS)
-                        .color(p.fg_dim),
-                );
+                root_group = root_group.push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
             }
         }
         line = line.push(root_group);
@@ -1206,7 +1186,11 @@ fn git_change_summary<'a>(
     p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let staged = stage == DiffStage::Staged;
-    let added_color = if staged { p.git_staged_added } else { p.git_added };
+    let added_color = if staged {
+        p.git_staged_added
+    } else {
+        p.git_added
+    };
     let removed_color = if staged {
         p.git_staged_deleted
     } else {

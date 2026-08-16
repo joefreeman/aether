@@ -2825,7 +2825,11 @@ impl App {
                 .style(move |_| container::Style {
                     background: Some(if highlighted { p.bg_selection } else { p.bg }.into()),
                     border: iced::Border {
-                        color: if highlighted { p.accent } else { p.border_subtle },
+                        color: if highlighted {
+                            p.accent
+                        } else {
+                            p.border_subtle
+                        },
                         width: 1.0,
                         radius: 4.0.into(),
                     },
@@ -2834,7 +2838,12 @@ impl App {
                 .into()
         }
 
-        let label = move |t: &str| text(t.to_string()).size(ui.small()).font(SANS).color(p.fg_dim);
+        let label = move |t: &str| {
+            text(t.to_string())
+                .size(ui.small())
+                .font(SANS)
+                .color(p.fg_dim)
+        };
 
         // A label tucked tight above its field (~3px), so each label+field reads as one group
         // while the column's `spacing(8)` keeps groups apart.
@@ -3101,7 +3110,11 @@ impl App {
                     text(ed.input.text.clone())
                         .size(ui.body())
                         .font(SANS)
-                        .color(if ed.path_invalid() { p.error } else { p.fg_bright }),
+                        .color(if ed.path_invalid() {
+                            p.error
+                        } else {
+                            p.fg_bright
+                        }),
                 );
             } else {
                 // Placeholder is always empty here: the ghost layer behind the input is what shows
@@ -3158,7 +3171,11 @@ impl App {
                         text(s.add_project_language.text.clone())
                             .size(ui.body())
                             .font(SANS)
-                            .color(if s.language_invalid() { p.error } else { p.fg_dim }),
+                            .color(if s.language_invalid() {
+                                p.error
+                            } else {
+                                p.fg_dim
+                            }),
                     );
                 }
             }
@@ -3180,12 +3197,7 @@ impl App {
         col = col.push(projects_col);
 
         if let Some(err) = &s.error {
-            col = col.push(
-                text(err.clone())
-                    .size(ui.small())
-                    .font(SANS)
-                    .color(p.error),
-            );
+            col = col.push(text(err.clone()).size(ui.small()).font(SANS).color(p.error));
         }
 
         // Wider than the other overlays: the add-project row carries three segments (root, path,
@@ -3632,13 +3644,8 @@ impl App {
                         };
                         rows = rows.push(
                             row![
-                                container(
-                                    text(r.label)
-                                        .size(ui.body())
-                                        .font(SANS)
-                                        .color(p.fg_dim)
-                                )
-                                .width(ui.at(84.0)),
+                                container(text(r.label).size(ui.body()).font(SANS).color(p.fg_dim))
+                                    .width(ui.at(84.0)),
                                 text(r.value).size(ui.body()).font(SANS).color(value_color),
                             ]
                             .spacing(8),
@@ -3712,8 +3719,8 @@ impl App {
                         root_group =
                             root_group.push(text(display).size(ui.body()).font(SANS).color(color));
                         // The focused segment draws its own separator flush against the text.
-                        root_group = root_group
-                            .push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
+                        root_group =
+                            root_group.push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
                     }
                     field = field.push(root_group).spacing(6);
                 }
@@ -4181,17 +4188,17 @@ impl App {
         let label = crate::labels::truncate_path(&self.session.buffer.label, budget);
         used += label.chars().count();
         let name = text(label)
-        .wrapping(iced::widget::text::Wrapping::None)
-        .size(ui.body())
-        .color(p.fg)
-        .font(
-            // A transient (preview) buffer slants the file label, like the other clients.
-            if self.session.buffer.transient {
-                SANS_ITALIC
-            } else {
-                SANS
-            },
-        );
+            .wrapping(iced::widget::text::Wrapping::None)
+            .size(ui.body())
+            .color(p.fg)
+            .font(
+                // A transient (preview) buffer slants the file label, like the other clients.
+                if self.session.buffer.transient {
+                    SANS_ITALIC
+                } else {
+                    SANS
+                },
+            );
         left = left.push(name);
         // The tether mark (docs/tether.md): a dim ` *` after the file label — closing this buffer
         // exits the window. Upright even on a slanted transient label, like the terminal client.
@@ -4328,21 +4335,15 @@ impl App {
         // indicator and language-server dot) always gets its natural width and can never be pushed
         // off the end — clipping the whole row instead meant an overlong breadcrumb shoved the
         // position out of the window entirely, losing the more useful of the two.
-        container(
-            row![
-                container(left).width(Length::Fill).clip(true),
-                right,
-            ]
-            .width(Length::Fill),
-        )
-        .padding([2, STATUS_PAD_X as u16])
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(p.bg_panel.into()),
-            text_color: Some(p.fg),
-            ..container::Style::default()
-        })
-        .into()
+        container(row![container(left).width(Length::Fill).clip(true), right,].width(Length::Fill))
+            .padding([2, STATUS_PAD_X as u16])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(p.bg_panel.into()),
+                text_color: Some(p.fg),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     /// Bottom-right toast stack, above the status bar — layout and accent colours mirror the
@@ -5270,14 +5271,17 @@ impl App {
                 // that blanked lists): the outer paints the bar colour, the inner repaints the
                 // canvas over everything but the 3px strip. Square corners, matching the
                 // position bar. Alerts colour the bar by kind, matching their label.
-                let bar = alert.map(|k| alert_style(k, p).1).unwrap_or(p.border_subtle);
-                let panel = container(inner)
-                    .width(Length::Fill)
-                    .padding([8, 10])
-                    .style(move |_| container::Style {
-                        background: Some(p.bg.into()),
-                        ..container::Style::default()
-                    });
+                let bar = alert
+                    .map(|k| alert_style(k, p).1)
+                    .unwrap_or(p.border_subtle);
+                let panel =
+                    container(inner)
+                        .width(Length::Fill)
+                        .padding([8, 10])
+                        .style(move |_| container::Style {
+                            background: Some(p.bg.into()),
+                            ..container::Style::default()
+                        });
                 container(panel)
                     .width(Length::Fill)
                     .padding(iced::Padding {
@@ -5342,8 +5346,7 @@ impl App {
                             let s = (h.start as usize).min(code.len());
                             let e = (h.end as usize).clamp(s, code.len());
                             push(&code[pos..s], p.fg);
-                            let color =
-                                theme::highlight_color(p.mode, &h.kind).unwrap_or(p.fg);
+                            let color = theme::highlight_color(p.mode, &h.kind).unwrap_or(p.fg);
                             push(&code[s..e], color);
                             pos = e;
                         }
@@ -7025,7 +7028,10 @@ mod tests {
         );
         let rendered: usize = parts.iter().map(|p| p.chars().count()).sum::<usize>()
             + CRUMB_SEPARATOR.chars().count() * parts.len().saturating_sub(1);
-        assert!(rendered <= budget, "{rendered} cols in a {budget}-col budget");
+        assert!(
+            rendered <= budget,
+            "{rendered} cols in a {budget}-col budget"
+        );
 
         // A bar with room to spare still shows the whole chain — the fix must not over-elide.
         let roomy = crumb_budget_cols(2000.0, &ui(), claimed);

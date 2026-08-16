@@ -518,7 +518,9 @@ impl ServerState {
     /// Mutable [`Self::doc_of`].
     pub fn doc_of_mut(&mut self, buffer_id: BufferId) -> &mut Document {
         let doc_id = self.buffers[&buffer_id].document;
-        self.documents.get_mut(&doc_id).expect("buffer references a live document")
+        self.documents
+            .get_mut(&doc_id)
+            .expect("buffer references a live document")
     }
 
     /// Non-panicking [`Self::doc_of`], for paths where the buffer may already be gone.
@@ -1158,7 +1160,8 @@ impl ServerState {
         self.symbol_highlights.retain(|(c, _), _| *c != client_id);
         self.symbol_highlight_gen
             .retain(|(c, _), _| *c != client_id);
-        self.symbol_highlight_follow.retain(|(c, _)| *c != client_id);
+        self.symbol_highlight_follow
+            .retain(|(c, _)| *c != client_id);
         self.blame_follow.retain(|(c, _)| *c != client_id);
         self.blame_follow_gen.retain(|(c, _), _| *c != client_id);
         self.blame_last_pushed.retain(|(c, _), _| *c != client_id);
@@ -1340,7 +1343,10 @@ impl ServerState {
         canonical: &Path,
     ) -> Option<BufferId> {
         self.buffers.iter().find_map(|(id, b)| {
-            if self.documents.get(&b.document).and_then(|d| d.canonical_path.as_deref())
+            if self
+                .documents
+                .get(&b.document)
+                .and_then(|d| d.canonical_path.as_deref())
                 == Some(canonical)
                 && self.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(workspace_name)
             {
@@ -1359,7 +1365,9 @@ impl ServerState {
         self.buffers
             .iter()
             .filter(|(_, b)| {
-                self.documents.get(&b.document).and_then(|d| d.canonical_path.as_deref())
+                self.documents
+                    .get(&b.document)
+                    .and_then(|d| d.canonical_path.as_deref())
                     == Some(canonical)
             })
             .map(|(id, _)| *id)
@@ -1407,7 +1415,8 @@ impl ServerState {
         self.sneaks.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlights.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
-        self.symbol_highlight_follow.retain(|&(c, b)| !in_proj(&c, &b));
+        self.symbol_highlight_follow
+            .retain(|&(c, b)| !in_proj(&c, &b));
         self.blame_follow.retain(|&(c, b)| !in_proj(&c, &b));
         self.blame_follow_gen.retain(|(c, b), _| !in_proj(c, b));
         self.blame_last_pushed.retain(|(c, b), _| !in_proj(c, b));
@@ -1582,7 +1591,9 @@ impl Document {
         let syntax = if defer_parse {
             None
         } else {
-            language.as_deref().and_then(|name| make_syntax(&text, name))
+            language
+                .as_deref()
+                .and_then(|name| make_syntax(&text, name))
         };
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Ok(Document {

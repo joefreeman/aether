@@ -112,7 +112,12 @@ async fn open_in_workspace(
              supported with --web yet"
         );
     };
-    let url = web_url(port, Some(&workspace), Some((path_index, &relative_path)), jump);
+    let url = web_url(
+        port,
+        Some(&workspace),
+        Some((path_index, &relative_path)),
+        jump,
+    );
 
     if !tether {
         // `--workspace` named: a session, not an errand. The web boot opens the file itself.
@@ -297,7 +302,12 @@ mod tests {
         // `#` would end the query early, `&` would split the pair, `+` would decode as a space,
         // spaces are unsafe raw. `URLSearchParams` decodes `%XX` back to the original.
         assert_eq!(
-            web_url(2385, Some("my workspace"), Some((0, "a&b/#1 + c.txt")), None),
+            web_url(
+                2385,
+                Some("my workspace"),
+                Some((0, "a&b/#1 + c.txt")),
+                None
+            ),
             "http://127.0.0.1:2385/?workspace=my%20workspace&file=a%26b/%231%20%2B%20c.txt"
         );
         // Percent itself must escape, or a literal `%20` in a filename would decode as a space.
