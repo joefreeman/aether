@@ -12,9 +12,7 @@ use super::hints::{
 };
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::path_editor::PathEditor;
-use super::picker::{
-    item_key, GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS,
-};
+use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AfterSave,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
@@ -88,9 +86,9 @@ use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, ExpandedRun, GroupHeader, MatchOptions, PickerFilters, PickerHide,
     PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset,
-    PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
-    PickerSelectResult, PickerSetGroup, PickerSetGroupParams, PickerUpdate, PickerUpdateParams,
-    PickerView, PickerViewParams, PickerViewResult, ScopedPath, MIN_GREP_QUERY_LEN,
+    PickerSelect, PickerSelectParams, PickerSelectResult, PickerSetGroup, PickerSetGroupParams,
+    PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
+    MIN_GREP_QUERY_LEN,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -256,9 +254,6 @@ pub enum Event {
     /// time — the wire carries only the geometry; the client picks the row). `None` = the
     /// group re-ranked away mid-flight, or a step ran off the ends (both benign stops).
     GroupSet(Result<Option<ExpandedRun>, String>, GroupLanding),
-    /// `picker/section_jump` resolved: the next/prev section start (None at the ends) — the
-    /// next file's first hit (Grep) or the next top-level symbol (DocumentSymbols).
-    SectionJumped(Result<Option<PickerItem>, String>),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
     /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
     /// push, which already switches us off a deleted current buffer.
@@ -1445,45 +1440,6 @@ impl Session {
                     GroupLanding::RunStart | GroupLanding::RunEnd => Reveal::Minimal,
                 })
             }
-            Event::SectionJumped(Ok(None)) => Effects::none(), // already at the first/last
-            Event::SectionJumped(Ok(Some(target))) => {
-                let Some(p) = &mut self.picker else {
-                    return Effects::none();
-                };
-                // In the loaded window → purely local move, no refetch; the target aligns
-                // to the top so the file reads from its first hit.
-                let key = item_key(&target);
-                if let Some(idx) = p.items.iter().position(|i| item_key(i) == key) {
-                    p.selected = p.offset + idx as u32;
-                    return Effects::one(Effect::RevealPickerSelection(Reveal::Top));
-                }
-                // Past the window → re-frame around the target; the arriving push lands the
-                // highlight via the `effective_center_on` echo (Reveal::Top for grep).
-                let kind = p.kind;
-
-                self.request::<PickerView>(
-                    PickerViewParams {
-                        kind,
-                        reset: PickerReset::Keep,
-                        offset: 0,
-                        limit: FETCH_LIMIT,
-                        center_on: Some(target),
-                        center_on_cursor: None,
-                        directory_path: None,
-                        explorer_roots: false,
-                        buffer_id: None,
-                        from_selection: false,
-                        filters: None,
-                        keybindings: None,
-                    },
-                    move |__r| Event::PickerViewed {
-                        initial: false,
-                        result: __r.map_err(|e| e.to_string()),
-                    },
-                )
-            }
-            Event::SectionJumped(Err(e)) => Effects::error(format!("File jump failed: {e}")),
-
             Event::PathDeleted { noun, result } => match result {
                 Err(e) => Effects::error(format!("Delete failed: {e}")),
                 Ok(_) => {
@@ -2856,21 +2812,6 @@ impl Session {
         fx
     }
 
-    /// Tab in the Explorer: adopt the common-prefix completion ghost into the query (extending the
-    /// filter part), then re-query. No-op when there's no completion to apply.
-    /// `None` when the query has no completion ghost to adopt, so a caller that folds this together
-    /// with another action (Explorer's Alt-l, which otherwise descends) can tell the two apart.
-    fn apply_explorer_completion(&mut self) -> Option<Effects> {
-        let suffix = match self.picker.as_ref().and_then(|p| p.explorer_completion()) {
-            Some(s) if !s.is_empty() => s,
-            _ => return None,
-        };
-        if let Some(p) = self.picker.as_mut() {
-            p.query.push_str(&suffix);
-        }
-        Some(self.picker_query_changed())
-    }
-
     /// Move the picker highlight, refetching when it leaves the fetched window and revealing
     /// it otherwise (the shell scrolls the native list the minimum to keep it visible).
     /// Wheel scroll over the picker overlay: move the highlight by `delta` rows, like Alt-j/k.
@@ -4176,52 +4117,24 @@ impl Session {
             KeyCode::Char('f') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
                 return self.switch_explorer_picker(PickerKind::Files);
             }
-            // Alt-l/h are per-kind: Explorer descends / ascends; the collapsible kinds
-            // descend into / ascend out of the selected group (two-level navigation, §9);
-            // the remaining header-grouped kinds (keybinding groups, reference sections)
-            // jump the selection to the next / previous group's first row; DocumentSymbols
-            // jumps to the next / previous top-level unit; elsewhere neither is bound —
-            // clearing the input is Alt-Backspace's, not Alt-h's.
-            // Alt-l is the accept/advance gesture: adopt the common-prefix completion ghost if the
-            // query has one, otherwise descend into the highlighted directory. Both are "go
-            // deeper", and folding them keeps Alt-l meaning "accept the suggestion" here as it does
-            // in every other completing field — which is what freed Tab for field traversal.
-            KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
-                if let Some(fx) = self.apply_explorer_completion() {
-                    return fx;
-                }
-                return self.explorer_enter_selected();
-            }
-            // Alt-h mirrors it structurally: ascend out of the listed directory. Never the
-            // query — the unwind ladder (query, then chips) is Alt-Backspace's alone.
+            // Alt-l is one rule in every picker: go one level deeper into the highlighted row.
+            // A container descends (Explorer directory, collapsed group); a leaf has no inside,
+            // so the level below it is the thing itself and Alt-l opens it — the same act as
+            // Enter. That makes `h`/`j`/`k`/`l` a complete picker vocabulary without leaving the
+            // home row, and it's the same "accept the highlight" gesture the completing path
+            // fields give Alt-l. Enter stays distinct on one row type only: on a group header it
+            // resolves server-side to the group's *first item*, where Alt-l descends onto the
+            // header's run instead.
+            //
+            // Alt-l/h used to also mean "jump to the next/previous group" in the header-grouped
+            // kinds that don't collapse (References, Keybindings) and "next top-level unit" in
+            // DocumentSymbols. That third meaning is gone — those rows open now.
+            KeyCode::Char('l') if mods.alt && !mods.ctrl => return self.picker_descend(),
+            // Alt-h mirrors it: one level shallower — out of the listed directory, or out of a
+            // group onto its header. There's no "un-open", so on a leaf it does nothing. Never
+            // the query: the unwind ladder (query, then chips) is Alt-Backspace's alone.
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_ascend().unwrap_or_else(Effects::none);
-            }
-            // Collapsible kinds (docs/picker-groups.md §9): Alt-l descends a level — from the
-            // selected group's header onto the run's first item (the selected group IS the
-            // expanded one, so the row is right below). On a header that is *not* the open
-            // group — a transient state after a re-rank clamped the selection — it re-selects
-            // that group instead, so each press still makes progress. On an item row it's
-            // already as deep as it goes.
-            KeyCode::Char('l') if mods.alt && !mods.ctrl && p.kind.collapsible() => {
-                if let Some(PickerItem::Group {
-                    header,
-                    expanded: false,
-                    ..
-                }) = p.selected_item()
-                {
-                    let header = header.clone();
-                    return self.picker_select_group(header);
-                }
-                if p.selection_at_item_level() {
-                    return Effects::none();
-                }
-                let Some((first, _)) = p.expanded_item_rows() else {
-                    return Effects::none();
-                };
-                p.selected = first;
-                p.level = PickerLevel::Item;
-                return self.picker_reveal_selection(Reveal::Minimal);
             }
             // Alt-h ascends a level: from an item onto its run's header — a local move,
             // nothing collapses (moving the *group selection* is what moves the expansion,
@@ -4238,22 +4151,6 @@ impl Session {
                 p.selected = run.header_row;
                 p.level = PickerLevel::Group;
                 return self.picker_reveal_selection(Reveal::Minimal);
-            }
-            KeyCode::Char('l')
-                if mods.alt
-                    && !mods.ctrl
-                    && (p.kind.renders_group_headers()
-                        || p.kind == PickerKind::DocumentSymbols) =>
-            {
-                return self.picker_section_jump(Direction::Forward);
-            }
-            KeyCode::Char('h')
-                if mods.alt
-                    && !mods.ctrl
-                    && (p.kind.renders_group_headers()
-                        || p.kind == PickerKind::DocumentSymbols) =>
-            {
-                return self.picker_section_jump(Direction::Backward);
             }
             // Alt-Backspace unwind: clear the query first, then (explorer) step to the parent
             // (one segment per press) into roots mode (multi-root only), then pop chips.
@@ -4691,28 +4588,53 @@ impl Session {
         fx
     }
 
-    /// Jump the open picker's selection to the next / previous section boundary — the next/prev
-    /// group's first row for the header-grouped kinds, the next/prev top-level symbol for
-    /// DocumentSymbols. The server finds the boundary across the *whole* result list (so it
-    /// works past the over-fetch window); the result lands as [`Event::SectionJumped`].
-    fn picker_section_jump(&mut self, direction: Direction) -> Effects {
+    /// `Alt-l`: one level deeper into the highlighted row. Descends where the row has an inside
+    /// — an Explorer directory (or root), a collapsible kind's group — and otherwise opens it
+    /// through [`Self::picker_accept`], since a leaf's only "deeper" is the thing itself.
+    ///
+    /// The one row Alt-l won't take is the synthetic "+ Create …": creating a file or a
+    /// workspace is a deliberate act, and Alt-l is a navigation chord sitting next to Alt-j/k,
+    /// where an overshoot would make something on disk. Enter keeps that gesture to itself.
+    fn picker_descend(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if !(p.kind.renders_group_headers() || p.kind == PickerKind::DocumentSymbols)
-            || p.items.is_empty()
-        {
+        if p.selected_is_create() {
             return Effects::none();
         }
-        let kind = p.kind;
-        self.request::<PickerSectionJump>(
-            PickerSectionJumpParams {
-                kind,
-                from_index: p.selected,
-                direction,
-            },
-            move |__r| Event::SectionJumped(__r.map_err(|e| e.to_string())),
-        )
+        if p.kind == PickerKind::Explorer {
+            // A directory / root descends; a file falls through and opens.
+            if matches!(
+                p.selected_item(),
+                Some(PickerItem::DirEntry { is_dir: true, .. }) | Some(PickerItem::Root { .. })
+            ) {
+                return self.explorer_enter_selected();
+            }
+        } else if p.kind.collapsible() && !p.selection_at_item_level() {
+            // From the selected group's header onto the run's first item (the selected group IS
+            // the expanded one, so the row is right below). On a header that is *not* the open
+            // group — a transient state after a re-rank clamped the selection — re-select that
+            // group instead, so each press still makes progress.
+            if let Some(PickerItem::Group {
+                header,
+                expanded: false,
+                ..
+            }) = p.selected_item()
+            {
+                let header = header.clone();
+                return self.picker_select_group(header);
+            }
+            let Some((first, _)) = p.expanded_item_rows() else {
+                return Effects::none(); // an empty run has nothing to descend onto
+            };
+            let Some(p) = &mut self.picker else {
+                return Effects::none();
+            };
+            p.selected = first;
+            p.level = PickerLevel::Item;
+            return self.picker_reveal_selection(Reveal::Minimal);
+        }
+        self.picker_accept()
     }
 
     /// Apply a server notification to the session. Stale pushes (other viewports/buffers,

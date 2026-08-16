@@ -755,9 +755,9 @@ impl PickerCandidates {
                 }
             }
             // Default preview (first changed line, no highlight). The window builder constructs the
-            // query-matched variant directly via `GitChangeCandidate::preview`; the center-on /
-            // section-jump callers reach here with empty `match_indices` and only use the item for
-            // identity, so the default preview suffices.
+            // query-matched variant directly via `GitChangeCandidate::preview`; the center-on
+            // callers reach here with empty `match_indices` and only use the item for identity,
+            // so the default preview suffices.
             PickerCandidates::GitChanges(v) => {
                 let c = &v[idx];
                 PickerItem::GitChange {
@@ -2109,40 +2109,6 @@ impl PickerState {
         }
     }
 
-    /// The ranked-space position `picker/section_jump` lands on from `from`, for any
-    /// header-grouped kind: `Forward` → the first row of the next group; `Backward` → the
-    /// current group's first row, or the previous group's first row when already there
-    /// (vim-`{` feel). `None` when there's no further boundary that way, or the kind doesn't
-    /// group. Grouping comes from [`Self::group_key_at`] — the same source as the pushed spans,
-    /// so the jump always lands where a client renders a header.
-    pub fn group_boundary(&self, from: usize, direction: Direction) -> Option<usize> {
-        if !self.kind.renders_group_headers() || self.ranked.is_empty() {
-            return None;
-        }
-        let from = from.min(self.ranked.len() - 1);
-        let key = |pos: usize| self.group_key_at(self.ranked[pos] as usize);
-        let cur = key(from)?;
-        match direction {
-            Direction::Forward => (from + 1..self.ranked.len()).find(|&j| key(j) != Some(cur)),
-            Direction::Backward => {
-                let mut run_start = from;
-                while run_start > 0 && key(run_start - 1) == Some(cur) {
-                    run_start -= 1;
-                }
-                if run_start < from {
-                    return Some(run_start);
-                }
-                // Already at the group's first row: step to the previous group's first row.
-                let prev = key(run_start.checked_sub(1)?)?;
-                let mut j = run_start - 1;
-                while j > 0 && key(j - 1) == Some(prev) {
-                    j -= 1;
-                }
-                Some(j)
-            }
-        }
-    }
-
     /// Grouped display-row metrics for a window starting at ranked index `offset`: the display-row
     /// index of that item (one header row per group is interleaved above the rows) and the
     /// total display rows (`ranked.len()` rows + the number of groups). `None` for the kinds
@@ -2480,49 +2446,6 @@ mod tests {
         // buffer-locked GitChangesFile gate is the kind, not the data.
         s.kind = PickerKind::GitChangesFile;
         assert!(s.build_window_spans(0, 3).is_empty());
-    }
-
-    #[test]
-    fn group_boundary_jumps_by_group_run() {
-        // Three files in walker order: a.rs (3 hits), b.rs (1 hit), c.rs (2 hits) — the exact
-        // semantics `picker/section_jump` (Alt-l / Alt-h) relies on, for every grouped kind.
-        let hit = |rel: &str, line: u32| GrepHitCandidate {
-            path_index: 0,
-            relative_path: rel.to_string(),
-            abs_path: format!("/ws/{rel}"),
-            line,
-            col: 0,
-            match_byte_len: 1,
-            preview: String::new(),
-            match_indices: Vec::new(),
-        };
-        let cands = PickerCandidates::Grep(vec![
-            hit("a.rs", 1),
-            hit("a.rs", 5),
-            hit("a.rs", 9), // indices 0,1,2
-            hit("b.rs", 2), // index 3
-            hit("c.rs", 1),
-            hit("c.rs", 4), // indices 4,5
-        ]);
-        let mut s = PickerState::new(cands);
-        let mut m = make_matcher();
-        s.rerank(&mut m);
-
-        // Forward: the next group's first row; nothing past the last group.
-        assert_eq!(s.group_boundary(0, Direction::Forward), Some(3));
-        assert_eq!(s.group_boundary(2, Direction::Forward), Some(3));
-        assert_eq!(s.group_boundary(3, Direction::Forward), Some(4));
-        assert_eq!(s.group_boundary(4, Direction::Forward), None);
-        assert_eq!(s.group_boundary(5, Direction::Forward), None);
-        // Backward: this group's first row, else the previous group's (vim-`{` feel).
-        assert_eq!(s.group_boundary(2, Direction::Backward), Some(0));
-        assert_eq!(s.group_boundary(1, Direction::Backward), Some(0));
-        assert_eq!(s.group_boundary(4, Direction::Backward), Some(3));
-        assert_eq!(s.group_boundary(3, Direction::Backward), Some(0));
-        assert_eq!(s.group_boundary(0, Direction::Backward), None);
-        // Headerless kinds never jump.
-        s.kind = PickerKind::GitChangesFile;
-        assert_eq!(s.group_boundary(0, Direction::Forward), None);
     }
 
     #[test]

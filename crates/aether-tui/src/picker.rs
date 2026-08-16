@@ -113,8 +113,9 @@ pub struct PickerState {
     /// a workspace root (Alt-h is then a no-op). Carried alongside `explorer_dir` for the same
     /// reasons.
     pub explorer_parent: Option<String>,
-    /// Explorer only. The tab-completion ghost: the common-prefix suffix `Tab` would append to the
-    /// query, rendered dim after the input. `None` when there's nothing to complete.
+    /// Explorer only. The completion ghost: the rest of the highlighted directory's name, rendered
+    /// dim after the input — the row `Alt-l` descends into. `None` when there's no such row (a file
+    /// is highlighted, or the name is fully typed).
     pub completion: Option<String>,
     /// Workspaces-picker only. When `Some(idx)`, `items[idx]` is a *synthetic* row added
     /// client-side to offer "create a new workspace named <query>" — it isn't part of the

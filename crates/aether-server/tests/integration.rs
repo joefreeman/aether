@@ -45,7 +45,7 @@ use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavSt
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, GroupHeader, MatchOptions, PickerFilters, PickerHide,
     PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset,
-    PickerSectionJump, PickerSectionJumpParams, PickerSelect, PickerSelectParams,
+    PickerSelect, PickerSelectParams,
     PickerSelectResult, PickerSetGroup, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
     PickerUpdateParams, PickerView, PickerViewParams, ScopedPath,
 };
@@ -11374,67 +11374,6 @@ async fn keybindings_picker_matches_across_the_composed_row() {
     drop(server);
 }
 
-/// `Alt-l` / `Alt-h` jump by group in every header-grouped kind: `picker/section_jump` resolves
-/// the boundary via the same grouping that produces the pushed spans.
-#[tokio::test]
-async fn keybindings_picker_section_jump_moves_by_group() {
-    let (server, mut ws) = setup_picker_workspace().await;
-    let _ = send_request::<PickerView>(
-        &mut ws,
-        10,
-        &keybindings_view_params(PickerReset::All, Some(keybinding_rows())),
-    )
-    .await;
-    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
-
-    // Forward from inside the Editing run (rows 0-1) → the Pickers group's first row.
-    let target = send_request::<PickerSectionJump>(
-        &mut ws,
-        11,
-        &PickerSectionJumpParams {
-            kind: PickerKind::Keybindings,
-            from_index: 0,
-            direction: Direction::Forward,
-        },
-    )
-    .await;
-    let Some(PickerItem::Keybinding { desc, .. }) = &target else {
-        panic!("expected a keybinding target, got {target:?}")
-    };
-    assert_eq!(desc, "Find file");
-
-    // Backward from the second Editing row → the Editing group's first row.
-    let target = send_request::<PickerSectionJump>(
-        &mut ws,
-        12,
-        &PickerSectionJumpParams {
-            kind: PickerKind::Keybindings,
-            from_index: 1,
-            direction: Direction::Backward,
-        },
-    )
-    .await;
-    let Some(PickerItem::Keybinding { desc, .. }) = &target else {
-        panic!("expected a keybinding target, got {target:?}")
-    };
-    assert_eq!(desc, "Delete word back");
-
-    // The very first row has nothing further back.
-    let target = send_request::<PickerSectionJump>(
-        &mut ws,
-        13,
-        &PickerSectionJumpParams {
-            kind: PickerKind::Keybindings,
-            from_index: 0,
-            direction: Direction::Backward,
-        },
-    )
-    .await;
-    assert!(target.is_none());
-
-    drop(server);
-}
-
 /// A scroll/resume re-view ships no rows (`keybindings: None`) — the server keeps the set from
 /// the fresh open, like the Diagnostics snapshot; a `reset` open with fresh rows rebuilds.
 #[tokio::test]
@@ -12865,7 +12804,7 @@ async fn picker_keep_view_centers_on_a_named_item() {
     .await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await;
 
-    // Re-view with center_on pointing at a known item — the section-jump / reveal path.
+    // Re-view with center_on pointing at a known item — the reveal path.
     let resume = send_request::<PickerView>(
         &mut ws,
         13,
@@ -15572,7 +15511,7 @@ async fn picker_grep_keeps_hits_across_a_keep_scoped_re_view() {
     let before_hits = before.total_matches;
     assert!(before_hits >= 1);
 
-    // A `Keep`-scoped re-view — what a scroll refetch and a section jump send, *without* closing
+    // A `Keep`-scoped re-view — what a scroll refetch sends, *without* closing
     // the picker — gets the prior hits back rather than re-running the walk. (Closing wipes, and a
     // fresh open sends `All`; see `grep_fresh_open_wipes_hits_and_filters`.)
     let resume = send_request::<PickerView>(

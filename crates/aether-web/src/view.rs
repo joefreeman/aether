@@ -236,8 +236,9 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 })),
                 "directory": p.directory,
                 "directory_parent": p.directory_parent,
-                // Explorer tab-completion ghost: the common-prefix suffix `Tab` would append to the
-                // query, shown dim after the input. `null` when there's nothing to complete.
+                // Explorer completion ghost: the rest of the highlighted directory's name, shown
+                // dim after the input — the row `Alt-l` descends into. `null` when there's no such
+                // row (a file is highlighted, or the name is fully typed).
                 "completion": p.explorer_completion(),
                 // The Explorer's synthetic "+ Create …" affordance (core-owned decision). `abs` is
                 // its selection index, one past the last match; the shell appends the row when the

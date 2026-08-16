@@ -44,7 +44,7 @@ use aether_protocol::lsp::{
 use aether_protocol::nav::{NavGoto, NavStep};
 use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{
-    PickerHide, PickerQuery, PickerSectionJump, PickerSelect, PickerSetGroup, PickerView,
+    PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView,
 };
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
@@ -484,7 +484,6 @@ async fn dispatch(
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
-        PickerSectionJump::NAME => run!(PickerSectionJump, handlers::picker_section_jump),
         PickerSetGroup::NAME => run!(PickerSetGroup, handlers::picker_set_group),
         JumplistCapture::NAME => run!(JumplistCapture, handlers::jumplist_capture),
         JumplistStep::NAME => run!(JumplistStep, handlers::jumplist_step),

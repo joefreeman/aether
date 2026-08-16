@@ -1485,8 +1485,43 @@ fn space_slash_opens_the_keybindings_picker_with_its_rows() {
 }
 
 #[test]
-fn alt_l_and_alt_h_jump_keybinding_groups_via_section_jump() {
+fn alt_l_opens_the_highlighted_row_like_enter() {
     use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    let p = s.picker.as_mut().unwrap();
+    p.items = (0..3)
+        .map(|n| PickerItem::File {
+            path_index: 0,
+            relative_path: format!("src/f{n}.rs"),
+            match_indices: vec![],
+            git_status: None,
+        })
+        .collect();
+    p.total_matches = 3;
+    p.selected = 1;
+    // Alt-h has no counterpart on a flat kind — you can't un-open — and it must not wipe the
+    // query (that ladder is Alt-Backspace's). Checked first: Alt-l closes the picker below.
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 1);
+    // A flat kind has no level below its rows, so "deeper" is the row itself: Alt-l resolves the
+    // pick exactly as Enter does.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/select").expect("Alt-l selects the highlighted row");
+    assert_eq!(params["kind"], "files");
+    assert_eq!(params["item"]["relative_path"], json!("src/f1.rs"));
+    assert!(
+        s.picker.is_none(),
+        "opening closes the picker, as Enter does"
+    );
+}
+
+#[test]
+fn alt_l_leaves_inert_rows_alone() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    // Keybindings is a reference list: Enter deliberately doesn't fire the binding, so neither
+    // does Alt-l. (It used to jump by group here — that meaning is gone.)
     let mut s = session();
     let _ = s.open_picker(PickerKind::Keybindings, None, None, false, None);
     let p = s.picker.as_mut().unwrap();
@@ -1501,16 +1536,35 @@ fn alt_l_and_alt_h_jump_keybinding_groups_via_section_jump() {
         .collect();
     p.total_matches = 6;
     p.selected = 4;
-    // Alt-l / Alt-h jump by group in every header-grouped kind — the same server-side grouping
-    // that produces the section headers.
     let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    let params = find_request(&fx, "picker/section_jump").expect("Alt-l jumps sections");
-    assert_eq!(params["kind"], "keybindings");
-    assert_eq!(params["from_index"], 4);
-    assert_eq!(params["direction"], "forward");
+    assert!(no_request(&fx), "a keybinding row isn't a jump target");
+    assert_eq!(s.picker.as_ref().unwrap().selected, 4, "and nothing moves");
     let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
-    let params = find_request(&fx, "picker/section_jump").expect("Alt-h jumps back");
-    assert_eq!(params["direction"], "backward");
+    assert!(no_request(&fx));
+}
+
+#[test]
+fn alt_l_declines_the_create_row() {
+    use aether_protocol::picker::PickerKind;
+    // "+ Create …" makes something on disk. Alt-l sits next to Alt-j/k, so an overshoot must not
+    // create a file — that stays Enter's alone.
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj".into());
+        p.query = "novel.rs".into();
+        p.items = vec![];
+        p.total_matches = 0;
+        p.selected = 0;
+    }
+    assert!(
+        s.picker.as_ref().unwrap().selected_is_create(),
+        "fixture should land on the synthetic create row",
+    );
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().query, "novel.rs");
 }
 
 /// A collapsible picker window (docs/picker-groups.md): a.rs collapsed with 2 hidden hits,
@@ -1572,11 +1626,7 @@ fn alt_l_descends_into_the_selected_group() {
     s.picker.as_mut().unwrap().selected = 1;
     let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
     assert!(find_request(&fx, "picker/set_group").is_none());
-    assert!(find_request(&fx, "picker/section_jump").is_none());
     assert_eq!(s.picker.as_ref().unwrap().selected, 2);
-    // On an item row: as deep as it goes — nothing fires.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    assert!(no_request(&fx));
     // On a header that is NOT the open group (transient, post-re-rank): Alt-l re-selects
     // that group first — each press makes progress.
     s.picker.as_mut().unwrap().selected = 0;
@@ -1585,6 +1635,25 @@ fn alt_l_descends_into_the_selected_group() {
     assert_eq!(params["kind"], "grep");
     assert_eq!(params["header"]["relative_path"], "a.rs");
     assert!(params.get("step").is_none(), "header-addressed, not a step");
+}
+
+#[test]
+fn alt_l_on_a_group_item_opens_it() {
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // Header → first item (the descend above), then one press further: an item row has no level
+    // below it, so Alt-l opens the hit and the picker closes. It used to be a dead key here.
+    s.picker.as_mut().unwrap().selected = 1;
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/select").expect("Alt-l opens the hit");
+    assert_eq!(params["kind"], "grep");
+    assert_eq!(params["item"]["relative_path"], json!("b.rs"));
+    assert_eq!(params["item"]["line"], json!(1), "the run's first hit");
+    assert!(
+        s.picker.is_none(),
+        "opening closes the picker, as Enter does"
+    );
 }
 
 #[test]
@@ -3708,7 +3777,7 @@ fn written_clipboard(fx: &Effects) -> Option<String> {
 }
 
 #[test]
-fn explorer_alt_l_applies_common_prefix_completion() {
+fn explorer_alt_l_enters_the_highlighted_directory_in_one_press() {
     use aether_client::keymap::Mods;
     use aether_protocol::picker::{PickerItem, PickerKind};
 
@@ -3735,23 +3804,54 @@ fn explorer_alt_l_applies_common_prefix_completion() {
         p.total_matches = 2;
         p.offset = 0;
     }
-    // Alt-l — the accept/advance gesture everywhere — extends the query by the shared remainder
-    // (`her-`), then re-queries. Tab no longer completes anywhere in the app; it traverses fields.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    assert_eq!(s.picker.as_ref().unwrap().query, "aether-");
-    let requery = find_request(&fx, "picker/query").expect("alt-l re-queries");
-    assert_eq!(requery["query"], json!("aether-"));
-
-    // With no ghost left to adopt, the same chord falls through to descending into the selection —
-    // which re-lists the new directory from an empty query.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    let requery = find_request(&fx, "picker/query").expect("descending re-lists");
+    // Alt-j moves the highlight onto the second entry — and the ghost follows it, previewing the
+    // whole remainder of *that* name rather than the prefix the two entries share.
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     assert_eq!(
-        requery["query"],
-        json!(""),
-        "nothing left to complete — Alt-l descended instead of extending the query",
+        s.picker.as_ref().unwrap().explorer_completion().as_deref(),
+        Some("her-tui"),
     );
+
+    // Alt-l takes it: one press descends into the highlighted directory, however much of the name
+    // is typed and whatever the other matches happen to share. Descending re-lists from an empty
+    // query.
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let view = find_request(&fx, "picker/view").expect("alt-l descends via picker/view");
+    assert_eq!(view["directory_path"], json!("/proj/aether-tui"));
+    let requery = find_request(&fx, "picker/query").expect("descending re-lists");
+    assert_eq!(requery["query"], json!(""));
     assert_eq!(s.picker.as_ref().unwrap().query, "");
+}
+
+#[test]
+fn explorer_alt_l_opens_a_file() {
+    use aether_client::keymap::Mods;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj".into());
+        p.query = "ma".into();
+        p.items = vec![PickerItem::DirEntry {
+            name: "main.rs".into(),
+            is_dir: false,
+            match_indices: vec![],
+            git_status: None,
+        }];
+        p.total_matches = 1;
+        p.offset = 0;
+    }
+    // A file has no inside, so Alt-l opens it rather than descending — no re-list, no query
+    // rewrite (completing the name in place would only restate the highlight). It gets no ghost
+    // either: the ghost is what Alt-l would *descend* into.
+    assert_eq!(s.picker.as_ref().unwrap().explorer_completion(), None);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/view").is_none());
+    assert!(find_request(&fx, "picker/query").is_none());
+    let params = find_request(&fx, "picker/select").expect("Alt-l opens the file");
+    assert_eq!(params["item"]["name"], json!("main.rs"));
 }
 
 #[test]

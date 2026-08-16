@@ -410,47 +410,35 @@ impl PickerState {
         }
     }
 
-    /// Tab-completion ghost for the Explorer input: the longest common prefix shared by *all*
-    /// currently-matched entries, beyond what the query's filter part already spells (so the ghost
-    /// is what `Tab` would append). `None` for non-Explorer kinds, when not every match is in hand
-    /// (the filtered listing overflows the fetched window, so a hidden entry could break the
-    /// prefix), or when there's nothing left to add. An empty filter in a directory whose entries
-    /// all share a prefix still suggests it.
+    /// Completion ghost for the Explorer input: the rest of the *highlighted* directory's name
+    /// beyond what the query's filter part already spells — a preview of the row `Alt-l` will
+    /// descend into. The highlight is the selection, so `Alt-j`/`k` moves the ghost with it, which
+    /// is the model every other completing path field uses (`ChipEditor`, `PathEditor`): the ghost
+    /// is the one candidate the accept key takes, never a prefix shared across several.
+    ///
+    /// Files get no ghost. `Alt-l` opens one rather than descending into it, and a ghost is a
+    /// promise about the *input* — text that would be absorbed — which opening never delivers.
+    /// So the rule is "a ghost is what `Alt-l` would descend into", not "what it would do".
+    /// `None` too for non-Explorer kinds, a highlight outside the fetched window, the Roots view
+    /// (its rows carry no name — the label is client-derived), and when the filter already
+    /// spells the whole name.
+    ///
+    /// The filter part is a smartcase *prefix* of every matched name (the server filters the
+    /// Explorer with `MatchStrategy::PrefixSmartcase`), so skipping its length off the name always
+    /// lands on the remainder — the typed chars stay as typed even when they differ in case.
     pub fn explorer_completion(&self) -> Option<String> {
         if self.kind != PickerKind::Explorer {
             return None;
         }
-        // Only safe when the window holds every match — otherwise the "common" prefix is over a
-        // subset and could run longer than the true one.
-        if self.items.is_empty() || self.items.len() as u32 != self.total_matches {
+        let PickerItem::DirEntry {
+            name, is_dir: true, ..
+        } = self.selected_item()?
+        else {
             return None;
-        }
+        };
         let filter_len = explorer_query_split(&self.query).1.chars().count();
-        let mut names = self.items.iter().filter_map(|it| match it {
-            PickerItem::DirEntry { name, .. } => Some(name.as_str()),
-            _ => None,
-        });
-        let first = names.next()?;
-        // Longest common prefix length (in chars) across all matched names.
-        let mut lcp_len = first.chars().count();
-        for name in names {
-            let common = first
-                .chars()
-                .zip(name.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-            lcp_len = lcp_len.min(common);
-            if lcp_len <= filter_len {
-                return None;
-            }
-        }
-        (lcp_len > filter_len).then(|| {
-            first
-                .chars()
-                .skip(filter_len)
-                .take(lcp_len - filter_len)
-                .collect()
-        })
+        let suffix: String = name.chars().skip(filter_len).collect();
+        (!suffix.is_empty()).then_some(suffix)
     }
 
     fn explorer_pending_create(&self) -> Option<PendingCreate> {
@@ -1824,6 +1812,15 @@ mod tests {
     /// An Explorer window listing the given entry names (all files), with `total_matches` equal to
     /// the number of names (the whole directory fits the window).
     fn explorer_with(names: &[&str]) -> PickerState {
+        explorer_listing(names, false)
+    }
+
+    /// As [`explorer_with`], but every entry is a subdirectory — what the completion ghost previews.
+    fn explorer_dirs(names: &[&str]) -> PickerState {
+        explorer_listing(names, true)
+    }
+
+    fn explorer_listing(names: &[&str], is_dir: bool) -> PickerState {
         let mut s = PickerState::new(PickerKind::Explorer);
         s.directory = Some("/proj/src".into());
         s.apply_update(PickerUpdateParams {
@@ -1835,7 +1832,7 @@ mod tests {
                     .iter()
                     .map(|n| PickerItem::DirEntry {
                         name: (*n).into(),
-                        is_dir: false,
+                        is_dir,
                         match_indices: vec![],
                         git_status: None,
                     })
@@ -1897,37 +1894,46 @@ mod tests {
     }
 
     #[test]
-    fn explorer_completion_suggests_common_prefix_beyond_the_query() {
-        // A single match → complete the rest of its name.
-        let mut s = explorer_with(&["crates"]);
+    fn explorer_completion_previews_the_highlighted_entry() {
+        // The rest of the highlighted name, beyond what's typed.
+        let mut s = explorer_dirs(&["crates"]);
         s.query = "cra".into();
         assert_eq!(s.explorer_completion().as_deref(), Some("tes"));
 
-        // Several matches sharing a prefix, empty query → suggest the whole shared prefix.
-        let mut s = explorer_with(&["aether-protocol", "aether-server", "aether-tui"]);
+        // Entries sharing a prefix: the ghost is the *highlighted* one, not the shared prefix —
+        // moving the highlight (Alt-j/k) moves the ghost with it.
+        let mut s = explorer_dirs(&["aether-protocol", "aether-server", "aether-tui"]);
         s.query = "".into();
-        assert_eq!(s.explorer_completion().as_deref(), Some("aether-"));
-        // Once the query reaches the shared prefix, the entries diverge → nothing to add.
+        assert_eq!(s.explorer_completion().as_deref(), Some("aether-protocol"));
+        s.selected = 2;
+        assert_eq!(s.explorer_completion().as_deref(), Some("aether-tui"));
+        // Typing past the shared prefix keeps previewing the highlight, not the divergence point.
         s.query = "aether-".into();
-        assert_eq!(s.explorer_completion(), None);
-        // Partway in, still suggests the remainder up to the divergence.
+        assert_eq!(s.explorer_completion().as_deref(), Some("tui"));
         s.query = "aet".into();
-        assert_eq!(s.explorer_completion().as_deref(), Some("her-"));
+        assert_eq!(s.explorer_completion().as_deref(), Some("her-tui"));
+        // Nothing left to add once the filter spells the whole name.
+        s.query = "aether-tui".into();
+        assert_eq!(s.explorer_completion(), None);
     }
 
     #[test]
-    fn explorer_completion_holds_off_until_all_matches_are_in_hand() {
-        // A windowed listing (more matches than rows shown) can't prove a common prefix.
-        let mut s = explorer_with(&["aether-a", "aether-b"]);
-        s.query = "".into();
-        s.total_matches = 5; // two shown, five total → don't guess
+    fn explorer_completion_only_offers_what_alt_l_can_take() {
+        // Files are Enter's, not Alt-l's — no ghost to accept.
+        let mut s = explorer_with(&["main.rs"]);
+        s.query = "ma".into();
+        assert_eq!(s.explorer_completion(), None);
+        // A highlight outside the fetched window has no row to preview.
+        let mut s = explorer_dirs(&["aether-a", "aether-b"]);
+        s.total_matches = 5;
+        s.selected = 4;
         assert_eq!(s.explorer_completion(), None);
         // No matches at all → nothing.
-        let mut s = explorer_with(&[]);
+        let mut s = explorer_dirs(&[]);
         s.query = "zzz".into();
         assert_eq!(s.explorer_completion(), None);
         // Not the Explorer → never.
-        let mut s = explorer_with(&["aaa", "aab"]);
+        let mut s = explorer_dirs(&["aaa", "aab"]);
         s.kind = PickerKind::Files;
         assert_eq!(s.explorer_completion(), None);
     }
@@ -1935,10 +1941,10 @@ mod tests {
     #[test]
     fn explorer_completion_respects_the_query_path_part() {
         // The completion applies to the filter part (after the last `/`), not the whole query:
-        // entries `alpha`/`alps` share `alp`, and with filter `al` the suffix is just `p`.
-        let mut s = explorer_with(&["alpha", "alps"]);
+        // with filter `al` against the highlighted `alpha`, the suffix is `pha`.
+        let mut s = explorer_dirs(&["alpha", "alps"]);
         s.query = "src/al".into();
-        assert_eq!(s.explorer_completion().as_deref(), Some("p"));
+        assert_eq!(s.explorer_completion().as_deref(), Some("pha"));
     }
 
     #[test]

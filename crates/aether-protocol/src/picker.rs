@@ -1165,31 +1165,6 @@ pub struct PickerHideParams {
     pub kind: PickerKind,
 }
 
-/// Move a picker's selection to the next/previous *section* boundary — the grouping is per-kind:
-/// Grep groups hits into contiguous per-file runs (jump to the next/previous file's first hit);
-/// DocumentSymbols groups by top-level unit (jump to the next/previous depth-0 symbol). Computed
-/// server-side against the full result list, so it works even when the target is past the client's
-/// over-fetched window — the client then frames the returned item via `picker/view { center_on }`.
-///
-/// `Forward` → the next section. `Backward` → the start of the *current* section, or, if the
-/// selection is already there, the start of the previous section (vim-`{` feel). Returns `None`
-/// when there's no further section in that direction (already at the first / last).
-pub struct PickerSectionJump;
-impl RpcMethod for PickerSectionJump {
-    const NAME: &'static str = "picker/section_jump";
-    type Params = PickerSectionJumpParams;
-    type Result = Option<PickerItem>;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PickerSectionJumpParams {
-    /// Which picker to act on (the client's open one).
-    pub kind: PickerKind,
-    /// The selection's current absolute index in the result list (`offset + selected`).
-    pub from_index: u32,
-    pub direction: Direction,
-}
-
 // ---- group spans ----------------------------------------------------------------------------
 
 /// What a group's header row shows. Presentation-neutral, like the items: `File` carries the

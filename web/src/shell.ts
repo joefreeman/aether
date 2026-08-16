@@ -362,8 +362,8 @@ interface PickerView {
   expanded_run: { header_row: number; len: number } | null;
   directory: string | null;
   directory_parent: string | null;
-  /** Explorer tab-completion ghost: the common-prefix suffix `Tab` would append, shown dim after
-   *  the query. Null when there's nothing to complete. */
+  /** Explorer completion ghost: the rest of the highlighted directory's name, shown dim after the
+   *  query — the row `Alt-l` descends into. Null when there's no such row. */
   completion: string | null;
   /** The Explorer's synthetic "+ Create …" affordance (view.rs `create`); null when not offered.
    *  `abs` is its selection index, one past the last match. */
@@ -3753,8 +3753,11 @@ export class Shell {
     const prefix = p.kind === "explorer" ? explorerPrefix(p.directory, v.workspace_paths) : "";
     this.pickerPathEl.textContent = prefix;
     this.pickerPathEl.style.display = prefix ? "" : "none";
-    // The breadcrumb already says where typing acts; otherwise show the per-kind hint.
-    this.pickerInput.placeholder = prefix ? "" : PLACEHOLDER[p.kind];
+    // The breadcrumb already says where typing acts; otherwise show the per-kind hint. A completion
+    // ghost says it too — and it's drawn *over* the input, from the same x as the placeholder when
+    // the query is empty, so the two would render on top of each other (native-client parity: iced
+    // and the TUI suppress the placeholder for either).
+    this.pickerInput.placeholder = prefix || p.completion ? "" : PLACEHOLDER[p.kind];
     // The input is the source of truth for the text while focused; only write when the core changed
     // it out from under us (grep priming, a seeded open) to avoid clobbering the caret mid-type.
     if (this.pickerInput.value !== p.query) this.pickerInput.value = p.query;
@@ -4415,6 +4418,9 @@ export class Shell {
       row.className = i === localSel ? "picker-row selected" : "picker-row";
       if (item.kind === "grep_hit" || item.kind === "git_change") row.classList.add("grep-hit");
       if (item.kind === "keybinding") row.classList.add("keybinding");
+      // Symbol rows put a signature in the suffix, which can run far longer than the row — the
+      // class flips the usual name-shrinks-first order (see `.picker-row.symbol` in theme.css).
+      if (item.kind === "symbol") row.classList.add("symbol");
       if (i === localSel) selectedRow = row;
       row.addEventListener("mousedown", (e: MouseEvent) => {
         // New-tab gesture on an anchor row: let the browser open the <a> itself.

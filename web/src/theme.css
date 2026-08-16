@@ -1196,6 +1196,26 @@ a.picker-row:not(.selected):hover .picker-main {
 /* Dim suffix right after the primary text (multi-root file rows: the root's name) — the path
    shrinks/ellipsizes first, like the terminal's budget math. */
 .picker-suffix { flex: 0 0 auto; color: var(--fg-muted); }
+/* Symbol rows invert that order. Their suffix is the signature, which can run many times the row's
+   width (`fn( key: &iced::keyboard::Key, modified_key: …, ) -> Option<KeyCode>`), while the name is
+   what you came to the picker for — so the signature yields every pixel before the name loses one,
+   and the kind tag never shrinks at all.
+
+   This is the terminal client's budget math (`symbol_row_spans`) expressed in flexbox: reserve the
+   kind tag, give the name the rest, let `detail` have what survives. `flex-basis: 0` is what makes
+   it exact — the signature's hypothetical size is zero, so it contributes nothing to the row's
+   overflow and simply *grows* into whatever space the name and tag leave behind. When the name
+   alone overruns the row there's no free space to grow into, the signature is already zero-width,
+   and the name (still `flex-shrink: 1` from `.picker-main`) takes the truncation itself. Weighting
+   the shrink factors instead would leave the name a sliver short and cost it a character to the
+   ellipsis even when the row nearly fits. */
+.picker-row.symbol .picker-suffix {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.picker-row.symbol .picker-meta { flex: 0 0 auto; }
 .picker-dir { color: var(--accent); } /* directories in frost blue, matching the terminal UI */
 /* Dimmed explorer entries — .gitignore'd files/folders (same shade for both: the trailing `/`
    already tells dirs apart). A lighter gray, legible on both the normal and selected backgrounds

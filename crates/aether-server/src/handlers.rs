@@ -66,7 +66,7 @@ use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
     BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
-    PickerReset, PickerSectionJumpParams, PickerSelectParams, PickerSelectResult,
+    PickerReset, PickerSelectParams, PickerSelectResult,
     PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
     PickerViewResult,
 };
@@ -14359,82 +14359,6 @@ pub async fn jumplist_step(
     Ok(JumplistStepResult::Moved(Box::new(target)))
 }
 
-/// Move a picker's selection to the next / previous *section* — the header-grouped kinds jump
-/// by group run (`PickerState::group_boundary`, the same grouping as the pushed spans);
-/// DocumentSymbols jumps by top-level unit. Computed against the full cached result list so it
-/// works past the client's over-fetch window; the client frames the returned item via
-/// `picker/view { center_on }`. `None` when there's no further section that way.
-pub async fn picker_section_jump(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: PickerSectionJumpParams,
-) -> Result<Option<PickerItem>, RpcError> {
-    let client_id = ctx.client_id;
-    let s = state.lock().await;
-    let Some(picker) = s.pickers.get(&(client_id, params.kind)) else {
-        return Ok(None);
-    };
-    match &picker.candidates {
-        // Top-level units are the depth-0 rows of the (ranked, display-order) outline. Work in
-        // ranked-position space so a query filter is respected; map back to a candidate index for
-        // the returned item.
-        picker_state::PickerCandidates::Symbols(syms) => {
-            let ranked = &picker.ranked;
-            if ranked.is_empty() {
-                return Ok(None);
-            }
-            let from = (params.from_index as usize).min(ranked.len() - 1);
-            let Some(pos) = symbol_unit_boundary(syms, ranked, from, params.direction) else {
-                return Ok(None);
-            };
-            Ok(Some(
-                picker
-                    .candidates
-                    .make_item(ranked[pos] as usize, Vec::new()),
-            ))
-        }
-        // Every header-grouped kind (grep and git-changes file runs, keybinding groups,
-        // reference sections, workspace-diagnostic files): one generic ranked-space boundary
-        // walk off the same grouping that produces the pushed spans, so the jump always lands
-        // on a row a client renders a header above.
-        _ => Ok(picker
-            .group_boundary(params.from_index as usize, params.direction)
-            .map(|pos| {
-                picker
-                    .candidates
-                    .make_item(picker.ranked[pos] as usize, Vec::new())
-            })),
-    }
-}
-
-/// Ranked position of the next / previous top-level (depth-0) symbol, mirroring
-/// `PickerState::group_boundary`'s feel. `Forward` → the next depth-0 row. `Backward` → this
-/// unit's own header (the nearest depth-0 row at or before `from`) when the selection sits below
-/// it, else the previous unit's header. `None` when there's no further unit that way.
-fn symbol_unit_boundary(
-    syms: &[picker_state::SymbolCandidate],
-    ranked: &[u32],
-    from: usize,
-    direction: Direction,
-) -> Option<usize> {
-    let is_top = |pos: usize| syms[ranked[pos] as usize].depth == 0;
-    match direction {
-        Direction::Forward => (from + 1..ranked.len()).find(|&j| is_top(j)),
-        Direction::Backward => {
-            // Walk back to this unit's header (nearest depth-0 at or before `from`).
-            let mut start = from;
-            while start > 0 && !is_top(start) {
-                start -= 1;
-            }
-            if is_top(start) && start < from {
-                return Some(start); // below the header → jump up to it
-            }
-            // Already on the header (or none above) → the previous unit's header.
-            (0..start).rev().find(|&j| is_top(j))
-        }
-    }
-}
-
 #[cfg(test)]
 mod document_highlight_tests {
     use super::*;
@@ -14516,61 +14440,6 @@ mod document_highlight_tests {
             render_matches(&st, client, buffer).map(|e| e.query.as_str()),
             Some("needle")
         );
-    }
-}
-
-#[cfg(test)]
-mod symbol_unit_boundary_tests {
-    use super::*;
-    use aether_protocol::LogicalPosition;
-
-    // Outline (depth): A(0) a1(1) a2(1) B(0) b1(1) C(0). Ranked is identity (no query filter).
-    fn sym(depth: u32) -> picker_state::SymbolCandidate {
-        picker_state::SymbolCandidate {
-            abs_path: String::new(),
-            start: LogicalPosition { line: 0, col: 0 },
-            end: LogicalPosition { line: 0, col: 0 },
-            name: String::new(),
-            symbol_kind: aether_protocol::picker::SymbolKind::Function,
-            detail: String::new(),
-            depth,
-            range_start: LogicalPosition { line: 0, col: 0 },
-            range_end: LogicalPosition { line: 0, col: 0 },
-        }
-    }
-
-    fn fixture() -> (Vec<picker_state::SymbolCandidate>, Vec<u32>) {
-        let syms = vec![sym(0), sym(1), sym(1), sym(0), sym(1), sym(0)];
-        let ranked = (0..syms.len() as u32).collect();
-        (syms, ranked)
-    }
-
-    #[test]
-    fn forward_jumps_to_the_next_top_level_unit() {
-        let (s, r) = fixture();
-        // From the `A` header → next top-level is `B` (idx 3).
-        assert_eq!(symbol_unit_boundary(&s, &r, 0, Direction::Forward), Some(3));
-        // From inside `A` (a child) → still `B`, skipping `A`'s children.
-        assert_eq!(symbol_unit_boundary(&s, &r, 1, Direction::Forward), Some(3));
-        // From the last unit `C` → nothing further.
-        assert_eq!(symbol_unit_boundary(&s, &r, 5, Direction::Forward), None);
-    }
-
-    #[test]
-    fn backward_snaps_to_the_unit_header_then_to_the_previous_unit() {
-        let (s, r) = fixture();
-        // From inside `B` (child idx 4) → jump up to `B`'s header (idx 3).
-        assert_eq!(
-            symbol_unit_boundary(&s, &r, 4, Direction::Backward),
-            Some(3)
-        );
-        // Already on `B`'s header (idx 3) → the previous unit `A` (idx 0).
-        assert_eq!(
-            symbol_unit_boundary(&s, &r, 3, Direction::Backward),
-            Some(0)
-        );
-        // On the first unit's header → nothing before it.
-        assert_eq!(symbol_unit_boundary(&s, &r, 0, Direction::Backward), None);
     }
 }
 

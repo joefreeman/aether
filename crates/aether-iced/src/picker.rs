@@ -286,7 +286,8 @@ pub fn overlay<'a>(
     let show_placeholder = prefix.is_none() && chip_row.is_empty();
     // The query: a real `text_input` synced to the core (web parity). Bright value, accent
     // caret/selection, dim placeholder, no border/background (the input row's bg is the box).
-    // The Explorer's tab-completion ghost: the common-prefix suffix `Tab` would append.
+    // The Explorer's completion ghost: the rest of the highlighted directory's name, which `Alt-l`
+    // descends into.
     let completion = state.explorer_completion().filter(|s| !s.is_empty());
     // A completion ghost is itself the "what typing does" hint, so it also suppresses the
     // placeholder (like the breadcrumb / chip row do).

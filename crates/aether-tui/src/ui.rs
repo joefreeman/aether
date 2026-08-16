@@ -2194,8 +2194,8 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let (chip_spans, chips_w) = picker_chip_spans(state, chip_budget(total_width, prefix_w));
     let prefix_has_content = prefix_w > 0 || chips_w > 0;
 
-    // The explorer tab-completion ghost: the common-prefix suffix `Tab` would append, dim after
-    // the query (even when the query is empty — a fresh dir whose entries all share a prefix).
+    // The explorer completion ghost: the rest of the highlighted directory's name, dim after the
+    // query (even when the query is empty — then it spells the highlighted row outright).
     let ghost = state
         .picker
         .completion

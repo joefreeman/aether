@@ -1809,24 +1809,6 @@ fn workspace_delete_params_round_trip() {
 }
 
 #[test]
-fn picker_section_jump_round_trips() {
-    use aether_protocol::cursor::Direction;
-    use aether_protocol::picker::{PickerKind, PickerSectionJump, PickerSectionJumpParams};
-    assert_eq!(PickerSectionJump::NAME, "picker/section_jump");
-    let p = PickerSectionJumpParams {
-        kind: PickerKind::DocumentSymbols,
-        from_index: 7,
-        direction: Direction::Backward,
-    };
-    let v = to_value(&p).unwrap();
-    assert_eq!(v["from_index"], 7);
-    let back: PickerSectionJumpParams = serde_json::from_value(v).unwrap();
-    assert_eq!(back.from_index, 7);
-    assert!(matches!(back.kind, PickerKind::DocumentSymbols));
-    assert!(matches!(back.direction, Direction::Backward));
-}
-
-#[test]
 fn path_delete_round_trips() {
     use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
     assert_eq!(PathDelete::NAME, "path/delete");
