@@ -70,6 +70,16 @@ impl ErrorCode {
     /// typo, or a branch that only exists on a remote). The previous baseline is left in force —
     /// a bad revision never silently drops the user back to HEAD.
     pub const UNKNOWN_REVISION: Self = Self(-32041);
+    /// A *mutating* git RPC named a repo the workspace can only see through an open buffer — a
+    /// dependency checkout a goto-definition wandered into, say. Reads there are fine; writes are
+    /// refused, because the user never opened it for editing. Add it as a workspace root to write
+    /// to it. See `GitRepoInfo::roots`.
+    pub const REPO_NOT_WRITABLE: Self = Self(-32042);
+    /// A git RPC that resolves its own repo found more than one candidate and no hint good enough
+    /// to choose between them. The client should ask the user (a repo chooser) and retry with an
+    /// explicit `repo_id`. Guessing is not an option: committing to the wrong repo isn't
+    /// recoverable by pressing undo.
+    pub const AMBIGUOUS_REPO: Self = Self(-32043);
 
     pub fn code(self) -> i32 {
         self.0

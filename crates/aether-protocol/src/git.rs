@@ -288,6 +288,104 @@ pub enum GitHead {
     Unborn { name: String },
 }
 
+// ---- git/prepare_commit + git/commit -------------------------------------------------------------
+
+/// Write the commit-message template to the repo's `COMMIT_EDITMSG` and report where it is.
+///
+/// The message is composed in an ordinary buffer on an ordinary file, so the whole editor works on
+/// it: undo, search, the jumplist, syntax highlighting. That's why this is two RPCs rather than a
+/// `git/commit { message }` — the alternative is reimplementing a text editor inside a dialog, in
+/// an editor.
+///
+/// `docs/todo.md` originally proposed doing this through `GIT_EDITOR` and the tether. That path
+/// still exists and is still wanted for operations git itself must drive (`rebase -i` via
+/// `GIT_SEQUENCE_EDITOR`), but for a plain commit it spawns a second client process to write a
+/// message in the client the user is already sitting in.
+pub struct GitPrepareCommit;
+impl RpcMethod for GitPrepareCommit {
+    const NAME: &'static str = "git/prepare_commit";
+    type Params = GitPrepareCommitParams;
+    type Result = GitPrepareCommitResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitPrepareCommitParams {
+    /// Which repo to commit to. Omit to let the server resolve it — from `buffer_id`'s repo, or
+    /// from the workspace when it holds exactly one. Resolution lives server-side because that's
+    /// where the buffer→repo mapping already is; a client that had to work it out would need
+    /// `git/repos` plus a copy of the rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    /// The buffer the user is looking at, as the resolution hint. Ignored when `repo_id` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Amend the previous commit: the template is prefilled with its message, and the commit that
+    /// follows must pass the same flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub amend: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPrepareCommitResult {
+    /// The repo this resolved to. Echoed so the follow-up [`GitCommit`] targets exactly what was
+    /// prepared, even if the user has moved to another buffer in the meantime.
+    pub repo_id: RepoId,
+    /// Absolute path of the message file to open. Lives in the repo's *own* git dir, so a linked
+    /// worktree composes its message independently of the main checkout.
+    pub path: String,
+    /// What would be committed, for the client to show — and to decide whether it's worth opening
+    /// a buffer at all. Empty with `amend: false` means `git commit` would refuse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged: Vec<StagedFile>,
+}
+
+/// One path in the index, with the word git would use for it in `git status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedFile {
+    /// Repo-relative, forward-slash.
+    pub path: String,
+    /// `new file`, `modified`, `deleted`, `renamed`, `typechange` — git's own vocabulary, so the
+    /// comment block reads like `git status` and clients need no mapping table.
+    pub status: String,
+}
+
+/// Commit what's staged, using the message left in `COMMIT_EDITMSG` by [`GitPrepareCommit`].
+///
+/// Runs the real `git commit`, so hooks fire (`pre-commit`, `commit-msg`) and signing works —
+/// the reason writes shell out at all. `--cleanup=strip` drops the comment lines, and an empty
+/// message aborts, exactly as it would in a terminal.
+///
+/// A refusal is **not** an RPC error: a failing `pre-commit` hook is an ordinary, expected outcome
+/// whose output the user needs to read. It comes back as `commit: None` with git's own stderr.
+pub struct GitCommit;
+impl RpcMethod for GitCommit {
+    const NAME: &'static str = "git/commit";
+    type Params = GitCommitParams;
+    type Result = GitCommitResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitCommitParams {
+    pub repo_id: RepoId,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub amend: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommitResult {
+    /// The commit that was created. `None` when git refused — see `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<CommitInfo>,
+    /// git's own output when it refused, verbatim and unparsed: a hook's complaint, "nothing to
+    /// commit", "empty commit message". Empty on success. Show it as a terminal would.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// The reconciliation that followed. Rarely interesting for a commit — but `pre-commit` hooks
+    /// routinely rewrite files (formatters), and those buffers have to be picked up.
+    #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
+    pub refreshed: GitRefreshResult,
+}
+
 // ---- git/set_baseline ---------------------------------------------------------------------------
 
 /// Diff a repo against a revision other than HEAD — "what have I changed since I branched?",
@@ -383,6 +481,12 @@ pub struct GitRefreshResult {
     /// flagged externally-deleted; their content survives in memory and a save recreates the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<BufferId>,
+}
+
+impl GitRefreshResult {
+    pub fn is_empty(&self) -> bool {
+        self.reloaded.is_empty() && self.diverged.is_empty() && self.missing.is_empty()
+    }
 }
 
 // ---- git/blame_changed (notification) -----------------------------------------------------------

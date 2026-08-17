@@ -9165,3 +9165,310 @@ fn explicit_boot_presentation_overrides_default_and_jump_rules() {
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "buffer/content");
 }
+
+// -------- git commit (Space t) --------------------------------------------------------------------
+
+/// The whole gesture as a state machine: `Space t` asks the server to prepare a message, the
+/// answer opens that file as a buffer, and `Space Alt-x` in it saves and then commits.
+#[test]
+fn space_t_prepares_a_commit_and_alt_x_commits_it() {
+    let mut s = session();
+
+    let fx = leader(&mut s, 't');
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "git/prepare_commit");
+    // The repo is resolved server-side from the buffer we're on — no `git/repos` round trip.
+    assert_eq!(params["buffer_id"], json!(s.buffer.buffer_id));
+    assert!(params.get("amend").is_none(), "plain commit sends no amend");
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "repo_id": "/src/aether",
+            "path": "/src/aether/.git/COMMIT_EDITMSG",
+            "staged": [{"path": "a.rs", "status": "modified"}],
+        })),
+    );
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/open");
+    assert_eq!(
+        params["absolute_path"],
+        json!("/src/aether/.git/COMMIT_EDITMSG")
+    );
+    // Never transient: a preview auto-closes when hidden, which would discard a half-written
+    // message the moment the user glanced at another file.
+    assert_eq!(params["transient"], json!(false));
+
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 42,
+            "line_count": 8,
+            "byte_count": 200,
+            "revision": 1,
+            "saved_revision": 1,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+    assert_eq!(
+        s.pending_commit.as_ref().map(|p| p.buffer_id),
+        Some(42),
+        "the open is what mints the buffer id, so the pending commit adopts it"
+    );
+
+    // `Space Alt-x` in the commit buffer: save first, so `git commit -F` reads what was written.
+    let fx = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    assert!(no_request(&fx));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/save");
+
+    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "git/commit", "the save is followed by the commit");
+    assert_eq!(
+        params["repo_id"],
+        json!("/src/aether"),
+        "the repo that was prepared"
+    );
+    // One gesture, one report: the intermediate save doesn't toast, or "Saved" and "Committed"
+    // stack up and it reads as two things happening.
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })),
+        "the save on the way to a commit is silent"
+    );
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "commit": {
+                "commit": "a1b2c3d4e5f6",
+                "author": "Ada",
+                "email": "ada@example.com",
+                "date": "2026-08-17 10:00:00 +0100",
+                "message": "Add a line\n\nBody.",
+            }
+        })),
+    );
+    assert!(s.pending_commit.is_none(), "the commit is done");
+    let toast =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Toast { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("a toast reports the commit");
+    assert!(toast.contains("a1b2c3d"), "short hash: {toast}");
+    assert!(toast.contains("Add a line"), "subject only: {toast}");
+    assert!(!toast.contains("Body."), "not the whole message: {toast}");
+}
+
+/// Nothing staged is caught before a buffer is opened — `git commit` would only refuse *after*
+/// the user had written a message.
+#[test]
+fn preparing_a_commit_with_nothing_staged_opens_no_buffer() {
+    let mut s = session();
+    let fx = leader(&mut s, 't');
+    let (token, _, _) = the_request(&fx);
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({"repo_id": "/src/aether", "path": "/src/aether/.git/COMMIT_EDITMSG"})),
+    );
+    assert!(no_request(&fx), "no buffer is opened");
+    assert!(s.pending_commit.is_none());
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Toast { message, .. } if message.contains("Nothing staged")
+        )),
+        "the user is told why nothing happened"
+    );
+}
+
+/// A refused commit — a failing `pre-commit` hook — keeps the buffer open with the message
+/// intact, and shows git's own words. Losing what you wrote because a linter complained would be
+/// its own bug.
+#[test]
+fn a_refused_commit_keeps_the_message_buffer_open() {
+    let mut s = session();
+    let fx = leader(&mut s, 't');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "repo_id": "/src/aether",
+            "path": "/src/aether/.git/COMMIT_EDITMSG",
+            "staged": [{"path": "a.rs", "status": "modified"}],
+        })),
+    );
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 42,
+            "line_count": 8,
+            "byte_count": 200,
+            "revision": 1,
+            "saved_revision": 1,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let (token, _, _) = the_request(&fx);
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({"message": "lint failed: tabs everywhere"})),
+    );
+    assert!(no_request(&fx), "no close — the buffer stays put");
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Toast { message, .. } if message.contains("lint failed: tabs everywhere")
+        )),
+        "git's own words, unedited"
+    );
+}
+
+/// `Space Alt-t` amends: the flag rides the prepare *and* the commit, or the message would be
+/// written for one and applied as the other.
+#[test]
+fn space_alt_t_amends() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None, ROWS);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "git/prepare_commit");
+    assert_eq!(params["amend"], json!(true));
+
+    let fx = s.on_rpc_result(
+        token,
+        // No staged files, which for an amend is fine: rewording stages nothing.
+        Ok(json!({"repo_id": "/src/aether", "path": "/src/aether/.git/COMMIT_EDITMSG"})),
+    );
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(
+        method, "buffer/open",
+        "an amend opens the buffer regardless"
+    );
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 7,
+            "line_count": 8,
+            "byte_count": 200,
+            "revision": 1,
+            "saved_revision": 1,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "git/commit");
+    assert_eq!(
+        params["amend"],
+        json!(true),
+        "the flag must match the prepare"
+    );
+}
+
+/// Pressing `Space t` again while a message is being written must *switch to* it, not prepare
+/// over it: rewriting `COMMIT_EDITMSG` under a dirty buffer flags it externally-modified, and the
+/// save on the way to the commit then refuses — losing the message to a keystroke meant to
+/// resume it.
+#[test]
+fn space_t_again_resumes_the_message_instead_of_overwriting_it() {
+    let mut s = session();
+    let fx = leader(&mut s, 't');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "repo_id": "/src/aether",
+            "path": "/src/aether/.git/COMMIT_EDITMSG",
+            "staged": [{"path": "a.rs", "status": "modified"}],
+        })),
+    );
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 42,
+            "line_count": 8,
+            "byte_count": 200,
+            "revision": 1,
+            "saved_revision": 1,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+
+    // On the message buffer already: nothing is sent, and the user is reminded how to finish.
+    let fx = leader(&mut s, 't');
+    assert!(no_request(&fx), "no second prepare");
+    assert!(fx.0.iter().any(|e| matches!(
+        e,
+        Effect::Toast { message, .. } if message.contains("Already writing")
+    )));
+
+    // From another buffer: switch back to it by id, still without re-preparing.
+    s.buffer.buffer_id = 7;
+    let fx = leader(&mut s, 't');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "buffer/open");
+    assert_eq!(
+        params["buffer_id"],
+        json!(42),
+        "attach to the existing message"
+    );
+    assert!(params.get("absolute_path").is_none(), "not a fresh prepare");
+}
+
+/// Abandoning the message (closing its buffer) abandons the commit — otherwise the pending entry
+/// outlives its buffer and `Space t` would later "resume" a buffer id that no longer exists.
+#[test]
+fn closing_the_message_buffer_abandons_the_commit() {
+    let mut s = session();
+    let fx = leader(&mut s, 't');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "repo_id": "/src/aether",
+            "path": "/src/aether/.git/COMMIT_EDITMSG",
+            "staged": [{"path": "a.rs", "status": "modified"}],
+        })),
+    );
+    let (token, _, _) = the_request(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "buffer_id": 42,
+            "line_count": 8,
+            "byte_count": 200,
+            "revision": 1,
+            "saved_revision": 1,
+            "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+        })),
+    );
+    assert!(s.pending_commit.is_some());
+
+    let _ = leader(&mut s, 'x'); // Space x — close buffer
+    assert!(
+        s.pending_commit.is_none(),
+        "the commit went with the buffer that held its message"
+    );
+
+    // And a fresh `Space t` genuinely prepares again rather than resuming a dead buffer.
+    let fx = leader(&mut s, 't');
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "git/prepare_commit");
+}

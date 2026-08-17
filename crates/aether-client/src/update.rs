@@ -16,9 +16,9 @@ use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT,
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AfterSave,
     AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
-    HoverBlock, HoverText, Mode, PasteKind, Pending, Prompt, ReadView, ReloadTry, RepeatTarget,
-    SaveTry, SearchSnapshot, SearchState, Session, SettingsRow, SneakState, TextField,
-    WorkspaceSettings,
+    HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView, ReloadTry,
+    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SettingsRow, SneakState,
+    TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -46,9 +46,10 @@ use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitNavigateHunk,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCommit, GitCommitParams,
+    GitCommitResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitSetBlameFollow,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -198,6 +199,13 @@ pub enum Event {
     FormatDone(Result<LspFormatResult, String>),
     CommitLookup(Result<CommitDetails, String>),
     HunkNav(Result<GitNavigateHunkResult, String>),
+    /// `git/prepare_commit` came back: the message file is written and ready to open.
+    CommitPrepared {
+        amend: bool,
+        result: Result<GitPrepareCommitResult, String>,
+    },
+    /// `git/commit` came back — created, or refused with git's own words.
+    Committed(Result<GitCommitResult, String>),
     HunkApplied {
         action: HunkAction,
         result: Result<GitApplyHunkResult, String>,
@@ -541,7 +549,17 @@ impl Session {
                 self.paste(kind, text)
             }
 
-            Event::Switched(Ok(open)) => self.adopt_navigation(open),
+            Event::Switched(Ok(open)) => {
+                // A commit prepared just before this open has been waiting for its buffer id
+                // (the open is what mints it). Anything else clears the wait: the user navigated
+                // away instead, so there is no commit buffer to confirm.
+                if let Some(pending) = self.pending_commit.as_mut() {
+                    if pending.buffer_id == 0 {
+                        pending.buffer_id = open.buffer_id;
+                    }
+                }
+                self.adopt_navigation(open)
+            }
             Event::Switched(Err(e)) => {
                 // A failed jump-shaped open must not leave its flag armed for the next
                 // (unrelated) switch — it would wrongly land a markdown file in the editor.
@@ -883,6 +901,81 @@ impl Session {
 
             Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more changes"),
             Event::HunkNav(Err(e)) => Effects::error(e),
+
+            Event::CommitPrepared { amend, result } => match result {
+                Ok(prepared) => {
+                    // Nothing staged is the overwhelmingly common mistake, and `git commit` would
+                    // only refuse *after* we'd opened a buffer and made the user write a message.
+                    // Amending is exempt: rewording the previous commit stages nothing.
+                    if prepared.staged.is_empty() && !amend {
+                        return Effects::toast("Nothing staged to commit", ToastKind::Info);
+                    }
+                    let summary = if amend {
+                        "Amending — write the message, then Space Alt-x".to_string()
+                    } else {
+                        format!(
+                            "Committing {} file{} — write the message, then Space Alt-x",
+                            prepared.staged.len(),
+                            if prepared.staged.len() == 1 { "" } else { "s" }
+                        )
+                    };
+                    let repo_id = prepared.repo_id.clone();
+                    // Not transient: a preview auto-closes when hidden, and a half-written commit
+                    // message vanishing because you glanced at another file would be its own bug.
+                    let mut fx = self.request_str::<BufferOpen>(
+                        BufferOpenParams {
+                            absolute_path: Some(prepared.path),
+                            transient: Some(false),
+                            record_nav_from: Some(self.buffer.buffer_id),
+                            ..Default::default()
+                        },
+                        Event::Switched,
+                    );
+                    // The buffer id isn't known until the open lands, so park the rest and let
+                    // `Switched` attach it (see `adopt_pending_commit`).
+                    self.pending_commit = Some(PendingCommit {
+                        buffer_id: 0,
+                        repo_id,
+                        amend,
+                    });
+                    fx.push(Effect::Toast {
+                        message: summary,
+                        kind: ToastKind::Info,
+                        group: None,
+                    });
+                    fx
+                }
+                Err(e) => Effects::error(e),
+            },
+
+            Event::Committed(result) => match result {
+                Ok(res) => {
+                    self.pending_commit = None;
+                    match res.commit {
+                        Some(commit) => {
+                            let subject = commit
+                                .message
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            let short: String = commit.commit.chars().take(7).collect();
+                            let mut fx = self.close_buffer();
+                            fx.push(Effect::Toast {
+                                message: format!("Committed {short} — {subject}"),
+                                kind: ToastKind::Success,
+                                group: None,
+                            });
+                            fx
+                        }
+                        // A refusal keeps the buffer open with the message intact: a failing
+                        // `pre-commit` hook is something you fix and retry, not something that
+                        // should cost you what you wrote. git's own words, unedited.
+                        None => Effects::toast(res.message, ToastKind::Warning),
+                    }
+                }
+                Err(e) => Effects::error(e),
+            },
 
             Event::HunkApplied { action, result } => match result {
                 Ok(r) => {
@@ -1668,7 +1761,13 @@ impl Session {
                     }
                     None => format!("Saved (rev {})", result.revision),
                 };
-                let mut fx = Effects::toast(note, ToastKind::Success);
+                // A save that exists only to feed the commit isn't news — the commit's own toast
+                // is the outcome, and stacking both makes one gesture look like two.
+                let mut fx = if after == AfterSave::Commit {
+                    Effects::none()
+                } else {
+                    Effects::toast(note, ToastKind::Success)
+                };
                 match after {
                     AfterSave::Nothing => {}
                     // Save-and-quit (`Space Alt-q`): the save landed, so close the window — the
@@ -1677,6 +1776,20 @@ impl Session {
                     // Save-and-close (`Space Alt-x`): the buffer is clean now, so this close
                     // never re-prompts — and when the buffer is the tether, it exits the client.
                     AfterSave::Close => fx = fx.and(self.close_buffer()),
+                    // The message is on disk now, so `git commit -F` will read what the user
+                    // actually wrote. The buffer stays open until the commit lands, so a refusal
+                    // leaves them looking at their message rather than at nothing.
+                    AfterSave::Commit => {
+                        if let Some(pending) = self.pending_commit.clone() {
+                            fx = fx.and(self.request_str::<GitCommit>(
+                                GitCommitParams {
+                                    repo_id: pending.repo_id,
+                                    amend: pending.amend,
+                                },
+                                Event::Committed,
+                            ));
+                        }
+                    }
                 }
                 fx
             }
@@ -2192,7 +2305,22 @@ impl Session {
     /// empty ephemeral workspace is pointless — so we close without `open_next` and either attach
     /// to a remaining sibling buffer or leave the context entirely (see
     /// [`Self::leave_ephemeral_workspace`]).
+    /// Drop a pending commit whose message buffer is closing.
+    ///
+    /// Without this the entry outlives its buffer, and `Space t` would then "switch to the
+    /// message already open" — at a buffer id that no longer exists.
+    fn forget_commit_buffer(&mut self, buffer_id: BufferId) {
+        if self
+            .pending_commit
+            .as_ref()
+            .is_some_and(|p| p.buffer_id == buffer_id)
+        {
+            self.pending_commit = None;
+        }
+    }
+
     pub fn close_buffer(&mut self) -> Effects {
+        self.forget_commit_buffer(self.buffer.buffer_id);
         if self.tethered() {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
@@ -4895,6 +5023,8 @@ impl Session {
                 if self.tether == Some(p.buffer_id) {
                     return Effects::one(Effect::Exit);
                 }
+                // However it went, the message buffer is gone — so is the commit it was for.
+                self.forget_commit_buffer(p.buffer_id);
                 if p.buffer_id != self.buffer.buffer_id {
                     return Effects::none();
                 }
@@ -7348,7 +7478,15 @@ impl Session {
             A::Quit => Effects::one(Effect::Exit),
             A::Save => self.save(None, false, AfterSave::Nothing),
             A::SaveAndQuit => self.save(None, false, AfterSave::Quit),
-            A::SaveAndClose => self.save(None, false, AfterSave::Close),
+            A::SaveAndClose => {
+                // Same gesture, same meaning — "I'm done, make this take effect" — so a commit
+                // buffer commits rather than merely closing.
+                let after = match &self.pending_commit {
+                    Some(p) if p.buffer_id == self.buffer.buffer_id => AfterSave::Commit,
+                    _ => AfterSave::Close,
+                };
+                self.save(None, false, after)
+            }
             A::SaveAs => {
                 // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self
@@ -7496,6 +7634,45 @@ impl Session {
                         action: hunk_action,
                         result,
                     },
+                )
+            }
+
+            A::GitCommit { amend } => {
+                // A message already being written is switched to, never rewritten. Preparing
+                // again would overwrite `COMMIT_EDITMSG` underneath a dirty buffer: the watcher
+                // would flag it externally-modified, and the save on the way to the commit would
+                // then *refuse* — losing the message to a keystroke meant to resume it.
+                if let Some(pending) = self.pending_commit.clone() {
+                    if pending.buffer_id == self.buffer.buffer_id {
+                        return Effects::toast(
+                            "Already writing this commit — Space Alt-x to commit",
+                            ToastKind::Info,
+                        );
+                    }
+                    let mut fx = self.request_str::<BufferOpen>(
+                        BufferOpenParams {
+                            buffer_id: Some(pending.buffer_id),
+                            record_nav_from: Some(self.buffer.buffer_id),
+                            ..Default::default()
+                        },
+                        Event::Switched,
+                    );
+                    fx.push(Effect::Toast {
+                        message: "Commit message already open".to_string(),
+                        kind: ToastKind::Info,
+                        group: None,
+                    });
+                    return fx;
+                }
+                // The repo is resolved server-side, from the buffer we're looking at — that's
+                // where the buffer→repo mapping already lives, and it saves a `git/repos` trip.
+                self.request_str::<GitPrepareCommit>(
+                    GitPrepareCommitParams {
+                        buffer_id: Some(self.buffer.buffer_id),
+                        amend,
+                        ..Default::default()
+                    },
+                    move |result| Event::CommitPrepared { amend, result },
                 )
             }
 

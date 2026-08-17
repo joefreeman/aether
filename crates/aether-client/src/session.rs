@@ -664,6 +664,24 @@ pub enum AfterSave {
     /// `Space Alt-x` — close the buffer once the save lands (which exits the client when the
     /// buffer is the [tether](Session::tether)).
     Close,
+    /// `Space Alt-x` in a commit message buffer: the message is on disk, so run the commit. The
+    /// same "I am done with this, make it take effect" gesture as `Close`, which is why it reuses
+    /// the binding rather than inventing a chord.
+    Commit,
+}
+
+/// A commit message being composed: which buffer holds it, and what it commits to.
+///
+/// Tracked rather than inferred from the path, so `Space Alt-x` knows it means "commit" here
+/// without pattern-matching filenames — and so the repo the commit targets is the one
+/// `git/prepare_commit` actually resolved, not whatever the cursor has wandered into since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCommit {
+    pub buffer_id: BufferId,
+    pub repo_id: String,
+    /// Must match what the message was prepared with, or the commit would amend a message written
+    /// for a new commit (or vice versa).
+    pub amend: bool,
 }
 
 /// What accepting a confirmation does.
@@ -794,6 +812,8 @@ pub struct Session {
     /// switch, or by a daemon restart (buffer ids don't survive it). The status bar marks the
     /// tethered buffer with a dim `*`.
     pub tether: Option<BufferId>,
+    /// The commit message buffer this client opened, if any — see [`PendingCommit`].
+    pub pending_commit: Option<PendingCommit>,
     pub buffer: BufferInfo,
     pub mode: Mode,
     pub pending: Pending,
@@ -1268,6 +1288,7 @@ impl Session {
             workspace_paths: workspace.paths,
             workspace_projects: workspace.projects,
             tether: None,
+            pending_commit: None,
             buffer,
             mode: Mode::Normal,
             pending: Pending::None,

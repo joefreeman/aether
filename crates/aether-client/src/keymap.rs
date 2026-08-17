@@ -415,6 +415,11 @@ pub enum Action {
     PrevHunk,
     ToggleStageHunk,
     RevertHunk,
+    /// Start a commit: prepare the message file server-side and open it as a buffer.
+    /// `amend` rewrites the previous commit instead of adding one.
+    GitCommit {
+        amend: bool,
+    },
 
     // ---- LSP ----
     GotoDefinition,
@@ -1179,6 +1184,8 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
+    bind!(L, ch('t'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
+    bind!(L, ch('t'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),

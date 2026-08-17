@@ -188,6 +188,57 @@ fn rev_blob_bytes(repo: &git2::Repository, rev: &str, rel: &Path) -> Option<Vec<
     Some(blob.content().to_vec())
 }
 
+/// The paths currently in the index that differ from HEAD, with git's own status word — what
+/// `git status` lists under "Changes to be committed", in the same vocabulary, so the commit
+/// template reads like the terminal.
+///
+/// Index-side flags only: a file modified in the working tree but not staged is not going to be
+/// committed and has no business in the message.
+pub fn staged_files(workdir: &Path) -> Vec<(String, &'static str)> {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in statuses.iter() {
+        let st = entry.status();
+        // Order matters: a path can carry several index bits (staged-new then staged-renamed);
+        // report the one git would name first.
+        let word = if st.contains(git2::Status::INDEX_NEW) {
+            "new file"
+        } else if st.contains(git2::Status::INDEX_RENAMED) {
+            "renamed"
+        } else if st.contains(git2::Status::INDEX_DELETED) {
+            "deleted"
+        } else if st.contains(git2::Status::INDEX_TYPECHANGE) {
+            "typechange"
+        } else if st.contains(git2::Status::INDEX_MODIFIED) {
+            "modified"
+        } else {
+            continue;
+        };
+        if let Ok(path) = entry.path() {
+            out.push((path.to_string(), word));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// HEAD's full commit message, for prefilling an amend. `None` on an unborn branch (nothing to
+/// amend) or any libgit2 error.
+pub fn head_message(workdir: &Path) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let commit = repo.head().ok()?.peel_to_commit().ok()?;
+    commit.message().ok().map(|m| m.to_string())
+}
+
 /// Resolve `rev` (a branch, tag, hash, `HEAD~3`, …) to a short commit hash, for pinning at
 /// `git/set_baseline` time. `None` when it names nothing in this repo.
 pub fn resolve_rev(workdir: &Path, rev: &str) -> Option<String> {

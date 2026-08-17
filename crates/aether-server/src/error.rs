@@ -77,6 +77,23 @@ impl RpcError {
         )
     }
 
+    pub fn ambiguous_repo() -> Self {
+        Self::new(
+            ErrorCode::AMBIGUOUS_REPO,
+            "this workspace spans several repos — say which one",
+        )
+    }
+
+    pub fn repo_not_writable(repo_id: impl std::fmt::Display) -> Self {
+        Self::new(
+            ErrorCode::REPO_NOT_WRITABLE,
+            format!(
+                "{repo_id} is not a repo of this workspace — open it as a workspace root to \
+                 write to it"
+            ),
+        )
+    }
+
     pub fn repo_not_found(repo_id: impl std::fmt::Display) -> Self {
         Self::new(
             ErrorCode::REPO_NOT_FOUND,

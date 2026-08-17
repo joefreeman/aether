@@ -35,9 +35,11 @@ use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged,
     GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
-    GitChangeCounts, GitNavigateHunkParams, GitNavigateHunkResult, GitRefreshParams,
+    GitChangeCounts, GitCommitParams, GitCommitResult, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams,
     GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult, GitSetBaselineParams,
     GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, HunkAction, HunkDirection,
+    StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -2739,6 +2741,241 @@ fn reachable_repos(s: &ServerState, client_id: ClientId) -> Result<Vec<GitRepoIn
     Ok(repos)
 }
 
+/// Write the commit-message template and report where it landed, so the client can open it as an
+/// ordinary buffer.
+pub async fn git_prepare_commit(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitPrepareCommitParams,
+) -> Result<GitPrepareCommitResult, RpcError> {
+    let (repo_id, workdir, git_dir) = {
+        let s = state.lock().await;
+        let repo = resolve_commit_repo(&s, ctx.client_id, &params)?;
+        (
+            repo.repo_id.clone(),
+            std::path::PathBuf::from(&repo.repo_id),
+            std::path::PathBuf::from(&repo.git_dir),
+        )
+    };
+
+    // Off the lock: status walks the working tree, and reading the previous message opens the repo.
+    let (staged, template) = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        let amend = params.amend;
+        move || {
+            let staged = crate::git::staged_files(&workdir);
+            let template = commit_template(&workdir, &staged, amend);
+            (staged, template)
+        }
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("preparing commit message: {e}")))?;
+
+    // `COMMIT_EDITMSG` in the repo's *own* git dir — per-worktree, so two worktrees compose their
+    // messages independently. It's also where git itself keeps this file, so an abandoned message
+    // is recoverable exactly where a user would look for it.
+    let path = git_dir.join("COMMIT_EDITMSG");
+    std::fs::write(&path, &template).map_err(RpcError::file_io)?;
+
+    Ok(GitPrepareCommitResult {
+        repo_id,
+        path: path_string(&path),
+        staged: staged
+            .into_iter()
+            .map(|(path, status)| StagedFile {
+                path,
+                status: status.to_string(),
+            })
+            .collect(),
+    })
+}
+
+/// Which repo a commit is for: the explicit `repo_id`, else the repo of the buffer the user is
+/// looking at, else the workspace's only writable repo. Ambiguity is an error rather than a guess
+/// — committing to the wrong repo is not recoverable by pressing undo.
+fn resolve_commit_repo(
+    s: &ServerState,
+    client_id: ClientId,
+    params: &GitPrepareCommitParams,
+) -> Result<GitRepoInfo, RpcError> {
+    if let Some(id) = &params.repo_id {
+        let repo = resolve_repo(s, client_id, id)?;
+        require_workspace_repo(&repo)?;
+        return Ok(repo);
+    }
+
+    let reachable = reachable_repos(s, client_id)?;
+    // Writable only: a repo reached solely through an open buffer is never a commit target, so it
+    // must not make the choice look ambiguous either.
+    let writable: Vec<GitRepoInfo> = reachable
+        .into_iter()
+        .filter(|r| !r.roots.is_empty())
+        .collect();
+
+    if let Some(buffer_id) = params.buffer_id {
+        if let Some(workdir) = s
+            .git_baseline
+            .get(&buffer_id)
+            .and_then(|b| b.repo.as_ref())
+            .map(|r| path_string(&r.workdir))
+        {
+            if let Some(repo) = writable.iter().find(|r| r.repo_id == workdir) {
+                return Ok(repo.clone());
+            }
+        }
+    }
+
+    match writable.len() {
+        1 => Ok(writable.into_iter().next().expect("checked len")),
+        0 => Err(RpcError::repo_not_found("no repo in this workspace")),
+        _ => Err(RpcError::ambiguous_repo()),
+    }
+}
+
+/// git's own commit template: the message (empty, or the previous one when amending) followed by
+/// a comment block that `--cleanup=strip` discards. Deliberately shaped like the one a terminal
+/// `git commit` produces — this is a file users have read a thousand times.
+fn commit_template(workdir: &std::path::Path, staged: &[(String, &str)], amend: bool) -> String {
+    let mut out = String::new();
+    if amend {
+        if let Some(previous) = crate::git::head_message(workdir) {
+            out.push_str(&previous);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out.push('\n');
+    out.push_str("# Please enter the commit message for your changes. Lines starting\n");
+    out.push_str("# with '#' will be ignored, and an empty message aborts the commit.\n");
+    out.push_str("#\n");
+    match crate::git::discover_repo(workdir).map(|r| r.head) {
+        Some(aether_protocol::git::GitHead::Branch { name, .. })
+        | Some(aether_protocol::git::GitHead::Unborn { name }) => {
+            out.push_str(&format!("# On branch {name}\n"));
+        }
+        Some(aether_protocol::git::GitHead::Detached { oid }) => {
+            out.push_str(&format!("# HEAD detached at {oid}\n"));
+        }
+        None => {}
+    }
+    if amend {
+        out.push_str("#\n# Amending the previous commit.\n");
+    }
+    if staged.is_empty() {
+        out.push_str("#\n# No changes staged for commit.\n");
+    } else {
+        out.push_str("#\n# Changes to be committed:\n");
+        for (path, status) in staged {
+            // Git pads the status word to a fixed column; matching it keeps the block aligned.
+            out.push_str(&format!("#\t{status:<12}{path}\n"));
+        }
+    }
+    out
+}
+
+/// Run the real `git commit`, then reconcile the repo.
+pub async fn git_commit(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitCommitParams,
+) -> Result<GitCommitResult, RpcError> {
+    let (workdir, git_dir) = {
+        let s = state.lock().await;
+        let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
+        require_workspace_repo(&repo)?;
+        (
+            std::path::PathBuf::from(&repo.repo_id),
+            std::path::PathBuf::from(&repo.git_dir),
+        )
+    };
+    let message_path = git_dir.join("COMMIT_EDITMSG");
+    if !message_path.exists() {
+        return Err(RpcError::internal(
+            "no prepared commit message — call git/prepare_commit first",
+        ));
+    }
+
+    // Suppress before the spawn, not after: `git commit` writes the index and HEAD, and a
+    // `pre-commit` hook may rewrite working-tree files. Every one of those events belongs to the
+    // reconciliation below, which is also what makes its report a true account (see
+    // `ServerState::git_suppressed`).
+    state.lock().await.git_suppressed.insert(workdir.clone());
+
+    let mut args: Vec<&str> = vec!["commit", "--cleanup=strip", "-F"];
+    let message_arg = path_string(&message_path);
+    args.push(&message_arg);
+    if params.amend {
+        args.push("--amend");
+    }
+    let outcome = crate::git_cli::run(&workdir, &args).await;
+
+    let mut s = state.lock().await;
+    s.git_suppressed.remove(&workdir);
+
+    let output = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            drop(s);
+            return Err(RpcError::internal(format!("running git commit: {e}")));
+        }
+    };
+
+    // A refusal is an outcome, not an error: a failing `pre-commit` hook is the system working.
+    // Reconcile either way — a hook that rewrote files then failed still moved the tree.
+    let (refreshed, pushes) = reconcile_repo(&mut s, &workdir);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    if !output.success() {
+        // git puts "nothing to commit" on stdout and hook failures on stderr; the user needs
+        // whichever one it chose.
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitCommitResult {
+            commit: None,
+            message: message.trim_end().to_string(),
+            refreshed,
+        });
+    }
+
+    let commit = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        move || {
+            crate::git::commit_info(
+                &crate::git::GitRepo {
+                    workdir,
+                    rel_path: std::path::PathBuf::new(),
+                },
+                "HEAD",
+            )
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    Ok(GitCommitResult {
+        commit,
+        message: String::new(),
+        refreshed,
+    })
+}
+
+/// Mutating git operations require a repo the *workspace* reaches, not merely one an open buffer
+/// wandered into. See `GitRepoInfo::roots`.
+fn require_workspace_repo(repo: &GitRepoInfo) -> Result<(), RpcError> {
+    if repo.roots.is_empty() {
+        return Err(RpcError::repo_not_writable(&repo.repo_id));
+    }
+    Ok(())
+}
+
 /// Point a repo's diff baseline at a revision other than HEAD, or (with `rev: None`) back at it.
 ///
 /// Repo-scoped: every open buffer in the repo re-resolves, so the gutter answers one consistent
@@ -2815,7 +3052,21 @@ pub async fn git_refresh(
     let mut s = state.lock().await;
     let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
     let workdir = std::path::PathBuf::from(&repo.repo_id);
+    let (result, pushes) = reconcile_repo(&mut s, &workdir);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
+}
 
+/// The reconciliation pass itself, separated from the RPC so an editor-driven operation that has
+/// just rewritten the tree (commit, and later checkout) runs exactly the same one rather than a
+/// near-copy that drifts. Returns the summary plus the pushes to send once the lock is released.
+fn reconcile_repo(
+    s: &mut ServerState,
+    workdir: &std::path::Path,
+) -> (GitRefreshResult, PendingPushes) {
     let mut affected: Vec<BufferId> = s
         .git_baseline
         .iter()
@@ -2856,7 +3107,7 @@ pub async fn git_refresh(
                 if let Some(doc) = s.try_doc_of_mut(id) {
                     doc.externally_deleted = true;
                 }
-                pushes.extend(collect_buffer_state_pushes(&s, id));
+                pushes.extend(collect_buffer_state_pushes(s, id));
             }
             result.missing.push(id);
         } else if disk_mtime == recorded_mtime && !was_deleted {
@@ -2870,10 +3121,10 @@ pub async fn git_refresh(
                 doc.externally_modified = true;
                 doc.externally_deleted = false;
             }
-            pushes.extend(collect_buffer_state_pushes(&s, id));
+            pushes.extend(collect_buffer_state_pushes(s, id));
             result.diverged.push(id);
         } else {
-            match reload_buffer_locked(&mut s, id) {
+            match reload_buffer_locked(s, id) {
                 Ok((_, reload_pushes)) => {
                     pushes.extend(reload_pushes);
                     result.reloaded.push(id);
@@ -2887,25 +3138,22 @@ pub async fn git_refresh(
         // Unconditional, including for buffers just reloaded above: a tree move takes HEAD with
         // it, so the cached blobs need re-reading, and the reload path only re-diffs against the
         // blobs it already had.
-        pushes.extend(refresh_git_for_buffer(&mut s, id));
+        pushes.extend(refresh_git_for_buffer(s, id));
     }
 
     // A tree move changes explorer entry colours and buffer-picker status dots without
     // necessarily touching any *open* buffer, so refresh those too — the same follow-up the
     // watcher does for an externally-driven Git change.
-    let workdirs: std::collections::HashSet<std::path::PathBuf> = [workdir].into_iter().collect();
+    let workdirs: std::collections::HashSet<std::path::PathBuf> =
+        [workdir.to_path_buf()].into_iter().collect();
     let dirs: std::collections::HashSet<std::path::PathBuf> =
-        explorer_dirs_in_workdirs(&s, &workdirs)
+        explorer_dirs_in_workdirs(s, &workdirs)
             .into_iter()
             .collect();
-    pushes.extend(refresh_explorers_for_dirs(&mut s, &dirs));
-    pushes.extend(refresh_buffer_pickers(&mut s));
+    pushes.extend(refresh_explorers_for_dirs(s, &dirs));
+    pushes.extend(refresh_buffer_pickers(s));
 
-    drop(s);
-    for (sender, notif) in pushes {
-        let _ = sender.send(notif).await;
-    }
-    Ok(result)
+    (result, pushes)
 }
 
 fn path_string(path: &Path) -> String {

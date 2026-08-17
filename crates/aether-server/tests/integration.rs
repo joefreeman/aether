@@ -19,11 +19,12 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitHead, GitNavigateHunk,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitRefresh, GitRefreshParams, GitRefreshResult,
-    GitRepos, GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams,
-    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommit, GitCommitParams,
+    GitCommitResult, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams,
+    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitSetBaseline,
+    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams,
+    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -31655,5 +31656,342 @@ async fn staging_is_refused_against_a_revision_baseline() {
     )
     .await;
     assert_eq!(reverted.status, ApplyHunkStatus::Reverted);
+    drop(server);
+}
+
+// -------- git/commit ------------------------------------------------------------------------------
+
+/// Isolate a fixture repo from the developer's global git config.
+///
+/// Repo-local config outranks global for every key that could change an outcome here, and unlike
+/// `GIT_CONFIG_GLOBAL` it needs no process-environment surgery — which the tests couldn't do
+/// anyway, since git runs inside the server. `core.hooksPath` matters most: without it, a global
+/// hooks directory would run a developer's real `pre-commit` against these fixtures.
+fn isolate_repo_config(repo: &git2::Repository, hooks_dir: &std::path::Path) {
+    std::fs::create_dir_all(hooks_dir).unwrap();
+    let mut cfg = repo.config().unwrap();
+    cfg.set_str("user.name", "Test").unwrap();
+    cfg.set_str("user.email", "test@example.com").unwrap();
+    cfg.set_bool("commit.gpgsign", false).unwrap();
+    cfg.set_str("core.hooksPath", hooks_dir.to_str().unwrap())
+        .unwrap();
+}
+
+/// A repo with one committed file, isolated config, a staged change ready to commit, and the
+/// workspace activated. Returns the hooks dir so a test can drop a hook in.
+async fn setup_commit_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    std::path::PathBuf, // repo root
+    std::path::PathBuf, // hooks dir
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::mem::forget(dir);
+    let repo = init_repo_at(&root);
+    let hooks = root.join(".git/test-hooks");
+    isolate_repo_config(&repo, &hooks);
+    commit_file(&repo, "a.rs", "one\n");
+
+    // Stage a change so there's something to commit.
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("a.rs")).unwrap();
+    index.write().unwrap();
+
+    let (server, ws) = setup_repos_workspace(vec![root.clone()]).await;
+    (server, ws, root, hooks)
+}
+
+async fn prepare_commit(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    amend: bool,
+) -> GitPrepareCommitResult {
+    send_request::<GitPrepareCommit>(
+        ws,
+        id,
+        &GitPrepareCommitParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            amend,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn commit(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    amend: bool,
+) -> GitCommitResult {
+    send_request::<GitCommit>(
+        ws,
+        id,
+        &GitCommitParams {
+            repo_id: root.to_string_lossy().into(),
+            amend,
+        },
+    )
+    .await
+}
+
+/// The whole loop: prepare a template, write a message into it as the user would, commit.
+#[tokio::test]
+async fn commit_writes_the_staged_change_with_the_edited_message() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+
+    let prepared = prepare_commit(&mut ws, 2, &root, false).await;
+    // The message file lives in the repo's own git dir, where git keeps it.
+    assert_eq!(
+        prepared.path,
+        root.join(".git/COMMIT_EDITMSG").to_string_lossy()
+    );
+    assert_eq!(prepared.staged.len(), 1);
+    assert_eq!(prepared.staged[0].path, "a.rs");
+    assert_eq!(prepared.staged[0].status, "modified");
+
+    // The template reads like git's: comments the user can leave in place.
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    assert!(template.contains("# On branch main"), "got: {template}");
+    assert!(template.contains("# Changes to be committed:"));
+    assert!(template.contains("#\tmodified    a.rs"), "got: {template}");
+
+    // The user writes their message above the comment block and saves.
+    std::fs::write(&prepared.path, format!("Add a line\n{template}")).unwrap();
+
+    let res = commit(&mut ws, 3, &root, false).await;
+    let made = res.commit.expect("commit created");
+    // `--cleanup=strip` removed the comment block, leaving only what the user wrote.
+    assert_eq!(made.message, "Add a line");
+    assert_eq!(made.author, "Test");
+    assert!(res.message.is_empty());
+
+    // And it really landed in the repo.
+    let repo = git2::Repository::open(&root).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.message().unwrap().trim(), "Add a line");
+    assert_eq!(head.parent_count(), 1);
+    drop(server);
+}
+
+/// A failing `pre-commit` hook must stop the commit and hand back the hook's own words — the
+/// reason writes shell out to real git at all. The message must survive for the retry.
+#[tokio::test]
+async fn a_failing_pre_commit_hook_blocks_the_commit_and_keeps_the_message() {
+    let (server, mut ws, root, hooks) = setup_commit_workspace().await;
+
+    let hook = hooks.join("pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'lint failed: tabs everywhere' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let prepared = prepare_commit(&mut ws, 2, &root, false).await;
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    std::fs::write(&prepared.path, format!("Careful work\n{template}")).unwrap();
+
+    let res = commit(&mut ws, 3, &root, false).await;
+    assert!(res.commit.is_none(), "the hook should have blocked it");
+    assert!(
+        res.message.contains("lint failed: tabs everywhere"),
+        "the hook's own output should come back verbatim, got: {:?}",
+        res.message
+    );
+
+    // Nothing was committed…
+    let repo = git2::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .trim(),
+        "init"
+    );
+    // …and the user's message is still there to retry with.
+    let after = std::fs::read_to_string(&prepared.path).unwrap();
+    assert!(after.starts_with("Careful work"), "got: {after}");
+    drop(server);
+}
+
+/// A `pre-commit` hook that *passes* still runs — and one that rewrites a file mid-commit has its
+/// change picked up by the reconciliation, rather than leaving the buffer showing stale content.
+#[tokio::test]
+async fn a_passing_hook_runs_and_its_rewrites_are_reconciled() {
+    let (server, mut ws, root, hooks) = setup_commit_workspace().await;
+
+    // A formatter-shaped hook: rewrites the staged file, re-stages it, succeeds.
+    let hook = hooks.join("pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'one\\nTWO\\n' > a.rs\ngit add a.rs\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let prepared = prepare_commit(&mut ws, 3, &root, false).await;
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    std::fs::write(&prepared.path, format!("Formatted\n{template}")).unwrap();
+
+    let res = commit(&mut ws, 4, &root, false).await;
+    assert!(res.commit.is_some(), "hook passes: {:?}", res.message);
+    // The hook's rewrite reached the open buffer, through the reconciliation the commit runs.
+    assert_eq!(
+        res.refreshed.reloaded,
+        vec![open.buffer_id],
+        "the hook rewrote a.rs, so its buffer must reload"
+    );
+    assert_eq!(buffer_text(&mut ws, 5, open.buffer_id).await, "one\nTWO\n");
+    drop(server);
+}
+
+/// Amending prefills the previous message and replaces the commit rather than adding one.
+#[tokio::test]
+async fn amend_prefills_the_previous_message_and_replaces_the_commit() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+
+    let prepared = prepare_commit(&mut ws, 2, &root, false).await;
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    std::fs::write(&prepared.path, format!("First go\n{template}")).unwrap();
+    commit(&mut ws, 3, &root, false)
+        .await
+        .commit
+        .expect("first commit");
+
+    let amended = prepare_commit(&mut ws, 4, &root, true).await;
+    let template = std::fs::read_to_string(&amended.path).unwrap();
+    assert!(
+        template.starts_with("First go"),
+        "amend should prefill the previous message, got: {template}"
+    );
+    assert!(template.contains("# Amending the previous commit."));
+
+    // Edit the prefilled subject in place, as a user amending a message actually would — the
+    // template already *contains* the old message, so prepending would commit both lines.
+    let edited = template.replacen("First go", "First go, revised", 1);
+    std::fs::write(&amended.path, edited).unwrap();
+    let res = commit(&mut ws, 5, &root, true).await;
+    assert_eq!(res.commit.expect("amended").message, "First go, revised");
+
+    // Replaced, not stacked: still one commit on top of the initial one.
+    let repo = git2::Repository::open(&root).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.message().unwrap().trim(), "First go, revised");
+    assert_eq!(head.parent_count(), 1);
+    assert_eq!(head.parent(0).unwrap().message().unwrap().trim(), "init");
+    drop(server);
+}
+
+/// An empty message aborts, the way it does in a terminal — and says so.
+#[tokio::test]
+async fn an_empty_message_aborts_the_commit() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+
+    let prepared = prepare_commit(&mut ws, 2, &root, false).await;
+    // The untouched template is comments only, which `--cleanup=strip` reduces to nothing.
+    let res = commit(&mut ws, 3, &root, false).await;
+    assert!(res.commit.is_none());
+    assert!(
+        res.message.to_lowercase().contains("empty commit message"),
+        "got: {:?}",
+        res.message
+    );
+    let _ = prepared;
+    drop(server);
+}
+
+/// The client doesn't have to know which repo it's committing to: the server resolves it from the
+/// buffer the user is looking at. That keeps the buffer→repo mapping in the one place that
+/// already has it, and saves the client a `git/repos` round trip before every commit.
+#[tokio::test]
+async fn prepare_commit_resolves_the_repo_from_the_buffer() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let prepared: GitPrepareCommitResult = send_request::<GitPrepareCommit>(
+        &mut ws,
+        3,
+        &GitPrepareCommitParams {
+            buffer_id: Some(open.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(prepared.repo_id, root.to_string_lossy());
+    assert_eq!(prepared.staged.len(), 1);
+    drop(server);
+}
+
+/// With no hint at all, a single-repo workspace still resolves — the overwhelmingly common case
+/// should never need a chooser.
+#[tokio::test]
+async fn prepare_commit_resolves_a_lone_repo_without_a_hint() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+    let prepared: GitPrepareCommitResult =
+        send_request::<GitPrepareCommit>(&mut ws, 2, &GitPrepareCommitParams::default()).await;
+    assert_eq!(prepared.repo_id, root.to_string_lossy());
+    drop(server);
+}
+
+/// A commit can't land in a repo the workspace only sees through an open buffer — the guard from
+/// decision 2, now that there's a mutation to guard.
+#[tokio::test]
+async fn commit_refuses_a_repo_the_workspace_only_reached_through_a_buffer() {
+    let (server, mut ws, _root, _hooks) = setup_commit_workspace().await;
+
+    // A real repo, outside the workspace entirely.
+    let other = tempfile::tempdir().unwrap();
+    let other_root = other.path().canonicalize().unwrap();
+    commit_file(&init_repo_at(&other_root), "b.rs", "two\n");
+
+    let err = send_request_expect_err::<GitPrepareCommit>(
+        &mut ws,
+        2,
+        &GitPrepareCommitParams {
+            repo_id: Some(other_root.to_string_lossy().into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(err.contains("no such repo"), "unexpected error: {err}");
     drop(server);
 }
