@@ -65,6 +65,7 @@ pub struct InjectionLayer {
 }
 
 static RUST: OnceLock<LanguageConfig> = OnceLock::new();
+static GITCOMMIT: OnceLock<LanguageConfig> = OnceLock::new();
 static MARKDOWN: OnceLock<LanguageConfig> = OnceLock::new();
 static MARKDOWN_INLINE: OnceLock<LanguageConfig> = OnceLock::new();
 static TOML: OnceLock<LanguageConfig> = OnceLock::new();
@@ -184,6 +185,22 @@ pub fn fence_language(info: &str) -> &str {
 pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
+        // No extension of its own: reached by the `COMMIT_EDITMSG` file rules below, or by an
+        // explicit `language` on `buffer/open`.
+        "gitcommit" | "git-commit" => Some(simple(
+            &GITCOMMIT,
+            LanguageSpec {
+                name: "gitcommit",
+                language: tree_sitter_gitcommit::LANGUAGE,
+                highlights: include_str!("../queries/gitcommit/highlights.scm"),
+                indents: None,
+                // A commit message is prose; nothing here indents, and a stray tab in the
+                // comment block shouldn't imply one.
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("#"),
+                block_comment: None,
+            },
+        )),
         "rust" | "rs" => Some(simple(
             &RUST,
             LanguageSpec {
@@ -494,6 +511,11 @@ impl FileRule {
 const FILE_RULES: &[(FileRule, &str)] = &[
     (FileRule::Stem("dockerfile"), "dockerfile"),
     (FileRule::Stem("containerfile"), "dockerfile"),
+    // git's message buffers. `Name`, not `Stem`: these are exact names, and a stem rule would
+    // also claim things like `commit_editmsg.bak`.
+    (FileRule::Name("commit_editmsg"), "gitcommit"),
+    (FileRule::Name("merge_msg"), "gitcommit"),
+    (FileRule::Name("tag_editmsg"), "gitcommit"),
 ];
 
 /// The language config for a file on disk: its name against [`FILE_RULES`] first, then its
@@ -965,6 +987,61 @@ mod tests {
             fn_kw.is_some(),
             "expected rust keyword highlight for 'fn' in fence"
         );
+    }
+
+    /// A commit message highlights by *name* — `COMMIT_EDITMSG` has no extension — and the
+    /// generated comment block reads as comment so it's visibly not part of the message.
+    #[test]
+    fn gitcommit_separates_the_message_from_gits_comment_block() {
+        let config = config_for_path(Path::new("/repo/.git/COMMIT_EDITMSG"))
+            .expect("COMMIT_EDITMSG is recognised by name");
+        assert_eq!(config.name, "gitcommit");
+
+        let source =
+            "Add a line\n\nBody text.\n\n# Please enter the commit message\n# On branch main\n";
+        let mut parser = make_parser(config);
+        let tree = parser.parse(source, None).expect("parses");
+        let highlights = highlights_for_range(config, &tree, &[], source, 0, source.len());
+        let kind_at = |needle: &str| {
+            let byte = source.find(needle).expect("needle present") as u32;
+            highlights
+                .iter()
+                .find(|h| h.start <= byte && h.end > byte)
+                .map(|h| h.kind.as_str())
+        };
+
+        // The subject earns emphasis — it's what `git log --oneline` shows.
+        assert_eq!(kind_at("Add a line"), Some("text.title"));
+        // Both comment lines are comment, including the generated "On branch" one: all of it is
+        // stripped before the commit lands, so none of it should read as message.
+        assert!(
+            kind_at("# Please enter").is_some_and(|k| k.contains("comment")),
+            "got {:?}",
+            kind_at("# Please enter")
+        );
+        assert!(
+            kind_at("# On branch").is_some_and(|k| k.contains("comment")),
+            "got {:?}",
+            kind_at("# On branch")
+        );
+        // The body is plain prose — highlighting it would be noise.
+        assert!(kind_at("Body text.").is_none_or(|k| !k.contains("comment")));
+    }
+
+    /// Trailers are structure worth seeing in a wall of prose.
+    #[test]
+    fn gitcommit_marks_trailers() {
+        let config = get_config("gitcommit").expect("registered");
+        let source = "Subject\n\nSigned-off-by: Ada <ada@example.com>\n";
+        let mut parser = make_parser(config);
+        let tree = parser.parse(source, None).expect("parses");
+        let highlights = highlights_for_range(config, &tree, &[], source, 0, source.len());
+        let byte = source.find("Signed-off-by").unwrap() as u32;
+        let kind = highlights
+            .iter()
+            .find(|h| h.start <= byte && h.end > byte)
+            .map(|h| h.kind.as_str());
+        assert_eq!(kind, Some("label"), "trailer token is labelled");
     }
 
     #[test]

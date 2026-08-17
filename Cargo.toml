@@ -84,6 +84,9 @@ tree-sitter-hcl = "1.1"
 # the maintained fork of it (same grammar lineage, covers `Containerfile` too) and ships both a
 # highlights and an injections query.
 tree-sitter-containerfile = "0.9"
+# Commit messages (`COMMIT_EDITMSG`). We ship our own highlights query rather than the crate's:
+# upstream captures use nvim's `markup.*` vocabulary, which `theme.rs` doesn't map.
+tree-sitter-gitcommit = "0.5"
 # Quiver grammar, tracking the upstream repo's `main` branch (the crate lives in its `tree-sitter`
 # subdirectory; Cargo resolves it by package name). Cargo.lock pins the exact commit.
 tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "main" }
