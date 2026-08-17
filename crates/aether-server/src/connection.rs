@@ -26,7 +26,7 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     GitApplyHunk, GitBlameLine, GitCommit, GitNavigateHunk, GitPrepareCommit, GitRefresh, GitRepos,
-    GitSetBaseline, GitSetBlameFollow, GitSetDiffView,
+    GitReset, GitSetBaseline, GitSetBlameFollow, GitSetDiffView,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -498,6 +498,7 @@ async fn dispatch(
         GitSetBaseline::NAME => run!(GitSetBaseline, handlers::git_set_baseline),
         GitPrepareCommit::NAME => run!(GitPrepareCommit, handlers::git_prepare_commit),
         GitCommit::NAME => run!(GitCommit, handlers::git_commit),
+        GitReset::NAME => run!(GitReset, handlers::git_reset),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),

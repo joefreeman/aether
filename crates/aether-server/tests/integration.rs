@@ -22,9 +22,9 @@ use aether_protocol::git::{
     GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommit, GitCommitParams,
     GitCommitResult, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
     GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams,
-    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitSetBaseline,
-    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams,
-    GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams,
+    GitResetResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -31994,4 +31994,122 @@ async fn commit_refuses_a_repo_the_workspace_only_reached_through_a_buffer() {
     .await;
     assert!(err.contains("no such repo"), "unexpected error: {err}");
     drop(server);
+}
+
+/// Uncommit: HEAD moves back and the commit's changes return to the index, ready to be
+/// recommitted. The point is that committing is safe to try.
+#[tokio::test]
+async fn uncommit_moves_head_back_and_keeps_the_changes_staged() {
+    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+
+    let prepared = prepare_commit(&mut ws, 2, &root, false).await;
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    std::fs::write(&prepared.path, format!("Add a line\n{template}")).unwrap();
+    commit(&mut ws, 3, &root, false)
+        .await
+        .commit
+        .expect("committed");
+
+    let res: GitResetResult = send_request::<GitReset>(
+        &mut ws,
+        4,
+        &GitResetParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            buffer_id: None,
+            rev: "HEAD^".into(),
+        },
+    )
+    .await;
+    assert!(res.message.is_empty(), "should have succeeded: {res:?}");
+    assert_eq!(
+        res.head.expect("new head").message,
+        "init",
+        "HEAD moved back to the previous commit"
+    );
+    // Named, so the client can say what was taken back rather than reporting a hash movement.
+    assert_eq!(res.undone.len(), 1);
+    assert_eq!(res.undone[0].message, "Add a line");
+
+    // Soft: the change is staged again, and the working tree is untouched.
+    let repo = git2::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .trim(),
+        "init"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "one\ntwo\n",
+        "the working tree is left alone"
+    );
+    let staged = git_staged_paths(&root);
+    assert_eq!(staged, vec!["a.rs".to_string()], "changes came back staged");
+
+    // And it can simply be recommitted.
+    let prepared = prepare_commit(&mut ws, 5, &root, false).await;
+    assert_eq!(prepared.staged.len(), 1);
+    drop(server);
+}
+
+/// Nothing behind the initial commit: git refuses, and its own words come back rather than an
+/// RPC error the client would have to translate.
+#[tokio::test]
+async fn uncommitting_the_initial_commit_is_refused_with_gits_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::mem::forget(dir);
+    let repo = init_repo_at(&root);
+    isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res: GitResetResult = send_request::<GitReset>(
+        &mut ws,
+        2,
+        &GitResetParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            buffer_id: None,
+            rev: "HEAD^".into(),
+        },
+    )
+    .await;
+    assert!(res.head.is_none(), "nothing to move back to");
+    assert!(!res.message.is_empty(), "git explains why");
+    // The commit is still there.
+    let repo = git2::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .trim(),
+        "init"
+    );
+    drop(server);
+}
+
+/// The staged paths in a repo, as `git status` would list them.
+fn git_staged_paths(root: &std::path::Path) -> Vec<String> {
+    let repo = git2::Repository::open(root).unwrap();
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false);
+    let statuses = repo.statuses(Some(&mut opts)).unwrap();
+    statuses
+        .iter()
+        .filter(|e| {
+            e.status().intersects(
+                git2::Status::INDEX_NEW
+                    | git2::Status::INDEX_MODIFIED
+                    | git2::Status::INDEX_DELETED,
+            )
+        })
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .collect()
 }

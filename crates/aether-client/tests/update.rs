@@ -9472,3 +9472,60 @@ fn closing_the_message_buffer_abandons_the_commit() {
     let (_, method, _) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
 }
+
+/// `Space u` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
+/// sentence the user can check against their intent; a hash movement isn't.
+#[test]
+fn space_u_uncommits_and_names_what_came_back() {
+    let mut s = session();
+    let fx = leader(&mut s, 'u');
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "git/reset");
+    assert_eq!(params["rev"], json!("HEAD^"));
+    assert_eq!(params["buffer_id"], json!(s.buffer.buffer_id));
+    assert!(params.get("repo_id").is_none(), "the server resolves it");
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "head": {
+                "commit": "aaaa1111", "author": "Ada", "email": "a@b.c",
+                "date": "2026-08-17 10:00:00 +0100", "message": "init",
+            },
+            "undone": [{
+                "commit": "bbbb2222", "author": "Ada", "email": "a@b.c",
+                "date": "2026-08-17 11:00:00 +0100", "message": "Add a line\n\nBody.",
+            }],
+        })),
+    );
+    let toast =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Toast { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("a toast reports the uncommit");
+    assert!(toast.contains("Add a line"), "names the commit: {toast}");
+    assert!(
+        toast.contains("staged"),
+        "says where the changes went: {toast}"
+    );
+    assert!(!toast.contains("Body."), "subject only: {toast}");
+}
+
+/// Nothing behind the initial commit: git's refusal is shown as-is rather than as an error.
+#[test]
+fn uncommitting_with_no_parent_shows_gits_refusal() {
+    let mut s = session();
+    let fx = leader(&mut s, 'u');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({"message": "fatal: ambiguous argument 'HEAD^': unknown revision"})),
+    );
+    assert!(fx.0.iter().any(|e| matches!(
+        e,
+        Effect::Toast { message, kind, .. }
+            if message.contains("ambiguous argument") && *kind == ToastKind::Warning
+    )));
+}

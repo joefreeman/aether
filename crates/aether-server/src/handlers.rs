@@ -37,9 +37,9 @@ use aether_protocol::git::{
     GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
     GitChangeCounts, GitCommitParams, GitCommitResult, GitNavigateHunkParams,
     GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams,
-    GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult, GitSetBaselineParams,
-    GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, HunkAction, HunkDirection,
-    StagedFile,
+    GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
+    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams,
+    HunkAction, HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -2750,7 +2750,8 @@ pub async fn git_prepare_commit(
 ) -> Result<GitPrepareCommitResult, RpcError> {
     let (repo_id, workdir, git_dir) = {
         let s = state.lock().await;
-        let repo = resolve_commit_repo(&s, ctx.client_id, &params)?;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
         (
             repo.repo_id.clone(),
             std::path::PathBuf::from(&repo.repo_id),
@@ -2793,12 +2794,13 @@ pub async fn git_prepare_commit(
 /// Which repo a commit is for: the explicit `repo_id`, else the repo of the buffer the user is
 /// looking at, else the workspace's only writable repo. Ambiguity is an error rather than a guess
 /// — committing to the wrong repo is not recoverable by pressing undo.
-fn resolve_commit_repo(
+fn resolve_writable_repo(
     s: &ServerState,
     client_id: ClientId,
-    params: &GitPrepareCommitParams,
+    repo_id: Option<&RepoId>,
+    buffer_id: Option<BufferId>,
 ) -> Result<GitRepoInfo, RpcError> {
-    if let Some(id) = &params.repo_id {
+    if let Some(id) = repo_id {
         let repo = resolve_repo(s, client_id, id)?;
         require_workspace_repo(&repo)?;
         return Ok(repo);
@@ -2812,7 +2814,7 @@ fn resolve_commit_repo(
         .filter(|r| !r.roots.is_empty())
         .collect();
 
-    if let Some(buffer_id) = params.buffer_id {
+    if let Some(buffer_id) = buffer_id {
         if let Some(workdir) = s
             .git_baseline
             .get(&buffer_id)
@@ -2964,6 +2966,87 @@ pub async fn git_commit(
         commit,
         message: String::new(),
         refreshed,
+    })
+}
+
+/// Move HEAD back, keeping the index and working tree (`git reset --soft`). See [`GitReset`] for
+/// why this is soft-only.
+pub async fn git_reset(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitResetParams,
+) -> Result<GitResetResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+
+    // Resolved *before* the reset, while the commits are still reachable from HEAD — afterwards
+    // there is nothing to walk from.
+    let undone = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        let rev = params.rev.clone();
+        move || crate::git::commits_between(&workdir, "HEAD", &rev)
+    })
+    .await
+    .unwrap_or_default();
+
+    state.lock().await.git_suppressed.insert(workdir.clone());
+    let outcome = crate::git_cli::run(&workdir, &["reset", "--soft", &params.rev]).await;
+    let mut s = state.lock().await;
+    s.git_suppressed.remove(&workdir);
+
+    let output = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            drop(s);
+            return Err(RpcError::internal(format!("running git reset: {e}")));
+        }
+    };
+
+    // Reconcile regardless: a soft reset moves no files, but it moves HEAD, and every open
+    // buffer's baseline is measured against HEAD.
+    let (_, pushes) = reconcile_repo(&mut s, &workdir);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitResetResult {
+            head: None,
+            undone: Vec::new(),
+            message: message.trim_end().to_string(),
+        });
+    }
+
+    let head = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        move || {
+            crate::git::commit_info(
+                &crate::git::GitRepo {
+                    workdir,
+                    rel_path: std::path::PathBuf::new(),
+                },
+                "HEAD",
+            )
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    Ok(GitResetResult {
+        head,
+        undone,
+        message: String::new(),
     })
 }
 

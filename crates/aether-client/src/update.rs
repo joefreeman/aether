@@ -48,8 +48,9 @@ use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
     GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCommit, GitCommitParams,
     GitCommitResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitSetBlameFollow,
-    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams,
+    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -206,6 +207,8 @@ pub enum Event {
     },
     /// `git/commit` came back — created, or refused with git's own words.
     Committed(Result<GitCommitResult, String>),
+    /// `git/reset` came back.
+    Uncommitted(Result<GitResetResult, String>),
     HunkApplied {
         action: HunkAction,
         result: Result<GitApplyHunkResult, String>,
@@ -974,6 +977,25 @@ impl Session {
                         None => Effects::toast(res.message, ToastKind::Warning),
                     }
                 }
+                Err(e) => Effects::error(e),
+            },
+
+            Event::Uncommitted(result) => match result {
+                Ok(res) if res.head.is_some() => {
+                    // Name what came back rather than reporting a hash movement: "Uncommitted:
+                    // Add a line" is the sentence the user can check against their intent.
+                    let note = match res.undone.first() {
+                        Some(c) => format!(
+                            "Uncommitted: {} — changes are staged",
+                            c.message.lines().next().unwrap_or_default()
+                        ),
+                        None => "Uncommitted — changes are staged".to_string(),
+                    };
+                    Effects::toast(note, ToastKind::Success)
+                }
+                // Refused: no parent commit (the initial commit has nothing behind it), or a
+                // repo-level objection. git's own words.
+                Ok(res) => Effects::toast(res.message, ToastKind::Warning),
                 Err(e) => Effects::error(e),
             },
 
@@ -7636,6 +7658,17 @@ impl Session {
                     },
                 )
             }
+
+            A::GitUncommit => self.request_str::<GitReset>(
+                GitResetParams {
+                    // Resolved server-side from the buffer we're on, the same rule
+                    // `git/prepare_commit` uses — the client never needs to know repo ids.
+                    buffer_id: Some(self.buffer.buffer_id),
+                    repo_id: None,
+                    rev: "HEAD^".to_string(),
+                },
+                Event::Uncommitted,
+            ),
 
             A::GitCommit { amend } => {
                 // A message already being written is switched to, never rewritten. Preparing

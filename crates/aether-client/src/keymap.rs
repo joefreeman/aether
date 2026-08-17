@@ -420,6 +420,8 @@ pub enum Action {
     GitCommit {
         amend: bool,
     },
+    /// Take back the last commit, leaving its changes staged (`git reset --soft HEAD^`).
+    GitUncommit,
 
     // ---- LSP ----
     GotoDefinition,
@@ -1186,6 +1188,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('t'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(L, ch('t'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
+    bind!(L, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),

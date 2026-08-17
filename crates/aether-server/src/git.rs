@@ -231,6 +231,49 @@ pub fn staged_files(workdir: &Path) -> Vec<(String, &'static str)> {
     out
 }
 
+/// The commits between `from` and `to` (exclusive of `to`), newest first — what a reset to `to`
+/// would unwind, so the client can name what the user just took back.
+///
+/// Empty when `to` isn't an ancestor of `from` (a sideways reset onto a divergent branch): those
+/// commits aren't "undone" in any sense worth reporting, and pretending otherwise would be worse
+/// than saying nothing.
+pub fn commits_between(workdir: &Path, from: &str, to: &str) -> Vec<CommitInfo> {
+    let repo = GitRepo {
+        workdir: workdir.to_path_buf(),
+        rel_path: PathBuf::new(),
+    };
+    let Ok(git_repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let (Ok(from_oid), Ok(to_oid)) = (
+        git_repo
+            .revparse_single(from)
+            .and_then(|o| o.peel_to_commit()),
+        git_repo
+            .revparse_single(to)
+            .and_then(|o| o.peel_to_commit()),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut walk = from_oid;
+    // Bounded: a reset that isn't a small step back is a mistake to report, not a history to
+    // enumerate, so stop rather than walking a whole repo.
+    for _ in 0..64 {
+        if walk.id() == to_oid.id() {
+            return out;
+        }
+        if let Some(info) = commit_info(&repo, &walk.id().to_string()) {
+            out.push(info);
+        }
+        match walk.parent(0) {
+            Ok(parent) => walk = parent,
+            Err(_) => break,
+        }
+    }
+    Vec::new()
+}
+
 /// HEAD's full commit message, for prefilling an amend. `None` on an unborn branch (nothing to
 /// amend) or any libgit2 error.
 pub fn head_message(workdir: &Path) -> Option<String> {

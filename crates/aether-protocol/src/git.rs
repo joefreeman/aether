@@ -386,6 +386,53 @@ pub struct GitCommitResult {
     pub refreshed: GitRefreshResult,
 }
 
+// ---- git/reset -----------------------------------------------------------------------------------
+
+/// Move HEAD to another commit, keeping the index and working tree exactly as they are
+/// (`git reset --soft`).
+///
+/// **Soft only, deliberately.** A soft reset touches no file: the commits it unwinds come back as
+/// staged changes, ready to be recommitted. `--mixed` and `--hard` rewrite the index and working
+/// tree, which needs the dirty-buffer pre-flight described in `docs/git-phase-2.md` decision 3 —
+/// enumerate what would be lost, refuse or stash, never silently discard. That isn't built, so
+/// this doesn't pretend to offer it.
+///
+/// Generic in `rev` rather than a bare "uncommit" so a log picker's "reset to this commit" is the
+/// same call with a different revision. `HEAD^` is the uncommit case, and the common one: wrong
+/// message, forgotten file.
+pub struct GitReset;
+impl RpcMethod for GitReset {
+    const NAME: &'static str = "git/reset";
+    type Params = GitResetParams;
+    type Result = GitResetResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitResetParams {
+    /// Omit to let the server resolve it, exactly as [`GitPrepareCommit`] does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    /// The buffer the user is looking at, as the resolution hint. Ignored when `repo_id` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Where HEAD should end up. Anything `git rev-parse` accepts; `HEAD^` to uncommit.
+    pub rev: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitResetResult {
+    /// The commit HEAD now points at, once it moved. `None` when git refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<CommitInfo>,
+    /// The commits that were unwound, newest first — what the user just took back, so the client
+    /// can name it ("Uncommitted: Add a line") rather than reporting a hash movement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undone: Vec<CommitInfo>,
+    /// git's own output when it refused, verbatim. Empty on success.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
 // ---- git/set_baseline ---------------------------------------------------------------------------
 
 /// Diff a repo against a revision other than HEAD — "what have I changed since I branched?",
