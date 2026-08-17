@@ -86,6 +86,16 @@ pub struct AppInfo {
     /// Activated (loaded) workspaces.
     pub workspaces_active: usize,
 
+    // ---- external tools ----
+    /// The installed `git`'s version string (`git version 2.43.0`), or `None` when git can't be
+    /// run. Git is the only external binary the editor shells out to, and every write operation
+    /// depends on it, so its absence is a real diagnostic rather than a curiosity — and it's an
+    /// absence the daemon can have without the user's shell having it, since the daemon is
+    /// spawned detached with a frozen environment. Probed against the active workspace's root, so
+    /// it reflects the `PATH` a real git operation there would see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_version: Option<String>,
+
     // ---- paths ----
     /// Where this profile's state lives on disk. Profile-scoped, so non-obvious.
     #[serde(default)]

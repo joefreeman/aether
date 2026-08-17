@@ -904,6 +904,12 @@ impl Session {
                         ApplyHunkStatus::Unavailable => {
                             ("Not in a git repository", ToastKind::Info)
                         }
+                        // Names the cause, not just the refusal: the user set this baseline, and
+                        // the way out is to unset it.
+                        ApplyHunkStatus::NotAgainstHead => (
+                            "Diffing against a revision — restore the HEAD baseline to stage",
+                            ToastKind::Warning,
+                        ),
                     };
                     Effects::toast(msg, kind)
                 }

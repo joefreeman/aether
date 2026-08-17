@@ -91,6 +91,12 @@ pub struct GitBufferStatus {
     /// Unstaged changes: index → working buffer (`git diff`).
     #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
     pub unstaged: GitChangeCounts,
+    /// Set when the repo is diffed against something other than HEAD ([`GitSetBaseline`]). The
+    /// gutter then means "changed since this commit" and `staged` is always empty, so clients
+    /// must surface this — an unexplained gutter that disagrees with `git diff` is worse than no
+    /// gutter at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GitBaselineRef>,
 }
 
 // ---- git/set_diff_view --------------------------------------------------------------------------
@@ -176,6 +182,10 @@ pub enum ApplyHunkStatus {
     DirtyBuffer,
     /// The buffer isn't in a Git repository (or the index write failed).
     Unavailable,
+    /// Staging refused because the repo is diffed against a revision rather than HEAD
+    /// ([`GitSetBaseline`]): these hunks have no index relationship to stage into. Reverting
+    /// still works. Restore the HEAD baseline to stage.
+    NotAgainstHead,
 }
 
 // ---- git/set_blame_follow -----------------------------------------------------------------------
@@ -201,6 +211,178 @@ impl RpcMethod for GitSetBlameFollow {
 pub struct GitSetBlameFollowParams {
     pub buffer_id: BufferId,
     pub enabled: bool,
+}
+
+// ---- git/repos ----------------------------------------------------------------------------------
+
+/// Identity of one Git repository: its canonicalized working directory, as an absolute path.
+///
+/// A path rather than a server-assigned token so it survives a server restart (a workspace's
+/// repo choice persists as something still meaningful next boot), so any code path holding a
+/// path can address a repo without a [`GitRepos`] round trip first, and so it reads in wire
+/// logs. The server validates incoming ids against the repos it can actually reach and rejects
+/// anything else, so clients should treat it as opaque and echo back what [`GitRepos`] gave them.
+///
+/// Keyed on the **working directory**, not the git dir: two workspace roots inside one repo
+/// collapse to one id, while two linked worktrees of the same repo stay distinct — they have
+/// separate HEADs and indexes, so checkout and commit mean different things in each. Repos
+/// sharing a [`GitRepoInfo::common_dir`] are worktrees of one another.
+pub type RepoId = String;
+
+/// The distinct repos reachable from the client's active workspace — via its roots, and via any
+/// buffer it has open. The set a repo chooser lists, and the source of every valid [`RepoId`].
+pub struct GitRepos;
+impl RpcMethod for GitRepos {
+    const NAME: &'static str = "git/repos";
+    type Params = GitReposParams;
+    type Result = GitReposResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitReposParams {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitReposResult {
+    /// Repos reached through a workspace root first (in root order), then repos reached only
+    /// through an open buffer (by id). Empty when the workspace touches no repo at all.
+    pub repos: Vec<GitRepoInfo>,
+}
+
+/// One repo reachable from the active workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepoInfo {
+    pub repo_id: RepoId,
+    /// This worktree's git dir — `<repo_id>/.git` for an ordinary checkout, but a path inside the
+    /// main repo's `.git/worktrees/` for a linked worktree (whose own `.git` is a *file*).
+    pub git_dir: String,
+    /// The shared object and ref store. Equal to `git_dir` for an ordinary checkout; rows sharing
+    /// a `common_dir` are worktrees of one repository, so they see the same branches, tags and
+    /// stash entries while keeping their own HEAD and index.
+    pub common_dir: String,
+    pub head: GitHead,
+    /// Active-workspace roots this repo was reached through, as absolute paths. **Empty means the
+    /// repo was reached only through an open buffer** — a dependency checkout a goto-definition
+    /// landed in, say. Those stay fully readable (diff, blame, log) but are not mutation targets
+    /// without the user explicitly saying so, which is what stops a commit going somewhere the
+    /// user never opened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
+}
+
+/// Where a repo's HEAD points. Three cases rather than one branch-name string, because they admit
+/// different operations: an unborn HEAD can be committed to but has nothing to push without
+/// `--set-upstream`, and moving off a detached HEAD abandons commits unless they're on a branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GitHead {
+    /// On a branch with at least one commit.
+    Branch {
+        name: String,
+        /// Configured upstream (`origin/main`), or `None` for a branch that has never been pushed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream: Option<String>,
+    },
+    /// Detached: HEAD names a commit directly. `oid` is the short hash.
+    Detached { oid: String },
+    /// A fresh repo whose branch has no commit yet. `name` is the branch HEAD will create.
+    Unborn { name: String },
+}
+
+// ---- git/set_baseline ---------------------------------------------------------------------------
+
+/// Diff a repo against a revision other than HEAD — "what have I changed since I branched?",
+/// "what did this file look like at v1.0?".
+///
+/// Repo-scoped rather than per-buffer: the question is about a body of work, not one file, and
+/// having the answer change as you move between files would make the gutter meaningless. Every
+/// buffer in the repo re-diffs, and the whole existing stack — gutter, hunk navigation, inline
+/// diff, revert — follows without knowing anything changed.
+///
+/// The staged/unstaged distinction does not survive: there is no index relationship to an
+/// arbitrary commit, so the entire change set reads as unstaged and staging is refused
+/// ([`ApplyHunkStatus::NotAgainstHead`]). Reverting still means something — restore this hunk to
+/// how it was at that commit — and still works.
+pub struct GitSetBaseline;
+impl RpcMethod for GitSetBaseline {
+    const NAME: &'static str = "git/set_baseline";
+    type Params = GitSetBaselineParams;
+    type Result = GitSetBaselineResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitSetBaselineParams {
+    pub repo_id: RepoId,
+    /// Anything `git rev-parse` accepts: a branch, tag, hash, `HEAD~3`. `None` restores HEAD.
+    /// An unresolvable revision is an error, not a silent fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitSetBaselineResult {
+    /// The baseline now in force, or `None` when it's back to HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GitBaselineRef>,
+    /// Buffers whose diff was recomputed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<BufferId>,
+}
+
+/// A pinned non-HEAD diff baseline: what the user asked for, and what it resolved to.
+///
+/// Pinned at set time rather than re-resolved per file. `git diff main` re-resolves, but a gutter
+/// is ambient — having it shift because someone pushed to `main` while you were reading is worse
+/// than it going slightly stale. `label` is carried so the UI can say `main` rather than a hash
+/// the user never typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBaselineRef {
+    pub label: String,
+    pub commit: String,
+}
+
+// ---- git/refresh --------------------------------------------------------------------------------
+
+/// Reconcile every open buffer in a repo with the working tree, in one pass.
+///
+/// The working tree can move *wholesale* — a checkout, a stash pop, a pull, a worktree switch —
+/// rewriting hundreds of files at once. `buffer/reload` is the wrong shape for that: it is
+/// per-buffer, user-driven, and refuses a dirty buffer. This is the repo-grain counterpart, and
+/// it is what an editor-driven tree-rewriting operation calls once when it finishes.
+///
+/// Deliberately non-destructive, so it is safe to call at any time and can be tested before
+/// anything destructive depends on it: a clean buffer is re-read, a **dirty** buffer is never
+/// touched — it's flagged as diverged for the user to resolve — and a buffer whose file has
+/// vanished stays open and marked missing rather than being closed out from under the user.
+pub struct GitRefresh;
+impl RpcMethod for GitRefresh {
+    const NAME: &'static str = "git/refresh";
+    type Params = GitRefreshParams;
+    type Result = GitRefreshResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitRefreshParams {
+    /// Which repo moved. Must be one `git/repos` reported for the caller's active workspace.
+    pub repo_id: RepoId,
+}
+
+/// What the pass did, so a caller that has just rewritten the tree can summarise it in one
+/// message instead of the user discovering it buffer by buffer. Buffers whose file was unchanged
+/// appear in none of these lists; their Git baseline is still recomputed, because a commit moves
+/// HEAD without touching any file.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRefreshResult {
+    /// Clean buffers whose file changed on disk, re-read in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reloaded: Vec<BufferId>,
+    /// Buffers with unsaved edits whose file *also* changed underneath. Left exactly as they
+    /// were and flagged externally-modified — reloading would silently discard the user's work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diverged: Vec<BufferId>,
+    /// Buffers whose file no longer exists (checked out a ref that doesn't have it). Still open,
+    /// flagged externally-deleted; their content survives in memory and a save recreates the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<BufferId>,
 }
 
 // ---- git/blame_changed (notification) -----------------------------------------------------------

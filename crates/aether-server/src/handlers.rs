@@ -33,10 +33,11 @@ use aether_protocol::directory::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
+    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged,
     GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
-    GitChangeCounts, GitNavigateHunkParams, GitNavigateHunkResult, GitSetBlameFollowParams,
-    GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitChangeCounts, GitNavigateHunkParams, GitNavigateHunkResult, GitRefreshParams,
+    GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -96,6 +97,7 @@ use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -141,11 +143,22 @@ pub async fn workspace_list(
 /// `ae server status` can never disagree about what the server is.
 pub async fn app_info(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     _params: AppInfoParams,
 ) -> Result<AppInfo, RpcError> {
+    // Probe git *between* the two locks, never under one: it spawns a child process, and the
+    // first call for a root also launches a login shell to resolve the environment. Holding the
+    // state lock across that would stall every other client. Probed in the active workspace's
+    // first root so the answer reflects the `PATH` git would really run under there.
+    let probe_dir = {
+        let s = state.lock().await;
+        s.active_workspace(ctx.client_id)
+            .and_then(|w| w.paths.first().cloned())
+    };
+    let git_version = crate::git_cli::version_in(probe_dir.as_deref()).await;
+
     let s = state.lock().await;
-    Ok(crate::status::app_info(&s))
+    Ok(crate::status::app_info(&s, git_version))
 }
 
 /// Read the global application settings (`$XDG_CONFIG_HOME/aether/settings.toml`). Returns defaults
@@ -2360,7 +2373,7 @@ async fn buffer_open_inner(
     let doc = &s.documents[&doc_id];
     let git_deferred = !external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
     let git = (!external && !git_deferred).then(|| {
-        let git_baseline = crate::git::load_baseline(&canonical);
+        let git_baseline = crate::git::load_baseline(&canonical, &s.git_baseline_revs);
         let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &doc.text);
         let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
         (git_baseline, git_unstaged, git_both)
@@ -2521,8 +2534,12 @@ async fn finish_git_baseline(
     buffer_id: BufferId,
     canonical: std::path::PathBuf,
 ) {
+    // Snapshotted rather than read inside the blocking task, which holds no lock. A
+    // `git/set_baseline` landing mid-load re-resolves every buffer in the repo anyway, so a
+    // snapshot that's one revision stale is corrected moments later rather than left wrong.
+    let revs = state.lock().await.git_baseline_revs.clone();
     let Ok(baseline) =
-        tokio::task::spawn_blocking(move || crate::git::load_baseline(&canonical)).await
+        tokio::task::spawn_blocking(move || crate::git::load_baseline(&canonical, &revs)).await
     else {
         return;
     };
@@ -2629,6 +2646,281 @@ fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> Pendin
 }
 
 // ---- git/* -------------------------------------------------------------------------------------
+
+/// The distinct repos the active workspace can reach: one per canonicalized working directory,
+/// roots first (in workspace order), then repos reached only through an open buffer.
+///
+/// Resolved on demand rather than cached. Discovery runs once per *root* — a handful of walks —
+/// and open buffers cost nothing at all, since a buffer's repo is already sitting in its cached
+/// Git baseline. There's nothing here worth invalidating yet; when the CLI runner needs somewhere
+/// to hang a per-repo operation lock, that's the point to introduce a registry.
+pub async fn git_repos(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    _params: GitReposParams,
+) -> Result<GitReposResult, RpcError> {
+    let s = state.lock().await;
+    Ok(GitReposResult {
+        repos: reachable_repos(&s, ctx.client_id)?,
+    })
+}
+
+/// Resolve a client-supplied [`RepoId`] against the set its active workspace can actually reach,
+/// erroring on anything else.
+///
+/// Ids are paths, so a client *could* synthesize one; validating every incoming id against the
+/// reachable set is what makes that harmless. Note this checks reachability only — a mutating RPC
+/// must additionally require a non-empty [`GitRepoInfo::roots`], since a repo reached solely
+/// through an open buffer is readable but is not something the user has opened for editing.
+fn resolve_repo(
+    s: &ServerState,
+    client_id: ClientId,
+    repo_id: &str,
+) -> Result<GitRepoInfo, RpcError> {
+    reachable_repos(s, client_id)?
+        .into_iter()
+        .find(|r| r.repo_id == repo_id)
+        .ok_or_else(|| RpcError::repo_not_found(repo_id))
+}
+
+fn reachable_repos(s: &ServerState, client_id: ClientId) -> Result<Vec<GitRepoInfo>, RpcError> {
+    let workspace = s.active_workspace_or_err(client_id)?;
+
+    // Discovery walks *upward*, so a root nested inside a repo reports the repo's top level and
+    // several roots in one repo collapse onto one entry.
+    let mut repos: Vec<GitRepoInfo> = Vec::new();
+    for root in &workspace.paths {
+        let Some(identity) = crate::git::discover_repo(root) else {
+            continue;
+        };
+        let id = path_string(&identity.workdir);
+        if !repos.iter().any(|r| r.repo_id == id) {
+            repos.push(repo_info(&identity));
+        }
+    }
+
+    // A repo can also sit *below* a root — a vendored subrepo under a non-repo workspace root —
+    // which an upward walk from the root never sees. Open buffers find those, via the workdir
+    // their baseline already resolved.
+    let mut nested: Vec<GitRepoInfo> = Vec::new();
+    for buffer_id in s.buffers_in_workspace(&workspace.id) {
+        let Some(workdir) = s
+            .git_baseline
+            .get(&buffer_id)
+            .and_then(|b| b.repo.as_ref())
+            .map(|r| r.workdir.clone())
+        else {
+            continue;
+        };
+        let id = path_string(&workdir);
+        if repos.iter().chain(nested.iter()).any(|r| r.repo_id == id) {
+            continue;
+        }
+        if let Some(identity) = crate::git::discover_repo(&workdir) {
+            nested.push(repo_info(&identity));
+        }
+    }
+    // Buffer iteration order is a `HashMap`'s, so sort for a stable response.
+    nested.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    repos.append(&mut nested);
+
+    // Which roots reach each repo, in either containment direction: a root inside the repo (the
+    // ordinary case, and the subdirectory-root case) and a repo inside a root (the vendored one).
+    for repo in &mut repos {
+        let workdir = Path::new(&repo.repo_id);
+        repo.roots = workspace
+            .paths
+            .iter()
+            .filter(|root| root.starts_with(workdir) || workdir.starts_with(root))
+            .map(|root| path_string(root))
+            .collect();
+    }
+
+    Ok(repos)
+}
+
+/// Point a repo's diff baseline at a revision other than HEAD, or (with `rev: None`) back at it.
+///
+/// Repo-scoped: every open buffer in the repo re-resolves, so the gutter answers one consistent
+/// question as you move between files. The revision is resolved to a commit *once*, here, and the
+/// pinned commit is what every later baseline load uses — see [`crate::git::BaselineRev`] for why
+/// a moving baseline would be worse than a slightly stale one.
+pub async fn git_set_baseline(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitSetBaselineParams,
+) -> Result<GitSetBaselineResult, RpcError> {
+    let mut s = state.lock().await;
+    let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
+    let workdir = std::path::PathBuf::from(&repo.repo_id);
+
+    let baseline = match &params.rev {
+        Some(rev) => {
+            // Resolved before anything is stored, so a typo leaves the previous baseline intact
+            // rather than silently dropping the user back to HEAD.
+            let commit = crate::git::resolve_rev(&workdir, rev)
+                .ok_or_else(|| RpcError::unknown_revision(rev))?;
+            let pinned = crate::git::BaselineRev {
+                label: rev.clone(),
+                commit,
+            };
+            s.git_baseline_revs.insert(workdir.clone(), pinned.clone());
+            Some(GitBaselineRef {
+                label: pinned.label,
+                commit: pinned.commit,
+            })
+        }
+        None => {
+            s.git_baseline_revs.remove(&workdir);
+            None
+        }
+    };
+
+    let mut buffers: Vec<BufferId> = s
+        .git_baseline
+        .iter()
+        .filter(|(_, b)| b.repo.as_ref().is_some_and(|r| r.workdir == workdir))
+        .map(|(id, _)| *id)
+        .collect();
+    buffers.sort_unstable();
+
+    let mut pushes: PendingPushes = Vec::new();
+    for id in &buffers {
+        pushes.extend(refresh_git_for_buffer(&mut s, *id));
+    }
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(GitSetBaselineResult { baseline, buffers })
+}
+
+/// Reconcile every open buffer in a repo with the working tree after it moved wholesale.
+///
+/// Scoped to the *repo*, not the workspace: a document open in two workspaces moved for both, so
+/// this walks the Git baselines (which is also where a buffer's repo is already resolved) rather
+/// than one workspace's buffer list.
+///
+/// The per-buffer policy is the file watcher's, applied deliberately instead of incidentally:
+/// clean buffers re-read, dirty buffers flagged rather than clobbered, vanished files flagged
+/// rather than closed. Every buffer's Git baseline is recomputed regardless of whether its file
+/// changed — a commit moves HEAD without touching a single working-tree file, and the gutter has
+/// to follow.
+pub async fn git_refresh(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitRefreshParams,
+) -> Result<GitRefreshResult, RpcError> {
+    let mut s = state.lock().await;
+    let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
+    let workdir = std::path::PathBuf::from(&repo.repo_id);
+
+    let mut affected: Vec<BufferId> = s
+        .git_baseline
+        .iter()
+        .filter(|(_, b)| b.repo.as_ref().is_some_and(|r| r.workdir == workdir))
+        .map(|(id, _)| *id)
+        .collect();
+    // `git_baseline` is a `HashMap`; sort so the reported lists are stable.
+    affected.sort_unstable();
+
+    let mut result = GitRefreshResult::default();
+    let mut pushes: PendingPushes = Vec::new();
+
+    for id in affected {
+        let Some((path, dirty, recorded_mtime, was_deleted)) = s.try_doc_of(id).map(|d| {
+            (
+                d.canonical_path.clone(),
+                d.dirty,
+                d.last_modified_unix_ms,
+                d.externally_deleted,
+            )
+        }) else {
+            continue;
+        };
+        let Some(path) = path else {
+            continue; // scratch: no file to reconcile against
+        };
+
+        let disk_mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+
+        if disk_mtime.is_none() {
+            // Gone from the working tree — checked out a ref without this file. The buffer stays
+            // open with its content intact; closing it would destroy work the user can still save.
+            if !was_deleted {
+                if let Some(doc) = s.try_doc_of_mut(id) {
+                    doc.externally_deleted = true;
+                }
+                pushes.extend(collect_buffer_state_pushes(&s, id));
+            }
+            result.missing.push(id);
+        } else if disk_mtime == recorded_mtime && !was_deleted {
+            // Byte-identical to what we already hold (this file wasn't part of the move, or the
+            // move restored it). Nothing to reload — but the baseline below still refreshes.
+        } else if dirty {
+            // Unsaved edits *and* the file moved underneath: the one case with no safe automatic
+            // answer, so it's surfaced rather than resolved. Same flag `buffer/save` and
+            // `buffer/reload` already understand.
+            if let Some(doc) = s.try_doc_of_mut(id) {
+                doc.externally_modified = true;
+                doc.externally_deleted = false;
+            }
+            pushes.extend(collect_buffer_state_pushes(&s, id));
+            result.diverged.push(id);
+        } else {
+            match reload_buffer_locked(&mut s, id) {
+                Ok((_, reload_pushes)) => {
+                    pushes.extend(reload_pushes);
+                    result.reloaded.push(id);
+                }
+                // A file that exists but can't be read (permissions, a directory in its place)
+                // shouldn't abort the whole repo's reconciliation.
+                Err(e) => tracing::warn!(?id, error = ?e, "reload during git/refresh failed"),
+            }
+        }
+
+        // Unconditional, including for buffers just reloaded above: a tree move takes HEAD with
+        // it, so the cached blobs need re-reading, and the reload path only re-diffs against the
+        // blobs it already had.
+        pushes.extend(refresh_git_for_buffer(&mut s, id));
+    }
+
+    // A tree move changes explorer entry colours and buffer-picker status dots without
+    // necessarily touching any *open* buffer, so refresh those too — the same follow-up the
+    // watcher does for an externally-driven Git change.
+    let workdirs: std::collections::HashSet<std::path::PathBuf> = [workdir].into_iter().collect();
+    let dirs: std::collections::HashSet<std::path::PathBuf> =
+        explorer_dirs_in_workdirs(&s, &workdirs)
+            .into_iter()
+            .collect();
+    pushes.extend(refresh_explorers_for_dirs(&mut s, &dirs));
+    pushes.extend(refresh_buffer_pickers(&mut s));
+
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn repo_info(identity: &crate::git::RepoIdentity) -> GitRepoInfo {
+    GitRepoInfo {
+        repo_id: path_string(&identity.workdir),
+        git_dir: path_string(&identity.git_dir),
+        common_dir: path_string(&identity.common_dir),
+        head: identity.head.clone(),
+        roots: Vec::new(),
+    }
+}
 
 /// Blame for a single buffer line, cursor-driven. Whole-file blame is computed once per buffer
 /// revision and cached, so repeated calls as the cursor moves within a revision are O(1) lookups.
@@ -3064,6 +3356,13 @@ pub async fn git_apply_hunk(
     };
     let head_blob = baseline.blob.clone();
     let index_blob = baseline.index_blob.clone();
+    // Staging into the index requires the gutter to *be* about the index. Against a pinned
+    // revision both blobs hold that commit's content, so a toggle would write the merge of it and
+    // the buffer into the index — content the user never asked to stage. Revert stays meaningful
+    // ("put this hunk back to how it was at that commit") and falls through.
+    if baseline.rev.is_some() && matches!(params.action, HunkAction::Toggle) {
+        return Ok(outcome(&s, ApplyHunkStatus::NotAgainstHead));
+    }
 
     match params.action {
         HunkAction::Toggle => {
@@ -4281,6 +4580,30 @@ fn rope_byte_col(
     crate::lsp::position::lsp_to_byte(&s, character, encoding) as u32
 }
 
+/// [`recompute_diff_hunks_if_viewed`] without the "is anyone viewing it" guard.
+///
+/// That guard is an optimisation — no viewport, no gutter to feed — but it leaves the cached
+/// hunks stale for a buffer mutated while hidden, and nothing recomputes them on the way back:
+/// a subscribe renders from the cache rather than refreshing it. So the moment a viewport
+/// *appears* is the other point the guard's assumption has to be re-established, which is the
+/// one caller here.
+///
+/// Cheap in the same way: it re-diffs the **cached** baseline (HEAD hasn't moved, only the
+/// buffer), so there's no repo discovery or blob read. Blame needs no invalidation — its cache
+/// carries the revision it was computed at and re-derives itself when that no longer matches.
+fn rediff_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) {
+    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
+        return;
+    };
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return;
+    };
+    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &doc.text);
+    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
+    s.git_unstaged_hunks.insert(buffer_id, unstaged);
+    s.git_both_hunks.insert(buffer_id, both);
+}
+
 /// Re-resolve a buffer's Git baseline from disk (HEAD changed externally — commit / checkout /
 /// stage), recompute its hunks, invalidate cached blame, and build `viewport/lines_changed`
 /// pushes for every viewport on the buffer so the gutter / inline diff refresh live. Called by
@@ -4296,7 +4619,7 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
     // Re-read the committed baseline (the expensive part), then attach it — re-diffing the live
     // buffer against both the HEAD and index blobs (the latter also picks up staging done outside
     // the editor).
-    let baseline = crate::git::load_baseline(&path);
+    let baseline = crate::git::load_baseline(&path, &s.git_baseline_revs);
     attach_git_baseline(s, buffer_id, baseline)
 }
 
@@ -6226,6 +6549,14 @@ pub async fn viewport_subscribe(
     let client_id = ctx.client_id;
 
     let mut s = state.lock().await;
+    s.try_doc_of(params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    // The buffer may have been mutated while nothing was viewing it — an edit through a sibling
+    // buffer in another workspace, or a reload — and the per-mutation refresh skips buffers with
+    // no viewport. This is the moment that stops being true, so re-diff before rendering, or the
+    // first frame shows a clean gutter for a modified file and stays wrong until the next edit.
+    rediff_git_for_buffer(&mut s, params.buffer_id);
+
     let buf = s
         .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
@@ -6948,6 +7279,10 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
         branch: baseline.branch.clone(),
         staged: git_change_counts(&baseline.staged_hunks),
         unstaged: git_change_counts(buffer_unstaged_hunks(s, buffer_id)),
+        baseline: baseline.rev.as_ref().map(|r| GitBaselineRef {
+            label: r.label.clone(),
+            commit: r.commit.clone(),
+        }),
     })
 }
 

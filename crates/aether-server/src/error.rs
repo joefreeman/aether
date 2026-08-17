@@ -70,6 +70,20 @@ impl RpcError {
         Self::new(ErrorCode::FILE_IO, format!("file I/O error: {detail}"))
     }
 
+    pub fn unknown_revision(rev: impl std::fmt::Display) -> Self {
+        Self::new(
+            ErrorCode::UNKNOWN_REVISION,
+            format!("no such revision in this repo: {rev}"),
+        )
+    }
+
+    pub fn repo_not_found(repo_id: impl std::fmt::Display) -> Self {
+        Self::new(
+            ErrorCode::REPO_NOT_FOUND,
+            format!("no such repo in this workspace: {repo_id}"),
+        )
+    }
+
     pub fn buffer_has_no_path() -> Self {
         Self::new(
             ErrorCode::BUFFER_HAS_NO_PATH,

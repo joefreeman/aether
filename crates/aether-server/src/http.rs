@@ -259,7 +259,14 @@ fn percent_decode(s: &str) -> String {
 async fn status_response(state: &SharedState) -> Vec<u8> {
     let status = {
         let s = state.lock().await;
-        crate::status::app_info(&s)
+        // The one field this route deliberately leaves unset. Probing git spawns a child and, on
+        // first use for a directory, a login shell to resolve its environment — which can take
+        // seconds, while `fetch_status` (this route's caller, `ae server status`) gives up after
+        // two. A slow shell rc would turn a healthy server into a reported-unhealthy one. Nothing
+        // here consumes the value either: `ae server status` prints its fields explicitly and
+        // doesn't show git. The dialog, which does, asks over `app/info` where the wait is
+        // affordable and there's an active workspace to probe against.
+        crate::status::app_info(&s, None)
     };
     match serde_json::to_vec(&status) {
         Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),

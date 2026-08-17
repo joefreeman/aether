@@ -16,7 +16,9 @@ use anyhow::Context;
 /// Build the snapshot from the authoritative in-memory state. Cheap — counts plus a handful of path
 /// derivations — so it's fine to call under the state lock, and cheap enough that the dialog
 /// re-fetches on every open rather than caching numbers that go stale immediately.
-pub fn app_info(s: &crate::state::ServerState) -> AppInfo {
+/// `git_version` is resolved by the caller rather than here, because probing it spawns a child
+/// process and this runs under the state lock.
+pub fn app_info(s: &crate::state::ServerState, git_version: Option<String>) -> AppInfo {
     let now = crate::config::now_unix_ms();
     AppInfo {
         version: aether_protocol::PROTOCOL_VERSION.to_string(),
@@ -38,6 +40,7 @@ pub fn app_info(s: &crate::state::ServerState) -> AppInfo {
         buffers_open: s.buffers.len(),
         buffers_unsaved: s.documents.values().filter(|d| d.dirty).count(),
         workspaces_active: s.workspaces.len(),
+        git_version,
         paths: paths(),
     }
 }
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn status_json_roundtrips() {
-        let s = app_info(&crate::state::ServerState::new());
+        let s = app_info(&crate::state::ServerState::new(), None);
         let json = serde_json::to_string(&s).unwrap();
         let back: AppInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
@@ -135,7 +138,7 @@ mod tests {
     /// an outdated bundle to reload. See `web/src/client.ts`.
     #[test]
     fn version_is_top_level_on_the_wire() {
-        let s = app_info(&crate::state::ServerState::new());
+        let s = app_info(&crate::state::ServerState::new(), None);
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(
             v.get("version").and_then(|v| v.as_str()),

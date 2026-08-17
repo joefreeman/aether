@@ -2234,6 +2234,7 @@ fn app_info() -> aether_protocol::app::AppInfo {
         buffers_open: 2,
         buffers_unsaved: 0,
         workspaces_active: 1,
+        git_version: Some("git version 2.43.0".into()),
         paths: aether_protocol::app::AppPaths {
             config_dir: Some("/c".into()),
             ..Default::default()

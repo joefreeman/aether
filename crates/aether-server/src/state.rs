@@ -33,6 +33,25 @@ pub struct ServerState {
     /// once a workspace gets loaded. Per-server (not a global) so tests can spin up multiple servers
     /// in the same process without sharing watcher state.
     pub watcher: Option<Arc<crate::watcher::WatcherHandle>>,
+    /// Repo working directories whose file events the watcher must ignore right now, because
+    /// *we* are rewriting the tree there (a checkout, a stash pop, a pull).
+    ///
+    /// Two reasons, and the second is the load-bearing one. The obvious one: a checkout rewrites
+    /// hundreds of files at once, and letting the per-file external-change path fire for each
+    /// would reload and re-diff them one by one. The subtle one: `git/refresh` reports back which
+    /// buffers reloaded, which diverged, and which vanished, so the caller can tell the user in
+    /// one message — and if the watcher has already quietly done that work, the report comes back
+    /// empty and the user is told nothing happened. Suppression is what makes the reconciliation
+    /// pass the authoritative account of a tree move rather than a race against the watcher.
+    ///
+    /// Keyed by canonicalized workdir (a [`aether_protocol::git::RepoId`]); a path is suppressed
+    /// if it sits under any entry. Held only for the duration of one operation.
+    pub git_suppressed: std::collections::HashSet<PathBuf>,
+    /// Repos currently diffed against a revision other than HEAD (`git/set_baseline`), keyed by
+    /// canonicalized workdir. In memory only: this is an inspection mode ("what have I changed
+    /// since I branched?"), not a preference — coming back to a restored session still diffing
+    /// against a commit you set last week would be a surprise, not a convenience.
+    pub git_baseline_revs: crate::git::BaselineRevs,
     pub buffers: HashMap<BufferId, Buffer>,
     /// Document content, shared by every buffer attached to the same file. A buffer is a
     /// workspace's *view* of a document (`Buffer::document`); the rope, undo history, dirty
@@ -456,6 +475,8 @@ impl ServerState {
         Self {
             workspaces: HashMap::new(),
             watcher: None,
+            git_suppressed: std::collections::HashSet::new(),
+            git_baseline_revs: crate::git::BaselineRevs::new(),
             buffers: HashMap::new(),
             documents: HashMap::new(),
             buffer_workspaces: HashMap::new(),

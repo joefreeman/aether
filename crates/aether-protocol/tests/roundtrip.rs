@@ -17,9 +17,12 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitBlameLineResult,
-    GitChangeCounts, GitNavigateHunk, GitNavigateHunkParams, GitSetBlameFollow,
-    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBaselineRef, GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams,
+    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitHead, GitNavigateHunk,
+    GitNavigateHunkParams, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepoInfo, GitRepos,
+    GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction,
+    HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
@@ -256,6 +259,177 @@ fn git_blame_follow_shapes() {
 }
 
 #[test]
+fn git_repos_shapes() {
+    assert_eq!(GitRepos::NAME, "git/repos");
+
+    // The ordinary case: git dir and common dir coincide, one root, on a branch with an upstream.
+    let ordinary = GitRepoInfo {
+        repo_id: "/src/aether".into(),
+        git_dir: "/src/aether/.git".into(),
+        common_dir: "/src/aether/.git".into(),
+        head: GitHead::Branch {
+            name: "main".into(),
+            upstream: Some("origin/main".into()),
+        },
+        roots: vec!["/src/aether".into()],
+    };
+    let v = to_value(&ordinary).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "repo_id": "/src/aether",
+            "git_dir": "/src/aether/.git",
+            "common_dir": "/src/aether/.git",
+            "head": {"state": "branch", "name": "main", "upstream": "origin/main"},
+            "roots": ["/src/aether"],
+        })
+    );
+    let back: GitRepoInfo = from_value(v).unwrap();
+    assert_eq!(back, ordinary);
+
+    // A linked worktree: distinct id and git dir, but the *common* dir points back at the main
+    // repo — that shared value is how a client tells worktree siblings apart from separate repos.
+    let worktree = GitRepoInfo {
+        repo_id: "/src/aether-worktrees/git-phase-2".into(),
+        git_dir: "/src/aether/.git/worktrees/git-phase-2".into(),
+        common_dir: "/src/aether/.git".into(),
+        head: GitHead::Branch {
+            name: "git-phase-2".into(),
+            upstream: None,
+        },
+        roots: vec![],
+    };
+    let v = to_value(&worktree).unwrap();
+    // A never-pushed branch drops `upstream`, and a buffer-only repo drops `roots` entirely.
+    assert_eq!(v["head"], json!({"state": "branch", "name": "git-phase-2"}));
+    assert!(v.get("roots").is_none());
+    assert_eq!(v["common_dir"], "/src/aether/.git");
+    assert_eq!(from_value::<GitRepoInfo>(v).unwrap(), worktree);
+
+    // The other two head states are externally tagged on `state` like the first.
+    assert_eq!(
+        to_value(&GitHead::Detached {
+            oid: "a1b2c3d".into()
+        })
+        .unwrap(),
+        json!({"state": "detached", "oid": "a1b2c3d"})
+    );
+    assert_eq!(
+        to_value(&GitHead::Unborn {
+            name: "main".into()
+        })
+        .unwrap(),
+        json!({"state": "unborn", "name": "main"})
+    );
+
+    // A workspace touching no repo at all answers with an empty list, not an error.
+    assert_eq!(
+        to_value(&GitReposResult { repos: vec![] }).unwrap(),
+        json!({"repos": []})
+    );
+    assert_eq!(to_value(&GitReposParams {}).unwrap(), json!({}));
+}
+
+#[test]
+fn git_set_baseline_shapes() {
+    assert_eq!(GitSetBaseline::NAME, "git/set_baseline");
+    assert_eq!(
+        to_value(&GitSetBaselineParams {
+            repo_id: "/src/aether".into(),
+            rev: Some("main".into()),
+        })
+        .unwrap(),
+        json!({"repo_id": "/src/aether", "rev": "main"})
+    );
+    // Clearing back to HEAD is the absent field, not a null.
+    assert_eq!(
+        to_value(&GitSetBaselineParams {
+            repo_id: "/src/aether".into(),
+            rev: None,
+        })
+        .unwrap(),
+        json!({"repo_id": "/src/aether"})
+    );
+
+    // The label is what the user typed; the commit is what it was pinned to.
+    let set = GitSetBaselineResult {
+        baseline: Some(GitBaselineRef {
+            label: "main".into(),
+            commit: "a1b2c3d".into(),
+        }),
+        buffers: vec![1, 2],
+    };
+    let v = to_value(&set).unwrap();
+    assert_eq!(
+        v,
+        json!({"baseline": {"label": "main", "commit": "a1b2c3d"}, "buffers": [1, 2]})
+    );
+    assert_eq!(from_value::<GitSetBaselineResult>(v).unwrap(), set);
+    assert_eq!(
+        to_value(&GitSetBaselineResult {
+            baseline: None,
+            buffers: vec![],
+        })
+        .unwrap(),
+        json!({})
+    );
+
+    // The status bar's copy of it: absent when diffing against HEAD, so existing clients that
+    // ignore the field keep reading the same shape they always did.
+    let plain = GitBufferStatus::default();
+    assert!(to_value(&plain).unwrap().get("baseline").is_none());
+    let against_rev = GitBufferStatus {
+        baseline: Some(GitBaselineRef {
+            label: "v1.0".into(),
+            commit: "9f8e7d6".into(),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        to_value(&against_rev).unwrap()["baseline"],
+        json!({"label": "v1.0", "commit": "9f8e7d6"})
+    );
+
+    // The refusal that comes with it.
+    assert_eq!(
+        to_value(ApplyHunkStatus::NotAgainstHead).unwrap(),
+        json!("not_against_head")
+    );
+}
+
+#[test]
+fn git_refresh_shapes() {
+    assert_eq!(GitRefresh::NAME, "git/refresh");
+    assert_eq!(
+        to_value(&GitRefreshParams {
+            repo_id: "/src/aether".into()
+        })
+        .unwrap(),
+        json!({"repo_id": "/src/aether"})
+    );
+
+    // The three outcomes a caller reports to the user in one message.
+    let res = GitRefreshResult {
+        reloaded: vec![1, 2],
+        diverged: vec![3],
+        missing: vec![4],
+    };
+    let v = to_value(&res).unwrap();
+    assert_eq!(
+        v,
+        json!({"reloaded": [1, 2], "diverged": [3], "missing": [4]})
+    );
+    assert_eq!(from_value::<GitRefreshResult>(v).unwrap(), res);
+
+    // "Nothing moved" is the common answer and costs no bytes.
+    assert_eq!(to_value(GitRefreshResult::default()).unwrap(), json!({}));
+    assert_eq!(
+        from_value::<GitRefreshResult>(json!({})).unwrap(),
+        GitRefreshResult::default()
+    );
+}
+
+#[test]
 fn git_apply_hunk_roundtrip() {
     let p = GitApplyHunkParams {
         buffer_id: 4,
@@ -480,6 +654,7 @@ fn git_buffer_status_shape() {
             modified: 0,
             deleted: 0,
         },
+        baseline: None,
     };
     let v = to_value(&s).unwrap();
     assert_eq!(v["branch"], "main");
@@ -3811,6 +3986,7 @@ fn app_info_wire_shapes() {
         buffers_open: 5,
         buffers_unsaved: 1,
         workspaces_active: 3,
+        git_version: Some("git version 2.43.0".into()),
         paths: AppPaths {
             config_dir: Some("/c".into()),
             state_dir: Some("/s".into()),
@@ -3831,13 +4007,23 @@ fn app_info_wire_shapes() {
         appimage: None,
         port: None,
         idle_timeout_secs: None,
+        // "git isn't available" — the client renders this absence as a warning row rather than
+        // omitting it, so the missing key has to survive the round trip as `None`.
+        git_version: None,
         paths: AppPaths::default(),
         ..info
     };
     let v = to_value(&bare).unwrap();
-    for key in ["commit", "appimage", "port", "idle_timeout_secs"] {
+    for key in [
+        "commit",
+        "appimage",
+        "port",
+        "idle_timeout_secs",
+        "git_version",
+    ] {
         assert!(v.get(key).is_none(), "{key} should be omitted when absent");
     }
+    assert_eq!(from_value::<AppInfo>(v.clone()).unwrap().git_version, None);
     assert_eq!(v["paths"], json!({}));
 
     // Every additive field defaults, so a client built against a newer protocol can still read an

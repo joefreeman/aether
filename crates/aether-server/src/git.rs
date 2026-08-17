@@ -20,7 +20,7 @@
 //! stage and unstage rewrite the file's index entry ([`write_index_blob`]); revert is an ordinary
 //! buffer edit driven by the handler.
 
-use aether_protocol::git::{BlameInfo, CommitInfo, GitStatus};
+use aether_protocol::git::{BlameInfo, CommitInfo, GitHead, GitStatus};
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,9 +71,29 @@ pub struct GitRepo {
     pub rel_path: PathBuf,
 }
 
+/// Which revision a repo is diffed against instead of HEAD (`git/set_baseline`), keyed by
+/// canonicalized workdir. Threaded into [`load_baseline`] because the repo a path belongs to is
+/// only known *after* discovery, so the caller can't look the override up in advance.
+pub type BaselineRevs = HashMap<PathBuf, BaselineRev>;
+
+/// A repo's non-HEAD diff baseline: what the user asked for, and the commit it resolved to.
+///
+/// The commit is **pinned at set time** rather than re-resolved per file. `git diff main`
+/// re-resolves, but a gutter is ambient: having it shift under you mid-review because someone
+/// pushed to `main` is worse than it going slightly stale, and pinning also means a ref deleted
+/// while you're reading doesn't blank the comparison. `label` is kept for display so the status
+/// bar can say `main` rather than a hash the user never typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineRev {
+    /// What the user typed: `main`, `v1.0`, `HEAD~3`.
+    pub label: String,
+    /// The commit it resolved to, short form.
+    pub commit: String,
+}
+
 /// Cached Git baseline for a buffer: where it lives in a repo (if anywhere) and the committed
-/// (HEAD) content to diff against. Resolved on open and refreshed when HEAD changes — *not* on
-/// every edit.
+/// content to diff against — HEAD normally, or a pinned revision when one is set for the repo.
+/// Resolved on open and refreshed when HEAD changes — *not* on every edit.
 #[derive(Debug, Clone, Default)]
 pub struct GitBaseline {
     /// `Some` when the file is inside a Git repo. A cached `None` means "checked, not in a repo",
@@ -91,12 +111,17 @@ pub struct GitBaseline {
     /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
     /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
     pub staged_hunks: Vec<DiffHunk>,
+    /// Set when this repo is being diffed against something other than HEAD. The staged/unstaged
+    /// split is meaningless then — there's no index relationship to an arbitrary commit — so both
+    /// blobs hold that commit's content and the whole change set reads as unstaged. See
+    /// [`load_baseline`].
+    pub rev: Option<BaselineRev>,
 }
 
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
 /// and decompressing the committed blob — so it runs on open and on external Git changes, never
 /// per edit. Synchronous and `!Send`-clean (every libgit2 object is dropped before returning).
-pub fn load_baseline(path: &Path) -> GitBaseline {
+pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     // Canonicalise so `strip_prefix` against the (also canonicalised) workdir is symlink-proof,
     // and so a not-yet-on-disk file (new buffer) resolves to "no repo" rather than erroring.
     let Ok(canonical) = path.canonicalize() else {
@@ -112,6 +137,24 @@ pub fn load_baseline(path: &Path) -> GitBaseline {
         return GitBaseline::default();
     };
     let rel_path = rel.to_path_buf();
+
+    // Diffing against a pinned revision instead of HEAD: point *both* blobs at that commit's
+    // content. The existing pipeline then produces exactly the right thing with no special cases
+    // downstream — staged (blob → index) comes out empty, unstaged (index → buffer) is the whole
+    // "changed since that commit" set, and the gutter, hunk navigation and revert all follow.
+    // A file absent from that commit has no blob, so it reads as wholly added, which is true.
+    if let Some(rev) = revs.get(&workdir) {
+        let bytes = rev_blob_bytes(&repo, &rev.commit, &rel_path).map(normalize_lf);
+        return GitBaseline {
+            repo: Some(GitRepo { workdir, rel_path }),
+            blob: bytes.clone(),
+            index_blob: bytes,
+            branch: current_branch(&repo),
+            staged_hunks: Vec::new(),
+            rev: Some(rev.clone()),
+        };
+    }
+
     let blob = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
     let index_blob = index_blob_bytes(&repo, &rel_path).map(normalize_lf);
     // Staged diff is HEAD → index; absent sides count as empty (a staged add has no HEAD side, a
@@ -126,7 +169,32 @@ pub fn load_baseline(path: &Path) -> GitBaseline {
         index_blob,
         branch: current_branch(&repo),
         staged_hunks,
+        rev: None,
     }
+}
+
+/// `rel`'s content at `rev`, or `None` when the path doesn't exist there (or `rev` no longer
+/// resolves — a pinned commit that has since been garbage-collected).
+fn rev_blob_bytes(repo: &git2::Repository, rev: &str, rel: &Path) -> Option<Vec<u8>> {
+    let tree = repo
+        .revparse_single(rev)
+        .ok()?
+        .peel_to_commit()
+        .ok()?
+        .tree()
+        .ok()?;
+    let entry = tree.get_path(rel).ok()?;
+    let blob = entry.to_object(repo).ok()?.peel_to_blob().ok()?;
+    Some(blob.content().to_vec())
+}
+
+/// Resolve `rev` (a branch, tag, hash, `HEAD~3`, …) to a short commit hash, for pinning at
+/// `git/set_baseline` time. `None` when it names nothing in this repo.
+pub fn resolve_rev(workdir: &Path, rev: &str) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let commit = repo.revparse_single(rev).ok()?.peel_to_commit().ok()?;
+    let s = commit.id().to_string();
+    Some(s[..7.min(s.len())].to_string())
 }
 
 /// The file's staged (index) content as raw bytes, or `None` when it has no index entry. Stage `0`
@@ -141,24 +209,87 @@ fn index_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
 
 /// Current branch name, or a short commit hash when HEAD is detached. Handles an unborn branch
 /// (fresh repo, no commits yet) by reading the symbolic `HEAD` target. `None` only on error.
+///
+/// The flattened, display-oriented view of [`head_state`] — what the status bar wants. Anything
+/// that needs to *act* on HEAD wants the three-way state instead.
 fn current_branch(repo: &git2::Repository) -> Option<String> {
+    head_state(repo).map(|h| match h {
+        GitHead::Branch { name, .. } | GitHead::Unborn { name } => name,
+        GitHead::Detached { oid } => oid,
+    })
+}
+
+/// Where HEAD points, as the three cases that admit different operations (see [`GitHead`]).
+/// `None` only when HEAD can't be read at all.
+///
+/// The unborn case is checked *last*: a repo with commits has a resolvable `head()`, and only a
+/// fresh one falls through to reading HEAD's symbolic target directly.
+fn head_state(repo: &git2::Repository) -> Option<GitHead> {
     if let Ok(head) = repo.head() {
         if head.is_branch() {
-            return head.shorthand().ok().map(String::from);
+            let name = head.shorthand().ok()?.to_string();
+            // The upstream lookup is best-effort and expected to fail for a never-pushed branch;
+            // `None` there is the "push needs --set-upstream" signal, not an error.
+            let upstream = repo
+                .find_branch(&name, git2::BranchType::Local)
+                .ok()
+                .and_then(|b| b.upstream().ok())
+                .and_then(|u| u.name().ok().flatten().map(String::from));
+            return Some(GitHead::Branch { name, upstream });
         }
         if let Some(oid) = head.target() {
             let s = oid.to_string();
-            return Some(s[..7.min(s.len())].to_string());
+            return Some(GitHead::Detached {
+                oid: s[..7.min(s.len())].to_string(),
+            });
         }
     }
     // Unborn branch: HEAD is a symbolic ref to a branch that has no commit yet.
-    repo.find_reference("HEAD")
+    let name = repo
+        .find_reference("HEAD")
         .ok()?
         .symbolic_target()
         .ok()
         .flatten()
-        .and_then(|t| t.strip_prefix("refs/heads/"))
-        .map(String::from)
+        .and_then(|t| t.strip_prefix("refs/heads/").map(String::from))?;
+    Some(GitHead::Unborn { name })
+}
+
+/// A repo's identity and current HEAD — everything `git/repos` reports about one repo except which
+/// workspace roots reached it (the caller knows that, this doesn't).
+///
+/// `workdir` is the [`RepoId`]; see there for why identity is the working directory and not the
+/// git dir. `git_dir` and `common_dir` differ only for a linked worktree, and that difference is
+/// the whole reason both are carried: HEAD and the index are per-worktree, refs and objects are
+/// shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIdentity {
+    pub workdir: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub head: GitHead,
+}
+
+/// Resolve the repo containing `path` (a file or a directory) to its identity, or `None` when the
+/// path is in no repo — or in a bare one, which has no working tree for an editor to point at.
+///
+/// Discovery walks upward, so a workspace root nested inside a repo resolves to the repo's
+/// top level, not the root: [`RepoIdentity::workdir`] is deliberately not the path passed in.
+/// Paths are canonicalized so two roots reaching one repo by different symlinks produce one id.
+pub fn discover_repo(path: &Path) -> Option<RepoIdentity> {
+    let canonical = path.canonicalize().ok()?;
+    let repo = git2::Repository::discover(&canonical).ok()?;
+    let workdir = repo.workdir()?.canonicalize().ok()?;
+    // `path()`/`commondir()` are the same directory for an ordinary checkout and diverge for a
+    // linked worktree. Canonicalized so ids and grouping compare as strings.
+    let git_dir = repo.path().canonicalize().ok()?;
+    let common_dir = repo.commondir().canonicalize().unwrap_or(git_dir.clone());
+    Some(RepoIdentity {
+        workdir,
+        git_dir,
+        common_dir,
+        head: head_state(&repo)?,
+    })
 }
 
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.
@@ -1625,11 +1756,13 @@ mod tests {
     fn write_index_blob_updates_tracked_entry() {
         let dir = tempfile::tempdir().unwrap();
         let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
-        let repo = load_baseline(&file).repo.expect("repo resolved");
+        let repo = load_baseline(&file, &BaselineRevs::new())
+            .repo
+            .expect("repo resolved");
 
         write_index_blob(&repo, b"one\nTWO\n").expect("index write");
 
-        let baseline = load_baseline(&file);
+        let baseline = load_baseline(&file, &BaselineRevs::new());
         assert_eq!(baseline.index_blob.as_deref(), Some(&b"one\nTWO\n"[..]));
         assert_eq!(
             baseline.blob.as_deref(),
@@ -1650,15 +1783,19 @@ mod tests {
         repo_with_committed_file(dir.path(), "other.rs", "x\n");
         let file = dir.path().join("new.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let repo = load_baseline(&file).repo.expect("repo resolved");
+        let repo = load_baseline(&file, &BaselineRevs::new())
+            .repo
+            .expect("repo resolved");
         assert!(
-            load_baseline(&file).index_blob.is_none(),
+            load_baseline(&file, &BaselineRevs::new())
+                .index_blob
+                .is_none(),
             "untracked → no entry yet"
         );
 
         write_index_blob(&repo, b"hello\n").expect("index write");
 
-        let baseline = load_baseline(&file);
+        let baseline = load_baseline(&file, &BaselineRevs::new());
         assert_eq!(baseline.index_blob.as_deref(), Some(&b"hello\n"[..]));
         assert!(baseline.blob.is_none(), "still not in HEAD");
     }
@@ -1693,7 +1830,7 @@ mod tests {
     // ---- load_baseline + diff_hunks against a real repo -----------------------------------------
 
     fn hunks_for(file: &Path, current: &str) -> Vec<DiffHunk> {
-        let baseline = load_baseline(file);
+        let baseline = load_baseline(file, &BaselineRevs::new());
         diff_hunks(baseline.blob.as_deref(), &rope(current))
     }
 
@@ -1734,7 +1871,7 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        let baseline = load_baseline(&file);
+        let baseline = load_baseline(&file, &BaselineRevs::new());
         assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\nthree\n"[..]));
         assert!(
             diff_hunks(baseline.blob.as_deref(), &rope("one\ntwo\nthree\n")).is_empty(),
@@ -1749,7 +1886,7 @@ mod tests {
         git2::Repository::init(dir.path()).unwrap();
         let file = dir.path().join("untracked.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let baseline = load_baseline(&file);
+        let baseline = load_baseline(&file, &BaselineRevs::new());
         assert!(baseline.repo.is_some(), "repo discovered");
         assert!(baseline.blob.is_none(), "untracked → no committed blob");
         assert!(diff_hunks(baseline.blob.as_deref(), &rope("hello\nworld\n")).is_empty());
@@ -1760,7 +1897,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("loose.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let baseline = load_baseline(&file);
+        let baseline = load_baseline(&file, &BaselineRevs::new());
         assert!(baseline.repo.is_none());
         assert!(baseline.blob.is_none());
     }
@@ -1771,7 +1908,9 @@ mod tests {
     fn blame_attributes_committed_lines_and_flags_edits() {
         let dir = tempfile::tempdir().unwrap();
         let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
-        let repo = load_baseline(&file).repo.expect("repo resolved");
+        let repo = load_baseline(&file, &BaselineRevs::new())
+            .repo
+            .expect("repo resolved");
 
         // Edit line 2 in the live buffer only (not on disk).
         let blame = compute_blame(&repo, &rope("one\nEDITED\nthree\n")).expect("blame available");
@@ -1795,7 +1934,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("loose.rs");
         std::fs::write(&file, "x\n").unwrap();
-        assert!(load_baseline(&file).repo.is_none());
+        assert!(load_baseline(&file, &BaselineRevs::new()).repo.is_none());
     }
 
     // ---- dir_statuses (explorer colouring) ------------------------------------------------------

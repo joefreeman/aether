@@ -31,12 +31,14 @@ pub struct InfoRow {
 }
 
 /// How prominently to render a row's value. Deliberately two-valued: this is a *diagnostic* screen,
-/// so almost everything is a plain fact, and reserving the warning tone for the one row that means
+/// so almost everything is a plain fact, and reserving the warning tone for rows that mean
 /// "something is actually wrong" keeps it meaningful.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoTone {
     Normal,
-    /// The client and server are different builds — the one condition here that a user can act on.
+    /// Something the user can act on: the client and server are different builds, or a required
+    /// external tool is missing. Both disable real functionality, and neither is visible anywhere
+    /// else in the UI.
     Warn,
 }
 
@@ -125,6 +127,18 @@ pub fn sections(info: Option<&AppInfo>, conn: &ConnState) -> Vec<InfoSection> {
     out.push(InfoSection {
         title: "Instance",
         rows: instance,
+    });
+
+    // ---- Tools: the external binaries we depend on ----
+    // Only git, and only because every git *write* shells out to it (reads are libgit2, in
+    // process). "Not found" is a real, actionable finding and easy to hit without noticing: the
+    // daemon is spawned detached, so it can be missing a `git` the user's own shell has.
+    out.push(InfoSection {
+        title: "Tools",
+        rows: vec![match &info.git_version {
+            Some(v) => InfoRow::new("Git", v.clone()),
+            None => InfoRow::warn("Git", "not found"),
+        }],
     });
 
     // ---- Paths: where does this profile's state live? ----
@@ -317,6 +331,7 @@ mod tests {
             buffers_open: 5,
             buffers_unsaved: 1,
             workspaces_active: 3,
+            git_version: Some("git version 2.43.0".into()),
             paths: AppPaths {
                 config_dir: Some("/home/u/.config/aether/profiles/default".into()),
                 ..Default::default()
@@ -362,14 +377,32 @@ mod tests {
     }
 
     #[test]
-    fn sections_cover_build_instance_and_paths() {
+    fn sections_cover_build_instance_tools_and_paths() {
         let s = sections(Some(&info()), &ConnState::Connected);
         let titles: Vec<_> = s.iter().map(|s| s.title).collect();
-        assert_eq!(titles, vec!["Build", "Instance", "Paths"]);
+        assert_eq!(titles, vec!["Build", "Instance", "Tools", "Paths"]);
         assert_eq!(value(&s, "Profile").as_deref(), Some("default"));
         assert_eq!(value(&s, "Port").as_deref(), Some("2384"));
         assert_eq!(value(&s, "Uptime").as_deref(), Some("3h 12m"));
         assert_eq!(value(&s, "Buffers").as_deref(), Some("5 open, 1 unsaved"));
+        assert_eq!(value(&s, "Git").as_deref(), Some("git version 2.43.0"));
+    }
+
+    /// A missing git is warn-toned, not omitted: an absent row would read as "nothing to say",
+    /// when in fact every git write is unavailable. Unlike an unresolved path, this row always
+    /// renders — the absence *is* the diagnostic and it has to be visible.
+    #[test]
+    fn missing_git_renders_as_a_warning_row() {
+        let mut without = info();
+        without.git_version = None;
+        let s = sections(Some(&without), &ConnState::Connected);
+        let row = s
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .find(|r| r.label == "Git")
+            .expect("git row is always present");
+        assert_eq!(row.value, "not found");
+        assert_eq!(row.tone, InfoTone::Warn);
     }
 
     /// Only the two profile roots render (per-file paths are always fixed names under them, so

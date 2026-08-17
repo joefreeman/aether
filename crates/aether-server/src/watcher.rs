@@ -346,6 +346,18 @@ async fn handle_event(state: &SharedState, event: Event) {
             watcher_handle = s.watcher.clone();
         }
 
+        // Drop everything under a repo we're mid-rewrite in: those files are about to be
+        // reconciled in one deliberate pass, which both avoids reloading them one at a time and
+        // keeps that pass's report of what changed accurate. See `ServerState::git_suppressed`.
+        let paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|p| !is_suppressed(p, &s.git_suppressed))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+
         for path in &paths {
             if let Some(parent) = path.parent() {
                 affected_dirs.insert(parent.to_path_buf());
@@ -437,6 +449,15 @@ enum Category {
     Remove,
 }
 
+/// Is `path` inside a repo whose tree we're currently rewriting ourselves?
+///
+/// Containment, not equality: a checkout touches files anywhere under the workdir, and the `.git`
+/// churn it produces sits under it too — both must be ignored, or the baseline-refresh path fires
+/// hundreds of times for one operation.
+fn is_suppressed(path: &Path, suppressed: &HashSet<PathBuf>) -> bool {
+    suppressed.iter().any(|workdir| path.starts_with(workdir))
+}
+
 /// If `path` is a meaningful file inside a `.git` directory — `HEAD`, `index`, `packed-refs`, or
 /// anything under `refs/` (the things commit/checkout/stage touch) — return the repo's working
 /// directory (the parent of `.git`). Ignores `*.lock` temp files and noise like `logs/` and
@@ -524,7 +545,7 @@ fn handle_buffer_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{git_change_workdir, watch_targets};
+    use super::{git_change_workdir, is_suppressed, watch_targets};
     use std::path::{Path, PathBuf};
 
     /// Build the directory tree the walk-target tests share:
@@ -546,6 +567,37 @@ mod tests {
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::create_dir_all(root.join(".hidden")).unwrap();
         dir
+    }
+
+    /// Suppression is by containment: while we're rewriting a repo, *everything* under its
+    /// workdir is ours to reconcile — the working-tree files and the `.git` churn alike. A
+    /// sibling repo that merely shares a path prefix must keep receiving events.
+    #[test]
+    fn suppression_covers_a_workdir_subtree_but_not_its_siblings() {
+        let suppressed: std::collections::HashSet<PathBuf> =
+            [PathBuf::from("/src/aether")].into_iter().collect();
+
+        for inside in [
+            "/src/aether/a.rs",
+            "/src/aether/crates/server/src/git.rs",
+            "/src/aether/.git/HEAD",
+            "/src/aether",
+        ] {
+            assert!(is_suppressed(Path::new(inside), &suppressed), "{inside}");
+        }
+        // `starts_with` is component-wise, so a sibling whose name merely extends the suppressed
+        // one is untouched — the string-prefix bug this would otherwise be.
+        for outside in [
+            "/src/aether-worktrees/feature/a.rs",
+            "/src/aetherium/a.rs",
+            "/src",
+        ] {
+            assert!(!is_suppressed(Path::new(outside), &suppressed), "{outside}");
+        }
+        assert!(!is_suppressed(
+            Path::new("/src/aether/a.rs"),
+            &std::collections::HashSet::new()
+        ));
     }
 
     #[test]

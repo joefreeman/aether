@@ -19,8 +19,10 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitNavigateHunk, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitHead, GitNavigateHunk,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitRefresh, GitRefreshParams, GitRefreshResult,
+    GitRepos, GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
     GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
@@ -29594,17 +29596,34 @@ async fn app_info_matches_the_status_endpoint() {
 
     // The HTTP snapshot is the same payload. Compare the fields that can't drift between two calls
     // — uptime advances between them, so it's excluded rather than made flaky.
+    //
+    // `git_version` is the one deliberate exception, normalised away here rather than silently
+    // tolerated: probing git can take seconds on first use for a directory (it resolves the
+    // environment through a login shell), and `fetch_status` gives up after two — so `/status`
+    // never probes, while `app/info` does. Everything else must stay identical; the point of one
+    // builder is that the dialog and `ae server status` can't disagree about the server.
     let via_http = tokio::task::spawn_blocking(move || aether_server::fetch_status(port))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
+        via_http.git_version, None,
+        "`/status` leaves the git probe unset"
+    );
+    assert!(
+        info.git_version.is_none() || info.git_version.as_deref().unwrap().starts_with("git "),
+        "the RPC path probes git (or reports it missing): {:?}",
+        info.git_version
+    );
+    assert_eq!(
         AppInfo {
             uptime_secs: 0,
+            git_version: None,
             ..via_http
         },
         AppInfo {
             uptime_secs: 0,
+            git_version: None,
             ..info
         },
         "`app/info` and `GET /status` serve one snapshot"
@@ -30602,5 +30621,1039 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
         .collect();
     assert_eq!(names, vec!["fn solo"]);
 
+    drop(server);
+}
+
+// -------- git/repos (repo identity) ---------------------------------------------------------------
+
+/// A repo with a deterministic initial branch. libgit2 honours `init.defaultBranch`, so a plain
+/// `Repository::init` would let the developer's global config decide the branch name and make
+/// these assertions machine-dependent.
+fn init_repo_at(dir: &std::path::Path) -> git2::Repository {
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    git2::Repository::init_opts(dir, &opts).unwrap()
+}
+
+/// Commit `rel` (created with `content`) so the repo has a resolvable HEAD.
+fn commit_file(repo: &git2::Repository, rel: &str, content: &str) {
+    let workdir = repo.workdir().unwrap().to_path_buf();
+    let path = workdir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, content).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(rel)).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let parents = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(c) => vec![c],
+        None => vec![],
+    };
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "init",
+        &tree,
+        &parents.iter().collect::<Vec<_>>(),
+    )
+    .unwrap();
+}
+
+async fn setup_repos_workspace(
+    roots: Vec<std::path::PathBuf>,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let server = spawn_for_test("repos-proj", roots).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "repos-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    (server, ws)
+}
+
+#[tokio::test]
+async fn git_repos_reports_the_workspace_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    assert_eq!(res.repos.len(), 1);
+    let r = &res.repos[0];
+    // The id is the *working directory*, and the git dir hangs off it. For an ordinary checkout
+    // (not a worktree) the common dir is the same directory — that equality is what tells a
+    // client this repo has no worktree siblings.
+    assert_eq!(r.repo_id, root.to_string_lossy());
+    assert_eq!(r.git_dir, root.join(".git").to_string_lossy());
+    assert_eq!(r.common_dir, r.git_dir);
+    assert_eq!(
+        r.head,
+        GitHead::Branch {
+            name: "main".into(),
+            // Nothing to push to in a test repo, which is exactly the never-pushed case.
+            upstream: None,
+        }
+    );
+    assert_eq!(r.roots, vec![root.to_string_lossy().to_string()]);
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_resolves_a_subdirectory_root_to_the_repo_top_level() {
+    // The root the user configured is *inside* the repo. Discovery walks up, so the id is the
+    // repo, not the root — the distinction every mutating RPC depends on (checking out a branch
+    // rewrites the whole working tree, not the root's subtree).
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&top);
+    commit_file(&repo, "crates/server/a.rs", "one\n");
+    let root = top.join("crates/server");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    assert_eq!(res.repos.len(), 1);
+    assert_eq!(res.repos[0].repo_id, top.to_string_lossy());
+    assert_ne!(res.repos[0].repo_id, root.to_string_lossy());
+    // The root still reports as the way this repo was reached.
+    assert_eq!(res.repos[0].roots, vec![root.to_string_lossy().to_string()]);
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_collapses_two_roots_in_one_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&top);
+    commit_file(&repo, "crates/server/a.rs", "one\n");
+    commit_file(&repo, "crates/tui/b.rs", "two\n");
+    let server_root = top.join("crates/server");
+    let tui_root = top.join("crates/tui");
+
+    let (server, mut ws) = setup_repos_workspace(vec![server_root.clone(), tui_root.clone()]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    // Two roots, one repo — one entry, listing both roots that reach it.
+    assert_eq!(res.repos.len(), 1);
+    assert_eq!(res.repos[0].repo_id, top.to_string_lossy());
+    assert_eq!(
+        res.repos[0].roots,
+        vec![
+            server_root.to_string_lossy().to_string(),
+            tui_root.to_string_lossy().to_string()
+        ]
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_keeps_distinct_repos_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let first = base.join("alpha");
+    let second = base.join("beta");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    commit_file(&init_repo_at(&first), "a.rs", "one\n");
+    commit_file(&init_repo_at(&second), "b.rs", "two\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![first.clone(), second.clone()]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    // Root order, so the response is stable and the first row is a sensible default target.
+    let ids: Vec<&str> = res.repos.iter().map(|r| r.repo_id.as_str()).collect();
+    assert_eq!(ids, vec![first.to_string_lossy(), second.to_string_lossy()]);
+    // Separate repos, so no shared common dir — the check that distinguishes them from worktrees.
+    assert_ne!(res.repos[0].common_dir, res.repos[1].common_dir);
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_is_empty_outside_a_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("loose.rs"), "x\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    // No repo is an ordinary answer, not an error — the client hides git affordances rather than
+    // reporting a failure.
+    assert!(res.repos.is_empty());
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_reports_an_unborn_head() {
+    // A freshly-initialised repo: HEAD names a branch that has no commit yet. Committing is fine
+    // here; pushing needs `--set-upstream`. Flattening this to a branch name would lose that.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    init_repo_at(&root);
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    assert_eq!(res.repos.len(), 1);
+    assert_eq!(
+        res.repos[0].head,
+        GitHead::Unborn {
+            name: "main".into()
+        }
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_reports_a_detached_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let oid = repo.head().unwrap().target().unwrap();
+    repo.set_head_detached(oid).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    assert_eq!(res.repos.len(), 1);
+    assert_eq!(
+        res.repos[0].head,
+        GitHead::Detached {
+            oid: oid.to_string()[..7].to_string()
+        }
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_finds_a_repo_nested_under_a_root() {
+    // The workspace root is not itself a repo but contains one (a vendored checkout). Discovery
+    // from the root walks *up* and never sees it; the open buffer's cached baseline does.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let vendored = root.join("vendor/lib");
+    std::fs::create_dir_all(&vendored).unwrap();
+    commit_file(&init_repo_at(&vendored), "x.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+
+    // Before anything is open, the root reaches no repo.
+    let before: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+    assert!(before.repos.is_empty());
+
+    let _open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("vendor/lib/x.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let after: GitReposResult = send_request::<GitRepos>(&mut ws, 4, &GitReposParams {}).await;
+    assert_eq!(after.repos.len(), 1);
+    assert_eq!(after.repos[0].repo_id, vendored.to_string_lossy());
+    // Reached through the root even though the root isn't in the repo: containment holds the
+    // other way round, and the file is one the user has open in this workspace.
+    assert_eq!(
+        after.repos[0].roots,
+        vec![root.to_string_lossy().to_string()]
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_repos_treats_a_worktree_as_its_own_repo_sharing_a_common_dir() {
+    // The case `RepoId` is keyed on the workdir *for*. A linked worktree has its own HEAD and
+    // index — so checkout and commit mean different things in each and they must be separate
+    // ids — while sharing refs, objects and the stash, which the common dir expresses.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let repo = init_repo_at(&main);
+    commit_file(&repo, "a.rs", "one\n");
+
+    // Sibling-of-the-repo layout, per the worktree convention in docs/git-phase-2.md. libgit2
+    // creates the leaf but not its parent.
+    let wt_path = base.join("main-worktrees/feature");
+    std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    repo.worktree("feature", &wt_path, None).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![main.clone(), wt_path.clone()]).await;
+    let res: GitReposResult = send_request::<GitRepos>(&mut ws, 2, &GitReposParams {}).await;
+
+    assert_eq!(res.repos.len(), 2);
+    let main_repo = &res.repos[0];
+    let worktree = &res.repos[1];
+    assert_eq!(main_repo.repo_id, main.to_string_lossy());
+    assert_eq!(worktree.repo_id, wt_path.to_string_lossy());
+
+    // A worktree's own `.git` is a *file* pointing into the main repo, so its git dir lives under
+    // the main repo's `.git/worktrees/` — not beside its working tree.
+    assert!(wt_path.join(".git").is_file());
+    assert_eq!(
+        worktree.git_dir,
+        main.join(".git/worktrees/feature").to_string_lossy()
+    );
+    // The shared store: equal common dirs is how a client knows these two are worktree siblings
+    // (so a stash listed in one is the same stash listed in the other) rather than separate repos.
+    assert_eq!(worktree.common_dir, main.join(".git").to_string_lossy());
+    assert_eq!(main_repo.common_dir, worktree.common_dir);
+    assert_ne!(main_repo.git_dir, worktree.git_dir);
+
+    // Each is on its own branch — the reason a branch checked out in one worktree can't be
+    // checked out in the other.
+    assert_eq!(
+        main_repo.head,
+        GitHead::Branch {
+            name: "main".into(),
+            upstream: None
+        }
+    );
+    assert_eq!(
+        worktree.head,
+        GitHead::Branch {
+            name: "feature".into(),
+            upstream: None
+        }
+    );
+    drop(server);
+}
+
+// -------- git/refresh (reconciliation) ------------------------------------------------------------
+
+/// A repo with one committed file, opened as a workspace with a viewport on it. Returns the repo
+/// (so the test can move the tree underneath), the buffer and the viewport.
+async fn setup_refresh_workspace(
+    committed: &str,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    git2::Repository,
+    std::path::PathBuf,
+    u64,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::mem::forget(dir); // outlive the test; /tmp is cleaned by the OS
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", committed);
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    (server, ws, repo, root, open.buffer_id)
+}
+
+/// Mutate the tree the way a real tree-rewriting operation will: with the watcher suppressed for
+/// the repo, so the reconciliation pass is the *only* thing that reacts and its report is a true
+/// account of what happened. Without this the watcher races us — it reloads clean buffers behind
+/// our back, and `git/refresh` then truthfully reports that it found nothing to do.
+///
+/// Production callers will hold this window around the `git` invocation itself (stage 1/2); here
+/// the test drives the tree directly, so it holds the window itself via the `ServerHandle::state`
+/// test seam.
+async fn with_tree_rewrite<F: FnOnce()>(
+    server: &aether_server::ServerHandle,
+    root: &std::path::Path,
+    rewrite: F,
+) {
+    server
+        .state
+        .lock()
+        .await
+        .git_suppressed
+        .insert(root.to_path_buf());
+    rewrite();
+    // Let the (now-ignored) events drain before lifting suppression, so a late-delivered event
+    // can't slip through after we stop filtering and reload behind the assertions.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    server.state.lock().await.git_suppressed.remove(root);
+}
+
+async fn refresh(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+) -> GitRefreshResult {
+    send_request::<GitRefresh>(
+        ws,
+        id,
+        &GitRefreshParams {
+            repo_id: root.to_string_lossy().into(),
+        },
+    )
+    .await
+}
+
+/// Reconciliation's core promise: a clean buffer picks up the new working-tree content in place.
+/// This is the path every tree-rewriting operation (checkout, stash pop, pull) runs when it ends.
+#[tokio::test]
+async fn git_refresh_reloads_a_clean_buffer() {
+    let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\ntwo\n").await;
+
+    // The tree moves underneath. The sleep gives the new file a distinct mtime — reconciliation
+    // uses mtime to tell "this file was part of the move" from "this one wasn't".
+    with_tree_rewrite(&server, &root, || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        commit_file(&repo, "a.rs", "one\nCHANGED\n");
+    })
+    .await;
+
+    let res = refresh(&mut ws, 3, &root).await;
+    assert_eq!(res.reloaded, vec![buffer_id]);
+    assert!(res.diverged.is_empty());
+    assert!(res.missing.is_empty());
+    assert_eq!(buffer_text(&mut ws, 4, buffer_id).await, "one\nCHANGED\n");
+
+    // Idempotent: with nothing changed since, a second pass reloads nothing. This is what stops a
+    // repeated refresh churning every open buffer's revision (and every viewport's render).
+    let again = refresh(&mut ws, 5, &root).await;
+    assert!(again.reloaded.is_empty());
+    drop(server);
+}
+
+/// The case with no safe automatic answer: unsaved edits *and* the file moved underneath. The
+/// buffer is left exactly as the user had it — silently discarding their work is the one outcome
+/// reconciliation must never produce — and flagged so the next save asks rather than clobbers.
+#[tokio::test]
+async fn git_refresh_never_discards_unsaved_edits() {
+    let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\ntwo\n").await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "MINE".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    with_tree_rewrite(&server, &root, || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        commit_file(&repo, "a.rs", "one\nTHEIRS\n");
+    })
+    .await;
+
+    let res = refresh(&mut ws, 4, &root).await;
+    assert_eq!(res.diverged, vec![buffer_id]);
+    assert!(res.reloaded.is_empty(), "a dirty buffer is never re-read");
+    assert!(
+        buffer_text(&mut ws, 5, buffer_id).await.starts_with("MINE"),
+        "the user's edit survives"
+    );
+
+    // The flag isn't cosmetic: it makes the next plain save refuse rather than overwrite the
+    // version that landed underneath. The user has to acknowledge the divergence.
+    let err = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("modified on disk"),
+        "save should refuse a diverged buffer, got: {err}"
+    );
+    drop(server);
+}
+
+/// A file that isn't on the newly checked-out ref. The buffer stays open holding its content —
+/// closing it would destroy the only remaining copy, and saving is how the user gets it back.
+#[tokio::test]
+async fn git_refresh_keeps_a_vanished_file_open_and_marked_missing() {
+    let (server, mut ws, _repo, root, buffer_id) = setup_refresh_workspace("bye\n").await;
+
+    let gone = root.join("a.rs");
+    with_tree_rewrite(&server, &root, || std::fs::remove_file(&gone).unwrap()).await;
+
+    let res = refresh(&mut ws, 3, &root).await;
+    assert_eq!(res.missing, vec![buffer_id]);
+    assert!(res.reloaded.is_empty());
+    assert_eq!(
+        buffer_text(&mut ws, 4, buffer_id).await,
+        "bye\n",
+        "content survives in memory"
+    );
+    drop(server);
+}
+
+/// A commit moves HEAD without touching a single working-tree file, so nothing reloads — but the
+/// baseline still has to follow, or the gutter keeps showing the just-committed lines as changed.
+/// This is why reconciliation refreshes every buffer's baseline, not only the ones it re-read.
+#[tokio::test]
+async fn git_refresh_rebases_baselines_when_no_file_changed() {
+    let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\n").await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Diverge from HEAD through the editor and save, so the working tree and the buffer agree and
+    // only HEAD is behind — the state you're in immediately before committing.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let before: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        6,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: true,
+        },
+    )
+    .await;
+    let before = before
+        .window
+        .git_status
+        .expect("tracked file has git status");
+    assert_eq!(
+        before.unstaged.modified, 1,
+        "buffer should differ from HEAD before the commit, got {before:?}"
+    );
+
+    // Commit exactly what's on disk: HEAD moves, no working-tree file changes at all.
+    with_tree_rewrite(&server, &root, || {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+            .unwrap();
+    })
+    .await;
+
+    let res = refresh(&mut ws, 7, &root).await;
+    assert!(res.reloaded.is_empty(), "no file changed on disk");
+    assert!(res.diverged.is_empty());
+    assert!(res.missing.is_empty());
+
+    let after: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        8,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: false,
+        },
+    )
+    .await;
+    let gs = after.window.git_status.expect("git status present");
+    assert!(
+        gs.unstaged.is_empty() && gs.staged.is_empty(),
+        "baseline should have moved to the new HEAD, got {gs:?}"
+    );
+    drop(server);
+}
+
+/// `RepoId`s are server-validated: one the active workspace can't reach is refused rather than
+/// acted on. This is what stops a synthesized path reaching a repo the user never opened.
+#[tokio::test]
+async fn git_refresh_rejects_an_unreachable_repo() {
+    let (server, mut ws, _repo, _root, _buffer_id) = setup_refresh_workspace("one\n").await;
+
+    // A real repo, correctly formed — but outside the workspace entirely.
+    let other = tempfile::tempdir().unwrap();
+    let other_root = other.path().canonicalize().unwrap();
+    commit_file(&init_repo_at(&other_root), "b.rs", "two\n");
+
+    let err = send_request_expect_err::<GitRefresh>(
+        &mut ws,
+        3,
+        &GitRefreshParams {
+            repo_id: other_root.to_string_lossy().into(),
+        },
+    )
+    .await;
+    assert!(err.contains("no such repo"), "unexpected error: {err}");
+    drop(server);
+}
+
+/// A reload replaces the buffer's text wholesale, so every cached hunk describes content that is
+/// no longer there. The gutter has to follow — it does, via the post-mutation refresh the reload
+/// already runs, but nothing pinned that, so this does.
+#[tokio::test]
+async fn buffer_reload_leaves_a_fresh_gutter() {
+    let (server, mut ws, _repo, root, buffer_id) = setup_refresh_workspace("one\ntwo\n").await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let clean = sub.window.git_status.expect("tracked file has git status");
+    assert!(clean.unstaged.is_empty(), "opens matching HEAD: {clean:?}");
+
+    // The file changes on disk without HEAD moving — an external tool, a formatter, a script.
+    // Suppressed so the reload under test is `buffer/reload`, not the watcher's silent one.
+    with_tree_rewrite(&server, &root, || {
+        std::fs::write(root.join("a.rs"), "one\ntwo\nthree\n").unwrap();
+    })
+    .await;
+
+    let _: BufferReloadResult = send_request::<BufferReload>(
+        &mut ws,
+        4,
+        &BufferReloadParams {
+            buffer_id,
+            force: false,
+        },
+    )
+    .await;
+
+    // Read the status back through a *cache-reading* RPC. `git/set_diff_view` deliberately
+    // recomputes hunks when it turns the view on, so asking through it would mask exactly the
+    // staleness under test; a scroll renders from whatever the reload left behind.
+    let after: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws,
+        5,
+        &ViewportScrollParams {
+            viewport_id: sub.viewport_id,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+        },
+    )
+    .await;
+    let gs = after.window.git_status.expect("git status present");
+    assert_eq!(
+        (gs.unstaged.added, gs.unstaged.modified, gs.unstaged.deleted),
+        (1, 0, 0),
+        "the added line should show as an unstaged change after the reload, got {gs:?}"
+    );
+
+    // And the hunk itself is addressable — the gutter has something to point at, not just a count.
+    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        6,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 0,
+            direction: HunkDirection::Next,
+            count: 1,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(nav.moved, "reload should leave a navigable hunk");
+    assert_eq!(nav.cursor.position.line, 2);
+    drop(server);
+}
+
+/// Recomputing hunks is skipped for a buffer nothing is viewing — there's no gutter to feed. That
+/// leaves the cache stale, and a subscribe renders from the cache rather than refreshing it, so
+/// the buffer's *first* frame would show a clean gutter for a modified file and stay wrong until
+/// the next keystroke. Reachable whenever a buffer is edited while hidden: a shared document
+/// edited through another workspace's view of it, or a reload of a background buffer.
+#[tokio::test]
+async fn subscribing_refreshes_a_gutter_left_stale_while_hidden() {
+    let (server, mut ws, _repo, _root, buffer_id) = setup_refresh_workspace("one\ntwo\n").await;
+
+    // Edit before any viewport exists, so the per-mutation recompute skips this buffer.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        4,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let gs = sub.window.git_status.expect("tracked file has git status");
+    assert_eq!(
+        (gs.unstaged.added, gs.unstaged.modified, gs.unstaged.deleted),
+        (0, 1, 0),
+        "the very first frame must show the edit, got {gs:?}"
+    );
+
+    // And it's the hunks themselves that were refreshed, not just the summary counts.
+    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        5,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 1,
+            direction: HunkDirection::Prev,
+            count: 1,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(nav.moved, "the modified line should be navigable");
+    assert_eq!(nav.cursor.position.line, 0);
+    drop(server);
+}
+
+// -------- git/set_baseline (diff against an arbitrary revision) -----------------------------------
+
+async fn set_baseline(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    rev: Option<&str>,
+) -> GitSetBaselineResult {
+    send_request::<GitSetBaseline>(
+        ws,
+        id,
+        &GitSetBaselineParams {
+            repo_id: root.to_string_lossy().into(),
+            rev: rev.map(str::to_string),
+        },
+    )
+    .await
+}
+
+async fn git_status_now(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    viewport_id: u64,
+) -> aether_protocol::git::GitBufferStatus {
+    let w: ViewportWindowResult = send_request::<ViewportScroll>(
+        ws,
+        id,
+        &ViewportScrollParams {
+            viewport_id,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+        },
+    )
+    .await;
+    w.window.git_status.expect("tracked file has git status")
+}
+
+/// The point of the feature: a buffer that matches HEAD still shows everything that changed since
+/// an earlier commit. The entire existing gutter/hunk stack follows the new baseline without
+/// knowing it moved.
+#[tokio::test]
+async fn set_baseline_diffs_against_an_older_commit() {
+    let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\n").await;
+    let first = repo.head().unwrap().target().unwrap().to_string();
+
+    // A second commit, checked out — the buffer matches HEAD, so it reads as clean.
+    with_tree_rewrite(&server, &root, || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        commit_file(&repo, "a.rs", "one\ntwo\n");
+    })
+    .await;
+    let _ = refresh(&mut ws, 3, &root).await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        4,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let clean = sub.window.git_status.expect("tracked file has git status");
+    assert!(clean.unstaged.is_empty(), "matches HEAD: {clean:?}");
+    assert!(clean.baseline.is_none(), "no override yet");
+
+    // Point the baseline at the first commit: the second commit's line is now a change.
+    let res = set_baseline(&mut ws, 5, &root, Some(&first)).await;
+    assert_eq!(res.buffers, vec![buffer_id]);
+    let baseline = res.baseline.expect("baseline set");
+    assert_eq!(
+        baseline.label, first,
+        "the label is what the user asked for"
+    );
+    assert_eq!(baseline.commit, first[..7], "resolved and pinned");
+
+    let gs = git_status_now(&mut ws, 6, sub.viewport_id).await;
+    assert_eq!(
+        (gs.unstaged.added, gs.unstaged.modified, gs.unstaged.deleted),
+        (1, 0, 0),
+        "the line added by the second commit should show, got {gs:?}"
+    );
+    // Staged is always empty against a revision — there is no index relationship to report.
+    assert!(gs.staged.is_empty());
+    // And the status says so, so the gutter disagreeing with `git diff` is explained rather than
+    // mysterious.
+    assert_eq!(
+        gs.baseline.as_ref().map(|b| b.label.as_str()),
+        Some(&*first)
+    );
+
+    // The hunk is real, not just a count.
+    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        7,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: 0,
+            direction: HunkDirection::Next,
+            count: 1,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(nav.moved);
+    assert_eq!(nav.cursor.position.line, 1);
+
+    // Clearing restores HEAD, and the buffer reads clean again.
+    let cleared = set_baseline(&mut ws, 8, &root, None).await;
+    assert!(cleared.baseline.is_none());
+    let gs = git_status_now(&mut ws, 9, sub.viewport_id).await;
+    assert!(gs.unstaged.is_empty(), "back to HEAD: {gs:?}");
+    assert!(gs.baseline.is_none());
+    drop(server);
+}
+
+/// Named revisions resolve the way `git rev-parse` does, and the resolved commit is pinned so a
+/// later move of the ref can't shift the gutter under the reader.
+#[tokio::test]
+async fn set_baseline_resolves_and_pins_a_named_revision() {
+    let (server, mut ws, repo, root, _buffer_id) = setup_refresh_workspace("one\n").await;
+    let first = repo.head().unwrap().target().unwrap().to_string();
+
+    let res = set_baseline(&mut ws, 3, &root, Some("main")).await;
+    let pinned = res.baseline.expect("baseline set");
+    assert_eq!(pinned.label, "main");
+    assert_eq!(pinned.commit, first[..7]);
+
+    // `main` moves on. The pinned commit does not follow it.
+    with_tree_rewrite(&server, &root, || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        commit_file(&repo, "a.rs", "one\ntwo\n");
+    })
+    .await;
+    let moved = repo.head().unwrap().target().unwrap().to_string();
+    assert_ne!(moved, first, "main should have moved");
+
+    let after = refresh(&mut ws, 4, &root).await;
+    assert_eq!(after.reloaded.len(), 1);
+
+    // Still comparing against the commit `main` named when it was set, so the new commit's line
+    // reads as a change rather than vanishing into a moved baseline.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        5,
+        &ViewportSubscribeParams {
+            buffer_id: _buffer_id,
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let gs = sub.window.git_status.expect("git status");
+    assert_eq!(gs.unstaged.added, 1, "pinned baseline, got {gs:?}");
+    assert_eq!(gs.baseline.map(|b| b.commit), Some(first[..7].to_string()));
+    drop(server);
+}
+
+/// A typo must not silently drop the user back to HEAD — that would look like "my changes
+/// disappeared". The previous baseline stays in force and the call errors.
+#[tokio::test]
+async fn set_baseline_rejects_an_unknown_revision_without_clearing() {
+    let (server, mut ws, repo, root, _buffer_id) = setup_refresh_workspace("one\n").await;
+    let first = repo.head().unwrap().target().unwrap().to_string();
+    set_baseline(&mut ws, 3, &root, Some(&first)).await;
+
+    let err = send_request_expect_err::<GitSetBaseline>(
+        &mut ws,
+        4,
+        &GitSetBaselineParams {
+            repo_id: root.to_string_lossy().into(),
+            rev: Some("no-such-ref".into()),
+        },
+    )
+    .await;
+    assert!(err.contains("no such revision"), "unexpected error: {err}");
+
+    // The good baseline survived the bad request.
+    let still = set_baseline(&mut ws, 5, &root, Some(&first)).await;
+    assert_eq!(
+        still.baseline.map(|b| b.commit),
+        Some(first[..7].to_string())
+    );
+    drop(server);
+}
+
+/// Staging is refused against a revision baseline: the hunks have no index relationship, so a
+/// toggle would write content the user never asked to stage. Reverting still works.
+#[tokio::test]
+async fn staging_is_refused_against_a_revision_baseline() {
+    let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\n").await;
+    let first = repo.head().unwrap().target().unwrap().to_string();
+    with_tree_rewrite(&server, &root, || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        commit_file(&repo, "a.rs", "one\ntwo\n");
+    })
+    .await;
+    let _ = refresh(&mut ws, 3, &root).await;
+    set_baseline(&mut ws, 4, &root, Some(&first)).await;
+
+    let toggled: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        5,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Toggle,
+        },
+    )
+    .await;
+    assert_eq!(toggled.status, ApplyHunkStatus::NotAgainstHead);
+
+    // Revert is still meaningful — put this hunk back to how it was at that commit.
+    let _: aether_protocol::cursor::CursorState = send_request::<CursorSet>(
+        &mut ws,
+        6,
+        &CursorSetParams {
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 0 },
+            anchor: LogicalPosition { line: 1, col: 0 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+    let reverted: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        7,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Revert,
+        },
+    )
+    .await;
+    assert_eq!(reverted.status, ApplyHunkStatus::Reverted);
     drop(server);
 }

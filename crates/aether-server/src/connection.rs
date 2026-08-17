@@ -25,7 +25,8 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::git::{
-    GitApplyHunk, GitBlameLine, GitNavigateHunk, GitSetBlameFollow, GitSetDiffView,
+    GitApplyHunk, GitBlameLine, GitNavigateHunk, GitRefresh, GitRepos, GitSetBaseline,
+    GitSetBlameFollow, GitSetDiffView,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -492,6 +493,9 @@ async fn dispatch(
         GitSetBlameFollow::NAME => run!(GitSetBlameFollow, handlers::git_set_blame_follow),
         GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
+        GitRepos::NAME => run!(GitRepos, handlers::git_repos),
+        GitRefresh::NAME => run!(GitRefresh, handlers::git_refresh),
+        GitSetBaseline::NAME => run!(GitSetBaseline, handlers::git_set_baseline),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),

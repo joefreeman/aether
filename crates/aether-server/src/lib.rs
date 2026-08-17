@@ -8,6 +8,7 @@ mod connection;
 mod cursor;
 mod error;
 mod git;
+mod git_cli;
 mod grep;
 mod handlers;
 mod http;

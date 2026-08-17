@@ -61,6 +61,15 @@ impl ErrorCode {
     /// confirm with the user and retry with `force: true` to discard the local edits.
     pub const WOULD_DISCARD_CHANGES: Self = Self(-32021);
     pub const LANGUAGE_NOT_FOUND: Self = Self(-32030);
+    /// A git RPC named a `RepoId` the caller's active workspace can't reach. Either the id was
+    /// never returned by `git/repos`, or the workspace has changed since it was. The client
+    /// should re-list the repos rather than retrying; ids are server-validated precisely so a
+    /// stale or invented one can't act on a repo the user never opened.
+    pub const REPO_NOT_FOUND: Self = Self(-32040);
+    /// `git/set_baseline` was given a revision `git rev-parse` doesn't recognise in that repo (a
+    /// typo, or a branch that only exists on a remote). The previous baseline is left in force —
+    /// a bad revision never silently drops the user back to HEAD.
+    pub const UNKNOWN_REVISION: Self = Self(-32041);
 
     pub fn code(self) -> i32 {
         self.0
