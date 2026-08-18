@@ -975,10 +975,23 @@ impl Session {
             },
 
             Event::Committed(result) => match result {
-                Ok(res) => {
+                // An empty message is the user changing their mind — git's own abort rule. Close
+                // the buffer as an ordinary close would, and say so quietly: this is the path
+                // "open the message, think better of it, press close" takes, and it must not
+                // strand them in a buffer they can't leave without writing something.
+                Ok(res) if res.empty_message => {
                     self.pending_commit = None;
+                    self.close_buffer()
+                        .and(Effects::toast("Commit abandoned", ToastKind::Info))
+                }
+                Ok(res) => {
                     match res.commit {
                         Some(commit) => {
+                            // Cleared only on success — a refusal leaves the entry standing so the
+                            // *next* close retries the commit. Without that, fixing what a
+                            // `pre-commit` hook complained about and pressing close again would
+                            // silently abandon the message instead of committing it.
+                            self.pending_commit = None;
                             let subject = commit
                                 .message
                                 .lines()
@@ -1929,9 +1942,14 @@ impl Session {
                     }
                     None => format!("Saved (rev {})", result.revision),
                 };
-                // A save that exists only to feed the commit isn't news — the commit's own toast
-                // is the outcome, and stacking both makes one gesture look like two.
-                let mut fx = if after == AfterSave::Commit {
+                // A save that exists only to feed a commit isn't news — the commit's own toast is
+                // the outcome, and stacking both makes one gesture look like two.
+                let feeds_commit = after == AfterSave::Close
+                    && self
+                        .pending_commit
+                        .as_ref()
+                        .is_some_and(|p| p.buffer_id == self.buffer.buffer_id);
+                let mut fx = if feeds_commit {
                     Effects::none()
                 } else {
                     Effects::toast(note, ToastKind::Success)
@@ -1944,20 +1962,6 @@ impl Session {
                     // Save-and-close (`Space Alt-x`): the buffer is clean now, so this close
                     // never re-prompts — and when the buffer is the tether, it exits the client.
                     AfterSave::Close => fx = fx.and(self.close_buffer()),
-                    // The message is on disk now, so `git commit -F` will read what the user
-                    // actually wrote. The buffer stays open until the commit lands, so a refusal
-                    // leaves them looking at their message rather than at nothing.
-                    AfterSave::Commit => {
-                        if let Some(pending) = self.pending_commit.clone() {
-                            fx = fx.and(self.request_str::<GitCommit>(
-                                GitCommitParams {
-                                    repo_id: pending.repo_id,
-                                    amend: pending.amend,
-                                },
-                                Event::Committed,
-                            ));
-                        }
-                    }
                 }
                 fx
             }
@@ -2495,6 +2499,25 @@ impl Session {
     }
 
     pub fn close_buffer(&mut self) -> Effects {
+        // Closing the prepared message *is* the commit — the `$EDITOR` contract, where git reads
+        // the file once the editor exits and aborts if the message came back empty. So this fires
+        // the commit instead of the close; `Event::Committed` clears the pending entry and calls
+        // back here to actually close, and a refusal (a `pre-commit` hook) leaves the buffer open
+        // with the message intact. Nothing is saved first, deliberately: git reads the *file*, so
+        // closing without saving abandons exactly as quitting an editor without writing does.
+        if let Some(pending) = self
+            .pending_commit
+            .clone()
+            .filter(|p| p.buffer_id == self.buffer.buffer_id)
+        {
+            return self.request_str::<GitCommit>(
+                GitCommitParams {
+                    repo_id: pending.repo_id,
+                    amend: pending.amend,
+                },
+                Event::Committed,
+            );
+        }
         self.forget_commit_buffer(self.buffer.buffer_id);
         if self.tethered() {
             return self.request_str::<BufferClose>(
@@ -7900,15 +7923,9 @@ impl Session {
             A::Quit => Effects::one(Effect::Exit),
             A::Save => self.save(None, false, AfterSave::Nothing),
             A::SaveAndQuit => self.save(None, false, AfterSave::Quit),
-            A::SaveAndClose => {
-                // Same gesture, same meaning — "I'm done, make this take effect" — so a commit
-                // buffer commits rather than merely closing.
-                let after = match &self.pending_commit {
-                    Some(p) if p.buffer_id == self.buffer.buffer_id => AfterSave::Commit,
-                    _ => AfterSave::Close,
-                };
-                self.save(None, false, after)
-            }
+            // Save, then close. On a commit message that commits — but only because *closing*
+            // commits, not because this chord knows anything about git.
+            A::SaveAndClose => self.save(None, false, AfterSave::Close),
             A::SaveAs => {
                 // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self

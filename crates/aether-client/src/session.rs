@@ -675,17 +675,14 @@ pub enum AfterSave {
     /// `Space Alt-q` — exit the client once the save lands.
     Quit,
     /// `Space Alt-x` — close the buffer once the save lands (which exits the client when the
-    /// buffer is the [tether](Session::tether)).
+    /// buffer is the [tether](Session::tether), and commits when it's a prepared commit message —
+    /// but that's the *close* path's business, not this chord's).
     Close,
-    /// `Space Alt-x` in a commit message buffer: the message is on disk, so run the commit. The
-    /// same "I am done with this, make it take effect" gesture as `Close`, which is why it reuses
-    /// the binding rather than inventing a chord.
-    Commit,
 }
 
 /// A commit message being composed: which buffer holds it, and what it commits to.
 ///
-/// Tracked rather than inferred from the path, so `Space Alt-x` knows it means "commit" here
+/// Tracked rather than inferred from the path, so closing this buffer knows it means "commit"
 /// without pattern-matching filenames — and so the repo the commit targets is the one
 /// `git/prepare_commit` actually resolved, not whatever the cursor has wandered into since.
 #[derive(Debug, Clone, PartialEq, Eq)]

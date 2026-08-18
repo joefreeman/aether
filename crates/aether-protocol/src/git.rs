@@ -398,7 +398,7 @@ pub struct GitCommitParams {
     pub amend: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCommitResult {
     /// The commit that was created. `None` when git refused — see `message`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,6 +407,13 @@ pub struct GitCommitResult {
     /// commit", "empty commit message". Empty on success. Show it as a terminal would.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// The message was empty (comments and blank lines only), so git was never run. Git's own rule
+    /// — *"Aborting commit due to empty commit message"* — surfaced as its own field rather than as
+    /// a refusal, because the two mean opposite things to the client: an empty message is the user
+    /// changing their mind (close the buffer, say nothing much), a refusal is a hook objecting
+    /// (keep the message, let them fix it and retry).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub empty_message: bool,
     /// The reconciliation that followed. Rarely interesting for a commit — but `pre-commit` hooks
     /// routinely rewrite files (formatters), and those buffers have to be picked up.
     #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]

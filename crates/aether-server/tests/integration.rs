@@ -32782,19 +32782,30 @@ async fn amend_prefills_the_previous_message_and_replaces_the_commit() {
     drop(server);
 }
 
-/// An empty message aborts, the way it does in a terminal — and says so.
+/// An empty message aborts, the way it does in a terminal — but reported as its own outcome
+/// rather than as a refusal, and without running git at all. The client has to tell "changed my
+/// mind" (close the buffer quietly) from "a hook objected" (keep the message and retry), and that
+/// distinction must not come from reading git's stderr.
 #[tokio::test]
 async fn an_empty_message_aborts_the_commit() {
     let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
+    let repo = git2::Repository::open(&root).unwrap();
+    let head_before = repo.head().unwrap().peel_to_commit().unwrap().id();
 
     let prepared = prepare_commit(&mut ws, 2, &root, false).await;
     // The untouched template is comments only, which `--cleanup=strip` reduces to nothing.
     let res = commit(&mut ws, 3, &root, false).await;
+    assert!(res.empty_message, "reported as an abandon");
     assert!(res.commit.is_none());
     assert!(
-        res.message.to_lowercase().contains("empty commit message"),
-        "got: {:?}",
+        res.message.is_empty(),
+        "not a refusal, so there is no git text to show: {:?}",
         res.message
+    );
+    assert_eq!(
+        repo.head().unwrap().peel_to_commit().unwrap().id(),
+        head_before,
+        "HEAD never moved"
     );
     let _ = prepared;
     drop(server);

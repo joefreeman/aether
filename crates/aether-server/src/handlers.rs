@@ -3090,6 +3090,25 @@ pub async fn git_commit(
         ));
     }
 
+    // An empty message is an *abandon*, not a failure — git's own rule ("Aborting commit due to
+    // empty commit message"), and the one that makes closing the buffer without writing anything
+    // behave like quitting an editor without writing. Answered here rather than by running git and
+    // reading its complaint: the client needs to tell "you changed your mind" (close quietly) from
+    // "a hook said no" (keep the message and let them retry), and that distinction must not come
+    // from parsing stderr.
+    //
+    // Emptiness follows `--cleanup=strip` below: comment lines and blank lines are not content.
+    let is_empty = std::fs::read_to_string(&message_path).is_ok_and(|text| {
+        text.lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    });
+    if is_empty {
+        return Ok(GitCommitResult {
+            empty_message: true,
+            ..Default::default()
+        });
+    }
+
     // Suppress before the spawn, not after: `git commit` writes the index and HEAD, and a
     // `pre-commit` hook may rewrite working-tree files. Every one of those events belongs to the
     // reconciliation below, which is also what makes its report a true account (see
@@ -3132,6 +3151,7 @@ pub async fn git_commit(
             output.stderr
         };
         return Ok(GitCommitResult {
+            empty_message: false,
             commit: None,
             message: message.trim_end().to_string(),
             refreshed,
@@ -3158,6 +3178,7 @@ pub async fn git_commit(
         commit,
         message: String::new(),
         refreshed,
+        empty_message: false,
     })
 }
 

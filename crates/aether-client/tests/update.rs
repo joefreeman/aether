@@ -9951,10 +9951,9 @@ fn space_g_c_again_resumes_the_message_instead_of_overwriting_it() {
     assert!(params.get("absolute_path").is_none(), "not a fresh prepare");
 }
 
-/// Abandoning the message (closing its buffer) abandons the commit — otherwise the pending entry
-/// outlives its buffer and `Space g c` would later "resume" a buffer id that no longer exists.
-#[test]
-fn closing_the_message_buffer_abandons_the_commit() {
+/// A session with a prepared commit message open: `Space g c`, the server's prepared path, and the
+/// buffer it opened. The starting point for every close-commits test.
+fn prepared_commit_session() -> Session {
     let mut s = session();
     let fx = git_leader(&mut s, 'c');
     let (token, _, _) = the_request(&fx);
@@ -9978,18 +9977,79 @@ fn closing_the_message_buffer_abandons_the_commit() {
             "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
         })),
     );
+    s
+}
+
+/// Closing the message buffer *is* the commit — the `$EDITOR` contract, where git reads the file
+/// once the editor exits. So `Space x` fires `git/commit` rather than closing, and the buffer only
+/// goes once the commit lands. Nothing is saved first: git reads the *file*, so closing without
+/// saving abandons exactly as quitting an editor without writing does.
+#[test]
+fn closing_the_message_buffer_commits_it() {
+    let mut s = prepared_commit_session();
     assert!(s.pending_commit.is_some());
 
-    let _ = leader(&mut s, 'x'); // Space x — close buffer
+    let fx = leader(&mut s, 'x'); // Space x — close buffer
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "git/commit", "the close commits instead of closing");
+
+    // The commit landing is what closes the buffer.
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "commit": {
+                "commit": "abc1234def", "author": "Ada", "email": "a@b.c",
+                "date": "2026-08-18 10:00:00 +0100", "message": "Add a line",
+            },
+        })),
+    );
+    assert!(s.pending_commit.is_none(), "the pending entry is spent");
     assert!(
-        s.pending_commit.is_none(),
-        "the commit went with the buffer that held its message"
+        find_request(&fx, "buffer/close").is_some(),
+        "and now the buffer closes"
+    );
+}
+
+/// Changing your mind: open the message, write nothing, close. git's own rule is that an empty
+/// message aborts, so the buffer closes like any other — the alternative is being stuck in a
+/// buffer you can't leave without committing something.
+#[test]
+fn closing_an_empty_message_abandons_the_commit() {
+    let mut s = prepared_commit_session();
+
+    let fx = leader(&mut s, 'x');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "git/commit");
+    let fx = s.on_rpc_result(token, Ok(json!({ "empty_message": true })));
+    assert!(s.pending_commit.is_none());
+    assert!(
+        find_request(&fx, "buffer/close").is_some(),
+        "the buffer closes rather than trapping the user"
+    );
+}
+
+/// A refusal — a `pre-commit` hook, most often — keeps the buffer, the message *and* the pending
+/// entry, so fixing the complaint and closing again retries. Clearing it on refusal would turn the
+/// second attempt into a silent abandon.
+#[test]
+fn a_refused_commit_keeps_the_buffer_and_retries_on_the_next_close() {
+    let mut s = prepared_commit_session();
+
+    let fx = leader(&mut s, 'x');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({ "message": "pre-commit hook failed" })));
+    assert!(
+        find_request(&fx, "buffer/close").is_none(),
+        "the buffer stays put"
+    );
+    assert!(
+        s.pending_commit.is_some(),
+        "and the commit is still pending, so closing again retries"
     );
 
-    // And a fresh `Space g c` genuinely prepares again rather than resuming a dead buffer.
-    let fx = git_leader(&mut s, 'c');
+    let fx = leader(&mut s, 'x');
     let (_, method, _) = the_request(&fx);
-    assert_eq!(method, "git/prepare_commit");
+    assert_eq!(method, "git/commit");
 }
 
 /// `Space g u` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
