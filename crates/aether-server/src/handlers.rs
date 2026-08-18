@@ -2358,13 +2358,22 @@ async fn buffer_open_inner(
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
-    // External buffers (path outside the active workspace's roots) get no Git integration — by
-    // design git is a workspace-scoped feature and an external file is only a guest here. Skipping
-    // the baseline load also avoids repo discovery walking up out of the workspace tree.
+    // External buffers (path outside the active workspace's roots) are guests: no language server
+    // (see the trust reasoning at `lsp_launch` below).
     let external = !s
         .workspaces
         .get(&active_workspace_name)
         .is_some_and(|p| p.contains(&canonical));
+    // Git eligibility is the *wider* test ([`WorkspaceEntry::git_eligible`]): containment, or
+    // inside the working tree of a repo a root reaches. The two deliberately differ — a file in
+    // your own repo should show its diff and be stageable however you reached it, while attaching
+    // a language server to it is an act of trust that containment, not the repo, still governs.
+    // Skipping the baseline for a true external also avoids repo discovery walking up out of the
+    // workspace tree.
+    let git_external = !s
+        .workspaces
+        .get(&active_workspace_name)
+        .is_some_and(|p| p.git_eligible(&canonical));
     // Resolve the Git baseline once (repo discovery + reading the committed blob) and diff the
     // buffer against it, so git-aware views have hunks from the first frame and later edits can
     // re-diff cheaply without touching the repo. Best-effort; untracked / no-repo → empty.
@@ -2374,8 +2383,8 @@ async fn buffer_open_inner(
     // the same deal the deferred parse gets. Computed per *buffer* even for a shared document:
     // git is workspace-scoped, so each attachment resolves its own baseline.
     let doc = &s.documents[&doc_id];
-    let git_deferred = !external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
-    let git = (!external && !git_deferred).then(|| {
+    let git_deferred = !git_external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
+    let git = (!git_external && !git_deferred).then(|| {
         let git_baseline = crate::git::load_baseline(&canonical, &s.git_baseline_revs);
         let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &doc.text);
         let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
@@ -14025,12 +14034,23 @@ fn rope_line_trimmed(text: &ropey::Rope, line: u32) -> String {
     text.line(line as usize).to_string().trim().to_string()
 }
 
-/// Build the Git-changes picker's candidate list: one entry per hunk of every changed file in the
-/// workspace's roots, grouped by file. Open buffers drive their own files (live combined hunks +
-/// text); the rest are diffed off disk (combined staged+unstaged vs HEAD, untracked = whole-file
-/// add). Runs entirely off the lock — `repo_status_for_root` walks the worktree and each file is
-/// re-diffed, so it must not sit on the keystroke path's mutex. Best-effort: a root outside a repo
-/// contributes nothing.
+/// Build the Git-changes picker's candidate list: one entry per hunk of every changed file **under
+/// the workspace's roots**, grouped by file. Open buffers drive their own files (live combined
+/// hunks plus text); the rest are diffed off disk (combined staged+unstaged vs HEAD, untracked =
+/// whole-file add). Runs entirely off the lock — the status walks and per-file diffs must not sit
+/// on the keystroke path's mutex. Best-effort: a root outside a repo contributes nothing.
+///
+/// **Workspace-scoped, aggregated across repos.** The roots may span several repos, or several
+/// roots may share one; either way this is "what have I changed in what I'm working on", the list
+/// form of the `c`/`Alt-c` hunk motions and the sibling of the workspace diagnostics list. Rows are
+/// root-addressed (`path_index` + `relative_path`) like grep hits, so multi-root workspaces get the
+/// disambiguating root label for free and nothing here needs to name a repo. A change elsewhere in
+/// a root's repo — the root-is-a-subdirectory case — is a *git* question rather than a workspace
+/// one and is deliberately absent; the buffer still gets a baseline if you open it
+/// ([`crate::state::WorkspaceEntry::git_eligible`]).
+///
+/// The walk is **per repo, not per root**: discovery plus a full `statuses()` pass is the expensive
+/// part, and two roots in one repo used to pay it twice.
 fn build_git_change_candidates(
     roots: &[std::path::PathBuf],
     open: Vec<OpenChange>,
@@ -14061,13 +14081,25 @@ fn build_git_change_candidates(
         }
     }
 
-    for (pi, root) in roots.iter().enumerate() {
-        // One repo discovery per root (not per file): `changed_files_with_hunks` opens the repo
-        // once and diffs every changed file against the shared HEAD tree + index. Untracked
-        // directories collapse to a single entry there and are dropped, so a big new directory
-        // doesn't flood the list.
-        for changed in crate::git::changed_files_with_hunks(root) {
-            if open_keys.contains(&(pi as u32, changed.rel_path.clone())) {
+    let mut walked: Vec<std::path::PathBuf> = Vec::new();
+    for root in roots {
+        let Some(identity) = crate::git::discover_repo(root) else {
+            continue; // a root outside any repo contributes nothing
+        };
+        if walked.contains(&identity.workdir) {
+            continue; // another root already walked this repo
+        }
+        walked.push(identity.workdir.clone());
+        for changed in crate::git::changed_files_in_repo(&identity.workdir) {
+            let abs = identity.workdir.join(&changed.rel_path);
+            // Keep only what falls under a root: the repo's changes elsewhere aren't this
+            // workspace's. This is also what re-addresses the row from repo- to root-relative.
+            let Some((path_index, relative_path)) =
+                crate::workspace_index::workspace_relative_parts(&abs, roots)
+            else {
+                continue;
+            };
+            if open_keys.contains(&(path_index, relative_path.clone())) {
                 continue; // a live buffer drives this file instead
             }
             let working_lines: Vec<&[u8]> = changed.working.split(|&b| b == b'\n').collect();
@@ -14084,9 +14116,9 @@ fn build_git_change_candidates(
                 })
                 .collect();
             files.push(FileChanges {
-                path_index: pi as u32,
-                abs_path: root.join(&changed.rel_path).to_string_lossy().into_owned(),
-                relative_path: changed.rel_path,
+                path_index,
+                relative_path,
+                abs_path: abs.to_string_lossy().into_owned(),
                 hunks: infos,
                 untracked: changed.untracked,
             });
@@ -14124,9 +14156,6 @@ fn build_git_change_candidates(
 struct CursorCentering {
     /// Leading edge of the selection: the position "nearest candidate" is measured from.
     leading_edge: LogicalPosition,
-    /// Workspace-relative `(root_index, path)` of the buffer — what the grouped kinds key on.
-    /// `None` for a buffer outside every root.
-    workspace_key: Option<(u32, String)>,
     /// The buffer's absolute path — the jumplist keys entries by it, since its files can sit
     /// outside every root. `None` for a scratch buffer, which `buffer_id` then identifies.
     abs_path: Option<String>,
@@ -14271,20 +14300,27 @@ pub async fn picker_view(
         PickerKind::WorkspaceSymbols => {
             picker_state::PickerCandidates::WorkspaceSymbols(Vec::new())
         }
-        PickerKind::GitChanges => {
+        // Repo-scoped, not root-scoped (docs/git-phase-2.md decision 2): the list is one repo's
+        // working-tree changes, including files outside every workspace root when a root is a
+        // subdirectory of its repo. Resolved as a *writable* repo — the same rule
+        // `git/prepare_commit` and the branch picker use, so a single-repo workspace never sees a
+        // chooser, and the list can't name changes you could never stage or commit.
+        PickerKind::GitChanges if params.reset == PickerReset::All => {
             // Snapshot the roots + every in-root open buffer (live combined hunks + text) under a
-            // brief lock, then build off-lock — the repo walk + per-file diffs must not block the
-            // keystroke path. Rebuilt fresh on every view (a snapshot of the repo at open).
+            // brief lock, then build off-lock — the repo walks + per-file diffs must not block the
+            // keystroke path. A snapshot of the working trees at open.
             let (roots, open) = {
                 let s = state.lock().await;
-                let p = s.active_workspace_or_err(client_id)?;
-                let roots = p.paths.clone();
+                let workspace = s.active_workspace_or_err(client_id)?;
+                let (workspace_id, roots) = (workspace.id.clone(), workspace.paths.clone());
                 let open: Vec<OpenChange> = s
-                    .buffers
-                    .iter()
-                    .filter_map(|(id, b)| {
-                        let b = s.documents.get(&b.document)?;
+                    .buffers_in_workspace(&workspace_id)
+                    .into_iter()
+                    .filter_map(|id| {
+                        let b = s.documents.get(&s.buffers.get(&id)?.document)?;
                         let abs = b.canonical_path.as_deref()?;
+                        // In-root buffers only: a guest buffer's changes aren't the workspace's,
+                        // and a scratch buffer has no path at all.
                         let (path_index, relative_path) =
                             crate::workspace_index::workspace_relative_parts(abs, &roots)?;
                         // Combined staged+unstaged hunks from the cached baseline + the LIVE buffer
@@ -14294,7 +14330,7 @@ pub async fn picker_view(
                         // whole buffer as an addition.
                         let (head, index, staged) = s
                             .git_baseline
-                            .get(id)
+                            .get(&id)
                             .map(|base| {
                                 (
                                     base.blob.is_some(),
@@ -14321,6 +14357,11 @@ pub async fn picker_view(
             };
             picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&roots, open))
         }
+        // Scroll / resume re-view: an empty placeholder that `preserve_existing` keeps, like
+        // Diagnostics. The list is a snapshot of the working trees taken at open, so re-walking
+        // them on every page would be both wasteful and (worse) able to change the rows under a
+        // scroll.
+        PickerKind::GitChanges => picker_state::PickerCandidates::GitChanges(Vec::new()),
         PickerKind::GitChangesFile => {
             // Modal sibling of GitChanges, locked to the active buffer (`params.buffer_id`): just
             // that buffer's live hunks, no disk walk. Like Diagnostics, a fresh open carries the
@@ -14450,18 +14491,8 @@ pub async fn picker_view(
                     .try_doc_of(buffer_id)
                     .and_then(|b| b.canonical_path.as_deref())
                     .map(|p| p.to_string_lossy().into_owned());
-                let current_key = s.try_doc_of(buffer_id).and_then(|b| {
-                    let workspace = s.active_workspace(client_id)?;
-                    b.canonical_path.as_deref().and_then(|p| {
-                        crate::workspace_index::workspace_relative_parts(
-                            std::path::Path::new(p),
-                            &workspace.paths,
-                        )
-                    })
-                });
                 Some(CursorCentering {
                     leading_edge,
-                    workspace_key: current_key,
                     abs_path: current_abs,
                     buffer_id,
                 })
@@ -14560,13 +14591,15 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::WorkspaceSymbols(_),
                     picker_state::PickerCandidates::WorkspaceSymbols(_),
                 ) => true,
-                // GitChangesFile: locked to a buffer, so re-views send an empty placeholder — keep
-                // the snapshot then, but a fresh open carries the buffer's hunks and rebuilds.
-                // (Workspace GitChanges always re-snapshots, so it falls through to `false`.)
+                // Both changes pickers: a fresh open snapshots (the roots' working trees, or the
+                // locked buffer's hunks) and rebuilds; a scroll/resume re-view sends an empty
+                // placeholder and keeps that snapshot. Keeping it is what stops a page-down
+                // re-walking every working tree — and, worse, letting the rows change underneath
+                // a scroll.
                 (
                     picker_state::PickerCandidates::GitChanges(_),
                     picker_state::PickerCandidates::GitChanges(new),
-                ) if params.kind == PickerKind::GitChangesFile => new.is_empty(),
+                ) => new.is_empty(),
                 // Keybindings: a fresh open ships the rows and rebuilds; a scroll/resume re-view
                 // ships none — keep the previously-shipped set, like GitChangesFile.
                 (
@@ -14657,16 +14690,16 @@ pub async fn picker_view(
             (
                 Some(CursorCentering {
                     leading_edge,
-                    workspace_key: Some(current_key),
+                    abs_path: Some(current_path),
                     ..
                 }),
                 picker_state::PickerCandidates::GitChanges(c),
-            ) if !c.is_empty() => find_nearest_git_change(
-                c,
-                (current_key.0, current_key.1.as_str()),
-                leading_edge.line,
-            )
-            .map(|idx| picker.candidates.make_item(idx, Vec::new())),
+            ) if !c.is_empty() => {
+                // Matched on the absolute path: the rows are repo-addressed now, and the buffer may
+                // sit outside every root while still being in the repo the picker lists.
+                find_nearest_git_change(c, current_path, leading_edge.line)
+                    .map(|idx| picker.candidates.make_item(idx, Vec::new()))
+            }
             // Jumplist: land on the entry at-or-after the cursor, wrapping — the same
             // "where you are in the cycle" the `]`/`[` stepping derives, inclusive so the
             // just-jumped-to entry counts as current (`crate::jumplist::nearest_index`).
@@ -15492,20 +15525,20 @@ mod document_highlight_tests {
     }
 }
 
-/// Candidate index of the hunk in `current`'s file nearest at-or-after `cursor_line`, falling back
+/// Candidate index of the hunk in `current_abs_path`'s file nearest at-or-after `cursor_line`, falling back
 /// to that file's last hunk when the cursor sits past them all. `None` when the file has no changes
 /// (the picker then opens at the top rather than jumping to an unrelated file). Used by
 /// `picker/view`'s `center_on_cursor` to land the Git-changes picker on "where you are".
 fn find_nearest_git_change(
     cands: &[picker_state::GitChangeCandidate],
-    current: (u32, &str),
+    current_abs_path: &str,
     cursor_line: u32,
 ) -> Option<usize> {
     // The file's hunks are a contiguous run in anchor order. Pick the first at-or-after the cursor;
     // if none, the last hunk of the file (the cursor is below every change).
     let mut last_in_file: Option<usize> = None;
     for (i, c) in cands.iter().enumerate() {
-        if (c.path_index, c.relative_path.as_str()) != current {
+        if c.abs_path != current_abs_path {
             continue;
         }
         if c.line >= cursor_line {
@@ -15540,18 +15573,18 @@ mod find_nearest_git_change_tests {
         // a.rs has hunks at lines 4 and 20; b.rs at line 2.
         let cands = [cand("a.rs", 0, 4), cand("a.rs", 1, 20), cand("b.rs", 0, 2)];
         // Cursor on a.rs line 10 → the next hunk at or after it (line 20, index 1).
-        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 10), Some(1));
+        assert_eq!(find_nearest_git_change(&cands, "/p/a.rs", 10), Some(1));
         // Cursor exactly on a hunk line is inclusive.
-        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 4), Some(0));
+        assert_eq!(find_nearest_git_change(&cands, "/p/a.rs", 4), Some(0));
         // Cursor before every hunk → the file's first hunk.
-        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 0), Some(0));
+        assert_eq!(find_nearest_git_change(&cands, "/p/a.rs", 0), Some(0));
     }
 
     #[test]
     fn falls_back_to_the_files_last_hunk_past_the_end() {
         let cands = [cand("a.rs", 0, 4), cand("a.rs", 1, 20), cand("b.rs", 0, 2)];
         // Cursor past every a.rs hunk → that file's last hunk (index 1), not b.rs.
-        assert_eq!(find_nearest_git_change(&cands, (0, "a.rs"), 99), Some(1));
+        assert_eq!(find_nearest_git_change(&cands, "/p/a.rs", 99), Some(1));
     }
 
     #[test]
@@ -15559,10 +15592,7 @@ mod find_nearest_git_change_tests {
         let cands = [cand("a.rs", 0, 4), cand("b.rs", 0, 2)];
         // The active file isn't in the change set → None (the picker opens at the top, not on an
         // unrelated file).
-        assert_eq!(
-            find_nearest_git_change(&cands, (0, "untouched.rs"), 0),
-            None
-        );
+        assert_eq!(find_nearest_git_change(&cands, "/p/untouched.rs", 0), None);
     }
 }
 

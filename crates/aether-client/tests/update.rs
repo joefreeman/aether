@@ -2656,6 +2656,25 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
     );
 }
 
+/// `Space c`: the workspace changes picker lists every root, whatever repos they span, so it needs
+/// no repo-resolution hint — it sends the buffer only as the *centring* target, to land on the hunk
+/// nearest the cursor.
+#[test]
+fn space_c_centres_on_the_cursor_without_a_resolution_hint() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    s.buffer.path = Some("/p/src/main.rs".into());
+    let fx = s.open_picker(PickerKind::GitChanges, None, None, false, None);
+    let params = find_request(&fx, "picker/view").expect("opens the picker");
+    assert_eq!(params["kind"], json!("git_changes"));
+    assert_eq!(params["center_on_cursor"], json!(s.buffer.buffer_id));
+    assert!(
+        params["buffer_id"].is_null(),
+        "nothing to resolve: the list is the workspace's, not a repo's"
+    );
+}
+
 #[test]
 fn space_alt_f_seeds_a_removable_directory_chip() {
     let mut s = session();

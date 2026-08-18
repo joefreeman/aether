@@ -597,13 +597,7 @@ fn normalize(entries: &mut Vec<(u32, JumplistEntry)>) {
 type GroupKey = (u32, String);
 
 fn group_key(g: &Option<GroupHeader>) -> Option<GroupKey> {
-    g.as_ref().map(|g| match g {
-        GroupHeader::File {
-            path_index,
-            relative_path,
-        } => (*path_index, relative_path.clone()),
-        GroupHeader::Label { label } => (u32::MAX, label.clone()),
-    })
+    g.as_ref().map(crate::picker::group_key_of_header)
 }
 
 /// Resolve one `jumplist/step`: the index of the entry `count` steps in `direction` from the

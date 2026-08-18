@@ -2920,7 +2920,8 @@ impl Session {
                 // The buffer-scoped kinds send the buffer they list *for*. GitBranches sends it
                 // for a different reason: it's the repo-resolution hint, the same one
                 // `git/prepare_commit` takes — without it a multi-repo workspace can't tell which
-                // repo's branches to list.
+                // repo's branches to list. (The workspace changes picker needs no hint: it lists
+                // every root, whatever repos they span.)
                 buffer_id: (from_selection
                     || matches!(
                         kind,

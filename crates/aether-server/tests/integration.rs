@@ -11413,6 +11413,122 @@ async fn keybindings_picker_reviews_preserve_the_shipped_rows() {
     drop(server);
 }
 
+/// The picker is the *workspace's* changes list, so it aggregates across every repo the roots
+/// span — two roots in two repos give one list with both files. Nothing resolves a repo, so nothing
+/// can be ambiguous about it; rows are root-addressed, and the multi-root root label (client-side)
+/// is what tells two same-named files apart.
+#[tokio::test]
+async fn git_changes_picker_aggregates_across_the_workspaces_repos() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let root_a = dir_a.path().canonicalize().unwrap();
+    let repo_a = init_repo_at(&root_a);
+    commit_file(&repo_a, "a.rs", "one\n");
+    std::fs::write(root_a.join("a.rs"), "ONE\n").unwrap();
+
+    let dir_b = tempfile::tempdir().unwrap();
+    let root_b = dir_b.path().canonicalize().unwrap();
+    let repo_b = init_repo_at(&root_b);
+    commit_file(&repo_b, "b.rs", "two\n");
+    std::fs::write(root_b.join("b.rs"), "TWO\n").unwrap();
+
+    let server = spawn_for_test("two-repos-proj", vec![root_a.clone(), root_b.clone()])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "two-repos-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // No buffer open, nothing to resolve from — and that's fine, because there is nothing to
+    // resolve. Both repos' changes are listed, each addressed to its own root.
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitChanges)).await;
+    assert_eq!(view.total_candidates, 2, "one hunk from each repo");
+    let headers: Vec<(u32, String)> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header:
+                    GroupHeader::File {
+                        path_index,
+                        relative_path,
+                    },
+                ..
+            } => Some((*path_index, relative_path.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        vec![(0, "a.rs".to_string()), (1, "b.rs".to_string())],
+        "root-addressed, in root order"
+    );
+
+    drop(server);
+}
+
+/// The workspace boundary is the list's boundary: a change elsewhere in a root's repo — the
+/// root-is-a-subdirectory case — is a git question, not a workspace one, and stays out. (Opening
+/// such a file still gives it a gutter and lets it be staged; see the `git_eligible` tests.)
+#[tokio::test]
+async fn git_changes_picker_omits_changes_outside_the_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&repo_root);
+    commit_file(&repo, "sub/inside.rs", "one\n");
+    commit_file(&repo, "other/outside.rs", "alpha\n");
+    std::fs::write(repo_root.join("sub/inside.rs"), "ONE\n").unwrap();
+    std::fs::write(repo_root.join("other/outside.rs"), "ALPHA\n").unwrap();
+
+    let server = spawn_for_test("subdir-root-proj", vec![repo_root.join("sub")])
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "subdir-root-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitChanges)).await;
+    assert_eq!(
+        view.total_candidates, 1,
+        "only the change under the root — `other/outside.rs` is the repo's, not the workspace's"
+    );
+    let headers: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::File { relative_path, .. },
+                ..
+            } => Some(relative_path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers, vec!["inside.rs"], "addressed relative to the root");
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn git_changes_picker_lists_hunks_grouped_by_file() {
     use aether_protocol::viewport::DiffStage;
@@ -11477,7 +11593,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     );
 
     // Selecting a.rs explicitly is a no-op re-affirmation of the same shape.
-    let (row, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "a.rs").await;
+    let (row, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, "a.rs").await;
     assert_eq!(row, 0);
     let items = update.items();
     assert_eq!(items.len(), 3, "2 headers + a.rs's hunk, got {items:?}");
@@ -11503,7 +11619,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     assert_eq!(*hunk_index, 0);
 
     // Expand new.rs: accordion — a.rs's group folds back up on its own.
-    let (row, update) = select_file_group(&mut ws, 40, PickerKind::GitChanges, 0, "new.rs").await;
+    let (row, update) = select_file_group(&mut ws, 40, PickerKind::GitChanges, "new.rs").await;
     assert_eq!(row, 1);
     let items = update.items();
     assert_eq!(
@@ -11709,7 +11825,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
         "the unsaved buffer edit shows as a.rs's group, open (the sole/first group)"
     );
     // Re-select it to check the hunk previews the live buffer text.
-    let (_, update) = select_file_group(&mut ws, 6, PickerKind::GitChanges, 0, "a.rs").await;
+    let (_, update) = select_file_group(&mut ws, 6, PickerKind::GitChanges, "a.rs").await;
     let PickerItem::GitChange {
         relative_path,
         preview,
@@ -11985,8 +12101,8 @@ async fn picker_set_group_holds_the_accordion_invariant() {
     .await;
 
     // Selecting the same group twice is idempotent — same row, same window shape.
-    let (row_a, update_a) = select_file_group(&mut ws, 10, PickerKind::GitChanges, 0, "a.rs").await;
-    let (row_b, update_b) = select_file_group(&mut ws, 20, PickerKind::GitChanges, 0, "a.rs").await;
+    let (row_a, update_a) = select_file_group(&mut ws, 10, PickerKind::GitChanges, "a.rs").await;
+    let (row_b, update_b) = select_file_group(&mut ws, 20, PickerKind::GitChanges, "a.rs").await;
     assert_eq!((row_a, row_b), (0, 0));
     assert_eq!(update_a.items(), update_b.items());
     assert_eq!(
@@ -12000,7 +12116,7 @@ async fn picker_set_group_holds_the_accordion_invariant() {
     // Selecting new.rs moves the expansion (accordion): a.rs folds to a bare header, and the
     // answered row is new.rs's header in the reshaped space (right below a.rs's header).
     let (row_new, update_new) =
-        select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "new.rs").await;
+        select_file_group(&mut ws, 30, PickerKind::GitChanges, "new.rs").await;
     assert_eq!(row_new, 1);
     assert_eq!(
         group_rows(update_new.items()),
@@ -12132,7 +12248,7 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
         "2 headers + big.rs's 10 hits"
     );
 
-    let (row, _) = select_file_group(&mut ws, 10, PickerKind::Grep, 0, "big.rs").await;
+    let (row, _) = select_file_group(&mut ws, 10, PickerKind::Grep, "big.rs").await;
     assert_eq!(row, 0);
 
     // Re-view a window starting inside big.rs's run (row 3 = its third hit).
@@ -12286,7 +12402,7 @@ async fn git_changes_picker_query_greps_diff_content() {
         vec![("a.rs".to_string(), 1, true)],
         "only the file whose hunk content matches"
     );
-    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, 0, "a.rs").await;
+    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, "a.rs").await;
     let PickerItem::GitChange {
         relative_path,
         preview,
@@ -12359,7 +12475,7 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
     .await;
     let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     // Re-select the group and re-view to get its hunk row in hand.
-    let (_, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, 0, "a.rs").await;
+    let (_, update) = select_file_group(&mut ws, 30, PickerKind::GitChanges, "a.rs").await;
     let item = update.items()[1].clone();
     let item_for_retry = serde_json::to_value(&item).unwrap();
 
@@ -12525,7 +12641,7 @@ async fn git_changes_picker_query_is_a_regex() {
     )
     .await;
     let _: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, 0, "a.rs").await;
+    let (_, update) = select_file_group(&mut ws, 4, PickerKind::GitChanges, "a.rs").await;
     let items = update.items();
     assert_eq!(
         items.len(),
@@ -15154,25 +15270,49 @@ async fn select_file_group(
     >,
     id: u64,
     kind: PickerKind,
-    path_index: u32,
-    relative_path: &str,
+    path: &str,
 ) -> (u32, PickerUpdateParams) {
-    let result: PickerSetGroupResult = send_request::<PickerSetGroup>(
+    // The header is looked up in the live window rather than constructed, which is what a client
+    // does — it echoes back a header it was pushed — and keeps the helper honest if a kind's
+    // header shape ever changes.
+    let window = send_request::<PickerView>(
         ws,
         id,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(kind)
+        },
+    )
+    .await
+    .update
+    .expect("a Keep re-view carries its window");
+    let header = window
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::Group { header, .. } => {
+                let label = match header {
+                    GroupHeader::File { relative_path, .. } => relative_path.as_str(),
+                    GroupHeader::Label { label } => label.as_str(),
+                };
+                (label == path).then(|| header.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no group header labelled {path:?} in the window"));
+    let result: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        ws,
+        id + 1,
         &PickerSetGroupParams {
             kind,
-            header: Some(GroupHeader::File {
-                path_index,
-                relative_path: relative_path.into(),
-            }),
+            header: Some(header),
             step: None,
         },
     )
     .await;
     let view = send_request::<PickerView>(
         ws,
-        id + 1,
+        id + 2,
         &PickerViewParams {
             reset: PickerReset::Keep,
             ..view_params(kind)
@@ -15243,7 +15383,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
         ]
     );
     // Re-select lib.rs's group and re-view to get its hit row in hand.
-    let (row, update) = select_file_group(&mut ws, 30, PickerKind::Grep, 0, "src/lib.rs").await;
+    let (row, update) = select_file_group(&mut ws, 30, PickerKind::Grep, "src/lib.rs").await;
     assert_eq!(row, 0, "lib.rs's header stays the first row");
     let hit = update
         .items()
@@ -16723,7 +16863,7 @@ async fn jumplist_capture_from_git_changes_picker() {
     git_commit_file(dir.path(), "a.rs", "one\ntwo\nthree\n");
     std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
-    let dir_path = dir.path().to_path_buf();
+    let dir_path = dir.path().canonicalize().unwrap();
     std::mem::forget(dir);
     let server = spawn_for_test("changes-proj", vec![dir_path])
         .await
@@ -16859,8 +16999,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
 
     // Select main.rs: its entries interleave below the header, each carrying its landing line
     // (0-based) for the right-aligned line number — main.rs's hits are on lines 1 and 2.
-    let (_row, update) =
-        select_file_group(&mut ws, 23, PickerKind::Jumplist, 0, "src/main.rs").await;
+    let (_row, update) = select_file_group(&mut ws, 23, PickerKind::Jumplist, "src/main.rs").await;
     let items = update.items();
     assert_eq!(
         items.len(),
@@ -21126,6 +21265,110 @@ async fn apply_hunk_toggle_round_trips_a_modification() {
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
         "alpha\nbeta\ngamma\n"
+    );
+
+    drop(server);
+}
+
+/// Git eligibility follows the *repo*, not the root list. A workspace rooted at a subdirectory of
+/// its repo can open a changed file elsewhere in the same repo — which is exactly what the
+/// repo-scoped changes picker lists — and stage it. Containment alone would make that file a guest
+/// with no baseline, so `git/apply_hunk` would refuse a row the picker had just offered.
+#[tokio::test]
+async fn a_file_outside_the_roots_but_inside_the_repo_gets_a_baseline_and_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&repo_root);
+    commit_file(&repo, "sub/inside.rs", "one\n");
+    commit_file(&repo, "other/outside.rs", "alpha\nbeta\n");
+    std::fs::write(repo_root.join("other/outside.rs"), "alpha\nBETA\n").unwrap();
+
+    // The workspace is rooted at `sub/`, so `other/outside.rs` is outside every root.
+    let server = spawn_for_test("repo-scope-proj", vec![repo_root.join("sub")])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "repo-scope-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            absolute_path: Some(repo_root.join("other/outside.rs").to_string_lossy().into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    set_cursor(&mut ws, 3, open.buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(
+        index_text(&repo_root, "other/outside.rs").unwrap(),
+        "alpha\nBETA\n"
+    );
+
+    drop(server);
+}
+
+/// The other half of that rule: reachability, not merely "is in some repo". A file in an unrelated
+/// repo — a dependency checkout reached by goto-definition is the real case — is still a guest with
+/// no baseline, because discovery only ever runs from a workspace root.
+#[tokio::test]
+async fn a_file_in_an_unreachable_repo_stays_a_guest() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let ws_root = ws_dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&ws_root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    // A separate repo, not reachable from the workspace's root in either direction.
+    let dep_dir = tempfile::tempdir().unwrap();
+    let dep_root = dep_dir.path().canonicalize().unwrap();
+    let dep = init_repo_at(&dep_root);
+    commit_file(&dep, "dep.rs", "alpha\nbeta\n");
+    std::fs::write(dep_root.join("dep.rs"), "alpha\nBETA\n").unwrap();
+
+    let server = spawn_for_test("guest-repo-proj", vec![ws_root.clone()])
+        .await
+        .unwrap();
+    let (mut ws, _r) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "guest-repo-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            absolute_path: Some(dep_root.join("dep.rs").to_string_lossy().into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    set_cursor(&mut ws, 3, open.buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Toggle).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unavailable);
+    assert_eq!(
+        index_text(&dep_root, "dep.rs").unwrap(),
+        "alpha\nbeta\n",
+        "the dependency's index is untouched"
     );
 
     drop(server);
@@ -25824,7 +26067,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
     assert_eq!(grep_hit_files(&update), vec!["minified.js"]);
     assert_eq!(update.total_matches, 1);
     // The hit rides behind its collapsed header; expand to get the row.
-    let (_, update) = select_file_group(&mut ws, 11, PickerKind::Grep, 0, "minified.js").await;
+    let (_, update) = select_file_group(&mut ws, 11, PickerKind::Grep, "minified.js").await;
     match &update.items()[1] {
         PickerItem::GrepHit {
             preview,

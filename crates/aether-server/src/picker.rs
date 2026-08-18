@@ -130,8 +130,9 @@ pub struct GrepHitCandidate {
 /// One Git-changes-picker candidate — a single hunk of one changed file. The candidates are
 /// grouped by file (contiguous runs, like grep), in `(path_index, relative_path)` order with the
 /// hunks of each file in anchor-line order; `hunk_index` is that position within the file. Built
-/// once on `picker/view` from the workspace's working-tree changes (combined staged+unstaged vs
-/// HEAD), so positional identity is stable for the picker's lifetime.
+/// once on `picker/view` from the workspace roots' working-tree changes (combined staged+unstaged
+/// vs HEAD, aggregated across whatever repos those roots span), so positional identity is stable
+/// for the picker's lifetime.
 #[derive(Debug, Clone)]
 pub struct GitChangeCandidate {
     /// Index into the workspace's root list this file lives under.
@@ -1217,16 +1218,21 @@ impl RowLayout {
 /// The group key a wire [`GroupHeader`] denotes — the owned mirror of
 /// [`PickerState::group_key_at`]'s per-row derivation, resolving headers a client sends back
 /// (`picker/set_group`, a `Group` row in `center_on`) to runs. The two MUST agree for the
-/// collapsible kinds: `File` ↔ `(path_index, relative_path)`, `Label` ↔ `(u32::MAX, label)`.
+/// collapsible kinds: `File` ↔ `(path_index, relative_path)`, `Label` ↔ `(LABEL_KEY, label)`. The
+/// sentinel keeps the two spaces disjoint even though a key is one `(u32, String)` pair — a real
+/// `path_index` is an index into a root list, so it can never reach it.
 pub fn group_key_of_header(header: &GroupHeader) -> (u32, String) {
     match header {
         GroupHeader::File {
             path_index,
             relative_path,
         } => (*path_index, relative_path.clone()),
-        GroupHeader::Label { label } => (u32::MAX, label.clone()),
+        GroupHeader::Label { label } => (LABEL_KEY, label.clone()),
     }
 }
+
+/// Group-key discriminant for a [`GroupHeader::Label`] run (see [`group_key_of_header`]).
+pub const LABEL_KEY: u32 = u32::MAX;
 
 /// Per-window item-building context — see [`PickerState::item_ctx`].
 struct ItemCtx {
@@ -1932,7 +1938,7 @@ impl PickerState {
             PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
             // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
             // jumplist's label groups.
-            PickerCandidates::WorkspaceSymbols(v) => Some((u32::MAX, v[ci].display_path.as_str())),
+            PickerCandidates::WorkspaceSymbols(v) => Some((LABEL_KEY, v[ci].display_path.as_str())),
             PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
             // Entries carry their source picker's header — capture makes grouping total
             // (`jumplist::assign_file_groups`), which the collapsible row space relies on
@@ -1942,7 +1948,7 @@ impl PickerState {
                     path_index,
                     relative_path,
                 } => (*path_index, relative_path.as_str()),
-                GroupHeader::Label { label } => (u32::MAX, label.as_str()),
+                GroupHeader::Label { label } => (LABEL_KEY, label.as_str()),
             }),
             _ => None,
         }

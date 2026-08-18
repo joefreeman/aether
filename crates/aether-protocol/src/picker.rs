@@ -478,6 +478,10 @@ pub enum PickerItem {
     /// the wire. `line` is the 0-based buffer line the hunk anchors to (the `FileAt` jump target).
     GitChange {
         /// Index into the workspace's root list — pairs with `relative_path` for the absolute path.
+        /// Root-addressed like grep hits and workspace diagnostics, because this picker lists the
+        /// *workspace's* changes: every row is a changed file under one of the roots, aggregated
+        /// across however many repos those roots span (docs/git-phase-2.md). A change elsewhere in
+        /// a root's repo is a git question, not a workspace one, and isn't listed here.
         path_index: u32,
         /// Path relative to root `path_index` (forward-slash separated). The fuzzy haystack + the
         /// group key the client renders a file header for.
@@ -1267,7 +1271,9 @@ pub struct PickerHideParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GroupHeader {
-    /// The group is a file (grep hits, git changes, workspace diagnostics).
+    /// The group is a file (grep hits, git changes, workspace diagnostics). The client composes the
+    /// label from the root's disambiguated name and `relative_path` — see
+    /// `aether-client/src/labels.rs`, which owns how a path is printed.
     File {
         path_index: u32,
         relative_path: String,

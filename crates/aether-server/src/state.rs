@@ -458,6 +458,29 @@ impl WorkspaceEntry {
             .any(|p| canonical == p || canonical.starts_with(p))
     }
 
+    /// True iff `canonical` is eligible for Git integration (baseline, gutter, hunk staging):
+    /// contained by a root, **or** inside the working tree of a repo one of those roots reaches.
+    ///
+    /// The second clause matters when a root is a *subdirectory* of its repo. Its siblings are
+    /// still the same working tree: open one — by absolute path, or by following a definition —
+    /// and a gutter reading "no history" would simply be wrong, and `ApplyHunkStatus::Unavailable`
+    /// wronger. Eligibility follows the repo, not the root list. (The workspace changes picker
+    /// deliberately doesn't *list* those files — that's a git question, not a workspace one — so
+    /// this is about what a buffer can do once you have it, not about what the picker offers.)
+    ///
+    /// Deliberately *not* "discover a repo from the file's own path": that walks upward out of the
+    /// workspace and would make every dependency checkout (`~/.cargo/git/checkouts/…`, reached by
+    /// goto-definition) a git target. Discovery only ever runs from a root, so an unreachable repo
+    /// stays unreachable. The containment test runs first, so the ordinary in-root open costs no
+    /// git work at all.
+    pub fn git_eligible(&self, canonical: &Path) -> bool {
+        self.contains(canonical)
+            || self.paths.iter().any(|root| {
+                crate::git::discover_repo(root)
+                    .is_some_and(|identity| canonical.starts_with(&identity.workdir))
+            })
+    }
+
     /// Ephemeral ⇔ not persisted ⇔ no on-disk config. The single source of truth is `name.is_none()`.
     pub fn is_ephemeral(&self) -> bool {
         self.name.is_none()

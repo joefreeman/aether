@@ -30,7 +30,9 @@ pub struct BufferOpenParams {
     /// goto-definition follow path, where the target may lie *outside* the active workspace's roots —
     /// an "external" buffer. Unlike root-relative opens (which are confined to the workspace boundary
     /// to block `../` traversal), an absolute-path open is allowed to land outside the roots; the
-    /// server marks the resulting buffer external (no git baseline, trust-restricted LSP). Mutually
+    /// server marks the resulting buffer external (trust-restricted LSP). Git is the wider test —
+    /// a file outside every root but inside a repo one of them reaches keeps its baseline, so a
+    /// sibling of your root in the same repo still shows its diff and stages. Mutually
     /// exclusive with `path_index`/`relative_path`. Ignored when `buffer_id` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absolute_path: Option<String>,

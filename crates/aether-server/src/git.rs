@@ -1382,9 +1382,10 @@ pub fn repo_status_for_root(root: &Path) -> Option<RepoStatus> {
     Some(RepoStatus { root_rel, map })
 }
 
-/// One changed file under a root: its combined staged+unstaged hunks vs HEAD (anchor order) plus
+/// One changed file in a repo: its combined staged+unstaged hunks vs HEAD (anchor order) plus
 /// the LF-normalized working-tree bytes, so the caller can pull each add/modify hunk's preview
-/// line without re-reading the file. `rel_path` is root-relative, forward-slash.
+/// line without re-reading the file. `rel_path` is **repo**-relative, forward-slash — the changes
+/// picker is scoped to a repo, so a changed file needn't sit under any workspace root.
 pub struct ChangedFile {
     pub rel_path: String,
     pub hunks: Vec<DiffHunk>,
@@ -1395,15 +1396,22 @@ pub struct ChangedFile {
     pub untracked: bool,
 }
 
-/// Diff every changed file under `root` against HEAD (combined staged+unstaged), opening the repo
-/// **once** — discovery, the HEAD tree, and the index are resolved a single time and reused for
-/// every file, instead of re-discovering the repo per file (the slow part when a workspace has many
-/// changes). Untracked directories are not recursed: a wholly-new directory collapses to one entry
-/// (git's default `git status`), which is a directory and skipped — only individual changed files
-/// are diffable. Files with no net change are dropped. Best-effort: empty on any libgit2 error.
-pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
+/// Diff every changed file in the repo at `repo_path` against HEAD (combined staged+unstaged),
+/// opening the repo **once** — discovery, the HEAD tree, and the index are resolved a single time
+/// and reused for every file, instead of re-discovering the repo per file (the slow part when a
+/// repo has many changes). Untracked directories are not recursed: a wholly-new directory collapses
+/// to one entry (git's default `git status`), which is a directory and skipped — only individual
+/// changed files are diffable. Files with no net change are dropped. Best-effort: empty on any
+/// libgit2 error.
+///
+/// **Repo-scoped, not root-scoped** (docs/git-phase-2.md decision 2). This used to take a workspace
+/// root and drop every change outside that root's subtree, which silently hid a repo's changes
+/// whenever a root was a subdirectory of it — the one place the root/repo ambiguity still lived.
+/// `repo_path` is normally the workdir itself; discovery still runs, so a subdirectory resolves to
+/// the same repo (and a linked worktree to its own).
+pub fn changed_files_in_repo(repo_path: &Path) -> Vec<ChangedFile> {
     let mut out = Vec::new();
-    let Ok(canonical) = root.canonicalize() else {
+    let Ok(canonical) = repo_path.canonicalize() else {
         return out;
     };
     let Ok(repo) = git2::Repository::discover(&canonical) else {
@@ -1412,10 +1420,6 @@ pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
     let Some(workdir) = repo.workdir().and_then(|w| w.canonicalize().ok()) else {
         return out;
     };
-    let Ok(root_rel) = canonical.strip_prefix(&workdir) else {
-        return out;
-    };
-    let root_rel = root_rel.to_path_buf();
 
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
@@ -1441,10 +1445,7 @@ pub fn changed_files_with_hunks(root: &Path) -> Vec<ChangedFile> {
             continue;
         }
         let repo_rel = Path::new(path);
-        let Ok(rel) = repo_rel.strip_prefix(&root_rel) else {
-            continue; // a change in another root of the same repo
-        };
-        let rel_path: String = rel
+        let rel_path: String = repo_rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
@@ -2415,7 +2416,7 @@ mod tests {
     // ---- changed_files_with_hunks (Git-changes picker) ------------------------------------------
 
     #[test]
-    fn changed_files_with_hunks_diffs_each_file_and_collapses_untracked_dirs() {
+    fn changed_files_in_repo_diffs_each_file_and_collapses_untracked_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         repo_with_files(root, &[("a.rs", "one\ntwo\nthree\n"), ("clean.rs", "x\n")]);
@@ -2426,7 +2427,7 @@ mod tests {
         std::fs::write(root.join("junk/y.rs"), "y\n").unwrap();
         std::fs::write(root.join("loose.rs"), "new\n").unwrap();
 
-        let mut changed = changed_files_with_hunks(root);
+        let mut changed = changed_files_in_repo(root);
         changed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let paths: Vec<&str> = changed.iter().map(|c| c.rel_path.as_str()).collect();
         assert_eq!(
@@ -2450,10 +2451,39 @@ mod tests {
     }
 
     #[test]
-    fn changed_files_with_hunks_no_repo_is_empty() {
+    fn changed_files_in_repo_no_repo_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
-        assert!(changed_files_with_hunks(dir.path()).is_empty());
+        assert!(changed_files_in_repo(dir.path()).is_empty());
+    }
+
+    /// Repo-scoped, not root-scoped: asked about a repo, it reports every changed file in it —
+    /// including ones a workspace root nested inside the repo would previously have hidden. Paths
+    /// come back repo-relative, which is what the picker renders.
+    #[test]
+    fn changed_files_in_repo_reports_changes_outside_a_nested_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(
+            root,
+            &[("sub/inside.rs", "one\n"), ("other/outside.rs", "two\n")],
+        );
+        std::fs::write(root.join("sub/inside.rs"), "ONE\n").unwrap();
+        std::fs::write(root.join("other/outside.rs"), "TWO\n").unwrap();
+
+        // Discovery from a subdirectory resolves the same repo, and the answer is the same:
+        // whole-repo, repo-relative.
+        for from in [root.to_path_buf(), root.join("sub")] {
+            let mut changed = changed_files_in_repo(&from);
+            changed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            let paths: Vec<&str> = changed.iter().map(|c| c.rel_path.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec!["other/outside.rs", "sub/inside.rs"],
+                "asked from {}",
+                from.display()
+            );
+        }
     }
 
     #[test]
