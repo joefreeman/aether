@@ -52,7 +52,8 @@ use aether_protocol::git::{
     GitDeleteBranchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
     GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams,
     GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
+    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -225,6 +226,9 @@ pub enum Event {
         forced: bool,
         result: Result<GitDeleteBranchResult, String>,
     },
+    /// Any `git/stash_*` outcome. One event for all three because the client does the same thing
+    /// with each: toast what happened, and refresh the stash picker if it's open.
+    StashDone(Result<GitStashResult, String>),
     HunkApplied {
         action: HunkAction,
         /// What the action was aimed at — carried back so the toast can say "file" or "change"
@@ -1097,6 +1101,29 @@ impl Session {
                         Effects::toast(res.message, ToastKind::Warning)
                     }
                 },
+            },
+
+            Event::StashDone(result) => match result {
+                Ok(r) => {
+                    let (msg, kind) = match r.status {
+                        GitStashStatus::Pushed => ("Stashed working tree", ToastKind::Success),
+                        GitStashStatus::NothingToStash => ("Nothing to stash", ToastKind::Info),
+                        GitStashStatus::Applied => ("Applied stash", ToastKind::Success),
+                        GitStashStatus::Popped => ("Popped stash", ToastKind::Success),
+                        GitStashStatus::Dropped => ("Dropped stash", ToastKind::Success),
+                        GitStashStatus::BlockedByDirtyBuffers => {
+                            ("Unsaved changes — save first", ToastKind::Warning)
+                        }
+                        // The picker was showing a snapshot; something removed the entry since.
+                        GitStashStatus::Gone => ("That stash is gone", ToastKind::Warning),
+                        GitStashStatus::Refused => ("", ToastKind::Error),
+                    };
+                    if r.status == GitStashStatus::Refused {
+                        return Effects::error(r.message);
+                    }
+                    Effects::toast(msg, kind)
+                }
+                Err(e) => Effects::error(e),
             },
 
             Event::HunkApplied {
@@ -2959,10 +2986,11 @@ impl Session {
                             | PickerKind::DocumentSymbols
                             | PickerKind::GitChangesFile
                             | PickerKind::GitBranches
-                            // Both log pickers resolve their repo from the buffer; the file-locked
-                            // one additionally takes its path from it.
+                            // The log and stash pickers resolve their repo from the buffer; the
+                            // file-locked log additionally takes its path from it.
                             | PickerKind::GitLog
                             | PickerKind::GitLogFile
+                            | PickerKind::GitStash
                     ))
                 .then_some(buffer_id),
                 from_selection,
@@ -4133,6 +4161,19 @@ impl Session {
                 let dir = self.workspace_paths.get(*path_index as usize).cloned();
                 return self.explorer_navigate(dir, false, None);
             }
+            PickerItem::GitStash { repo_id, oid, .. } => {
+                // A stash *is* a commit, so previewing it is the log picker's Enter verbatim: its
+                // first-parent diff is exactly what `git stash show -p` prints.
+                let params = aether_protocol::git::GitShowParams {
+                    repo_id: repo_id.clone(),
+                    rev: oid.clone(),
+                    path: None,
+                };
+                let hide = self.close_picker();
+                return hide.and(
+                    self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
+                );
+            }
             PickerItem::GitCommit { repo_id, hash, .. } => {
                 // The row *is* the revision, so this needs no resolution: `git/show` materialises
                 // the commit as a read-only virtual buffer and the result adopts exactly like a
@@ -4425,6 +4466,44 @@ impl Session {
                 self.prompt = Some(Prompt::Confirm {
                     kind: ConfirmKind::DeleteBranch { name: name.clone() },
                     action: ConfirmAction::DeleteBranch { name, force: false },
+                });
+                return Effects::none();
+            }
+            // Stash chords, in the Ctrl family the other pickers' row actions use. `Ctrl-p` pops
+            // (the gesture you stashed *for*) and `Ctrl-Alt-p` applies — the plain/Alt sibling
+            // convention, so the pair needs one letter rather than two unrelated ones.
+            KeyCode::Char('p')
+                if mods.ctrl && p.kind == PickerKind::GitStash && !p.items.is_empty() =>
+            {
+                let pop = !mods.alt;
+                let Some(PickerItem::GitStash { repo_id, oid, .. }) = p.selected_item() else {
+                    return Effects::none();
+                };
+                let params = GitStashApplyParams {
+                    repo_id: Some(repo_id.clone()),
+                    buffer_id: None,
+                    oid: oid.clone(),
+                    pop,
+                };
+                let hide = self.close_picker();
+                return hide.and(self.request_str::<GitStashApply>(params, Event::StashDone));
+            }
+            // `Ctrl-d` deletes the highlighted thing, as in every other picker — behind a confirm,
+            // because a dropped stash is not something the editor can give back.
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::GitStash => {
+                let Some(PickerItem::GitStash {
+                    repo_id,
+                    oid,
+                    message,
+                    ..
+                }) = p.selected_item()
+                else {
+                    return Effects::none();
+                };
+                let (repo_id, oid, message) = (repo_id.clone(), oid.clone(), message.clone());
+                self.prompt = Some(Prompt::Confirm {
+                    kind: ConfirmKind::DropStash { message },
+                    action: ConfirmAction::DropStash { repo_id, oid },
                 });
                 return Effects::none();
             }
@@ -6927,6 +7006,14 @@ impl Session {
     fn run_confirm(&mut self, action: ConfirmAction) -> Effects {
         match action {
             ConfirmAction::Save { target, after } => self.save(target, true, after),
+            ConfirmAction::DropStash { repo_id, oid } => self.request_str::<GitStashDrop>(
+                GitStashDropParams {
+                    repo_id: Some(repo_id),
+                    buffer_id: None,
+                    oid,
+                },
+                Event::StashDone,
+            ),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
             ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
@@ -7973,6 +8060,18 @@ impl Session {
                     },
                 )
             }
+
+            A::GitStashPush => self.request_str::<GitStashPush>(
+                GitStashPushParams {
+                    // Resolved server-side from the buffer we're on, like every other git verb.
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                    // No prompt: `git stash` with no message is the common gesture, and git's own
+                    // `WIP on <branch>` names the entry well enough to recognise in the picker.
+                    message: None,
+                },
+                Event::StashDone,
+            ),
 
             A::GitUncommit => self.request_str::<GitReset>(
                 GitResetParams {

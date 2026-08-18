@@ -691,6 +691,113 @@ pub struct GitShowParams {
     pub path: Option<String>,
 }
 
+// ---- git/stash_* --------------------------------------------------------------------------------
+
+/// Stash the working tree (`git stash push`). Rewrites the working tree, so it carries the same
+/// dirty-buffer pre-flight and reconciliation as a checkout: unsaved buffers would be stranded on a
+/// base that no longer exists on disk.
+pub struct GitStashPush;
+impl RpcMethod for GitStashPush {
+    const NAME: &'static str = "git/stash_push";
+    type Params = GitStashPushParams;
+    type Result = GitStashResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStashPushParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    /// Resolution hint when `repo_id` is absent, as everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Optional label. `None` takes git's own `WIP on <branch>: <commit> <subject>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Restore a stash into the working tree — `git stash apply`, or `pop` to drop it afterwards.
+/// Tree-rewriting, like [`GitStashPush`] and [`GitCheckout`].
+pub struct GitStashApply;
+impl RpcMethod for GitStashApply {
+    const NAME: &'static str = "git/stash_apply";
+    type Params = GitStashApplyParams;
+    type Result = GitStashResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStashApplyParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// The stash commit's hash. Addressed by hash rather than by `stash@{n}` because positions
+    /// shift as entries are dropped: the server re-resolves the position immediately before
+    /// shelling out, and refuses if this entry has since gone.
+    pub oid: String,
+    /// Drop the entry after a successful restore (`git stash pop`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pop: bool,
+}
+
+/// Discard a stash entry (`git stash drop`). **Not** tree-rewriting — nothing to reconcile, the
+/// same split [`GitDeleteBranch`] has from [`GitCheckout`].
+pub struct GitStashDrop;
+impl RpcMethod for GitStashDrop {
+    const NAME: &'static str = "git/stash_drop";
+    type Params = GitStashDropParams;
+    type Result = GitStashResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStashDropParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// The stash commit's hash — see [`GitStashApplyParams::oid`].
+    pub oid: String,
+}
+
+/// The outcome of any stash operation. One result type for all three because the client does the
+/// same three things with it — toast the outcome, list the buffers it refreshed, surface git's
+/// refusal verbatim — and every discriminated variant here is one the *server* determined.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitStashResult {
+    pub status: GitStashStatus,
+    /// The reconciliation that followed: which open buffers were re-read, which diverged, which
+    /// files the operation removed. Default (all empty) for a drop, which touches no file.
+    #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
+    pub refreshed: GitRefreshResult,
+    /// Unsaved buffers blocking the operation, for `BlockedByDirtyBuffers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BufferId>,
+    /// git's own words on a `Refused`, or the created entry's description on a push. Empty
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStashStatus {
+    /// `git stash push` created an entry.
+    #[default]
+    Pushed,
+    /// Nothing to stash — a clean working tree. Distinguished from `Pushed` because git exits 0
+    /// either way, and "stashed" when nothing was is a lie the user would act on.
+    NothingToStash,
+    Applied,
+    Popped,
+    Dropped,
+    /// Unsaved buffers in this repo: refused before anything ran, listing them.
+    BlockedByDirtyBuffers,
+    /// The entry named by `oid` is no longer in `refs/stash` — dropped or popped elsewhere while
+    /// the picker was open.
+    Gone,
+    /// git refused (a conflicting apply, most often); `message` carries its text verbatim.
+    Refused,
+}
+
 // ---- git/refresh --------------------------------------------------------------------------------
 
 /// Reconcile every open buffer in a repo with the working tree, in one pass.

@@ -445,6 +445,10 @@ pub enum Action {
     /// `Space g u` — take back the last commit, leaving its changes staged
     /// (`git reset --soft HEAD^`).
     GitUncommit,
+    /// `Space g Alt-z` — shelve the working tree (`git stash push`), taking git's own
+    /// `WIP on <branch>` message. The stash *picker* (`Space g z`) is where entries are previewed,
+    /// applied, popped and dropped.
+    GitStashPush,
 
     // ---- LSP ----
     GotoDefinition,
@@ -1254,8 +1258,8 @@ static LEADER: &[Binding] = &[
 /// Reserved for docs/git-phase-2.md's remaining stages, so the shape is decided once rather than
 /// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
 /// `f`/`Alt-f` fetch/pull,
-/// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord), `z`/`Alt-z` the
-/// stash picker and stash-working-tree, `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
+/// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord),
+/// `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
 /// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
 /// reflog is a filter chip on the log picker rather than a key: it's the same rows over a
 /// different ref walk.
@@ -1272,6 +1276,8 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
     bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
+    bind!(LG, ch('z'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
+    bind!(LG, ch('z'), Exact(Mods::ALT), A::GitStashPush, "Git", "Stash working tree"),
 ];
 
 #[cfg(test)]

@@ -41,6 +41,7 @@ use aether_protocol::git::{
     GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams, GitRefreshResult,
     GitRepoInfo, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
     GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams,
+    GitStashApplyParams, GitStashDropParams, GitStashPushParams, GitStashResult, GitStashStatus,
     HunkAction, HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
@@ -2958,12 +2959,21 @@ fn resolve_readable_repo(
 ) -> Result<GitRepoInfo, RpcError> {
     let repos = reachable_repos(s, client_id)?;
     if let Some(buffer_id) = buffer_id {
-        if let Some(workdir) = s
+        // A *virtual* buffer has no baseline — it isn't a file — but its key names the repo it was
+        // materialised from. Without this, opening the log or stash picker *while reading a commit
+        // or a stash* would be ambiguous in a multi-repo workspace, which is precisely the moment
+        // the answer is least in doubt.
+        let from_revision = s
+            .try_doc_of(buffer_id)
+            .and_then(|d| d.virtual_source.as_ref())
+            .and_then(|v| v.key.rsplit_once('@'))
+            .map(|(repo, _)| repo.to_string());
+        let from_baseline = s
             .git_baseline
             .get(&buffer_id)
             .and_then(|b| b.repo.as_ref())
-            .map(|r| path_string(&r.workdir))
-        {
+            .map(|r| path_string(&r.workdir));
+        if let Some(workdir) = from_baseline.or(from_revision) {
             if let Some(repo) = repos.iter().find(|r| r.repo_id == workdir) {
                 return Ok(repo.clone());
             }
@@ -3458,6 +3468,196 @@ pub async fn git_checkout(
     })
 }
 
+/// Run a tree-rewriting stash command (`push` / `apply` / `pop`) with the full checkout ceremony:
+/// dirty-buffer pre-flight, watcher suppression, reconciliation either way, git's stderr surfaced
+/// verbatim. Factored out because the three differ only in argv and the status they report on
+/// success — the hazards are identical, and duplicating them is how one of them ends up missing a
+/// reconcile.
+async fn run_tree_stash(
+    state: &SharedState,
+    workdir: std::path::PathBuf,
+    args: Vec<String>,
+    ok_status: GitStashStatus,
+) -> Result<GitStashResult, RpcError> {
+    let blocked = {
+        let s = state.lock().await;
+        dirty_buffers_in_repo(&s, &workdir)
+    };
+    // Refuse before anything runs. A stash rewrites the working tree under any unsaved buffer, and
+    // saving on the user's behalf is not ours to do — the same call checkout makes.
+    if !blocked.is_empty() {
+        return Ok(GitStashResult {
+            status: GitStashStatus::BlockedByDirtyBuffers,
+            blocked,
+            ..Default::default()
+        });
+    }
+
+    state.lock().await.git_suppressed.insert(workdir.clone());
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outcome = crate::git_cli::run(&workdir, &argv).await;
+
+    let mut s = state.lock().await;
+    s.git_suppressed.remove(&workdir);
+    let output = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            drop(s);
+            return Err(RpcError::internal(format!("running git stash: {e}")));
+        }
+    };
+    // Reconcile either way: a stash that failed partway can still have touched files.
+    let (refreshed, mut pushes) = reconcile_repo(&mut s, &workdir);
+    // The entry list changed under any open stash picker — including a *failed* run, which may
+    // still have created or consumed an entry.
+    pushes.extend(refresh_git_ref_pickers(&mut s, PickerKind::GitStash));
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitStashResult {
+            status: GitStashStatus::Refused,
+            message: message.trim_end().to_string(),
+            refreshed,
+            ..Default::default()
+        });
+    }
+    Ok(GitStashResult {
+        status: ok_status,
+        refreshed,
+        message: output.stdout.trim_end().to_string(),
+        ..Default::default()
+    })
+}
+
+/// `git stash push`: shelve the working tree.
+pub async fn git_stash_push(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitStashPushParams,
+) -> Result<GitStashResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+    // "Nothing to stash" is a success exit for git, so ask *before* running rather than parsing
+    // its narration afterwards: reporting "stashed" when nothing was is a lie the user would act
+    // on (they'd go looking for an entry that doesn't exist).
+    let clean = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::git::changed_files_in_repo(&workdir).is_empty())
+            .await
+            .unwrap_or(false)
+    };
+    if clean {
+        return Ok(GitStashResult {
+            status: GitStashStatus::NothingToStash,
+            ..Default::default()
+        });
+    }
+
+    let mut args = vec!["stash".to_string(), "push".to_string()];
+    if let Some(message) = params.message.as_deref().filter(|m| !m.trim().is_empty()) {
+        args.push("-m".to_string());
+        args.push(message.to_string());
+    }
+    run_tree_stash(state, workdir, args, GitStashStatus::Pushed).await
+}
+
+/// `git stash apply` / `pop`: restore an entry into the working tree.
+pub async fn git_stash_apply(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitStashApplyParams,
+) -> Result<GitStashResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+    let Some(spec) = stash_spec(&workdir, &params.oid).await else {
+        return Ok(GitStashResult {
+            status: GitStashStatus::Gone,
+            ..Default::default()
+        });
+    };
+    let verb = if params.pop { "pop" } else { "apply" };
+    let args = vec!["stash".to_string(), verb.to_string(), spec];
+    let ok = if params.pop {
+        GitStashStatus::Popped
+    } else {
+        GitStashStatus::Applied
+    };
+    run_tree_stash(state, workdir, args, ok).await
+}
+
+/// `git stash drop`: discard an entry. No tree move, so no pre-flight and nothing to reconcile —
+/// the split `git/delete_branch` has from `git/checkout`.
+pub async fn git_stash_drop(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitStashDropParams,
+) -> Result<GitStashResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+    let Some(spec) = stash_spec(&workdir, &params.oid).await else {
+        return Ok(GitStashResult {
+            status: GitStashStatus::Gone,
+            ..Default::default()
+        });
+    };
+    let output = crate::git_cli::run(&workdir, &["stash", "drop", &spec])
+        .await
+        .map_err(|e| RpcError::internal(format!("running git stash drop: {e}")))?;
+    // The picker that fired this is still open on a list that now has one fewer entry — refresh it
+    // before answering, or the next keystroke acts on a row that no longer exists.
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_git_ref_pickers(&mut s, PickerKind::GitStash)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    if !output.success() {
+        return Ok(GitStashResult {
+            status: GitStashStatus::Refused,
+            message: output.stderr.trim_end().to_string(),
+            ..Default::default()
+        });
+    }
+    Ok(GitStashResult {
+        status: GitStashStatus::Dropped,
+        message: output.stdout.trim_end().to_string(),
+        ..Default::default()
+    })
+}
+
+/// The `stash@{n}` the CLI needs, resolved from the stable hash the client sent. `None` when the
+/// entry is gone — dropped or popped elsewhere while the picker was up. Resolving here rather than
+/// trusting the listed position is what stops a shifted index acting on the *wrong* stash.
+async fn stash_spec(workdir: &std::path::Path, oid: &str) -> Option<String> {
+    let (workdir, oid) = (workdir.to_path_buf(), oid.to_string());
+    tokio::task::spawn_blocking(move || crate::git::stash_index_of(&workdir, &oid))
+        .await
+        .ok()
+        .flatten()
+        .map(|index| format!("stash@{{{index}}}"))
+}
+
 /// Delete a local branch. No tree move, so none of checkout's machinery applies.
 pub async fn git_delete_branch(
     state: &SharedState,
@@ -3519,6 +3719,15 @@ pub async fn git_delete_branch(
             status: GitDeleteBranchStatus::Refused,
             message: message.trim_end().to_string(),
         });
+    }
+    // The branch picker is still open on a list that now has one fewer row — same reason the stash
+    // drop refreshes. (Checkout doesn't need this: it closes its picker.)
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_git_ref_pickers(&mut s, PickerKind::GitBranches)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
     }
     Ok(GitDeleteBranchResult {
         status: GitDeleteBranchStatus::Deleted,
@@ -13513,6 +13722,97 @@ fn buffer_dirty_state(buf: &Document) -> BufferDirtyState {
     }
 }
 
+/// Rebuild candidates for every subscribed picker whose list a git *ref* operation just changed —
+/// the stash picker after a push/apply/pop/drop, the branch picker after a delete. Re-ranks under
+/// the existing query, so the user's filter and their place in the list survive.
+///
+/// Deferred once, on the reasoning that checkout closes its picker so nothing could observe a
+/// stale list. That was true of checkout and wrong in general: dropping a stash (or deleting a
+/// branch) leaves the picker *open*, and it kept showing the row that had just been removed —
+/// which the next keystroke would then act on.
+///
+/// Cheap when nothing is open: a scan over `pickers` and an early return. Rebuilt for every client
+/// with one subscribed, not just the one that acted, since `refs/stash` is repo-wide.
+pub(crate) fn refresh_git_ref_pickers(s: &mut ServerState, kind: PickerKind) -> PendingPushes {
+    let client_ids: Vec<ClientId> = s
+        .pickers
+        .iter()
+        .filter_map(|((c, k), p)| (*k == kind && p.subscribed.is_some()).then_some(*c))
+        .collect();
+    let mut pushes = Vec::new();
+    for client_id in client_ids {
+        // Re-resolve from the repo the picker's own rows name, not from the active buffer: the
+        // buffer may have moved (or be a preview that closed) since the picker opened, and a
+        // refresh must not silently repoint the list at a different repo.
+        let workdir = {
+            let picker = match s.pickers.get(&(client_id, kind)) {
+                Some(p) => p,
+                None => continue,
+            };
+            match &picker.candidates {
+                picker_state::PickerCandidates::GitStash(v) => v.first().map(|c| c.repo_id.clone()),
+                picker_state::PickerCandidates::GitBranches(v) => {
+                    v.first().map(|c| c.repo_id.clone())
+                }
+                _ => None,
+            }
+        };
+        // An empty list has no repo to re-read: nothing to refresh, and the next open resolves
+        // afresh anyway.
+        let Some(workdir) = workdir.map(std::path::PathBuf::from) else {
+            continue;
+        };
+        let repo_id = workdir.to_string_lossy().into_owned();
+        let new_candidates = match kind {
+            PickerKind::GitStash => picker_state::PickerCandidates::GitStash(
+                crate::git::list_stashes(&workdir)
+                    .into_iter()
+                    .map(|row| picker_state::GitStashCandidate {
+                        repo_id: repo_id.clone(),
+                        row,
+                    })
+                    .collect(),
+            ),
+            PickerKind::GitBranches => picker_state::PickerCandidates::GitBranches(
+                crate::git::list_branches(&workdir)
+                    .into_iter()
+                    .map(|row| picker_state::GitBranchCandidate {
+                        repo_id: repo_id.clone(),
+                        row,
+                    })
+                    .collect(),
+            ),
+            _ => continue,
+        };
+        let ServerState {
+            pickers,
+            matcher,
+            clients,
+            ..
+        } = &mut *s;
+        let Some(picker) = pickers.get_mut(&(client_id, kind)) else {
+            continue;
+        };
+        picker.candidates = new_candidates;
+        picker.rerank(matcher);
+        // The list can only shrink here, so a window sitting past the new end would render empty.
+        if let Some(window) = picker.subscribed.as_mut() {
+            let total = picker.ranked.len() as u32;
+            if window.offset >= total {
+                window.offset = total.saturating_sub(window.limit);
+            }
+        }
+        let Some(update) = picker_state::build_update(picker, matcher) else {
+            continue;
+        };
+        let Some(sender) = clients.get(&client_id).map(|c| c.outbound.clone()) else {
+            continue;
+        };
+        pushes.push((sender, picker_update_notif(update)));
+    }
+    pushes
+}
+
 /// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
 /// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
 /// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
@@ -14739,6 +15039,32 @@ pub async fn picker_view(
         PickerKind::GitLog | PickerKind::GitLogFile => {
             picker_state::PickerCandidates::GitLog(Vec::new())
         }
+        // The stash list is small and changes under every stash mutation, so it rebuilds on a
+        // fresh open like the branch picker rather than being preserved. Read-only, so it resolves
+        // against reachable repos like the log.
+        PickerKind::GitStash if params.reset == PickerReset::All => {
+            let workdir = {
+                let s = state.lock().await;
+                std::path::PathBuf::from(
+                    resolve_readable_repo(&s, client_id, params.buffer_id)?.repo_id,
+                )
+            };
+            let repo_id = workdir.to_string_lossy().into_owned();
+            let rows = tokio::task::spawn_blocking(move || crate::git::list_stashes(&workdir))
+                .await
+                .unwrap_or_default();
+            picker_state::PickerCandidates::GitStash(
+                rows.into_iter()
+                    .map(|row| picker_state::GitStashCandidate {
+                        repo_id: repo_id.clone(),
+                        row,
+                    })
+                    .collect(),
+            )
+        }
+        // Scroll / resume re-view: the empty placeholder `preserve_existing` keeps, like the
+        // branch picker — re-resolving carries no `buffer_id` and would fail a scroll.
+        PickerKind::GitStash => picker_state::PickerCandidates::GitStash(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -14908,6 +15234,10 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::GitLog(_),
                     picker_state::PickerCandidates::GitLog(new),
                 ) => new.is_empty(),
+                (
+                    picker_state::PickerCandidates::GitStash(_),
+                    picker_state::PickerCandidates::GitStash(new),
+                ) => new.is_empty(),
                 _ => false,
             };
             if !preserve_existing {
@@ -14997,6 +15327,18 @@ pub async fn picker_view(
             ) => v
                 .iter()
                 .position(|c| c.hash == *rev)
+                .map(|idx| picker.candidates.make_item(idx, Vec::new())),
+            // The same for a stash being read: a stash entry *is* a commit, so the buffer's
+            // revision identifies its row exactly as it does in the log.
+            (
+                Some(CursorCentering {
+                    revision: Some(rev),
+                    ..
+                }),
+                picker_state::PickerCandidates::GitStash(v),
+            ) => v
+                .iter()
+                .position(|c| c.row.oid == *rev)
                 .map(|idx| picker.candidates.make_item(idx, Vec::new())),
             // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
             // fall-through to "some other file" — if the active file has no changes, leave the

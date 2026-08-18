@@ -236,6 +236,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitBranches => "Switch branch…",
         PickerKind::GitLog => "Search history…",
         PickerKind::GitLogFile => "Search this file's history…",
+        PickerKind::GitStash => "Find stash…",
         PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
@@ -1586,6 +1587,33 @@ fn render_item<'a>(
             row![
                 dot_cell(Some(color), ui),
                 highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(m, ui, p),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
+        PickerItem::GitStash {
+            index,
+            message,
+            timestamp,
+            match_indices,
+            ..
+        } => {
+            // A stash reads as a commit with a name you didn't choose: positional label, the
+            // message, then a relative date.
+            let mut m = String::new();
+            if *timestamp > 0 {
+                m.push_str(&crate::app::time_ago(*timestamp));
+            }
+            row![
+                text(format!("stash@{{{index}}}"))
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(p.fg_dim)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                highlighted(message, match_indices, p.fg_bright, SANS, hovered, ui, p),
                 iced::widget::Space::new().width(Length::Fill),
                 meta(m, ui, p),
             ]

@@ -162,6 +162,14 @@ pub enum PickerKind {
     /// against its parent to know whether the path was touched — which is why the cap counts
     /// commits *examined*, not rows produced.
     GitLogFile,
+    /// The repo's stash entries (`Space g z`, docs/git-phase-2.md stage 5), newest first. Rows are
+    /// [`PickerItem::GitStash`]; `Enter` previews the entry as a read-only virtual buffer, exactly
+    /// as the log picker shows a commit — a stash *is* a commit, so it costs no new read path.
+    ///
+    /// Not a jump target: the mutations (`Ctrl-p` pop, `Ctrl-Alt-p` apply, `Ctrl-d` drop) are RPCs
+    /// the client fires against the highlighted row, so there is no `PickerSelectResult` for it.
+    /// `refs/stash` is shared across worktrees, so a linked worktree lists the whole repo's.
+    GitStash,
 }
 
 impl PickerKind {
@@ -245,9 +253,10 @@ impl PickerKind {
     /// Whether `picker/view`'s `center_on_cursor` applies — the picker resolves "where you are"
     /// **server-side from the named buffer** and opens framed on it. The field carries a buffer id
     /// and the answer is per kind: the changes pickers take the hunk nearest the cursor, the
-    /// jumplist its nearest entry, and the log pickers the commit the buffer *is* — a `git/show`
-    /// buffer holds one, so opening the log from it lands on that row. (The name is a slight
-    /// stretch for that last one: the cursor plays no part, the buffer's identity does.)
+    /// jumplist its nearest entry, and the log and stash pickers the revision the buffer *is* — a
+    /// `git/show` buffer holds one, so opening either from it lands on that row (a stash entry is a
+    /// commit, so one rule covers both). (The name is a slight stretch for those: the cursor plays
+    /// no part, the buffer's identity does.)
     ///
     /// This is what carries the weight now that no picker resumes its highlight
     /// ([`PickerReset`]): "where you are" is derived on every open, so it can't go stale the way a
@@ -256,7 +265,10 @@ impl PickerKind {
     pub fn centers_on_cursor(self) -> bool {
         matches!(
             self,
-            PickerKind::Jumplist | PickerKind::GitLog | PickerKind::GitLogFile
+            PickerKind::Jumplist
+                | PickerKind::GitLog
+                | PickerKind::GitLogFile
+                | PickerKind::GitStash
         ) || self.is_git_changes()
     }
 
@@ -805,6 +817,28 @@ pub enum PickerItem {
         /// caps at what's rendered, since it only says how much of the row to highlight.
         #[serde(default, skip_serializing_if = "is_zero")]
         hash_match_len: u32,
+    },
+    /// One stash entry ([`PickerKind::GitStash`]). Identity is `oid` — the stash commit's hash —
+    /// because `stash@{n}` positions shift as entries are dropped, and acting on a stale position
+    /// would hit the *wrong* stash rather than failing.
+    GitStash {
+        /// The repo this entry belongs to, echoed onto every action the row triggers.
+        repo_id: crate::git::RepoId,
+        /// Position at listing time, rendered as `stash@{n}` — display only. Every action
+        /// re-resolves it server-side from `oid`.
+        index: u32,
+        /// The stash commit's hash: the row's identity, and what `git/show` previews.
+        oid: String,
+        /// git's own description — `WIP on main: abc1234 subject`, or the user's message. The
+        /// fuzzy haystack, and the row's text.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
+        /// When the entry was made, Unix seconds; rendered as a relative date by the client.
+        #[serde(default, skip_serializing_if = "is_zero_i64")]
+        timestamp: i64,
+        /// Char offsets into `message` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
     },
     /// One captured entry in the Jumplist picker (docs/jumplist.md). Identity is `index` —
     /// the entry's position in the captured list, stable for the picker's lifetime (the list

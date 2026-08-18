@@ -6353,6 +6353,7 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
         ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
+        ConfirmKind::DropStash { message } => format!("Drop stash \"{message}\""),
         ConfirmKind::DeleteUnmergedBranch { name } => {
             format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
         }

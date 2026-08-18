@@ -2574,6 +2574,9 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
         ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
+        // Names the entry, because "drop the stash" is ambiguous with several in the list — and
+        // this is the one stash action the editor can't undo.
+        ConfirmKind::DropStash { message } => format!("Drop stash \"{message}\""),
         ConfirmKind::DeleteUnmergedBranch { name } => {
             format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
         }

@@ -200,6 +200,7 @@ operations live behind the `Space g` sub-leader.
 | `Space g c`/`Space g Alt-c` | Commit staged changes / amend the previous commit |
 | `Space g u` | Uncommit (keep the changes staged) |
 | `Space g b` | Branches: switch, create, delete |
+| `Space g z`/`Space g Alt-z` | Stashes (preview, pop, apply, drop) / stash the working tree |
 | `Space g d` | Toggle inline diff |
 
 ### Code / LSP

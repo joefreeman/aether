@@ -294,7 +294,8 @@ export type PickerKind =
   | "jumplist"
   | "git_branches"
   | "git_log"
-  | "git_log_file";
+  | "git_log_file"
+  | "git_stash";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -354,6 +355,20 @@ export type PickerItem =
       behind?: number;
       /** Workdir of another worktree holding this branch — the row is not checkout-able. */
       checked_out_in?: string | null;
+      match_indices?: number[];
+    }
+  | {
+      kind: "git_stash";
+      /** Which repo the row belongs to — echoed onto the stash action it triggers. */
+      repo_id: string;
+      /** Position at listing time, rendered as `stash@{n}`. Display only: every action
+       *  re-resolves it server-side from `oid`, because positions shift as entries are dropped. */
+      index: number;
+      /** The stash commit's hash — the row's identity, and what `git/show` previews. */
+      oid: string;
+      message?: string;
+      /** When the entry was made, Unix seconds; 0/absent when unknown. */
+      timestamp?: number;
       match_indices?: number[];
     }
   | {

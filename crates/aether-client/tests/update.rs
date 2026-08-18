@@ -2744,6 +2744,75 @@ fn enter_on_a_log_row_shows_the_commit() {
     assert!(find_request(&fx, "picker/hide").is_some());
 }
 
+/// The stash picker's row actions: Enter previews the entry (a stash is a commit, so it goes
+/// through `git/show` exactly as a log row does), `Ctrl-p` pops it, `Ctrl-Alt-p` applies without
+/// dropping, and `Ctrl-d` asks first — a dropped stash is the one stash action the editor can't
+/// give back.
+#[test]
+fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let row = || PickerItem::GitStash {
+        repo_id: "/p".into(),
+        index: 0,
+        oid: "abc1234def".into(),
+        message: "WIP on main: 1234567 subject".into(),
+        timestamp: 1_700_000_000,
+        match_indices: Vec::new(),
+    };
+    let open = |s: &mut aether_client::session::Session| {
+        let _ = s.open_picker(PickerKind::GitStash, None, None, false, None);
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![row()];
+        p.selected = 0;
+    };
+
+    // Enter previews.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/show").expect("Enter previews the entry");
+    assert_eq!(params["rev"], json!("abc1234def"));
+
+    // Ctrl-p pops; Ctrl-Alt-p applies without dropping.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL, None, ROWS);
+    let params = find_request(&fx, "git/stash_apply").expect("Ctrl-p pops");
+    assert_eq!(params["oid"], json!("abc1234def"));
+    assert_eq!(params["pop"], json!(true));
+
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL_ALT, None, ROWS);
+    let params = find_request(&fx, "git/stash_apply").expect("Ctrl-Alt-p applies");
+    assert!(
+        params.get("pop").is_none(),
+        "apply leaves the entry in place"
+    );
+
+    // Ctrl-d asks before discarding, and the action carries the row's identity so a moved
+    // highlight can't redirect it.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    assert!(
+        no_request(&fx),
+        "nothing fires until the confirm is accepted"
+    );
+    assert!(matches!(
+        &s.prompt,
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::DropStash { message },
+            ..
+        }) if message.contains("WIP on main")
+    ));
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let params = find_request(&fx, "git/stash_drop").expect("accepting drops it");
+    assert_eq!(params["oid"], json!("abc1234def"));
+}
+
 /// `Space c`: the workspace changes picker lists every root, whatever repos they span, so it needs
 /// no repo-resolution hint — it sends the buffer only as the *centring* target, to land on the hunk
 /// nearest the cursor.

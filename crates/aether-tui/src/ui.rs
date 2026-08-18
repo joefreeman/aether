@@ -2555,6 +2555,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::GitBranches) => "Switch branch…",
         Some(aether_protocol::picker::PickerKind::GitLog) => "Search history…",
         Some(aether_protocol::picker::PickerKind::GitLogFile) => "Search this file's history…",
+        Some(aether_protocol::picker::PickerKind::GitStash) => "Find stash…",
         None => "Search…",
     }
 }
@@ -3005,6 +3006,27 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::GitStash {
+        index,
+        message,
+        timestamp,
+        match_indices,
+        ..
+    } = item
+    {
+        // The same shape as a commit row — a positional label, the text, then a relative date —
+        // because a stash entry reads as a commit with a name you didn't choose.
+        return git_commit_item_spans(
+            &format!("stash@{{{index}}}"),
+            message,
+            "",
+            *timestamp,
+            match_indices,
+            0,
+            highlighted,
+            max_width,
+        );
+    }
     if let PickerItem::GitCommit {
         short_hash,
         subject,
@@ -3136,6 +3158,7 @@ fn picker_item_spans(
         | PickerItem::Keybinding { .. }
         | PickerItem::GitBranch { .. }
         | PickerItem::GitCommit { .. }
+        | PickerItem::GitStash { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {

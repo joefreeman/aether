@@ -27,7 +27,8 @@ use aether_protocol::git::{
     GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams,
     GitResetResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
     GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams,
-    HunkAction, HunkDirection,
+    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
+    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -32432,6 +32433,42 @@ async fn delete_branch(
     .await
 }
 
+/// The branch picker gets the same refresh as the stash picker, for the same reason: `Ctrl-d`
+/// leaves it open, so without a push it keeps offering the branch it just deleted. (Checkout needs
+/// no equivalent — it closes its picker.)
+#[tokio::test]
+async fn deleting_a_branch_refreshes_the_open_picker() {
+    let (server, mut ws, repo, root, buf) = setup_checkout_workspace().await;
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            buffer_id: Some(buf),
+            ..view_params(PickerKind::GitBranches)
+        },
+    )
+    .await;
+    assert_eq!(view.total_candidates, 2, "main + feature");
+
+    let res = delete_branch(&mut ws, 4, &root, "feature", false).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::Deleted);
+
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1, "the deleted branch is gone");
+    assert!(
+        !update.items().iter().any(|i| matches!(
+            i,
+            PickerItem::GitBranch { name, .. } if name == "feature"
+        )),
+        "and it is `feature` that went"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn delete_branch_removes_a_merged_branch() {
     let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
@@ -33636,6 +33673,384 @@ async fn apply_hunk_file_scope_reverts_the_whole_file() {
         content.text, "one\ntwo\nthree\n",
         "every change restored, not just the one under the cursor"
     );
+
+    drop(server);
+}
+
+// -------- git stash ------------------------------------------------------------------------------
+
+/// The whole loop: stash the working tree, see the entry listed, pop it back. Push and pop rewrite
+/// the tree, so both reconcile the open buffer — which is what stops it sitting on content that no
+/// longer exists on disk.
+#[tokio::test]
+async fn git_stash_push_lists_and_pops() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "CHANGED\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let repo_id = root.to_string_lossy().into_owned();
+
+    let pushed: GitStashResult = send_request::<GitStashPush>(
+        &mut ws,
+        2,
+        &GitStashPushParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            message: Some("wip on the thing".into()),
+        },
+    )
+    .await;
+    assert_eq!(pushed.status, GitStashStatus::Pushed);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "one\n",
+        "the working tree went back to HEAD"
+    );
+
+    // The picker lists it, newest first, with git's own description.
+    let view = send_request::<PickerView>(&mut ws, 3, &view_params(PickerKind::GitStash)).await;
+    assert_eq!(view.total_candidates, 1);
+    let item = view
+        .update
+        .expect("window")
+        .items()
+        .first()
+        .expect("a row")
+        .clone();
+    let PickerItem::GitStash { oid, message, .. } = &item else {
+        panic!("expected a stash row, got {item:?}");
+    };
+    assert!(
+        message.contains("wip on the thing"),
+        "the message rides the row: {message}"
+    );
+
+    // Popping restores the change and removes the entry.
+    let popped: GitStashResult = send_request::<GitStashApply>(
+        &mut ws,
+        4,
+        &GitStashApplyParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            oid: oid.clone(),
+            pop: true,
+        },
+    )
+    .await;
+    assert_eq!(popped.status, GitStashStatus::Popped);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "CHANGED\n"
+    );
+    let view = send_request::<PickerView>(&mut ws, 5, &view_params(PickerKind::GitStash)).await;
+    assert_eq!(view.total_candidates, 0, "the entry is gone");
+
+    drop(server);
+}
+
+/// Stashing a clean tree reports it rather than claiming success — git exits 0 either way, and
+/// "stashed" when nothing was is a lie the user would go looking for an entry over.
+#[tokio::test]
+async fn git_stash_push_on_a_clean_tree_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let r: GitStashResult = send_request::<GitStashPush>(
+        &mut ws,
+        2,
+        &GitStashPushParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            message: None,
+        },
+    )
+    .await;
+    assert_eq!(r.status, GitStashStatus::NothingToStash);
+
+    drop(server);
+}
+
+/// An unsaved buffer blocks a stash before anything runs — a stash rewrites the working tree under
+/// it, and saving on the user's behalf isn't ours to do. Same pre-flight as a checkout.
+#[tokio::test]
+async fn git_stash_push_refuses_with_unsaved_buffers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "CHANGED\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let buffer_id = open_test_buffer(&mut ws, 2, "a.rs").await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "unsaved".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let r: GitStashResult = send_request::<GitStashPush>(
+        &mut ws,
+        4,
+        &GitStashPushParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            message: None,
+        },
+    )
+    .await;
+    assert_eq!(r.status, GitStashStatus::BlockedByDirtyBuffers);
+    assert_eq!(r.blocked, vec![buffer_id]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "CHANGED\n",
+        "git never ran"
+    );
+
+    drop(server);
+}
+
+/// Stash entries are addressed by hash, not by `stash@{n}`: an entry that's gone reports `Gone`
+/// rather than acting on whatever now sits at that position — the failure mode worth engineering
+/// against, since positions shift as entries are dropped.
+#[tokio::test]
+async fn git_stash_actions_refuse_a_vanished_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "CHANGED\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let repo_id = root.to_string_lossy().into_owned();
+    let push = |id: u64| GitStashPushParams {
+        repo_id: Some(repo_id.clone()),
+        buffer_id: None,
+        message: Some(format!("entry {id}")),
+    };
+    let _: GitStashResult = send_request::<GitStashPush>(&mut ws, 2, &push(1)).await;
+    std::fs::write(root.join("a.rs"), "AGAIN\n").unwrap();
+    let _: GitStashResult = send_request::<GitStashPush>(&mut ws, 3, &push(2)).await;
+
+    let view = send_request::<PickerView>(&mut ws, 4, &view_params(PickerKind::GitStash)).await;
+    let oids: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitStash { oid, .. } => Some(oid.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(oids.len(), 2);
+
+    // Drop the newest, which shifts the other from `stash@{1}` to `stash@{0}`...
+    let dropped: GitStashResult = send_request::<GitStashDrop>(
+        &mut ws,
+        5,
+        &GitStashDropParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            oid: oids[0].clone(),
+        },
+    )
+    .await;
+    assert_eq!(dropped.status, GitStashStatus::Dropped);
+
+    // ...and the older one still resolves by hash, at its new position.
+    let applied: GitStashResult = send_request::<GitStashApply>(
+        &mut ws,
+        6,
+        &GitStashApplyParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            oid: oids[1].clone(),
+            pop: false,
+        },
+    )
+    .await;
+    assert_eq!(applied.status, GitStashStatus::Applied);
+
+    // A hash that no longer exists is refused rather than resolved to a neighbour.
+    let gone: GitStashResult = send_request::<GitStashDrop>(
+        &mut ws,
+        7,
+        &GitStashDropParams {
+            repo_id: Some(repo_id),
+            buffer_id: None,
+            oid: oids[0].clone(),
+        },
+    )
+    .await;
+    assert_eq!(gone.status, GitStashStatus::Gone);
+
+    drop(server);
+}
+
+/// Dropping an entry refreshes the open picker. The picker fires the drop and stays up, so without
+/// this it keeps showing the row that was just removed — and the next keystroke acts on it.
+/// Deliberately a *push*, not a client-side re-open: the list is repo-wide, so every client with
+/// the picker open is looking at the same stale row.
+#[tokio::test]
+async fn dropping_a_stash_refreshes_the_open_picker() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let repo_id = root.to_string_lossy().into_owned();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    for (id, content) in [(2u64, "first\n"), (3, "second\n")] {
+        std::fs::write(root.join("a.rs"), content).unwrap();
+        let _: GitStashResult = send_request::<GitStashPush>(
+            &mut ws,
+            id,
+            &GitStashPushParams {
+                repo_id: Some(repo_id.clone()),
+                buffer_id: None,
+                message: Some(format!("entry {id}")),
+            },
+        )
+        .await;
+    }
+
+    // Open (and so subscribe) the picker.
+    let view = send_request::<PickerView>(&mut ws, 4, &view_params(PickerKind::GitStash)).await;
+    assert_eq!(view.total_candidates, 2);
+    let oid = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitStash { oid, .. } => Some(oid.clone()),
+            _ => None,
+        })
+        .expect("a row");
+
+    let dropped: GitStashResult = send_request::<GitStashDrop>(
+        &mut ws,
+        5,
+        &GitStashDropParams {
+            repo_id: Some(repo_id),
+            buffer_id: None,
+            oid: oid.clone(),
+        },
+    )
+    .await;
+    assert_eq!(dropped.status, GitStashStatus::Dropped);
+
+    // The refresh rides a push, so the still-open picker re-renders without asking.
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1, "the dropped row is gone");
+    assert!(
+        !update.items().iter().any(|i| matches!(
+            i,
+            PickerItem::GitStash { oid: o, .. } if *o == oid
+        )),
+        "and specifically it is the dropped one that went"
+    );
+
+    drop(server);
+}
+
+/// Opening the stash picker while *reading* a stash lands on that entry's row — the same rule the
+/// log picker follows, since a stash entry is a commit. It also has to resolve the repo from the
+/// buffer being read, which is a virtual buffer with no baseline: without that, doing this in a
+/// multi-repo workspace would be ambiguous exactly when the answer is least in doubt.
+#[tokio::test]
+async fn stash_picker_centres_on_the_entry_being_viewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let repo_id = root.to_string_lossy().into_owned();
+
+    // A second repo, so resolution has something to be ambiguous about.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_root = other_dir.path().canonicalize().unwrap();
+    let other = init_repo_at(&other_root);
+    commit_file(&other, "b.rs", "two\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone(), other_root]).await;
+    for (id, content) in [(2u64, "first\n"), (3, "second\n")] {
+        std::fs::write(root.join("a.rs"), content).unwrap();
+        let _: GitStashResult = send_request::<GitStashPush>(
+            &mut ws,
+            id,
+            &GitStashPushParams {
+                repo_id: Some(repo_id.clone()),
+                buffer_id: None,
+                message: Some(format!("entry {id}")),
+            },
+        )
+        .await;
+    }
+
+    // The *older* entry — so landing on it can't be confused with landing at the top. This first
+    // listing resolves its repo from an ordinary buffer in it (the workspace spans two).
+    let file_buffer = open_test_buffer(&mut ws, 4, "a.rs").await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        5,
+        &PickerViewParams {
+            buffer_id: Some(file_buffer),
+            ..view_params(PickerKind::GitStash)
+        },
+    )
+    .await;
+    let oids: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitStash { oid, .. } => Some(oid.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(oids.len(), 2);
+    let older = oids[1].clone();
+
+    let shown: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        6,
+        &GitShowParams {
+            repo_id: repo_id.clone(),
+            rev: older.clone(),
+            path: None,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        7,
+        &PickerViewParams {
+            center_on_cursor: Some(shown.buffer_id),
+            buffer_id: Some(shown.buffer_id),
+            ..view_params(PickerKind::GitStash)
+        },
+    )
+    .await;
+    let centred = view.effective_center_on.expect("resolved a row to frame");
+    let PickerItem::GitStash { oid, .. } = centred else {
+        panic!("expected a stash row, got {centred:?}");
+    };
+    assert_eq!(oid, older, "the entry being read, not the newest");
 
     drop(server);
 }

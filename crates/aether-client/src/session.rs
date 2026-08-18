@@ -660,6 +660,9 @@ pub enum ConfirmKind {
     /// discards them. Raised only after a `git/delete_branch` came back `NotMerged`, which is a
     /// real merge-base check — accepting this sends the same delete with `force`.
     DeleteUnmergedBranch { name: String },
+    /// Dropping a stash entry. Confirmed because the editor can't give it back: unlike a pop
+    /// (which restores the work first), a drop discards it outright.
+    DropStash { message: String },
 }
 
 /// What a successful save is followed by — threads the save-and-quit (`Space Alt-q`) and
@@ -735,6 +738,9 @@ pub enum ConfirmAction {
     /// self-contained — the picker highlight may have moved by the time the confirm resolves —
     /// and `force`, which is set only on the escalation from a `NotMerged` refusal.
     DeleteBranch { name: String, force: bool },
+    /// Self-contained like `DeleteBranch`: the picker highlight may have moved — or the picker
+    /// closed — by the time the confirm resolves, so the row's identity travels with the action.
+    DropStash { repo_id: String, oid: String },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.

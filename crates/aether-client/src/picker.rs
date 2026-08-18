@@ -917,6 +917,7 @@ impl PickerState {
             // first commit. Typing a name offers "+ Create", which is the way out.
             PickerKind::GitBranches => "No branches yet",
             PickerKind::GitLog | PickerKind::GitLogFile => "No commits",
+            PickerKind::GitStash => "No stashes",
             _ => "No results",
         })
     }
@@ -952,6 +953,8 @@ pub enum ItemKey<'a> {
     GitBranch(&'a str, &'a str),
     /// A commit hash: unique and stable, so it identifies the row however the list is filtered.
     GitCommit(&'a str),
+    /// A stash entry's hash — stable where its `stash@{n}` position isn't.
+    GitStash(&'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1052,6 +1055,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry(*index),
         PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch(repo_id, name),
         PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit(hash),
+        PickerItem::GitStash { oid, .. } => ItemKey::GitStash(oid),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,

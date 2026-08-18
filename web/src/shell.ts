@@ -106,6 +106,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   git_branches: "Switch branch…",
   git_log: "Search history…",
   git_log_file: "Search this file\u2019s history…",
+  git_stash: "Find stash…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -283,7 +284,8 @@ type ConfirmKind =
   | { kind: "remove_project"; path: string }
   | { kind: "delete_workspace"; name: string }
   | { kind: "delete_branch"; name: string }
-  | { kind: "delete_unmerged_branch"; name: string };
+  | { kind: "delete_unmerged_branch"; name: string }
+  | { kind: "drop_stash"; message: string };
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
@@ -343,6 +345,8 @@ function confirmMessage(c: ConfirmKind): string {
       return `Delete branch "${c.name}"?`;
     case "delete_unmerged_branch":
       return `"${c.name}" isn't merged — delete anyway, discarding its commits?`;
+    case "drop_stash":
+      return `Drop stash "${c.message}"?`;
   }
 }
 
@@ -862,6 +866,15 @@ function describePickerItem(
         metaParts: parts,
         bullet: true,
         bulletStatus: item.is_head ? "head" : undefined,
+      };
+    }
+    case "git_stash": {
+      // A stash reads as a commit with a name you didn't choose: positional label, message, date.
+      return {
+        primary: item.message ?? "",
+        matches: item.match_indices,
+        prefix: `stash@{${item.index}}`,
+        meta: item.timestamp ? timeAgo(item.timestamp) : "",
       };
     }
     case "git_commit": {

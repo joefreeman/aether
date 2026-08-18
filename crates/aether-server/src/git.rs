@@ -1237,6 +1237,67 @@ pub fn commit_info(repo: &GitRepo, rev: &str) -> Option<CommitInfo> {
     })
 }
 
+/// One entry of the stash reflog, as the stash picker's rows need it.
+#[derive(Debug, Clone)]
+pub struct StashRow {
+    /// Position in `refs/stash` at listing time — `stash@{index}`, which is how the git CLI
+    /// addresses it. Shifts as entries are added or dropped, which is why every *action* re-resolves
+    /// it from `oid` rather than trusting a listed index.
+    pub index: usize,
+    /// The stash commit's hash: the stable identity, and what `git/show` previews.
+    pub oid: String,
+    /// git's own line — `WIP on main: abc1234 subject`, or the message the user gave. Carries the
+    /// branch, so nothing here re-derives it.
+    pub message: String,
+    pub timestamp: i64,
+}
+
+/// The repo's stash entries, newest first (`stash@{0}` leads).
+///
+/// `refs/stash` is **shared across worktrees**, so a linked worktree lists the whole repo's
+/// stashes — that's git's own model, not an approximation.
+pub fn list_stashes(workdir: &Path) -> Vec<StashRow> {
+    let Ok(mut repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(usize, String, String)> = Vec::new();
+    // The callback can't borrow `repo` (it's held mutably), so commit times are looked up after.
+    let _ = repo.stash_foreach(|index, message, oid| {
+        rows.push((index, oid.to_string(), message.to_string()));
+        true
+    });
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .map(|(index, oid, message)| {
+            let timestamp = git2::Oid::from_str(&oid)
+                .ok()
+                .and_then(|o| repo.find_commit(o).ok())
+                .map(|c| c.time().seconds())
+                .unwrap_or(0);
+            StashRow {
+                index,
+                oid,
+                message,
+                timestamp,
+            }
+        })
+        .collect()
+}
+
+/// The current `stash@{n}` position of the entry with this hash, or `None` if it's gone.
+///
+/// Every stash mutation re-resolves this immediately before shelling out: the CLI addresses stashes
+/// by position, positions shift as entries are dropped, and a stale one would act on the *wrong*
+/// stash rather than failing — the one outcome worth engineering against here.
+pub fn stash_index_of(workdir: &Path, oid: &str) -> Option<usize> {
+    list_stashes(workdir)
+        .into_iter()
+        .find(|s| s.oid == oid)
+        .map(|s| s.index)
+}
+
 /// One row of the log picker: a commit reduced to what the list renders and matches on.
 pub struct LogCommit {
     pub hash: String,

@@ -473,6 +473,15 @@ pub struct GitCommitCandidate {
     pub haystack: String,
 }
 
+/// One stash-picker candidate: an entry of `refs/stash`, plus the repo it came from. The message
+/// is the whole match target — a stash has no other prose, and its hash is not something anyone
+/// types.
+#[derive(Debug, Clone)]
+pub struct GitStashCandidate {
+    pub repo_id: String,
+    pub row: crate::git::StashRow,
+}
+
 /// Shortest query treated as a hash abbreviation — git's own floor for an abbreviated object name.
 /// Below it, a hex-looking query is far more likely to be prose ("add", "fed") than an id.
 pub const HASH_PREFIX_MIN: usize = 4;
@@ -616,6 +625,9 @@ pub enum PickerCandidates {
     /// (see [`GitCommitCandidate`]). Preserved across scroll/resume re-views like the other
     /// snapshot kinds: re-walking per page would be wasteful and could shuffle rows mid-scroll.
     GitLog(Vec<GitCommitCandidate>),
+    /// One repo's stash entries, newest first. Rebuilt on every fresh open and after any stash
+    /// mutation — like [`Self::GitBranches`], a stale list here would offer entries that are gone.
+    GitStash(Vec<GitStashCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -647,6 +659,7 @@ impl PickerCandidates {
             PickerCandidates::Jumplist(v) => v.len(),
             PickerCandidates::GitBranches(v) => v.len(),
             PickerCandidates::GitLog(v) => v.len(),
+            PickerCandidates::GitStash(v) => v.len(),
         }
     }
 
@@ -674,6 +687,7 @@ impl PickerCandidates {
             PickerCandidates::Jumplist(v) => v.clear(),
             PickerCandidates::GitBranches(v) => v.clear(),
             PickerCandidates::GitLog(v) => v.clear(),
+            PickerCandidates::GitStash(v) => v.clear(),
         }
     }
 
@@ -697,6 +711,7 @@ impl PickerCandidates {
             // Serves the file-locked `GitLogFile` too, exactly as `GitChanges` serves
             // `GitChangesFile`: same rows, different scope and its own state slot.
             PickerCandidates::GitLog(_) => PickerKind::GitLog,
+            PickerCandidates::GitStash(_) => PickerKind::GitStash,
         }
     }
 
@@ -724,6 +739,7 @@ impl PickerCandidates {
             PickerCandidates::Jumplist(v) => &v[idx].display,
             PickerCandidates::GitBranches(v) => &v[idx].row.name,
             PickerCandidates::GitLog(v) => &v[idx].haystack,
+            PickerCandidates::GitStash(v) => &v[idx].row.message,
         }
     }
 
@@ -905,6 +921,17 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::GitStash(v) => {
+                let c = &v[idx];
+                PickerItem::GitStash {
+                    repo_id: c.repo_id.clone(),
+                    index: c.row.index as u32,
+                    oid: c.row.oid.clone(),
+                    message: c.row.message.clone(),
+                    timestamp: c.row.timestamp,
+                    match_indices,
+                }
+            }
             PickerCandidates::GitLog(v) => {
                 let c = &v[idx];
                 PickerItem::GitCommit {
@@ -1045,6 +1072,10 @@ impl PickerCandidates {
             (PickerCandidates::GitLog(v), PickerItem::GitCommit { hash, .. }) => {
                 v.iter().position(|c| c.hash == *hash)
             }
+            // Likewise a stash, whose `index` shifts but whose hash doesn't.
+            (PickerCandidates::GitStash(v), PickerItem::GitStash { oid, .. }) => {
+                v.iter().position(|c| c.row.oid == *oid)
+            }
             _ => None,
         }
     }
@@ -1068,7 +1099,8 @@ impl PickerCandidates {
             | PickerCandidates::Keybindings(_)
             | PickerCandidates::Jumplist(_)
             | PickerCandidates::GitBranches(_)
-            | PickerCandidates::GitLog(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::GitLog(_)
+            | PickerCandidates::GitStash(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1189,6 +1221,8 @@ impl PickerCandidates {
             // Nor is a commit: Enter opens it as a read-only virtual buffer via `git/show`, which
             // the client fires against the highlighted row.
             PickerCandidates::GitLog(_) => None,
+            // A stash is the same: preview via `git/show`, mutate via the `git/stash_*` chords.
+            PickerCandidates::GitStash(_) => None,
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker
@@ -1791,6 +1825,7 @@ impl PickerState {
                         | PickerCandidates::Keybindings(_)
                         | PickerCandidates::Jumplist(_)
                         | PickerCandidates::GitLog(_)
+                        | PickerCandidates::GitStash(_)
                 ) {
                     // Grouped kinds: keep matches in document (candidate) order, not score order,
                     // so each group's rows stay a contiguous run the client can put a single
