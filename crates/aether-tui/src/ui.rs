@@ -6669,6 +6669,18 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let Some(status) = ed.git_status.as_ref() else {
         return parts;
     };
+    // An operation in flight takes the branch's place in the cluster: while a push is running,
+    // "Pushing… Writing objects: 47%" is the only thing about git worth the width, and the branch
+    // it's pushing hasn't changed. Reads from the session, not the buffer, because the operation
+    // belongs to the repo rather than to whatever file happens to be open.
+    if let Some(op) = state.git_operation.as_ref() {
+        let mut label = format!("⟳ {}", op.kind.label());
+        if !op.detail.is_empty() {
+            label.push_str(&format!("  {}", op.detail));
+        }
+        parts.push(Span::styled(label, meta));
+        return parts;
+    }
     if let Some(branch) = &status.branch {
         let mut label = format!("⎇  {branch}");
         // Upstream divergence rides the branch label in the same colour: it annotates the branch
@@ -7540,6 +7552,7 @@ mod tests {
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             tether: None,
+            git_operation: None,
             viewport_cols: TEST_COLS as u32,
             viewport_rows: TEST_ROWS as u32,
             should_quit: false,

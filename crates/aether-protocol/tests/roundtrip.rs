@@ -2385,6 +2385,71 @@ fn git_checkout_shape() {
 }
 
 #[test]
+fn git_fetch_and_push_shapes() {
+    use aether_protocol::git::{
+        GitFetch, GitFetchResult, GitFetchStatus, GitPush, GitPushResult, GitPushStatus,
+        GitUpstreamStatus,
+    };
+    assert_eq!(GitFetch::NAME, "git/fetch");
+    assert_eq!(GitPush::NAME, "git/push");
+
+    // A no-remote answer is decided without running git, so it carries neither a message nor a
+    // divergence — the empty fields stay off the wire.
+    let v = to_value(GitFetchResult {
+        status: GitFetchStatus::NoRemote,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "status": "no_remote" }));
+
+    // A first push reports the tracking it established. `set_upstream` is a bool that only appears
+    // when true, so an ordinary push doesn't carry it.
+    let first = GitPushResult {
+        status: GitPushStatus::Pushed,
+        message: String::new(),
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 0,
+            behind: 0,
+        }),
+        set_upstream: true,
+    };
+    let v = to_value(&first).unwrap();
+    assert_eq!(v["status"], "pushed");
+    assert_eq!(v["set_upstream"], json!(true));
+    assert_eq!(v["upstream"]["name"], "origin/main");
+    assert_eq!(from_value::<GitPushResult>(v).unwrap(), first);
+
+    // A `Behind` refusal keeps *both*: our classification and git's own words. Dropping either
+    // would cost the client something — the verb to suggest, or the detail behind it.
+    let behind = GitPushResult {
+        status: GitPushStatus::Behind,
+        message: "hint: Updates were rejected".into(),
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 1,
+            behind: 3,
+        }),
+        set_upstream: false,
+    };
+    let v = to_value(&behind).unwrap();
+    assert_eq!(v["status"], "behind");
+    assert_eq!(v["upstream"]["behind"], json!(3));
+    assert!(v.get("set_upstream").is_none(), "false stays off the wire");
+    assert_eq!(from_value::<GitPushResult>(v).unwrap(), behind);
+
+    for (s, wire) in [
+        (GitPushStatus::NothingToPush, "nothing_to_push"),
+        (GitPushStatus::DetachedHead, "detached_head"),
+        (GitPushStatus::AmbiguousRemote, "ambiguous_remote"),
+        (GitPushStatus::NoRemote, "no_remote"),
+        (GitPushStatus::Refused, "refused"),
+    ] {
+        assert_eq!(to_value(s).unwrap(), json!(wire));
+    }
+}
+
+#[test]
 fn git_delete_branch_shape() {
     use aether_protocol::git::{
         GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,

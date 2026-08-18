@@ -19,17 +19,19 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCheckout,
-    GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
-    GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitFetch, GitFetchParams, GitFetchResult, GitFetchStatus, GitHead,
-    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams, GitRefreshResult,
-    GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams, GitResetResult,
-    GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
-    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams,
-    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
-    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
+    GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCancel,
+    GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
+    GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
+    GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
+    GitFetchResult, GitFetchStatus, GitHead, GitNavigateHunk, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitOperationChanged, GitOperationKind, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitPush, GitPushParams, GitPushResult,
+    GitPushStatus, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepos, GitReposParams,
+    GitReposResult, GitReset, GitResetParams, GitResetResult, GitSetBaseline, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, GitShow, GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop,
+    GitStashDropParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
+    HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -34168,6 +34170,53 @@ async fn send_request_expect_error<M: RpcMethod>(
     }
 }
 
+/// A bare `origin` plus a working repo `ours` with one commit and `origin` configured — but
+/// **nothing pushed yet**, so the branch has no upstream. That's the starting state for the first
+/// push; tests that want a tracking branch push once themselves.
+///
+/// A `file://` remote is what makes any of this testable in CI: a real `git push`/`git fetch` over
+/// the real CLI, with no network and no credentials.
+///
+/// Returns the tempdir guard first — dropping it deletes everything, so it has to outlive the test.
+fn repo_with_origin() -> (
+    tempfile::TempDir,
+    std::path::PathBuf, // base
+    std::path::PathBuf, // ours
+    String,             // origin url
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+
+    let origin = base.join("origin.git");
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.bare(true).initial_head("main");
+    git2::Repository::init_opts(&origin, &opts).unwrap();
+
+    let ours = base.join("ours");
+    std::fs::create_dir(&ours).unwrap();
+    let repo = init_repo_at(&ours);
+    isolate_repo_config(&repo, &ours.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+    let origin_url = origin.to_string_lossy().to_string();
+    run_git(&ours, &["remote", "add", "origin", &origin_url]);
+
+    (dir, base, ours, origin_url)
+}
+
+/// Clone `origin` into `<base>/theirs`, commit, and push — a second working copy standing in for
+/// someone else. The commit travels through the remote rather than being fabricated in our own
+/// object store, which is what keeps the divergence assertions honest.
+fn someone_else_pushes(base: &std::path::Path, origin_url: &str, file: &str) {
+    let theirs = base.join("theirs");
+    if !theirs.exists() {
+        run_git(base, &["clone", origin_url, "theirs"]);
+    }
+    std::fs::write(theirs.join(file), "two\n").unwrap();
+    run_git(&theirs, &["add", file]);
+    run_git(&theirs, &["commit", "-m", "their work"]);
+    run_git(&theirs, &["push", "origin", "main"]);
+}
+
 /// Open `rel` and return the git status riding its first window.
 async fn git_status_of(
     ws: &mut tokio_tungstenite::WebSocketStream<
@@ -34304,22 +34353,7 @@ async fn git_fetch_updates_the_divergence_counts() {
     // End-to-end over a `file://` remote: a real `git fetch`, no network. The point is that the
     // count a *buffer* reports changes as a result — the fetch has to refresh the open buffers'
     // baselines, or the status bar keeps showing the world as it was before.
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().canonicalize().unwrap();
-
-    // A bare origin, and a clone of it that will do the pushing.
-    let origin = base.join("origin.git");
-    let mut opts = git2::RepositoryInitOptions::new();
-    opts.bare(true).initial_head("main");
-    git2::Repository::init_opts(&origin, &opts).unwrap();
-
-    let ours = base.join("ours");
-    std::fs::create_dir(&ours).unwrap();
-    let repo = init_repo_at(&ours);
-    isolate_repo_config(&repo, &ours.join(".git/test-hooks"));
-    commit_file(&repo, "a.rs", "one\n");
-    let origin_url = origin.to_string_lossy().to_string();
-    run_git(&ours, &["remote", "add", "origin", &origin_url]);
+    let (_dir, base, ours, origin_url) = repo_with_origin();
     run_git(&ours, &["push", "-u", "origin", "main"]);
 
     let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
@@ -34329,14 +34363,7 @@ async fn git_fetch_updates_the_divergence_counts() {
         "fixture starts in sync"
     );
 
-    // Someone else pushes. Cloning into a second working copy keeps this honest — the commit
-    // travels through the remote rather than being fabricated in our own object store.
-    let theirs = base.join("theirs");
-    run_git(&base, &["clone", &origin_url, "theirs"]);
-    std::fs::write(theirs.join("b.rs"), "two\n").unwrap();
-    run_git(&theirs, &["add", "b.rs"]);
-    run_git(&theirs, &["commit", "-m", "their work"]);
-    run_git(&theirs, &["push", "origin", "main"]);
+    someone_else_pushes(&base, &origin_url, "b.rs");
 
     // Nothing has told us yet: the counts are local refs, so they still read as level.
     let stale = git_status_of(&mut ws, "a.rs").await;
@@ -34403,6 +34430,291 @@ async fn git_fetch_refuses_a_repo_the_workspace_cannot_reach() {
         serde_json::json!(-32040),
         "expected REPO_NOT_FOUND — refused before any network access, got {err}"
     );
+
+    drop(server);
+}
+
+// -------- git/push ---------------------------------------------------------------------------------
+
+async fn push(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    repo: &std::path::Path,
+) -> GitPushResult {
+    send_request::<GitPush>(
+        ws,
+        id,
+        &GitPushParams {
+            repo_id: Some(repo.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn git_push_publishes_a_new_branch_and_starts_tracking_it() {
+    // The first push is the one that matters most for the status bar: a branch with no upstream has
+    // nothing to be ahead *of*, so it reports no divergence at all until `--set-upstream` runs.
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+
+    let before = git_status_of(&mut ws, "a.rs").await;
+    assert!(
+        before.upstream.is_none(),
+        "fixture starts with no upstream, got {:?}",
+        before.upstream
+    );
+
+    let res = push(&mut ws, 2, &ours).await;
+    assert_eq!(
+        res.status,
+        GitPushStatus::Pushed,
+        "push failed: {}",
+        res.message
+    );
+    assert!(res.set_upstream, "a never-pushed branch is pushed with -u");
+    assert_eq!(
+        res.upstream.as_ref().map(|u| u.name.as_str()),
+        Some("origin/main")
+    );
+
+    // And the counts start working from here — which is the whole reason `-u` is automatic.
+    let after = git_status_of(&mut ws, "a.rs").await;
+    assert!(after.upstream.expect("now tracking").is_level());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_clears_the_ahead_count() {
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    let repo = git2::Repository::open(&ours).unwrap();
+    commit_file(&repo, "b.rs", "two\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let before = git_status_of(&mut ws, "a.rs").await;
+    assert_eq!(before.upstream.expect("tracking").ahead, 1);
+
+    let res = push(&mut ws, 2, &ours).await;
+    assert_eq!(
+        res.status,
+        GitPushStatus::Pushed,
+        "push failed: {}",
+        res.message
+    );
+    assert!(!res.set_upstream, "already tracking — no -u this time");
+    assert!(res.upstream.expect("reports the new state").is_level());
+
+    // The open buffer's own status agrees: a push moves the remote-tracking ref, so the baselines
+    // have to be re-read or the status bar keeps claiming there's something to push.
+    let after = git_status_of(&mut ws, "a.rs").await;
+    assert!(after.upstream.expect("tracking").is_level());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_with_nothing_to_push_says_so_without_running_git() {
+    // Asked, not parsed — the same discipline as the stash's "nothing to stash". Reporting a push
+    // that pushed nothing is a small lie, and this saves a pointless round trip to the remote.
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let res = push(&mut ws, 2, &ours).await;
+    assert_eq!(res.status, GitPushStatus::NothingToPush);
+    assert!(res.message.is_empty(), "nothing ran, so nothing to quote");
+    assert!(
+        res.upstream
+            .expect("still reports where we stand")
+            .is_level(),
+        "a no-op push still says what it compared against"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_rejected_for_being_behind_is_named_as_such() {
+    // The fast-forward rule. git does the refusing — this asserts we then classify it from our own
+    // graph read rather than from its wording, which is what lets the client say "1 behind" and a
+    // verb instead of relaying several lines of hint text.
+    let (_dir, base, ours, origin_url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    someone_else_pushes(&base, &origin_url, "b.rs");
+
+    // Our own commit on top of the old tip, and a fetch so we know we're behind.
+    let repo = git2::Repository::open(&ours).unwrap();
+    commit_file(&repo, "c.rs", "three\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let fetched: GitFetchResult = send_request::<GitFetch>(
+        &mut ws,
+        2,
+        &GitFetchParams {
+            repo_id: Some(ours.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(fetched.status, GitFetchStatus::Fetched);
+    let up = fetched.upstream.expect("tracking");
+    assert_eq!((up.ahead, up.behind), (1, 1), "diverged both ways");
+
+    let res = push(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPushStatus::Behind);
+    assert_eq!(res.upstream.expect("carries the gap").behind, 1);
+    // git's own text is kept even when we classified the failure — it's the detail if the toast
+    // isn't enough.
+    assert!(
+        !res.message.is_empty(),
+        "git's stderr survives classification"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_without_a_remote_is_refused_before_spawning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res = push(&mut ws, 2, &root).await;
+    assert_eq!(res.status, GitPushStatus::NoRemote);
+    assert!(res.message.is_empty());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_from_a_detached_head_is_refused() {
+    // No branch means no refspec. Answered from libgit2 rather than let git fail, because "not on
+    // a branch" is a state the user can act on and git's phrasing buries it.
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    let repo = git2::Repository::open(&ours).unwrap();
+    commit_file(&repo, "b.rs", "two\n");
+    run_git(&ours, &["checkout", "--detach", "HEAD~1"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let res = push(&mut ws, 2, &ours).await;
+    assert_eq!(res.status, GitPushStatus::DetachedHead);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_push_with_several_remotes_and_no_upstream_refuses_to_choose() {
+    // Publishing a branch to the wrong remote in a fork workflow puts work somewhere it wasn't
+    // meant to go, so this is the one place a lone-candidate default isn't good enough.
+    let (_dir, base, ours, origin_url) = repo_with_origin();
+    let fork = base.join("fork.git");
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.bare(true).initial_head("main");
+    git2::Repository::init_opts(&fork, &opts).unwrap();
+    run_git(&ours, &["remote", "add", "fork", &fork.to_string_lossy()]);
+    assert!(!origin_url.is_empty());
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let res = push(&mut ws, 2, &ours).await;
+    assert_eq!(res.status, GitPushStatus::AmbiguousRemote);
+
+    drop(server);
+}
+
+/// A user-initiated network operation announces itself, so the status bar can say something is
+/// happening rather than freezing silently for the length of a transfer.
+#[tokio::test]
+async fn a_user_fetch_announces_itself_and_then_clears() {
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+
+    // Send by hand rather than through `send_request`, which drains notifications on its way to
+    // the response — and the notifications are the thing under test here.
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 2,
+        method: GitFetch::NAME.into(),
+        params: Some(
+            serde_json::to_value(GitFetchParams {
+                repo_id: Some(ours.to_string_lossy().into()),
+                buffer_id: None,
+            })
+            .unwrap(),
+        ),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+
+    let started = expect_notification::<GitOperationChanged>(&mut ws).await;
+    let op = started.operation.expect("an operation is in flight");
+    assert_eq!(op.kind, GitOperationKind::Fetch);
+    assert_eq!(started.repo_id, ours.to_string_lossy());
+
+    // ...and it clears, or the indicator would stick forever after a fetch that worked.
+    let finished = expect_notification::<GitOperationChanged>(&mut ws).await;
+    assert!(
+        finished.operation.is_none(),
+        "the last push clears the indicator, got {:?}",
+        finished.operation
+    );
+
+    drop(server);
+}
+
+/// The background fetcher says nothing. A spinner every quarter of an hour is the interruption the
+/// whole feature exists to avoid — and there is nobody waiting on it to offer a cancel to.
+#[tokio::test]
+async fn the_background_fetch_stays_silent() {
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    // Drive the same path the scheduler drives, bypassing the RPC.
+    aether_server::fetch_repo_for_test(&server.state, ours.clone())
+        .await
+        .expect("fetch ran");
+
+    // Nothing should be queued for this client. A short read that times out is the assertion.
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        expect_notification::<GitOperationChanged>(&mut ws),
+    )
+    .await;
+    assert!(
+        quiet.is_err(),
+        "the background path must not announce an operation"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_cancel_with_nothing_running_is_not_an_error() {
+    // The race the client has to tolerate: the operation finished between the keystroke and this
+    // arriving. Reporting it as a failure would put an error toast on a push that worked.
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+
+    let res: GitCancelResult = send_request::<GitCancel>(
+        &mut ws,
+        2,
+        &GitCancelParams {
+            repo_id: ours.to_string_lossy().into(),
+        },
+    )
+    .await;
+    assert!(!res.cancelled);
 
     drop(server);
 }

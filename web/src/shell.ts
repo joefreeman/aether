@@ -35,6 +35,7 @@ import type {
   BufferWindow,
   CursorState,
   DiagnosticCounts,
+  GitOperation,
   GroupHeader,
   GroupSpan,
   LogicalPosition,
@@ -483,6 +484,8 @@ interface CoreView {
   workspace_paths: string[];
   externally_modified: boolean;
   externally_deleted: boolean;
+  /** The long-running git operation in flight, or null. Only user-initiated ones appear. */
+  git_operation: GitOperation | null;
   diagnostics: DiagnosticCounts;
   lsp: LspServerStatus | null;
   search: SearchView;
@@ -4695,8 +4698,19 @@ export class Shell {
     used += [...name.textContent].length;
     fileGroup.append(name);
     left.append(fileGroup);
+    // An operation in flight replaces the whole git group: while a push runs, its progress is the
+    // only thing about git worth the width, and the branch hasn't moved.
+    const op = v.git_operation;
+    if (op) {
+      const el = document.createElement("span");
+      el.className = "status-git git-branch";
+      const label = op.kind === "push" ? "Pushing" : "Fetching";
+      el.textContent = op.detail ? `⟳ ${label}  ${op.detail}` : `⟳ ${label}`;
+      used += [...el.textContent].length + DIVIDER_COLS;
+      left.append(sectionDivider(), el);
+    }
     // Git group: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
-    const gs = v.window?.git_status;
+    const gs = op ? undefined : v.window?.git_status;
     if (gs) {
       const gitGroup = document.createElement("span");
       gitGroup.className = "status-git-group";

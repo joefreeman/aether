@@ -317,7 +317,7 @@ async fn git_fetch_loop(state: SharedState) {
                 continue;
             }
             let workdir = PathBuf::from(&repo.repo_id);
-            let outcome = crate::handlers::fetch_repo(&state, workdir).await;
+            let outcome = crate::handlers::fetch_repo(&state, workdir, false).await;
             let entry = schedule.entry(key).or_insert(RepoFetchState {
                 next: Instant::now(),
                 failures: 0,
@@ -342,6 +342,14 @@ async fn git_fetch_loop(state: SharedState) {
                             "background fetch refused: {}",
                             result.message.trim()
                         );
+                        entry.next = Instant::now() + auto_fetch_backoff(interval, entry.failures);
+                    }
+                    // Unreachable: the background path passes `announce: false`, so it registers
+                    // no cancel handle and `git/cancel` can't find it. Backed off as a failure
+                    // rather than ignored, so a future caller that *can* be cancelled doesn't get
+                    // retried a minute later.
+                    GitFetchStatus::Cancelled => {
+                        entry.failures = entry.failures.saturating_add(1);
                         entry.next = Instant::now() + auto_fetch_backoff(interval, entry.failures);
                     }
                 },

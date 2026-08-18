@@ -49,6 +49,9 @@ pub fn build_view(s: &Session) -> Value {
         "lsp": s.lsp.as_ref().map(jv),
         "externally_modified": s.externally_modified,
         "externally_deleted": s.externally_deleted,
+        // The long-running git operation in flight, if any. The repo id it also carries stays in
+        // the core — the shell only paints the indicator; `Space g x` is dispatched core-side.
+        "git_operation": s.git_operation.as_ref().map(|(_, op)| jv(op)),
         // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
         // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
         "blame": s.blame.as_ref().map(|(line, b)| json!({

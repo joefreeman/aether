@@ -1809,6 +1809,7 @@ impl Shell {
         let st = &mut self.state;
         st.workspace_name = s.workspace.clone();
         st.tether = s.tether;
+        st.git_operation = s.git_operation.as_ref().map(|(_, op)| op.clone());
         if st.workspace_paths != s.workspace_paths {
             st.workspace_paths = s.workspace_paths.clone();
             st.root_labels = labels::root_labels(&st.workspace_paths);
@@ -3094,6 +3095,7 @@ fn make_state(
         workspace_paths,
         root_labels,
         tether: None,
+        git_operation: None,
         viewport_cols: cols as u32,
         viewport_rows: (rows as u32).saturating_sub(1),
         should_quit: false,

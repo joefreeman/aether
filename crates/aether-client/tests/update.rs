@@ -5225,6 +5225,118 @@ fn a_finished_fetch_reports_what_it_found() {
 }
 
 #[test]
+fn space_g_p_pushes() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = key(&mut s, 'p');
+    let req = find_request(&fx, "git/push").expect("git/push fired");
+    assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
+    assert!(req.get("buffer_id").is_some());
+}
+
+/// `Esc` on the git sub-leader backs out — it must never be a verb.
+///
+/// The sub-leader cancels on any *unbound* second key, so binding `Esc` to something would silently
+/// make it the one key on `Space g` that acts instead of escaping. Cancelling an operation lives on
+/// `x` for exactly this reason, and this pins both halves.
+#[test]
+fn esc_cancels_the_git_leader_rather_than_acting() {
+    use aether_client::session::Pending;
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    assert!(matches!(s.pending, Pending::LeaderGit));
+
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "git/cancel").is_none(),
+        "Esc must not dispatch a git verb"
+    );
+    assert!(
+        matches!(s.pending, Pending::None),
+        "Esc backs out of the sub-leader"
+    );
+
+    // And the verb itself is on `x`. With nothing in flight it sends nothing, which is the
+    // no-op case rather than an error.
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = key(&mut s, 'x');
+    assert!(find_request(&fx, "git/cancel").is_none());
+    assert!(matches!(s.pending, Pending::None), "the chord completed");
+}
+
+/// The push outcomes that carry a next step say what it is. A `Behind` refusal in particular is
+/// the reason that status exists — git's own text here is several lines of hint, and what the user
+/// needs is the number and the verb.
+#[test]
+fn push_outcomes_name_their_next_step() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitPushResult, GitPushStatus, GitUpstreamStatus};
+
+    let mut s = session();
+    let origin = || {
+        Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 0,
+            behind: 0,
+        })
+    };
+
+    // A first push names the tracking it just established — the moment the arrows start working.
+    let fx = s.on_event(Event::PushDone(Ok(GitPushResult {
+        status: GitPushStatus::Pushed,
+        message: String::new(),
+        upstream: origin(),
+        set_upstream: true,
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("tracking") && msg.contains("origin/main"),
+        "first push should say it set up tracking, got {msg:?}"
+    );
+
+    // An ordinary push just says where the commits went.
+    let fx = s.on_event(Event::PushDone(Ok(GitPushResult {
+        status: GitPushStatus::Pushed,
+        message: String::new(),
+        upstream: origin(),
+        set_upstream: false,
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(msg.contains("origin/main") && !msg.contains("tracking"));
+
+    // Behind: the count and the verb, not git's hint block.
+    let fx = s.on_event(Event::PushDone(Ok(GitPushResult {
+        status: GitPushStatus::Behind,
+        message: "hint: Updates were rejected because...".into(),
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 1,
+            behind: 3,
+        }),
+        set_upstream: false,
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains('3') && msg.contains("fetch"),
+        "behind should name the gap and the next step, got {msg:?}"
+    );
+    assert!(!has_error_toast(&fx), "this is actionable, not an error");
+
+    // Anything git refused for a reason we didn't classify keeps its own words.
+    let fx = s.on_event(Event::PushDone(Ok(GitPushResult {
+        status: GitPushStatus::Refused,
+        message: "remote: protected branch".into(),
+        upstream: None,
+        set_upstream: false,
+    })));
+    assert!(has_error_toast(&fx));
+    assert!(toast_messages(&fx).join(" ").contains("protected branch"));
+}
+
+#[test]
 fn space_k_toggles_keep_and_guards_unsaved() {
     let mut s = session();
 

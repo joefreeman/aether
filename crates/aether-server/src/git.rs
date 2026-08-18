@@ -602,10 +602,28 @@ pub fn branch_is_merged(workdir: &Path, branch: &str) -> bool {
 /// has to be distinguishable from a network blip that will. `false` when the repo can't be opened,
 /// which folds an unreadable repo into "nothing to fetch" rather than an error.
 pub fn has_remote(workdir: &Path) -> bool {
-    git2::Repository::open(workdir)
-        .ok()
-        .and_then(|repo| repo.remotes().ok().map(|r| !r.is_empty()))
-        .unwrap_or(false)
+    !remote_names(workdir).is_empty()
+}
+
+/// The repo's configured remote names, in libgit2's order.
+///
+/// `git/push` needs the *list*, not just "is there one": a branch with no upstream can be published
+/// to a lone remote without asking, but with several the choice is the user's — pushing to the
+/// wrong one in a fork workflow publishes work where it wasn't meant to go.
+pub fn remote_names(workdir: &Path) -> Vec<String> {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let Ok(remotes) = repo.remotes() else {
+        return Vec::new();
+    };
+    // `StringArray` yields `Result<Option<&str>, _>` per entry — a name that isn't valid UTF-8
+    // reads as `Ok(None)`. Both empty cases are simply skipped: a remote we can't name is one we
+    // can't push to either.
+    remotes
+        .iter()
+        .filter_map(|entry| entry.ok().flatten().map(String::from))
+        .collect()
 }
 
 /// [`upstream_divergence`] for a repo rather than a buffer — what `git/fetch` reports back once

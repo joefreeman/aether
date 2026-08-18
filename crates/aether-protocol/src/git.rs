@@ -708,6 +708,167 @@ pub enum GitFetchStatus {
     /// deliberately one variant, because the client's response to each is the same (show git's own
     /// words) and telling them apart would mean parsing them.
     Refused,
+    /// The user stopped it ([`GitCancel`]). Distinguished from a failure because it isn't one, and
+    /// git's stderr on a killed process reads like a crash.
+    Cancelled,
+}
+
+// ---- git/push ------------------------------------------------------------------------------------
+
+/// Publish the current branch's commits to its remote — the other half of the `↑ahead` count.
+///
+/// Like [`GitFetch`] and unlike checkout or stash, this never touches the working tree, so it needs
+/// no unsaved-work pre-flight. It *does* move `refs/remotes/**` on success, which is what makes the
+/// arrows drop back to level without a fetch.
+///
+/// **A never-pushed branch is pushed with `--set-upstream`**, so the divergence counts start
+/// working from then on. That's not a convenience: a branch with no upstream has nothing to be
+/// ahead *of*, so until it has one the status bar can't say anything about it at all.
+///
+/// Never force-pushes. There is no parameter for it and the keymap deliberately leaves `Alt-p`
+/// free rather than making it the force variant.
+pub struct GitPush;
+impl RpcMethod for GitPush {
+    const NAME: &'static str = "git/push";
+    type Params = GitPushParams;
+    type Result = GitPushResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitPushParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPushResult {
+    pub status: GitPushStatus,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Divergence as it stands *after* the attempt — level after a successful push, and still
+    /// showing the gap after a [`GitPushStatus::Behind`] refusal, which is what lets the client
+    /// say how far behind without asking again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<GitUpstreamStatus>,
+    /// True when this push established the tracking relationship (`--set-upstream`). Reported
+    /// rather than inferred: it's a one-time event worth naming in the toast, and the client can't
+    /// reliably know the branch had no upstream a moment ago.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub set_upstream: bool,
+}
+
+/// How a [`GitPush`] resolved. Every discriminated variant comes from the server's own libgit2
+/// reads — including [`Self::Behind`], which is the interesting one: see its note.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPushStatus {
+    #[default]
+    Pushed,
+    /// The branch has an upstream and is level with it. Asked before spawning, like the stash's
+    /// "nothing to stash" — reporting a push that pushed nothing is a small lie, and this saves a
+    /// pointless round trip to the remote.
+    NothingToPush,
+    /// The push was rejected because the branch is behind its upstream — the fast-forward rule.
+    ///
+    /// **Classified after the fact, not pre-flighted.** Refusing before spawning would look
+    /// cheaper, but the behind count comes from *local* refs, so a stale one would refuse a push
+    /// that git would have accepted (the remote was reset since the last fetch). Letting git decide
+    /// and then asking libgit2 *why* keeps the good message without inventing a refusal: git really
+    /// did say no, and the reason is still our own read rather than a parse of its wording.
+    Behind,
+    /// HEAD is detached, so there is no branch to push.
+    DetachedHead,
+    /// The repo has no remote configured.
+    NoRemote,
+    /// The branch has no upstream and the repo has several remotes, so which one to publish to is
+    /// a choice, not a default. Refused rather than guessed: pushing a branch to the wrong remote
+    /// in a fork workflow means publishing work somewhere it wasn't meant to go.
+    AmbiguousRemote,
+    /// Git refused for some other reason; `message` is its stderr. Authentication, a pre-receive
+    /// hook, a protected branch — all one variant, because the client's response to each is the
+    /// same (show git's own words) and telling them apart would mean parsing them.
+    Refused,
+    /// The user stopped it ([`GitCancel`]). Distinguished from a failure because it isn't one, and
+    /// git's stderr on a killed process reads like a crash.
+    Cancelled,
+}
+
+// ---- long-running operations ---------------------------------------------------------------------
+
+/// What long-running git operation a repo is currently running, if any.
+///
+/// Only **user-initiated** operations are announced. The periodic fetcher deliberately says nothing
+/// — a spinner appearing every quarter of an hour is the interruption a background refresh exists
+/// to avoid, and there is nobody waiting on it to inform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitOperation {
+    pub kind: GitOperationKind,
+    /// git's most recent progress line, verbatim (`Writing objects:  47% (8/17)`), or empty before
+    /// it has said anything. Passed through rather than parsed into a percentage: git's phrasing
+    /// already names the phase, and the phases differ per operation and version.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitOperationKind {
+    Fetch,
+    Push,
+}
+
+impl GitOperationKind {
+    /// Present-continuous label for the status bar — "Fetching", "Pushing".
+    pub fn label(self) -> &'static str {
+        match self {
+            GitOperationKind::Fetch => "Fetching",
+            GitOperationKind::Push => "Pushing",
+        }
+    }
+}
+
+/// Pushed to every client when a repo starts, advances through, or finishes a long-running git
+/// operation. `operation: None` means it has finished — the client clears its indicator without
+/// needing to know how it ended, which it learns from the RPC result it is already waiting on.
+pub struct GitOperationChanged;
+impl NotificationMethod for GitOperationChanged {
+    const NAME: &'static str = "git/operation_changed";
+    type Params = GitOperationChangedParams;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitOperationChangedParams {
+    pub repo_id: RepoId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitOperation>,
+}
+
+/// Stop the long-running git operation running in `repo_id`.
+///
+/// The reason this exists at all: a push to an unreachable host sits in a TCP connect timeout for
+/// minutes, and without this the only way out is to quit the editor. Killing git mid-transfer is
+/// safe — a partial push is simply not applied, and a partial fetch leaves unreferenced objects
+/// that git's own gc collects.
+pub struct GitCancel;
+impl RpcMethod for GitCancel {
+    const NAME: &'static str = "git/cancel";
+    type Params = GitCancelParams;
+    type Result = GitCancelResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitCancelParams {
+    pub repo_id: RepoId,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCancelResult {
+    /// False when nothing was running — the operation finished between the keystroke and this
+    /// arriving, which is a race the client should treat as success rather than an error.
+    pub cancelled: bool,
 }
 
 // ---- git/set_baseline ---------------------------------------------------------------------------

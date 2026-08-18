@@ -160,6 +160,16 @@ export interface GitUpstreamStatus {
   behind: number;
 }
 
+/**
+ * A long-running git operation in flight (`git/operation_changed`). Only user-initiated ones are
+ * announced — the periodic background fetch stays silent.
+ */
+export interface GitOperation {
+  kind: "fetch" | "push";
+  /** git's latest progress line, verbatim. */
+  detail?: string;
+}
+
 /** Buffer-level Git status: branch + staged (HEAD→index) and unstaged (index→buffer) counts. */
 export interface GitBufferStatus {
   branch?: string | null;

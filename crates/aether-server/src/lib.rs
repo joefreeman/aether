@@ -47,6 +47,19 @@ pub use server::{
 };
 pub use status::{app_info, fetch_status};
 
+/// **Test seam.** Run one background fetch — the periodic fetcher's exact path — without waiting
+/// for its timer.
+///
+/// Exists because the background path's defining property is what it *doesn't* do: it announces no
+/// operation and registers no cancel handle, and no RPC reaches that variant to assert it. Returns
+/// `None` if the fetch couldn't be attempted at all.
+pub async fn fetch_repo_for_test(
+    state: &state::SharedState,
+    workdir: std::path::PathBuf,
+) -> Option<aether_protocol::git::GitFetchResult> {
+    handlers::fetch_repo(state, workdir, false).await.ok()
+}
+
 /// **Test view.** One language server's lifecycle state, flattened for integration assertions.
 ///
 /// Pinning isn't observable over the wire — the LSP picker shows a server's *status*, not whether

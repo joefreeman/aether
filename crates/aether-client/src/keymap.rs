@@ -447,8 +447,17 @@ pub enum Action {
     GitUncommit,
     /// `Space g f` — fetch from the remote, refreshing the ahead/behind counts in the status bar.
     /// Touches no file, so unlike the other git verbs it needs no unsaved-work pre-flight. The
-    /// periodic fetcher (the `git_fetch_minutes` app setting) runs the same operation on a timer.
+    /// periodic fetcher (the `git_auto_fetch` app setting) runs the same operation on a timer.
     GitFetch,
+    /// `Space g p` — publish the current branch's commits (`↑ahead`). Never force-pushes; `Alt-p`
+    /// is deliberately left unbound rather than made the force variant.
+    GitPush,
+    /// `Space g x` — stop the fetch or push in flight. A no-op when nothing is running.
+    ///
+    /// Deliberately **not** `Esc`: an unbound second key cancels the sub-leader, so binding `Esc`
+    /// to a verb would make it the one key on `Space g` that does something instead of backing
+    /// out. Escape belongs to the chord.
+    GitCancel,
     /// `Space g Alt-z` — shelve the working tree (`git stash push`), taking git's own
     /// `WIP on <branch>` message. The stash *picker* (`Space g z`) is where entries are previewed,
     /// applied, popped and dropped.
@@ -1277,6 +1286,8 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
+    bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPush, "Git", "Push commits to remote"),
+    bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch or push in progress"),
     bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),

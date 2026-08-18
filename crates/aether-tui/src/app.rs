@@ -165,6 +165,9 @@ pub struct AppState {
     /// The session's [tether](aether_client::session::Session::tether), mirrored each sync so the
     /// Buffers picker can mark the tethered row with the same dim ` *` as the status bar.
     pub tether: Option<BufferId>,
+    /// The long-running git operation in flight, mirrored from the session each sync. Session-level
+    /// rather than per-editor: it belongs to a repo, not to the buffer that happens to be open.
+    pub git_operation: Option<aether_protocol::git::GitOperation>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
@@ -977,6 +980,7 @@ mod tests {
             workspace_paths: Vec::new(),
             root_labels: Vec::new(),
             tether: None,
+            git_operation: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1011,6 +1015,7 @@ mod tests {
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             tether: None,
+            git_operation: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1048,6 +1053,7 @@ mod tests {
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             tether: None,
+            git_operation: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,

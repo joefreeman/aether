@@ -47,6 +47,13 @@ pub struct ServerState {
     /// Keyed by canonicalized workdir (a [`aether_protocol::git::RepoId`]); a path is suppressed
     /// if it sits under any entry. Held only for the duration of one operation.
     pub git_suppressed: std::collections::HashSet<PathBuf>,
+    /// Long-running git operations currently in flight, keyed by canonicalized workdir — at most
+    /// one per repo, since they all contend for the same refs anyway.
+    ///
+    /// Holds the cancel handle so `git/cancel` can reach a `git push` that is sitting in a TCP
+    /// timeout. Only **user-initiated** operations are registered: the periodic fetcher runs
+    /// unannounced and uncancellable, which is what keeps it out of the way.
+    pub git_operations: HashMap<PathBuf, crate::git_cli::CancelHandle>,
     /// Repos currently diffed against a revision other than HEAD (`git/set_baseline`), keyed by
     /// canonicalized workdir. In memory only: this is an inspection mode ("what have I changed
     /// since I branched?"), not a preference — coming back to a restored session still diffing
@@ -499,6 +506,7 @@ impl ServerState {
             workspaces: HashMap::new(),
             watcher: None,
             git_suppressed: std::collections::HashSet::new(),
+            git_operations: HashMap::new(),
             git_baseline_revs: crate::git::BaselineRevs::new(),
             buffers: HashMap::new(),
             documents: HashMap::new(),

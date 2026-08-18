@@ -4208,10 +4208,21 @@ impl App {
             left = left.push(t(" *".into(), p.fg_muted));
             used += 2;
         }
+        // An operation in flight replaces the whole git cluster: while a push runs, its progress
+        // is the only thing about git worth the width, and the branch hasn't moved.
+        if let Some((_, op)) = self.session.git_operation.as_ref() {
+            let mut seg = format!("⟳ {}", op.kind.label());
+            if !op.detail.is_empty() {
+                seg.push_str(&format!("  {}", op.detail));
+            }
+            left = left.push(section_divider(&self.ui(), p));
+            used += DIVIDER_COLS + seg.chars().count();
+            left = left.push(t(seg, p.accent_alt));
+        }
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero. Introduced, like every following
         // section, by a dim `·` divider.
-        if let Some(gs) = self
+        else if let Some(gs) = self
             .session
             .window
             .as_ref()

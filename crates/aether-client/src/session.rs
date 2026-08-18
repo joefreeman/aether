@@ -7,7 +7,7 @@ use super::keymap::Action;
 use super::picker::PickerState;
 use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
-use aether_protocol::git::CommitInfo;
+use aether_protocol::git::{CommitInfo, GitOperation};
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
@@ -884,6 +884,13 @@ pub struct Session {
     /// can render and toggle it: the fetching itself is the *server's* loop, and the client learns
     /// its results the ordinary way, through the refreshed ahead/behind counts in the status bar.
     pub git_auto_fetch: bool,
+    /// The long-running git operation in flight, if any, with the repo it belongs to — pushed by
+    /// the server (`git/operation_changed`) and rendered as the status bar's activity indicator.
+    /// The repo id rides along because it's what `Space g x` cancels; without it the client would
+    /// have to re-resolve a repo that may have stopped being the active one mid-operation.
+    ///
+    /// Only user-initiated operations ever appear here: the periodic fetcher runs unannounced.
+    pub git_operation: Option<(String, GitOperation)>,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -1335,6 +1342,7 @@ impl Session {
             theme: aether_protocol::settings::default_theme(),
             hints_enabled: true,
             git_auto_fetch: false,
+            git_operation: None,
             diff_view: false,
             read: None,
             read_on: true,

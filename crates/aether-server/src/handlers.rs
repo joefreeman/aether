@@ -35,15 +35,16 @@ use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef,
     GitBlameChanged, GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult,
-    GitBufferStatus, GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus,
-    GitCommitParams, GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus, GitHead,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult,
-    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
-    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
-    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection, RepoId,
-    StagedFile,
+    GitBufferStatus, GitCancelParams, GitCancelResult, GitChangeCounts, GitCheckoutParams,
+    GitCheckoutResult, GitCheckoutStatus, GitCommitParams, GitCommitResult, GitDeleteBranchParams,
+    GitDeleteBranchResult, GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus,
+    GitHead, GitNavigateHunkParams, GitNavigateHunkResult, GitOperation, GitOperationChanged,
+    GitOperationChangedParams, GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult,
+    GitPushParams, GitPushResult, GitPushStatus, GitRefreshParams, GitRefreshResult, GitRepoInfo,
+    GitReposParams, GitReposResult, GitResetParams, GitResetResult, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams,
+    GitStashDropParams, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
+    HunkAction, HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -3853,6 +3854,164 @@ fn reconcile_repo(
     (result, pushes)
 }
 
+/// A long-running git operation, announced to every client while it runs.
+///
+/// Holds the cancel handle in [`ServerState::git_operations`], streams git's progress lines out as
+/// `git/operation_changed` pushes, and clears the indicator on drop-in-name-only (`finish`, which
+/// has to be awaited, so it's an explicit call rather than a `Drop` impl).
+struct OperationReporter {
+    workdir: std::path::PathBuf,
+    /// The most recent progress line, overwritten as fast as git produces them and drained by the
+    /// ticker. Coalescing here rather than pushing per line is the point: `git push` emits a
+    /// counter update per percent, and a notification per percent to every client is a lot of
+    /// traffic to render the same word.
+    latest: Arc<std::sync::Mutex<Option<String>>>,
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+/// How often the in-flight indicator is refreshed. Fast enough to read as live, slow enough that a
+/// busy transfer doesn't turn into a push storm.
+const OPERATION_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Announce `kind` starting in `workdir`, and hand back the token its runner should watch.
+async fn begin_operation(
+    state: &SharedState,
+    workdir: &Path,
+    kind: GitOperationKind,
+) -> (crate::git_cli::CancelToken, OperationReporter) {
+    let (handle, token) = crate::git_cli::cancel_channel();
+    {
+        let mut s = state.lock().await;
+        s.git_operations.insert(workdir.to_path_buf(), handle);
+    }
+    push_operation(
+        state,
+        workdir,
+        Some(GitOperation {
+            kind,
+            detail: String::new(),
+        }),
+    )
+    .await;
+
+    let latest = Arc::new(std::sync::Mutex::new(None::<String>));
+    let ticker = tokio::spawn({
+        let state = state.clone();
+        let workdir = workdir.to_path_buf();
+        let latest = latest.clone();
+        async move {
+            loop {
+                tokio::time::sleep(OPERATION_TICK).await;
+                let detail = latest.lock().ok().and_then(|mut l| l.take());
+                let Some(detail) = detail else {
+                    continue; // nothing new since the last tick
+                };
+                push_operation(&state, &workdir, Some(GitOperation { kind, detail })).await;
+            }
+        }
+    });
+    (
+        token,
+        OperationReporter {
+            workdir: workdir.to_path_buf(),
+            latest,
+            ticker,
+        },
+    )
+}
+
+impl OperationReporter {
+    /// The progress sink for [`crate::git_cli::run_streaming`] — synchronous by necessity (it runs
+    /// inside the read loop), so it only ever parks the line for the ticker to send.
+    fn sink(&self) -> impl FnMut(String) + Send {
+        let latest = self.latest.clone();
+        move |line| {
+            if let Ok(mut slot) = latest.lock() {
+                *slot = Some(line);
+            }
+        }
+    }
+
+    /// Stop reporting and clear every client's indicator.
+    async fn finish(self, state: &SharedState) {
+        self.ticker.abort();
+        {
+            let mut s = state.lock().await;
+            s.git_operations.remove(&self.workdir);
+        }
+        push_operation(state, &self.workdir, None).await;
+    }
+}
+
+/// Push one `git/operation_changed` to every connected client. Repo-scoped rather than
+/// client-scoped: any client with this repo open wants the indicator, and the operation isn't
+/// owned by whoever happened to start it.
+async fn push_operation(state: &SharedState, workdir: &Path, operation: Option<GitOperation>) {
+    let params = GitOperationChangedParams {
+        repo_id: path_string(workdir),
+        operation,
+    };
+    let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+    let pushes: PendingPushes = {
+        let s = state.lock().await;
+        s.clients
+            .values()
+            .map(|sess| {
+                (
+                    sess.outbound.clone(),
+                    Notification {
+                        jsonrpc: JsonRpc,
+                        method: GitOperationChanged::NAME.into(),
+                        params: value.clone(),
+                    },
+                )
+            })
+            .collect()
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+}
+
+/// Run one network git command, optionally announcing it as a cancellable operation.
+///
+/// The single place fetch and push agree on how a network invocation behaves, so "announced and
+/// cancellable" versus "silent" is one argument rather than two divergent code paths. Returns
+/// git's output and whether the user cancelled — read from the token rather than inferred from the
+/// exit status, since a killed git looks identical to a crashed one from the outside.
+async fn run_network_git(
+    state: &SharedState,
+    workdir: &Path,
+    args: &[&str],
+    announce: Option<GitOperationKind>,
+) -> std::io::Result<(crate::git_cli::GitOutput, bool)> {
+    let Some(kind) = announce else {
+        return Ok((crate::git_cli::run(workdir, args).await?, false));
+    };
+    let (token, reporter) = begin_operation(state, workdir, kind).await;
+    let output = crate::git_cli::run_streaming(workdir, args, token.clone(), reporter.sink()).await;
+    reporter.finish(state).await;
+    let cancelled = *token.borrow();
+    Ok((output?, cancelled))
+}
+
+/// Stop the long-running git operation in a repo — see [`GitCancel`].
+pub async fn git_cancel(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitCancelParams,
+) -> Result<GitCancelResult, RpcError> {
+    let s = state.lock().await;
+    // Resolved (not just trusted) so a client can't kill an operation in a repo it can't see.
+    let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
+    let cancelled = match s.git_operations.get(Path::new(&repo.repo_id)) {
+        // A send failure means the runner has already gone, which is the same race as no entry.
+        Some(handle) => handle.send(true).is_ok(),
+        None => false,
+    };
+    Ok(GitCancelResult { cancelled })
+}
+
 /// The repos the periodic fetcher may fetch: everything reachable from a *connected* client's
 /// active workspace, one entry per repository.
 ///
@@ -3898,6 +4057,7 @@ pub(crate) fn auto_fetch_targets(s: &ServerState) -> Vec<GitRepoInfo> {
 pub(crate) async fn fetch_repo(
     state: &SharedState,
     workdir: std::path::PathBuf,
+    announce: bool,
 ) -> Result<GitFetchResult, RpcError> {
     // Ask before spawning. A repo with no remote is the one failure that retrying can never fix,
     // and the periodic fetcher needs to tell it apart from a network blip that will.
@@ -3921,10 +4081,28 @@ pub(crate) async fn fetch_repo(
     // never a file in the working tree, so there is no storm to absorb and no reconciliation pass
     // whose report a racing watcher could steal. The ref writes the watcher *does* see are exactly
     // the signal that keeps a terminal `git fetch` reflected here too.
-    let output = match crate::git_cli::run(&workdir, &["fetch"]).await {
-        Ok(o) => o,
+    //
+    // `announce` is what separates the two callers: `Space g f` puts an indicator up and can be
+    // cancelled, while the periodic fetcher runs silent and uninterruptible. A background operation
+    // that raised a spinner every quarter of an hour would be exactly the interruption it exists to
+    // avoid, and there is nobody waiting on it to offer a cancel to.
+    let (output, cancelled) = match run_network_git(
+        state,
+        &workdir,
+        &["fetch"],
+        announce.then_some(GitOperationKind::Fetch),
+    )
+    .await
+    {
+        Ok(v) => v,
         Err(e) => return Err(RpcError::internal(format!("running git fetch: {e}"))),
     };
+    if cancelled {
+        return Ok(GitFetchResult {
+            status: GitFetchStatus::Cancelled,
+            ..Default::default()
+        });
+    }
     if !output.success() {
         let message = if output.stderr.trim().is_empty() {
             output.stdout
@@ -3971,7 +4149,152 @@ pub async fn git_fetch(
             resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
         std::path::PathBuf::from(&repo.repo_id)
     };
-    fetch_repo(state, workdir).await
+    fetch_repo(state, workdir, true).await
+}
+
+/// What `git/push` needs to know about a repo before it can decide anything, read in one pass off
+/// the async thread: where HEAD points, how far it has diverged, and what remotes exist.
+struct PushPreflight {
+    head: Option<GitHead>,
+    upstream: Option<GitUpstreamStatus>,
+    remotes: Vec<String>,
+}
+
+fn push_preflight(workdir: &Path) -> PushPreflight {
+    PushPreflight {
+        head: crate::git::discover_repo(workdir).map(|i| i.head),
+        upstream: crate::git::repo_upstream(workdir),
+        remotes: crate::git::remote_names(workdir),
+    }
+}
+
+/// Publish the current branch — see [`GitPush`]. Reachability-gated like the other network
+/// operation.
+pub async fn git_push(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitPushParams,
+) -> Result<GitPushResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+
+    // Everything decidable without the network is decided here. Three of the four refusals below
+    // will never succeed on retry, and the fourth ("nothing to push") would spend a round trip to
+    // be told what we already know.
+    let pre = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || push_preflight(&workdir))
+            .await
+            .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+    let refuse = |status| {
+        Ok(GitPushResult {
+            status,
+            ..Default::default()
+        })
+    };
+    if pre.remotes.is_empty() {
+        return refuse(GitPushStatus::NoRemote);
+    }
+    let branch = match &pre.head {
+        Some(GitHead::Branch { name, .. }) => name.clone(),
+        // No commits yet, so there is nothing to publish — answered here rather than spending a
+        // round trip to have git say "src refspec does not match any", which reads like a fault.
+        Some(GitHead::Unborn { .. }) => return refuse(GitPushStatus::NothingToPush),
+        Some(GitHead::Detached { .. }) => return refuse(GitPushStatus::DetachedHead),
+        None => return refuse(GitPushStatus::Refused),
+    };
+
+    // The argv is the whole of the branch/upstream decision, so it's made in one place. `-u` on a
+    // branch that has never been pushed is what gives the divergence counts something to compare
+    // against from then on; with several remotes and no upstream, which one to publish to is the
+    // user's call rather than ours.
+    let set_upstream = pre.upstream.is_none();
+    let args: Vec<String> = if set_upstream {
+        let [remote] = &pre.remotes[..] else {
+            return refuse(GitPushStatus::AmbiguousRemote);
+        };
+        vec![
+            "push".into(),
+            "--set-upstream".into(),
+            remote.clone(),
+            branch,
+        ]
+    } else {
+        if pre.upstream.as_ref().is_some_and(|u| u.ahead == 0) {
+            return Ok(GitPushResult {
+                status: GitPushStatus::NothingToPush,
+                upstream: pre.upstream,
+                ..Default::default()
+            });
+        }
+        vec!["push".into()]
+    };
+
+    // No watcher suppression and no dirty-buffer pre-flight, for the same reason as `fetch_repo`:
+    // a push writes remote refs, never the working tree.
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (output, cancelled) =
+        match run_network_git(state, &workdir, &argv, Some(GitOperationKind::Push)).await {
+            Ok(v) => v,
+            Err(e) => return Err(RpcError::internal(format!("running git push: {e}"))),
+        };
+    if cancelled {
+        return Ok(GitPushResult {
+            status: GitPushStatus::Cancelled,
+            ..Default::default()
+        });
+    }
+
+    // Re-read either way: a successful push moved the remote-tracking ref, and a failed one is
+    // about to be classified by how far behind we are.
+    let after = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::git::repo_upstream(&workdir))
+            .await
+            .ok()
+            .flatten()
+    };
+
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        // The fast-forward rule, named from *our* read of the graph rather than from git's wording
+        // — see [`GitPushStatus::Behind`] for why this is classified after the attempt instead of
+        // refused before it. A rejection with nothing behind us is something else entirely
+        // (credentials, a protected branch, a pre-receive hook) and keeps git's own text.
+        let status = match after.as_ref() {
+            Some(u) if u.behind > 0 => GitPushStatus::Behind,
+            _ => GitPushStatus::Refused,
+        };
+        return Ok(GitPushResult {
+            status,
+            message: message.trim_end().to_string(),
+            upstream: after,
+            set_upstream: false,
+        });
+    }
+
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_repo_baselines(&mut s, &workdir)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(GitPushResult {
+        status: GitPushStatus::Pushed,
+        message: String::new(),
+        upstream: after,
+        set_upstream,
+    })
 }
 
 /// Re-read the Git baseline of every open buffer in `workdir`, collecting the resulting pushes.

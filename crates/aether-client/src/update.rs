@@ -46,16 +46,17 @@ use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCheckout,
-    GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
-    GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitFetch, GitFetchParams, GitFetchResult, GitFetchStatus,
-    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams, GitResetResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams,
-    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
-    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
-    HunkDirection,
+    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCancel,
+    GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
+    GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
+    GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
+    GitFetchResult, GitFetchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitOperationChanged, GitOperationChangedParams, GitPrepareCommit, GitPrepareCommitParams,
+    GitPrepareCommitResult, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitReset,
+    GitResetParams, GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
+    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
+    HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -235,6 +236,12 @@ pub enum Event {
     /// server-side and speaks through the status bar, since a toast every quarter of an hour is
     /// exactly the interruption a background refresh is supposed to avoid.
     FetchDone(Result<GitFetchResult, String>),
+    /// A `Space g p` push finished.
+    PushDone(Result<GitPushResult, String>),
+    /// A `Space g x` cancel was acknowledged. Silent on success — the operation's own result
+    /// arrives right behind it and says what happened — and silent when nothing was running,
+    /// which just means the operation finished before the keystroke landed.
+    CancelDone(Result<GitCancelResult, String>),
     HunkApplied {
         action: HunkAction,
         /// What the action was aimed at — carried back so the toast can say "file" or "change"
@@ -1155,8 +1162,51 @@ impl Session {
                     GitFetchStatus::NoRemote => {
                         Effects::toast("No remote configured", ToastKind::Info)
                     }
+                    // Acknowledged, not celebrated or mourned: the user asked for this.
+                    GitFetchStatus::Cancelled => Effects::toast("Fetch cancelled", ToastKind::Info),
                     GitFetchStatus::Refused => Effects::error(r.message),
                 },
+                Err(e) => Effects::error(e),
+            },
+
+            Event::PushDone(result) => match result {
+                Ok(r) => match r.status {
+                    GitPushStatus::Pushed => Effects::toast(push_summary(&r), ToastKind::Success),
+                    GitPushStatus::NothingToPush => {
+                        Effects::toast("Nothing to push", ToastKind::Info)
+                    }
+                    // The one refusal with a next step worth naming. Git's own wording here is
+                    // several lines of hint text; what the user needs is the number and the verb.
+                    GitPushStatus::Behind => Effects::toast(
+                        match r.upstream.as_ref() {
+                            Some(u) => {
+                                format!("{} behind {} — fetch and merge first", u.behind, u.name)
+                            }
+                            None => "Behind the remote — fetch and merge first".to_string(),
+                        },
+                        ToastKind::Warning,
+                    ),
+                    GitPushStatus::DetachedHead => {
+                        Effects::toast("Not on a branch — nothing to push", ToastKind::Warning)
+                    }
+                    GitPushStatus::NoRemote => {
+                        Effects::toast("No remote configured", ToastKind::Info)
+                    }
+                    GitPushStatus::AmbiguousRemote => Effects::toast(
+                        "Several remotes and no upstream — set one with git push -u",
+                        ToastKind::Warning,
+                    ),
+                    GitPushStatus::Cancelled => Effects::toast("Push cancelled", ToastKind::Info),
+                    GitPushStatus::Refused => Effects::error(r.message),
+                },
+                Err(e) => Effects::error(e),
+            },
+
+            Event::CancelDone(result) => match result {
+                // Nothing to say either way: a successful cancel is followed immediately by the
+                // operation's own `Cancelled` result, and "nothing was running" means it beat the
+                // keystroke, which is not a failure the user needs telling about.
+                Ok(_) => Effects::none(),
                 Err(e) => Effects::error(e),
             },
 
@@ -5194,6 +5244,16 @@ impl Session {
                 }
                 Effects::none()
             }
+            GitOperationChanged::NAME => {
+                // A long-running git operation started, advanced, or finished. Repo-scoped and
+                // pushed to every client, so this is adopted regardless of which buffer is
+                // showing — the operation isn't a property of the buffer that started it.
+                let Ok(p) = serde_json::from_value::<GitOperationChangedParams>(n.params) else {
+                    return Effects::none();
+                };
+                self.git_operation = p.operation.map(|op| (p.repo_id, op));
+                Effects::none()
+            }
             BufferChanged::NAME => {
                 // The revision-only change signal for edits outside the pushed window — the
                 // reading view's cue to re-fetch (docs/markdown-view.md §3). Editor rendering
@@ -8140,6 +8200,27 @@ impl Session {
                 Event::FetchDone,
             ),
 
+            A::GitPush => self.request_str::<GitPush>(
+                GitPushParams {
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                },
+                Event::PushDone,
+            ),
+
+            // Cancelling names the repo from the operation itself, never from the active buffer:
+            // a transient preview closing mid-push would otherwise re-resolve to a different repo
+            // than the one the indicator is showing.
+            A::GitCancel => match self.git_operation.as_ref() {
+                Some((repo_id, _)) => self.request_str::<GitCancel>(
+                    GitCancelParams {
+                        repo_id: repo_id.clone(),
+                    },
+                    Event::CancelDone,
+                ),
+                None => Effects::none(),
+            },
+
             A::GitUncommit => self.request_str::<GitReset>(
                 GitResetParams {
                     // Resolved server-side from the buffer we're on, the same rule
@@ -9455,6 +9536,25 @@ fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> String {
         parts.push(format!("{} behind", up.behind));
     }
     format!("Fetched — {} {}", parts.join(", "), up.name)
+}
+
+/// What a successful push accomplished. Names the upstream, because that's the fact the user is
+/// checking — that the commits went where they meant them to go.
+///
+/// A first push says so explicitly: it's the one that *created* the tracking relationship, which is
+/// also the moment the status bar's arrows start working for that branch, so it's worth a different
+/// sentence rather than a silent success.
+fn push_summary(result: &GitPushResult) -> String {
+    let target = result
+        .upstream
+        .as_ref()
+        .map(|u| u.name.clone())
+        .unwrap_or_else(|| "the remote".to_string());
+    if result.set_upstream {
+        format!("Pushed — now tracking {target}")
+    } else {
+        format!("Pushed to {target}")
+    }
 }
 
 /// The toast to show when a cursor-relative LSP request (hover / goto-definition) couldn't run
