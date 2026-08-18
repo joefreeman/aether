@@ -22,10 +22,11 @@ use aether_protocol::git::{
     GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCheckout,
     GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
     GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams,
-    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams,
-    GitResetResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    GitDeleteBranchStatus, GitFetch, GitFetchParams, GitFetchResult, GitFetchStatus, GitHead,
+    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams, GitRefreshResult,
+    GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams, GitResetResult,
+    GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
     GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams,
     GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
     GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
@@ -34062,6 +34063,346 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
         panic!("expected a stash row, got {centred:?}");
     };
     assert_eq!(oid, older, "the entry being read, not the newest");
+
+    drop(server);
+}
+
+// -------- upstream divergence + git/fetch ---------------------------------------------------------
+
+/// Give `repo`'s current branch an upstream, entirely from local refs — no remote is contacted and
+/// none needs to exist yet.
+///
+/// This *is* how ahead/behind works in production: it's a comparison between two refs already in
+/// the object store, which is why the counts can go stale and why fetching is a separate concern.
+/// Committing straight onto `refs/remotes/origin/main` is the honest way to simulate "the remote
+/// moved" — it is exactly what a fetch would have written.
+fn track_upstream(repo: &git2::Repository, url: &str) {
+    repo.remote("origin", url).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.reference(
+        "refs/remotes/origin/main",
+        head.id(),
+        true,
+        "test upstream ref",
+    )
+    .unwrap();
+    let mut branch = repo.find_branch("main", git2::BranchType::Local).unwrap();
+    branch.set_upstream(Some("origin/main")).unwrap();
+}
+
+/// Advance `refs/remotes/origin/main` by one commit without touching the working tree — the state
+/// a fetch leaves behind when someone else has pushed.
+fn advance_upstream_ref(repo: &git2::Repository) {
+    let tip = repo
+        .find_reference("refs/remotes/origin/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let sig = git2::Signature::now("Other", "other@example.com").unwrap();
+    repo.commit(
+        Some("refs/remotes/origin/main"),
+        &sig,
+        &sig,
+        "upstream work",
+        &tip.tree().unwrap(),
+        &[&tip],
+    )
+    .unwrap();
+}
+
+/// Run `git` in `cwd` for fixture setup. Panics on failure — a fixture that didn't build isn't a
+/// test result.
+///
+/// Unlike the git the *server* runs (which builds its own argv, so tests can't reach its
+/// environment — hence the repo-local isolation `isolate_repo_config` uses), these spawns are ours,
+/// so they get the strong isolation directly: no global or system config, and an identity from the
+/// environment rather than from whatever the developer has configured.
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git is on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed in {cwd:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Send a request expecting an RPC *error*, and return the error object. `send_request` panics on
+/// one, which is right for every call that should succeed and useless for the ones that shouldn't.
+async fn send_request_expect_error<M: RpcMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    params: &M::Params,
+) -> Value {
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id,
+        method: M::NAME.into(),
+        params: Some(serde_json::to_value(params).unwrap()),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let text = next_text(ws).await;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        if v["id"] == serde_json::json!(id) {
+            assert!(
+                v.get("error").is_some(),
+                "expected an error from {}, got {v}",
+                M::NAME
+            );
+            return v["error"].clone();
+        }
+    }
+}
+
+/// Open `rel` and return the git status riding its first window.
+async fn git_status_of(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    rel: &str,
+) -> aether_protocol::git::GitBufferStatus {
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        ws,
+        90,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some(rel.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        91,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    sub.window
+        .git_status
+        .expect("tracked file carries git status")
+}
+
+#[tokio::test]
+async fn git_status_reports_upstream_divergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    track_upstream(&repo, "https://example.invalid/repo.git");
+
+    // Two commits of our own, one of theirs: the diverged case, which is the one a user needs the
+    // status bar for — "you have work to push *and* work to merge".
+    commit_file(&repo, "b.rs", "two\n");
+    commit_file(&repo, "c.rs", "three\n");
+    advance_upstream_ref(&repo);
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let gs = git_status_of(&mut ws, "a.rs").await;
+    let up = gs.upstream.expect("branch tracks an upstream");
+    assert_eq!(up.name, "origin/main");
+    assert_eq!((up.ahead, up.behind), (2, 1));
+    assert!(!up.is_level());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_status_omits_upstream_for_a_never_pushed_branch() {
+    // No upstream is *not* "level with upstream": reporting zeros here would tell a user with
+    // unpushed work on a fresh branch that they are in sync with something.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let gs = git_status_of(&mut ws, "a.rs").await;
+    assert_eq!(gs.branch.as_deref(), Some("main"));
+    assert!(
+        gs.upstream.is_none(),
+        "a branch with no upstream reports no divergence, got {:?}",
+        gs.upstream
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_status_reports_level_with_upstream() {
+    // The third case: an upstream that exists and agrees. Distinct from absent, and the client
+    // says different things about each.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    track_upstream(&repo, "https://example.invalid/repo.git");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let gs = git_status_of(&mut ws, "a.rs").await;
+    let up = gs.upstream.expect("branch tracks an upstream");
+    assert!(up.is_level(), "expected level, got {up:?}");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_fetch_reports_no_remote_without_running_git() {
+    // A local-only repo is the one fetch failure that retrying can never fix, so it's answered
+    // from libgit2 rather than read out of git's complaint — which is what lets the periodic
+    // fetcher back off permanently instead of spawning a doomed `git fetch` every interval.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res: GitFetchResult = send_request::<GitFetch>(
+        &mut ws,
+        2,
+        &GitFetchParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(res.status, GitFetchStatus::NoRemote);
+    assert!(res.message.is_empty(), "nothing ran, so nothing to quote");
+    assert!(res.upstream.is_none());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_fetch_updates_the_divergence_counts() {
+    // End-to-end over a `file://` remote: a real `git fetch`, no network. The point is that the
+    // count a *buffer* reports changes as a result — the fetch has to refresh the open buffers'
+    // baselines, or the status bar keeps showing the world as it was before.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+
+    // A bare origin, and a clone of it that will do the pushing.
+    let origin = base.join("origin.git");
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.bare(true).initial_head("main");
+    git2::Repository::init_opts(&origin, &opts).unwrap();
+
+    let ours = base.join("ours");
+    std::fs::create_dir(&ours).unwrap();
+    let repo = init_repo_at(&ours);
+    isolate_repo_config(&repo, &ours.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+    let origin_url = origin.to_string_lossy().to_string();
+    run_git(&ours, &["remote", "add", "origin", &origin_url]);
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let before = git_status_of(&mut ws, "a.rs").await;
+    assert!(
+        before.upstream.expect("tracking origin/main").is_level(),
+        "fixture starts in sync"
+    );
+
+    // Someone else pushes. Cloning into a second working copy keeps this honest — the commit
+    // travels through the remote rather than being fabricated in our own object store.
+    let theirs = base.join("theirs");
+    run_git(&base, &["clone", &origin_url, "theirs"]);
+    std::fs::write(theirs.join("b.rs"), "two\n").unwrap();
+    run_git(&theirs, &["add", "b.rs"]);
+    run_git(&theirs, &["commit", "-m", "their work"]);
+    run_git(&theirs, &["push", "origin", "main"]);
+
+    // Nothing has told us yet: the counts are local refs, so they still read as level.
+    let stale = git_status_of(&mut ws, "a.rs").await;
+    assert!(
+        stale.upstream.expect("still tracking").is_level(),
+        "divergence is a local-ref comparison — it can't know until something fetches"
+    );
+
+    let res: GitFetchResult = send_request::<GitFetch>(
+        &mut ws,
+        3,
+        &GitFetchParams {
+            repo_id: Some(ours.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        GitFetchStatus::Fetched,
+        "fetch failed: {}",
+        res.message
+    );
+    let reported = res.upstream.expect("fetch reports the new divergence");
+    assert_eq!((reported.ahead, reported.behind), (0, 1));
+
+    // And the buffer's own status agrees — the part that makes the status bar update.
+    let after = git_status_of(&mut ws, "a.rs").await;
+    let up = after.upstream.expect("still tracking");
+    assert_eq!((up.ahead, up.behind), (0, 1), "the open buffer sees it too");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_fetch_refuses_a_repo_the_workspace_cannot_reach() {
+    // Fetching reaches the network on the user's behalf, so the repo has to be one they actually
+    // opened. A repo the active workspace can't see at all is refused outright; the narrower
+    // `REPO_NOT_WRITABLE` case (reachable through a buffer but under no root) can't be built here,
+    // because `buffer/open` gives such a buffer no baseline in the first place — see
+    // docs/git-phase-2.md decision 2.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_repo = init_repo_at(&outside_root);
+    commit_file(&outside_repo, "dep.rs", "dep\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let err = send_request_expect_error::<GitFetch>(
+        &mut ws,
+        2,
+        &GitFetchParams {
+            repo_id: Some(outside_root.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        err["code"],
+        serde_json::json!(-32040),
+        "expected REPO_NOT_FOUND — refused before any network access, got {err}"
+    );
 
     drop(server);
 }

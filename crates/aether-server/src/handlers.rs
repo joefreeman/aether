@@ -37,12 +37,13 @@ use aether_protocol::git::{
     GitBlameChanged, GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult,
     GitBufferStatus, GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus,
     GitCommitParams, GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitHead, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams, GitRefreshResult,
-    GitRepoInfo, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
-    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams,
-    GitStashApplyParams, GitStashDropParams, GitStashPushParams, GitStashResult, GitStashStatus,
-    HunkAction, HunkDirection, RepoId, StagedFile,
+    GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus, GitHead,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult,
+    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
+    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
+    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection, RepoId,
+    StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -3850,6 +3851,150 @@ fn reconcile_repo(
     pushes.extend(refresh_buffer_pickers(s));
 
     (result, pushes)
+}
+
+/// The repos the periodic fetcher may fetch: everything reachable from a *connected* client's
+/// active workspace, one entry per repository.
+///
+/// Three filters, each load-bearing:
+///
+/// - **Connected clients only.** No client means no one to show a count to, and the daemon is
+///   auto-started and idle-reaped — it has no business waking the network on its own behalf.
+/// - **`roots` non-empty**, the same reachability guard the write operations use. A repo reached
+///   only through an open buffer is a dependency checkout a goto-definition landed in; fetching it
+///   would be contacting a remote the user has never expressed any interest in.
+/// - **One per `common_dir`.** Worktrees of one repository share their object store and remote
+///   refs, so fetching each in turn is the same fetch two or three times over.
+pub(crate) fn auto_fetch_targets(s: &ServerState) -> Vec<GitRepoInfo> {
+    let mut out: Vec<GitRepoInfo> = Vec::new();
+    let mut client_ids: Vec<ClientId> = s.clients.keys().copied().collect();
+    client_ids.sort_unstable(); // `clients` is a HashMap; keep the order deterministic
+    for client_id in client_ids {
+        // A client that hasn't activated a workspace yet (still on the boot chooser) contributes
+        // nothing rather than failing the sweep.
+        let Ok(repos) = reachable_repos(s, client_id) else {
+            continue;
+        };
+        for repo in repos {
+            if repo.roots.is_empty() {
+                continue;
+            }
+            if out.iter().any(|r| r.common_dir == repo.common_dir) {
+                continue;
+            }
+            out.push(repo);
+        }
+    }
+    out.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    out
+}
+
+/// Fetch from the remote, refreshing the divergence counts every open buffer in the repo carries.
+///
+/// The repo is already resolved: [`git_fetch`] resolves it from a client's request, the periodic
+/// fetcher ([`crate::server::git_fetch_loop`]) from the workspaces it can reach. Everything after
+/// that point — the no-remote gate, the spawn, the refresh — has to be identical for both, so it
+/// lives here rather than in either caller.
+pub(crate) async fn fetch_repo(
+    state: &SharedState,
+    workdir: std::path::PathBuf,
+) -> Result<GitFetchResult, RpcError> {
+    // Ask before spawning. A repo with no remote is the one failure that retrying can never fix,
+    // and the periodic fetcher needs to tell it apart from a network blip that will.
+    let has_remote = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::git::has_remote(&workdir))
+            .await
+            .unwrap_or(false)
+    };
+    if !has_remote {
+        return Ok(GitFetchResult {
+            status: GitFetchStatus::NoRemote,
+            ..Default::default()
+        });
+    }
+
+    // **No watcher suppression here**, unlike every other git mutation — deliberately, and it
+    // would be a bug. Suppression is keyed by workdir *containment*, so holding it across a fetch
+    // (which can take many seconds on a slow link) would swallow the user's own edits to their own
+    // files for the duration. Nothing needs it: a fetch writes `refs/remotes/**` and objects,
+    // never a file in the working tree, so there is no storm to absorb and no reconciliation pass
+    // whose report a racing watcher could steal. The ref writes the watcher *does* see are exactly
+    // the signal that keeps a terminal `git fetch` reflected here too.
+    let output = match crate::git_cli::run(&workdir, &["fetch"]).await {
+        Ok(o) => o,
+        Err(e) => return Err(RpcError::internal(format!("running git fetch: {e}"))),
+    };
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitFetchResult {
+            status: GitFetchStatus::Refused,
+            message: message.trim_end().to_string(),
+            upstream: None,
+        });
+    }
+
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_repo_baselines(&mut s, &workdir)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    // Read back outside the lock: this is a revwalk, and it's the answer the caller reports.
+    let upstream = tokio::task::spawn_blocking(move || crate::git::repo_upstream(&workdir))
+        .await
+        .ok()
+        .flatten();
+    Ok(GitFetchResult {
+        status: GitFetchStatus::Fetched,
+        message: String::new(),
+        upstream,
+    })
+}
+
+/// Fetch from the remote — see [`GitFetch`]. Reachability-gated: this reaches the network on the
+/// user's behalf, so a repo they never opened (reached only through a buffer) is refused, the same
+/// guard the write operations use.
+pub async fn git_fetch(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitFetchParams,
+) -> Result<GitFetchResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+    fetch_repo(state, workdir).await
+}
+
+/// Re-read the Git baseline of every open buffer in `workdir`, collecting the resulting pushes.
+///
+/// Deliberately *not* [`reconcile_repo`]. That exists for operations that rewrite the working tree
+/// and pays accordingly — an mtime stat and a possible reload per buffer, plus explorer and
+/// buffer-picker refreshes. A fetch moves no file and changes no file's status against HEAD or the
+/// index, so all of that would be work with no observable effect, on a path the periodic fetcher
+/// runs unattended for as long as the editor is open. What a fetch *does* change is
+/// `refs/remotes/**`, and the baseline's cached upstream divergence is read from exactly there.
+fn refresh_repo_baselines(s: &mut ServerState, workdir: &Path) -> PendingPushes {
+    let mut affected: Vec<BufferId> = s
+        .git_baseline
+        .iter()
+        .filter(|(_, b)| b.repo.as_ref().is_some_and(|r| r.workdir == workdir))
+        .map(|(id, _)| *id)
+        .collect();
+    affected.sort_unstable(); // `git_baseline` is a HashMap; keep push order stable
+    let mut pushes: PendingPushes = Vec::new();
+    for id in affected {
+        pushes.extend(refresh_git_for_buffer(s, id));
+    }
+    pushes
 }
 
 fn path_string(path: &Path) -> String {
@@ -8248,6 +8393,7 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
         branch: baseline.branch.clone(),
         staged: git_change_counts(&baseline.staged_hunks),
         unstaged: git_change_counts(buffer_unstaged_hunks(s, buffer_id)),
+        upstream: baseline.upstream.clone(),
         baseline: baseline.rev.as_ref().map(|r| GitBaselineRef {
             label: r.label.clone(),
             commit: r.commit.clone(),

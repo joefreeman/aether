@@ -20,7 +20,7 @@
 //! stage and unstage rewrite the file's index entry ([`write_index_blob`]); revert is an ordinary
 //! buffer edit driven by the handler.
 
-use aether_protocol::git::{BlameInfo, CommitInfo, GitHead, GitStatus};
+use aether_protocol::git::{BlameInfo, CommitInfo, GitHead, GitStatus, GitUpstreamStatus};
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +108,11 @@ pub struct GitBaseline {
     pub index_blob: Option<Vec<u8>>,
     /// Current branch name (or short commit hash when detached). `None` outside a repo.
     pub branch: Option<String>,
+    /// Divergence from the branch's upstream, cached here for the same reason `branch` is: it's a
+    /// repo-level read that changes only when HEAD or a ref moves, which is exactly when this
+    /// baseline is reloaded. A fetch writes `refs/remotes/**`, the watcher keys on `refs/`, and
+    /// the refresh recomputes this — so the count follows a terminal `git fetch` too.
+    pub upstream: Option<GitUpstreamStatus>,
     /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
     /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
     pub staged_hunks: Vec<DiffHunk>,
@@ -138,6 +143,16 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     };
     let rel_path = rel.to_path_buf();
 
+    // Read HEAD once and derive both views of it: the flattened label for the status bar, and the
+    // upstream divergence. Both are repo-level rather than file-level, and both are wanted whether
+    // or not a pinned baseline is in play — how far you are from `origin/main` is a fact about the
+    // branch, not about what the gutter happens to be diffing against.
+    let head = head_state(&repo);
+    let branch = head.as_ref().map(branch_label);
+    let upstream = head
+        .as_ref()
+        .and_then(|head| upstream_divergence(&repo, head));
+
     // Diffing against a pinned revision instead of HEAD: point *both* blobs at that commit's
     // content. The existing pipeline then produces exactly the right thing with no special cases
     // downstream — staged (blob → index) comes out empty, unstaged (index → buffer) is the whole
@@ -149,7 +164,8 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
             repo: Some(GitRepo { workdir, rel_path }),
             blob: bytes.clone(),
             index_blob: bytes,
-            branch: current_branch(&repo),
+            branch,
+            upstream,
             staged_hunks: Vec::new(),
             rev: Some(rev.clone()),
         };
@@ -167,7 +183,8 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         repo: Some(GitRepo { workdir, rel_path }),
         blob,
         index_blob,
-        branch: current_branch(&repo),
+        branch,
+        upstream,
         staged_hunks,
         rev: None,
     }
@@ -301,15 +318,42 @@ fn index_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
     Some(blob.content().to_vec())
 }
 
-/// Current branch name, or a short commit hash when HEAD is detached. Handles an unborn branch
-/// (fresh repo, no commits yet) by reading the symbolic `HEAD` target. `None` only on error.
+/// Branch name, or a short commit hash when HEAD is detached — the flattened, display-oriented
+/// view of [`head_state`], which is what the status bar wants. Anything that needs to *act* on
+/// HEAD wants the three-way state instead.
+fn branch_label(head: &GitHead) -> String {
+    match head {
+        GitHead::Branch { name, .. } | GitHead::Unborn { name } => name.clone(),
+        GitHead::Detached { oid } => oid.clone(),
+    }
+}
+
+/// How far HEAD's branch has diverged from its configured upstream.
 ///
-/// The flattened, display-oriented view of [`head_state`] — what the status bar wants. Anything
-/// that needs to *act* on HEAD wants the three-way state instead.
-fn current_branch(repo: &git2::Repository) -> Option<String> {
-    head_state(repo).map(|h| match h {
-        GitHead::Branch { name, .. } | GitHead::Unborn { name } => name,
-        GitHead::Detached { oid } => oid,
+/// **Local refs only** — `graph_ahead_behind` is a revwalk between two commits already in the
+/// object store, so this costs no network and says nothing about the remote's current state. It is
+/// the same comparison `git status` prints, and it goes stale in exactly the same way: only a
+/// fetch moves the upstream ref.
+///
+/// `None` whenever there is nothing to compare against — a detached or unborn HEAD, a branch with
+/// no upstream configured, or an upstream ref that no longer resolves (a deleted remote branch that
+/// hasn't been pruned). Those are distinct from "level with upstream", which is `Some` with zeros.
+fn upstream_divergence(repo: &git2::Repository, head: &GitHead) -> Option<GitUpstreamStatus> {
+    let GitHead::Branch {
+        name,
+        upstream: Some(upstream_name),
+    } = head
+    else {
+        return None;
+    };
+    let branch = repo.find_branch(name, git2::BranchType::Local).ok()?;
+    let local_oid = branch.get().target()?;
+    let upstream_oid = branch.upstream().ok()?.get().target()?;
+    let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid).ok()?;
+    Some(GitUpstreamStatus {
+        name: upstream_name.clone(),
+        ahead: ahead as u32,
+        behind: behind as u32,
     })
 }
 
@@ -549,6 +593,27 @@ pub fn branch_is_merged(workdir: &Path, branch: &str) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether the repo has any remote configured — the gate `git/fetch` checks before spawning.
+///
+/// Asked of libgit2 rather than read out of git's complaint, for the usual reason, plus one
+/// specific to the periodic fetcher: this is the failure that can never succeed on retry, so it
+/// has to be distinguishable from a network blip that will. `false` when the repo can't be opened,
+/// which folds an unreadable repo into "nothing to fetch" rather than an error.
+pub fn has_remote(workdir: &Path) -> bool {
+    git2::Repository::open(workdir)
+        .ok()
+        .and_then(|repo| repo.remotes().ok().map(|r| !r.is_empty()))
+        .unwrap_or(false)
+}
+
+/// [`upstream_divergence`] for a repo rather than a buffer — what `git/fetch` reports back once
+/// the refs have moved. `None` when the repo can't be opened or HEAD has no upstream.
+pub fn repo_upstream(workdir: &Path) -> Option<GitUpstreamStatus> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let head = head_state(&repo)?;
+    upstream_divergence(&repo, &head)
 }
 
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.

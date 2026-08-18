@@ -7,7 +7,9 @@
 use crate::config::{self};
 use crate::state::{ServerState, SharedState};
 use crate::watcher;
+use aether_protocol::git::{GitFetchStatus, AUTO_FETCH_INTERVAL_MINUTES};
 use anyhow::{bail, Context};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,6 +148,11 @@ pub async fn run_with_listener(
         tokio::spawn(aggregate_flush_loop(state.clone()));
     }
 
+    // Periodic `git fetch`, when the user has asked for it. Spawned unconditionally: the setting
+    // is read per tick rather than at boot, so turning it on in the settings overlay takes effect
+    // without a restart, and while it's off the loop costs one small file read a minute.
+    tokio::spawn(git_fetch_loop(state.clone()));
+
     // Cursor-following decorations (blame label, symbol highlights): `handlers::set_cursor`
     // funnels every followed cursor change into this channel; the loop debounces and refreshes.
     {
@@ -224,6 +231,127 @@ async fn backup_flush_loop(state: SharedState) {
     loop {
         tokio::time::sleep(BACKUP_FLUSH_INTERVAL).await;
         crate::handlers::flush_backups(&state).await;
+    }
+}
+
+/// How often the auto-fetch loop wakes to ask whether any repo is due.
+///
+/// Short ticks with per-repo due times, rather than one sleep the length of the interval. That is
+/// what makes the two cases which aren't "every N minutes" fall out for free: a repo is due the
+/// moment a client first connects (nothing has fetched it yet), and a laptop resuming from suspend
+/// fetches on the next tick — tokio's timer runs on `CLOCK_MONOTONIC`, which does *not* advance
+/// while the machine is asleep, so a single long sleep would wake believing almost no time had
+/// passed. The tick itself is nearly free: with the setting off it is one small file read.
+const AUTO_FETCH_TICK: Duration = Duration::from_secs(60);
+
+/// How many times the retry delay doubles before it stops growing. With the 15-minute interval
+/// this tops out at two hours, which is roughly "you are somewhere without a network, so stop
+/// asking" without becoming "you are never fetching again".
+const AUTO_FETCH_MAX_BACKOFF_STEPS: u32 = 3;
+
+/// One repository's place in the auto-fetch rotation.
+struct RepoFetchState {
+    /// Earliest tick this repo may be fetched again.
+    next: Instant,
+    /// Consecutive failures, driving [`auto_fetch_backoff`]. Reset by any successful fetch.
+    failures: u32,
+}
+
+/// How long to wait after `failures` consecutive failed fetches. Exponential and capped.
+///
+/// The failure this exists for is a laptop with no network: without backoff every repo would try
+/// an SSH connection every interval forever, which on a passphrase-protected key means an agent
+/// prompt on a drumbeat. Uncapped growth is the opposite mistake — coming back from a week offline
+/// should not mean waiting a week for the first fetch.
+fn auto_fetch_backoff(interval: Duration, failures: u32) -> Duration {
+    interval * 2u32.pow(failures.min(AUTO_FETCH_MAX_BACKOFF_STEPS))
+}
+
+/// Periodically fetch the workspaces' repos so the status bar's ahead/behind counts describe now,
+/// rather than whenever the user last fetched by hand. Inert unless `git_auto_fetch` is set.
+///
+/// The loop decides *when* and *for which repos*; everything about the operation itself is
+/// [`crate::handlers::fetch_repo`], the same code path `Space g f` runs. A scheduler with its own
+/// git invocation is how one of the two ends up missing the reachability guard or the baseline
+/// refresh, so there is deliberately only one.
+///
+/// No coordination with user-initiated git: a background fetch that collides with a commit or a
+/// checkout loses a ref lock, comes back as an ordinary failure, and is retried after a backoff.
+/// That is the correct amount of machinery for an operation nobody is waiting on.
+async fn git_fetch_loop(state: SharedState) {
+    let interval = Duration::from_secs(AUTO_FETCH_INTERVAL_MINUTES * 60);
+    // Keyed by common dir — the unit a fetch actually acts on, since worktrees share remote refs.
+    // Loop-local and deliberately forgotten on restart: a fresh server should fetch promptly
+    // rather than honour a backoff inherited from a network problem that may be long gone.
+    let mut schedule: HashMap<PathBuf, RepoFetchState> = HashMap::new();
+    loop {
+        tokio::time::sleep(AUTO_FETCH_TICK).await;
+
+        // Read per tick, not at boot: toggling the setting takes effect on the next tick rather
+        // than at the next restart, and there is no cached copy to keep in sync.
+        let enabled = config::load_app_settings()
+            .map(|s| s.git_auto_fetch)
+            .unwrap_or(false);
+        if !enabled {
+            continue;
+        }
+
+        let targets = {
+            let s = state.lock().await;
+            crate::handlers::auto_fetch_targets(&s)
+        };
+        // Drop repos that have left the rotation (workspace closed, last client gone), so a
+        // backoff can't outlive the thing it was about.
+        schedule.retain(|key, _| {
+            targets
+                .iter()
+                .any(|repo| std::path::Path::new(&repo.common_dir) == key)
+        });
+
+        for repo in targets {
+            let key = PathBuf::from(&repo.common_dir);
+            let due = schedule
+                .get(&key)
+                .is_none_or(|st| st.next <= Instant::now());
+            if !due {
+                continue;
+            }
+            let workdir = PathBuf::from(&repo.repo_id);
+            let outcome = crate::handlers::fetch_repo(&state, workdir).await;
+            let entry = schedule.entry(key).or_insert(RepoFetchState {
+                next: Instant::now(),
+                failures: 0,
+            });
+            match outcome {
+                Ok(result) => match result.status {
+                    GitFetchStatus::Fetched => {
+                        entry.failures = 0;
+                        entry.next = Instant::now() + interval;
+                    }
+                    // Will never succeed until the user runs `git remote add`, so go straight to
+                    // the longest delay rather than retrying a local-only repo every interval.
+                    GitFetchStatus::NoRemote => {
+                        entry.failures = AUTO_FETCH_MAX_BACKOFF_STEPS;
+                        entry.next = Instant::now() + auto_fetch_backoff(interval, entry.failures);
+                    }
+                    GitFetchStatus::Refused => {
+                        entry.failures = entry.failures.saturating_add(1);
+                        tracing::debug!(
+                            repo = %repo.repo_id,
+                            failures = entry.failures,
+                            "background fetch refused: {}",
+                            result.message.trim()
+                        );
+                        entry.next = Instant::now() + auto_fetch_backoff(interval, entry.failures);
+                    }
+                },
+                Err(e) => {
+                    entry.failures = entry.failures.saturating_add(1);
+                    tracing::warn!(repo = %repo.repo_id, error = ?e, "background fetch failed to run");
+                    entry.next = Instant::now() + auto_fetch_backoff(interval, entry.failures);
+                }
+            }
+        }
     }
 }
 
@@ -520,6 +648,28 @@ mod tests {
     use super::*;
     use crate::state::{Document, ServerState};
     use std::path::PathBuf;
+
+    /// The retry delay grows and then stops growing. The cap is the point: uncapped doubling means
+    /// coming back from a week offline waits a week for the first fetch, and no backoff at all
+    /// means a laptop with no network retries every interval forever.
+    #[test]
+    fn auto_fetch_backoff_grows_then_caps() {
+        let interval = Duration::from_secs(900);
+        assert_eq!(auto_fetch_backoff(interval, 1), interval * 2);
+        assert_eq!(auto_fetch_backoff(interval, 2), interval * 4);
+        let capped = auto_fetch_backoff(interval, AUTO_FETCH_MAX_BACKOFF_STEPS);
+        assert_eq!(auto_fetch_backoff(interval, 99), capped);
+        assert!(capped > interval);
+    }
+
+    /// No connected client means nothing to fetch. The daemon is auto-started and idle-reaped, so
+    /// a background fetch with nobody attached would be the editor using the network purely on its
+    /// own behalf — and with no one to show the resulting count to.
+    #[tokio::test]
+    async fn auto_fetch_targets_are_empty_without_clients() {
+        let state = ServerState::new();
+        assert!(crate::handlers::auto_fetch_targets(&state).is_empty());
+    }
 
     /// A reapable server with no clients ever connecting shuts itself down once the idle timeout
     /// elapses — this is the auto-start cleanup path.

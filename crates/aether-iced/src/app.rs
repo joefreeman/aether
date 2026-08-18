@@ -4231,7 +4231,18 @@ impl App {
                 used += DIVIDER_COLS;
             }
             if let Some(branch) = &gs.branch {
-                let seg = format!("⎇  {branch}");
+                // Upstream divergence rides the branch label in the same colour: it annotates the
+                // branch rather than the file, unlike the change counts. Level (or no upstream at
+                // all) renders nothing, matching `git status`'s own silence in both cases.
+                let mut seg = format!("⎇  {branch}");
+                if let Some(up) = &gs.upstream {
+                    if up.ahead > 0 {
+                        seg.push_str(&format!(" ↑{}", up.ahead));
+                    }
+                    if up.behind > 0 {
+                        seg.push_str(&format!(" ↓{}", up.behind));
+                    }
+                }
                 used += seg.chars().count();
                 left = left.push(t(seg, p.accent_alt));
             }

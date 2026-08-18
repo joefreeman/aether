@@ -553,6 +553,8 @@ pub enum AppSettingId {
     MarkdownRead,
     /// Light vs dark colour theme (the toggle is "light on/off"; off is dark).
     Theme,
+    /// Periodic background `git fetch` (docs/git-phase-2.md stage 3).
+    GitAutoFetch,
 }
 
 /// Font-size presets the two font-size rows step through (px). Both defaults
@@ -877,6 +879,11 @@ pub struct Session {
     /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
     /// hint disappears (and observation stops) when off.
     pub hints_enabled: bool,
+    /// Periodic background `git fetch` on/off — an app-wide setting (`Space ,`), seeded from
+    /// `settings/get` at boot and synced via `settings/changed`. Held here only so the overlay row
+    /// can render and toggle it: the fetching itself is the *server's* loop, and the client learns
+    /// its results the ordinary way, through the refreshed ahead/behind counts in the status bar.
+    pub git_auto_fetch: bool,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -1327,6 +1334,7 @@ impl Session {
             ui_font_size: aether_protocol::settings::default_ui_font_size(),
             theme: aether_protocol::settings::default_theme(),
             hints_enabled: true,
+            git_auto_fetch: false,
             diff_view: false,
             read: None,
             read_on: true,
@@ -1358,53 +1366,66 @@ impl Session {
     /// row here (and a toggle arm in [`crate::update`]'s `toggle_app_setting`, keyed by
     /// [`AppSettingId`]).
     pub fn app_setting_groups(&self) -> Vec<AppSettingGroup> {
-        vec![AppSettingGroup {
-            title: "View",
-            rows: vec![
-                AppSettingRow {
-                    id: AppSettingId::SoftWrap,
-                    label: "Soft wrap",
-                    control: AppSettingControl::Toggle(self.wrap == WrapMode::Soft),
-                    hint: "Wrap long lines to the viewport width",
-                },
-                AppSettingRow {
-                    id: AppSettingId::Ligatures,
-                    label: "Ligatures",
-                    control: AppSettingControl::Toggle(self.ligatures),
-                    hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
-                },
-                AppSettingRow {
-                    id: AppSettingId::BufferFontSize,
-                    label: "Buffer font size",
-                    control: AppSettingControl::Value(self.buffer_font_size),
-                    hint: "File text size in pixels (GUI/web; the terminal uses its own font)",
-                },
-                AppSettingRow {
-                    id: AppSettingId::UiFontSize,
-                    label: "UI font size",
-                    control: AppSettingControl::Value(self.ui_font_size),
-                    hint: "Status bar, picker and dialog text size in pixels (GUI/web)",
-                },
-                AppSettingRow {
-                    id: AppSettingId::Hints,
-                    label: "Hints",
-                    control: AppSettingControl::Toggle(self.hints_enabled),
-                    hint: "Suggest things to try in the corner (Space h dismisses one, Space Alt-h toggles)",
-                },
-                AppSettingRow {
-                    id: AppSettingId::MarkdownRead,
-                    label: "Markdown reading view",
-                    control: AppSettingControl::Toggle(self.markdown_read_default),
-                    hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
-                },
-                AppSettingRow {
-                    id: AppSettingId::Theme,
-                    label: "Light theme",
-                    control: AppSettingControl::Toggle(self.theme == ThemeMode::Light),
-                    hint: "Render every client in the light colour theme (off is dark)",
-                },
-            ],
-        }]
+        vec![
+            AppSettingGroup {
+                title: "View",
+                rows: vec![
+                    AppSettingRow {
+                        id: AppSettingId::SoftWrap,
+                        label: "Soft wrap",
+                        control: AppSettingControl::Toggle(self.wrap == WrapMode::Soft),
+                        hint: "Wrap long lines to the viewport width",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::Ligatures,
+                        label: "Ligatures",
+                        control: AppSettingControl::Toggle(self.ligatures),
+                        hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::BufferFontSize,
+                        label: "Buffer font size",
+                        control: AppSettingControl::Value(self.buffer_font_size),
+                        hint: "File text size in pixels (GUI/web; the terminal uses its own font)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::UiFontSize,
+                        label: "UI font size",
+                        control: AppSettingControl::Value(self.ui_font_size),
+                        hint: "Status bar, picker and dialog text size in pixels (GUI/web)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::Hints,
+                        label: "Hints",
+                        control: AppSettingControl::Toggle(self.hints_enabled),
+                        hint: "Suggest things to try in the corner (Space h dismisses one, Space Alt-h toggles)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::MarkdownRead,
+                        label: "Markdown reading view",
+                        control: AppSettingControl::Toggle(self.markdown_read_default),
+                        hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::Theme,
+                        label: "Light theme",
+                        control: AppSettingControl::Toggle(self.theme == ThemeMode::Light),
+                        hint: "Render every client in the light colour theme (off is dark)",
+                    },
+                ],
+            },
+            // The first group that isn't about how things look — and the first setting the
+            // *server* acts on rather than the shells.
+            AppSettingGroup {
+                title: "Git",
+                rows: vec![AppSettingRow {
+                    id: AppSettingId::GitAutoFetch,
+                    label: "Fetch in the background",
+                    control: AppSettingControl::Toggle(self.git_auto_fetch),
+                    hint: "Periodically fetch from remotes so the ↑ahead ↓behind counts stay current (Space g f fetches now)",
+                }],
+            },
+        ]
     }
 
     /// The settings rows flattened across all groups, in display order — the index space keyboard

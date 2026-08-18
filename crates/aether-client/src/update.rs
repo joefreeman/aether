@@ -49,11 +49,13 @@ use aether_protocol::git::{
     GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCheckout,
     GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
     GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
-    GitDeleteBranchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams,
-    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
+    GitDeleteBranchStatus, GitFetch, GitFetchParams, GitFetchResult, GitFetchStatus,
+    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams, GitResetResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams,
+    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
+    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
+    HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -229,6 +231,10 @@ pub enum Event {
     /// Any `git/stash_*` outcome. One event for all three because the client does the same thing
     /// with each: toast what happened, and refresh the stash picker if it's open.
     StashDone(Result<GitStashResult, String>),
+    /// A `Space g f` fetch finished. Only the *asked-for* fetch reports: the periodic one runs
+    /// server-side and speaks through the status bar, since a toast every quarter of an hour is
+    /// exactly the interruption a background refresh is supposed to avoid.
+    FetchDone(Result<GitFetchResult, String>),
     HunkApplied {
         action: HunkAction,
         /// What the action was aimed at — carried back so the toast can say "file" or "change"
@@ -1136,6 +1142,21 @@ impl Session {
                     }
                     Effects::toast(msg, kind)
                 }
+                Err(e) => Effects::error(e),
+            },
+
+            Event::FetchDone(result) => match result {
+                Ok(r) => match r.status {
+                    // Report the divergence, not the transfer: "fetched" alone leaves the user
+                    // looking for what changed, and the counts are the whole reason to fetch.
+                    GitFetchStatus::Fetched => {
+                        Effects::toast(fetch_summary(r.upstream.as_ref()), ToastKind::Success)
+                    }
+                    GitFetchStatus::NoRemote => {
+                        Effects::toast("No remote configured", ToastKind::Info)
+                    }
+                    GitFetchStatus::Refused => Effects::error(r.message),
+                },
                 Err(e) => Effects::error(e),
             },
 
@@ -6730,6 +6751,9 @@ impl Session {
         // Theme is shell-render-only too: the shells resolve `self.theme` to a role table each
         // frame (web also stamps `data-theme`), so adopting the mode is enough.
         self.theme = settings.theme;
+        // Nothing to apply client-side: the server reads this off disk when its timer fires, so
+        // adopting the value only keeps the overlay row showing the truth.
+        self.git_auto_fetch = settings.git_auto_fetch;
         if settings.wrap != self.wrap {
             let mut fx = Effects::one(Effect::SaveContentAnchor);
             fx.push(Effect::ShellAction(ShellAction::ToggleWrap));
@@ -6791,6 +6815,22 @@ impl Session {
                 self.read_on = self.markdown_read_default;
                 self.persist_app_settings()
             }
+            // Background fetch: the toast is the affordance, because turning this *on* has no
+            // visible effect until the next tick — and turning it on is the moment to be explicit
+            // that the editor will now talk to the network on its own.
+            AppSettingId::GitAutoFetch => {
+                self.git_auto_fetch = !self.git_auto_fetch;
+                let msg = if self.git_auto_fetch {
+                    "Background fetch enabled"
+                } else {
+                    "Background fetch disabled"
+                };
+                self.persist_app_settings().and(Effects::toast_grouped(
+                    msg,
+                    ToastKind::Info,
+                    "git-auto-fetch",
+                ))
+            }
             // Theme: shell-render-only like ligatures — flip the mode + persist; every shell
             // re-resolves its role table on the next render.
             AppSettingId::Theme => {
@@ -6829,6 +6869,7 @@ impl Session {
             hints: self.hints_enabled,
             markdown_read: self.markdown_read_default,
             theme: self.theme,
+            git_auto_fetch: self.git_auto_fetch,
         }
     }
 
@@ -8088,6 +8129,15 @@ impl Session {
                     message: None,
                 },
                 Event::StashDone,
+            ),
+
+            A::GitFetch => self.request_str::<GitFetch>(
+                GitFetchParams {
+                    // Resolved server-side from the buffer we're on, like every other git verb.
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                },
+                Event::FetchDone,
             ),
 
             A::GitUncommit => self.request_str::<GitReset>(
@@ -9382,6 +9432,29 @@ fn has_url_scheme(s: &str) -> bool {
         }
     }
     false
+}
+
+/// What a completed fetch actually told us, phrased as the status bar would read it.
+///
+/// The three cases are genuinely different answers and the wording keeps them apart: no upstream
+/// at all (nothing to be ahead or behind *of*), level with it, and diverged. Naming the upstream
+/// matters in the last case — in a fork workflow "5 behind" is a very different sentence about
+/// `origin/main` than about `upstream/main`.
+fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> String {
+    let Some(up) = upstream else {
+        return "Fetched".to_string();
+    };
+    if up.is_level() {
+        return format!("Fetched — up to date with {}", up.name);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if up.ahead > 0 {
+        parts.push(format!("{} ahead", up.ahead));
+    }
+    if up.behind > 0 {
+        parts.push(format!("{} behind", up.behind));
+    }
+    format!("Fetched — {} {}", parts.join(", "), up.name)
 }
 
 /// The toast to show when a cursor-relative LSP request (hover / goto-definition) couldn't run

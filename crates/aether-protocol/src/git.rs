@@ -74,6 +74,32 @@ impl GitChangeCounts {
     }
 }
 
+/// How far the current branch has diverged from its configured upstream: commits HEAD has that the
+/// upstream doesn't (`ahead`), and commits the upstream has that HEAD doesn't (`behind`).
+///
+/// **A local ref comparison, not a network read.** It answers "how did things stand as of the last
+/// fetch" — nothing here contacts a remote, and a repo that has never been fetched reports zeros
+/// however far the remote has moved. That's why the status bar shows the numbers unqualified: they
+/// are exactly what `git status` would say in the same working directory at the same moment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitUpstreamStatus {
+    /// The upstream ref's shorthand, e.g. `origin/main`. Worth carrying rather than assuming
+    /// `origin`: a fork workflow tracks `upstream/main`, and a divergence count is misleading
+    /// without knowing what it's counting against.
+    pub name: String,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+impl GitUpstreamStatus {
+    /// True when HEAD and the upstream are level. Distinct from *absent*: `None` means there is no
+    /// upstream to compare with (detached, unborn, or a never-pushed branch), which is a different
+    /// thing to say in the status bar than "in sync".
+    pub fn is_level(&self) -> bool {
+        self.ahead == 0 && self.behind == 0
+    }
+}
+
 /// Buffer-level Git status for the status bar: the branch, and the change counts split into staged
 /// (HEAD → index) and unstaged (index → working buffer). `Some` for any file inside a repo (the
 /// counts are zero for a clean / untracked file); `None` outside a repo. The counts here match
@@ -91,6 +117,12 @@ pub struct GitBufferStatus {
     /// Unstaged changes: index → working buffer (`git diff`).
     #[serde(default, skip_serializing_if = "GitChangeCounts::is_empty")]
     pub unstaged: GitChangeCounts,
+    /// Divergence from the branch's upstream, or `None` when there is no upstream to compare
+    /// against — detached HEAD, an unborn branch, or a branch that has never been pushed. See
+    /// [`GitUpstreamStatus`]: local refs only, so it reflects the last fetch rather than the
+    /// remote's current state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<GitUpstreamStatus>,
     /// Set when the repo is diffed against something other than HEAD ([`GitSetBaseline`]). The
     /// gutter then means "changed since this commit" and `staged` is always empty, so clients
     /// must surface this — an unexplained gutter that disagrees with `git diff` is worse than no
@@ -605,6 +637,76 @@ pub enum GitDeleteBranchStatus {
     /// mistake and "switch away first" is more useful than git's phrasing.
     IsCurrentBranch,
     /// Git refused for some other reason; `message` is its stderr.
+    Refused,
+}
+
+// ---- git/fetch -----------------------------------------------------------------------------------
+
+/// How often the server re-fetches when [`crate::settings::AppSettings::git_auto_fetch`] is on.
+///
+/// A fixed cadence rather than a configurable one, per CLAUDE.md's preference for deciding in code:
+/// far enough apart that the network cost is invisible and a credential prompt can't become a
+/// drumbeat, close enough that "3 behind" is a fact about now rather than about this morning.
+/// Lives in the protocol crate so the number has one home even though only the server acts on it.
+pub const AUTO_FETCH_INTERVAL_MINUTES: u64 = 15;
+
+/// Fetch from the remote — update `refs/remotes/**` so the divergence counts
+/// ([`GitUpstreamStatus`]) reflect the remote's current state.
+///
+/// **The one mutation that doesn't move the working tree.** It writes remote-tracking refs and
+/// objects, never HEAD, the index or a file, so it skips the whole dirty-buffer pre-flight that
+/// checkout, stash and pull need: there is nothing it could clobber. Everything it changes is
+/// invisible until the user asks for it.
+///
+/// Plain `git fetch` — the current branch's remote, or `origin`. Not `--all` (an unattended fetch
+/// of every remote in a fork workflow is a surprise), and not `--prune` (deleting local
+/// remote-tracking refs is a decision, not a refresh).
+///
+/// Reachability-gated like the other mutations: a repo reached only through an open buffer — a
+/// dependency checkout a goto-definition landed in — is refused. Not because fetching would harm
+/// it, but because the user never opened it and this reaches the network on their behalf.
+pub struct GitFetch;
+impl RpcMethod for GitFetch {
+    const NAME: &'static str = "git/fetch";
+    type Params = GitFetchParams;
+    type Result = GitFetchResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitFetchParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitFetchResult {
+    pub status: GitFetchStatus,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Divergence **after** the fetch, so the caller can report what arrived ("3 behind") without
+    /// a second round trip. `None` when the branch has no upstream to compare against — which is
+    /// not the same as level, and a fetch is exactly the moment that distinction gets interesting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<GitUpstreamStatus>,
+}
+
+/// How a [`GitFetch`] resolved. Same discipline as [`GitCheckoutStatus`]: every discriminated
+/// variant is one the *server* determined from its own reads, never from matching git's wording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitFetchStatus {
+    #[default]
+    Fetched,
+    /// The repo has no remote configured. Asked of libgit2 before spawning rather than read out of
+    /// git's complaint — and worth distinguishing, because it's the one failure that will never
+    /// succeed on retry, which is what stops the periodic fetcher hammering a local-only repo.
+    NoRemote,
+    /// Git failed; `message` is its stderr. Network down, credentials refused, host unknown — all
+    /// deliberately one variant, because the client's response to each is the same (show git's own
+    /// words) and telling them apart would mean parsing them.
     Refused,
 }
 

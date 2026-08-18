@@ -445,6 +445,10 @@ pub enum Action {
     /// `Space g u` — take back the last commit, leaving its changes staged
     /// (`git reset --soft HEAD^`).
     GitUncommit,
+    /// `Space g f` — fetch from the remote, refreshing the ahead/behind counts in the status bar.
+    /// Touches no file, so unlike the other git verbs it needs no unsaved-work pre-flight. The
+    /// periodic fetcher (the `git_fetch_minutes` app setting) runs the same operation on a timer.
+    GitFetch,
     /// `Space g Alt-z` — shelve the working tree (`git stash push`), taking git's own
     /// `WIP on <branch>` message. The stash *picker* (`Space g z`) is where entries are previewed,
     /// applied, popped and dropped.
@@ -1272,6 +1276,7 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
+    bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
     bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),

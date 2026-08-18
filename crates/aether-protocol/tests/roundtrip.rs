@@ -638,7 +638,7 @@ fn git_change_counts_shape() {
 
 #[test]
 fn git_buffer_status_shape() {
-    use aether_protocol::git::GitBufferStatus;
+    use aether_protocol::git::{GitBufferStatus, GitUpstreamStatus};
     // Clean / outside a repo: branch None, both sides empty → empty object on the wire.
     assert_eq!(to_value(GitBufferStatus::default()).unwrap(), json!({}));
 
@@ -655,10 +655,15 @@ fn git_buffer_status_shape() {
             modified: 0,
             deleted: 0,
         },
+        upstream: None,
         baseline: None,
     };
     let v = to_value(&s).unwrap();
     assert_eq!(v["branch"], "main");
+    // Absent upstream stays absent: "no upstream to compare with" and "level with upstream" are
+    // different answers, and a client that can't tell them apart would report a never-pushed
+    // branch as in sync.
+    assert!(v.get("upstream").is_none());
     assert_eq!(
         v["staged"],
         json!({"added": 0, "modified": 1, "deleted": 0})
@@ -670,6 +675,33 @@ fn git_buffer_status_shape() {
     let back: GitBufferStatus = from_value(v).unwrap();
     assert_eq!(back.branch.as_deref(), Some("main"));
     assert_eq!((back.staged.modified, back.unstaged.added), (1, 2));
+
+    // Divergence rides along when there *is* an upstream, named so a fork workflow can tell
+    // `origin/main` from `upstream/main`. Zeros are carried, not omitted: level is a real answer.
+    let diverged = GitBufferStatus {
+        branch: Some("main".into()),
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 2,
+            behind: 5,
+        }),
+        ..Default::default()
+    };
+    let v = to_value(&diverged).unwrap();
+    assert_eq!(
+        v["upstream"],
+        json!({"name": "origin/main", "ahead": 2, "behind": 5})
+    );
+    let back: GitBufferStatus = from_value(v).unwrap();
+    let up = back.upstream.expect("upstream survives the round trip");
+    assert_eq!((up.ahead, up.behind), (2, 5));
+    assert!(!up.is_level());
+    assert!(GitUpstreamStatus {
+        name: "origin/main".into(),
+        ahead: 0,
+        behind: 0,
+    }
+    .is_level());
 }
 
 #[test]
@@ -4028,6 +4060,7 @@ fn app_settings_wire_shape_and_defaults() {
         hints: false,
         markdown_read: false,
         theme: aether_protocol::settings::ThemeMode::Light,
+        git_auto_fetch: true,
     };
     assert_eq!(
         to_value(s).unwrap(),
@@ -4039,6 +4072,7 @@ fn app_settings_wire_shape_and_defaults() {
             "hints": false,
             "markdown_read": false,
             "theme": "light",
+            "git_auto_fetch": true,
         })
     );
 
@@ -4047,6 +4081,13 @@ fn app_settings_wire_shape_and_defaults() {
     let parsed: AppSettings = from_value(json!({ "wrap": "none" })).unwrap();
     assert_eq!(parsed.wrap, WrapMode::None);
     assert!(parsed.ligatures);
+    // Off by default, and — the point of pinning it here — off for an *existing* settings file
+    // written before this key existed. Unattended network access must never arrive by upgrade.
+    assert!(
+        !parsed.git_auto_fetch,
+        "background fetch must not switch itself on for an existing settings.toml"
+    );
+    assert!(!AppSettings::default().git_auto_fetch);
     assert_eq!(
         parsed.buffer_font_size,
         aether_protocol::settings::default_buffer_font_size()

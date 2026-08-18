@@ -5120,6 +5120,110 @@ fn font_size_settings_step_and_persist_independently() {
     assert_eq!(params["buffer_font_size"], json!(16));
 }
 
+/// The background-fetch setting is off until asked for, and toggling it persists through the same
+/// `settings/set` every other row uses. Off-by-default is the load-bearing half: this is the only
+/// setting that makes the editor talk to the network unprompted.
+#[test]
+fn background_fetch_setting_is_off_by_default_and_persists() {
+    use aether_client::session::AppSettingId;
+    let mut s = session();
+    assert!(!s.git_auto_fetch, "unattended network access is opt-in");
+
+    s.open_app_settings();
+    let row = s
+        .app_setting_rows()
+        .iter()
+        .position(|r| r.id == AppSettingId::GitAutoFetch)
+        .expect("a background-fetch row");
+    let fx = s.app_settings_toggle(row);
+    assert!(s.git_auto_fetch);
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["git_auto_fetch"], json!(true));
+    // Turning it on has no visible effect until the server's next tick, so the toast is the only
+    // confirmation that anything happened.
+    assert!(
+        toast_messages(&fx).iter().any(|m| m.contains("enabled")),
+        "expected an enabled toast, got {:?}",
+        toast_messages(&fx)
+    );
+
+    let fx = s.app_settings_toggle(row);
+    assert!(!s.git_auto_fetch);
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["git_auto_fetch"], json!(false));
+}
+
+/// `Space g f` fetches the repo of the buffer we're on, letting the server resolve it — the client
+/// never needs to know a repo id.
+#[test]
+fn space_g_f_fetches() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = key(&mut s, 'f');
+    let req = find_request(&fx, "git/fetch").expect("git/fetch fired");
+    assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
+    assert!(req.get("buffer_id").is_some());
+}
+
+/// A completed fetch reports the *divergence*, not the transfer: "fetched" on its own leaves the
+/// user hunting for what changed, and the counts are the reason to fetch at all. The three cases
+/// read differently on purpose — no upstream, level, diverged.
+#[test]
+fn a_finished_fetch_reports_what_it_found() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitFetchResult, GitFetchStatus, GitUpstreamStatus};
+
+    let mut s = session();
+    let fetched = |upstream| {
+        Event::FetchDone(Ok(GitFetchResult {
+            status: GitFetchStatus::Fetched,
+            message: String::new(),
+            upstream,
+        }))
+    };
+
+    let fx = s.on_event(fetched(Some(GitUpstreamStatus {
+        name: "origin/main".into(),
+        ahead: 2,
+        behind: 5,
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("2 ahead") && msg.contains("5 behind") && msg.contains("origin/main"),
+        "diverged fetch should name both counts and the upstream, got {msg:?}"
+    );
+
+    let fx = s.on_event(fetched(Some(GitUpstreamStatus {
+        name: "origin/main".into(),
+        ahead: 0,
+        behind: 0,
+    })));
+    assert!(
+        toast_messages(&fx).join(" ").contains("up to date"),
+        "level with upstream is its own message"
+    );
+
+    // No upstream is not "in sync with nothing" — there is simply nothing to report.
+    let fx = s.on_event(fetched(None));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        !msg.contains("up to date") && !msg.contains("behind"),
+        "a branch with no upstream claims no divergence, got {msg:?}"
+    );
+
+    // A refusal surfaces git's own words rather than a paraphrase.
+    let fx = s.on_event(Event::FetchDone(Ok(GitFetchResult {
+        status: GitFetchStatus::Refused,
+        message: "fatal: could not read Username".into(),
+        upstream: None,
+    })));
+    assert!(has_error_toast(&fx));
+    assert!(toast_messages(&fx)
+        .join(" ")
+        .contains("could not read Username"));
+}
+
 #[test]
 fn space_k_toggles_keep_and_guards_unsaved() {
     let mut s = session();

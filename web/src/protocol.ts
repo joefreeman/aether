@@ -149,11 +149,23 @@ export interface GitChangeCounts {
   deleted: number;
 }
 
+/**
+ * Divergence between the current branch and its upstream, from local refs only — it reports the
+ * world as of the last fetch and never contacts a remote. Absent when there is nothing to compare
+ * against (detached, unborn, or a never-pushed branch).
+ */
+export interface GitUpstreamStatus {
+  name: string;
+  ahead: number;
+  behind: number;
+}
+
 /** Buffer-level Git status: branch + staged (HEAD→index) and unstaged (index→buffer) counts. */
 export interface GitBufferStatus {
   branch?: string | null;
   staged?: GitChangeCounts;
   unstaged?: GitChangeCounts;
+  upstream?: GitUpstreamStatus | null;
 }
 
 // ---- cursor -------------------------------------------------------------------------------------

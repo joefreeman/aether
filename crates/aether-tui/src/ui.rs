@@ -6670,7 +6670,20 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
         return parts;
     };
     if let Some(branch) = &status.branch {
-        parts.push(Span::styled(format!("⎇  {branch}"), meta));
+        let mut label = format!("⎇  {branch}");
+        // Upstream divergence rides the branch label in the same colour: it annotates the branch
+        // rather than the file, unlike the change counts. Level (or no upstream at all) renders
+        // nothing — `git status` is silent in both cases too, and a permanent `↑0 ↓0` would be
+        // noise in the one place on screen that has no room for it.
+        if let Some(up) = &status.upstream {
+            if up.ahead > 0 {
+                label.push_str(&format!(" ↑{}", up.ahead));
+            }
+            if up.behind > 0 {
+                label.push_str(&format!(" ↓{}", up.behind));
+            }
+        }
+        parts.push(Span::styled(label, meta));
     }
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [

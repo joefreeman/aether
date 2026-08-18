@@ -50,6 +50,21 @@ pub struct AppSettings {
     /// module) at draw time.
     #[serde(default = "default_theme")]
     pub theme: ThemeMode,
+    /// Periodically `git fetch` the workspaces' repos, so the status bar's ahead/behind counts
+    /// stay current instead of reporting whenever the user last fetched by hand.
+    ///
+    /// Unlike every other setting here this one the *server* acts on — it's the only behaviour in
+    /// the app that reaches the network without being asked, which is exactly why it needs an
+    /// off-switch and why it defaults to **off**. A metered connection, a VPN-gated remote or an
+    /// SSH key with a passphrase all make an unattended fetch a nuisance rather than a
+    /// convenience, and there's no "just don't press the key" escape from a timer.
+    ///
+    /// A toggle rather than an interval: the cadence
+    /// ([`crate::git::AUTO_FETCH_INTERVAL_MINUTES`]-worth, fixed in the server) is a judgement
+    /// call with a good answer, and CLAUDE.md would rather that answer live in code than in
+    /// config surface.
+    #[serde(default = "default_git_auto_fetch")]
+    pub git_auto_fetch: bool,
 }
 
 fn default_wrap() -> WrapMode {
@@ -91,6 +106,11 @@ pub const fn default_theme() -> ThemeMode {
     ThemeMode::Dark
 }
 
+/// Off. Unattended network access is opt-in — see [`AppSettings::git_auto_fetch`].
+fn default_git_auto_fetch() -> bool {
+    false
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
@@ -101,6 +121,7 @@ impl Default for AppSettings {
             hints: default_hints(),
             markdown_read: default_markdown_read(),
             theme: default_theme(),
+            git_auto_fetch: default_git_auto_fetch(),
         }
     }
 }

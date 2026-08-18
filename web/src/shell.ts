@@ -4703,7 +4703,16 @@ export class Shell {
       if (gs.branch) {
         const b = document.createElement("span");
         b.className = "status-git git-branch";
-        b.textContent = `⎇  ${gs.branch}`;
+        // Upstream divergence rides the branch label in the same colour: it annotates the branch
+        // rather than the file, unlike the change counts. Level (or no upstream at all) renders
+        // nothing, matching `git status`'s own silence in both cases.
+        let label = `⎇  ${gs.branch}`;
+        const up = gs.upstream;
+        if (up) {
+          if (up.ahead > 0) label += ` ↑${up.ahead}`;
+          if (up.behind > 0) label += ` ↓${up.behind}`;
+        }
+        b.textContent = label;
         used += [...b.textContent].length + 2;
         gitGroup.append(b);
       }

@@ -25,7 +25,7 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::git::{
-    GitApplyHunk, GitBlameLine, GitCheckout, GitCommit, GitDeleteBranch, GitNavigateHunk,
+    GitApplyHunk, GitBlameLine, GitCheckout, GitCommit, GitDeleteBranch, GitFetch, GitNavigateHunk,
     GitPrepareCommit, GitRefresh, GitRepos, GitReset, GitSetBaseline, GitSetBlameFollow,
     GitSetDiffView, GitShow, GitStashApply, GitStashDrop, GitStashPush,
 };
@@ -506,6 +506,7 @@ async fn dispatch(
         GitStashDrop::NAME => run!(GitStashDrop, handlers::git_stash_drop),
         GitCheckout::NAME => run!(GitCheckout, handlers::git_checkout),
         GitDeleteBranch::NAME => run!(GitDeleteBranch, handlers::git_delete_branch),
+        GitFetch::NAME => run!(GitFetch, handlers::git_fetch),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),
