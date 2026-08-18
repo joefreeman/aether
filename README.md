@@ -195,6 +195,8 @@ operations live behind the `Space g` sub-leader.
 | `Space c`/`Space Alt-c` | Git changes in current file / across the workspace (hunks) |
 | `Space m` | Blame commit details for the cursor line |
 | `Space g s`/`Space g Alt-s` | Stage-unstage / revert the change under the cursor (or selected lines) |
+| `Space g a`/`Space g Alt-a` | Stage-unstage / revert the whole file |
+| `Space g l`/`Space g Alt-l` | History / this file's history |
 | `Space g c`/`Space g Alt-c` | Commit staged changes / amend the previous commit |
 | `Space g u` | Uncommit (keep the changes staged) |
 | `Space g b` | Branches: switch, create, delete |

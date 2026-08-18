@@ -140,6 +140,33 @@ impl RpcMethod for GitApplyHunk {
 pub struct GitApplyHunkParams {
     pub buffer_id: BufferId,
     pub action: HunkAction,
+    /// Which region the action applies to. Defaults to [`ApplyScope::Cursor`] — the shape the
+    /// method is named for. The method name predates the file scope; the *edit* is identical
+    /// either way (index ← buffer for a stage, baseline → buffer for a revert), only the region
+    /// differs, which is why this is a parameter rather than a second RPC.
+    #[serde(default, skip_serializing_if = "ApplyScope::is_cursor")]
+    pub scope: ApplyScope,
+}
+
+/// The region [`GitApplyHunk`] acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyScope {
+    /// Resolve from the client's cursor: a bare cursor addresses the hunk it sits on, a wider
+    /// selection the lines it covers.
+    #[default]
+    Cursor,
+    /// The whole file, wherever the cursor is — `git add <file>` / `git restore --staged <file>`
+    /// in one keystroke, which is the more common gesture than picking off hunks. Toggling
+    /// resolves its direction over the whole file, unstaged-first, exactly as it does for a hunk:
+    /// anything unstaged stages, and a file with nothing unstaged unstages entirely.
+    File,
+}
+
+impl ApplyScope {
+    pub fn is_cursor(&self) -> bool {
+        matches!(self, ApplyScope::Cursor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

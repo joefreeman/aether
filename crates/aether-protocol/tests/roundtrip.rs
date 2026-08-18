@@ -432,6 +432,7 @@ fn git_refresh_shapes() {
 #[test]
 fn git_apply_hunk_roundtrip() {
     let p = GitApplyHunkParams {
+        scope: Default::default(),
         buffer_id: 4,
         action: HunkAction::Toggle,
     };

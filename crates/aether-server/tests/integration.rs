@@ -18,14 +18,14 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCheckout, GitCheckoutParams,
-    GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult,
-    GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitHead,
-    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams, GitRefreshResult,
-    GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams, GitResetResult,
-    GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
+    GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCheckout,
+    GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
+    GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
+    GitDeleteBranchStatus, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams,
+    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams,
+    GitResetResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
     GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams,
     HunkAction, HunkDirection,
 };
@@ -21232,7 +21232,16 @@ async fn apply_hunk(
     buffer_id: u64,
     action: HunkAction,
 ) -> GitApplyHunkResult {
-    send_request::<GitApplyHunk>(ws, id, &GitApplyHunkParams { buffer_id, action }).await
+    send_request::<GitApplyHunk>(
+        ws,
+        id,
+        &GitApplyHunkParams {
+            buffer_id,
+            action,
+            scope: Default::default(),
+        },
+    )
+    .await
 }
 
 /// The file's staged (index) content, or `None` when it has no index entry.
@@ -32102,6 +32111,7 @@ async fn staging_is_refused_against_a_revision_baseline() {
         &mut ws,
         5,
         &GitApplyHunkParams {
+            scope: Default::default(),
             buffer_id,
             action: HunkAction::Toggle,
         },
@@ -32125,6 +32135,7 @@ async fn staging_is_refused_against_a_revision_baseline() {
         &mut ws,
         7,
         &GitApplyHunkParams {
+            scope: Default::default(),
             buffer_id,
             action: HunkAction::Revert,
         },
@@ -33517,6 +33528,114 @@ async fn git_log_matches_hashes_by_prefix_including_longer_than_rendered() {
     // A fragment from the *middle* of the hash matches nothing — prefix semantics, not fuzzy.
     let update = matches_for(&mut ws, 5, head[8..14].to_string(), 3).await;
     assert_eq!(update.total_matches, 0, "{} is not a prefix", &head[8..14]);
+
+    drop(server);
+}
+
+/// Whole-file staging: `Space g a` stages every change in the file wherever the cursor is, and
+/// toggles back the same way — the hunk rule read over the whole file (unstaged-first). This is the
+/// commoner gesture than picking off hunks, which is why it has its own chord rather than needing a
+/// select-all first.
+#[tokio::test]
+async fn apply_hunk_file_scope_stages_and_unstages_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two separate changes, far apart, so a cursor-scoped action could only ever take one.
+    git_commit_file(dir.path(), "edit.rs", "one\ntwo\nthree\nfour\nfive\n");
+    std::fs::write(dir.path().join("edit.rs"), "ONE\ntwo\nthree\nfour\nFIVE\n").unwrap();
+    let (server, mut ws, buffer_id) =
+        setup_git_apply(dir.path(), "file-stage-proj", "edit.rs").await;
+
+    // Cursor sits on the first change; the file scope ignores it and takes both.
+    set_cursor(&mut ws, 3, buffer_id, 0, 1).await;
+    let r: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        4,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Toggle,
+            scope: ApplyScope::File,
+        },
+    )
+    .await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n",
+        "both changes staged, not just the one under the cursor"
+    );
+
+    // Nothing unstaged remains, so the same chord unstages the file entirely.
+    let r: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        5,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Toggle,
+            scope: ApplyScope::File,
+        },
+    )
+    .await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "one\ntwo\nthree\nfour\nfive\n",
+        "back to HEAD's content"
+    );
+
+    drop(server);
+}
+
+/// A clean file has nothing to stage, and says so rather than reporting success.
+#[tokio::test]
+async fn apply_hunk_file_scope_on_a_clean_file_reports_no_change() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "clean.rs", "one\n");
+    let (server, mut ws, buffer_id) =
+        setup_git_apply(dir.path(), "clean-file-proj", "clean.rs").await;
+
+    let r: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        3,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Toggle,
+            scope: ApplyScope::File,
+        },
+    )
+    .await;
+    assert_eq!(r.status, ApplyHunkStatus::NoChange);
+
+    drop(server);
+}
+
+/// The revert half: `Space g Alt-a` restores the whole file to its baseline in one undoable edit,
+/// wherever the cursor is.
+#[tokio::test]
+async fn apply_hunk_file_scope_reverts_the_whole_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "one\ntwo\nthree\n");
+    std::fs::write(dir.path().join("edit.rs"), "ONE\ntwo\nTHREE\n").unwrap();
+    let (server, mut ws, buffer_id) =
+        setup_git_apply(dir.path(), "file-revert-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 0, 1).await;
+    let r: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        4,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Revert,
+            scope: ApplyScope::File,
+        },
+    )
+    .await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 5, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        content.text, "one\ntwo\nthree\n",
+        "every change restored, not just the one under the cursor"
+    );
 
     drop(server);
 }

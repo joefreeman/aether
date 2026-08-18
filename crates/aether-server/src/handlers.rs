@@ -33,14 +33,15 @@ use aether_protocol::directory::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged,
-    GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
-    GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommitParams,
-    GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitHead,
-    GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult,
-    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
-    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollowParams, GitSetDiffViewParams, HunkAction, HunkDirection, RepoId, StagedFile,
+    ApplyHunkStatus, ApplyScope, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef,
+    GitBlameChanged, GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult,
+    GitBufferStatus, GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus,
+    GitCommitParams, GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult,
+    GitDeleteBranchStatus, GitHead, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams, GitRefreshResult,
+    GitRepoInfo, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
+    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams,
+    HunkAction, HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -4052,13 +4053,21 @@ pub async fn git_apply_hunk(
         .unwrap_or_default();
     // Bare cursor (the editor's resting single-char selection) addresses the whole hunk; anything
     // wider snaps to its line span and stages/reverts at line granularity.
-    let sel = if cursor.is_point() {
-        crate::git::HunkSelection::WholeHunkAt(cursor.position.line)
-    } else {
-        crate::git::HunkSelection::Lines {
+    let sel = match params.scope {
+        // Every line, wherever the cursor is. The direction logic below is unchanged: a file
+        // holding anything unstaged stages entirely, one holding only staged changes unstages
+        // entirely — the hunk rule, read over the whole file.
+        ApplyScope::File => crate::git::HunkSelection::Lines {
+            lo: 0,
+            hi: u32::MAX,
+        },
+        ApplyScope::Cursor if cursor.is_point() => {
+            crate::git::HunkSelection::WholeHunkAt(cursor.position.line)
+        }
+        ApplyScope::Cursor => crate::git::HunkSelection::Lines {
             lo: cursor.anchor.line.min(cursor.position.line),
             hi: cursor.anchor.line.max(cursor.position.line),
-        }
+        },
     };
 
     let Some(baseline) = s.git_baseline.get(&buffer_id) else {

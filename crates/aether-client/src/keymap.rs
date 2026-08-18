@@ -12,6 +12,7 @@
 //! time, and tables are scanned in order so more-specific chords precede catch-alls.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
+use aether_protocol::git::ApplyScope;
 use aether_protocol::input::{BlockUnit, CommentStyle, SurroundTarget};
 use aether_protocol::picker::PickerKind;
 
@@ -426,10 +427,16 @@ pub enum Action {
     /// repeatable motions ([`Action::is_repeatable`]) and a three-key prefix would ruin them.
     NextHunk,
     PrevHunk,
-    /// `Space g s` — stage/unstage the hunk under the cursor (or the selected lines).
-    ToggleStageHunk,
-    /// `Space g Alt-s` — revert that change instead.
-    RevertHunk,
+    /// Stage/unstage a change: `Space g s` takes the hunk under the cursor (or the selected
+    /// lines), `Space g a` the whole file — the more common gesture, and the reason the scope is a
+    /// parameter rather than a separate action.
+    ToggleStage {
+        scope: ApplyScope,
+    },
+    /// The same two scopes, reverting instead: `Space g Alt-s` and `Space g Alt-a`.
+    RevertChange {
+        scope: ApplyScope,
+    },
     /// `Space g c` — start a commit: prepare the message file server-side and open it as a buffer.
     /// `amend` (`Space g Alt-c`) rewrites the previous commit instead of adding one.
     GitCommit {
@@ -1246,7 +1253,7 @@ static LEADER: &[Binding] = &[
 ///
 /// Reserved for docs/git-phase-2.md's remaining stages, so the shape is decided once rather than
 /// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
-/// `a`/`Alt-a` stage/revert a whole file, `f`/`Alt-f` fetch/pull,
+/// `f`/`Alt-f` fetch/pull,
 /// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord), `z`/`Alt-z` the
 /// stash picker and stash-working-tree, `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
 /// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
@@ -1254,8 +1261,10 @@ static LEADER: &[Binding] = &[
 /// different ref walk.
 #[rustfmt::skip]
 static LEADER_GIT: &[Binding] = &[
-    bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
-    bind!(LG, ch('s'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
+    bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::Cursor }, "Git", "Stage/unstage change (hunk/selection)"),
+    bind!(LG, ch('s'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::Cursor }, "Git", "Revert change"),
+    bind!(LG, ch('a'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::File }, "Git", "Stage/unstage whole file"),
+    bind!(LG, ch('a'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::File }, "Git", "Revert whole file"),
     bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
@@ -1567,9 +1576,29 @@ mod tests {
         let git = |code, mods| lookup(KeyContext::LeaderGit, code, mods).map(|b| b.action);
         assert!(matches!(
             git(ch('s'), Mods::NONE),
-            Some(Action::ToggleStageHunk)
+            Some(Action::ToggleStage {
+                scope: ApplyScope::Cursor
+            })
         ));
-        assert!(matches!(git(ch('s'), Mods::ALT), Some(Action::RevertHunk)));
+        assert!(matches!(
+            git(ch('s'), Mods::ALT),
+            Some(Action::RevertChange {
+                scope: ApplyScope::Cursor
+            })
+        ));
+        // The same pair one scope wider: `a` takes the whole file, the commoner gesture.
+        assert!(matches!(
+            git(ch('a'), Mods::NONE),
+            Some(Action::ToggleStage {
+                scope: ApplyScope::File
+            })
+        ));
+        assert!(matches!(
+            git(ch('a'), Mods::ALT),
+            Some(Action::RevertChange {
+                scope: ApplyScope::File
+            })
+        ));
         assert!(matches!(
             git(ch('c'), Mods::NONE),
             Some(Action::GitCommit { amend: false })
@@ -1596,8 +1625,6 @@ mod tests {
         // The old single-key homes are free — a stale reflex does nothing rather than something
         // else (`a` stage, `i` diff, `t` commit, `u` uncommit, `y` branches).
         for (code, mods) in [
-            (ch('a'), Mods::NONE),
-            (ch('a'), Mods::ALT),
             (ch('i'), Mods::NONE),
             (ch('t'), Mods::NONE),
             (ch('t'), Mods::ALT),

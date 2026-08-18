@@ -45,14 +45,14 @@ use aether_protocol::envelope::RpcMethod;
 use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCheckout, GitCheckoutParams,
-    GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult,
-    GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,
-    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams, GitResetResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction,
-    HunkDirection,
+    ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
+    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCheckout,
+    GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams,
+    GitCommitResult, GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult,
+    GitDeleteBranchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams,
+    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -227,6 +227,9 @@ pub enum Event {
     },
     HunkApplied {
         action: HunkAction,
+        /// What the action was aimed at — carried back so the toast can say "file" or "change"
+        /// rather than making the user infer how much just moved.
+        scope: ApplyScope,
         result: Result<GitApplyHunkResult, String>,
     },
     DiffViewSet {
@@ -1096,17 +1099,36 @@ impl Session {
                 },
             },
 
-            Event::HunkApplied { action, result } => match result {
+            Event::HunkApplied {
+                action,
+                scope,
+                result,
+            } => match result {
                 Ok(r) => {
                     self.buffer.cursor = r.cursor;
+                    // The wording names what was acted on — "Staged file" after `Space g a` and
+                    // "Staged change" after `Space g s` — because at a glance the toast is the
+                    // only confirmation of *how much* just moved into the index.
+                    let whole_file = scope == ApplyScope::File;
                     let (msg, kind) = match r.status {
+                        ApplyHunkStatus::Staged if whole_file => {
+                            ("Staged file", ToastKind::Success)
+                        }
+                        ApplyHunkStatus::Unstaged if whole_file => {
+                            ("Unstaged file", ToastKind::Success)
+                        }
+                        ApplyHunkStatus::Reverted if whole_file => {
+                            ("Reverted file", ToastKind::Success)
+                        }
                         ApplyHunkStatus::Staged => ("Staged change", ToastKind::Success),
                         ApplyHunkStatus::Unstaged => ("Unstaged change", ToastKind::Success),
                         ApplyHunkStatus::Reverted => ("Reverted change", ToastKind::Success),
                         ApplyHunkStatus::NoChange => (
-                            match action {
-                                HunkAction::Toggle => "No change here",
-                                HunkAction::Revert => "No change to revert here",
+                            match (action, whole_file) {
+                                (HunkAction::Toggle, false) => "No change here",
+                                (HunkAction::Revert, false) => "No change to revert here",
+                                (HunkAction::Toggle, true) => "Nothing to stage in this file",
+                                (HunkAction::Revert, true) => "Nothing to revert in this file",
                             },
                             ToastKind::Info,
                         ),
@@ -7932,8 +7954,8 @@ impl Session {
                     Event::HunkNav,
                 )
             }
-            A::ToggleStageHunk | A::RevertHunk => {
-                let hunk_action = if matches!(action, A::ToggleStageHunk) {
+            A::ToggleStage { scope } | A::RevertChange { scope } => {
+                let hunk_action = if matches!(action, A::ToggleStage { .. }) {
                     HunkAction::Toggle
                 } else {
                     HunkAction::Revert
@@ -7942,9 +7964,11 @@ impl Session {
                     GitApplyHunkParams {
                         buffer_id,
                         action: hunk_action,
+                        scope,
                     },
                     move |result| Event::HunkApplied {
                         action: hunk_action,
+                        scope,
                         result,
                     },
                 )
