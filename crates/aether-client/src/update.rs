@@ -2058,10 +2058,17 @@ impl Session {
         self.on_event(event)
     }
 
+    /// Send an edit RPC — the single client-side funnel for every buffer mutation, mirroring the
+    /// server's `apply_edit`. A read-only buffer (a revision materialised by `git/show`) declines
+    /// here with a toast rather than paying a round trip to be refused: the server is still the
+    /// authority, this just makes holding a key down quiet instead of a stream of errors.
     pub fn edit<M>(&mut self, params: M::Params) -> Effects
     where
         M: RpcMethod<Result = EditResult> + 'static,
     {
+        if self.buffer.read_only {
+            return Effects::toast("Buffer is read-only", ToastKind::Warning);
+        }
         self.request_str::<M>(params, Event::EditDone)
     }
 
@@ -2930,6 +2937,10 @@ impl Session {
                             | PickerKind::DocumentSymbols
                             | PickerKind::GitChangesFile
                             | PickerKind::GitBranches
+                            // Both log pickers resolve their repo from the buffer; the file-locked
+                            // one additionally takes its path from it.
+                            | PickerKind::GitLog
+                            | PickerKind::GitLogFile
                     ))
                 .then_some(buffer_id),
                 from_selection,
@@ -4099,6 +4110,20 @@ impl Session {
             PickerItem::Root { path_index, .. } => {
                 let dir = self.workspace_paths.get(*path_index as usize).cloned();
                 return self.explorer_navigate(dir, false, None);
+            }
+            PickerItem::GitCommit { repo_id, hash, .. } => {
+                // The row *is* the revision, so this needs no resolution: `git/show` materialises
+                // the commit as a read-only virtual buffer and the result adopts exactly like a
+                // `buffer/open` (same shape), so the picker closes onto the diff.
+                let params = aether_protocol::git::GitShowParams {
+                    repo_id: repo_id.clone(),
+                    rev: hash.clone(),
+                    path: None,
+                };
+                let hide = self.close_picker();
+                return hide.and(
+                    self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
+                );
             }
             PickerItem::GitBranch {
                 repo_id,
@@ -7622,6 +7647,11 @@ impl Session {
 
             // ---- mode transitions ----
             A::EnterInsert(where_) => {
+                // Refused up front rather than letting the mode change and toasting per keystroke:
+                // a read-only buffer has nothing Insert mode could do.
+                if self.buffer.read_only {
+                    return Effects::toast("Buffer is read-only", ToastKind::Warning);
+                }
                 self.mode = Mode::Insert;
                 self.enter_insert_at(where_)
             }

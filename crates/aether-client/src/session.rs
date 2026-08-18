@@ -86,6 +86,10 @@ pub struct BufferInfo {
     pub transient: bool,
     /// The language server backing this buffer, if any — keys `lsp/status_changed` updates.
     pub lsp_server: Option<LspServerRef>,
+    /// The buffer refuses edits, saves and reloads — a *virtual* buffer holding a revision's
+    /// content (`git/show`). The server is the authority; the client declines locally so a
+    /// keystroke doesn't cost a round trip to be told no, and marks it in the status bar.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1473,6 +1477,7 @@ impl Session {
                 scroll: None,
                 transient: false,
                 lsp_server: None,
+                read_only: false,
             },
         )
     }
@@ -1506,10 +1511,13 @@ pub fn label_for_path(path: &str, roots: &[String]) -> String {
 }
 
 pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
-    let label = match (&open.path, open.scratch_number) {
-        (Some(path), _) => label_for_path(path, roots),
-        (None, Some(n)) => format!("(scratch {n})"),
-        (None, None) => "(scratch)".into(),
+    // A virtual buffer (a revision materialised by `git/show`) is pathless but named: the server
+    // supplies the title, since only it knows what revision this is.
+    let label = match (&open.path, &open.title, open.scratch_number) {
+        (Some(path), _, _) => label_for_path(path, roots),
+        (None, Some(title), _) => title.clone(),
+        (None, None, Some(n)) => format!("(scratch {n})"),
+        (None, None, None) => "(scratch)".into(),
     };
     BufferInfo {
         buffer_id: open.buffer_id,
@@ -1522,6 +1530,7 @@ pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
         scroll: open.scroll,
         transient: open.transient,
         lsp_server: open.lsp_server,
+        read_only: open.read_only,
     }
 }
 

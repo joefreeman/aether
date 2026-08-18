@@ -2003,6 +2003,8 @@ async fn open_restored_scratch(
         scroll,
         lsp_server: None, // scratch buffers are never language-server-backed
         transient: buf.transient,
+        title: None,
+        read_only: false,
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
@@ -2015,6 +2017,125 @@ async fn open_restored_scratch(
         let _ = sender.send(notif).await;
     }
     Ok(result)
+}
+
+/// `git/show`: materialise a revision into a read-only virtual buffer (docs/git-phase-2.md
+/// decision 4) — the commit's patch, or one file as of that commit.
+///
+/// Resolution is against **reachable** repos, not writable ones: this is a read, and decision 2 is
+/// explicit that a repo reachable only through an open buffer stays fully read-eligible. Nothing
+/// here can mutate anything, so the reachability guard that protects writes doesn't apply.
+///
+/// Re-showing the same `(repo, rev, path)` attaches to the existing buffer — the pathless
+/// equivalent of the canonical-path sharing key — so walking a log picker doesn't leave a trail of
+/// duplicates. The content is generated off the lock: a large commit's patch is O(diff), which has
+/// no business on the keystroke path's mutex.
+pub async fn git_show(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::git::GitShowParams,
+) -> Result<BufferOpenResult, RpcError> {
+    let client_id = ctx.client_id;
+    let key = match &params.path {
+        Some(path) => format!("{}@{}:{}", params.repo_id, params.rev, path),
+        None => format!("{}@{}", params.repo_id, params.rev),
+    };
+
+    // Already open? Attach to it — same buffer, same cursor, no regeneration.
+    {
+        let s = state.lock().await;
+        let workspace = s.active_workspace_or_err(client_id)?.id.clone();
+        let existing = s.buffers_in_workspace(&workspace).into_iter().find(|id| {
+            s.buffers
+                .get(id)
+                .and_then(|b| s.documents.get(&b.document))
+                .and_then(|d| d.virtual_source.as_ref())
+                .is_some_and(|v| v.key == key)
+        });
+        if let Some(buffer_id) = existing {
+            drop(s);
+            return buffer_open_inner(
+                state,
+                ctx,
+                BufferOpenParams {
+                    buffer_id: Some(buffer_id),
+                    transient: params_transient_of(&params),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+    }
+
+    let workdir = {
+        let s = state.lock().await;
+        std::path::PathBuf::from(resolve_repo(&s, client_id, &params.repo_id)?.repo_id)
+    };
+    let (rev, path) = (params.rev.clone(), params.path.clone());
+    let content = tokio::task::spawn_blocking(move || match &path {
+        Some(path) => crate::git::show_file(&workdir, &rev, path),
+        None => crate::git::show_commit(&workdir, &rev),
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("git show: {e}")))?
+    .map_err(RpcError::git_show_failed)?;
+
+    let mut s = state.lock().await;
+    let active_workspace_name = s.active_workspace_or_err(client_id)?.id.clone();
+    let id = s.allocate_buffer_id();
+    let doc_id = s.allocate_document_id();
+    let doc = Document::virtual_content(
+        doc_id,
+        crate::state::VirtualSource {
+            key,
+            title: content.title.clone(),
+        },
+        content.text,
+        content.language,
+    );
+    // Transient: a revision view is a preview, so it closes itself once nothing shows it. Since a
+    // read-only buffer can never be promoted by an edit or a save, `Space k` is the only way to
+    // pin one — which is exactly the affordance a user wants for "keep this diff open".
+    let buf = Buffer {
+        id,
+        document: doc_id,
+        scratch_number: None,
+        transient: true,
+    };
+    let result = BufferOpenResult {
+        buffer_id: id,
+        language: doc.language.clone(),
+        line_count: doc.line_count(),
+        byte_count: doc.byte_count(),
+        revision: doc.revision,
+        saved_revision: doc.saved_revision(),
+        path: None,
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None, // no file on disk for a server to have an opinion about
+        transient: buf.transient,
+        title: Some(content.title),
+        read_only: true,
+    };
+    s.documents.insert(doc_id, doc);
+    s.buffers.insert(id, buf);
+    s.buffer_workspaces
+        .insert(id, active_workspace_name.clone());
+    s.touch_mru(id);
+    let pushes = refresh_buffer_pickers(&mut s);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
+}
+
+/// Re-showing an already-open revision keeps whatever pinned state it has: `None` leaves the
+/// transient flag alone, so a buffer the user kept with `Space k` doesn't silently become a
+/// preview again.
+fn params_transient_of(_params: &aether_protocol::git::GitShowParams) -> Option<bool> {
+    None
 }
 
 async fn buffer_open_inner(
@@ -2079,6 +2200,10 @@ async fn buffer_open_inner(
         let revision = doc.revision;
         let saved_revision = doc.saved_revision();
         let path = doc.canonical_path.as_ref().map(|p| p.display().to_string());
+        // The only reopen path that can meet a virtual buffer: switching back to one through the
+        // buffers picker, which opens by id because there's no path to dispatch on.
+        let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
+        let read_only = doc.read_only();
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
         let clamped_anchor = params
             .jump_to_anchor
@@ -2100,6 +2225,8 @@ async fn buffer_open_inner(
             scroll,
             lsp_server: buffer_lsp_server_ref(&s, buffer_id),
             transient: s.buffers[&buffer_id].transient,
+            title: virtual_title,
+            read_only,
         };
         s.touch_mru(buffer_id);
         pushes.extend(refresh_buffer_pickers(&mut s));
@@ -2162,6 +2289,8 @@ async fn buffer_open_inner(
                     scroll,
                     lsp_server: None, // scratch buffers are never language-server-backed
                     transient: buf.transient,
+                    title: None,
+                    read_only: false,
                 };
                 s.documents.insert(doc_id, doc);
                 s.buffers.insert(id, buf);
@@ -2275,6 +2404,8 @@ async fn buffer_open_inner(
                 scroll,
                 lsp_server: buffer_lsp_server_ref(&s, existing),
                 transient: s.buffers[&existing].transient,
+                title: None,
+                read_only: false,
             };
             s.touch_mru(existing);
             pushes.extend(refresh_buffer_pickers(&mut s));
@@ -2486,6 +2617,8 @@ async fn buffer_open_inner(
         scroll,
         lsp_server: buffer_lsp_server_ref(&s, id),
         transient,
+        title: None,
+        read_only: false,
     };
     s.touch_mru(id);
     let mut pushes = refresh_buffer_pickers(&mut s);
@@ -2804,6 +2937,44 @@ pub async fn git_prepare_commit(
 /// Which repo a commit is for: the explicit `repo_id`, else the repo of the buffer the user is
 /// looking at, else the workspace's only writable repo. Ambiguity is an error rather than a guess
 /// — committing to the wrong repo is not recoverable by pressing undo.
+/// How far the log walk goes before giving up: **commits examined**, not rows produced. The
+/// whole-repo walk makes those the same, but the file-scoped one diffs each commit against its
+/// parent, so a narrow path in a deep history could walk indefinitely to fill one screen.
+///
+/// 20k is well past what anyone scrolls and costs tens of milliseconds for the repo log. The
+/// picker reports hitting it (`PickerViewResult::truncated`) rather than pretending the history
+/// ended, because the query filters what was loaded.
+const LOG_MAX_EXAMINED: usize = 20_000;
+
+/// Repo resolution for a **read** — the log picker. Wider than [`resolve_writable_repo`] on
+/// purpose: decision 2 keeps a repo that's only reachable through an open buffer fully
+/// read-eligible ("gutter, blame, log all work"), and nothing this picker offers can mutate
+/// anything. Ambiguity still refuses rather than guessing, exactly as it does for a write.
+fn resolve_readable_repo(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: Option<BufferId>,
+) -> Result<GitRepoInfo, RpcError> {
+    let repos = reachable_repos(s, client_id)?;
+    if let Some(buffer_id) = buffer_id {
+        if let Some(workdir) = s
+            .git_baseline
+            .get(&buffer_id)
+            .and_then(|b| b.repo.as_ref())
+            .map(|r| path_string(&r.workdir))
+        {
+            if let Some(repo) = repos.iter().find(|r| r.repo_id == workdir) {
+                return Ok(repo.clone());
+            }
+        }
+    }
+    match repos.len() {
+        1 => Ok(repos.into_iter().next().expect("checked len")),
+        0 => Err(RpcError::repo_not_found("no repo in this workspace")),
+        _ => Err(RpcError::ambiguous_repo()),
+    }
+}
+
 fn resolve_writable_repo(
     s: &ServerState,
     client_id: ClientId,
@@ -6762,6 +6933,17 @@ pub async fn buffer_save(
     params: BufferSaveParams,
 ) -> Result<BufferSaveResult, RpcError> {
     let _client_id = ctx.client_id;
+    {
+        // A virtual buffer has no file behind it and its content is a snapshot of something
+        // already immutable — including via save-as, which would only make a copy nobody asked
+        // the editor for.
+        let s = state.lock().await;
+        if s.try_doc_of(params.buffer_id)
+            .is_some_and(|d| d.read_only())
+        {
+            return Err(RpcError::read_only_buffer(params.buffer_id));
+        }
+    }
 
     // Resolve the target absolute path.
     let target: std::path::PathBuf = match (params.path_index, params.relative_path.as_deref()) {
@@ -6962,6 +7144,12 @@ pub async fn buffer_reload(
 ) -> Result<BufferReloadResult, RpcError> {
     let _client_id = ctx.client_id;
     let mut s = state.lock().await;
+    // Nothing to reload from: the content came from a revision, not a file.
+    if s.try_doc_of(params.buffer_id)
+        .is_some_and(|d| d.read_only())
+    {
+        return Err(RpcError::read_only_buffer(params.buffer_id));
+    }
     if !params.force {
         let buf = s
             .try_doc_of(params.buffer_id)
@@ -12386,6 +12574,11 @@ async fn apply_edit_reporting(
     let buf = s
         .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    // Every `input/*` funnels through here, so one guard covers the whole edit surface: a virtual
+    // buffer holds a revision's content and there is nothing an edit against it could mean.
+    if buf.read_only() {
+        return Err(RpcError::read_only_buffer(buffer_id));
+    }
     let cursor = s
         .cursors
         .get(&(client_id, buffer_id))
@@ -13266,10 +13459,13 @@ fn buffer_candidate(
     doc: &Document,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let display = match doc.canonical_path.as_deref() {
-        Some(p) => crate::workspace_index::workspace_relative_display(p, roots)
+    let display = match (doc.canonical_path.as_deref(), &doc.virtual_source) {
+        (Some(p), _) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
-        None => format!(
+        // A virtual buffer is pathless but named: show the revision title rather than calling a
+        // commit's diff "(scratch 3)".
+        (None, Some(v)) => v.title.clone(),
+        (None, None) => format!(
             "(scratch {})",
             buf.scratch_number.map(u64::from).unwrap_or(buf.id)
         ),
@@ -14162,6 +14358,9 @@ struct CursorCentering {
     /// The buffer itself — the jumplist's identity for a pathless (scratch) buffer, which can be
     /// a captured target in its own right (`crate::jumplist::location_of`).
     buffer_id: BufferId,
+    /// The revision this buffer *is*, for a `git/show` virtual buffer — the log picker's "where
+    /// you are". `None` for an ordinary file buffer.
+    revision: Option<String>,
 }
 
 pub async fn picker_view(
@@ -14190,6 +14389,10 @@ pub async fn picker_view(
     // Explorer carries its committed anchor (path the query peeks relative to) + whether the peek
     // resolved, out of the candidate-building phase so the hydration phase below can persist both.
     let mut explorer_anchor_to_set: Option<(picker_state::ExplorerAnchorInfo, bool)> = None;
+    // The log walk's "stopped at the cap" verdict, carried out of the candidate build so the
+    // hydration phase can store it on the slot (a scroll re-view keeps the snapshot and must keep
+    // reporting it). `None` on a re-view, which leaves the stored flag alone.
+    let mut log_truncated: Option<bool> = None;
     let candidates = match params.kind {
         PickerKind::Files => {
             // Walk the workspace outside the global lock — on first call it can take seconds.
@@ -14464,6 +14667,69 @@ pub async fn picker_view(
         // carries no `buffer_id`, so a multi-repo workspace would fall through to the
         // "exactly one writable repo" rule and fail the scroll with `ambiguous_repo`.
         PickerKind::GitBranches => picker_state::PickerCandidates::GitBranches(Vec::new()),
+        // The log: one repo's history, newest first. Resolved against *reachable* repos rather
+        // than writable ones — reading history is not a mutation, and decision 2 keeps a repo
+        // that's only reachable through an open buffer fully read-eligible. Ambiguity still
+        // refuses rather than guessing.
+        //
+        // `GitLogFile` narrows to the active buffer's repo-relative path, the same
+        // buffer-locked shape `GitChangesFile` has.
+        kind @ (PickerKind::GitLog | PickerKind::GitLogFile)
+            if params.reset == PickerReset::All =>
+        {
+            let (workdir, path) = {
+                let s = state.lock().await;
+                let repo = resolve_readable_repo(&s, client_id, params.buffer_id)?;
+                let workdir = std::path::PathBuf::from(&repo.repo_id);
+                // The path is repo-relative, so it survives a root that is a subdirectory of the
+                // repo — the file log follows the file, not the workspace's view of it.
+                let path = match kind {
+                    PickerKind::GitLogFile => {
+                        let doc = params.buffer_id.and_then(|b| s.try_doc_of(b));
+                        let from_disk =
+                            doc.and_then(|d| d.canonical_path.clone()).and_then(|abs| {
+                                abs.strip_prefix(&workdir).ok().map(|rel| {
+                                    rel.components()
+                                        .map(|c| c.as_os_str().to_string_lossy())
+                                        .collect::<Vec<_>>()
+                                        .join("/")
+                                })
+                            });
+                        // A `git/show <rev>:<path>` buffer has no file on disk but does name a
+                        // path — asking for "this file's history" from one is a reasonable thing
+                        // to do, so take the path out of its key rather than refusing.
+                        let from_revision = doc
+                            .and_then(|d| d.virtual_source.as_ref())
+                            .and_then(|v| v.key.split_once(':'))
+                            .map(|(_, path)| path.to_string());
+                        Some(
+                            from_disk
+                                .or(from_revision)
+                                .ok_or_else(RpcError::buffer_has_no_path)?,
+                        )
+                    }
+                    _ => None,
+                };
+                (workdir, path)
+            };
+            let repo_id = workdir.to_string_lossy().into_owned();
+            let (rows, truncated) = tokio::task::spawn_blocking(move || {
+                crate::git::log_commits(&workdir, path.as_deref(), LOG_MAX_EXAMINED)
+            })
+            .await
+            .unwrap_or_default();
+            log_truncated = Some(truncated);
+            picker_state::PickerCandidates::GitLog(
+                rows.into_iter()
+                    .map(|row| picker_state::GitCommitCandidate::new(repo_id.clone(), row))
+                    .collect(),
+            )
+        }
+        // Scroll / resume re-view: keep the snapshot (and its truncation verdict) rather than
+        // re-walking history per page.
+        PickerKind::GitLog | PickerKind::GitLogFile => {
+            picker_state::PickerCandidates::GitLog(Vec::new())
+        }
     };
 
     let mut s = state.lock().await;
@@ -14491,10 +14757,23 @@ pub async fn picker_view(
                     .try_doc_of(buffer_id)
                     .and_then(|b| b.canonical_path.as_deref())
                     .map(|p| p.to_string_lossy().into_owned());
+                // A virtual buffer's key is `<repo>@<rev>[:<path>]`; the rev is what the log
+                // picker centres on.
+                let revision = s
+                    .try_doc_of(buffer_id)
+                    .and_then(|d| d.virtual_source.as_ref())
+                    .and_then(|v| v.key.rsplit_once('@'))
+                    .map(|(_, rest)| {
+                        rest.split_once(':')
+                            .map(|(rev, _)| rev)
+                            .unwrap_or(rest)
+                            .to_string()
+                    });
                 Some(CursorCentering {
                     leading_edge,
                     abs_path: current_abs,
                     buffer_id,
+                    revision,
                 })
             }
             _ => None,
@@ -14613,6 +14892,13 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::GitBranches(_),
                     picker_state::PickerCandidates::GitBranches(new),
                 ) => new.is_empty(),
+                // The log: a fresh open walks and rebuilds; a re-view sends the empty placeholder
+                // and keeps the snapshot, so a page-down neither re-walks history nor risks
+                // shuffling rows mid-scroll.
+                (
+                    picker_state::PickerCandidates::GitLog(_),
+                    picker_state::PickerCandidates::GitLog(new),
+                ) => new.is_empty(),
                 _ => false,
             };
             if !preserve_existing {
@@ -14622,6 +14908,12 @@ pub async fn picker_view(
         }
     }
     let picker = pickers.get_mut(&key).expect("populated above");
+
+    // A fresh log walk reports whether it stopped at the cap; a re-view leaves the stored verdict
+    // alone, since it kept that same snapshot.
+    if let Some(truncated) = log_truncated {
+        picker.truncated = truncated;
+    }
 
     // Commit the resolved Explorer anchor (navigation moved the directory) + the peek-missing flag.
     // Only set for actual directory listings — Roots mode leaves the prior anchor untouched so
@@ -14684,6 +14976,19 @@ pub async fn picker_view(
     // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =
         match (cursor_centering_info.as_ref(), &picker.candidates) {
+            // The log: land on the commit the active buffer *is*, so opening the log from a
+            // `git/show` buffer shows you where that commit sits in history. Nothing to resolve
+            // from an ordinary buffer — the list then opens at the top, which is the newest commit.
+            (
+                Some(CursorCentering {
+                    revision: Some(rev),
+                    ..
+                }),
+                picker_state::PickerCandidates::GitLog(v),
+            ) => v
+                .iter()
+                .position(|c| c.hash == *rev)
+                .map(|idx| picker.candidates.make_item(idx, Vec::new())),
             // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
@@ -14794,6 +15099,10 @@ pub async fn picker_view(
         directory_parent,
         filters: picker.filters.clone(),
         path_filterable,
+        // The log walk stopped at its cap: the client says so, because the query filters what was
+        // loaded and "no matches" would otherwise be indistinguishable from "older than the cap".
+        // Stored on the picker so a scroll re-view (which doesn't re-walk) still reports it.
+        truncated: picker.truncated,
         collapsible: picker.collapsible(),
         // Carry the window on the response too — see `PickerViewResult::update`. The push below
         // stays for redundancy (and for the async grep walk's later updates).

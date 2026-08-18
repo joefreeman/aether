@@ -101,6 +101,17 @@ impl RpcError {
         )
     }
 
+    pub fn git_show_failed(detail: impl std::fmt::Display) -> Self {
+        Self::new(ErrorCode::GIT_SHOW_FAILED, format!("git show: {detail}"))
+    }
+
+    pub fn read_only_buffer(buffer_id: aether_protocol::BufferId) -> Self {
+        Self::new(
+            ErrorCode::READ_ONLY_BUFFER,
+            format!("buffer {buffer_id} is read-only"),
+        )
+    }
+
     pub fn buffer_has_no_path() -> Self {
         Self::new(
             ErrorCode::BUFFER_HAS_NO_PATH,

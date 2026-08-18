@@ -142,6 +142,26 @@ pub enum PickerKind {
     /// "+ Create" row, which creates *and* switches — that is also what makes the picker usable in
     /// a repo with an unborn HEAD, where there are no branches to list at all.
     GitBranches,
+    /// One repo's commit history (`Space g l`, docs/git-phase-2.md stage 4), newest first —
+    /// the editor's `git log`. Rows are [`PickerItem::GitCommit`]; `Enter` opens the commit as a
+    /// read-only virtual buffer (`git/show`), so it is not a file jump and has no
+    /// `PickerSelectResult`.
+    ///
+    /// The query **filters what has been loaded** rather than re-running a search: matching is
+    /// fuzzy over the composed haystack of subject, author and short hash, and no keystroke
+    /// re-walks history. That makes the walk's cap part of the contract — see
+    /// [`PickerViewResult::truncated`].
+    GitLog,
+    /// The commit history of a *single* file — the modal sibling of [`GitLog`] (`Space g Alt-l`),
+    /// locked to [`PickerViewParams::buffer_id`] exactly as [`GitChangesFile`](Self::GitChangesFile)
+    /// is. Its own state slot.
+    ///
+    /// "History of this path", not of the file's identity: a rename ends the history, because
+    /// following renames is a separate mechanism (git's `--follow`) rather than a filter on the
+    /// walk. Materially more expensive than [`GitLog`] too — the walk has to diff each commit
+    /// against its parent to know whether the path was touched — which is why the cap counts
+    /// commits *examined*, not rows produced.
+    GitLogFile,
 }
 
 impl PickerKind {
@@ -222,17 +242,22 @@ impl PickerKind {
         )
     }
 
-    /// Whether `picker/view`'s `center_on_cursor` applies — the picker can resolve a result near
-    /// the buffer's cursor and open framed on it (the changes pickers' nearest hunk, the
-    /// jumplist's nearest entry). Wider than [`Self::groups_by_file`]: it includes the
-    /// headerless buffer-locked changes picker, which still wants to land on "where you are".
+    /// Whether `picker/view`'s `center_on_cursor` applies — the picker resolves "where you are"
+    /// **server-side from the named buffer** and opens framed on it. The field carries a buffer id
+    /// and the answer is per kind: the changes pickers take the hunk nearest the cursor, the
+    /// jumplist its nearest entry, and the log pickers the commit the buffer *is* — a `git/show`
+    /// buffer holds one, so opening the log from it lands on that row. (The name is a slight
+    /// stretch for that last one: the cursor plays no part, the buffer's identity does.)
     ///
     /// This is what carries the weight now that no picker resumes its highlight
-    /// ([`PickerReset`]): "where you are" is derived from the live cursor on every open, so it
-    /// can't go stale the way a saved selection did. Grep is deliberately absent — it opens with no
-    /// hits to frame, so there is nothing for a cursor to resolve against.
+    /// ([`PickerReset`]): "where you are" is derived on every open, so it can't go stale the way a
+    /// saved selection did. Grep is deliberately absent — it opens with no hits to frame, so there
+    /// is nothing to resolve against.
     pub fn centers_on_cursor(self) -> bool {
-        self == PickerKind::Jumplist || self.is_git_changes()
+        matches!(
+            self,
+            PickerKind::Jumplist | PickerKind::GitLog | PickerKind::GitLogFile
+        ) || self.is_git_changes()
     }
 
     /// Whether `jumplist/capture` (picker `Ctrl-j`) applies (docs/jumplist.md) — the
@@ -745,6 +770,42 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "is_false")]
         expanded: bool,
     },
+    /// One commit in the log picker ([`PickerKind::GitLog`] / [`PickerKind::GitLogFile`]).
+    /// Identity is `hash`, which is unique and stable — unlike the positional identity the
+    /// snapshot kinds use, a commit is the same commit however the list is filtered.
+    GitCommit {
+        /// The repo this commit belongs to, echoed onto `git/show`. Carried per row for the same
+        /// reason the branch rows carry it: resolution runs off the active buffer, which can change
+        /// while the list is up (docs/git-phase-2.md decision 2).
+        repo_id: crate::git::RepoId,
+        /// Full 40-char hash — what `git/show` receives.
+        hash: String,
+        /// Abbreviated hash for display, as git prints it.
+        short_hash: String,
+        /// First line of the message. Empty when unreadable.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        subject: String,
+        /// Author name, shown dim.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        author: String,
+        /// Author time as Unix seconds, rendered as a relative date by the client (which has the
+        /// clock). `0` when unknown — same convention as the branch rows.
+        #[serde(default, skip_serializing_if = "is_zero_i64")]
+        timestamp: i64,
+        /// Char offsets into `subject` covered by fuzzy matches. The subject is the only thing
+        /// matched *fuzzily*: the author isn't matched at all (it would make every query match
+        /// every commit by the repo's main author) and the hash is matched by prefix instead
+        /// (`hash_match_len`).
+        #[serde(default)]
+        match_indices: Vec<u32>,
+        /// How many leading characters of `short_hash` the query abbreviates, or `0`. A commit
+        /// hash is an identifier, not prose: `git show 20a3a8a` means a **prefix**, so scattered
+        /// fuzzy hits inside it are noise. The prefix is tested against the *full* hash, so
+        /// pasting 12 or 40 characters finds the commit even though the row renders 7 — this
+        /// caps at what's rendered, since it only says how much of the row to highlight.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        hash_match_len: u32,
+    },
     /// One captured entry in the Jumplist picker (docs/jumplist.md). Identity is `index` —
     /// the entry's position in the captured list, stable for the picker's lifetime (the list
     /// only changes via a re-capture, which resets the picker). Deliberately flat: one
@@ -1136,6 +1197,12 @@ pub struct PickerViewResult {
     /// Always `false` for the other kinds — their chip availability is static per kind.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub path_filterable: bool,
+    /// The log pickers: the walk stopped at its cap rather than reaching the repo's root commit,
+    /// so older history is **not** in the candidate set. Clients must surface it — the query
+    /// filters what was loaded, so a silent cap makes "no matches" indistinguishable from "your
+    /// match is older than the cap".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// Whether *this view* renders as a collapsible accordion (docs/picker-groups.md): group
     /// headers as selectable [`PickerItem::Group`] rows, two-level selection, the row space
     /// counting headers. Normally a per-kind constant ([`PickerKind::collapsible`]) — the second

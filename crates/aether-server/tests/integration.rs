@@ -26,7 +26,8 @@ use aether_protocol::git::{
     GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams, GitRefreshResult,
     GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams, GitResetResult,
     GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
-    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams,
+    HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -30882,6 +30883,29 @@ fn init_repo_at(dir: &std::path::Path) -> git2::Repository {
 }
 
 /// Commit `rel` (created with `content`) so the repo has a resolvable HEAD.
+/// Commit the working-tree state of `rel` under a chosen message — for tests that care about
+/// subjects (the log picker's rows) rather than content.
+fn commit_with_message(repo: &git2::Repository, rel: &str, message: &str) {
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(rel)).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let parents = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(c) => vec![c],
+        None => vec![],
+    };
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        message,
+        &tree,
+        &parents.iter().collect::<Vec<_>>(),
+    )
+    .unwrap();
+}
+
 fn commit_file(repo: &git2::Repository, rel: &str, content: &str) {
     let workdir = repo.workdir().unwrap().to_path_buf();
     let path = workdir.join(rel);
@@ -32910,4 +32934,589 @@ fn git_staged_paths(root: &std::path::Path) -> Vec<String> {
         })
         .filter_map(|e| e.path().ok().map(str::to_string))
         .collect()
+}
+
+// -------- git/show (virtual buffers) -------------------------------------------------------------
+
+/// A commit opens as a read-only virtual buffer: pathless, titled `<short> — <subject>`, holding
+/// what `git show` prints — metadata, the indented message, then the patch. The buffer is transient
+/// (it's a preview) and refuses every mutation.
+#[tokio::test]
+async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: head.clone(),
+            path: None,
+        },
+    )
+    .await;
+
+    assert_eq!(opened.path, None, "no file behind it");
+    assert_eq!(opened.scratch_number, None, "not a scratch either");
+    assert!(opened.read_only);
+    assert!(opened.transient, "a revision view is a preview");
+    let title = opened.title.expect("virtual buffers are titled");
+    assert!(
+        title.starts_with(&head[..7]) && title.ends_with("init"),
+        "title is `<short> — <subject>`, got {title:?}"
+    );
+
+    // The content is `git show`-shaped: header, indented message, then the patch.
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        3,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    assert!(content.text.starts_with(&format!("commit {head}\n")));
+    assert!(content.text.contains("\n    init\n"), "message is indented");
+    assert!(content.text.contains("+one"), "the patch is included");
+    assert!(content.text.contains("--- /dev/null") || content.text.contains("+++ b/a.rs"));
+
+    // Every mutation is refused at the server, whatever the client thinks.
+    let err = send_request_expect_err::<InputText>(
+        &mut ws,
+        4,
+        &InputTextParams {
+            buffer_id: opened.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    assert!(err.contains("read-only"), "edit refused: {err}");
+    let err = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id: opened.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(err.contains("read-only"), "save refused: {err}");
+
+    drop(server);
+}
+
+/// Showing the same revision twice attaches to the same buffer rather than stacking duplicates —
+/// the pathless equivalent of the canonical-path sharing key, so walking a log picker doesn't
+/// leave a trail.
+#[tokio::test]
+async fn git_show_reuses_the_buffer_for_the_same_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let first = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let params = || GitShowParams {
+        repo_id: root.to_string_lossy().into_owned(),
+        rev: head.clone(),
+        path: None,
+    };
+    let opened: BufferOpenResult = send_request::<GitShow>(&mut ws, 2, &params()).await;
+    let again: BufferOpenResult = send_request::<GitShow>(&mut ws, 3, &params()).await;
+    assert_eq!(opened.buffer_id, again.buffer_id);
+
+    // A *different* revision is a different buffer.
+    let other: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        4,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: first.clone(),
+            path: None,
+        },
+    )
+    .await;
+    assert_ne!(opened.buffer_id, other.buffer_id);
+
+    drop(server);
+}
+
+/// With a path, `git/show` is `git show <rev>:<path>` — the file's content at that commit, titled
+/// the way you'd type it, and with the language detected from the path so it highlights like its
+/// working-tree twin.
+#[tokio::test]
+async fn git_show_with_a_path_yields_that_file_at_the_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "src/main.rs", "fn main() {}\n");
+    let first = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    commit_file(&repo, "src/main.rs", "fn main() { changed(); }\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: first.clone(),
+            path: Some("src/main.rs".into()),
+        },
+    )
+    .await;
+    assert_eq!(
+        opened.language.as_deref(),
+        Some("rust"),
+        "highlights as Rust"
+    );
+    assert_eq!(
+        opened.title.as_deref(),
+        Some(format!("{}:src/main.rs", &first[..7]).as_str())
+    );
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        3,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    assert_eq!(
+        content.text, "fn main() {}\n",
+        "the content is the *old* revision, not the working tree"
+    );
+
+    // A path that doesn't exist at that revision is an error, not an empty buffer.
+    let err = send_request_expect_err::<GitShow>(
+        &mut ws,
+        4,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: first,
+            path: Some("nope.rs".into()),
+        },
+    )
+    .await;
+    assert!(err.contains("nope.rs"), "names what was missing: {err}");
+
+    drop(server);
+}
+
+/// A virtual buffer is listed like any other buffer — by its title, not as "(scratch N)" — but it
+/// never reaches the session file: it opens transient, and it has neither a path nor a scratch
+/// number to be keyed by. Restoring last Tuesday's commit diff is not a session.
+#[tokio::test]
+async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: head.clone(),
+            path: None,
+        },
+    )
+    .await;
+    let title = opened.title.clone().expect("titled");
+
+    let view = send_request::<PickerView>(&mut ws, 3, &view_params(PickerKind::Buffers)).await;
+    let displays: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Buffer { display, .. } => Some(display.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        displays.contains(&title),
+        "the buffers picker names the revision, got {displays:?}"
+    );
+    assert!(
+        !displays.iter().any(|d| d.starts_with("(scratch")),
+        "and doesn't call it a scratch: {displays:?}"
+    );
+
+    drop(server);
+}
+
+// -------- git log picker -------------------------------------------------------------------------
+
+/// The log lists a repo's history newest-first, and the query *filters* what was loaded rather
+/// than re-walking. It matches the subject and the short hash — deliberately **not** the author,
+/// which would make every query match every commit by the repo's main author.
+#[tokio::test]
+async fn git_log_picker_lists_history_and_filters_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    commit_file(&repo, "b.rs", "two\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitLog)).await;
+    assert_eq!(view.total_candidates, 2, "both commits");
+    assert!(!view.truncated, "a two-commit history is not capped");
+
+    let rows: Vec<(String, String)> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitCommit {
+                short_hash,
+                subject,
+                author,
+                ..
+            } => Some((short_hash.clone(), format!("{subject} — {author}"))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0].1.starts_with("init — Test"),
+        "newest first, {rows:?}"
+    );
+    assert_eq!(rows[0].0.len(), 7, "abbreviated hash");
+
+    // The short hash is matchable, so pasting one finds its commit.
+    let short = rows[0].0.clone();
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitLog,
+            query: short.clone(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1, "the hash {short} names one commit");
+
+    // The author is rendered but not matched: it's a facet for a future chip, not free text.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        4,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitLog,
+            query: "Test".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        update.total_matches, 0,
+        "author is not part of the haystack"
+    );
+
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        5,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitLog,
+            query: "nomatchatall".into(),
+            generation: 3,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 0);
+
+    drop(server);
+}
+
+/// The file-locked sibling walks the same history but keeps only the commits that touched the
+/// buffer's path — "history of this path", which is why a rename ends it.
+#[tokio::test]
+async fn git_log_file_picker_is_locked_to_the_buffers_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    commit_file(&repo, "b.rs", "two\n");
+    commit_file(&repo, "a.rs", "one\nmore\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let buffer_id = open_test_buffer(&mut ws, 2, "a.rs").await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            buffer_id: Some(buffer_id),
+            ..view_params(PickerKind::GitLogFile)
+        },
+    )
+    .await;
+    assert_eq!(
+        view.total_candidates, 2,
+        "the two commits touching a.rs, not b.rs's"
+    );
+
+    // The whole-repo picker is a separate slot and still shows everything.
+    let all = send_request::<PickerView>(&mut ws, 4, &view_params(PickerKind::GitLog)).await;
+    assert_eq!(all.total_candidates, 3);
+
+    drop(server);
+}
+
+/// Selecting a row is not a file jump: the client fires `git/show` against the row's hash, so the
+/// server offers no `PickerSelectResult` for a commit — the same shape the branch picker has.
+#[tokio::test]
+async fn git_log_rows_carry_what_git_show_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitLog)).await;
+    let item = view
+        .update
+        .expect("window")
+        .items()
+        .first()
+        .expect("a row")
+        .clone();
+    let PickerItem::GitCommit { repo_id, hash, .. } = &item else {
+        panic!("expected a commit row, got {item:?}");
+    };
+    assert_eq!(repo_id, &root.to_string_lossy().into_owned());
+
+    // The hash the row carries is exactly what `git/show` resolves.
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        3,
+        &GitShowParams {
+            repo_id: repo_id.clone(),
+            rev: hash.clone(),
+            path: None,
+        },
+    )
+    .await;
+    assert!(opened.read_only);
+    assert!(opened.title.is_some_and(|t| t.ends_with("init")));
+
+    drop(server);
+}
+
+/// A query *filters* the log; it never reorders it. Ranking commits by fuzzy score puts an old
+/// commit above a recent one whenever its subject scores better, which stops the list being a
+/// history — so matches keep chronological order and the score only decides who survives.
+#[tokio::test]
+async fn git_log_query_filters_without_reordering() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // "jump" scores well on a short subject; "adjust" buries the `j` mid-word. Chronologically
+    // `adjust` is the newer commit, so score order and history order disagree.
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "two\n").unwrap();
+    commit_with_message(&repo, "a.rs", "jump");
+    std::fs::write(root.join("a.rs"), "three\n").unwrap();
+    commit_with_message(&repo, "a.rs", "adjust the thing");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitLog)).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitLog,
+            query: "j".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let subjects: Vec<String> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitCommit { subject, .. } => Some(subject.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        subjects,
+        vec!["adjust the thing", "jump"],
+        "newest first, whatever the fuzzy scores say"
+    );
+
+    drop(server);
+}
+
+/// Opening the log from a `git/show` buffer lands on that commit's row: the picker resolves "where
+/// you are" from the buffer, and for a revision buffer that's the revision it holds.
+#[tokio::test]
+async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let first = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    std::fs::write(root.join("a.rs"), "two\n").unwrap();
+    commit_with_message(&repo, "a.rs", "second");
+    std::fs::write(root.join("a.rs"), "three\n").unwrap();
+    commit_with_message(&repo, "a.rs", "third");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let shown: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: root.to_string_lossy().into_owned(),
+            rev: first.clone(),
+            path: None,
+        },
+    )
+    .await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            center_on_cursor: Some(shown.buffer_id),
+            buffer_id: Some(shown.buffer_id),
+            ..view_params(PickerKind::GitLog)
+        },
+    )
+    .await;
+    let centred = view.effective_center_on.expect("resolved a row to frame");
+    let PickerItem::GitCommit { hash, .. } = centred else {
+        panic!("expected a commit row, got {centred:?}");
+    };
+    assert_eq!(hash, first, "the oldest commit — the one being shown");
+
+    drop(server);
+}
+
+/// A hash is an identifier, not prose: it matches by **prefix**, against the *full* hash, so a
+/// pasted 12- or 40-character sha finds the commit even though the row renders 7 — and a fragment
+/// from the middle of a hash matches nothing, where a fuzzy match would have hit.
+#[tokio::test]
+async fn git_log_matches_hashes_by_prefix_including_longer_than_rendered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "two\n").unwrap();
+    commit_with_message(&repo, "a.rs", "second");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitLog)).await;
+
+    async fn matches_for(
+        ws: &mut Ws,
+        id: u64,
+        query: String,
+        generation: u64,
+    ) -> PickerUpdateParams {
+        let _: () = send_request::<PickerQuery>(
+            ws,
+            id,
+            &PickerQueryParams {
+                filters: Default::default(),
+                kind: PickerKind::GitLog,
+                query,
+                generation,
+            },
+        )
+        .await;
+        expect_notification::<PickerUpdate>(ws).await
+    }
+
+    // The whole 40-char hash: one commit, even though the row shows 7 characters.
+    let update = matches_for(&mut ws, 3, head.clone(), 1).await;
+    assert_eq!(update.total_matches, 1, "a full sha resolves");
+    let hash_len = update.items().iter().find_map(|i| match i {
+        PickerItem::GitCommit { hash_match_len, .. } => Some(*hash_match_len),
+        _ => None,
+    });
+    assert_eq!(
+        hash_len,
+        Some(7),
+        "the highlight caps at what the row renders"
+    );
+
+    // A 12-character abbreviation: still one commit.
+    let update = matches_for(&mut ws, 4, head[..12].to_string(), 2).await;
+    assert_eq!(update.total_matches, 1);
+
+    // A fragment from the *middle* of the hash matches nothing — prefix semantics, not fuzzy.
+    let update = matches_for(&mut ws, 5, head[8..14].to_string(), 3).await;
+    assert_eq!(update.total_matches, 0, "{} is not a prefix", &head[8..14]);
+
+    drop(server);
 }

@@ -2553,6 +2553,8 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
         Some(aether_protocol::picker::PickerKind::Jumplist) => "Filter the jumplist…",
         Some(aether_protocol::picker::PickerKind::GitBranches) => "Switch branch…",
+        Some(aether_protocol::picker::PickerKind::GitLog) => "Search history…",
+        Some(aether_protocol::picker::PickerKind::GitLogFile) => "Search this file's history…",
         None => "Search…",
     }
 }
@@ -3003,6 +3005,27 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::GitCommit {
+        short_hash,
+        subject,
+        author,
+        timestamp,
+        match_indices,
+        hash_match_len,
+        ..
+    } = item
+    {
+        return git_commit_item_spans(
+            short_hash,
+            subject,
+            author,
+            *timestamp,
+            match_indices,
+            *hash_match_len,
+            highlighted,
+            max_width,
+        );
+    }
     if let PickerItem::Reference {
         display_path,
         line,
@@ -3112,6 +3135,7 @@ fn picker_item_spans(
         | PickerItem::Symbol { .. }
         | PickerItem::Keybinding { .. }
         | PickerItem::GitBranch { .. }
+        | PickerItem::GitCommit { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -4256,6 +4280,77 @@ fn git_branch_item_spans(
             Style::default().fg(c(th().warning)).bg(bg),
         ));
     }
+    spans
+}
+
+/// One commit row: `abc1234  subject          author · 3w ago`. The hash leads (it's the row's
+/// identity and what you'd quote elsewhere), the subject takes the space, and the author and
+/// relative date trail dim. The subject highlights where the fuzzy match landed; the hash
+/// highlights the leading `hash_match_len` characters the query abbreviated. The author is shown
+/// but never matched.
+#[allow(clippy::too_many_arguments)]
+fn git_commit_item_spans(
+    short_hash: &str,
+    subject: &str,
+    author: &str,
+    timestamp: i64,
+    match_indices: &[u32],
+    hash_match_len: u32,
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = picker_row_bg(highlighted);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let dim = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
+
+    let mut tail = String::new();
+    if !author.is_empty() {
+        tail.push_str("  ");
+        tail.push_str(author);
+    }
+    if timestamp > 0 {
+        tail.push_str(if tail.is_empty() { "  " } else { " · " });
+        tail.push_str(&crate::shell::time_ago(timestamp));
+    }
+    let subject_budget = max_width
+        .saturating_sub(short_hash.width() + 2)
+        .saturating_sub(tail.width());
+    let truncated: String = subject
+        .chars()
+        .scan(0usize, |w, ch| {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            (*w + cw <= subject_budget).then(|| {
+                *w += cw;
+                ch
+            })
+        })
+        .collect();
+    let kept = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept)
+        .collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let hash_indices: Vec<u32> = (0..hash_match_len).collect();
+    spans.extend(match_highlighted_spans(
+        short_hash.to_string(),
+        &hash_indices,
+        dim,
+        match_style,
+    ));
+    spans.push(Span::styled("  ".to_string(), base));
+    spans.extend(match_highlighted_spans(
+        truncated,
+        &kept_indices,
+        base,
+        match_style,
+    ));
+    spans.push(Span::styled(tail, dim));
     spans
 }
 

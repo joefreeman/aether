@@ -234,6 +234,8 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitChanges => "Changes in workspace…",
         PickerKind::Keybindings => "Search keybindings…",
         PickerKind::GitBranches => "Switch branch…",
+        PickerKind::GitLog => "Search history…",
+        PickerKind::GitLogFile => "Search this file's history…",
         PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
@@ -1584,6 +1586,45 @@ fn render_item<'a>(
             row![
                 dot_cell(Some(color), ui),
                 highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(m, ui, p),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
+        PickerItem::GitCommit {
+            short_hash,
+            subject,
+            author,
+            timestamp,
+            match_indices,
+            hash_match_len,
+            ..
+        } => {
+            // `abc1234  subject … author · 3w ago`: the hash leads (it identifies the commit and
+            // is what you'd quote elsewhere), the subject takes the width, metadata trails dim.
+            // The subject highlights its fuzzy hits, the hash the leading characters the query
+            // abbreviated; the author is shown but never matched.
+            let hash_indices: Vec<u32> = (0..*hash_match_len).collect();
+            let mut m = author.clone();
+            if *timestamp > 0 {
+                if !m.is_empty() {
+                    m.push_str(" · ");
+                }
+                m.push_str(&crate::app::time_ago(*timestamp));
+            }
+            row![
+                highlighted_owned(
+                    short_hash.clone(),
+                    hash_indices,
+                    p.fg_dim,
+                    SANS,
+                    hovered,
+                    ui,
+                    p
+                ),
+                highlighted(subject, match_indices, p.fg_bright, SANS, hovered, ui, p),
                 iced::widget::Space::new().width(Length::Fill),
                 meta(m, ui, p),
             ]

@@ -104,6 +104,8 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   keybindings: "Search keybindings…",
   jumplist: "Filter the jumplist…",
   git_branches: "Switch branch…",
+  git_log: "Search history…",
+  git_log_file: "Search this file\u2019s history…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -860,6 +862,23 @@ function describePickerItem(
         metaParts: parts,
         bullet: true,
         bulletStatus: item.is_head ? "head" : undefined,
+      };
+    }
+    case "git_commit": {
+      // `abc1234  subject … author · 3w ago`. The hash leads (it identifies the commit and is what
+      // you'd quote elsewhere); author and date trail dim. The subject highlights its fuzzy hits,
+      // the hash the leading characters the query abbreviated; the author is never matched.
+      const author = item.author ?? "";
+      const dim: string[] = [];
+      if (author) dim.push(author);
+      if (item.timestamp) dim.push(timeAgo(item.timestamp));
+      const hashLen = item.hash_match_len ?? 0;
+      return {
+        primary: item.subject ?? "",
+        matches: item.match_indices,
+        prefix: item.short_hash,
+        prefixMatches: Array.from({ length: hashLen }, (_, i) => i),
+        meta: dim.join(" · "),
       };
     }
     case "lsp_server": {

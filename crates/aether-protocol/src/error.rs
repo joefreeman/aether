@@ -80,6 +80,14 @@ impl ErrorCode {
     /// explicit `repo_id`. Guessing is not an option: committing to the wrong repo isn't
     /// recoverable by pressing undo.
     pub const AMBIGUOUS_REPO: Self = Self(-32043);
+    /// `git/show` could not materialise the revision — an unresolvable rev, a path that doesn't
+    /// exist at it, or binary content. Carries git's own wording, since it says it better than a
+    /// paraphrase would.
+    pub const GIT_SHOW_FAILED: Self = Self(-32044);
+    /// An edit, save or reload was addressed to a **read-only** buffer — a virtual buffer holding
+    /// a revision's content (`git/show`), which has no file behind it and nothing an edit could
+    /// mean. Clients decline these locally too; this is the authoritative refusal.
+    pub const READ_ONLY_BUFFER: Self = Self(-32045);
 
     pub fn code(self) -> i32 {
         self.0

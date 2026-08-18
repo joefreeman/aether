@@ -1305,6 +1305,8 @@ fn buffer_open_result_shape() {
             language: "rust".into(),
             workspace_root: "/proj".into(),
         }),
+        title: None,
+        read_only: false,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -1338,6 +1340,8 @@ fn buffer_open_result_restored_scroll() {
             sub_row: 0.5,
         }),
         lsp_server: None,
+        title: None,
+        read_only: false,
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
@@ -3604,6 +3608,7 @@ fn picker_view_result_directory_fields_skipped_when_none() {
         directory_parent: None,
         filters: Default::default(),
         path_filterable: false,
+        truncated: false,
 
         collapsible: false,
         update: None,
@@ -3645,6 +3650,7 @@ fn picker_view_result_directory_fields_serialized() {
 
         collapsible: false,
         update: None,
+        truncated: false,
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["directory_path"], "/proj/src");
@@ -3743,6 +3749,7 @@ fn picker_view_result_filters_serialized_when_non_default() {
             ..Default::default()
         },
         path_filterable: false,
+        truncated: false,
 
         collapsible: false,
         update: None,

@@ -1246,10 +1246,12 @@ static LEADER: &[Binding] = &[
 ///
 /// Reserved for docs/git-phase-2.md's remaining stages, so the shape is decided once rather than
 /// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
-/// `a`/`Alt-a` stage/revert a whole file, `l`/`Alt-l` log/reflog pickers, `f`/`Alt-f` fetch/pull,
+/// `a`/`Alt-a` stage/revert a whole file, `f`/`Alt-f` fetch/pull,
 /// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord), `z`/`Alt-z` the
 /// stash picker and stash-working-tree, `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
-/// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink.
+/// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
+/// reflog is a filter chip on the log picker rather than a key: it's the same rows over a
+/// different ref walk.
 #[rustfmt::skip]
 static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
@@ -1259,6 +1261,8 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
+    bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
 ];
 
 #[cfg(test)]

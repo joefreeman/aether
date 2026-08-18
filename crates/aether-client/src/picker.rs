@@ -916,6 +916,7 @@ impl PickerState {
             // Reachable and not an error: a repo whose HEAD is unborn has no branches until the
             // first commit. Typing a name offers "+ Create", which is the way out.
             PickerKind::GitBranches => "No branches yet",
+            PickerKind::GitLog | PickerKind::GitLogFile => "No commits",
             _ => "No results",
         })
     }
@@ -949,6 +950,8 @@ pub enum ItemKey<'a> {
     /// `(repo_id, branch name)` — the listing is single-repo, but keying on both means an item
     /// held across a repo switch can't resolve to a same-named branch in the new one.
     GitBranch(&'a str, &'a str),
+    /// A commit hash: unique and stable, so it identifies the row however the list is filtered.
+    GitCommit(&'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1048,6 +1051,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         } => ItemKey::Keybinding(mode, keys, desc),
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry(*index),
         PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch(repo_id, name),
+        PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit(hash),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,

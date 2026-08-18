@@ -106,6 +106,18 @@ pub struct BufferOpenResult {
     /// [`BufferOpenParams::transient`]). Promotion mid-session is pushed via `buffer/state`.
     #[serde(default)]
     pub transient: bool,
+    /// Display name for a **virtual** buffer — one with no path and no scratch number, whose
+    /// content the server materialised from a revision (`git/show`: a commit's diff, or a file as
+    /// of some commit). Rendered verbatim by the client, which otherwise labels a pathless buffer
+    /// `(scratch N)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The buffer refuses edits, saves and reloads. Set for virtual buffers: their content is a
+    /// snapshot of something immutable, so there is nothing an edit could mean. Enforced
+    /// server-side (`apply_edit` and the save/reload handlers); clients surface it and decline
+    /// early so a keystroke doesn't cost a round trip to be told no.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------
@@ -375,4 +387,8 @@ pub struct BufferStateParams {
     /// save/reload (the client only adopts a differing path).
     #[serde(default)]
     pub path: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }

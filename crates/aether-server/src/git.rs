@@ -1237,6 +1237,199 @@ pub fn commit_info(repo: &GitRepo, rev: &str) -> Option<CommitInfo> {
     })
 }
 
+/// One row of the log picker: a commit reduced to what the list renders and matches on.
+pub struct LogCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub timestamp: i64,
+}
+
+/// A repo's history from HEAD, newest first — the log picker's candidate set. `path` narrows to
+/// commits that touched it (repo-relative); `None` walks everything.
+///
+/// **Bounded by commits *examined*, not rows produced.** For the whole-repo walk the two are the
+/// same, but a path filter has to diff each commit against its parent to know whether the path was
+/// touched, so a narrow path in a deep history could otherwise walk forever to fill a screen. The
+/// bool in the return says the walk stopped early, which the picker must surface: the query filters
+/// what was loaded, so a silent cap turns "older than the cap" into an indistinguishable "no
+/// matches".
+///
+/// Path narrowing is a plain pathspec, not git's `--follow`: history ends at a rename. Rename
+/// detection is a separate mechanism, and inferring it here would make the walk cost per commit
+/// jump again.
+pub fn log_commits(
+    repo_path: &Path,
+    path: Option<&str>,
+    max_examined: usize,
+) -> (Vec<LogCommit>, bool) {
+    let mut out = Vec::new();
+    let Ok(repo) = git2::Repository::discover(repo_path) else {
+        return (out, false);
+    };
+    let Ok(mut walk) = repo.revwalk() else {
+        return (out, false);
+    };
+    // Time order matches what `git log` shows by default, and keeps the newest-first reading the
+    // picker's rows imply.
+    let _ = walk.set_sorting(git2::Sort::TIME);
+    if walk.push_head().is_err() {
+        return (out, false); // unborn HEAD: no history yet, not an error
+    }
+
+    let mut truncated = false;
+    for (examined, oid) in walk.enumerate() {
+        if examined >= max_examined {
+            truncated = true;
+            break;
+        }
+        let Ok(oid) = oid else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        if let Some(path) = path {
+            if !commit_touches_path(&repo, &commit, path) {
+                continue;
+            }
+        }
+        let sig = commit.author();
+        out.push(LogCommit {
+            hash: commit.id().to_string(),
+            short_hash: short_hash(&commit.id().to_string()),
+            subject: commit
+                .summary()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_string(),
+            author: sig.name().unwrap_or("(unknown)").to_string(),
+            timestamp: sig.when().seconds(),
+        });
+    }
+    (out, truncated)
+}
+
+/// Whether `commit` changed `path` relative to its first parent — the pathspec test behind the
+/// file-scoped log. A root commit counts as touching every path it introduces.
+fn commit_touches_path(repo: &git2::Repository, commit: &git2::Commit, path: &str) -> bool {
+    let Ok(new_tree) = commit.tree() else {
+        return false;
+    };
+    let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut opts = git2::DiffOptions::new();
+    opts.pathspec(path);
+    // `diff_tree_to_tree` with a pathspec is the cheap form: libgit2 prunes to the path rather than
+    // diffing the whole tree and filtering after.
+    repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut opts))
+        .map(|d| d.deltas().len() > 0)
+        .unwrap_or(false)
+}
+
+/// The abbreviated form of a commit hash, as git prints it in logs and as the client already
+/// renders blame (`commit.chars().take(7)`).
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(7).collect()
+}
+
+/// The content of a revision, materialised for a read-only virtual buffer (`git/show`).
+pub struct RevisionContent {
+    /// Buffer title — `abc1234 — subject` for a commit, `abc1234:src/main.rs` for a file. Git's own
+    /// syntax for the file form, so it reads the way you'd type it.
+    pub title: String,
+    pub text: String,
+    /// Detected from the path for a file; `None` for a commit's patch (no diff grammar is
+    /// bundled — the patch renders unhighlighted, which is legible enough to defer).
+    pub language: Option<String>,
+}
+
+/// A commit as `git show` prints it: metadata and message, then the patch against its first parent
+/// (against the empty tree for a root commit, so the initial commit shows as all additions).
+///
+/// libgit2 rather than the CLI, per decision 1 — this is a read, and the patch text libgit2's
+/// printer emits is the same format. Merge commits diff against the *first* parent only, which is
+/// what `git show` does too.
+pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, String> {
+    let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
+    let commit = repo
+        .revparse_single(rev)
+        .and_then(|o| o.peel_to_commit())
+        .map_err(|e| e.message().to_string())?;
+    let sig = commit.author();
+    let subject = commit
+        .summary()
+        .ok()
+        .flatten()
+        .unwrap_or("(no subject)")
+        .to_string();
+    let short = short_hash(&commit.id().to_string());
+
+    let mut text = String::new();
+    text.push_str(&format!("commit {}\n", commit.id()));
+    text.push_str(&format!(
+        "Author: {} <{}>\n",
+        sig.name().unwrap_or("(unknown)"),
+        sig.email().unwrap_or_default()
+    ));
+    text.push_str(&format!("Date:   {}\n\n", format_commit_time(sig.when())));
+    // Indented four spaces, as git prints a message body.
+    for line in commit.message().unwrap_or_default().trim_end().lines() {
+        text.push_str(&format!("    {line}\n"));
+    }
+    text.push('\n');
+
+    let new_tree = commit.tree().map_err(|e| e.message().to_string())?;
+    let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let diff = repo
+        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
+        .map_err(|e| e.message().to_string())?;
+    diff.print(git2::DiffFormat::Patch, |_, _, line| {
+        // The origin character is part of the patch for content lines but not for headers;
+        // libgit2 hands it over separately either way.
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            text.push(line.origin());
+        }
+        text.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })
+    .map_err(|e| e.message().to_string())?;
+
+    Ok(RevisionContent {
+        title: format!("{short} — {subject}"),
+        text,
+        language: None,
+    })
+}
+
+/// One file's content as of `rev` — `git show <rev>:<path>`. `path` is repo-relative. Binary
+/// content is refused rather than dumped into a text buffer.
+pub fn show_file(repo_path: &Path, rev: &str, path: &str) -> Result<RevisionContent, String> {
+    let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
+    let commit = repo
+        .revparse_single(rev)
+        .and_then(|o| o.peel_to_commit())
+        .map_err(|e| e.message().to_string())?;
+    let entry = commit
+        .tree()
+        .and_then(|t| t.get_path(Path::new(path)))
+        .map_err(|_| format!("{path} does not exist at {rev}"))?;
+    let blob = entry
+        .to_object(&repo)
+        .and_then(|o| o.peel_to_blob())
+        .map_err(|_| format!("{path} is not a file at {rev}"))?;
+    if blob.is_binary() {
+        return Err(format!("{path} is binary at {rev}"));
+    }
+    let short = short_hash(&commit.id().to_string());
+    Ok(RevisionContent {
+        title: format!("{short}:{path}"),
+        text: String::from_utf8_lossy(blob.content()).into_owned(),
+        // Detected from the path, so a file at a revision highlights exactly like its working-tree
+        // twin — the whole point of showing it in the editor rather than a pager.
+        language: crate::syntax::config_for_path(Path::new(path)).map(|c| c.name.to_string()),
+    })
+}
+
 /// Git status of each immediate child of `dir`, keyed by leaf name, for colouring the file
 /// explorer. One repo-wide [`git2::Repository::statuses`] call per listing — repo discovery (the
 /// expensive part) runs here, never on the keystroke path: the explorer only rebuilds candidates

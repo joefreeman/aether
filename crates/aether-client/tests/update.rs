@@ -959,6 +959,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         path_filterable: false,
         collapsible: false,
         update: Some(update(Some(vec![]), 0)),
+        truncated: false,
     };
     let _ = s.on_event(Event::PickerViewed {
         initial: false,
@@ -1008,6 +1009,7 @@ fn view_response_does_not_regress_a_query_typed_before_it() {
         path_filterable: false,
         collapsible: false,
         update: None,
+        truncated: false,
     };
     let _ = s.on_event(Event::PickerViewed {
         initial: true,
@@ -1341,6 +1343,7 @@ fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
         path_filterable: true,
         collapsible: false,
         update: None,
+        truncated: false,
     };
     let _ = s.on_event(Event::PickerViewed {
         initial: true,
@@ -1414,6 +1417,7 @@ fn jumplist_chip_removal_requeries() {
         path_filterable: true,
         collapsible: false,
         update: None,
+        truncated: false,
     };
     let _ = s.on_event(Event::PickerViewed {
         initial: true,
@@ -2656,6 +2660,90 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
     );
 }
 
+/// A virtual buffer (a revision materialised by `git/show`) labels itself with the server's title
+/// rather than "(scratch)", and declines edits locally: the server refuses them anyway, so holding
+/// a key down should be quiet rather than a stream of round trips. Insert mode is refused at the
+/// door for the same reason.
+#[test]
+fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
+    use aether_client::session::buffer_info;
+    use aether_protocol::buffer::BufferOpenResult;
+
+    let roots = vec!["/p".to_string()];
+    let info = buffer_info(
+        serde_json::from_value::<BufferOpenResult>(json!({
+            "buffer_id": 7,
+            "language": null,
+            "line_count": 3,
+            "byte_count": 20,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": null,
+            "title": "abc1234 — Add commit grammar",
+            "read_only": true,
+            "transient": true,
+        }))
+        .unwrap(),
+        &roots,
+    );
+    assert_eq!(info.label, "abc1234 — Add commit grammar");
+    assert!(info.read_only);
+
+    let mut s = session();
+    s.buffer = info;
+
+    // Motions still work — reading a diff means moving around in it.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()), ROWS);
+    assert!(
+        find_request(&fx, "cursor/move").is_some(),
+        "navigation is unaffected"
+    );
+
+    // Edits are dropped with a warning rather than sent.
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    assert!(no_request(&fx), "no edit RPC leaves the client");
+
+    // ...and `i` doesn't even change mode, so the next keystroke isn't text either.
+    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
+    assert!(no_request(&fx));
+    assert!(matches!(s.mode, aether_client::session::Mode::Normal));
+}
+
+/// Enter on a commit row opens it as a read-only virtual buffer: the row already carries the repo
+/// and the hash, so nothing is re-resolved, and `git/show` returns a `buffer/open`-shaped result
+/// the ordinary switch path adopts.
+#[test]
+fn enter_on_a_log_row_shows_the_commit() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::GitLog, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![PickerItem::GitCommit {
+            repo_id: "/p".into(),
+            hash: "abc1234def5678".into(),
+            short_hash: "abc1234".into(),
+            subject: "Add commit grammar".into(),
+            author: "Ada".into(),
+            timestamp: 1_700_000_000,
+            match_indices: Vec::new(),
+            hash_match_len: 0,
+        }];
+        p.selected = 0;
+    }
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/show").expect("Enter shows the commit");
+    assert_eq!(params["repo_id"], json!("/p"));
+    assert_eq!(params["rev"], json!("abc1234def5678"));
+    assert!(
+        params.get("path").is_none(),
+        "the commit itself, not a file within it"
+    );
+    // The picker closes onto the diff, like the branch picker's checkout.
+    assert!(find_request(&fx, "picker/hide").is_some());
+}
+
 /// `Space c`: the workspace changes picker lists every root, whatever repos they span, so it needs
 /// no repo-resolution hint — it sends the buffer only as the *centring* target, to land on the hunk
 /// nearest the cursor.
@@ -3266,6 +3354,8 @@ fn jumplist_step_adopts_the_opened_entry() {
         scroll: None,
         lsp_server: None,
         transient: true,
+        title: None,
+        read_only: false,
     };
     let _ = s.on_event(Event::JumplistStepped(
         Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
@@ -3347,6 +3437,7 @@ fn picker_view_response_renders_items_without_the_push() {
 
         collapsible: false,
         update: Some(update),
+        truncated: false,
     };
     let _ = s.on_event(Event::PickerViewed {
         initial: true,
@@ -3411,6 +3502,7 @@ fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total:
 
         collapsible: false,
         update: Some(update),
+        truncated: false,
     };
     s.on_event(Event::PickerViewed {
         initial,
@@ -4615,6 +4707,8 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
         scroll: None,
         lsp_server: None,
         transient: false,
+        title: None,
+        read_only: false,
     };
     let _ = s.on_event(Event::Switched(Ok(successor)));
     assert_eq!(
@@ -5657,6 +5751,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
             scroll: None,
             transient: false,
             lsp_server: None,
+            read_only: false,
         },
     );
     assert_eq!(s.workspace_projects.len(), 1);
@@ -6881,6 +6976,8 @@ fn open_path_prompt_submits_via_open_path_rpc() {
         scroll: None,
         lsp_server: None,
         transient: false,
+        title: None,
+        read_only: false,
     };
     let result = serde_json::to_value(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
@@ -7081,6 +7178,7 @@ fn hint_session() -> Session {
             scroll: None,
             transient: false,
             lsp_server: None,
+            read_only: false,
         },
     )
 }
@@ -9116,6 +9214,8 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
         scroll: None,
         lsp_server: None,
         transient: true,
+        title: None,
+        read_only: false,
     };
     let step = |position: Option<LogicalPosition>, buffer_id: u64, path: &str| {
         Event::JumplistStepped(

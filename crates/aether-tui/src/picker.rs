@@ -863,6 +863,10 @@ pub enum ItemKey<'a> {
         repo_id: &'a str,
         name: &'a str,
     },
+    /// A commit hash — unique and stable however the list is filtered.
+    GitCommit {
+        hash: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -940,6 +944,9 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch {
             repo_id: repo_id.as_str(),
             name: name.as_str(),
+        },
+        PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit {
+            hash: hash.as_str(),
         },
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {

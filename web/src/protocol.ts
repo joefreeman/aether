@@ -292,7 +292,9 @@ export type PickerKind =
   | "workspace_symbols"
   | "keybindings"
   | "jumplist"
-  | "git_branches";
+  | "git_branches"
+  | "git_log"
+  | "git_log_file";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -353,6 +355,25 @@ export type PickerItem =
       /** Workdir of another worktree holding this branch — the row is not checkout-able. */
       checked_out_in?: string | null;
       match_indices?: number[];
+    }
+  | {
+      kind: "git_commit";
+      /** Which repo the row belongs to — echoed onto the `git/show` it triggers. */
+      repo_id: string;
+      /** Full hash; what `git/show` receives. */
+      hash: string;
+      short_hash: string;
+      subject?: string;
+      author?: string;
+      /** Author time, Unix seconds; 0/absent when unknown. */
+      timestamp?: number;
+      /** Offsets into `subject` covered by the fuzzy match. The author is rendered but never
+       *  matched; the hash is matched by prefix instead (`hash_match_len`). */
+      match_indices?: number[];
+      /** How many leading characters of `short_hash` the query abbreviated (0 = no hash match).
+       *  A hash is an identifier, so `git show 20a3a8a` means a prefix — and the prefix is tested
+       *  against the *full* hash, so a pasted 40-character sha matches a row rendering 7. */
+      hash_match_len?: number;
     }
   | {
       kind: "lsp_server";

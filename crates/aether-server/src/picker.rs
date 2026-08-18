@@ -448,6 +448,70 @@ pub struct GitBranchCandidate {
     pub row: crate::git::BranchRow,
 }
 
+/// One log-picker candidate: a commit, plus the repo it came from (carried per row for the same
+/// reason the branch rows carry it — the active buffer can change while the list is up).
+///
+/// The query *filters* this loaded set; it never re-walks history. Two kinds of match, because a
+/// commit row holds two kinds of thing:
+///
+/// - the **subject** is prose, matched fuzzily (the candidate's `display_at`);
+/// - the **hash** is an identifier, matched by *prefix* ([`Self::matches_hash_prefix`]) — `git show
+///   20a3a8a` means a prefix, and scattered fuzzy hits inside a hex string are noise.
+///
+/// **Author is matched by neither.** It was in the fuzzy haystack briefly, and it made every query
+/// match every commit by the repo's main author: typing `j` matched "Joe" in all of them, and the
+/// surviving score differences came from where that `j` landed — i.e. from subject length, which is
+/// noise. Author is a facet, so it belongs on a filter chip (`git log --author`).
+#[derive(Debug, Clone)]
+pub struct GitCommitCandidate {
+    pub repo_id: String,
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub timestamp: i64,
+    pub haystack: String,
+}
+
+/// Shortest query treated as a hash abbreviation — git's own floor for an abbreviated object name.
+/// Below it, a hex-looking query is far more likely to be prose ("add", "fed") than an id.
+pub const HASH_PREFIX_MIN: usize = 4;
+
+impl GitCommitCandidate {
+    /// Whether `query` abbreviates this commit's hash, `git show <prefix>`-style: hex, at least
+    /// [`HASH_PREFIX_MIN`] characters, and a prefix of the **full** hash — so pasting 12 or 40
+    /// characters finds the commit even though the row renders 7.
+    pub fn matches_hash_prefix(&self, query: &str) -> bool {
+        query.len() >= HASH_PREFIX_MIN
+            && query.chars().all(|c| c.is_ascii_hexdigit())
+            && self.hash.starts_with(&query.to_ascii_lowercase())
+    }
+
+    /// How much of the *rendered* short hash a matching query covers — what the row highlights.
+    /// Capped at the rendered length: a 40-character paste highlights the whole abbreviation, not
+    /// past the end of it.
+    pub fn hash_match_len(&self, query: &str) -> u32 {
+        if self.matches_hash_prefix(query) {
+            (query.chars().count() as u32).min(self.short_hash.chars().count() as u32)
+        } else {
+            0
+        }
+    }
+
+    pub fn new(repo_id: String, c: crate::git::LogCommit) -> Self {
+        let haystack = c.subject.clone();
+        GitCommitCandidate {
+            repo_id,
+            hash: c.hash,
+            short_hash: c.short_hash,
+            subject: c.subject,
+            author: c.author,
+            timestamp: c.timestamp,
+            haystack,
+        }
+    }
+}
+
 /// One Keybindings-picker candidate — a [`KeybindingEntry`] the client shipped on `picker/view`
 /// (the binding tables live client-side; the server only matches and windows). `haystack` is the
 /// entry's canonical composition ([`KeybindingEntry::haystack`]), precomputed once at build so
@@ -548,6 +612,10 @@ pub enum PickerCandidates {
     /// every view and after any operation that moves HEAD (like [`Self::LspServers`], never
     /// preserved) — a stale "current branch" marker is worse than a rebuild that costs a ref walk.
     GitBranches(Vec<GitBranchCandidate>),
+    /// One repo's history, newest first — a snapshot taken on open and filtered in place after
+    /// (see [`GitCommitCandidate`]). Preserved across scroll/resume re-views like the other
+    /// snapshot kinds: re-walking per page would be wasteful and could shuffle rows mid-scroll.
+    GitLog(Vec<GitCommitCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -578,6 +646,7 @@ impl PickerCandidates {
             PickerCandidates::Keybindings(v) => v.len(),
             PickerCandidates::Jumplist(v) => v.len(),
             PickerCandidates::GitBranches(v) => v.len(),
+            PickerCandidates::GitLog(v) => v.len(),
         }
     }
 
@@ -604,6 +673,7 @@ impl PickerCandidates {
             PickerCandidates::Keybindings(v) => v.clear(),
             PickerCandidates::Jumplist(v) => v.clear(),
             PickerCandidates::GitBranches(v) => v.clear(),
+            PickerCandidates::GitLog(v) => v.clear(),
         }
     }
 
@@ -624,6 +694,9 @@ impl PickerCandidates {
             PickerCandidates::Keybindings(_) => PickerKind::Keybindings,
             PickerCandidates::Jumplist(_) => PickerKind::Jumplist,
             PickerCandidates::GitBranches(_) => PickerKind::GitBranches,
+            // Serves the file-locked `GitLogFile` too, exactly as `GitChanges` serves
+            // `GitChangesFile`: same rows, different scope and its own state slot.
+            PickerCandidates::GitLog(_) => PickerKind::GitLog,
         }
     }
 
@@ -650,6 +723,7 @@ impl PickerCandidates {
             PickerCandidates::Keybindings(v) => &v[idx].haystack,
             PickerCandidates::Jumplist(v) => &v[idx].display,
             PickerCandidates::GitBranches(v) => &v[idx].row.name,
+            PickerCandidates::GitLog(v) => &v[idx].haystack,
         }
     }
 
@@ -831,6 +905,21 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::GitLog(v) => {
+                let c = &v[idx];
+                PickerItem::GitCommit {
+                    repo_id: c.repo_id.clone(),
+                    hash: c.hash.clone(),
+                    short_hash: c.short_hash.clone(),
+                    subject: c.subject.clone(),
+                    author: c.author.clone(),
+                    timestamp: c.timestamp,
+                    match_indices,
+                    // The window builder fills this in; the centring/identity callers that reach
+                    // here have no query to abbreviate a hash with.
+                    hash_match_len: 0,
+                }
+            }
         }
     }
 
@@ -951,6 +1040,11 @@ impl PickerCandidates {
             (PickerCandidates::GitBranches(v), PickerItem::GitBranch { repo_id, name, .. }) => v
                 .iter()
                 .position(|c| c.repo_id == *repo_id && c.row.name == *name),
+            // A hash is unique and stable, so unlike the positional-identity kinds a commit row
+            // resolves however the list has been filtered since.
+            (PickerCandidates::GitLog(v), PickerItem::GitCommit { hash, .. }) => {
+                v.iter().position(|c| c.hash == *hash)
+            }
             _ => None,
         }
     }
@@ -973,7 +1067,8 @@ impl PickerCandidates {
             | PickerCandidates::WorkspaceSymbols(_)
             | PickerCandidates::Keybindings(_)
             | PickerCandidates::Jumplist(_)
-            | PickerCandidates::GitBranches(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::GitBranches(_)
+            | PickerCandidates::GitLog(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1091,6 +1186,9 @@ impl PickerCandidates {
             // `git/checkout` (Enter / Alt-l) or `git/delete_branch` (Ctrl-d), so `select` never
             // fires for this kind. Same shape as LspServers above.
             PickerCandidates::GitBranches(_) => None,
+            // Nor is a commit: Enter opens it as a read-only virtual buffer via `git/show`, which
+            // the client fires against the highlighted row.
+            PickerCandidates::GitLog(_) => None,
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker
@@ -1267,6 +1365,10 @@ pub struct PickerState {
     /// resolve to an in-workspace directory. Set wherever the peek listing is (re)built; echoed in
     /// `picker/update` so the client only offers "+ Create directory" when it's actually missing.
     pub explorer_peek_missing: bool,
+    /// Log pickers only: the walk hit its cap, so this snapshot is not the whole history. Stored
+    /// on the slot rather than derived, because a scroll re-view keeps the snapshot without
+    /// re-walking and must still report it (`PickerViewResult::truncated`).
+    pub truncated: bool,
     /// `Some` while the client has the picker open and is receiving pushes. `None` after `hide`,
     /// which also clears the rest of the slot — the fields around this one are only ever populated
     /// while a picker is open.
@@ -1467,6 +1569,7 @@ impl PickerState {
             candidates,
             explorer_anchor: None,
             explorer_peek_missing: false,
+            truncated: false,
             subscribed: None,
             pending_async_load: None,
             pending_symbol_queries: 0,
@@ -1610,6 +1713,16 @@ impl PickerState {
                     let haystack = Utf32Str::new(self.candidates.display_at(i), &mut buf);
                     if let Some(score) = pattern.score(haystack, matcher) {
                         scored.push((score, i as u32));
+                        continue;
+                    }
+                    // A commit also matches by hash *prefix*, which the fuzzy pass can't express:
+                    // the query may be longer than the rendered abbreviation (a pasted 40-char
+                    // hash), and a hash wants prefix semantics rather than scattered hits. Score is
+                    // irrelevant — GitLog re-sorts chronologically below.
+                    if let PickerCandidates::GitLog(v) = &self.candidates {
+                        if v[i].matches_hash_prefix(&self.query) {
+                            scored.push((0, i as u32));
+                        }
                     }
                 }
                 if let PickerCandidates::WorkspaceSymbols(v) = &self.candidates {
@@ -1677,12 +1790,18 @@ impl PickerState {
                     PickerCandidates::GitChanges(_)
                         | PickerCandidates::Keybindings(_)
                         | PickerCandidates::Jumplist(_)
+                        | PickerCandidates::GitLog(_)
                 ) {
                     // Grouped kinds: keep matches in document (candidate) order, not score order,
                     // so each group's rows stay a contiguous run the client can put a single
                     // header above — GitChanges' per-file hunks, Keybindings' per-group bindings
                     // (shipped pre-bucketed), the jumplist's carried source groups. The fuzzy score
                     // only decides which rows survive.
+                    //
+                    // GitLog is here for a different reason with the same answer: a log's order is
+                    // *data*. Reordering commits by match score puts a 12-week-old commit above an
+                    // hour-old one because its subject happens to score better, which reads as a
+                    // bug — the list stopped being a history. Filter, don't rank.
                     let mut keep: Vec<u32> = scored.into_iter().map(|(_, i)| i).collect();
                     keep.sort_unstable();
                     self.ranked = keep;
@@ -1883,6 +2002,28 @@ impl PickerState {
                 removed: c.removed,
                 preview,
                 match_indices,
+            };
+        }
+        // A commit row carries two independent matches — fuzzy over the subject, prefix over the
+        // hash — so it builds its item directly rather than through the single-index-set path.
+        if let PickerCandidates::GitLog(v) = &self.candidates {
+            let c = &v[idx];
+            let mut match_indices: Vec<u32> = Vec::new();
+            if let Some(pat) = ctx.pattern.as_ref() {
+                let haystack = Utf32Str::new(c.subject.as_str(), buf);
+                pat.indices(haystack, matcher, &mut match_indices);
+                match_indices.sort_unstable();
+                match_indices.dedup();
+            }
+            return PickerItem::GitCommit {
+                repo_id: c.repo_id.clone(),
+                hash: c.hash.clone(),
+                short_hash: c.short_hash.clone(),
+                subject: c.subject.clone(),
+                author: c.author.clone(),
+                timestamp: c.timestamp,
+                match_indices,
+                hash_match_len: c.hash_match_len(&self.query),
             };
         }
         let match_indices: Vec<u32> = if let Some(pat) = ctx.pattern.as_ref() {

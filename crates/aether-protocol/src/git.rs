@@ -626,6 +626,44 @@ pub struct GitBaselineRef {
     pub commit: String,
 }
 
+// ---- git/show ------------------------------------------------------------------------------------
+
+/// Materialise a revision as a read-only **virtual buffer** — a buffer with no file behind it
+/// (docs/git-phase-2.md decision 4). Two shapes, one call:
+///
+/// - **no `path`** — the commit itself: its metadata and message, then the patch against its first
+///   parent (against the empty tree for a root commit), which is what `git show` prints.
+/// - **with `path`** — that file's content as of the commit, i.e. `git show <rev>:<path>`. The
+///   language is detected from the path, so it highlights like the working-tree file does.
+///
+/// One RPC rather than two because the shape is identical — a revision, materialised read-only —
+/// and only the narrowing differs. The server owns the content: there is deliberately no way for a
+/// client to seed a buffer with arbitrary text.
+///
+/// Repeat calls for the same `(repo, rev, path)` return the **same buffer** rather than stacking
+/// duplicates, so re-selecting a row in the log picker lands where you were. The buffer opens
+/// transient (it's a preview, so it auto-closes once hidden); `Space k` pins it, and since a
+/// read-only buffer can never be promoted by an edit or a save, that's the only promotion there is.
+pub struct GitShow;
+impl RpcMethod for GitShow {
+    const NAME: &'static str = "git/show";
+    type Params = GitShowParams;
+    /// The opened buffer, in the same shape `buffer/open` returns — the client's adopt path is
+    /// identical, and `title` + `read_only` are what mark it as virtual.
+    type Result = crate::buffer::BufferOpenResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitShowParams {
+    pub repo_id: RepoId,
+    /// Anything `git rev-parse` accepts: a hash, a branch, a tag, `HEAD~3`. Unresolvable is an
+    /// error, not an empty buffer.
+    pub rev: String,
+    /// Repo-relative path to show *at* `rev`. `None` shows the commit itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 // ---- git/refresh --------------------------------------------------------------------------------
 
 /// Reconcile every open buffer in a repo with the working tree, in one pass.

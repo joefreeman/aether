@@ -1271,6 +1271,10 @@ impl ServerState {
     /// means "ephemeral, don't accumulate me"; persisting previews would reintroduce exactly the
     /// buffer-list clutter the transient mechanism exists to avoid. A scratch is only worth restoring
     /// if it has unsaved content (it's dirty, hence has a backup); an empty scratch is dropped.
+    ///
+    /// **Virtual** buffers ([`VirtualSource`]) are excluded twice over, which is deliberate rather
+    /// than incidental: they open transient, and they have neither a path nor a scratch number to
+    /// be keyed by. Restoring "the diff of a commit you looked at last Tuesday" is not a session.
     pub fn session_buffers(&self, workspace_name: &str) -> Vec<crate::config::SessionBuffer> {
         use crate::config::SessionBuffer;
         let Some(workspace) = self.workspaces.get(workspace_name) else {
@@ -1501,11 +1505,32 @@ pub struct Buffer {
 /// The shared content of one open file (or scratch): everything derived from *what the text is*
 /// rather than from any workspace's relationship to it. Owned by [`ServerState::documents`] and
 /// referenced by one or more [`Buffer`]s — see `Buffer` for the split.
+/// What a **virtual** document was materialised from (docs/git-phase-2.md decision 4): content
+/// the server produced from an immutable source rather than loading from disk. `git/show` is the
+/// only producer today — a commit's patch, or a file as of a commit.
+///
+/// Its presence is what makes a document read-only: there is no file to save to and no meaning to
+/// an edit against a revision that has already happened. Deriving read-only from this rather than
+/// carrying a separate flag keeps the two from disagreeing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualSource {
+    /// Identity for reuse: `<repo_id>@<rev>` for a commit, `<repo_id>@<rev>:<path>` for a file.
+    /// Re-showing the same revision attaches to the existing document instead of stacking
+    /// duplicates — the pathless equivalent of the canonical-path sharing key.
+    pub key: String,
+    /// Display name (`abc1234 — subject`, `abc1234:src/main.rs`), shipped as
+    /// `BufferOpenResult::title`.
+    pub title: String,
+}
+
 pub struct Document {
     pub id: DocumentId,
     /// The canonical path this document is loaded from (and the sharing key — one live document
-    /// per canonical path). `None` for a scratch.
+    /// per canonical path). `None` for a scratch *and* for a virtual document (`virtual_source`).
     pub canonical_path: Option<PathBuf>,
+    /// Set when this document's content was materialised from a revision rather than a file — see
+    /// [`VirtualSource`]. Read-only, never backed up, never session-restored.
+    pub virtual_source: Option<VirtualSource>,
     pub text: ropey::Rope,
     pub revision: Revision,
     pub language: Option<String>,
@@ -1660,6 +1685,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            virtual_source: None,
         })
     }
 
@@ -1693,7 +1719,51 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            virtual_source: None,
         }
+    }
+
+    /// A **virtual** document: pathless, read-only, content materialised from a revision
+    /// ([`VirtualSource`]). Structurally a scratch with content and a title — the difference that
+    /// matters is that nothing may write to it, and nothing should try to persist it.
+    pub fn virtual_content(
+        id: DocumentId,
+        source: VirtualSource,
+        text: String,
+        language: Option<String>,
+    ) -> Self {
+        let text = ropey::Rope::from_str(&text);
+        let syntax = language
+            .as_deref()
+            .and_then(|name| make_syntax(&text, name));
+        let indent_style = resolve_indent_style(&text, language.as_deref());
+        Document {
+            id,
+            canonical_path: None,
+            virtual_source: Some(source),
+            text,
+            revision: 0,
+            language,
+            dirty: false,
+            line_ending: LineEnding::Lf,
+            last_modified_unix_ms: None,
+            syntax,
+            syntax_pending: false,
+            indent_style,
+            saved_revision: Some(0),
+            next_revision_id: 1,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            active_group: None,
+            externally_modified: false,
+            externally_deleted: false,
+            backed_up_revision: None,
+        }
+    }
+
+    /// Whether this document refuses edits, saves and reloads — true exactly for the virtual ones.
+    pub fn read_only(&self) -> bool {
+        self.virtual_source.is_some()
     }
 
     /// Content for a scratch buffer: empty, pathless. The scratch's per-workspace display number
@@ -1725,6 +1795,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            virtual_source: None,
         }
     }
 
