@@ -1258,6 +1258,12 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--git-modified); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--git-deleted); }
+/* Branch picker: the current branch's dot, matching the native clients' accent bullet. */
+.picker-bullet-head { color: var(--accent); }
+/* Branch-row meta spans. `-warn` is the "checked out in another worktree" marker, which is a
+   disabled-state tell rather than decoration, so it must not read as dim. */
+.picker-meta-dim { color: var(--fg-dim); }
+.picker-meta-warn { color: var(--warning); }
 /* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the
    far edge. Colours match the editor status bar / favicon; the dot itself is the shared
    `.buffer-status-dot` circle, so size parity with the status bar holds by construction. */

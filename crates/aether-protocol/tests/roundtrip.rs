@@ -2291,6 +2291,169 @@ fn picker_item_file_carries_git_status() {
 }
 
 #[test]
+fn git_checkout_shape() {
+    use aether_protocol::git::{
+        GitCheckout, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitHead,
+        GitRefreshResult,
+    };
+    assert_eq!(GitCheckout::NAME, "git/checkout");
+
+    // Switching to an existing branch: `create` is defaulted away.
+    let p = GitCheckoutParams {
+        repo_id: Some("/home/u/proj".into()),
+        branch: "main".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "repo_id": "/home/u/proj", "branch": "main" })
+    );
+
+    // A success carries the new head and nothing else; the refusal fields stay off the wire.
+    let ok = GitCheckoutResult {
+        status: GitCheckoutStatus::Switched,
+        head: Some(GitHead::Branch {
+            name: "main".into(),
+            upstream: None,
+        }),
+        ..Default::default()
+    };
+    let v = to_value(&ok).unwrap();
+    assert_eq!(v["status"], "switched");
+    assert_eq!(v["head"]["state"], "branch");
+    assert!(v.get("blocked").is_none() && v.get("message").is_none());
+    assert_eq!(from_value::<GitCheckoutResult>(v).unwrap(), ok);
+
+    // A blocked checkout is an *outcome*, not an error: the buffers ride back so the client can
+    // name what to save, and `head` stays absent because nothing moved.
+    let blocked = GitCheckoutResult {
+        status: GitCheckoutStatus::BlockedByDirtyBuffers,
+        blocked: vec![3, 7],
+        refreshed: GitRefreshResult::default(),
+        ..Default::default()
+    };
+    let v = to_value(&blocked).unwrap();
+    assert_eq!(v["status"], "blocked_by_dirty_buffers");
+    assert_eq!(v["blocked"], json!([3, 7]));
+    assert!(v.get("head").is_none(), "nothing moved, so no new head");
+    assert_eq!(from_value::<GitCheckoutResult>(v).unwrap(), blocked);
+
+    for (s, wire) in [
+        (GitCheckoutStatus::Created, "created"),
+        (GitCheckoutStatus::AlreadyCheckedOut, "already_checked_out"),
+        (GitCheckoutStatus::Refused, "refused"),
+    ] {
+        assert_eq!(to_value(s).unwrap(), json!(wire));
+    }
+}
+
+#[test]
+fn git_delete_branch_shape() {
+    use aether_protocol::git::{
+        GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,
+    };
+    assert_eq!(GitDeleteBranch::NAME, "git/delete_branch");
+
+    let p = GitDeleteBranchParams {
+        repo_id: Some("/home/u/proj".into()),
+        branch: "feature".into(),
+        force: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "repo_id": "/home/u/proj", "branch": "feature", "force": true })
+    );
+
+    let refused = GitDeleteBranchResult {
+        status: GitDeleteBranchStatus::NotMerged,
+        message: String::new(),
+    };
+    let v = to_value(&refused).unwrap();
+    assert_eq!(v["status"], "not_merged");
+    assert!(
+        v.get("message").is_none(),
+        "a pre-flight refusal has no git output to carry"
+    );
+    assert_eq!(from_value::<GitDeleteBranchResult>(v).unwrap(), refused);
+
+    for (s, wire) in [
+        (GitDeleteBranchStatus::Deleted, "deleted"),
+        (GitDeleteBranchStatus::IsCurrentBranch, "is_current_branch"),
+        (GitDeleteBranchStatus::Refused, "refused"),
+    ] {
+        assert_eq!(to_value(s).unwrap(), json!(wire));
+    }
+}
+
+#[test]
+fn picker_item_git_branch_is_tagged() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(
+        to_value(PickerKind::GitBranches).unwrap(),
+        json!("git_branches")
+    );
+    // Flat and not a jump target, like LspServers: no headers, no grouping, no cursor centring,
+    // and nothing to capture into the jumplist.
+    assert!(!PickerKind::GitBranches.groups_by_file());
+    assert!(!PickerKind::GitBranches.collapsible());
+    assert!(!PickerKind::GitBranches.renders_group_headers());
+    assert!(!PickerKind::GitBranches.centers_on_cursor());
+    assert!(!PickerKind::GitBranches.captures_to_jumplist());
+
+    // The ordinary row — an unremarkable branch in a single-worktree repo — carries only what it
+    // has to. Every decoration field is defaulted away, so the common case stays small.
+    let plain = PickerItem::GitBranch {
+        repo_id: "/home/u/proj".into(),
+        name: "feature".into(),
+        is_head: false,
+        subject: "Add the thing".into(),
+        timestamp: 1_700_000_000,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        checked_out_in: None,
+        match_indices: vec![0, 1],
+    };
+    let v = to_value(&plain).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "git_branch",
+            "repo_id": "/home/u/proj",
+            "name": "feature",
+            "subject": "Add the thing",
+            "timestamp": 1_700_000_000i64,
+            "match_indices": [0, 1],
+        }),
+        "is_head/upstream/ahead/behind/checked_out_in all omitted at their defaults"
+    );
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), plain);
+
+    // The decorated row: current branch, tracking an upstream it has diverged from, and held by
+    // another worktree. `checked_out_in` is what stops the client offering a doomed checkout.
+    let decorated = PickerItem::GitBranch {
+        repo_id: "/home/u/proj".into(),
+        name: "main".into(),
+        is_head: true,
+        subject: "Release".into(),
+        timestamp: 1_700_000_001,
+        upstream: Some("origin/main".into()),
+        ahead: 2,
+        behind: 1,
+        checked_out_in: Some("/home/u/proj-worktrees/main".into()),
+        match_indices: vec![],
+    };
+    let v = to_value(&decorated).unwrap();
+    assert_eq!(v["is_head"], true);
+    assert_eq!(v["upstream"], "origin/main");
+    assert_eq!(v["ahead"], 2);
+    assert_eq!(v["behind"], 1);
+    assert_eq!(v["checked_out_in"], "/home/u/proj-worktrees/main");
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), decorated);
+}
+
+#[test]
 fn picker_item_git_change_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     use aether_protocol::viewport::DiffStage;

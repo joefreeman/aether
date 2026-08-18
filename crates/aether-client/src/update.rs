@@ -46,11 +46,13 @@ use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCommit, GitCommitParams,
-    GitCommitResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams,
-    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, HunkAction, HunkDirection,
+    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCheckout, GitCheckoutParams,
+    GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult,
+    GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,
+    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitReset, GitResetParams, GitResetResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction,
+    HunkDirection,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -209,6 +211,20 @@ pub enum Event {
     Committed(Result<GitCommitResult, String>),
     /// `git/reset` came back.
     Uncommitted(Result<GitResetResult, String>),
+    /// `git/checkout` came back. `branch` is echoed so the toast can name it without re-reading
+    /// the picker, which has closed by then.
+    CheckedOut {
+        branch: String,
+        result: Result<GitCheckoutResult, String>,
+    },
+    /// `git/delete_branch` came back. `branch` is echoed for the same reason, and `forced` says
+    /// whether this was already the escalated attempt — a `NotMerged` refusal of a forced delete
+    /// would be a bug, not something to offer forcing again.
+    BranchDeleted {
+        branch: String,
+        forced: bool,
+        result: Result<GitDeleteBranchResult, String>,
+    },
     HunkApplied {
         action: HunkAction,
         result: Result<GitApplyHunkResult, String>,
@@ -997,6 +1013,87 @@ impl Session {
                 // repo-level objection. git's own words.
                 Ok(res) => Effects::toast(res.message, ToastKind::Warning),
                 Err(e) => Effects::error(e),
+            },
+
+            // One `match` on the status, because that's what the status enum is for: every arm
+            // has a different message and a different thing for the user to do next.
+            Event::CheckedOut { branch, result } => match result {
+                Err(e) => Effects::error(e),
+                Ok(res) => match res.status {
+                    GitCheckoutStatus::Switched | GitCheckoutStatus::Created => {
+                        let verb = if res.status == GitCheckoutStatus::Created {
+                            "Created"
+                        } else {
+                            "Switched to"
+                        };
+                        // Name the buffers the switch disturbed. A checkout that quietly left
+                        // three buffers pointing at content from another branch is exactly the
+                        // surprise the reconciliation pass exists to prevent, so say so.
+                        let mut note = format!("{verb} {branch}");
+                        let moved = res.refreshed.reloaded.len();
+                        if moved > 0 {
+                            note.push_str(&format!(" — reloaded {moved} buffer(s)"));
+                        }
+                        if !res.refreshed.missing.is_empty() {
+                            note.push_str(&format!(
+                                ", {} not on this branch",
+                                res.refreshed.missing.len()
+                            ));
+                        }
+                        Effects::toast(note, ToastKind::Success)
+                    }
+                    // The one refusal with a concrete next step, so it gets one.
+                    GitCheckoutStatus::BlockedByDirtyBuffers => Effects::toast(
+                        format!(
+                            "{} unsaved buffer(s) — save first (Space s), then retry",
+                            res.blocked.len()
+                        ),
+                        ToastKind::Warning,
+                    ),
+                    GitCheckoutStatus::AlreadyCheckedOut => Effects::toast(
+                        format!("{branch} is checked out in {}", res.message),
+                        ToastKind::Warning,
+                    ),
+                    GitCheckoutStatus::Refused => Effects::toast(res.message, ToastKind::Warning),
+                },
+            },
+
+            Event::BranchDeleted {
+                branch,
+                forced,
+                result,
+            } => match result {
+                Err(e) => Effects::error(e),
+                Ok(res) => match res.status {
+                    GitDeleteBranchStatus::Deleted => {
+                        Effects::toast(format!("Deleted {branch}"), ToastKind::Success)
+                    }
+                    // Escalate rather than dead-end: the user gets told what they'd lose and
+                    // presses Enter to accept it. Not offered on an already-forced attempt —
+                    // that would be a loop.
+                    GitDeleteBranchStatus::NotMerged if !forced => {
+                        self.prompt = Some(Prompt::Confirm {
+                            kind: ConfirmKind::DeleteUnmergedBranch {
+                                name: branch.clone(),
+                            },
+                            action: ConfirmAction::DeleteBranch {
+                                name: branch,
+                                force: true,
+                            },
+                        });
+                        Effects::none()
+                    }
+                    GitDeleteBranchStatus::NotMerged => {
+                        Effects::toast(format!("{branch} isn't merged"), ToastKind::Warning)
+                    }
+                    GitDeleteBranchStatus::IsCurrentBranch => Effects::toast(
+                        format!("{branch} is checked out here — switch away first"),
+                        ToastKind::Warning,
+                    ),
+                    GitDeleteBranchStatus::Refused => {
+                        Effects::toast(res.message, ToastKind::Warning)
+                    }
+                },
             },
 
             Event::HunkApplied { action, result } => match result {
@@ -2820,6 +2917,10 @@ impl Session {
                 .then_some(buffer_id),
                 directory_path,
                 explorer_roots: false,
+                // The buffer-scoped kinds send the buffer they list *for*. GitBranches sends it
+                // for a different reason: it's the repo-resolution hint, the same one
+                // `git/prepare_commit` takes — without it a multi-repo workspace can't tell which
+                // repo's branches to list.
                 buffer_id: (from_selection
                     || matches!(
                         kind,
@@ -2827,6 +2928,7 @@ impl Session {
                             | PickerKind::References
                             | PickerKind::DocumentSymbols
                             | PickerKind::GitChangesFile
+                            | PickerKind::GitBranches
                     ))
                 .then_some(buffer_id),
                 from_selection,
@@ -3976,6 +4078,7 @@ impl Session {
         if p.selected_is_create() {
             return match p.kind {
                 PickerKind::Workspaces => self.workspace_create_from_query(),
+                PickerKind::GitBranches => self.branch_create_from_query(),
                 _ => self.explorer_create_from_query(),
             };
         }
@@ -3995,6 +4098,32 @@ impl Session {
             PickerItem::Root { path_index, .. } => {
                 let dir = self.workspace_paths.get(*path_index as usize).cloned();
                 return self.explorer_navigate(dir, false, None);
+            }
+            PickerItem::GitBranch {
+                repo_id,
+                name,
+                is_head,
+                checked_out_in,
+                ..
+            } => {
+                // Already here: say so rather than spawning a git that would do nothing.
+                if *is_head {
+                    return Effects::toast(format!("Already on {name}"), ToastKind::Info);
+                }
+                // Refuse client-side, naming the worktree. The server checks this too (a race is
+                // possible), but the round trip is pointless when the row already says so.
+                if let Some(held) = checked_out_in {
+                    let leaf = held.rsplit('/').next().unwrap_or(held);
+                    return Effects::toast(
+                        format!("{name} is checked out in {leaf}"),
+                        ToastKind::Warning,
+                    );
+                }
+                let (repo_id, name) = (repo_id.clone(), name.clone());
+                // Close first: a checkout is a terminal action, and the list it was showing is
+                // about to be stale (the HEAD marker moves).
+                let hide = self.close_picker();
+                return hide.and(self.git_checkout(repo_id, name, false));
             }
             PickerItem::LspServer {
                 name,
@@ -4232,6 +4361,25 @@ impl Session {
             // core ever sees it — the iced forward gate in `app.rs` only forwards keys the input left
             // uncaptured, and the web `routeOverlayKey` clip filter drops Ctrl-c/v/x/a outright. Only
             // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
+            // GitBranches: Ctrl-d deletes the highlighted branch behind a confirm — the same
+            // gesture Explorer/Files/Workspaces and Buffers use for "remove the highlighted thing".
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::GitBranches => {
+                let Some(PickerItem::GitBranch { name, is_head, .. }) = p.selected_item() else {
+                    return Effects::none();
+                };
+                // Git refuses this outright, so don't stage a doomed confirm — say why.
+                if *is_head {
+                    return Effects::error(format!(
+                        "{name} is checked out here — switch away first"
+                    ));
+                }
+                let name = name.clone();
+                self.prompt = Some(Prompt::Confirm {
+                    kind: ConfirmKind::DeleteBranch { name: name.clone() },
+                    action: ConfirmAction::DeleteBranch { name, force: false },
+                });
+                return Effects::none();
+            }
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
                 let fx = self.observe_picker_cmd(PickerCmd::CloseBuffer);
                 return fx.and(self.picker_close_buffer());
@@ -6773,7 +6921,105 @@ impl Session {
                     }))
                 })
             }
+            ConfirmAction::DeleteBranch { name, force } => self.git_delete_branch(name, force),
         }
+    }
+
+    /// Fire `git/checkout` for a branch row, naming the repo the *row* carried.
+    ///
+    /// The row's `repo_id` rather than a fresh resolution: resolution runs off the active buffer,
+    /// and between opening the picker and pressing Enter the user may have switched buffers — or a
+    /// transient preview may have closed — which would land the checkout in a different repo than
+    /// the one whose branches are on screen.
+    fn git_checkout(&mut self, repo_id: String, branch: String, create: bool) -> Effects {
+        let echoed = branch.clone();
+        self.request::<GitCheckout>(
+            GitCheckoutParams {
+                repo_id: Some(repo_id),
+                buffer_id: Some(self.buffer.buffer_id),
+                branch,
+                create,
+            },
+            move |r| Event::CheckedOut {
+                branch: echoed.clone(),
+                result: r.map_err(|e| e.message),
+            },
+        )
+    }
+
+    /// Fire `git/delete_branch`. `force` is set only by the escalation from a `NotMerged` refusal.
+    fn git_delete_branch(&mut self, branch: String, force: bool) -> Effects {
+        let Some(repo_id) = self.branch_picker_repo_id() else {
+            return Effects::none();
+        };
+        let echoed = branch.clone();
+        self.request::<GitDeleteBranch>(
+            GitDeleteBranchParams {
+                repo_id: Some(repo_id),
+                buffer_id: Some(self.buffer.buffer_id),
+                branch,
+                force,
+            },
+            move |r| Event::BranchDeleted {
+                branch: echoed.clone(),
+                forced: force,
+                result: r.map_err(|e| e.message),
+            },
+        )
+    }
+
+    /// The repo the open branch picker is listing, taken off any of its rows (they all carry the
+    /// same id — it's a property of the listing). `None` when the picker is closed or empty, which
+    /// is also why a delete confirm can't outlive its picker.
+    fn branch_picker_repo_id(&self) -> Option<String> {
+        let p = self.picker.as_ref()?;
+        if p.kind != PickerKind::GitBranches {
+            return None;
+        }
+        p.items.iter().find_map(|it| match it {
+            PickerItem::GitBranch { repo_id, .. } => Some(repo_id.clone()),
+            _ => None,
+        })
+    }
+
+    /// The `+ Create` row in the branch picker: create the typed branch and switch to it, which is
+    /// what `git checkout -b` does and what the Explorer/Workspaces create rows do (they open and
+    /// activate what they made). Also the only way into a repo whose HEAD is unborn.
+    pub fn branch_create_from_query(&mut self) -> Effects {
+        let (name, repo_id) = {
+            let Some(p) = &self.picker else {
+                return Effects::none();
+            };
+            if p.kind != PickerKind::GitBranches {
+                return Effects::none();
+            }
+            (p.query.trim().to_string(), self.branch_picker_repo_id())
+        };
+        if name.is_empty() {
+            return Effects::error("Type a name to create");
+        }
+        // An unborn-HEAD repo lists no branches, so there's no row to read the id off — fall back
+        // to letting the server resolve from the active buffer, which is the same rule the picker
+        // itself opened with. (Not a drift risk the way the checkout case is: nothing was listed.)
+        let repo_id = repo_id.unwrap_or_default();
+        let hide = self.close_picker();
+        hide.and(if repo_id.is_empty() {
+            let echoed = name.clone();
+            self.request::<GitCheckout>(
+                GitCheckoutParams {
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                    branch: name,
+                    create: true,
+                },
+                move |r| Event::CheckedOut {
+                    branch: echoed.clone(),
+                    result: r.map_err(|e| e.message),
+                },
+            )
+        } else {
+            self.git_checkout(repo_id, name, true)
+        })
     }
 
     /// Open the save-as prompt pre-filled with `(path_index, input)`. A brand-new buffer (empty

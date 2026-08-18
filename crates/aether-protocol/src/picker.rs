@@ -131,6 +131,17 @@ pub enum PickerKind {
     /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
     /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
     Jumplist,
+    /// The local branches of one repo (`Space y`, docs/git-phase-2.md stage 2), fuzzy-matched on
+    /// branch name, HEAD first then most-recently-committed. The repo is resolved server-side from
+    /// [`PickerViewParams::buffer_id`] by the same rule `git/prepare_commit` uses, so a single-repo
+    /// workspace never sees a chooser.
+    ///
+    /// Not a jump target, like [`LspServers`](Self::LspServers): the client acts on the highlighted
+    /// row (`Enter`/`Alt-l` → `git/checkout`, `Ctrl-d` → `git/delete_branch`), so there's no
+    /// `PickerSelectResult` for it. A query naming no existing branch offers the synthetic
+    /// "+ Create" row, which creates *and* switches — that is also what makes the picker usable in
+    /// a repo with an unborn HEAD, where there are no branches to list at all.
+    GitBranches,
 }
 
 impl PickerKind {
@@ -649,6 +660,47 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
+    /// One local branch in the [`PickerKind::GitBranches`] picker. Identity is `(repo_id, name)`;
+    /// the matcher haystack is `name`. Not a jump target — the client acts on the row — so there's
+    /// no corresponding `PickerSelectResult` variant, like [`PickerItem::LspServer`].
+    GitBranch {
+        /// Which repo this row belongs to, echoed onto every action the client fires.
+        ///
+        /// Redundant-looking (the server could re-resolve it) and load-bearing anyway: resolution
+        /// runs off the *active buffer*, so a picker opened over repo A would have its checkout
+        /// land in repo B if the user switched buffers — or a transient preview closed — while the
+        /// list was up. Carrying the id makes each row name what it acts on, which is the rule
+        /// `docs/git-phase-2.md` decision 2 sets for every repo-level operation.
+        repo_id: crate::git::RepoId,
+        /// Shorthand name (`main`), not `refs/heads/main`.
+        name: String,
+        /// This branch is the repo's current HEAD.
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_head: bool,
+        /// The tip commit's summary line, shown dim after the name. Empty when unreadable.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        subject: String,
+        /// Tip commit's author time as Unix seconds, rendered as a relative date. `0` when unknown.
+        #[serde(default, skip_serializing_if = "is_zero_i64")]
+        timestamp: i64,
+        /// Configured upstream (`origin/main`); `None` for a branch never pushed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream: Option<String>,
+        /// Commits ahead of / behind `upstream`. Both `0` without one. Only as fresh as the last
+        /// fetch — there is no fetch yet (stage 3), so treat them as advisory.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ahead: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        behind: u32,
+        /// Workdir of another worktree holding this branch, when one does. Git refuses the same
+        /// branch in two worktrees, so the client refuses the checkout on this before the round
+        /// trip — the row has to carry it for that to be possible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checked_out_in: Option<String>,
+        /// Char offsets into `name` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
     /// One keyboard shortcut in the Keybindings picker — the [`KeybindingEntry`] the client
     /// shipped on open, echoed back with match highlighting. Identity is `(mode, keys, desc)`
     /// (a chord can be bound in several modes, and an Alt-pair fold can reuse a description).
@@ -1031,6 +1083,10 @@ fn is_false(b: &bool) -> bool {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_i64(n: &i64) -> bool {
     *n == 0
 }
 

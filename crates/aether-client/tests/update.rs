@@ -71,6 +71,17 @@ fn quits(fx: &Effects) -> bool {
     fx.0.iter().any(|e| matches!(e, Effect::Exit))
 }
 
+/// The messages of every toast an update produced, for asserting on wording that carries a
+/// concrete next step ("save first", "switch away first").
+fn toast_messages(fx: &Effects) -> Vec<String> {
+    fx.0.iter()
+        .filter_map(|e| match e {
+            Effect::Toast { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn has_error_toast(fx: &Effects) -> bool {
     fx.0.iter().any(|e| {
         matches!(
@@ -3937,6 +3948,248 @@ fn changes_pickers_open_fresh_and_centre_on_the_cursor() {
             "{kind:?} frames the hunk nearest the live cursor instead"
         );
     }
+}
+
+/// `Space y` opens the branch picker, carrying the active buffer as the repo-resolution hint —
+/// the same rule `git/prepare_commit` uses, so the client never needs to know repo ids.
+#[test]
+fn space_y_opens_the_branch_picker() {
+    let mut s = session();
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None, ROWS);
+    let view = find_request(&fx, "picker/view").expect("Space y opens a picker");
+    assert_eq!(view["kind"], json!("git_branches"));
+    assert_eq!(
+        view["buffer_id"],
+        json!(s.buffer.buffer_id),
+        "the active buffer rides along so the server can resolve the repo"
+    );
+}
+
+/// Open the branch picker on a fixed two-branch listing: `main` (current) and `feature`.
+fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session::Session {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::GitBranches, None, None, false, None);
+    let row = |name: &str, is_head: bool, held: Option<&str>| PickerItem::GitBranch {
+        repo_id: "/p".into(),
+        name: name.into(),
+        is_head,
+        subject: "Add a thing".into(),
+        timestamp: 1_700_000_000,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        checked_out_in: held.map(str::to_string),
+        match_indices: vec![],
+    };
+    {
+        let p = s.picker.as_mut().expect("picker open");
+        p.items = vec![
+            row("main", true, None),
+            row("feature", false, checked_out_in),
+        ];
+        p.total_matches = 2;
+        p.selected = 1; // "feature"
+    }
+    s
+}
+
+/// Enter on a branch row checks it out, naming the repo the *row* carried rather than
+/// re-resolving — the picker may have been opened over a different repo than the active buffer's.
+#[test]
+fn branch_picker_enter_checks_out_the_highlighted_branch() {
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    let req = find_request(&fx, "git/checkout").expect("Enter checks out");
+    assert_eq!(req["branch"], json!("feature"));
+    assert_eq!(
+        req["repo_id"],
+        json!("/p"),
+        "the row's repo, not a re-resolve"
+    );
+    assert!(
+        req.get("create").is_none_or(|c| c == &json!(false)),
+        "an existing branch is switched to, not created"
+    );
+    assert!(
+        s.picker.is_none(),
+        "a checkout is terminal — the list closes"
+    );
+}
+
+/// `Alt-l` is "one level deeper" everywhere; a flat picker has no deeper, so it means open.
+#[test]
+fn branch_picker_alt_l_checks_out_like_enter() {
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let req = find_request(&fx, "git/checkout").expect("Alt-l checks out");
+    assert_eq!(req["branch"], json!("feature"));
+}
+
+#[test]
+fn branch_picker_refuses_a_branch_held_by_another_worktree() {
+    // The row already says it's taken, so the round trip would only come back refused. The server
+    // checks too (a race is possible); this is about not sending a request that can't succeed.
+    let mut s = branch_picker_session(Some("/p-worktrees/feature"));
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    assert!(
+        find_request(&fx, "git/checkout").is_none(),
+        "no checkout is attempted"
+    );
+    assert!(
+        s.picker.is_some(),
+        "and the picker stays open to pick another"
+    );
+}
+
+#[test]
+fn branch_picker_enter_on_the_current_branch_is_a_no_op() {
+    let mut s = branch_picker_session(None);
+    s.picker.as_mut().unwrap().selected = 0; // "main", the HEAD row
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "git/checkout").is_none(),
+        "already on it — nothing to run"
+    );
+}
+
+/// Typing a novel name offers "+ Create", which creates *and* switches (`git checkout -b`) —
+/// matching the Explorer/Workspaces create rows, which open and activate what they made.
+#[test]
+fn branch_picker_create_row_creates_and_switches() {
+    let mut s = branch_picker_session(None);
+    s.picker_set_query("new-thing".into());
+    {
+        let p = s.picker.as_ref().unwrap();
+        assert!(
+            p.pending_create().is_some(),
+            "a name no branch carries offers the create row"
+        );
+    }
+    s.picker.as_mut().unwrap().selected = s.picker.as_ref().unwrap().create_row_index().unwrap();
+
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let req = find_request(&fx, "git/checkout").expect("the create row checks out");
+    assert_eq!(req["branch"], json!("new-thing"));
+    assert_eq!(req["create"], json!(true));
+}
+
+#[test]
+fn branch_picker_create_row_hides_once_the_name_matches_a_branch() {
+    let mut s = branch_picker_session(None);
+    s.picker_set_query("feature".into());
+    assert!(
+        s.picker.as_ref().unwrap().pending_create().is_none(),
+        "an exact existing name would be checked out by Enter, so there's nothing to create"
+    );
+}
+
+/// `Ctrl-d` deletes behind a confirm — the same gesture Explorer/Files/Workspaces and Buffers use.
+#[test]
+fn branch_picker_ctrl_d_confirms_then_deletes() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    let mut s = branch_picker_session(None);
+
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    assert!(
+        find_request(&fx, "git/delete_branch").is_none(),
+        "Ctrl-d stages a confirm; it doesn't delete outright"
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::DeleteBranch { name },
+            ..
+        }) => assert_eq!(name, "feature"),
+        other => panic!("expected a delete-branch confirm, got {other:?}"),
+    }
+
+    let fx = s.on_event(Event::PromptAccept);
+    let req = find_request(&fx, "git/delete_branch").expect("accepting deletes");
+    assert_eq!(req["branch"], json!("feature"));
+    assert!(
+        req.get("force").is_none_or(|f| f == &json!(false)),
+        "the first attempt is never forced"
+    );
+}
+
+#[test]
+fn branch_picker_ctrl_d_refuses_the_current_branch() {
+    let mut s = branch_picker_session(None);
+    s.picker.as_mut().unwrap().selected = 0; // "main", the HEAD row
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    assert!(s.prompt.is_none(), "no confirm for a doomed delete");
+    assert!(find_request(&fx, "git/delete_branch").is_none());
+}
+
+/// A `NotMerged` refusal escalates into a second confirm rather than dead-ending, and accepting
+/// re-sends with `force`. The status comes from a real merge-base check server-side, which is what
+/// lets the client offer this instead of pattern-matching git's wording.
+#[test]
+fn not_merged_delete_escalates_to_a_force_confirm() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    let mut s = branch_picker_session(None);
+
+    let fx = s.on_event(Event::BranchDeleted {
+        branch: "feature".into(),
+        forced: false,
+        result: Ok(serde_json::from_value(json!({ "status": "not_merged" })).unwrap()),
+    });
+    assert!(fx.0.is_empty(), "no toast — a confirm is the response");
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::DeleteUnmergedBranch { name },
+            ..
+        }) => assert_eq!(name, "feature"),
+        other => panic!("expected the unmerged escalation, got {other:?}"),
+    }
+
+    let fx = s.on_event(Event::PromptAccept);
+    let req = find_request(&fx, "git/delete_branch").expect("accepting force-deletes");
+    assert_eq!(req["force"], json!(true));
+}
+
+#[test]
+fn a_forced_delete_that_still_reports_not_merged_does_not_loop() {
+    use aether_client::update::Event;
+    // Defensive: escalating again would be an infinite confirm. Reachable only if the server's
+    // pre-flight and git ever disagree, which is exactly when a loop would be worst.
+    let mut s = branch_picker_session(None);
+    let fx = s.on_event(Event::BranchDeleted {
+        branch: "feature".into(),
+        forced: true,
+        result: Ok(serde_json::from_value(json!({ "status": "not_merged" })).unwrap()),
+    });
+    assert!(s.prompt.is_none(), "no second escalation");
+    assert!(
+        !fx.0.is_empty(),
+        "the user is still told something happened"
+    );
+}
+
+/// A blocked checkout names how many buffers to save — the one refusal with a concrete next step.
+#[test]
+fn blocked_checkout_tells_the_user_to_save() {
+    use aether_client::update::Event;
+    let mut s = branch_picker_session(None);
+    let fx = s.on_event(Event::CheckedOut {
+        branch: "feature".into(),
+        result: Ok(serde_json::from_value(json!({
+            "status": "blocked_by_dirty_buffers",
+            "blocked": [7, 9],
+        }))
+        .unwrap()),
+    });
+    let toasted = toast_messages(&fx).join(" | ");
+    assert!(
+        toasted.contains("2 unsaved") && toasted.contains("Space s"),
+        "names the count and the way out, got: {toasted}"
+    );
 }
 
 #[test]

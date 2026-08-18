@@ -386,6 +386,171 @@ pub fn discover_repo(path: &Path) -> Option<RepoIdentity> {
     })
 }
 
+/// One local branch, as the branch picker's rows need it.
+///
+/// Read-only and libgit2-side (`docs/git-phase-2.md` decision 1: reads stay in-process, writes
+/// shell out). Everything here is cheap — a ref walk plus one commit lookup each — so the list is
+/// rebuilt per `picker/view` rather than cached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRow {
+    /// Shorthand name (`main`), not the full `refs/heads/main`.
+    pub name: String,
+    /// This branch is the current worktree's HEAD.
+    pub is_head: bool,
+    /// The tip commit's summary line; empty when it can't be read.
+    pub subject: String,
+    /// Tip commit's author time, Unix seconds — the client formats it (as blame does).
+    pub timestamp: i64,
+    /// Configured upstream (`origin/main`), or `None` for a branch never pushed.
+    pub upstream: Option<String>,
+    /// Commits this branch has that its upstream doesn't, and vice versa. Both `0` without an
+    /// upstream. Computed locally, so they're only as fresh as the last fetch — stage 3's job.
+    pub ahead: u32,
+    pub behind: u32,
+    /// Workdir of *another* worktree that has this branch checked out. Git refuses the same branch
+    /// in two worktrees, so the picker must show this before the user tries.
+    pub checked_out_in: Option<String>,
+}
+
+/// Every local branch of the repo at `workdir`, HEAD first and then most-recently-committed first.
+///
+/// That ordering is the useful default for a fuzzy picker: with no query you want the branch you're
+/// on and the ones you've touched lately, not an alphabetical list where `main` sits under `feat/…`.
+///
+/// Best-effort throughout — a branch whose tip can't be peeled still lists, with an empty subject.
+/// An unborn HEAD (fresh repo, no commits) has no branches at all and correctly returns empty.
+pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let head_name = match head_state(&repo) {
+        Some(GitHead::Branch { name, .. }) => Some(name),
+        _ => None,
+    };
+    let elsewhere = branches_checked_out_elsewhere(&repo, workdir);
+
+    let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (branch, _) in branches.flatten() {
+        let Some(name) = branch.name().ok().flatten().map(String::from) else {
+            continue;
+        };
+        let commit = branch.get().peel_to_commit().ok();
+        let upstream = branch.upstream().ok();
+        // `graph_ahead_behind` wants both tips; without an upstream there's nothing to compare to.
+        let (ahead, behind) = match (
+            branch.get().target(),
+            upstream.as_ref().and_then(|u| u.get().target()),
+        ) {
+            (Some(local), Some(up)) => repo.graph_ahead_behind(local, up).unwrap_or((0, 0)),
+            _ => (0, 0),
+        };
+        out.push(BranchRow {
+            is_head: head_name.as_deref() == Some(name.as_str()),
+            subject: commit
+                .as_ref()
+                .and_then(|c| c.summary().ok().flatten().map(String::from))
+                .unwrap_or_default(),
+            timestamp: commit.as_ref().map(|c| c.time().seconds()).unwrap_or(0),
+            upstream: upstream.and_then(|u| u.name().ok().flatten().map(String::from)),
+            ahead: ahead as u32,
+            behind: behind as u32,
+            checked_out_in: elsewhere.get(&name).cloned(),
+            name,
+        });
+    }
+    // HEAD pinned to the top; the rest newest-tip first, name as the tiebreak so the order is
+    // stable when several branches share a commit (a just-created branch and its base).
+    out.sort_by(|a, b| {
+        b.is_head
+            .cmp(&a.is_head)
+            .then(b.timestamp.cmp(&a.timestamp))
+            .then(a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// Which branches are checked out in a worktree *other than* `workdir`, mapped to that worktree's
+/// path.
+///
+/// Both directions have to be covered: `worktrees()` lists only the *linked* worktrees, so a linked
+/// worktree asking this question would never see the main checkout. The main working tree is
+/// recovered from the common dir instead — it is `<main>/.git`, so its parent is the main worktree
+/// (absent for a bare main repo, which has no working tree and so checks nothing out).
+fn branches_checked_out_elsewhere(
+    repo: &git2::Repository,
+    workdir: &Path,
+) -> HashMap<String, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(main) = repo.commondir().parent() {
+        candidates.push(main.to_path_buf());
+    }
+    if let Ok(names) = repo.worktrees() {
+        for name in names.iter() {
+            let Ok(Some(name)) = name else { continue };
+            if let Ok(worktree) = repo.find_worktree(name) {
+                candidates.push(worktree.path().to_path_buf());
+            }
+        }
+    }
+
+    let here = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let mut map = HashMap::new();
+    for path in candidates {
+        let Ok(canonical) = path.canonicalize() else {
+            continue; // a pruned worktree whose directory is gone
+        };
+        if canonical == here {
+            continue;
+        }
+        let Ok(other) = git2::Repository::open(&canonical) else {
+            continue;
+        };
+        if let Some(GitHead::Branch { name, .. }) = head_state(&other) {
+            map.entry(name)
+                .or_insert_with(|| canonical.to_string_lossy().into_owned());
+        }
+    }
+    map
+}
+
+/// The workdir of another worktree holding `branch`, when one does — the checkout pre-flight's
+/// question, asked without listing every branch.
+///
+/// Git permits a branch in only one worktree at a time, so this is a refusal the server can make
+/// (and explain, naming the worktree) before spawning a `git checkout` that could only fail.
+pub fn branch_checked_out_elsewhere(workdir: &Path, branch: &str) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    branches_checked_out_elsewhere(&repo, workdir).remove(branch)
+}
+
+/// Whether `branch` is fully merged into HEAD — the check `git branch -d` makes before refusing.
+///
+/// Done here, from libgit2, rather than by reading git's refusal: the client escalates to a
+/// force-delete confirm on this specific outcome, and `docs/git-phase-2.md` decision 1 rules out
+/// parsing stderr into structured variants. `true` when the answer can't be determined (an unborn
+/// HEAD, an unpeelable tip) so the caller falls through to git, which is authoritative anyway.
+pub fn branch_is_merged(workdir: &Path, branch: &str) -> bool {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return true;
+    };
+    let tip = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().target());
+    let head = repo.head().ok().and_then(|h| h.target());
+    match (tip, head) {
+        (Some(tip), Some(head)) => {
+            repo.graph_descendant_of(head, tip).unwrap_or(true) || tip == head
+        }
+        _ => true,
+    }
+}
+
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.
 fn head_blob_bytes(repo: &git2::Repository, rel: &Path) -> Option<Vec<u8>> {
     let tree = repo.head().ok()?.peel_to_tree().ok()?;
@@ -2295,5 +2460,149 @@ mod tests {
     fn repo_status_for_root_no_repo_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(repo_status_for_root(dir.path()).is_none());
+    }
+
+    // ---- list_branches (branch picker) ----------------------------------------------------------
+
+    /// Create `name` at HEAD without switching to it — a second branch to list.
+    fn branch_at_head(dir: &Path, name: &str) {
+        let repo = git2::Repository::open(dir).expect("open repo");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch(name, &head, false).expect("create branch");
+    }
+
+    #[test]
+    fn list_branches_marks_head_and_reads_the_tip_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        branch_at_head(dir.path(), "feature");
+
+        let rows = list_branches(dir.path());
+        assert_eq!(rows.len(), 2, "both local branches listed");
+
+        let head: Vec<&BranchRow> = rows.iter().filter(|r| r.is_head).collect();
+        assert_eq!(head.len(), 1, "exactly one branch is HEAD");
+        assert!(rows[0].is_head, "HEAD sorts first regardless of name");
+        assert_eq!(head[0].subject, "init", "tip commit's summary line");
+        assert!(head[0].timestamp > 0);
+
+        let feature = rows.iter().find(|r| r.name == "feature").unwrap();
+        assert!(!feature.is_head);
+        assert_eq!(
+            feature.upstream, None,
+            "a never-pushed branch has no upstream"
+        );
+        assert_eq!((feature.ahead, feature.behind), (0, 0));
+        assert_eq!(
+            feature.checked_out_in, None,
+            "no linked worktrees in this fixture"
+        );
+    }
+
+    #[test]
+    fn list_branches_unborn_head_has_no_branches() {
+        // A fresh repo with no commit: the branch picker's empty state, and the case the
+        // "+ Create" row exists for. Must be empty rather than an error.
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).expect("init");
+        assert!(list_branches(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn list_branches_detached_head_marks_nothing_current() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let oid = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(oid).expect("detach");
+
+        let rows = list_branches(dir.path());
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].is_head,
+            "detached HEAD is on no branch, so no row is current"
+        );
+    }
+
+    #[test]
+    fn list_branches_no_repo_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_branches(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn list_branches_flags_a_branch_checked_out_in_a_linked_worktree() {
+        // Git refuses the same branch in two worktrees, so the picker has to show this *before*
+        // the user presses Enter on it.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        branch_at_head(dir.path(), "feature");
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let wt_path = dir.path().join("wt-feature");
+        let branch_ref = repo
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        let reference = branch_ref.into_reference();
+        opts.reference(Some(&reference));
+        repo.worktree("feature", &wt_path, Some(&opts))
+            .expect("add worktree");
+
+        let rows = list_branches(dir.path());
+        let feature = rows.iter().find(|r| r.name == "feature").unwrap();
+        let held = feature
+            .checked_out_in
+            .as_deref()
+            .expect("feature is checked out in the linked worktree");
+        assert!(
+            held.ends_with("wt-feature"),
+            "names the worktree holding it, got {held}"
+        );
+
+        // ...and the reverse direction: from inside the linked worktree, the *main* checkout's
+        // branch must show as taken. `worktrees()` lists only linked ones, so this is the case
+        // that would silently regress.
+        let from_worktree = list_branches(&wt_path);
+        let main_row = rows.iter().find(|r| r.is_head).unwrap();
+        let seen = from_worktree
+            .iter()
+            .find(|r| r.name == main_row.name)
+            .unwrap();
+        assert!(
+            seen.checked_out_in.is_some(),
+            "the main worktree's branch reads as taken from the linked worktree"
+        );
+    }
+
+    // ---- branch_is_merged (delete pre-flight) ---------------------------------------------------
+
+    #[test]
+    fn branch_is_merged_is_true_for_a_branch_at_head() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        branch_at_head(dir.path(), "feature");
+        assert!(
+            branch_is_merged(dir.path(), "feature"),
+            "same commit as HEAD — nothing would be lost"
+        );
+    }
+
+    #[test]
+    fn branch_is_merged_is_false_once_the_branch_has_its_own_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        // A commit that only `feature` points at: deleting it would lose work.
+        let tree = repo.find_tree(head.tree_id()).unwrap();
+        let oid = repo
+            .commit(None, &sig, &sig, "unmerged work", &tree, &[&head])
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(oid).unwrap(), false)
+            .unwrap();
+
+        assert!(!branch_is_merged(dir.path(), "feature"));
     }
 }

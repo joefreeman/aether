@@ -2572,6 +2572,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
+        ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
+        ConfirmKind::DeleteUnmergedBranch { name } => {
+            format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
+        }
     }
 }
 
@@ -2879,8 +2883,8 @@ fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
     }
 }
 
-/// Coarse relative age for the blame line ("3w ago").
-fn time_ago(unix_secs: i64) -> String {
+/// Coarse relative age for the blame line ("3w ago") and the branch picker's tip dates.
+pub(crate) fn time_ago(unix_secs: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

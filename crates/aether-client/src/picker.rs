@@ -398,6 +398,7 @@ impl PickerState {
         match self.kind {
             PickerKind::Explorer => self.explorer_pending_create(),
             PickerKind::Workspaces => self.workspace_pending_create(),
+            PickerKind::GitBranches => self.branch_pending_create(),
             _ => None,
         }
     }
@@ -500,6 +501,31 @@ impl PickerState {
             .items
             .iter()
             .any(|it| matches!(it, PickerItem::Workspace { name: n, .. } if n == name));
+        if exact {
+            return None;
+        }
+        Some(PendingCreate {
+            name: name.to_string(),
+            is_dir: false,
+        })
+    }
+
+    fn branch_pending_create(&self) -> Option<PendingCreate> {
+        let name = self.query.trim();
+        if name.is_empty() {
+            return None;
+        }
+        // Deliberately *not* validating ref-name syntax here. Git's rules are fiddly (no `..`, no
+        // trailing `.lock`, no control characters, no `@{`) and reimplementing them client-side
+        // would drift; `git checkout -b` refuses with a clear message and that refusal already
+        // surfaces verbatim. Only the empty case is worth catching, because it produces no row.
+        //
+        // Suppress once a listed branch already carries the exact name — Enter would check it out.
+        // Case-sensitive: git refs are.
+        let exact = self
+            .items
+            .iter()
+            .any(|it| matches!(it, PickerItem::GitBranch { name: n, .. } if n == name));
         if exact {
             return None;
         }
@@ -887,6 +913,9 @@ impl PickerState {
             // Empty list, empty query: advertise how to fill it (a non-empty query that matched
             // nothing already took the "No matches" arm above).
             PickerKind::Jumplist => "Nothing captured",
+            // Reachable and not an error: a repo whose HEAD is unborn has no branches until the
+            // first commit. Typing a name offers "+ Create", which is the way out.
+            PickerKind::GitBranches => "No branches yet",
             _ => "No results",
         })
     }
@@ -917,6 +946,9 @@ pub enum ItemKey<'a> {
     /// A collapsible group's header row, keyed like the server's `group_key_at`: a `File`
     /// header is `(path_index, relative_path)`, a `Label` header `(u32::MAX, label)`.
     Group(u32, &'a str),
+    /// `(repo_id, branch name)` — the listing is single-repo, but keying on both means an item
+    /// held across a repo switch can't resolve to a same-named branch in the new one.
+    GitBranch(&'a str, &'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1015,6 +1047,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             mode, keys, desc, ..
         } => ItemKey::Keybinding(mode, keys, desc),
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry(*index),
+        PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch(repo_id, name),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,

@@ -103,6 +103,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   workspace_symbols: "Go to symbol in workspace…",
   keybindings: "Search keybindings…",
   jumplist: "Filter the jumplist…",
+  git_branches: "Switch branch…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -278,7 +279,9 @@ type ConfirmKind =
   | { kind: "delete"; noun: string; name: string }
   | { kind: "remove_root"; path: string }
   | { kind: "remove_project"; path: string }
-  | { kind: "delete_workspace"; name: string };
+  | { kind: "delete_workspace"; name: string }
+  | { kind: "delete_branch"; name: string }
+  | { kind: "delete_unmerged_branch"; name: string };
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
@@ -334,6 +337,10 @@ function confirmMessage(c: ConfirmKind): string {
       return `Stop pinning project "${c.path}"?`;
     case "delete_workspace":
       return `Delete workspace "${c.name}"?`;
+    case "delete_branch":
+      return `Delete branch "${c.name}"?`;
+    case "delete_unmerged_branch":
+      return `"${c.name}" isn't merged — delete anyway, discarding its commits?`;
   }
 }
 
@@ -828,6 +835,31 @@ function describePickerItem(
         matches: ephemeral ? [] : item.match_indices,
         italic: ephemeral,
         dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
+      };
+    }
+    case "git_branch": {
+      // Accent dot on the current branch (the shared bullet cell, so the pickers stay aligned),
+      // then dim metadata: tip subject, relative date, ahead/behind. The worktree marker is NOT
+      // decoration — git refuses the same branch in two worktrees, so it's the row's "you can't
+      // check this out" tell and gets the warning colour.
+      const parts: { text: string; cls: string }[] = [];
+      const dim: string[] = [];
+      if (item.subject) dim.push(item.subject);
+      if (item.timestamp) dim.push(timeAgo(item.timestamp));
+      if (dim.length) parts.push({ text: dim.join(" · "), cls: "picker-meta-dim" });
+      if (item.ahead || item.behind) {
+        parts.push({ text: `↑${item.ahead ?? 0} ↓${item.behind ?? 0}`, cls: "picker-meta-dim" });
+      }
+      if (item.checked_out_in) {
+        const leaf = item.checked_out_in.split("/").filter(Boolean).pop() ?? item.checked_out_in;
+        parts.push({ text: `⧉ ${leaf}`, cls: "picker-meta-warn" });
+      }
+      return {
+        primary: item.name,
+        matches: item.match_indices,
+        metaParts: parts,
+        bullet: true,
+        bulletStatus: item.is_head ? "head" : undefined,
       };
     }
     case "lsp_server": {

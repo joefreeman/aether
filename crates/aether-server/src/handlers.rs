@@ -35,11 +35,12 @@ use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged,
     GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
-    GitChangeCounts, GitCommitParams, GitCommitResult, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult, GitRefreshParams,
-    GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
-    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams,
-    HunkAction, HunkDirection, RepoId, StagedFile,
+    GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommitParams,
+    GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitHead,
+    GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommitParams, GitPrepareCommitResult,
+    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
+    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollowParams, GitSetDiffViewParams, HunkAction, HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -3141,6 +3142,207 @@ pub async fn git_refresh(
         let _ = sender.send(notif).await;
     }
     Ok(result)
+}
+
+/// Open buffers in this repo that hold unsaved edits — the checkout pre-flight.
+///
+/// Same enumeration as [`reconcile_repo`]'s (the Git baselines, which is where a buffer's repo is
+/// already resolved), asked *before* the operation instead of after. Git cannot see these: it
+/// guards files on disk, so it would rewrite a file underneath an unsaved buffer and leave the
+/// user's edits sitting on the wrong base.
+fn dirty_buffers_in_repo(s: &ServerState, workdir: &std::path::Path) -> Vec<BufferId> {
+    let mut ids: Vec<BufferId> = s
+        .git_baseline
+        .iter()
+        .filter(|(_, b)| b.repo.as_ref().is_some_and(|r| r.workdir == workdir))
+        .map(|(id, _)| *id)
+        .filter(|id| s.try_doc_of(*id).is_some_and(|d| d.dirty))
+        .collect();
+    ids.sort_unstable(); // `git_baseline` is a HashMap; keep the reported list stable
+    ids
+}
+
+/// Switch branches, creating the branch first when asked.
+///
+/// Structurally the same as [`git_commit`] — resolve, suppress, spawn, reconcile — with one thing
+/// commit doesn't need in front: the dirty-buffer pre-flight. Commit doesn't rewrite the working
+/// tree; checkout does, and unsaved buffers are invisible to git.
+pub async fn git_checkout(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitCheckoutParams,
+) -> Result<GitCheckoutResult, RpcError> {
+    let (workdir, blocked) = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        let workdir = std::path::PathBuf::from(&repo.repo_id);
+        let blocked = dirty_buffers_in_repo(&s, &workdir);
+        (workdir, blocked)
+    };
+
+    // Refuse before anything happens, and say what to do about it. Deliberately not "save them for
+    // the user": saving is a user act, and a checkout is a bad moment to perform one silently.
+    if !blocked.is_empty() {
+        return Ok(GitCheckoutResult {
+            status: GitCheckoutStatus::BlockedByDirtyBuffers,
+            blocked,
+            ..Default::default()
+        });
+    }
+
+    // A branch can be checked out in one worktree at a time. Answer that from libgit2 rather than
+    // letting git refuse, so the message can name the worktree. Irrelevant when creating — a brand
+    // new branch is checked out nowhere.
+    if !params.create {
+        let held = tokio::task::spawn_blocking({
+            let workdir = workdir.clone();
+            let branch = params.branch.clone();
+            move || crate::git::branch_checked_out_elsewhere(&workdir, &branch)
+        })
+        .await
+        .unwrap_or_default();
+        if let Some(worktree) = held {
+            return Ok(GitCheckoutResult {
+                status: GitCheckoutStatus::AlreadyCheckedOut,
+                message: worktree,
+                ..Default::default()
+            });
+        }
+    }
+
+    // Suppress before the spawn: a checkout rewrites many files at once and the reconciliation
+    // below is what accounts for them. Without this the watcher races it and the report — which is
+    // the only thing that tells the user what moved — comes back empty.
+    state.lock().await.git_suppressed.insert(workdir.clone());
+    let mut args: Vec<&str> = vec!["checkout"];
+    if params.create {
+        args.push("-b");
+    }
+    args.push(&params.branch);
+    let outcome = crate::git_cli::run(&workdir, &args).await;
+
+    let mut s = state.lock().await;
+    s.git_suppressed.remove(&workdir);
+    let output = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            drop(s);
+            return Err(RpcError::internal(format!("running git checkout: {e}")));
+        }
+    };
+
+    // Reconcile either way: a checkout that fails partway still may have touched files, and a
+    // buffer left stale is worse than a redundant pass.
+    let (refreshed, pushes) = reconcile_repo(&mut s, &workdir);
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    if !output.success() {
+        // git narrates checkout on stderr ("Switched to branch 'x'" included), so a failure's
+        // useful text is there; fall back to stdout the way `git_commit` does.
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitCheckoutResult {
+            status: GitCheckoutStatus::Refused,
+            message: message.trim_end().to_string(),
+            refreshed,
+            ..Default::default()
+        });
+    }
+
+    let head = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        move || crate::git::discover_repo(&workdir).map(|i| i.head)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    Ok(GitCheckoutResult {
+        status: if params.create {
+            GitCheckoutStatus::Created
+        } else {
+            GitCheckoutStatus::Switched
+        },
+        head,
+        blocked: Vec::new(),
+        message: String::new(),
+        refreshed,
+    })
+}
+
+/// Delete a local branch. No tree move, so none of checkout's machinery applies.
+pub async fn git_delete_branch(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitDeleteBranchParams,
+) -> Result<GitDeleteBranchResult, RpcError> {
+    let workdir = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        std::path::PathBuf::from(&repo.repo_id)
+    };
+
+    // Classify the two refusals worth naming ourselves, from libgit2. Both are things git would
+    // also refuse, but the client acts differently on each — `NotMerged` escalates to a force
+    // confirm — and deriving that from git's wording is what decision 1 rules out.
+    let branch = params.branch.clone();
+    let classified = tokio::task::spawn_blocking({
+        let workdir = workdir.clone();
+        let branch = branch.clone();
+        let force = params.force;
+        move || {
+            let head_is_branch = matches!(
+                crate::git::discover_repo(&workdir).map(|i| i.head),
+                Some(GitHead::Branch { ref name, .. }) if *name == branch
+            );
+            if head_is_branch {
+                return Some(GitDeleteBranchStatus::IsCurrentBranch);
+            }
+            // Force is the user having already seen and accepted the loss, so skip the check.
+            if !force && !crate::git::branch_is_merged(&workdir, &branch) {
+                return Some(GitDeleteBranchStatus::NotMerged);
+            }
+            None
+        }
+    })
+    .await
+    .unwrap_or(None);
+    if let Some(status) = classified {
+        return Ok(GitDeleteBranchResult {
+            status,
+            message: String::new(),
+        });
+    }
+
+    let flag = if params.force { "-D" } else { "-d" };
+    let outcome = crate::git_cli::run(&workdir, &["branch", flag, &params.branch]).await;
+    let output = match outcome {
+        Ok(o) => o,
+        Err(e) => return Err(RpcError::internal(format!("running git branch: {e}"))),
+    };
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitDeleteBranchResult {
+            status: GitDeleteBranchStatus::Refused,
+            message: message.trim_end().to_string(),
+        });
+    }
+    Ok(GitDeleteBranchResult {
+        status: GitDeleteBranchStatus::Deleted,
+        message: String::new(),
+    })
 }
 
 /// The reconciliation pass itself, separated from the RPC so an editor-driven operation that has
@@ -14189,6 +14391,38 @@ pub async fn picker_view(
                     .unwrap_or_default(),
             )
         }
+        // Resolve the repo under a brief lock, then walk its refs off it: `list_branches` peels a
+        // commit per branch and opens every sibling worktree, which is filesystem work that has no
+        // business on the keystroke path's mutex (same reasoning as GitChanges above).
+        //
+        // Resolved as a *writable* repo — the same rule `git/prepare_commit` uses, so a single-repo
+        // workspace never sees a chooser. Deliberately stricter than "readable": every action this
+        // picker offers is a mutation, so listing branches for a repo you could never check out in
+        // would just be a dead end.
+        PickerKind::GitBranches if params.reset == PickerReset::All => {
+            let repo = {
+                let s = state.lock().await;
+                resolve_writable_repo(&s, client_id, None, params.buffer_id)?
+            };
+            let repo_id = repo.repo_id.clone();
+            let workdir = std::path::PathBuf::from(&repo.repo_id);
+            let rows = tokio::task::spawn_blocking(move || crate::git::list_branches(&workdir))
+                .await
+                .unwrap_or_default();
+            picker_state::PickerCandidates::GitBranches(
+                rows.into_iter()
+                    .map(|row| picker_state::GitBranchCandidate {
+                        repo_id: repo_id.clone(),
+                        row,
+                    })
+                    .collect(),
+            )
+        }
+        // Scroll / resume re-view: an empty placeholder that `preserve_existing` keeps, like
+        // Diagnostics. Re-resolving here would be actively wrong, not just wasteful — a re-view
+        // carries no `buffer_id`, so a multi-repo workspace would fall through to the
+        // "exactly one writable repo" rule and fail the scroll with `ambiguous_repo`.
+        PickerKind::GitBranches => picker_state::PickerCandidates::GitBranches(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -14338,6 +14572,13 @@ pub async fn picker_view(
                 (
                     picker_state::PickerCandidates::Keybindings(_),
                     picker_state::PickerCandidates::Keybindings(new),
+                ) => new.is_empty(),
+                // GitBranches: a fresh open resolves the repo and lists it; a re-view builds the
+                // empty placeholder above, and keeping the snapshot is what stops a scroll from
+                // re-resolving (or re-walking) the repo mid-list.
+                (
+                    picker_state::PickerCandidates::GitBranches(_),
+                    picker_state::PickerCandidates::GitBranches(new),
                 ) => new.is_empty(),
                 _ => false,
             };

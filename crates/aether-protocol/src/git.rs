@@ -433,6 +433,147 @@ pub struct GitResetResult {
     pub message: String,
 }
 
+// ---- git/checkout -------------------------------------------------------------------------------
+
+/// Switch the repo's working tree to another branch — optionally creating it first
+/// (`git checkout -b`).
+///
+/// Creating rides this RPC rather than getting its own because `git checkout -b` is the *same edit
+/// shape*: the tree may move, reconciliation follows, and the refusal surface is identical.
+/// Deleting a branch is a different shape entirely (no tree move, nothing to reconcile) and gets
+/// [`GitDeleteBranch`].
+///
+/// **Buffers with unsaved edits block the switch**, and this is the reason the RPC needs a
+/// pre-flight at all. Git only knows about files on disk: it refuses a checkout that would clobber
+/// a *modified file*, but an unsaved buffer is invisible to it, so git would cheerfully rewrite the
+/// file underneath and strand the user's edits on top of the wrong base. The pre-flight enumerates
+/// them and refuses before git runs — nothing is stashed, saved or discarded on the user's behalf.
+pub struct GitCheckout;
+impl RpcMethod for GitCheckout {
+    const NAME: &'static str = "git/checkout";
+    type Params = GitCheckoutParams;
+    type Result = GitCheckoutResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitCheckoutParams {
+    /// Omit to let the server resolve it, exactly as [`GitPrepareCommit`] does. Clients that got
+    /// the branch from the picker should send the `repo_id` the *row* carried: resolution runs off
+    /// the active buffer, which may have moved since the list was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    /// The buffer the user is looking at, as the resolution hint. Ignored when `repo_id` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Branch to switch to — or, with `create`, the name to create at HEAD.
+    pub branch: String,
+    /// `git checkout -b`: create `branch` at the current HEAD, then switch to it. Also the way to
+    /// get a first branch in a repo whose HEAD is unborn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCheckoutResult {
+    pub status: GitCheckoutStatus,
+    /// Where HEAD ended up. `None` unless the switch happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<GitHead>,
+    /// With [`GitCheckoutStatus::BlockedByDirtyBuffers`]: the buffers that stopped it. Git was
+    /// never run, so the working tree is exactly as it was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BufferId>,
+    /// Context for the refusing statuses: the worktree path for `AlreadyCheckedOut`, and git's own
+    /// stderr — verbatim and unparsed — for `Refused`. Empty on success.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// The reconciliation that followed a successful switch: which open buffers were re-read, which
+    /// diverged, and which files the new ref doesn't have.
+    #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
+    pub refreshed: GitRefreshResult,
+}
+
+/// How a [`GitCheckout`] resolved.
+///
+/// A discriminated outcome rather than a bare `head: Option` plus a message, following
+/// [`ApplyHunkStatus`]: the client picks a different message and a different follow-up for each,
+/// and inferring that from which fields happen to be populated is how those get out of step.
+///
+/// Every variant here is one the *server* determines — from its own buffer state, or from a
+/// libgit2 read. Git's stderr is never parsed into these; whatever only git knows arrives as
+/// [`Self::Refused`] with its text intact (`docs/git-phase-2.md` decision 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitCheckoutStatus {
+    /// HEAD moved to an existing branch.
+    #[default]
+    Switched,
+    /// The branch was created and switched to (`create: true`).
+    Created,
+    /// Refused before running git: buffers in this repo hold unsaved edits (`blocked`).
+    BlockedByDirtyBuffers,
+    /// Refused before running git: another worktree of this repo already has the branch checked
+    /// out, and git permits that in only one. `message` names the worktree.
+    AlreadyCheckedOut,
+    /// Git refused. `message` is its stderr — an unmerged path, a would-be-overwritten untracked
+    /// file, a name that isn't a valid ref. Show it as a terminal would.
+    Refused,
+}
+
+// ---- git/delete_branch --------------------------------------------------------------------------
+
+/// Delete a local branch (`git branch -d`, or `-D` with `force`).
+///
+/// Separate from [`GitCheckout`] rather than folded in as a mode: nothing moves in the working
+/// tree, so there is no reconciliation, no watcher suppression and no dirty-buffer pre-flight —
+/// none of checkout's machinery applies.
+pub struct GitDeleteBranch;
+impl RpcMethod for GitDeleteBranch {
+    const NAME: &'static str = "git/delete_branch";
+    type Params = GitDeleteBranchParams;
+    type Result = GitDeleteBranchResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitDeleteBranchParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    pub branch: String,
+    /// `git branch -D`: delete even though the branch isn't merged. The client is expected to
+    /// reach this only by escalating from a [`GitDeleteBranchStatus::NotMerged`] refusal, so the
+    /// user has seen what they're discarding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDeleteBranchResult {
+    pub status: GitDeleteBranchStatus,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+/// How a [`GitDeleteBranch`] resolved. Same discipline as [`GitCheckoutStatus`]: the discriminated
+/// cases come from libgit2 reads the server makes itself, never from matching git's wording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitDeleteBranchStatus {
+    #[default]
+    Deleted,
+    /// The branch holds commits that are not reachable from HEAD — deleting it loses them. A
+    /// merge-base check, not a reading of git's complaint, which is what lets the client offer
+    /// `force` as a specific escalation rather than pattern-matching stderr.
+    NotMerged,
+    /// It's the branch currently checked out here. Distinguished because it's the likeliest
+    /// mistake and "switch away first" is more useful than git's phrasing.
+    IsCurrentBranch,
+    /// Git refused for some other reason; `message` is its stderr.
+    Refused,
+}
+
 // ---- git/set_baseline ---------------------------------------------------------------------------
 
 /// Diff a repo against a revision other than HEAD — "what have I changed since I branched?",

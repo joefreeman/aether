@@ -376,6 +376,10 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::DeleteWorkspace { name } => {
             json!({ "kind": "delete_workspace", "name": name })
         }
+        ConfirmKind::DeleteBranch { name } => json!({ "kind": "delete_branch", "name": name }),
+        ConfirmKind::DeleteUnmergedBranch { name } => {
+            json!({ "kind": "delete_unmerged_branch", "name": name })
+        }
     }
 }
 

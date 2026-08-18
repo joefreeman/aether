@@ -857,6 +857,12 @@ pub enum ItemKey<'a> {
         path_index: u32,
         path: &'a str,
     },
+    /// A local branch, identified by `(repo_id, name)` — the listing is single-repo, but keying on
+    /// both keeps an item held across a repo switch from resolving to a same-named branch there.
+    GitBranch {
+        repo_id: &'a str,
+        name: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -931,6 +937,10 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             desc: desc.as_str(),
         },
         PickerItem::JumplistEntry { index, .. } => ItemKey::JumplistEntry { index: *index },
+        PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch {
+            repo_id: repo_id.as_str(),
+            name: name.as_str(),
+        },
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {
                 path_index,

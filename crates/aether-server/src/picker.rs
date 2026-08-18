@@ -435,6 +435,18 @@ pub struct LspServerCandidate {
     pub progress: Vec<LspProgress>,
 }
 
+/// One branch-picker candidate — a local branch of the resolved repo. `name` is the fuzzy
+/// haystack; `repo_id` rides every row so the client's checkout/delete name the repo the list was
+/// built for rather than re-resolving off whatever buffer is active by then.
+///
+/// A thin wrapper over [`crate::git::BranchRow`] rather than the row itself: the candidate carries
+/// the repo id, which is a property of the *listing*, not of a branch.
+#[derive(Debug, Clone)]
+pub struct GitBranchCandidate {
+    pub repo_id: String,
+    pub row: crate::git::BranchRow,
+}
+
 /// One Keybindings-picker candidate — a [`KeybindingEntry`] the client shipped on `picker/view`
 /// (the binding tables live client-side; the server only matches and windows). `haystack` is the
 /// entry's canonical composition ([`KeybindingEntry::haystack`]), precomputed once at build so
@@ -531,6 +543,10 @@ pub enum PickerCandidates {
     /// stable for the picker's lifetime: the list only changes via a re-capture, which resets
     /// the picker.
     Jumplist(Vec<crate::jumplist::JumplistEntry>),
+    /// One repo's local branches, resolved on `picker/view` from the active buffer. Rebuilt on
+    /// every view and after any operation that moves HEAD (like [`Self::LspServers`], never
+    /// preserved) — a stale "current branch" marker is worse than a rebuild that costs a ref walk.
+    GitBranches(Vec<GitBranchCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -560,6 +576,7 @@ impl PickerCandidates {
             PickerCandidates::GitChanges(v) => v.len(),
             PickerCandidates::Keybindings(v) => v.len(),
             PickerCandidates::Jumplist(v) => v.len(),
+            PickerCandidates::GitBranches(v) => v.len(),
         }
     }
 
@@ -585,6 +602,7 @@ impl PickerCandidates {
             PickerCandidates::GitChanges(v) => v.clear(),
             PickerCandidates::Keybindings(v) => v.clear(),
             PickerCandidates::Jumplist(v) => v.clear(),
+            PickerCandidates::GitBranches(v) => v.clear(),
         }
     }
 
@@ -604,6 +622,7 @@ impl PickerCandidates {
             PickerCandidates::GitChanges(_) => PickerKind::GitChanges,
             PickerCandidates::Keybindings(_) => PickerKind::Keybindings,
             PickerCandidates::Jumplist(_) => PickerKind::Jumplist,
+            PickerCandidates::GitBranches(_) => PickerKind::GitBranches,
         }
     }
 
@@ -629,6 +648,7 @@ impl PickerCandidates {
             PickerCandidates::GitChanges(v) => &v[idx].relative_path,
             PickerCandidates::Keybindings(v) => &v[idx].haystack,
             PickerCandidates::Jumplist(v) => &v[idx].display,
+            PickerCandidates::GitBranches(v) => &v[idx].row.name,
         }
     }
 
@@ -795,6 +815,21 @@ impl PickerCandidates {
                 display: v[idx].display.clone(),
                 match_indices,
             },
+            PickerCandidates::GitBranches(v) => {
+                let c = &v[idx];
+                PickerItem::GitBranch {
+                    repo_id: c.repo_id.clone(),
+                    name: c.row.name.clone(),
+                    is_head: c.row.is_head,
+                    subject: c.row.subject.clone(),
+                    timestamp: c.row.timestamp,
+                    upstream: c.row.upstream.clone(),
+                    ahead: c.row.ahead,
+                    behind: c.row.behind,
+                    checked_out_in: c.row.checked_out_in.clone(),
+                    match_indices,
+                }
+            }
         }
     }
 
@@ -909,6 +944,12 @@ impl PickerCandidates {
             (PickerCandidates::Jumplist(v), PickerItem::JumplistEntry { index, .. }) => {
                 ((*index as usize) < v.len()).then_some(*index as usize)
             }
+            // `repo_id` is fixed for the whole listing, so the name alone identifies the row —
+            // but match it anyway, so an item held across a repo switch can't resolve to a
+            // same-named branch in the new repo.
+            (PickerCandidates::GitBranches(v), PickerItem::GitBranch { repo_id, name, .. }) => v
+                .iter()
+                .position(|c| c.repo_id == *repo_id && c.row.name == *name),
             _ => None,
         }
     }
@@ -930,7 +971,8 @@ impl PickerCandidates {
             // `rerank`'s workspace-symbols arm and `docs/workspace-symbols.md` § Merging.
             | PickerCandidates::WorkspaceSymbols(_)
             | PickerCandidates::Keybindings(_)
-            | PickerCandidates::Jumplist(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::Jumplist(_)
+            | PickerCandidates::GitBranches(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1044,6 +1086,10 @@ impl PickerCandidates {
             // Informational — a shortcut row isn't a jump target and `select` never fires for
             // this kind (the client's Enter just closes the picker), like LspServers.
             PickerCandidates::Keybindings(_) => None,
+            // A branch isn't a jump target either: the client acts on the highlighted row via
+            // `git/checkout` (Enter / Alt-l) or `git/delete_branch` (Ctrl-d), so `select` never
+            // fires for this kind. Same shape as LspServers above.
+            PickerCandidates::GitBranches(_) => None,
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker

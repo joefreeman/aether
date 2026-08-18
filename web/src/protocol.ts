@@ -291,7 +291,8 @@ export type PickerKind =
   | "document_symbols"
   | "workspace_symbols"
   | "keybindings"
-  | "jumplist";
+  | "jumplist"
+  | "git_branches";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -336,6 +337,23 @@ export type PickerItem =
   | { kind: "workspace"; name: string; unsaved_buffers?: number; match_indices?: number[] }
   | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
+  | {
+      kind: "git_branch";
+      /** Which repo the row belongs to — echoed onto the checkout/delete it triggers, so the
+       *  action can't re-resolve to a different repo if the active buffer moved meanwhile. */
+      repo_id: string;
+      name: string;
+      is_head?: boolean;
+      subject?: string;
+      /** Tip commit's author time, Unix seconds; 0/absent when unknown. */
+      timestamp?: number;
+      upstream?: string | null;
+      ahead?: number;
+      behind?: number;
+      /** Workdir of another worktree holding this branch — the row is not checkout-able. */
+      checked_out_in?: string | null;
+      match_indices?: number[];
+    }
   | {
       kind: "lsp_server";
       name: string;

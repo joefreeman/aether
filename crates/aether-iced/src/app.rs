@@ -6266,7 +6266,7 @@ fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
     }
 }
 
-fn time_ago(ts: i64) -> String {
+pub(crate) fn time_ago(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -6352,6 +6352,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
         ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
+        ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
+        ConfirmKind::DeleteUnmergedBranch { name } => {
+            format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
+        }
     }
 }
 

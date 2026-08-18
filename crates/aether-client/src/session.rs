@@ -650,6 +650,12 @@ pub enum ConfirmKind {
     /// Deleting a workspace (its config) from the workspace switcher. Forgets the definition, not the
     /// files under its roots.
     DeleteWorkspace { name: String },
+    /// Deleting a local branch from the branch picker.
+    DeleteBranch { name: String },
+    /// The escalation: the branch holds commits reachable from nowhere else, so deleting it
+    /// discards them. Raised only after a `git/delete_branch` came back `NotMerged`, which is a
+    /// real merge-base check — accepting this sends the same delete with `force`.
+    DeleteUnmergedBranch { name: String },
 }
 
 /// What a successful save is followed by — threads the save-and-quit (`Space Alt-q`) and
@@ -721,6 +727,10 @@ pub enum ConfirmAction {
     /// Delete a workspace (`workspace/delete`) from the switcher. The server refuses if it's active
     /// anywhere or has dirty buffers; the refreshed picker list rides a `picker/update` push.
     DeleteWorkspace { name: String },
+    /// Delete a local branch (`git/delete_branch`). Carries the name so the request is
+    /// self-contained — the picker highlight may have moved by the time the confirm resolves —
+    /// and `force`, which is set only on the escalation from a `NotMerged` refusal.
+    DeleteBranch { name: String, force: bool },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.

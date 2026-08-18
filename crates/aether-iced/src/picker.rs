@@ -233,6 +233,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitChangesFile => "Changes in current file…",
         PickerKind::GitChanges => "Changes in workspace…",
         PickerKind::Keybindings => "Search keybindings…",
+        PickerKind::GitBranches => "Switch branch…",
         PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
@@ -1589,6 +1590,50 @@ fn render_item<'a>(
             .spacing(6)
             .align_y(iced::Alignment::Center)
             .into()
+        }
+        PickerItem::GitBranch {
+            name,
+            is_head,
+            subject,
+            timestamp,
+            ahead,
+            behind,
+            checked_out_in,
+            match_indices,
+            ..
+        } => {
+            // Accent dot on the current branch (the LSP/buffer rows' dot cell, so the pickers line
+            // up), name, then dim metadata: tip subject, relative date, ahead/behind.
+            let mut m = subject.clone();
+            if *timestamp > 0 {
+                if !m.is_empty() {
+                    m.push_str(" · ");
+                }
+                m.push_str(&crate::app::time_ago(*timestamp));
+            }
+            if *ahead > 0 || *behind > 0 {
+                m.push_str(&format!("  ↑{ahead} ↓{behind}"));
+            }
+            let mut r = row![
+                dot_cell(is_head.then_some(p.accent), ui),
+                highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(m, ui, p),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            // Not decoration: git refuses the same branch in two worktrees, so this is the row's
+            // "you cannot check this out" tell and it gets the warning colour, not the dim one.
+            if let Some(held) = checked_out_in {
+                let leaf = held.rsplit('/').next().unwrap_or(held);
+                r = r.push(
+                    text(format!("⧉ {leaf}"))
+                        .size(ui.small())
+                        .font(SANS)
+                        .color(p.warning),
+                );
+            }
+            r.into()
         }
         PickerItem::Symbol {
             name,

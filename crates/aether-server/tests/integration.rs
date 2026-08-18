@@ -19,11 +19,13 @@ use aether_protocol::cursor::{
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
     ApplyHunkStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult, GitBlameChanged,
-    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCommit, GitCommitParams,
-    GitCommitResult, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams,
-    GitRefreshResult, GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams,
-    GitResetResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCheckout, GitCheckoutParams,
+    GitCheckoutResult, GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult,
+    GitDeleteBranch, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitHead,
+    GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitRefresh, GitRefreshParams, GitRefreshResult,
+    GitRepos, GitReposParams, GitReposResult, GitReset, GitResetParams, GitResetResult,
+    GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
     GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
@@ -30940,6 +30942,212 @@ async fn git_repos_treats_a_worktree_as_its_own_repo_sharing_a_common_dir() {
     drop(server);
 }
 
+// -------- the branch picker (PickerKind::GitBranches) ---------------------------------------------
+
+/// The branch rows of a `picker/view` on `GitBranches`, in window order.
+fn branch_rows(items: &[PickerItem]) -> Vec<(String, bool, Option<String>)> {
+    items
+        .iter()
+        .map(|it| match it {
+            PickerItem::GitBranch {
+                name,
+                is_head,
+                checked_out_in,
+                ..
+            } => (name.clone(), *is_head, checked_out_in.clone()),
+            other => panic!("expected a branch row, got {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn branch_picker_lists_local_branches_with_head_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let update = view.update.expect("the view carries its initial window");
+
+    assert_eq!(update.kind, PickerKind::GitBranches);
+    assert_eq!(update.total_matches, 2);
+    assert_eq!(
+        branch_rows(update.items()),
+        vec![
+            ("main".to_string(), true, None),
+            ("feature".to_string(), false, None),
+        ],
+        "HEAD sorts first; neither branch is held by another worktree"
+    );
+    // Every row names the repo it belongs to, so the checkout the client fires can't re-resolve
+    // to a different one if the active buffer moves while the picker is up.
+    let PickerItem::GitBranch {
+        repo_id, subject, ..
+    } = &update.items()[0]
+    else {
+        panic!("branch row");
+    };
+    assert_eq!(*repo_id, root.to_string_lossy());
+    assert_eq!(subject, "init", "the tip commit's summary rides the row");
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_filters_on_the_branch_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature/login", &head, false).unwrap();
+    repo.branch("release", &head, false).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the view's own push
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        3,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::GitBranches,
+            query: "login".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    assert_eq!(
+        branch_rows(update.items())
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect::<Vec<_>>(),
+        vec!["feature/login".to_string()],
+        "fuzzy-matched on the name"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_is_empty_on_an_unborn_head() {
+    // A fresh repo has no branches until its first commit. That is a legitimate empty list, not
+    // an error — it's the state the "+ Create" row exists to get you out of.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    init_repo_at(&root);
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let update = view.update.expect("the view carries its initial window");
+
+    assert_eq!(update.total_matches, 0);
+    assert!(update.items().is_empty());
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_marks_a_branch_held_by_another_worktree() {
+    // Git refuses the same branch in two worktrees, so the picker must surface it *before* the
+    // user presses Enter — a checkout that can only fail is worse than a disabled row.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let repo = init_repo_at(&main);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let wt_path = base.join("main-worktrees/feature");
+    std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    repo.worktree("feature", &wt_path, None).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![main.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let update = view.update.expect("the view carries its initial window");
+
+    let rows = branch_rows(update.items());
+    let feature = rows
+        .iter()
+        .find(|(n, _, _)| n == "feature")
+        .expect("the worktree's branch is listed");
+    assert_eq!(
+        feature.2.as_deref(),
+        Some(wt_path.to_string_lossy().as_ref()),
+        "named with the worktree holding it"
+    );
+    let main_row = rows.iter().find(|(n, _, _)| n == "main").unwrap();
+    assert!(main_row.1, "the main checkout's branch is still HEAD here");
+    assert_eq!(main_row.2, None, "and is not held elsewhere");
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_scroll_review_keeps_the_listing() {
+    // A re-view carries no `buffer_id`, so re-resolving the repo on one would fall through to the
+    // "exactly one writable repo" rule — fine here, `ambiguous_repo` in a multi-repo workspace.
+    // The snapshot is preserved instead, which also keeps the list from shifting under a scroll.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let _ = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+
+    // Delete a branch behind the picker's back: a preserved snapshot still shows it, which is
+    // what proves the re-view didn't rebuild.
+    repo.find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            offset: 0,
+            buffer_id: None,
+            ..view_params(PickerKind::GitBranches)
+        },
+    )
+    .await;
+    let update = view.update.expect("the re-view carries its window");
+    assert_eq!(
+        branch_rows(update.items())
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect::<Vec<_>>(),
+        vec!["main".to_string(), "feature".to_string()],
+        "the scroll re-view keeps the snapshot rather than re-listing"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_errors_outside_a_repo() {
+    // Resolution is the same rule `git/prepare_commit` uses, so "no repo here" surfaces as an
+    // error rather than an empty list that would read as "this repo has no branches".
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let err =
+        send_request_expect_err::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches))
+            .await;
+    assert!(
+        err.contains("repo"),
+        "the error should name the missing repo, got: {err}"
+    );
+    drop(server);
+}
+
 // -------- git/refresh (reconciliation) ------------------------------------------------------------
 
 /// A repo with one committed file, opened as a workspace with a viewport on it. Returns the repo
@@ -31656,6 +31864,353 @@ async fn staging_is_refused_against_a_revision_baseline() {
     )
     .await;
     assert_eq!(reverted.status, ApplyHunkStatus::Reverted);
+    drop(server);
+}
+
+// -------- git/checkout + git/delete_branch --------------------------------------------------------
+
+/// A repo with `a.rs` committed on `main`, isolated config, the workspace active, and `a.rs` open.
+/// Returns the repo (to move the tree), the root and the open buffer.
+async fn setup_checkout_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    git2::Repository,
+    std::path::PathBuf,
+    u64,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::mem::forget(dir); // outlive the test; /tmp is cleaned by the OS
+    let repo = init_repo_at(&root);
+    isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    (server, ws, repo, root, open.buffer_id)
+}
+
+async fn checkout(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    branch: &str,
+    create: bool,
+) -> GitCheckoutResult {
+    send_request::<GitCheckout>(
+        ws,
+        id,
+        &GitCheckoutParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            branch: branch.into(),
+            create,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The branch HEAD is on, read straight from the repo — the independent check that the RPC's
+/// reported status matches what git actually did.
+fn head_branch(repo: &git2::Repository) -> String {
+    repo.head().unwrap().shorthand().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn checkout_creates_and_switches() {
+    let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
+
+    let res = checkout(&mut ws, 3, &root, "feature", true).await;
+    assert_eq!(res.status, GitCheckoutStatus::Created);
+    assert_eq!(
+        res.head,
+        Some(GitHead::Branch {
+            name: "feature".into(),
+            upstream: None
+        })
+    );
+    assert!(res.blocked.is_empty());
+    assert_eq!(head_branch(&repo), "feature", "git actually moved HEAD");
+
+    // And back again, this time without `create`.
+    let res = checkout(&mut ws, 4, &root, "main", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::Switched);
+    assert_eq!(head_branch(&repo), "main");
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_creates_the_first_branch_on_an_unborn_head() {
+    // A repo with no commits has no branches to list, so `+ Create` is the only way in — and
+    // `git checkout -b` on an unborn HEAD is what makes it work.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res = checkout(&mut ws, 3, &root, "trunk", true).await;
+
+    assert_eq!(res.status, GitCheckoutStatus::Created);
+    assert_eq!(
+        res.head,
+        Some(GitHead::Unborn {
+            name: "trunk".into()
+        }),
+        "still unborn — created, switched to, and with nothing committed yet"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_is_blocked_by_a_dirty_buffer_and_git_never_runs() {
+    // The pre-flight's whole point. Git guards *files*; an unsaved buffer is invisible to it, so
+    // without this it would rewrite a.rs underneath the buffer and strand the edit on the wrong
+    // base. A refusal that merely reported afterwards would be no protection at all — hence the
+    // assertion that HEAD did not move.
+    let (server, mut ws, repo, root, buffer_id) = setup_checkout_workspace().await;
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "MINE".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let res = checkout(&mut ws, 4, &root, "feature", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::BlockedByDirtyBuffers);
+    assert_eq!(res.blocked, vec![buffer_id], "names what to save");
+    assert_eq!(head_branch(&repo), "main", "git was never run");
+    assert!(
+        res.refreshed.is_empty(),
+        "nothing moved, so there is nothing to reconcile"
+    );
+    assert!(
+        buffer_text(&mut ws, 5, buffer_id).await.starts_with("MINE"),
+        "the unsaved edit is untouched"
+    );
+
+    // Saving clears the block, and the retry goes through — the affordance the client offers.
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        6,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let res = checkout(&mut ws, 7, &root, "feature", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::Switched);
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_reloads_an_open_buffer_whose_file_differs_on_the_new_branch() {
+    let (server, mut ws, repo, root, buffer_id) = setup_checkout_workspace().await;
+
+    // A branch where a.rs says something else, then back to main so the switch is a real move.
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+    repo.set_head("refs/heads/feature").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    repo.set_head("refs/heads/main").unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .unwrap();
+
+    let res = checkout(&mut ws, 3, &root, "feature", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::Switched);
+    assert_eq!(
+        res.refreshed.reloaded,
+        vec![buffer_id],
+        "the clean buffer is re-read from the new ref in the same pass"
+    );
+    assert_eq!(
+        buffer_text(&mut ws, 4, buffer_id).await,
+        "one\ntwo\n",
+        "and holds the new branch's content"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_leaves_a_buffer_open_when_the_file_is_absent_on_the_new_branch() {
+    // Closing it would destroy the only remaining copy of content the user can still save back.
+    let (server, mut ws, repo, root, _a_buf) = setup_checkout_workspace().await;
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    // `only-on-main.rs` exists on main and not on feature.
+    commit_file(&repo, "only-on-main.rs", "keep me\n");
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("only-on-main.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let res = checkout(&mut ws, 4, &root, "feature", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::Switched);
+    assert_eq!(res.refreshed.missing, vec![open.buffer_id]);
+    assert_eq!(
+        buffer_text(&mut ws, 5, open.buffer_id).await,
+        "keep me\n",
+        "content survives in memory; a save recreates the file"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_refuses_a_branch_held_by_another_worktree() {
+    // Answered from libgit2 before git runs, so the message can name the worktree — git's own
+    // refusal would be a string to parse.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let repo = init_repo_at(&main);
+    isolate_repo_config(&repo, &main.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+
+    let wt_path = base.join("main-worktrees/feature");
+    std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    repo.worktree("feature", &wt_path, None).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![main.clone()]).await;
+    let res = checkout(&mut ws, 3, &main, "feature", false).await;
+
+    assert_eq!(res.status, GitCheckoutStatus::AlreadyCheckedOut);
+    assert_eq!(
+        res.message,
+        wt_path.to_string_lossy(),
+        "names the worktree holding it"
+    );
+    assert_eq!(head_branch(&repo), "main", "nothing moved");
+    drop(server);
+}
+
+#[tokio::test]
+async fn checkout_surfaces_gits_refusal_verbatim() {
+    // Anything only git knows arrives as `Refused` with its own text — never parsed into a
+    // variant (docs/git-phase-2.md decision 1).
+    let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
+
+    let res = checkout(&mut ws, 3, &root, "no-such-branch", false).await;
+    assert_eq!(res.status, GitCheckoutStatus::Refused);
+    assert!(
+        !res.message.is_empty(),
+        "git's stderr is passed through for the user to read"
+    );
+    assert_eq!(head_branch(&repo), "main");
+    drop(server);
+}
+
+async fn delete_branch(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    branch: &str,
+    force: bool,
+) -> GitDeleteBranchResult {
+    send_request::<GitDeleteBranch>(
+        ws,
+        id,
+        &GitDeleteBranchParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            branch: branch.into(),
+            force,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn delete_branch_removes_a_merged_branch() {
+    let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let res = delete_branch(&mut ws, 3, &root, "feature", false).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::Deleted);
+    assert!(
+        repo.find_branch("feature", git2::BranchType::Local)
+            .is_err(),
+        "actually gone"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn delete_branch_reports_not_merged_then_force_deletes() {
+    // The escalation the client's confirm is built on: refuse first, naming the reason, and only
+    // discard the commits once the user has said so. `NotMerged` is a merge-base check, not a
+    // reading of git's complaint.
+    let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree = repo.find_tree(head.tree_id()).unwrap();
+    let oid = repo
+        .commit(None, &sig, &sig, "unmerged work", &tree, &[&head])
+        .unwrap();
+    repo.branch("feature", &repo.find_commit(oid).unwrap(), false)
+        .unwrap();
+
+    let res = delete_branch(&mut ws, 3, &root, "feature", false).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::NotMerged);
+    assert!(
+        repo.find_branch("feature", git2::BranchType::Local).is_ok(),
+        "the refusal left it alone"
+    );
+
+    let res = delete_branch(&mut ws, 4, &root, "feature", true).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::Deleted);
+    assert!(repo
+        .find_branch("feature", git2::BranchType::Local)
+        .is_err());
+    drop(server);
+}
+
+#[tokio::test]
+async fn delete_branch_refuses_the_current_branch() {
+    let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
+
+    let res = delete_branch(&mut ws, 3, &root, "main", false).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::IsCurrentBranch);
+    assert!(repo.find_branch("main", git2::BranchType::Local).is_ok());
+
+    // Force doesn't get you around it either — git refuses the checked-out branch outright.
+    let res = delete_branch(&mut ws, 4, &root, "main", true).await;
+    assert_eq!(res.status, GitDeleteBranchStatus::IsCurrentBranch);
     drop(server);
 }
 

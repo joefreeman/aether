@@ -2552,6 +2552,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
         Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
         Some(aether_protocol::picker::PickerKind::Jumplist) => "Filter the jumplist…",
+        Some(aether_protocol::picker::PickerKind::GitBranches) => "Switch branch…",
         None => "Search…",
     }
 }
@@ -2975,6 +2976,33 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::GitBranch {
+        name,
+        is_head,
+        subject,
+        timestamp,
+        ahead,
+        behind,
+        checked_out_in,
+        match_indices,
+        ..
+    } = item
+    {
+        return git_branch_item_spans(
+            GitBranchRow {
+                name,
+                is_head: *is_head,
+                subject,
+                timestamp: *timestamp,
+                ahead: *ahead,
+                behind: *behind,
+                checked_out_in: checked_out_in.as_deref(),
+            },
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
     if let PickerItem::Reference {
         display_path,
         line,
@@ -3083,6 +3111,7 @@ fn picker_item_spans(
         | PickerItem::Reference { .. }
         | PickerItem::Symbol { .. }
         | PickerItem::Keybinding { .. }
+        | PickerItem::GitBranch { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -4093,6 +4122,152 @@ fn lsp_server_item_spans(
         ));
     }
     spans
+}
+
+/// Split `text` into styled spans, switching to `match_style` over the char offsets in `indices`
+/// (which must be ascending). The fuzzy-highlight loop, factored out of the row renderers that
+/// need it.
+fn match_highlighted_spans(
+    text: String,
+    indices: &[u32],
+    base: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if indices.is_empty() {
+        return vec![Span::styled(text, base)];
+    }
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    let mut idx_iter = indices.iter().copied().peekable();
+    for (ci, ch) in text.chars().enumerate() {
+        let is_match = idx_iter.peek().copied() == Some(ci as u32);
+        if is_match {
+            idx_iter.next();
+        }
+        if is_match != current_is_match && !current.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_is_match { match_style } else { base },
+            ));
+        }
+        current_is_match = is_match;
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_is_match { match_style } else { base },
+        ));
+    }
+    spans
+}
+
+/// One branch row: `● name   subject · 3d ago  ↑2 ↓1  ⧉ worktree`.
+///
+/// The HEAD dot reuses the LSP/buffer rows' two-column glyph cell so the pickers line up. The
+/// worktree marker is the load-bearing part: git refuses the same branch in two worktrees, so a
+/// row you cannot check out has to say so before you press Enter on it.
+fn git_branch_item_spans(
+    branch: GitBranchRow<'_>,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let GitBranchRow {
+        name,
+        is_head,
+        subject,
+        timestamp,
+        ahead,
+        behind,
+        checked_out_in,
+    } = branch;
+    let bg = picker_row_bg(highlighted);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
+
+    // Right-hand decorations, innermost first. Each is omitted entirely when it has nothing to
+    // say, so an ordinary branch in an ordinary repo renders as just `name  subject · date`.
+    let mut tail = String::new();
+    if !subject.is_empty() {
+        tail.push_str("  ");
+        tail.push_str(subject);
+    }
+    if timestamp > 0 {
+        tail.push_str(if tail.is_empty() { "  " } else { " · " });
+        tail.push_str(&crate::shell::time_ago(timestamp));
+    }
+    if ahead > 0 || behind > 0 {
+        tail.push_str(&format!("  ↑{ahead} ↓{behind}"));
+    }
+    // Basename only: the full path would dominate the row, and the point is *which* worktree, not
+    // where it lives.
+    let held = checked_out_in.map(|p| {
+        let leaf = p.rsplit('/').next().unwrap_or(p);
+        format!("  ⧉ {leaf}")
+    });
+
+    let name_budget = max_width
+        .saturating_sub(2)
+        .saturating_sub(tail.width())
+        .saturating_sub(held.as_deref().map(|h| h.width()).unwrap_or(0));
+
+    let truncated: String = name
+        .chars()
+        .scan(0usize, |w, c| {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if *w + cw > name_budget {
+                None
+            } else {
+                *w += cw;
+                Some(c)
+            }
+        })
+        .collect();
+    let kept = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept)
+        .collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        if is_head { "● " } else { "  " }.to_string(),
+        Style::default().fg(c(th().accent)).bg(bg),
+    ));
+    spans.extend(match_highlighted_spans(
+        truncated,
+        &kept_indices,
+        base,
+        match_style,
+    ));
+    spans.push(Span::styled(
+        tail,
+        Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
+    ));
+    if let Some(held) = held {
+        // Warning-coloured, not dim: this is the row's *disabled* tell, not decoration.
+        spans.push(Span::styled(
+            held,
+            Style::default().fg(c(th().warning)).bg(bg),
+        ));
+    }
+    spans
+}
+
+/// The fields of [`PickerItem::GitBranch`] a row needs, borrowed for rendering.
+struct GitBranchRow<'a> {
+    name: &'a str,
+    is_head: bool,
+    subject: &'a str,
+    timestamp: i64,
+    ahead: u32,
+    behind: u32,
+    checked_out_in: Option<&'a str>,
 }
 
 /// A compact one-line summary of a server's active `$/progress` work for a picker row: the

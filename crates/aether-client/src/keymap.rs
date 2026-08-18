@@ -1189,6 +1189,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('t'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(L, ch('t'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(L, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
+    bind!(L, ch('y'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
