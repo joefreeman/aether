@@ -1476,12 +1476,12 @@ fn workspaces_picker_centers_on_the_active_workspace() {
 }
 
 #[test]
-fn space_slash_opens_the_keybindings_picker_with_its_rows() {
+fn space_dot_opens_the_keybindings_picker_with_its_rows() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, '/');
-    let params = find_request(&fx, "picker/view").expect("Space / opens via picker/view");
+    let fx = key(&mut s, '.');
+    let params = find_request(&fx, "picker/view").expect("Space . opens via picker/view");
     assert_eq!(params["kind"], "keybindings");
     assert_eq!(params["reset"], "all");
     // The rows ride the open: the keymap tables live client-side, the server only matches.
@@ -1491,8 +1491,14 @@ fn space_slash_opens_the_keybindings_picker_with_its_rows() {
         "the whole keymap ships ({} rows)",
         rows.len()
     );
-    assert!(rows.iter().any(|r| r["keys"] == "Space /"
+    assert!(rows.iter().any(|r| r["keys"] == "Space ."
         && r["desc"] == "Show keyboard shortcuts"
+        && r["mode"] == "Application"));
+    // The `Space g` sub-leader's rows carry their prefix in the label and list as Application
+    // rows like any other leader chord.
+    assert!(rows.iter().any(|r| r["keys"] == "Space g c"
+        && r["desc"] == "Commit staged changes"
+        && r["group"] == "Git"
         && r["mode"] == "Application"));
     assert!(
         rows.iter().any(|r| r["keys"] == "Space Alt-q"
@@ -2020,7 +2026,7 @@ fn enter_on_a_keybinding_row_is_a_noop() {
         group: "App".into(),
         desc: "Show keyboard shortcuts".into(),
         mode: "Application".into(),
-        keys: "Space /".into(),
+        keys: "Space .".into(),
         match_indices: vec![],
     }];
     p.total_matches = 1;
@@ -2680,8 +2686,8 @@ fn space_alt_f_unscoped_for_scratch_buffer() {
 }
 
 #[test]
-fn space_alt_g_opens_grep_from_selection() {
-    // `Space Alt-g`: open Grep asking the server to seed the query from the buffer's selection.
+fn space_alt_slash_opens_grep_from_selection() {
+    // `Space Alt-/`: open Grep asking the server to seed the query from the buffer's selection.
     // The client carries no selection text — it just sets `from_selection` + the buffer id and
     // lets the server slice + search (the query/generation ride back via the `PickerViewed` echo).
     let mut s = session();
@@ -3950,14 +3956,13 @@ fn changes_pickers_open_fresh_and_centre_on_the_cursor() {
     }
 }
 
-/// `Space y` opens the branch picker, carrying the active buffer as the repo-resolution hint —
+/// `Space g b` opens the branch picker, carrying the active buffer as the repo-resolution hint —
 /// the same rule `git/prepare_commit` uses, so the client never needs to know repo ids.
 #[test]
-fn space_y_opens_the_branch_picker() {
+fn space_g_b_opens_the_branch_picker() {
     let mut s = session();
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None, ROWS);
-    let view = find_request(&fx, "picker/view").expect("Space y opens a picker");
+    let fx = git_leader(&mut s, 'b');
+    let view = find_request(&fx, "picker/view").expect("Space g b opens a picker");
     assert_eq!(view["kind"], json!("git_branches"));
     assert_eq!(
         view["buffer_id"],
@@ -4817,6 +4822,60 @@ fn space_m_shows_blame_commit() {
     assert_eq!(method, "git/blame_line");
 }
 
+/// The `Space g` sub-leader as a state machine: `g` arms it (no effects, and the shells read
+/// `Pending::LeaderGit` to draw the awaiting-key cursor), the next key runs the git action, and an
+/// unbound key cancels instead of leaking through to Normal mode.
+#[test]
+fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
+    use aether_client::session::Pending;
+
+    let mut s = session();
+    s.viewport_id = Some(1); // the diff toggle addresses a viewport
+    let fx = key(&mut s, ' ');
+    assert!(matches!(s.pending, Pending::Leader));
+    assert!(fx.0.is_empty(), "the leader alone does nothing");
+
+    let fx = key(&mut s, 'g');
+    assert!(
+        matches!(s.pending, Pending::LeaderGit),
+        "Space g waits for one more key rather than opening grep"
+    );
+    assert!(fx.0.is_empty(), "the prefix alone does nothing");
+
+    let fx = s.on_key(KeyCode::Char('d'), Mods::NONE, Some("d".into()), ROWS);
+    assert!(
+        find_request(&fx, "git/set_diff_view").is_some(),
+        "Space g d toggles the inline diff"
+    );
+    assert!(matches!(s.pending, Pending::None), "the chord is spent");
+
+    // An unbound second key cancels: no request, and `j` must not move the cursor either.
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()), ROWS);
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+        "an unbound git chord is silently dropped"
+    );
+    assert!(matches!(s.pending, Pending::None));
+}
+
+/// `Space g s` / `Space g Alt-s` stage and revert the change at the cursor — the pair that used to
+/// live on `Space a` / `Space Alt-a`.
+#[test]
+fn space_g_s_stages_and_alt_s_reverts() {
+    let mut s = session();
+    let fx = git_leader(&mut s, 's');
+    let params = find_request(&fx, "git/apply_hunk").expect("Space g s stages");
+    assert_eq!(params["action"], json!("toggle"));
+
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "git/apply_hunk").expect("Space g Alt-s reverts");
+    assert_eq!(params["action"], json!("revert"));
+}
+
 #[test]
 fn font_size_settings_step_and_persist_independently() {
     use aether_client::keymap::{KeyCode, Mods};
@@ -4938,7 +4997,8 @@ fn reload_moved_to_space_alt_k() {
         "Space Alt-k reloads"
     );
 
-    // ...and its old home, Space a, no longer reloads.
+    // ...and its old home, Space a, no longer reloads. (It's unbound outright now stage-hunk
+    // has moved to the git sub-leader, so this doubles as the ignore-an-unbound-key path.)
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
     assert!(
@@ -4998,19 +5058,28 @@ fn copy_path_warns_for_scratch_buffer() {
     );
 }
 
-// ---- application settings (Space .) -----------------------------------------------------------
+// ---- application settings (Space ,) -----------------------------------------------------------
 
 #[test]
-fn app_settings_overlay_opens_via_leader_dot() {
+fn app_settings_overlay_opens_via_leader_comma() {
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()), ROWS);
+    s.on_key(KeyCode::Char(','), Mods::NONE, Some(','.to_string()), ROWS);
     assert!(
         s.app_settings.is_some(),
-        "Space . opens the app-settings overlay"
+        "Space , opens the app-settings overlay"
     );
-    // The workspace-settings overlay (Space ,) is a distinct chord.
+    // Its Alt sibling is the workspace-scoped overlay — a distinct chord.
     assert!(s.workspace_settings.is_none());
+
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    s.on_key(KeyCode::Char(','), Mods::ALT, None, ROWS);
+    assert!(
+        s.workspace_settings.is_some(),
+        "Space Alt-, opens the workspace-settings overlay"
+    );
+    assert!(s.app_settings.is_none());
 }
 
 #[test]
@@ -7875,6 +7944,14 @@ fn leader(s: &mut Session, c: char) -> Effects {
     key(s, c)
 }
 
+/// `Space g …` — the git sub-leader (`KeyContext::LeaderGit`). Two prefix keystrokes, then the
+/// operation; the intermediate `g` produces no effects of its own.
+fn git_leader(s: &mut Session, c: char) -> Effects {
+    let _ = key(s, ' ');
+    let _ = key(s, 'g');
+    key(s, c)
+}
+
 /// A canned reading-view setup: `Space v` on a markdown buffer, content fetched and parsed.
 /// Layout: heading (line 0), paragraph (line 2), paragraph with a link (line 4).
 fn read_session() -> Session {
@@ -9419,15 +9496,15 @@ fn explicit_boot_presentation_overrides_default_and_jump_rules() {
     assert_eq!(method, "buffer/content");
 }
 
-// -------- git commit (Space t) --------------------------------------------------------------------
+// -------- git commit (Space g c) --------------------------------------------------------------------
 
-/// The whole gesture as a state machine: `Space t` asks the server to prepare a message, the
+/// The whole gesture as a state machine: `Space g c` asks the server to prepare a message, the
 /// answer opens that file as a buffer, and `Space Alt-x` in it saves and then commits.
 #[test]
-fn space_t_prepares_a_commit_and_alt_x_commits_it() {
+fn space_g_c_prepares_a_commit_and_alt_x_commits_it() {
     let mut s = session();
 
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
     // The repo is resolved server-side from the buffer we're on — no `git/repos` round trip.
@@ -9521,7 +9598,7 @@ fn space_t_prepares_a_commit_and_alt_x_commits_it() {
 #[test]
 fn preparing_a_commit_with_nothing_staged_opens_no_buffer() {
     let mut s = session();
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (token, _, _) = the_request(&fx);
 
     let fx = s.on_rpc_result(
@@ -9545,7 +9622,7 @@ fn preparing_a_commit_with_nothing_staged_opens_no_buffer() {
 #[test]
 fn a_refused_commit_keeps_the_message_buffer_open() {
     let mut s = session();
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,
@@ -9588,13 +9665,14 @@ fn a_refused_commit_keeps_the_message_buffer_open() {
     );
 }
 
-/// `Space Alt-t` amends: the flag rides the prepare *and* the commit, or the message would be
+/// `Space g Alt-c` amends: the flag rides the prepare *and* the commit, or the message would be
 /// written for one and applied as the other.
 #[test]
-fn space_alt_t_amends() {
+fn space_g_alt_c_amends() {
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None, ROWS);
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
     assert_eq!(params["amend"], json!(true));
@@ -9634,14 +9712,14 @@ fn space_alt_t_amends() {
     );
 }
 
-/// Pressing `Space t` again while a message is being written must *switch to* it, not prepare
+/// Pressing `Space g c` again while a message is being written must *switch to* it, not prepare
 /// over it: rewriting `COMMIT_EDITMSG` under a dirty buffer flags it externally-modified, and the
 /// save on the way to the commit then refuses — losing the message to a keystroke meant to
 /// resume it.
 #[test]
-fn space_t_again_resumes_the_message_instead_of_overwriting_it() {
+fn space_g_c_again_resumes_the_message_instead_of_overwriting_it() {
     let mut s = session();
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,
@@ -9665,7 +9743,7 @@ fn space_t_again_resumes_the_message_instead_of_overwriting_it() {
     );
 
     // On the message buffer already: nothing is sent, and the user is reminded how to finish.
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     assert!(no_request(&fx), "no second prepare");
     assert!(fx.0.iter().any(|e| matches!(
         e,
@@ -9674,7 +9752,7 @@ fn space_t_again_resumes_the_message_instead_of_overwriting_it() {
 
     // From another buffer: switch back to it by id, still without re-preparing.
     s.buffer.buffer_id = 7;
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "buffer/open");
     assert_eq!(
@@ -9686,11 +9764,11 @@ fn space_t_again_resumes_the_message_instead_of_overwriting_it() {
 }
 
 /// Abandoning the message (closing its buffer) abandons the commit — otherwise the pending entry
-/// outlives its buffer and `Space t` would later "resume" a buffer id that no longer exists.
+/// outlives its buffer and `Space g c` would later "resume" a buffer id that no longer exists.
 #[test]
 fn closing_the_message_buffer_abandons_the_commit() {
     let mut s = session();
-    let fx = leader(&mut s, 't');
+    let fx = git_leader(&mut s, 'c');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,
@@ -9720,18 +9798,18 @@ fn closing_the_message_buffer_abandons_the_commit() {
         "the commit went with the buffer that held its message"
     );
 
-    // And a fresh `Space t` genuinely prepares again rather than resuming a dead buffer.
-    let fx = leader(&mut s, 't');
+    // And a fresh `Space g c` genuinely prepares again rather than resuming a dead buffer.
+    let fx = git_leader(&mut s, 'c');
     let (_, method, _) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
 }
 
-/// `Space u` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
+/// `Space g u` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
 /// sentence the user can check against their intent; a hash movement isn't.
 #[test]
-fn space_u_uncommits_and_names_what_came_back() {
+fn space_g_u_uncommits_and_names_what_came_back() {
     let mut s = session();
-    let fx = leader(&mut s, 'u');
+    let fx = git_leader(&mut s, 'u');
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/reset");
     assert_eq!(params["rev"], json!("HEAD^"));
@@ -9770,7 +9848,7 @@ fn space_u_uncommits_and_names_what_came_back() {
 #[test]
 fn uncommitting_with_no_parent_shows_gits_refusal() {
     let mut s = session();
-    let fx = leader(&mut s, 'u');
+    let fx = git_leader(&mut s, 'u');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,

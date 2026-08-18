@@ -128,6 +128,13 @@ pub enum KeyContext {
     /// mode — the read-only invariant is the table itself.
     Read,
     Leader,
+    /// The `Space g` sub-leader: git verbs and the repo-wide git pickers. A second table rather
+    /// than `Alt`-variants on the leader because git is the one area with more operations than a
+    /// single key row can hold (docs/git-phase-2.md). Cursor-local git *navigation* deliberately
+    /// stays out of it — `c`/`Alt-c` (next/prev hunk) in Normal, `Space c`/`Space Alt-c` (the
+    /// changes pickers, mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor,
+    /// the third reveal next to `Tab` and `Space n`).
+    LeaderGit,
     Global,
 }
 
@@ -292,6 +299,9 @@ pub enum Action {
     EnterInsert(InsertWhere),
     LeaveInsert,
     BeginLeader,
+    /// `Space g` — arm the git sub-leader ([`KeyContext::LeaderGit`]): the next keystroke names a
+    /// git operation. Like the leader itself, an unbound key just cancels.
+    BeginGitLeader,
 
     // ---- edits ----
     Backspace,
@@ -409,18 +419,24 @@ pub enum Action {
     /// ([`ShellAction::CopyWebUrl`]).
     CopyWebUrl,
 
-    // ---- git ----
+    // ---- git (the verbs live on the `Space g` sub-leader; see [`KeyContext::LeaderGit`]) ----
+    /// `Space g d` — toggle the inline diff.
     ToggleDiffView,
+    /// `c` / `Alt-c` in Normal — cursor-local hunk navigation, so *not* behind `Space g`: they're
+    /// repeatable motions ([`Action::is_repeatable`]) and a three-key prefix would ruin them.
     NextHunk,
     PrevHunk,
+    /// `Space g s` — stage/unstage the hunk under the cursor (or the selected lines).
     ToggleStageHunk,
+    /// `Space g Alt-s` — revert that change instead.
     RevertHunk,
-    /// Start a commit: prepare the message file server-side and open it as a buffer.
-    /// `amend` rewrites the previous commit instead of adding one.
+    /// `Space g c` — start a commit: prepare the message file server-side and open it as a buffer.
+    /// `amend` (`Space g Alt-c`) rewrites the previous commit instead of adding one.
     GitCommit {
         amend: bool,
     },
-    /// Take back the last commit, leaving its changes staged (`git reset --soft HEAD^`).
+    /// `Space g u` — take back the last commit, leaving its changes staged
+    /// (`git reset --soft HEAD^`).
     GitUncommit,
 
     // ---- LSP ----
@@ -432,6 +448,8 @@ pub enum Action {
     Format,
 
     // ---- git (popovers) ----
+    /// `Space m` — blame details for the cursor's line. Stays on the leader (not `Space g`) as the
+    /// third cursor-local *reveal*, beside `Tab` (hover) and `Space n` (diagnostic at cursor).
     ShowCommitInfo,
 
     // ---- pickers ----
@@ -440,8 +458,9 @@ pub enum Action {
     /// ordinary directory filter chip (editable, composable, removable). The buffer-locked
     /// changes/diagnostics *modes* use a dedicated kind instead (see [`PickerKind::GitChangesFile`]).
     OpenFilesInBufferDir,
-    /// `Space Alt-g` — open Grep with the query seeded from the buffer's selection (the grep
-    /// equivalent of `Alt-/`). A fresh open, so the chip row starts empty like any other; an empty
+    /// `Space Alt-/` — open Grep with the query seeded from the buffer's selection: the
+    /// workspace-scoped echo of Normal mode's `Alt-/` (search for selection), just as `Space /`
+    /// echoes `/`. A fresh open, so the chip row starts empty like any other; an empty
     /// selection just opens grep.
     OpenGrepFromSelection,
     /// `Space Alt-e` — Explorer at the buffer's workspace root rather than its directory.
@@ -449,16 +468,18 @@ pub enum Action {
 
     // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
     // overlay ignores them) ----
-    /// `Space /` — the keyboard-shortcut help overlay, generated from these tables.
+    /// `Space .` — the keyboard-shortcut reference (the Keybindings picker), generated from these
+    /// tables. On `.` rather than `/` because `Space /` is grep, mirroring Normal mode's `/`.
     OpenHelp,
-    /// `Space ,` — the workspace-settings overlay (roots + rename). TUI-only today.
+    /// `Space Alt-,` — the workspace-settings overlay (roots + rename). TUI-only today. The Alt
+    /// sibling of the app-wide settings on `Space ,`: same overlay family, narrower scope.
     OpenWorkspaceSettings,
-    /// `Space .` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
+    /// `Space ,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
     /// `Space ?` — the application-info dialog: build identity, the daemon we're connected to, and
-    /// where this profile's state lives. Sits next to `Space /` (the shortcut reference) because
-    /// both answer "what is this thing doing?" — one about keys, one about the install.
+    /// where this profile's state lives. Keeps its key through the `,`/`.`//` reshuffle: `?` is a
+    /// strong enough "what is this thing?" mnemonic to stand on its own.
     ShowAppInfo,
 
     // ---- hints (docs/hints.md) ----
@@ -622,13 +643,15 @@ impl Binding {
         self.code == other.code && a.ctrl == b.ctrl && a.shift == b.shift && a.alt != b.alt
     }
 
-    /// Render the chord for the help overlay, e.g. `Alt-h`, `Ctrl-z`, `Space f`, `↑`. Chords
-    /// that arm a capture get a trailing `␣` placeholder (`f ␣`) to signal one more
+    /// Render the chord for the help overlay, e.g. `Alt-h`, `Ctrl-z`, `Space f`, `Space g s`, `↑`.
+    /// Chords that arm a capture get a trailing `␣` placeholder (`f ␣`) to signal one more
     /// keystroke is expected.
     pub fn key_label(&self) -> String {
         let mut s = String::new();
-        if self.ctx == KeyContext::Leader {
-            s.push_str("Space ");
+        match self.ctx {
+            KeyContext::Leader => s.push_str("Space "),
+            KeyContext::LeaderGit => s.push_str("Space g "),
+            _ => {}
         }
         let m = self.mods.display_mods();
         if m.ctrl {
@@ -676,6 +699,7 @@ pub fn all() -> impl Iterator<Item = &'static Binding> {
         KeyContext::Search,
         KeyContext::Read,
         KeyContext::Leader,
+        KeyContext::LeaderGit,
     ]
     .into_iter()
     .flat_map(|cx| table(cx).iter())
@@ -690,6 +714,7 @@ pub fn table(ctx: KeyContext) -> &'static [Binding] {
         KeyContext::Search => SEARCH,
         KeyContext::Read => READ,
         KeyContext::Leader => LEADER,
+        KeyContext::LeaderGit => LEADER_GIT,
         KeyContext::Global => GLOBAL,
     }
 }
@@ -726,24 +751,30 @@ const GROUP_ORDER: &[&str] = &[
 /// be a contiguous run. Groups follow [`GROUP_ORDER`]; within a group, rows keep mode-major
 /// order (Normal, the shared `Any` keys, Insert, Search, Application — so unlike the old tabbed
 /// help dialog the `Global` keys appear *once*, as mode `Any`, rather than folded into both
-/// Normal and Insert). Bindings with no `group` (internal aliases) and the leader-trigger itself
-/// are omitted. Built straight from the binding tables and shipped on `picker/view`, so every
-/// client's picker shows exactly its own keymap.
+/// Normal and Insert). Bindings with no `group` (internal aliases) and the leader-triggers
+/// themselves are omitted. Built straight from the binding tables and shipped on `picker/view`, so
+/// every client's picker shows exactly its own keymap.
 pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
-    const MODES: [(&str, KeyContext); 6] = [
+    // The `Space g` sub-leader lists as "Application" too: mode is the editor mode a chord is
+    // reachable from, and both leaders are reached from Normal. Its rows are told apart by the
+    // `Git` group and the `Space g …` label, not by a mode of their own.
+    const MODES: [(&str, KeyContext); 7] = [
         ("Normal", KeyContext::Normal),
         ("Any", KeyContext::Global),
         ("Insert", KeyContext::Insert),
         ("Search", KeyContext::Search),
         ("Read", KeyContext::Read),
         ("Application", KeyContext::Leader),
+        ("Application", KeyContext::LeaderGit),
     ];
     // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
     // A Vec scan beats a map: ~15 groups, built once per open.
     let mut groups: Vec<(&str, Vec<aether_protocol::picker::KeybindingEntry>)> = Vec::new();
     for (mode, cx) in MODES {
         for b in table(cx) {
-            if !b.group.is_empty() && !matches!(b.action, Action::BeginLeader) {
+            if !b.group.is_empty()
+                && !matches!(b.action, Action::BeginLeader | Action::BeginGitLeader)
+            {
                 let entry = aether_protocol::picker::KeybindingEntry {
                     group: b.group.to_string(),
                     desc: b.desc.to_string(),
@@ -797,7 +828,7 @@ pub fn hover_action(code: KeyCode, mods: Mods) -> Option<HoverAction> {
 }
 
 use Action as A;
-use KeyContext::{Global as G, Insert as I, Leader as L, Normal as N, Read as R};
+use KeyContext::{Global as G, Insert as I, Leader as L, LeaderGit as LG, Normal as N, Read as R};
 use ModPattern::{Any, Exact, IgnoreShift};
 
 const fn ch(c: char) -> KeyCode {
@@ -1161,8 +1192,12 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInBufferDir, "Files", "Find files in buffer's directory"),
     bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
     bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch buffer"),
-    bind!(L, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
-    bind!(L, ch('g'), Exact(Mods::ALT), A::OpenGrepFromSelection, "Files", "Grep for selection"),
+    // `g` is the git sub-leader's prefix, so grep moved to `/` (and its selection-seeded sibling to
+    // `Alt-/`) — the workspace-scoped echo of Normal's `/` and `Alt-/`. `Space Alt-g` is left
+    // unbound on purpose: `g` should read as "git" with no exception to remember.
+    bind!(L, ch('g'), Exact(Mods::NONE), A::BeginGitLeader, "Leader", "Git sub-leader chord"),
+    bind!(L, ch('/'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Grep), "Files", "Grep workspace"),
+    bind!(L, ch('/'), Exact(Mods::ALT), A::OpenGrepFromSelection, "Files", "Grep for selection"),
     bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
     bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at workspace root"),
     bind!(L, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Workspaces), "Workspace", "Switch workspace"),
@@ -1175,21 +1210,20 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
     bind!(L, ch('o'), Exact(Mods::ALT), A::OpenPicker(PickerKind::WorkspaceSymbols), "Code", "Workspace symbols"),
+    // The changes pickers stay on the leader rather than moving under `Space g`: they're the list
+    // form of the cursor-local hunk navigation on `c`/`Alt-c`, exactly as `Space d`/`Space Alt-d`
+    // are for `d`/`Alt-d`'s diagnostics. Plain is buffer-scoped, Alt widens to the workspace.
     bind!(L, ch('c'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitChangesFile), "Git", "Git changes in current file"),
     bind!(L, ch('c'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitChanges), "Git", "Workspace git changes (hunks)"),
     bind!(L, ch('q'), Exact(Mods::NONE), A::Quit, "App", "Quit"),
     bind!(L, ch('q'), Exact(Mods::ALT), A::SaveAndQuit, "App", "Save and quit"),
-    bind!(L, ch('/'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     // `?` is a shifted `/` on every layout we care about, so the terminal reports it with SHIFT set
-    // while the GUI/web report the resolved character — `IgnoreShift` accepts both. Deliberately
-    // adjacent to `Space /`.
+    // while the GUI/web report the resolved character — `IgnoreShift` accepts both. It keeps its
+    // key now `/` is grep: "?" asks about the install, and the shortcut list is one key away on `.`.
     bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
-    bind!(L, ch(','), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
-    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
-    bind!(L, ch('t'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
-    bind!(L, ch('t'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
-    bind!(L, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
-    bind!(L, ch('y'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
+    bind!(L, ch(','), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
+    bind!(L, ch(','), Exact(Mods::ALT), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
+    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
@@ -1201,12 +1235,30 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
     bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
-    bind!(L, ch('a'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
-    bind!(L, ch('a'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
-    bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(L, ch('v'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reading view"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
+];
+
+/// The `Space g` sub-leader: git operations on the repo. Same plain/Alt sibling convention as the
+/// leader — plain is the common gesture, Alt its variant. Largely magit's alphabet (`s` stage,
+/// `c` commit, `b` branch, `d` diff), which is free muscle memory for anyone arriving from it.
+///
+/// Reserved for docs/git-phase-2.md's remaining stages, so the shape is decided once rather than
+/// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
+/// `a`/`Alt-a` stage/revert a whole file, `l`/`Alt-l` log/reflog pickers, `f`/`Alt-f` fetch/pull,
+/// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord), `z`/`Alt-z` the
+/// stash picker and stash-working-tree, `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
+/// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink.
+#[rustfmt::skip]
+static LEADER_GIT: &[Binding] = &[
+    bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStageHunk, "Git", "Stage/unstage change (hunk/selection)"),
+    bind!(LG, ch('s'), Exact(Mods::ALT), A::RevertHunk, "Git", "Revert change"),
+    bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
+    bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
+    bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
+    bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
+    bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
 ];
 
 #[cfg(test)]
@@ -1453,9 +1505,9 @@ mod tests {
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),
             Some(Action::ShowCommitInfo)
         ));
-        // `Space ?` is the info dialog, next to `Space /`'s shortcut reference. A terminal reports
-        // the shifted `/` with SHIFT held while the GUI/web hand over the resolved character, so
-        // both must resolve — the whole point of binding it `IgnoreShift`.
+        // `Space ?` is the info dialog. A terminal reports the shifted `/` with SHIFT held while
+        // the GUI/web hand over the resolved character, so both must resolve — the whole point of
+        // binding it `IgnoreShift`. It must not be shadowed by `Space /`'s grep, which is `Exact`.
         for mods in [Mods::NONE, Mods::SHIFT] {
             assert!(
                 matches!(
@@ -1496,6 +1548,97 @@ mod tests {
             lookup(KeyContext::Leader, ch('c'), Mods::ALT).map(|b| b.action),
             Some(Action::OpenPicker(PickerKind::GitChanges))
         ));
+    }
+
+    #[test]
+    fn space_g_is_a_prefix_and_the_git_verbs_live_behind_it() {
+        // `Space g` arms the sub-leader rather than running anything itself.
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('g'), Mods::NONE).map(|b| b.action),
+            Some(Action::BeginGitLeader)
+        ));
+        // `Space Alt-g` is deliberately unbound: `g` reads as "git" with no exception.
+        assert!(lookup(KeyContext::Leader, ch('g'), Mods::ALT).is_none());
+
+        let git = |code, mods| lookup(KeyContext::LeaderGit, code, mods).map(|b| b.action);
+        assert!(matches!(
+            git(ch('s'), Mods::NONE),
+            Some(Action::ToggleStageHunk)
+        ));
+        assert!(matches!(git(ch('s'), Mods::ALT), Some(Action::RevertHunk)));
+        assert!(matches!(
+            git(ch('c'), Mods::NONE),
+            Some(Action::GitCommit { amend: false })
+        ));
+        assert!(matches!(
+            git(ch('c'), Mods::ALT),
+            Some(Action::GitCommit { amend: true })
+        ));
+        assert!(matches!(
+            git(ch('u'), Mods::NONE),
+            Some(Action::GitUncommit)
+        ));
+        assert!(matches!(
+            git(ch('b'), Mods::NONE),
+            Some(Action::OpenPicker(PickerKind::GitBranches))
+        ));
+        assert!(matches!(
+            git(ch('d'), Mods::NONE),
+            Some(Action::ToggleDiffView)
+        ));
+        // A key with no git meaning resolves to nothing, so the chord just cancels.
+        assert!(git(ch('j'), Mods::NONE).is_none());
+
+        // The old single-key homes are free — a stale reflex does nothing rather than something
+        // else (`a` stage, `i` diff, `t` commit, `u` uncommit, `y` branches).
+        for (code, mods) in [
+            (ch('a'), Mods::NONE),
+            (ch('a'), Mods::ALT),
+            (ch('i'), Mods::NONE),
+            (ch('t'), Mods::NONE),
+            (ch('t'), Mods::ALT),
+            (ch('u'), Mods::NONE),
+            (ch('y'), Mods::NONE),
+        ] {
+            assert!(
+                lookup(KeyContext::Leader, code, mods).is_none(),
+                "{code:?} + {mods:?} must be free on the leader"
+            );
+        }
+
+        // Sub-leader rows render with their prefix, so the keybindings picker reads `Space g s`.
+        assert_eq!(
+            lookup(KeyContext::LeaderGit, ch('s'), Mods::ALT)
+                .map(|b| b.key_label())
+                .as_deref(),
+            Some("Space g Alt-s")
+        );
+    }
+
+    #[test]
+    fn leader_punctuation_is_settings_shortcuts_and_grep() {
+        let l = |code, mods| lookup(KeyContext::Leader, code, mods).map(|b| b.action);
+        // `,` app-wide, `Alt-,` this workspace: same overlay family, narrower scope on Alt.
+        assert!(matches!(
+            l(ch(','), Mods::NONE),
+            Some(Action::OpenAppSettings)
+        ));
+        assert!(matches!(
+            l(ch(','), Mods::ALT),
+            Some(Action::OpenWorkspaceSettings)
+        ));
+        // `.` is the shortcut reference; `/` is grep, mirroring Normal mode's `/` and `Alt-/`.
+        assert!(matches!(l(ch('.'), Mods::NONE), Some(Action::OpenHelp)));
+        assert!(matches!(
+            l(ch('/'), Mods::NONE),
+            Some(Action::OpenPicker(PickerKind::Grep))
+        ));
+        assert!(matches!(
+            l(ch('/'), Mods::ALT),
+            Some(Action::OpenGrepFromSelection)
+        ));
+        // Grep is `Exact(NONE)`, so the shifted `/` still reaches the info dialog behind it.
+        assert!(matches!(l(ch('?'), Mods::SHIFT), Some(Action::ShowAppInfo)));
     }
 
     #[test]

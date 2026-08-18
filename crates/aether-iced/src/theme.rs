@@ -192,7 +192,7 @@ pub const SCROLLBAR_W: f32 = 4.0;
 /// pan horizontally within the document rather than scrolling the view itself.
 pub const SCROLLBAR_INLINE_W: f32 = 3.0;
 
-/// Chrome sizing, derived from the `ui_font_size` app setting (`Space .`). Every size in the chrome
+/// Chrome sizing, derived from the `ui_font_size` app setting (`Space ,`). Every size in the chrome
 /// — status bar, pickers, dialogs, hover, toasts, hints — goes through here, so the whole UI scales
 /// as one knob. The buffer text is *not* chrome: it has its own setting (`buffer_font_size`) that
 /// the editor widget reads directly.

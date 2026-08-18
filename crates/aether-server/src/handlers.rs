@@ -14469,7 +14469,7 @@ pub async fn picker_view(
             _ => None,
         };
 
-    // `Space Alt-g`: grep for the buffer's selection. Slice the selection text now (the same
+    // `Space Alt-/`: grep for the buffer's selection. Slice the selection text now (the same
     // derivation `search_set`'s `from_selection` does for `Alt-/`), before the `pickers`/`matcher`
     // split-borrow takes `s`. An empty selection (empty buffer) leaves grep unseeded.
     let grep_selection_query: Option<String> =
@@ -14612,7 +14612,7 @@ pub async fn picker_view(
         }
     }
 
-    // from-selection grep (`Space Alt-g`): install the sliced selection as a literal query and kick
+    // from-selection grep (`Space Alt-/`): install the sliced selection as a literal query and kick
     // off the search in this same call — the grep analogue of `Alt-/`, but spawning the async walk
     // like References/DocumentSymbols do above. Bump the generation so the worker's pushes are
     // tagged freshly; the client adopts `result.generation`/`result.query` and keeps them. Queries
@@ -14646,7 +14646,7 @@ pub async fn picker_view(
     };
 
     // Cursor-derived centering: resolve the candidate nearest the buffer's cursor and use it as
-    // the effective center_on (overriding any client-passed item). Lets `Space g` / `Space c` land
+    // the effective center_on (overriding any client-passed item). Lets `Space /` / `Space c` land
     // on the user's spot in the result list even when the cursor isn't sitting on a match exactly.
     // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =

@@ -853,7 +853,7 @@ html, body, #app {
 /* Only the client/server build-mismatch row — the one thing here that's actionable. */
 .info-val.warn { color: var(--warning); }
 
-/* Workspace settings (Space ,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
+/* Workspace settings (Space Alt-,). Keyboard-driven — the focused field/row gets a frost-blue accent. */
 .modal.workspace-settings { width: min(640px, 88vw); }
 .modal.workspace-settings .modal-message { font-weight: 600; margin-bottom: 10px; }
 /* Small gray labels (matching the native client). Tucked tight above their field (~3px) so each
@@ -957,7 +957,7 @@ html, body, #app {
 .ps-language-gap.grow { flex-grow: 1; }
 .ps-error { color: var(--error); font-size: var(--ui-small); margin-top: 8px; }
 
-/* Application-settings overlay (Space .). Grouped checkbox settings: a frost-accent group header,
+/* Application-settings overlay (Space ,). Grouped checkbox settings: a frost-accent group header,
    then per-setting blocks of a label-left / native-checkbox-right row with the description grouped
    directly beneath. Only the focused setting's checkbox is ringed (not the whole row). Keyboard nav
    routes through the core; clicking a checkbox toggles it. */

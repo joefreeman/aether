@@ -98,7 +98,7 @@ pub enum PickerKind {
     /// slot, independent of the workspace-wide [`GitChanges`]. Rows are the buffer's hunks, under the
     /// file's header.
     GitChangesFile,
-    /// The keyboard-shortcut reference (`Space /`), fuzzy-matched on description, mode, and
+    /// The keyboard-shortcut reference (`Space .`), fuzzy-matched on description, mode, and
     /// chord, with rows grouped under one section header per binding group (the grep-style
     /// grouping — matches keep candidate order so each group stays a contiguous run; the client
     /// ships the rows already bucketed by group). Unique among the kinds in that the *client*
@@ -131,7 +131,7 @@ pub enum PickerKind {
     /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
     /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
     Jumplist,
-    /// The local branches of one repo (`Space y`, docs/git-phase-2.md stage 2), fuzzy-matched on
+    /// The local branches of one repo (`Space g b`, docs/git-phase-2.md stage 2), fuzzy-matched on
     /// branch name, HEAD first then most-recently-committed. The repo is resolved server-side from
     /// [`PickerViewParams::buffer_id`] by the same rule `git/prepare_commit` uses, so a single-repo
     /// workspace never sees a chooser.
@@ -1059,7 +1059,7 @@ pub struct PickerViewParams {
     /// Also carries the active buffer for [`PickerViewParams::from_selection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
-    /// Grep only (`Space Alt-g`): derive the initial query from `buffer_id`'s selection — the
+    /// Grep only (`Space Alt-/`): derive the initial query from `buffer_id`'s selection — the
     /// grep equivalent of `Alt-/`. The server slices the selection text, installs it as the
     /// query (literally, like the rest of grep), and kicks off the search in this same call;
     /// the derived query and its `generation` come back in the result for the client to adopt.
@@ -1068,7 +1068,7 @@ pub struct PickerViewParams {
     pub from_selection: bool,
     /// Replace the persisted filters before attaching. `None` keeps whatever the prior
     /// `view`/`query` cycle left behind (the default, no-op filters on a fresh open). `Some` is how a client opens a picker pre-scoped (e.g. `Space Alt-f` /
-    /// `Space Alt-g` seeding the buffer's directory chip).
+    /// `Space Alt-/` seeding the buffer's directory chip).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<PickerFilters>,
     /// Keybindings only: the candidate rows, shipped on a fresh open (the binding tables live

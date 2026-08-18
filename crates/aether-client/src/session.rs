@@ -331,7 +331,7 @@ impl TextField {
     }
 }
 
-/// The workspace-settings overlay state (`Space ,`), migrated from the TUI's shell-local
+/// The workspace-settings overlay state (`Space Alt-,`), migrated from the TUI's shell-local
 /// `WorkspaceSettingsState` into the core so every shell renders it. Shows an editable
 /// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field.
@@ -519,7 +519,7 @@ impl WorkspaceSettings {
     }
 }
 
-/// The application-settings overlay (`Space .`): global preferences (not per-workspace),
+/// The application-settings overlay (`Space ,`): global preferences (not per-workspace),
 /// rendered by every shell from `session.app_settings`. Distinct from [`WorkspaceSettings`], which
 /// edits the active workspace's name and roots.
 ///
@@ -760,6 +760,10 @@ pub enum ReloadTry {
 pub enum Pending {
     None,
     Leader,
+    /// `Space g` pressed: the next keystroke is looked up in [`KeyContext::LeaderGit`]
+    /// (`crates/aether-client/src/keymap.rs`). Its own variant rather than a flag on `Leader` so
+    /// the shells can say *which* chord is in flight; the awaiting-key cursor treats both alike.
+    LeaderGit,
     Find {
         dir: Direction,
         till: bool,
@@ -845,11 +849,11 @@ pub struct Session {
     pub viewport_id: Option<ViewportId>,
     pub window: Option<Window>,
     pub wrap: WrapMode,
-    /// Coding ligatures in the editor font — an app-wide setting (`Space .`), seeded from
+    /// Coding ligatures in the editor font — an app-wide setting (`Space ,`), seeded from
     /// `settings/get` at boot. The shells read it each render to pick their text shaping
     /// (native) / font feature (web); the core just holds the value.
     pub ligatures: bool,
-    /// Buffer text size in px — an app-wide setting (`Space .`), seeded from `settings/get` at
+    /// Buffer text size in px — an app-wide setting (`Space ,`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
     /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
     pub buffer_font_size: u32,
@@ -858,11 +862,11 @@ pub struct Session {
     /// separately from [`Self::buffer_font_size`]: chrome density and code size are different
     /// preferences.
     pub ui_font_size: u32,
-    /// Colour theme — an app-wide setting (`Space .`), seeded from `settings/get` at boot and
+    /// Colour theme — an app-wide setting (`Space ,`), seeded from `settings/get` at boot and
     /// synced via `settings/changed`. The shells resolve it to a role→shade table
     /// ([`crate::theme::Theme::of`]) each render; the core just holds the mode.
     pub theme: ThemeMode,
-    /// Hints on/off — an app-wide setting (`Space .`), seeded from `settings/get` at
+    /// Hints on/off — an app-wide setting (`Space ,`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
     /// hint disappears (and observation stops) when off.
     pub hints_enabled: bool,
@@ -879,7 +883,7 @@ pub struct Session {
     /// deliberately does **not** write through to the setting, which is app-wide and shared with
     /// every other client.
     pub(crate) read_on: bool,
-    /// App-wide "open markdown as reading view" setting (`Space .`), seeded from `settings/get`
+    /// App-wide "open markdown as reading view" setting (`Space ,`), seeded from `settings/get`
     /// and synced via `settings/changed`. The persisted *default* [`Self::read_on`] starts from,
     /// not the live state.
     pub markdown_read_default: bool,
@@ -920,9 +924,9 @@ pub struct Session {
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
-    /// The workspace-settings overlay (`Space ,`); owns the keyboard while open.
+    /// The workspace-settings overlay (`Space Alt-,`); owns the keyboard while open.
     pub workspace_settings: Option<WorkspaceSettings>,
-    /// The application-settings overlay (`Space .`); owns the keyboard while open.
+    /// The application-settings overlay (`Space ,`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,
     pub conn: ConnState,
     /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be

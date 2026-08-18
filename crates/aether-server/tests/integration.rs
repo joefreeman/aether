@@ -15281,7 +15281,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     drop(server);
 }
 
-/// `Space Alt-g`: `picker/view { from_selection }` slices the buffer's selection into a literal
+/// `Space Alt-/`: `picker/view { from_selection }` slices the buffer's selection into a literal
 /// grep query and runs the search in the same call — the query rides back in the response and the
 /// hits stream in, with no separate `picker/query`.
 #[tokio::test]

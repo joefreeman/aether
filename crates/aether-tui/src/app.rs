@@ -25,12 +25,13 @@ pub enum EditorMode {
     Search,
 }
 
-/// Multi-key prefix the next keystroke completes: `Space` (the picker / app chords). Drives the
-/// underline cursor that signals "waiting for one more key"; the actual second-key dispatch lives
-/// in the core.
+/// Multi-key prefix the next keystroke completes: `Space` (the picker / app chords) or `Space g`
+/// (the git sub-leader). Drives the underline cursor that signals "waiting for one more key"; the
+/// actual second-key dispatch lives in the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingLeader {
     Space,
+    SpaceG,
 }
 
 /// Captured state for a pending `f`/`t` keystroke — the next char the user types becomes the
@@ -216,10 +217,10 @@ pub struct AppState {
     /// laid-out document instead of the editor window. Synced from the session each frame; the
     /// layout itself is cached shell-side by `(buffer, revision, cols)`.
     pub read: Option<ReadViewState>,
-    /// Active workspace-settings overlay (`Space ,`). When `Some`, draws a centered modal listing
+    /// Active workspace-settings overlay (`Space Alt-,`). When `Some`, draws a centered modal listing
     /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub workspace_settings: Option<WorkspaceSettingsState>,
-    /// Active application-settings overlay (`Space .`). When `Some`, draws a centered modal
+    /// Active application-settings overlay (`Space ,`). When `Some`, draws a centered modal
     /// listing the global settings (e.g. soft wrap). Closed by Esc.
     pub app_settings: Option<AppSettingsState>,
     /// Latest language-server status per server, keyed by `(language, workspace_root)`, from

@@ -120,7 +120,7 @@ fn read_view(s: &Session) -> Value {
     })
 }
 
-/// The application-settings overlay (`Space .`), when open. Core-owned state + key handling
+/// The application-settings overlay (`Space ,`), when open. Core-owned state + key handling
 /// (`on_app_settings_key`); the shell renders grouped checkboxes and routes keys through the global
 /// keydown → `on_key`, plus checkbox clicks via `app_settings_toggle`. `selected` is the flat row
 /// index across all groups (group headers aren't part of it).
@@ -152,7 +152,7 @@ fn app_settings(s: &Session) -> Value {
     })
 }
 
-/// The workspace-settings overlay (`Space ,`), when open. Core-owned state + key handling
+/// The workspace-settings overlay (`Space Alt-,`), when open. Core-owned state + key handling
 /// (`on_workspace_settings_key`); the shell renders this projection and routes keys through the
 /// global keydown → `on_key`.
 ///
@@ -428,6 +428,9 @@ fn pending(p: &Pending) -> Value {
     match p {
         Pending::None => Value::Null,
         Pending::Leader => json!({ "kind": "leader" }),
+        // The git sub-leader is a leader with a prefix already typed; the shell only tests for a
+        // non-null `pending` to pick the awaiting-key cursor, so this needs no TS counterpart.
+        Pending::LeaderGit => json!({ "kind": "leader", "prefix": "g" }),
         Pending::Find {
             dir,
             till,

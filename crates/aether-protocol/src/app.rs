@@ -108,7 +108,7 @@ pub struct AppInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPaths {
     /// `<config>/aether/profiles/<name>/` — user-authored durable config: `settings.toml`
-    /// (app-wide preferences, `Space .`) and the `workspaces/*.toml` definitions.
+    /// (app-wide preferences, `Space ,`) and the `workspaces/*.toml` definitions.
     ///
     /// Only the two profile dirs travel: everything inside them sits at a fixed name joined onto
     /// one of these bases and resolves iff its base does, so per-file paths would carry no extra

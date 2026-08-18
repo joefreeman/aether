@@ -3,7 +3,7 @@
 //! roots): these are app-wide preferences that apply regardless of the active workspace.
 //!
 //! The client fetches them at boot (`settings/get`) and writes them from the app-settings overlay
-//! (`Space .`) with `settings/set`. Kept deliberately small — this is a personal editor, so a
+//! (`Space ,`) with `settings/set`. Kept deliberately small — this is a personal editor, so a
 //! setting earns its place by being something worth toggling, not configuring.
 
 use crate::envelope::{NotificationMethod, RpcMethod};

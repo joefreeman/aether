@@ -1823,6 +1823,7 @@ impl Shell {
         });
         st.pending_leader = match s.pending {
             Pending::Leader => Some(PendingLeader::Space),
+            Pending::LeaderGit => Some(PendingLeader::SpaceG),
             _ => None,
         };
         st.lsp_status = match (&s.lsp, &s.buffer.lsp_server) {

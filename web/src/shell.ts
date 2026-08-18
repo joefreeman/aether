@@ -492,7 +492,7 @@ interface CoreView {
   read: ReadDoc | null;
 }
 
-/** The workspace-settings overlay (`Space ,`), when open (view.rs `workspace_settings`). Core-owned
+/** The workspace-settings overlay (`Space Alt-,`), when open (view.rs `workspace_settings`). Core-owned
  *  state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys through
  *  the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index` (the
  *  add-root input), the projects (docs/projects.md), and `add_project_index` (the add-project
@@ -538,7 +538,7 @@ interface WorkspaceSettingsView {
   error: string | null;
 }
 
-/** The application-settings overlay (`Space .`), when open (view.rs `app_settings`). Core-owned
+/** The application-settings overlay (`Space ,`), when open (view.rs `app_settings`). Core-owned
  *  state + key handling (`on_app_settings_key`); the shell renders grouped checkboxes and routes
  *  keys through the global keydown → `on_key`, plus checkbox clicks via `app_settings_toggle`.
  *  `selected` is the flat row index across all groups. */
@@ -1073,7 +1073,7 @@ export class Shell {
   /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
    *  (this runs on every status render). */
   private faviconKey = "";
-  /** The workspace-settings overlay (Space ,). Core-owned state (`session.workspace_settings`); the
+  /** The workspace-settings overlay (Space Alt-,). Core-owned state (`session.workspace_settings`); the
    *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
    *  text editing and sync to the core (`workspace_settings_set_name` / `_set_add`); nav/commit/cancel
    *  keys route through their keydown → `on_key`. The labels + root rows are rebuilt each render. */
@@ -1102,7 +1102,7 @@ export class Shell {
   private psSelected = 0;
   private psInputIndex = 0;
   private psOpen = false;
-  /** The application-settings overlay (Space .). Core-owned state (`session.app_settings`);
+  /** The application-settings overlay (Space ,). Core-owned state (`session.app_settings`);
    *  toggle-only, so there are no inputs — keys route through the global keydown → `on_key`. The
    *  modal body (rows + hint) is rebuilt each render. */
   private readonly appSettingsEl: HTMLElement;
@@ -1447,7 +1447,7 @@ export class Shell {
     this.faviconEl.rel = "icon";
     document.head.appendChild(this.faviconEl);
     this.faviconDark.addEventListener("change", () => this.updateFavicon());
-    // The workspace-settings overlay (Space ,): a persistent modal whose name + add-root fields are
+    // The workspace-settings overlay (Space Alt-,): a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
     this.workspaceSettingsEl = document.createElement("div");
@@ -1562,7 +1562,7 @@ export class Shell {
     );
     this.workspaceSettingsEl.append(this.psModalEl);
 
-    // The application-settings overlay (Space .): a toggle-only modal — its body (rows + hint)
+    // The application-settings overlay (Space ,): a toggle-only modal — its body (rows + hint)
     // is rebuilt each render by `renderAppSettings`. A backdrop click is swallowed (editor stays).
     this.appSettingsEl = document.createElement("div");
     this.appSettingsEl.className = "overlay";
@@ -3396,7 +3396,7 @@ export class Shell {
     return span;
   }
 
-  /** The workspace-settings overlay (`Space ,`): the editable workspace name, the roots list, and an
+  /** The workspace-settings overlay (`Space Alt-,`): the editable workspace name, the roots list, and an
    *  add-root input row — all rendered from the core's `session.workspace_settings`. Keyboard-driven
    *  (Alt-j/k navigate, Enter rename/add, Del then y remove, Esc close); keys route through the
    *  global keydown → `on_key`, so this only paints. Mirrors the TUI/iced overlays. */
@@ -3636,7 +3636,7 @@ export class Shell {
     return wrap;
   }
 
-  /** Render the application-settings overlay (`Space .`) from `view.app_settings`: grouped rows,
+  /** Render the application-settings overlay (`Space ,`) from `view.app_settings`: grouped rows,
    *  each a left-aligned label with a native checkbox on the right. Clicking a checkbox toggles that
    *  setting (`app_settings_toggle`); keyboard nav/toggle routes through the global keydown →
    *  `on_key` (the checkboxes aren't focused), so on open we park focus on `capture`. The flat row

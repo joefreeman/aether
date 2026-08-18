@@ -159,11 +159,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    // Workspace settings overlay (Space P): centered modal listing the active workspace's roots.
+    // Workspace settings overlay (Space Alt-,): centered modal listing the active workspace's roots.
     if state.workspace_settings.is_some() {
         draw_workspace_settings_overlay(f, state, chunks[0]);
     }
-    // Application settings overlay (Space .): centered modal listing global settings.
+    // Application settings overlay (Space ,): centered modal listing global settings.
     if state.app_settings.is_some() {
         draw_app_settings_overlay(f, state, chunks[0]);
     }
@@ -279,7 +279,7 @@ fn draw_workspace_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) 
     }
 }
 
-/// Application-settings overlay (`Space .`): a small bordered modal of grouped checkbox settings.
+/// Application-settings overlay (`Space ,`): a small bordered modal of grouped checkbox settings.
 /// Each group has a frost-accent header; each setting is a flush-left white label with its
 /// `[✓]`/`[ ]` checkbox on the right, and its description on the line directly below (no gap). A
 /// blank line separates the group header and each setting. Only the focused setting's *checkbox* is

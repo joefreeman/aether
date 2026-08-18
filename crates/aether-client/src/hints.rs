@@ -187,7 +187,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "toggle", tier: 0, contexts: &[C::Normal], keys: "Space Alt-h",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleHints)),
         text: "Use {} to toggle hints off/on" },
-    HintDef { id: "help", tier: 0, contexts: &[C::Normal], keys: "Space /",
+    HintDef { id: "help", tier: 0, contexts: &[C::Normal], keys: "Space .",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenHelp)),
         text: "Use {} to browse all keybindings" },
     HintDef { id: "quit", tier: 0, contexts: &[C::Normal], keys: "Space q",
@@ -241,7 +241,7 @@ pub static CURRICULUM: &[HintDef] = &[
         text: "Use {} to grow the selection by syntax node" },
 
     // ---- tier 3: workspace & code intelligence ----
-    HintDef { id: "picker-grep", tier: 3, contexts: &[C::Normal], keys: "Space g",
+    HintDef { id: "picker-grep", tier: 3, contexts: &[C::Normal], keys: "Space /",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Grep))),
         text: "Use {} to grep the workspace" },
     HintDef { id: "explorer", tier: 3, contexts: &[C::Normal], keys: "Space e",
@@ -307,7 +307,7 @@ pub static CURRICULUM: &[HintDef] = &[
         text: "Use {} to copy the link URL or block source" },
 
     // ---- tier 4: git, picker deep-cuts, and the off switch ----
-    HintDef { id: "diff", tier: 4, contexts: &[C::Normal], keys: "Space i",
+    HintDef { id: "diff", tier: 4, contexts: &[C::Normal], keys: "Space g d",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleDiffView)),
         text: "Use {} to toggle the inline diff" },
     HintDef { id: "hunk-nav", tier: 4, contexts: &[C::Normal], keys: "c",
@@ -361,7 +361,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "jumplist-picker", tier: 4, contexts: &[C::Normal], keys: "Space j",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Jumplist))),
         text: "Use {} to reopen the jumplist" },
-    HintDef { id: "settings", tier: 4, contexts: &[C::Normal], keys: "Space .",
+    HintDef { id: "settings", tier: 4, contexts: &[C::Normal], keys: "Space ,",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenAppSettings)),
         text: "Use {} to open the app settings" },
 ];

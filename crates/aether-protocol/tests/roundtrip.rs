@@ -2772,13 +2772,13 @@ fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
             group: "App".into(),
             desc: "Show keyboard shortcuts".into(),
             mode: "Application".into(),
-            keys: "Space /".into(),
+            keys: "Space .".into(),
         }]),
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["kind"], "keybindings");
     assert_eq!(v["keybindings"][0]["group"], "App");
-    assert_eq!(v["keybindings"][0]["keys"], "Space /");
+    assert_eq!(v["keybindings"][0]["keys"], "Space .");
     let back: PickerViewParams = from_value(v).unwrap();
     assert_eq!(back.keybindings.as_deref().map(|k| k.len()), Some(1));
 
@@ -3145,7 +3145,7 @@ fn history_wire_shapes_round_trip() {
 #[test]
 fn picker_view_params_from_selection_serialized() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
-    // `Space Alt-g`: grep-for-selection rides `from_selection` + the active buffer id.
+    // `Space Alt-/`: grep-for-selection rides `from_selection` + the active buffer id.
     let p = PickerViewParams {
         from_selection: true,
         kind: PickerKind::Grep,

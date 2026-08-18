@@ -2426,7 +2426,7 @@ impl Session {
     /// [`Self::leave_ephemeral_workspace`]).
     /// Drop a pending commit whose message buffer is closing.
     ///
-    /// Without this the entry outlives its buffer, and `Space t` would then "switch to the
+    /// Without this the entry outlives its buffer, and `Space g c` would then "switch to the
     /// message already open" — at a buffer id that no longer exists.
     fn forget_commit_buffer(&mut self, buffer_id: BufferId) {
         if self
@@ -2488,7 +2488,7 @@ impl Session {
     }
 
     /// Copy the active buffer's path to the system clipboard — `absolute` picks the canonical
-    /// on-disk path (`Space Alt-a`), otherwise the workspace-relative path (`Space a`). Scratch
+    /// on-disk path (`Space Alt-p`), otherwise the workspace-relative path (`Space p`). Scratch
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
         let Some(path) = self.buffer.path.as_deref() else {
@@ -2827,7 +2827,7 @@ impl Session {
     /// `directory_path` seeds the Explorer's listing (its `Space e` = the buffer's directory).
     /// `seed_filters` replaces the server's persisted set (Explorer→Grep/Files switches,
     /// `Space Alt-f`); the echo through `PickerViewed` rebuilds the chip row.
-    /// `from_selection` (Grep, `Space Alt-g`) tells the server to seed the query from the buffer's
+    /// `from_selection` (Grep, `Space Alt-/`) tells the server to seed the query from the buffer's
     /// selection and run the search in this same call — the derived query/generation ride the
     /// `PickerViewed` echo, so there's no separate `picker/query` to send.
     /// `center_on_override` replaces the per-kind "where you are" default below — the
@@ -2951,7 +2951,7 @@ impl Session {
 
     /// `Space Alt-f`: open Files pre-scoped to the active buffer's directory — a normal dir filter
     /// chip, visible/editable/removable, composable with globs. Falls back to an unscoped open for
-    /// scratch buffers or files outside every root. (Grep's `Space Alt-g` is the unrelated
+    /// scratch buffers or files outside every root. (Grep's `Space Alt-/` is the unrelated
     /// [`Session::open_grep_from_selection`].)
     pub fn open_files_in_buffer_dir(&mut self) -> Effects {
         let seed = self
@@ -2972,7 +2972,7 @@ impl Session {
         self.open_picker(PickerKind::Files, None, seed, false, None)
     }
 
-    /// `Space Alt-g`: open Grep with the query seeded from the buffer's selection — the grep
+    /// `Space Alt-/`: open Grep with the query seeded from the buffer's selection — the grep
     /// equivalent of `Alt-/`. The server slices the selection, installs it as a literal query, and
     /// runs the search in the same `picker/view`; the derived query/generation ride back through
     /// the `PickerViewed` echo (so there's no follow-up `picker/query`). It's an ordinary open, so
@@ -5881,7 +5881,7 @@ impl Session {
         }
     }
 
-    /// Open the workspace-settings overlay (`Space ,`), seeded from the active workspace's name and
+    /// Open the workspace-settings overlay (`Space Alt-,`), seeded from the active workspace's name and
     /// roots. Cheap — no RPC. Focus lands on the always-present add-root input row at the bottom,
     /// since most opens (especially the post-create flow) are to add a root; the name field is
     /// above the roots and reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
@@ -6460,7 +6460,7 @@ impl Session {
         fx
     }
 
-    /// Open the application-settings overlay (`Space .`). Cheap — no RPC; the values it shows
+    /// Open the application-settings overlay (`Space ,`). Cheap — no RPC; the values it shows
     /// already live on the session. Focus lands on the first row.
     pub fn open_app_settings(&mut self) {
         self.app_settings = Some(AppSettingsOverlay { selected: 0 });
@@ -7219,8 +7219,18 @@ impl Session {
             Pending::Leader => {
                 self.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::Leader, code, mods) {
+                    // `Space g` re-arms into the git sub-leader from inside `run_action`, which is
+                    // why the clear above happens first.
                     return self.run_action(b.action, 1, mods.shift, visible_rows);
                 }
+                return Effects::none();
+            }
+            Pending::LeaderGit => {
+                self.pending = Pending::None;
+                if let Some(b) = lookup(KeyContext::LeaderGit, code, mods) {
+                    return self.run_action(b.action, 1, mods.shift, visible_rows);
+                }
+                // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
             }
             Pending::None => {}
@@ -7620,6 +7630,10 @@ impl Session {
             }
             A::BeginLeader => {
                 self.pending = Pending::Leader;
+                Effects::none()
+            }
+            A::BeginGitLeader => {
+                self.pending = Pending::LeaderGit;
                 Effects::none()
             }
 

@@ -39,9 +39,10 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 ## Keybindings
 
-Type `Space /` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
+Type `Space .` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/git/code commands, and `Tab` reveals hover info at the cursor.
+app/file/code commands, `Space g` the sub-leader for git operations, and `Tab` reveals hover info
+at the cursor.
 
 ### Motions (normal mode)
 
@@ -169,7 +170,7 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | --- | --- |
 | `Space f`/`Space Alt-f` | Find files / in buffer's directory |
 | `Space b`/`Space Alt-b` | Switch buffer / new scratch buffer |
-| `Space g`/`Space Alt-g` | Grep workspace / for current selection |
+| `Space /`/`Space Alt-/` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
 | `Space j` | Jumplist (`Ctrl-j` in any picker captures its results into it) |
@@ -178,21 +179,26 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
 | `Space x`/`Space Alt-x` | Close buffer / save and close it |
 | `Space z` | Open another window |
-| `Space ,` | Workspace settings (roots, projects) |
-| `Space .` | Application settings (soft wrap, font sizes, …) |
+| `Space ,`/`Space Alt-,` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save current buffer and quit |
-| `Space /`/`Space ?` | Show keyboard shortcuts / about this build |
+| `Space .`/`Space ?` | Show keyboard shortcuts / about this build |
 
 ### Git
+
+Navigation and reveals sit on the plain leader, beside their diagnostics counterparts; the
+operations live behind the `Space g` sub-leader.
 
 | Chord | Action |
 | --- | --- |
 | `c`/`Alt-c` | Next/previous change (hunk) |
 | `Space c`/`Space Alt-c` | Git changes in current file / across the workspace (hunks) |
-| `Space a`/`Space Alt-a` | Stage-unstage / revert the change under the cursor (or selected lines) |
-| `Space i` | Toggle inline diff |
 | `Space m` | Blame commit details for the cursor line |
+| `Space g s`/`Space g Alt-s` | Stage-unstage / revert the change under the cursor (or selected lines) |
+| `Space g c`/`Space g Alt-c` | Commit staged changes / amend the previous commit |
+| `Space g u` | Uncommit (keep the changes staged) |
+| `Space g b` | Branches: switch, create, delete |
+| `Space g d` | Toggle inline diff |
 
 ### Code / LSP
 

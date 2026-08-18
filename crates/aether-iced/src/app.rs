@@ -2783,7 +2783,7 @@ impl App {
             .into()
     }
 
-    /// The workspace-settings dialog (`Space ,`): a centred modal with the editable workspace name,
+    /// The workspace-settings dialog (`Space Alt-,`): a centred modal with the editable workspace name,
     /// the list of roots, and an add-root input row — rendered from the core's
     /// `session.workspace_settings`. Keyboard-driven (keys route through `session.on_key`, which the
     /// core handles): Alt-j/k navigate, Enter renames / adds, Delete (then y) removes, Esc closes.
@@ -3235,7 +3235,7 @@ impl App {
         )
     }
 
-    /// The application-settings overlay (`Space .`). Grouped checkbox settings: a frost-accent group
+    /// The application-settings overlay (`Space ,`). Grouped checkbox settings: a frost-accent group
     /// header, then each setting as a left-aligned label + native checkbox on the right, with its
     /// description grouped on the line directly below. Clicking a checkbox toggles that setting
     /// (`AppSettingToggle`); keys also work (Alt-j/k or Up/Down move, Enter/Space toggles, Esc
