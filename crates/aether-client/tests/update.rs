@@ -5336,6 +5336,284 @@ fn push_outcomes_name_their_next_step() {
     assert!(toast_messages(&fx).join(" ").contains("protected branch"));
 }
 
+/// `Alt-f` is pull, and it must not collide with plain `f` (fetch) — the two differ only by the
+/// modifier, and the one that moves the working tree is the one it would be worst to fire by
+/// accident.
+#[test]
+fn space_g_alt_f_pulls_and_plain_f_still_fetches() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('f'), Mods::ALT, None, ROWS);
+    let req = find_request(&fx, "git/pull").expect("git/pull fired");
+    assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
+    assert!(req.get("buffer_id").is_some());
+    assert!(
+        find_request(&fx, "git/fetch").is_none(),
+        "Alt-f must not also fetch"
+    );
+
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = key(&mut s, 'f');
+    assert!(find_request(&fx, "git/fetch").is_some());
+    assert!(find_request(&fx, "git/pull").is_none());
+}
+
+/// What a pull did to local history is the thing the user can't see for themselves, so each outcome
+/// gets its own sentence. The three moves in particular are three different things to have happened
+/// to their commits.
+#[test]
+fn pull_outcomes_name_what_happened_to_local_history() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitPullResult, GitPullStatus, GitRefreshResult, GitUpstreamStatus};
+
+    let mut s = session();
+    let origin = |ahead, behind| {
+        Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead,
+            behind,
+        })
+    };
+    let done = |status, upstream, refreshed| {
+        Event::PullDone(Ok(GitPullResult {
+            status,
+            upstream,
+            refreshed,
+            ..Default::default()
+        }))
+    };
+
+    // A fast-forward names the upstream and the buffers it disturbed — the count is the only
+    // warning that content changed underneath open windows.
+    let fx = s.on_event(done(
+        GitPullStatus::FastForwarded,
+        origin(0, 0),
+        GitRefreshResult {
+            reloaded: vec![1, 2],
+            ..Default::default()
+        },
+    ));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("Fast-forwarded") && msg.contains("origin/main") && msg.contains('2'),
+        "got {msg:?}"
+    );
+
+    // Merge and rebase are distinguishable in the wording, because they are distinguishable in
+    // what happened to the user's commits.
+    let fx = s.on_event(done(
+        GitPullStatus::Merged,
+        origin(1, 0),
+        GitRefreshResult::default(),
+    ));
+    assert!(toast_messages(&fx).join(" ").contains("Merged"));
+    let fx = s.on_event(done(
+        GitPullStatus::Rebased,
+        origin(1, 0),
+        GitRefreshResult::default(),
+    ));
+    assert!(toast_messages(&fx).join(" ").contains("Rebased"));
+
+    // Up to date is information, not a success worth celebrating.
+    let fx = s.on_event(done(
+        GitPullStatus::UpToDate,
+        origin(0, 0),
+        GitRefreshResult::default(),
+    ));
+    assert!(toast_messages(&fx).join(" ").contains("up to date"));
+
+    // Conflicts name the files, because the next step is to open one. Not an error toast: the
+    // pull did something, and the user has work to do rather than a fault to report.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Conflicted,
+        message: "CONFLICT (content): Merge conflict in a.rs".into(),
+        conflicts: vec!["a.rs".into(), "b.rs".into()],
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("a.rs") && msg.contains("b.rs") && msg.contains("Conflict"),
+        "got {msg:?}"
+    );
+    assert!(!has_error_toast(&fx));
+
+    // Diverged is push's `Behind` seen from the other side: the counts and the verb, not git's
+    // several lines of hint text.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Diverged,
+        message: "hint: You have divergent branches...".into(),
+        upstream: origin(2, 3),
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("Diverged") && msg.contains('2') && msg.contains('3'),
+        "got {msg:?}"
+    );
+    assert!(!has_error_toast(&fx));
+
+    // The refusal whose fix is another key on this same sub-leader.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::NoUpstream,
+        ..Default::default()
+    })));
+    assert!(toast_messages(&fx).join(" ").contains("Space g p"));
+
+    // The pre-flight refusal points at saving, exactly as checkout's does.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::BlockedByDirtyBuffers,
+        blocked: vec![4],
+        ..Default::default()
+    })));
+    assert!(toast_messages(&fx).join(" ").contains("save first"));
+
+    // Anything we didn't classify keeps git's own words.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Refused,
+        message: "error: Your local changes would be overwritten".into(),
+        ..Default::default()
+    })));
+    assert!(has_error_toast(&fx));
+    assert!(toast_messages(&fx)
+        .join(" ")
+        .contains("would be overwritten"));
+}
+
+/// The states a repo can be *left* in, as opposed to the pull that left it there. Each names the
+/// operation, because "resolve, then commit the merge" and "resolve, then continue the rebase" are
+/// different instructions and guessing costs the user a wrong command.
+#[test]
+fn pull_reports_a_repo_left_mid_operation() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitPullResult, GitPullStatus, GitRepoOperation};
+
+    let mut s = session();
+
+    // A rebase that stopped: the follow-up is `--continue`, not a commit.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Conflicted,
+        conflicts: vec!["a.rs".into()],
+        operation: Some(GitRepoOperation::Rebase),
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("continue the rebase") && msg.contains("a.rs"),
+        "got {msg:?}"
+    );
+
+    // The same conflict from a merge gets the other instruction.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Conflicted,
+        conflicts: vec!["a.rs".into()],
+        operation: Some(GitRepoOperation::Merge),
+        ..Default::default()
+    })));
+    assert!(toast_messages(&fx).join(" ").contains("commit the merge"));
+
+    // Pulling again while still stopped names the operation and what's left to resolve — the
+    // state the user has forgotten they're in, which is why the pull made no sense.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::OperationInProgress,
+        operation: Some(GitRepoOperation::Rebase),
+        conflicts: vec!["a.rs".into()],
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("rebasing") && msg.contains("a.rs"),
+        "got {msg:?}"
+    );
+
+    // Stopped with nothing left conflicted — resolved and staged but never committed. Nothing to
+    // point at, so it says what to do instead.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::OperationInProgress,
+        operation: Some(GitRepoOperation::Merge),
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("merging") && msg.contains("abort"),
+        "got {msg:?}"
+    );
+
+    // A cancel that stranded the index lock is a warning naming the lock, not a bare
+    // acknowledgement — until it's gone, every git operation in the repo fails.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Cancelled,
+        index_locked: true,
+        ..Default::default()
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(msg.contains("index.lock"), "got {msg:?}");
+    // ...and an ordinary cancel still says nothing alarming.
+    let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
+        status: GitPullStatus::Cancelled,
+        ..Default::default()
+    })));
+    assert!(!toast_messages(&fx).join(" ").contains("index.lock"));
+}
+
+/// Staging inside a conflicted file is refused with the reason, because the silent alternative was
+/// `git add`'s "mark resolved" — a different operation from the one the key names.
+#[test]
+fn staging_a_conflicted_file_explains_the_refusal() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{ApplyHunkStatus, ApplyScope, GitApplyHunkResult, HunkAction};
+
+    let mut s = session();
+    let fx = s.on_event(Event::HunkApplied {
+        action: HunkAction::Toggle,
+        scope: ApplyScope::Cursor,
+        result: Ok(GitApplyHunkResult {
+            cursor: Default::default(),
+            status: ApplyHunkStatus::Conflicted,
+        }),
+    });
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("resolved") && msg.contains("Conflicted"),
+        "got {msg:?}"
+    );
+}
+
+/// Only one announced git operation at a time: the indicator and `Space g x` are both single-slot,
+/// so a second would leave no way to say which one to stop.
+#[test]
+fn a_second_git_operation_is_refused_while_one_is_running() {
+    use aether_protocol::git::{GitOperation, GitOperationKind};
+
+    let mut s = session();
+    s.git_operation = Some((
+        "/repo".to_string(),
+        GitOperation {
+            kind: GitOperationKind::Pull,
+            detail: String::new(),
+        },
+    ));
+
+    for (keys, method) in [(Mods::NONE, "git/fetch"), (Mods::ALT, "git/pull")] {
+        let _ = key(&mut s, ' ');
+        let _ = key(&mut s, 'g');
+        let fx = s.on_key(KeyCode::Char('f'), keys, None, ROWS);
+        assert!(
+            find_request(&fx, method).is_none(),
+            "{method} must not start while another operation runs"
+        );
+        assert!(toast_messages(&fx).join(" ").contains("already running"));
+    }
+
+    // Cleared, it works again.
+    s.git_operation = None;
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('f'), Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "git/pull").is_some());
+}
+
 #[test]
 fn space_k_toggles_keep_and_guards_unsaved() {
     let mut s = session();

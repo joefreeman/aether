@@ -200,6 +200,9 @@ operations live behind the `Space g` sub-leader.
 | `Space g c`/`Space g Alt-c` | Commit staged changes / amend the previous commit |
 | `Space g u` | Uncommit (keep the changes staged) |
 | `Space g b` | Branches: switch, create, delete |
+| `Space g f`/`Space g Alt-f` | Fetch / pull from the remote |
+| `Space g p` | Push commits to the remote |
+| `Space g x` | Stop the fetch, push or pull in progress |
 | `Space g z`/`Space g Alt-z` | Stashes (preview, pop, apply, drop) / stash the working tree |
 | `Space g d` | Toggle inline diff |
 

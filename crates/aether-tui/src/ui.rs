@@ -6695,6 +6695,11 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
                 label.push_str(&format!(" ↓{}", up.behind));
             }
         }
+        // A stopped merge/rebase, named. Without it a conflicted `pull --rebase` shows a bare
+        // detached-HEAD hash with no arrows and no explanation.
+        if let Some(op) = status.operation {
+            label.push_str(&format!(" ({})", op.label()));
+        }
         parts.push(Span::styled(label, meta));
     }
     // Combined per-class counts: unstaged then `(staged)`.

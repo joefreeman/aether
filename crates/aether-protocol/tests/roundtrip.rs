@@ -657,6 +657,7 @@ fn git_buffer_status_shape() {
         },
         upstream: None,
         baseline: None,
+        operation: None,
     };
     let v = to_value(&s).unwrap();
     assert_eq!(v["branch"], "main");
@@ -2446,6 +2447,171 @@ fn git_fetch_and_push_shapes() {
         (GitPushStatus::Refused, "refused"),
     ] {
         assert_eq!(to_value(s).unwrap(), json!(wire));
+    }
+}
+
+#[test]
+fn git_pull_shape() {
+    use aether_protocol::git::{
+        GitPull, GitPullResult, GitPullStatus, GitRefreshResult, GitUpstreamStatus,
+    };
+    assert_eq!(GitPull::NAME, "git/pull");
+
+    // A pull that ran but found nothing carries only its status: no message, no reconciliation,
+    // and — being level — a divergence of zeros that still has to appear, because "level" and "no
+    // upstream" are different answers everywhere else in this protocol too.
+    let level = GitPullResult {
+        status: GitPullStatus::UpToDate,
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 0,
+            behind: 0,
+        }),
+        ..Default::default()
+    };
+    let v = to_value(&level).unwrap();
+    assert_eq!(
+        v,
+        json!({ "status": "up_to_date", "upstream": { "name": "origin/main", "ahead": 0, "behind": 0 } })
+    );
+    assert_eq!(from_value::<GitPullResult>(v).unwrap(), level);
+
+    // A conflicted pull is the shape the others aren't: it *failed* and still moved the tree, so
+    // the reconciliation report and the conflicting paths travel together.
+    let conflicted = GitPullResult {
+        status: GitPullStatus::Conflicted,
+        message: "CONFLICT (content): Merge conflict in a.rs".into(),
+        upstream: Some(GitUpstreamStatus {
+            name: "origin/main".into(),
+            ahead: 1,
+            behind: 1,
+        }),
+        blocked: Vec::new(),
+        refreshed: GitRefreshResult {
+            reloaded: vec![7],
+            ..Default::default()
+        },
+        conflicts: vec!["a.rs".into()],
+        operation: Some(aether_protocol::git::GitRepoOperation::Merge),
+        index_locked: false,
+    };
+    let v = to_value(&conflicted).unwrap();
+    assert_eq!(v["status"], "conflicted");
+    assert_eq!(v["conflicts"], json!(["a.rs"]));
+    assert_eq!(v["refreshed"]["reloaded"], json!([7]));
+    assert!(v.get("blocked").is_none(), "empty stays off the wire");
+    assert_eq!(from_value::<GitPullResult>(v).unwrap(), conflicted);
+
+    // The pre-flight refusal is the mirror image: git never ran, so there is nothing to reconcile
+    // and no divergence worth reporting — only who blocked it.
+    let blocked = GitPullResult {
+        status: GitPullStatus::BlockedByDirtyBuffers,
+        blocked: vec![1, 4],
+        ..Default::default()
+    };
+    let v = to_value(&blocked).unwrap();
+    assert_eq!(
+        v,
+        json!({ "status": "blocked_by_dirty_buffers", "blocked": [1, 4] })
+    );
+    assert_eq!(from_value::<GitPullResult>(v).unwrap(), blocked);
+
+    for (s, wire) in [
+        (GitPullStatus::FastForwarded, "fast_forwarded"),
+        (GitPullStatus::Merged, "merged"),
+        (GitPullStatus::Rebased, "rebased"),
+        (GitPullStatus::Diverged, "diverged"),
+        (GitPullStatus::OperationInProgress, "operation_in_progress"),
+        (GitPullStatus::NoUpstream, "no_upstream"),
+        (GitPullStatus::DetachedHead, "detached_head"),
+        (GitPullStatus::NoRemote, "no_remote"),
+        (GitPullStatus::Refused, "refused"),
+        (GitPullStatus::Cancelled, "cancelled"),
+    ] {
+        assert_eq!(to_value(s).unwrap(), json!(wire));
+    }
+}
+
+/// A repo stopped part-way through an operation, on the two shapes that carry it: the pull result
+/// that refused because of it, and the buffer status the bar reads.
+///
+/// The wire values are mirrored by hand in `web/src/protocol.ts` (`REPO_OPERATION_LABELS`), which
+/// is what makes them worth pinning rather than trusting to derive.
+#[test]
+fn git_repo_operation_shape() {
+    use aether_protocol::git::{GitBufferStatus, GitPullResult, GitPullStatus, GitRepoOperation};
+
+    for (op, wire, label) in [
+        (GitRepoOperation::Merge, "merge", "merging"),
+        (GitRepoOperation::Rebase, "rebase", "rebasing"),
+        (
+            GitRepoOperation::CherryPick,
+            "cherry_pick",
+            "cherry-picking",
+        ),
+        (GitRepoOperation::Revert, "revert", "reverting"),
+        (GitRepoOperation::Bisect, "bisect", "bisecting"),
+        (GitRepoOperation::ApplyMailbox, "apply_mailbox", "applying"),
+    ] {
+        assert_eq!(to_value(op).unwrap(), json!(wire));
+        assert_eq!(op.label(), label);
+    }
+
+    // A clean repo carries nothing — the field is absent, not `"clean"`, so every existing client
+    // reading a status keeps deserializing one.
+    let clean = GitBufferStatus::default();
+    assert!(to_value(&clean).unwrap().get("operation").is_none());
+
+    let stopped = GitBufferStatus {
+        branch: Some("a1b2c3d".into()),
+        operation: Some(GitRepoOperation::Rebase),
+        ..Default::default()
+    };
+    let v = to_value(&stopped).unwrap();
+    assert_eq!(v["operation"], "rebase");
+    assert_eq!(from_value::<GitBufferStatus>(v).unwrap(), stopped);
+
+    // The refusal, plus the stranded-lock flag — a bool that only appears when true, like
+    // `set_upstream` on a push.
+    let mid = GitPullResult {
+        status: GitPullStatus::OperationInProgress,
+        operation: Some(GitRepoOperation::Rebase),
+        conflicts: vec!["a.rs".into()],
+        ..Default::default()
+    };
+    let v = to_value(&mid).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "status": "operation_in_progress",
+            "operation": "rebase",
+            "conflicts": ["a.rs"],
+        })
+    );
+    assert_eq!(from_value::<GitPullResult>(v).unwrap(), mid);
+
+    let locked = GitPullResult {
+        status: GitPullStatus::Cancelled,
+        index_locked: true,
+        ..Default::default()
+    };
+    let v = to_value(&locked).unwrap();
+    assert_eq!(v, json!({ "status": "cancelled", "index_locked": true }));
+    assert_eq!(from_value::<GitPullResult>(v).unwrap(), locked);
+}
+
+/// The in-flight indicator's third kind. A wire value the client switches a label on, so it is
+/// pinned like the statuses are.
+#[test]
+fn git_operation_kind_covers_pull() {
+    use aether_protocol::git::GitOperationKind;
+    for (kind, wire, label) in [
+        (GitOperationKind::Fetch, "fetch", "Fetching"),
+        (GitOperationKind::Push, "push", "Pushing"),
+        (GitOperationKind::Pull, "pull", "Pulling"),
+    ] {
+        assert_eq!(to_value(kind).unwrap(), json!(wire));
+        assert_eq!(kind.label(), label);
     }
 }
 

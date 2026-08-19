@@ -50,6 +50,7 @@ import type {
   ViewportWindowResult,
   WrapMode,
 } from "./protocol";
+import { REPO_OPERATION_LABELS } from "./protocol";
 
 const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
@@ -4704,7 +4705,8 @@ export class Shell {
     if (op) {
       const el = document.createElement("span");
       el.className = "status-git git-branch";
-      const label = op.kind === "push" ? "Pushing" : "Fetching";
+      // Mirrors `GitOperationKind::label` in the core, which the native shells call directly.
+      const label = { fetch: "Fetching", push: "Pushing", pull: "Pulling" }[op.kind];
       el.textContent = op.detail ? `⟳ ${label}  ${op.detail}` : `⟳ ${label}`;
       used += [...el.textContent].length + DIVIDER_COLS;
       left.append(sectionDivider(), el);
@@ -4726,6 +4728,9 @@ export class Shell {
           if (up.ahead > 0) label += ` ↑${up.ahead}`;
           if (up.behind > 0) label += ` ↓${up.behind}`;
         }
+        // A stopped merge/rebase, named — mirrors `GitRepoOperation::label` in the core. Without
+        // it a conflicted `pull --rebase` shows a bare detached-HEAD hash with no explanation.
+        if (gs.operation) label += ` (${REPO_OPERATION_LABELS[gs.operation]})`;
         b.textContent = label;
         used += [...b.textContent].length + 2;
         gitGroup.append(b);

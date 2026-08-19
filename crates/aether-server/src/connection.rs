@@ -26,8 +26,9 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit, GitDeleteBranch, GitFetch,
-    GitNavigateHunk, GitPrepareCommit, GitPush, GitRefresh, GitRepos, GitReset, GitSetBaseline,
-    GitSetBlameFollow, GitSetDiffView, GitShow, GitStashApply, GitStashDrop, GitStashPush,
+    GitNavigateHunk, GitPrepareCommit, GitPull, GitPush, GitRefresh, GitRepos, GitReset,
+    GitSetBaseline, GitSetBlameFollow, GitSetDiffView, GitShow, GitStashApply, GitStashDrop,
+    GitStashPush,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -245,7 +246,25 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         };
         match msg {
             Message::Text(text) => {
-                if let Some(reply) = process_text(&text, &state, &mut ctx).await {
+                let Some(request) = parse_request(&text) else {
+                    continue;
+                };
+                // Detachable methods run on their own task so the reader loop stays free to read
+                // the next frame — which is the only way a `git/cancel` can ever reach the
+                // operation it is cancelling. Everything else keeps the sequential in-line
+                // dispatch the rest of the server assumes. See [`is_detachable`].
+                if is_detachable(&request) {
+                    let state = state.clone();
+                    let reply_tx = reply_tx.clone();
+                    let mut ctx = ConnectionCtx { client_id };
+                    tokio::spawn(async move {
+                        if let Some(reply) = process_request(request, &state, &mut ctx).await {
+                            // A closed channel means the connection went away while this ran —
+                            // the operation still finished, which is what matters.
+                            let _ = reply_tx.send(Message::text(reply)).await;
+                        }
+                    });
+                } else if let Some(reply) = process_request(request, &state, &mut ctx).await {
                     if reply_tx.send(Message::text(reply)).await.is_err() {
                         break; // writer gone — connection is dead
                     }
@@ -324,15 +343,48 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn process_text(text: &str, state: &SharedState, ctx: &mut ConnectionCtx) -> Option<String> {
-    let request: Request = match serde_json::from_str(text) {
-        Ok(r) => r,
+/// The methods that run off the reader loop instead of blocking it.
+///
+/// **Exactly the operations that contact a network, and the reason is `git/cancel`.** Handlers are
+/// dispatched sequentially in-line, which every other method wants — it is what makes one client's
+/// requests apply in the order it sent them. But a client has *one* socket, so while a handler runs
+/// the loop reads nothing, and the cancel frame for the very operation in flight sits unread behind
+/// it. `Space g x` could therefore never stop anything it was pressed for: a push to an unreachable
+/// host still sat out its TCP timeout with the only way out being to quit the editor, which is the
+/// precise scenario [`GitCancel`] was built to prevent.
+///
+/// Kept to a hard-coded three rather than made a property of "slow" handlers. Detaching costs the
+/// ordering guarantee — a detached request can now interleave with later ones from the same client
+/// — and these three are the only ones that both take unbounded time and touch nothing the next
+/// keystroke depends on. Anything editing a buffer must stay in line.
+fn is_detachable(request: &Request) -> bool {
+    // Matched against the parsed `method`, never against the raw frame. A substring probe would be
+    // cheaper and catastrophically wrong: `input/text` params carry arbitrary user text, so pasting
+    // the string "git/pull" into a buffer would detach that *edit* from the ordered dispatch.
+    matches!(
+        request.method.as_str(),
+        GitFetch::NAME | GitPush::NAME | GitPull::NAME
+    )
+}
+
+/// Parse an incoming frame, or `None` if it isn't a JSON-RPC request. Split from
+/// [`process_request`] so the reader loop can see the method before deciding whether to run it
+/// in line — one parse either way, just moved up.
+fn parse_request(text: &str) -> Option<Request> {
+    match serde_json::from_str(text) {
+        Ok(r) => Some(r),
         Err(e) => {
             tracing::warn!(error = %e, "failed to parse incoming frame as JSON-RPC request");
-            return None;
+            None
         }
-    };
+    }
+}
 
+async fn process_request(
+    request: Request,
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+) -> Option<String> {
     let id = request.id;
     let method = request.method.clone();
     let params = request.params.unwrap_or(Value::Null);
@@ -508,6 +560,7 @@ async fn dispatch(
         GitDeleteBranch::NAME => run!(GitDeleteBranch, handlers::git_delete_branch),
         GitFetch::NAME => run!(GitFetch, handlers::git_fetch),
         GitPush::NAME => run!(GitPush, handlers::git_push),
+        GitPull::NAME => run!(GitPull, handlers::git_pull),
         GitCancel::NAME => run!(GitCancel, handlers::git_cancel),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),

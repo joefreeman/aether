@@ -25,9 +25,10 @@ use aether_protocol::git::{
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
     GitFetchResult, GitFetchStatus, GitHead, GitNavigateHunk, GitNavigateHunkParams,
     GitNavigateHunkResult, GitOperationChanged, GitOperationKind, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitPush, GitPushParams, GitPushResult,
-    GitPushStatus, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepos, GitReposParams,
-    GitReposResult, GitReset, GitResetParams, GitResetResult, GitSetBaseline, GitSetBaselineParams,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
+    GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRefresh,
+    GitRefreshParams, GitRefreshResult, GitRepoOperation, GitRepos, GitReposParams, GitReposResult,
+    GitReset, GitResetParams, GitResetResult, GitSetBaseline, GitSetBaselineParams,
     GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
     GitSetDiffViewParams, GitShow, GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop,
     GitStashDropParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
@@ -34715,6 +34716,579 @@ async fn git_cancel_with_nothing_running_is_not_an_error() {
     )
     .await;
     assert!(!res.cancelled);
+
+    drop(server);
+}
+
+// -------- git/pull ----------------------------------------------------------------------------------
+
+/// A clone with `a.rs` open in a viewport, ready for the remote to move underneath it.
+///
+/// **`pull.rebase` is pinned repo-locally in every pull test**, and that isn't tidiness. The git the
+/// *server* spawns reads the developer's own global config (decision 1's cost — the tests can't
+/// reach its environment), so a contributor with `pull.rebase = true` would otherwise see these
+/// merge tests rebase. Repo-local config is the one lever that overrides it.
+async fn setup_pull_workspace(
+    rebase: bool,
+) -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tempfile::TempDir,
+    std::path::PathBuf, // base
+    std::path::PathBuf, // ours
+    String,             // origin url
+    u64,                // buffer id for a.rs
+) {
+    let (dir, base, ours, origin_url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    run_git(
+        &ours,
+        &[
+            "config",
+            "pull.rebase",
+            if rebase { "true" } else { "false" },
+        ],
+    );
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    (server, ws, dir, base, ours, origin_url, open.buffer_id)
+}
+
+async fn pull(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    repo: &std::path::Path,
+) -> GitPullResult {
+    send_request::<GitPull>(
+        ws,
+        id,
+        &GitPullParams {
+            repo_id: Some(repo.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await
+}
+
+/// The whole point of pull, end to end: someone else's commit arrives *and* the buffer showing that
+/// file is re-read in place.
+///
+/// This is the assertion that separates pull from fetch. A fetch that updated refs would leave the
+/// buffer showing yesterday's content with a clean gutter; only the reconciliation pass makes the
+/// editor agree with the disk.
+#[tokio::test]
+async fn git_pull_fast_forwards_and_reloads_the_open_buffer() {
+    let (server, mut ws, _dir, base, ours, url, buffer_id) = setup_pull_workspace(false).await;
+    assert_eq!(buffer_text(&mut ws, 3, buffer_id).await, "one\n");
+
+    someone_else_pushes(&base, &url, "a.rs");
+
+    let res = pull(&mut ws, 4, &ours).await;
+    assert_eq!(
+        res.status,
+        GitPullStatus::FastForwarded,
+        "nothing local was in the way: {}",
+        res.message
+    );
+    let up = res.upstream.expect("tracking origin/main");
+    assert!(up.is_level(), "caught up, got {up:?}");
+    assert_eq!(
+        res.refreshed.reloaded,
+        vec![buffer_id],
+        "the open buffer has to be re-read, or the editor disagrees with the disk"
+    );
+    assert_eq!(buffer_text(&mut ws, 5, buffer_id).await, "two\n");
+
+    drop(server);
+}
+
+/// Nothing new upstream: HEAD didn't move, so the outcome is read as `UpToDate` from the graph
+/// rather than from git's "Already up to date." line.
+#[tokio::test]
+async fn git_pull_with_nothing_new_reports_up_to_date() {
+    let (server, mut ws, _dir, _base, ours, _url, buffer_id) = setup_pull_workspace(false).await;
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::UpToDate, "{}", res.message);
+    assert!(
+        res.upstream.expect("tracking origin/main").is_level(),
+        "still level"
+    );
+    assert!(
+        res.refreshed.is_empty(),
+        "nothing moved, so nothing to reconcile: {:?}",
+        res.refreshed
+    );
+    assert_eq!(buffer_text(&mut ws, 4, buffer_id).await, "one\n");
+
+    drop(server);
+}
+
+/// Diverged, with the user's config saying "merge": a merge commit appears, and we name it as one.
+/// The distinction from a fast-forward is the user's own history gaining a commit, which is worth
+/// a different sentence.
+#[tokio::test]
+async fn git_pull_merges_when_the_user_configured_merge() {
+    let (server, mut ws, _dir, base, ours, url, _buffer_id) = setup_pull_workspace(false).await;
+    someone_else_pushes(&base, &url, "b.rs");
+    // A local commit of our own, so the branches genuinely diverge and a fast-forward is impossible.
+    std::fs::write(ours.join("c.rs"), "mine\n").unwrap();
+    run_git(&ours, &["add", "c.rs"]);
+    run_git(&ours, &["commit", "-m", "my work"]);
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Merged, "{}", res.message);
+    let up = res.upstream.expect("tracking origin/main");
+    // The merge commit and our own are both unpushed now; nothing is left to come down.
+    assert_eq!((up.ahead, up.behind), (2, 0), "got {up:?}");
+    assert!(ours.join("b.rs").exists(), "their file arrived");
+
+    drop(server);
+}
+
+/// The same divergence with `pull.rebase = true`: our commit is replayed on top, so the old HEAD is
+/// no longer an ancestor of the new one. That — not git's wording — is how the server tells a
+/// rebase from a merge.
+#[tokio::test]
+async fn git_pull_rebases_when_the_user_configured_rebase() {
+    let (server, mut ws, _dir, base, ours, url, _buffer_id) = setup_pull_workspace(true).await;
+    someone_else_pushes(&base, &url, "b.rs");
+    std::fs::write(ours.join("c.rs"), "mine\n").unwrap();
+    run_git(&ours, &["add", "c.rs"]);
+    run_git(&ours, &["commit", "-m", "my work"]);
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Rebased, "{}", res.message);
+    let up = res.upstream.expect("tracking origin/main");
+    assert_eq!(
+        (up.ahead, up.behind),
+        (1, 0),
+        "one replayed commit, got {up:?}"
+    );
+
+    drop(server);
+}
+
+/// A conflicting pull: git exits non-zero, the tree has *already* moved, and the repo is left
+/// mid-merge. Three things have to hold at once — the status names the state rather than relaying
+/// stderr, the conflicting paths come from the index, and the open buffer is reloaded so the user
+/// can see the markers they are being asked to resolve.
+#[tokio::test]
+async fn git_pull_reports_conflicts_from_the_index() {
+    let (server, mut ws, _dir, base, ours, url, buffer_id) = setup_pull_workspace(false).await;
+    // Both sides rewrite the same line of the same file.
+    someone_else_pushes(&base, &url, "a.rs");
+    std::fs::write(ours.join("a.rs"), "mine\n").unwrap();
+    run_git(&ours, &["add", "a.rs"]);
+    run_git(&ours, &["commit", "-m", "my edit"]);
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Conflicted, "{}", res.message);
+    assert_eq!(res.conflicts, vec!["a.rs".to_string()]);
+    assert_eq!(
+        res.refreshed.reloaded,
+        vec![buffer_id],
+        "the conflicted file is open — it has to show the markers"
+    );
+    let text = buffer_text(&mut ws, 4, buffer_id).await;
+    assert!(
+        text.contains("<<<<<<<") && text.contains(">>>>>>>"),
+        "expected conflict markers in the buffer, got {text:?}"
+    );
+
+    drop(server);
+}
+
+/// Diverged and git declined to reconcile. Provoked here with `pull.ff = only`, which refuses
+/// deterministically; the case this really exists for is a user with *neither* `pull.rebase` nor
+/// `pull.ff` set, which git has refused since 2.27 — and which can't be tested, because repo-local
+/// config can override an inherited value but cannot un-set one.
+///
+/// The classification is ours either way: git failed, the tree is clean, and libgit2 says both
+/// branches moved.
+#[tokio::test]
+async fn git_pull_names_a_divergence_git_refused_to_reconcile() {
+    let (server, mut ws, _dir, base, ours, url, _buffer_id) = setup_pull_workspace(false).await;
+    run_git(&ours, &["config", "pull.ff", "only"]);
+    someone_else_pushes(&base, &url, "b.rs");
+    std::fs::write(ours.join("c.rs"), "mine\n").unwrap();
+    run_git(&ours, &["add", "c.rs"]);
+    run_git(&ours, &["commit", "-m", "my work"]);
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Diverged, "{}", res.message);
+    let up = res.upstream.expect("tracking origin/main");
+    assert_eq!((up.ahead, up.behind), (1, 1), "got {up:?}");
+    assert!(
+        !res.message.is_empty(),
+        "git's own words ride along underneath our classification"
+    );
+    // Nothing was merged, so the local file the remote added must still be absent.
+    assert!(
+        !ours.join("b.rs").exists(),
+        "the pull really did not happen"
+    );
+
+    drop(server);
+}
+
+/// The pre-flight checkout and stash also make: git guards files on disk and cannot see an unsaved
+/// buffer, so it would merge underneath one. Refused before anything ran — asserted by the remote's
+/// commit still being absent afterwards, not merely by the status.
+#[tokio::test]
+async fn git_pull_refuses_while_a_buffer_is_unsaved() {
+    let (server, mut ws, _dir, base, ours, url, buffer_id) = setup_pull_workspace(false).await;
+    someone_else_pushes(&base, &url, "b.rs");
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        3,
+        &InputTextParams {
+            buffer_id,
+            text: "MINE".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let res = pull(&mut ws, 4, &ours).await;
+    assert_eq!(res.status, GitPullStatus::BlockedByDirtyBuffers);
+    assert_eq!(res.blocked, vec![buffer_id]);
+    assert!(
+        !ours.join("b.rs").exists(),
+        "a refusal that merely reported afterwards would be no protection at all"
+    );
+
+    drop(server);
+}
+
+/// No tracking information, answered from libgit2 rather than by spending a process to be told so.
+/// Distinguished from `NoRemote` because the fix differs: this one is `Space g p` away.
+#[tokio::test]
+async fn git_pull_without_an_upstream_is_refused_before_spawning() {
+    // `repo_with_origin` deliberately stops short of pushing, so `main` has a remote but no
+    // upstream — the state a freshly created branch is in.
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+
+    let res = pull(&mut ws, 2, &ours).await;
+    assert_eq!(res.status, GitPullStatus::NoUpstream);
+    assert!(res.message.is_empty(), "git never ran, so it said nothing");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_pull_without_a_remote_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let res = pull(&mut ws, 2, &root).await;
+    assert_eq!(res.status, GitPullStatus::NoRemote);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn git_pull_from_a_detached_head_is_refused() {
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    run_git(&ours, &["checkout", "--detach"]);
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let res = pull(&mut ws, 2, &ours).await;
+    assert_eq!(res.status, GitPullStatus::DetachedHead);
+
+    drop(server);
+}
+
+/// Pull announces itself as its own kind, not as the fetch it contains. The status bar reads the
+/// label off this, so a pull that reported `Fetch` would spend the whole transfer lying about what
+/// it was doing — and `Space g x` would be cancelling something the user wasn't told about.
+#[tokio::test]
+async fn git_pull_announces_itself_as_a_pull() {
+    let (_dir, _base, ours, _url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+
+    // By hand, because `send_request` drains the notifications this test is about.
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id: 2,
+        method: GitPull::NAME.into(),
+        params: Some(
+            serde_json::to_value(GitPullParams {
+                repo_id: Some(ours.to_string_lossy().into()),
+                buffer_id: None,
+            })
+            .unwrap(),
+        ),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+
+    let started = expect_notification::<GitOperationChanged>(&mut ws).await;
+    let op = started.operation.expect("an operation is in flight");
+    assert_eq!(op.kind, GitOperationKind::Pull);
+
+    let finished = expect_notification::<GitOperationChanged>(&mut ws).await;
+    assert!(
+        finished.operation.is_none(),
+        "the indicator has to clear, got {:?}",
+        finished.operation
+    );
+
+    drop(server);
+}
+
+// -------- stopped operations (mid-merge / mid-rebase) ------------------------------------------------
+
+/// Leave `ours` stopped in the middle of a conflicting rebase, the state a `pull --rebase` that hit
+/// a conflict leaves behind. Returns the buffer on the conflicted file.
+async fn setup_stopped_rebase() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tempfile::TempDir,
+    std::path::PathBuf, // ours
+    u64,                // buffer id for a.rs
+) {
+    let (server, mut ws, dir, base, ours, url, buffer_id) = setup_pull_workspace(true).await;
+    someone_else_pushes(&base, &url, "a.rs");
+    std::fs::write(ours.join("a.rs"), "mine\n").unwrap();
+    run_git(&ours, &["add", "a.rs"]);
+    run_git(&ours, &["commit", "-m", "my edit"]);
+
+    let res = pull(&mut ws, 3, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Conflicted, "{}", res.message);
+    assert_eq!(
+        res.operation,
+        Some(GitRepoOperation::Rebase),
+        "the result names which operation stopped, so the client can say `--continue` vs `commit`"
+    );
+    (server, ws, dir, ours, buffer_id)
+}
+
+/// A stopped rebase **detaches HEAD**, so the pre-flight order is what decides whether the user is
+/// told the cause or the symptom. Checking detached-HEAD first would answer "not on a branch" to
+/// someone who is mid-rebase from a pull that conflicted a minute ago — true, and useless.
+#[tokio::test]
+async fn a_pull_mid_rebase_names_the_operation_not_the_detached_head() {
+    let (server, mut ws, _dir, ours, _buffer_id) = setup_stopped_rebase().await;
+
+    let res = pull(&mut ws, 4, &ours).await;
+    assert_eq!(res.status, GitPullStatus::OperationInProgress);
+    assert_eq!(res.operation, Some(GitRepoOperation::Rebase));
+    assert_eq!(
+        res.conflicts,
+        vec!["a.rs".to_string()],
+        "the conflicts still needing resolution ride along — that's the actionable part"
+    );
+
+    drop(server);
+}
+
+/// The status bar's copy of the same fact. Without it the window silently swaps the branch name for
+/// a detached-HEAD hash and drops the ahead/behind arrows, and nothing on screen ever says "rebase"
+/// once the toast has faded.
+#[tokio::test]
+async fn buffer_status_reports_a_stopped_rebase() {
+    let (server, mut ws, _dir, _ours, _buffer_id) = setup_stopped_rebase().await;
+
+    let gs = git_status_of(&mut ws, "a.rs").await;
+    assert_eq!(gs.operation, Some(GitRepoOperation::Rebase));
+    // The degradation this exists to explain, asserted so the pairing is visible: detached HEAD, so
+    // the branch label is a bare hash and there is no upstream to compare against.
+    assert!(
+        gs.upstream.is_none(),
+        "detached mid-rebase — nothing to be ahead of, got {:?}",
+        gs.upstream
+    );
+
+    drop(server);
+}
+
+/// Staging a hunk in a conflicted file is refused rather than quietly meaning something else.
+///
+/// A conflicted path has no stage-0 index entry, so writing one is `git add`'s "mark resolved" —
+/// the user would press *stage this hunk* and get *resolve this file*, markers and all. The index
+/// still holding its conflict stages afterwards is the real assertion: the status alone would pass
+/// even if the write had happened.
+#[tokio::test]
+async fn staging_a_hunk_in_a_conflicted_file_is_refused() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+
+    let res = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    assert_eq!(res.status, ApplyHunkStatus::Conflicted);
+
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert!(
+        repo.index().unwrap().has_conflicts(),
+        "the conflict must survive — a stage-0 write would have marked it resolved"
+    );
+
+    drop(server);
+}
+
+// -------- cancelling a long-running operation --------------------------------------------------------
+
+/// Send `request` without waiting for its response — the caller is about to send another.
+async fn send_no_wait<M: RpcMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    params: &M::Params,
+) {
+    let req = Request {
+        jsonrpc: JsonRpc,
+        id,
+        method: M::NAME.into(),
+        params: Some(serde_json::to_value(params).unwrap()),
+    };
+    ws.send(Message::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+}
+
+/// Wait for the response to a request already sent by [`send_no_wait`]. The detached methods reply
+/// out of order by design, so the id is the only thing that identifies it.
+async fn await_response<M: RpcMethod>(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+) -> M::Result {
+    loop {
+        let text = next_text(ws).await;
+        match serde_json::from_str::<ClientInbound>(&text).expect("parseable inbound") {
+            ClientInbound::Response(r) if r.id == id => {
+                return serde_json::from_value(r.result).expect("typed result");
+            }
+            ClientInbound::Error(e) if e.id == id => {
+                panic!("request {id} ({}) returned error: {:?}", M::NAME, e.error);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Install a `post-merge` hook in `ours` running `body`. The portable way to make a pull take long
+/// enough to cancel: no network, no timing luck.
+fn install_post_merge_hook(ours: &std::path::Path, body: &str) {
+    let hooks = ours.join(".git/test-hooks"); // where `isolate_repo_config` points core.hooksPath
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-merge");
+    std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// **A client can cancel its own in-flight operation.** Not a detail of pull: handlers are
+/// dispatched sequentially in line on the reader loop, so before `is_detachable` existed the cancel
+/// frame sat unread behind the very operation it was meant to stop — for fetch and push too. The
+/// whole `Space g x` feature was inert, and the way it failed (a request that is simply never read)
+/// is invisible to any test that sends one request at a time.
+#[tokio::test]
+async fn a_client_can_cancel_its_own_in_flight_pull() {
+    let (_dir, base, ours, url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    run_git(&ours, &["config", "pull.rebase", "false"]);
+    someone_else_pushes(&base, &url, "b.rs");
+    install_post_merge_hook(&ours, "sleep 20");
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let repo_id: String = ours.to_string_lossy().into();
+    send_no_wait::<GitPull>(
+        &mut ws,
+        2,
+        &GitPullParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+        },
+    )
+    .await;
+
+    // Answered while the pull is still sleeping in its hook — the assertion is that this returns at
+    // all, long before the 20s hook could finish.
+    let res: GitCancelResult = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send_request::<GitCancel>(&mut ws, 3, &GitCancelParams { repo_id }),
+    )
+    .await
+    .expect("git/cancel must be readable while a pull is in flight");
+    assert!(res.cancelled, "an operation was running and was stopped");
+
+    drop(server);
+}
+
+/// Cancelling SIGKILLs git, and unlike fetch and push a pull's merge half writes the index — so a
+/// cancel can strand `.git/index.lock`, which makes *every* later git operation in the repo fail.
+///
+/// The lock here is **planted by the hook, not raced for**: reproducing a kill inside git's own
+/// index write is a coin toss, and what needs pinning is that a cancelled pull *looks* for the lock
+/// and reports it rather than saying a bare "cancelled" over a repo that is now wedged.
+#[tokio::test]
+async fn a_cancelled_pull_reports_a_stranded_index_lock() {
+    let (_dir, base, ours, url) = repo_with_origin();
+    run_git(&ours, &["push", "-u", "origin", "main"]);
+    run_git(&ours, &["config", "pull.rebase", "false"]);
+    someone_else_pushes(&base, &url, "b.rs");
+    install_post_merge_hook(
+        &ours,
+        "touch \"$(git rev-parse --git-dir)/index.lock\"\nsleep 20",
+    );
+
+    let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
+    let repo_id: String = ours.to_string_lossy().into();
+    send_no_wait::<GitPull>(
+        &mut ws,
+        2,
+        &GitPullParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    // Wait for the lock to *exist* rather than for a duration: a fixed sleep races the hook, and
+    // under a loaded test run the cancel would land first and kill git before it planted anything.
+    let lock = ours.join(".git/index.lock");
+    for _ in 0..200 {
+        if lock.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(lock.exists(), "the hook never planted the lock");
+    let _: GitCancelResult =
+        send_request::<GitCancel>(&mut ws, 3, &GitCancelParams { repo_id }).await;
+
+    let res: GitPullResult = await_response::<GitPull>(&mut ws, 2).await;
+    assert_eq!(res.status, GitPullStatus::Cancelled);
+    assert!(
+        res.index_locked,
+        "a cancelled pull must notice the lock it may have stranded"
+    );
 
     drop(server);
 }

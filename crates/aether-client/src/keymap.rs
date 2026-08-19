@@ -452,7 +452,13 @@ pub enum Action {
     /// `Space g p` — publish the current branch's commits (`↑ahead`). Never force-pushes; `Alt-p`
     /// is deliberately left unbound rather than made the force variant.
     GitPush,
-    /// `Space g x` — stop the fetch or push in flight. A no-op when nothing is running.
+    /// `Space g Alt-f` — bring the branch up to date with its upstream (`↓behind`). The `Alt` pair
+    /// of fetch, because that's what it is: a fetch that then moves the working tree, which is why
+    /// this one refuses when buffers are unsaved and fetch doesn't.
+    ///
+    /// Runs plain `git pull`, so the user's own `pull.rebase` decides between merge and rebase.
+    GitPull,
+    /// `Space g x` — stop the fetch, push or pull in flight. A no-op when nothing is running.
     ///
     /// Deliberately **not** `Esc`: an unbound second key cancels the sub-leader, so binding `Esc`
     /// to a verb would make it the one key on `Space g` that does something instead of backing
@@ -1286,8 +1292,9 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
+    bind!(LG, ch('f'), Exact(Mods::ALT), A::GitPull, "Git", "Pull from remote"),
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPush, "Git", "Push commits to remote"),
-    bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch or push in progress"),
+    bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch, push or pull in progress"),
     bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),

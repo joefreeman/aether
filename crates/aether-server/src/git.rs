@@ -20,7 +20,9 @@
 //! stage and unstage rewrite the file's index entry ([`write_index_blob`]); revert is an ordinary
 //! buffer edit driven by the handler.
 
-use aether_protocol::git::{BlameInfo, CommitInfo, GitHead, GitStatus, GitUpstreamStatus};
+use aether_protocol::git::{
+    BlameInfo, CommitInfo, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
+};
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -121,6 +123,11 @@ pub struct GitBaseline {
     /// blobs hold that commit's content and the whole change set reads as unstaged. See
     /// [`load_baseline`].
     pub rev: Option<BaselineRev>,
+    /// A merge/rebase/cherry-pick the repo is stopped in the middle of. Cached here beside `branch`
+    /// and `upstream` for the same reason: a repo-level read that changes when `.git` does, which
+    /// is exactly when this baseline reloads — so a rebase started in a *terminal* reaches the
+    /// status bar too.
+    pub operation: Option<GitRepoOperation>,
 }
 
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
@@ -152,6 +159,9 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     let upstream = head
         .as_ref()
         .and_then(|head| upstream_divergence(&repo, head));
+    // Read while the repo is open. A stopped rebase detaches HEAD, so `branch` above is about to
+    // become a bare hash and `upstream` `None` — this is the only thing that will explain why.
+    let operation = state_operation(&repo);
 
     // Diffing against a pinned revision instead of HEAD: point *both* blobs at that commit's
     // content. The existing pipeline then produces exactly the right thing with no special cases
@@ -168,6 +178,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
             upstream,
             staged_hunks: Vec::new(),
             rev: Some(rev.clone()),
+            operation,
         };
     }
 
@@ -187,6 +198,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         upstream,
         staged_hunks,
         rev: None,
+        operation,
     }
 }
 
@@ -632,6 +644,149 @@ pub fn repo_upstream(workdir: &Path) -> Option<GitUpstreamStatus> {
     let repo = git2::Repository::open(workdir).ok()?;
     let head = head_state(&repo)?;
     upstream_divergence(&repo, &head)
+}
+
+/// The commit HEAD points at, as a hex oid. `None` for an unborn HEAD or an unreadable repo.
+///
+/// A string rather than a `git2::Oid` so the handlers can hold one across an `await` without the
+/// git2 types leaking out of this module — it is an opaque token to them, compared and passed back
+/// to [`head_move`], never inspected.
+pub fn head_oid(workdir: &Path) -> Option<String> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let oid = repo.head().ok()?.peel_to_commit().ok()?.id().to_string();
+    Some(oid)
+}
+
+/// How local history changed while an operation ran — what a pull actually *did*.
+///
+/// Read from the commit graph rather than from git's summary line, which is the same discipline
+/// every other status here follows. The three moves are genuinely different things to have
+/// happened: catching up, gaining a merge commit, or having your commits rewritten onto new bases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadMove {
+    /// HEAD is where it was. Also the answer when the move can't be read at all — reporting "up to
+    /// date" for an unreadable repo is the harmless direction to be wrong in, and the caller has
+    /// already established that git succeeded.
+    Unchanged,
+    /// HEAD moved onto a descendant of where it was, without a merge: nothing local was in the way.
+    FastForward,
+    /// A merge commit was created with the old HEAD among its parents.
+    Merge,
+    /// The old HEAD is no longer an ancestor of the new one, which is what rewriting means —
+    /// `pull.rebase` replaying local commits onto the upstream.
+    Rewritten,
+}
+
+/// Classify the move from `before` to the repo's current HEAD. `before` is a [`head_oid`] taken
+/// before the operation ran.
+pub fn head_move(workdir: &Path, before: Option<&str>) -> HeadMove {
+    let Some(after) = head_oid(workdir) else {
+        return HeadMove::Unchanged;
+    };
+    let Some(before) = before else {
+        // Unborn before, committed now: the branch caught up from nothing, which is the fast-forward
+        // a pull into a fresh clone performs.
+        return HeadMove::FastForward;
+    };
+    if before == after {
+        return HeadMove::Unchanged;
+    }
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return HeadMove::Unchanged;
+    };
+    let (Ok(before_oid), Ok(after_oid)) =
+        (git2::Oid::from_str(before), git2::Oid::from_str(&after))
+    else {
+        return HeadMove::Unchanged;
+    };
+
+    // Merge before fast-forward: a merge commit is a descendant of the old HEAD too, so the
+    // descendant test alone would call every merge a fast-forward.
+    if let Ok(commit) = repo.find_commit(after_oid) {
+        if commit.parent_count() > 1 && commit.parent_ids().any(|p| p == before_oid) {
+            return HeadMove::Merge;
+        }
+    }
+    if repo
+        .graph_descendant_of(after_oid, before_oid)
+        .unwrap_or(false)
+    {
+        return HeadMove::FastForward;
+    }
+    HeadMove::Rewritten
+}
+
+/// What multi-step operation the repo is stopped part-way through, if any.
+///
+/// libgit2's `Repository::state` reads the same `.git` markers git does (`MERGE_HEAD`,
+/// `rebase-merge/`, `CHERRY_PICK_HEAD`…), so this sees an operation started from a terminal exactly
+/// as well as one of ours. The rebase flavours are folded together: they differ in how git resumes,
+/// which nothing here acts on.
+pub fn repo_operation(workdir: &Path) -> Option<GitRepoOperation> {
+    state_operation(&git2::Repository::open(workdir).ok()?)
+}
+
+/// [`repo_operation`] for a caller that already has the repo open — `load_baseline` does, and
+/// paying for a second discovery on every baseline reload to learn a flag would be silly.
+fn state_operation(repo: &git2::Repository) -> Option<GitRepoOperation> {
+    use git2::RepositoryState as S;
+    match repo.state() {
+        S::Clean => None,
+        S::Merge => Some(GitRepoOperation::Merge),
+        S::Revert | S::RevertSequence => Some(GitRepoOperation::Revert),
+        S::CherryPick | S::CherryPickSequence => Some(GitRepoOperation::CherryPick),
+        S::Bisect => Some(GitRepoOperation::Bisect),
+        S::Rebase | S::RebaseInteractive | S::RebaseMerge => Some(GitRepoOperation::Rebase),
+        S::ApplyMailbox | S::ApplyMailboxOrRebase => Some(GitRepoOperation::ApplyMailbox),
+    }
+}
+
+/// Whether this one path is left conflicted — the guard `git/apply_hunk` checks before writing an
+/// index entry.
+///
+/// Asked per path rather than by scanning [`conflicted_paths`] because it runs on every stage
+/// keystroke, and a conflicted *repo* says nothing about the file the cursor is in. Stage 2 is
+/// "ours", the side that exists in every conflict flavour except a delete/modify where we deleted;
+/// the ancestor and "theirs" slots cover the rest.
+pub fn path_has_conflict(workdir: &Path, rel: &Path) -> bool {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return false;
+    };
+    let Ok(index) = repo.index() else {
+        return false;
+    };
+    // Cheap exit: `has_conflicts` is a flag on the index, so an unconflicted repo — every repo,
+    // nearly all of the time — never reaches the per-path lookups.
+    if !index.has_conflicts() {
+        return false;
+    }
+    (1..=3).any(|stage| index.get_path(rel, stage).is_some())
+}
+
+/// Repo-relative paths left conflicted in the index — where a merge or rebase stopped.
+///
+/// The index is the authority git itself uses (`git status` reads the same entries), so this needs
+/// no parsing of the `CONFLICT (content):` lines git prints. Sorted, because the index iterates in
+/// its own order and this list is shown to the user.
+pub fn conflicted_paths(workdir: &Path) -> Vec<String> {
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let Ok(index) = repo.index() else {
+        return Vec::new();
+    };
+    let Ok(conflicts) = index.conflicts() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = conflicts
+        .filter_map(|c| c.ok())
+        // "Ours" first: a modify/delete conflict has only one side, and either names the same path.
+        .filter_map(|c| c.our.or(c.their).or(c.ancestor))
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.

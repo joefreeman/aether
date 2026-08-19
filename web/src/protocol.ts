@@ -165,14 +165,38 @@ export interface GitUpstreamStatus {
  * announced — the periodic background fetch stays silent.
  */
 export interface GitOperation {
-  kind: "fetch" | "push";
+  kind: "fetch" | "push" | "pull";
   /** git's latest progress line, verbatim. */
   detail?: string;
 }
 
+/**
+ * A multi-step git operation the repo is stopped part-way through (`.git/MERGE_HEAD`,
+ * `.git/rebase-merge`, …). Distinct from `GitOperation`, which is one we are running right now.
+ */
+export type GitRepoOperation =
+  | "merge"
+  | "rebase"
+  | "cherry_pick"
+  | "revert"
+  | "bisect"
+  | "apply_mailbox";
+
+/** Mirrors `GitRepoOperation::label` in the core, which the native shells call directly. */
+export const REPO_OPERATION_LABELS: Record<GitRepoOperation, string> = {
+  merge: "merging",
+  rebase: "rebasing",
+  cherry_pick: "cherry-picking",
+  revert: "reverting",
+  bisect: "bisecting",
+  apply_mailbox: "applying",
+};
+
 /** Buffer-level Git status: branch + staged (HEAD→index) and unstaged (index→buffer) counts. */
 export interface GitBufferStatus {
   branch?: string | null;
+  /** Set when the repo is stopped mid-merge/rebase — the status bar must say so. */
+  operation?: GitRepoOperation | null;
   staged?: GitChangeCounts;
   unstaged?: GitChangeCounts;
   upstream?: GitUpstreamStatus | null;

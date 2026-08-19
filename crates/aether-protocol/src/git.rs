@@ -129,6 +129,51 @@ pub struct GitBufferStatus {
     /// gutter at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<GitBaselineRef>,
+    /// A multi-step git operation the repo is stopped in the middle of, if any.
+    ///
+    /// Surfaced for the same reason `baseline` is: the editor is showing a state that doesn't match
+    /// the user's mental model and must say so. A conflicted `pull --rebase` leaves HEAD *detached*,
+    /// so without this the status bar silently swaps the branch name for a bare hash and drops the
+    /// ahead/behind arrows (there is no upstream to compare a detached HEAD against) — the whole git
+    /// surface degrades with no explanation, and the only thing that ever said "rebase" was a toast
+    /// that has since faded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitRepoOperation>,
+}
+
+/// A multi-step git operation a repo is stopped part-way through — what `.git/MERGE_HEAD`,
+/// `.git/rebase-merge` and friends record, read via libgit2's `Repository::state`.
+///
+/// Distinct from [`GitOperation`], which is something *we* are running right now: this is a
+/// persistent property of the repo that outlives the process that created it, and it is just as
+/// likely to have been started from a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepoOperation {
+    Merge,
+    /// Every rebase flavour — plain, interactive and merge-backend — folded together. The
+    /// distinction changes how git resumes, and nothing the editor does with this cares.
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
+    /// `git am`: applying a mailbox of patches.
+    ApplyMailbox,
+}
+
+impl GitRepoOperation {
+    /// Present-continuous label for the status bar — "merging", "rebasing". Lower case: it renders
+    /// as an aside next to the branch (`main (rebasing)`), not as a heading.
+    pub fn label(self) -> &'static str {
+        match self {
+            GitRepoOperation::Merge => "merging",
+            GitRepoOperation::Rebase => "rebasing",
+            GitRepoOperation::CherryPick => "cherry-picking",
+            GitRepoOperation::Revert => "reverting",
+            GitRepoOperation::Bisect => "bisecting",
+            GitRepoOperation::ApplyMailbox => "applying",
+        }
+    }
 }
 
 // ---- git/set_diff_view --------------------------------------------------------------------------
@@ -245,6 +290,14 @@ pub enum ApplyHunkStatus {
     /// ([`GitSetBaseline`]): these hunks have no index relationship to stage into. Reverting
     /// still works. Restore the HEAD baseline to stage.
     NotAgainstHead,
+    /// Staging refused because this file is left conflicted by a merge or rebase.
+    ///
+    /// Not a limitation but a guard against a silent surprise. A conflicted path has no stage-0
+    /// index entry, so writing one is `git add`'s "mark resolved" — the user would press *stage
+    /// this hunk* and get *resolve this file*, with the other side's changes and possibly the
+    /// conflict markers themselves committed to the index. The staged/unstaged split is meaningless
+    /// here anyway (see `git.rs`), so the gutter can't show what they'd be acting on.
+    Conflicted,
 }
 
 // ---- git/set_blame_follow -----------------------------------------------------------------------
@@ -796,6 +849,154 @@ pub enum GitPushStatus {
     Cancelled,
 }
 
+// ---- git/pull ------------------------------------------------------------------------------------
+
+/// Bring the current branch up to date with its upstream — the third network operation, and the
+/// only one that moves the working tree.
+///
+/// **This is where the two halves of the git support meet.** [`GitFetch`] and [`GitPush`] are pure
+/// network operations and inherit none of checkout's machinery; [`GitCheckout`] rewrites the tree
+/// and inherits all of it. A pull is both, so it carries the dirty-buffer pre-flight, the watcher
+/// suppression and the reconciliation pass *and* the progress indicator and cancellation.
+///
+/// **Plain `git pull`** — the user's own `pull.rebase`, `pull.ff`, `rebase.autoStash` and
+/// `merge.conflictstyle` decide what happens, exactly as they would in a terminal. That is
+/// `docs/git-phase-2.md` decision 1 applied to a strategy rather than to hooks: an editor that
+/// forced `--ff-only` would refuse where the user's own git would have rebased. The cost is that a
+/// pull can leave the tree mid-merge, which is what [`GitPullStatus::Conflicted`] exists to report.
+///
+/// Nothing here is pre-flighted that git could decide better. Uncommitted changes on disk, a merge
+/// that would overwrite them, a diverged branch with no configured strategy — all left to git, and
+/// classified afterwards from our own reads. The four refusals below it *does* answer up front are
+/// the ones knowable without the network that no retry could fix.
+pub struct GitPull;
+impl RpcMethod for GitPull {
+    const NAME: &'static str = "git/pull";
+    type Params = GitPullParams;
+    type Result = GitPullResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitPullParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPullResult {
+    pub status: GitPullStatus,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Divergence as it stands *after* the attempt — level after a clean pull, and still showing
+    /// the gap after a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<GitUpstreamStatus>,
+    /// With [`GitPullStatus::BlockedByDirtyBuffers`]: the buffers that stopped it. Git was never
+    /// run, so the working tree is exactly as it was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BufferId>,
+    /// The reconciliation that followed. Reported on *every* outcome that ran git, including the
+    /// failures: a pull that stopped at a conflict has already rewritten files, and a buffer left
+    /// showing pre-merge content would be the worst possible moment to be stale.
+    #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
+    pub refreshed: GitRefreshResult,
+    /// Repo-relative paths left conflicted, read from the index rather than from git's narration.
+    /// Populated for [`GitPullStatus::Conflicted`] and for the
+    /// [`GitPullStatus::OperationInProgress`] refusal, which is usually the same conflict seen on a
+    /// later attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
+    /// What the repo is stopped in the middle of. Set on
+    /// [`GitPullStatus::OperationInProgress`] (which is *why* it refused) and on
+    /// [`GitPullStatus::Conflicted`] (which merge or rebase just stopped), so the client can name
+    /// the operation rather than guessing from the user's config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitRepoOperation>,
+    /// `.git/index.lock` was still present after a cancelled pull.
+    ///
+    /// Cancelling SIGKILLs git. Fetch and push never write the index so this could not arise for
+    /// them, but a pull's merge half does, and a lock left behind makes *every* subsequent git
+    /// operation fail until it is removed. Reported and never removed for us: we know we killed a
+    /// git, not that we killed *the* holder of this lock, and deleting a live lock corrupts the
+    /// index of whatever does hold it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub index_locked: bool,
+}
+
+/// How a [`GitPull`] resolved.
+///
+/// The three success variants are told apart by comparing HEAD before and after — a libgit2 read of
+/// our own, never a parse of git's summary line. They are worth distinguishing because they are
+/// three different things to have happened to the user's history: nothing moved, the branch caught
+/// up, a merge commit appeared, or their commits were rewritten onto new bases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPullStatus {
+    /// HEAD did not move: already up to date.
+    #[default]
+    UpToDate,
+    /// HEAD moved straight onto the upstream tip — no local commits were in the way.
+    FastForwarded,
+    /// A merge commit was created: the new HEAD has the old one as a parent alongside the upstream.
+    Merged,
+    /// Local commits were replayed onto the upstream (`pull.rebase`). Recognised by the old HEAD no
+    /// longer being an ancestor of the new one, which is precisely what rewriting means.
+    Rebased,
+    /// The merge or rebase stopped with conflicts; `conflicts` names the files. **The tree has
+    /// moved** and the repo is left mid-operation, exactly as a terminal would leave it.
+    ///
+    /// Aether has no conflict resolution yet (`docs/git-phase-2.md` stage 6), so this reports the
+    /// state rather than offering to fix it. It is still a distinct outcome and not a
+    /// [`Self::Refused`]: the user's next step is to edit the marked files, not to read git's
+    /// stderr and work out what happened.
+    Conflicted,
+    /// The branch and its upstream have both moved and git declined to guess how to reconcile them
+    /// (no `pull.rebase` or `pull.ff` configured — git's own refusal since 2.27).
+    ///
+    /// **Classified after the fact**, the same trick and for the same reason as
+    /// [`GitPushStatus::Behind`]: whether it applies depends on the *user's config*, which the
+    /// server would have to read and re-implement git's precedence rules to predict. Letting git
+    /// decide and then asking libgit2 whether we are diverged keeps the good message without
+    /// inventing a refusal. Nothing moved.
+    Diverged,
+    /// The repo is already stopped part-way through a merge, rebase, cherry-pick or bisect
+    /// ([`GitRepoOperation`]), so there is nothing sensible to pull into. Pre-flighted.
+    ///
+    /// **This is the answer a conflicted `pull --rebase` needs on the *next* attempt**, and getting
+    /// there needs this check to run before [`Self::DetachedHead`] — a stopped rebase detaches HEAD,
+    /// so the detached-head refusal would otherwise fire first and report the symptom ("not on a
+    /// branch") in place of the cause. A stopped *merge* keeps HEAD on its branch, which is why that
+    /// case appeared to work: it reached git, git refused, and the index conflicts were still there
+    /// to classify. This covers both, and also the case with no conflicts left — everything
+    /// resolved and staged but never committed — which nothing else detects.
+    OperationInProgress,
+    /// The branch has no upstream, so there is nothing to pull from. Pre-flighted: git's own
+    /// "there is no tracking information for the current branch" costs a process spawn to learn
+    /// something libgit2 already knows, and the fix — push first, which sets one — is worth naming.
+    /// An unborn HEAD folds in here, having no tracking information either.
+    NoUpstream,
+    /// HEAD is detached, so there is no branch to bring up to date.
+    DetachedHead,
+    /// The repo has no remote configured.
+    NoRemote,
+    /// Open buffers in this repo hold unsaved edits; `blocked` lists them. Refused before anything
+    /// ran, the same pre-flight [`GitCheckout`] makes and for the same reason — git guards files on
+    /// disk and cannot see an unsaved buffer, so it would merge underneath one and leave the user's
+    /// edits sitting on a base that no longer exists.
+    BlockedByDirtyBuffers,
+    /// Git refused for some other reason; `message` is its stderr. Local changes that would be
+    /// overwritten, authentication, an unreachable host — one variant, because the client's
+    /// response to each is the same (show git's own words).
+    Refused,
+    /// The user stopped it ([`GitCancel`]). A cancel during the fetch half leaves nothing behind; a
+    /// cancel during the merge half can leave the repo mid-operation, which is why `refreshed` is
+    /// reported here too.
+    Cancelled,
+}
+
 // ---- long-running operations ---------------------------------------------------------------------
 
 /// What long-running git operation a repo is currently running, if any.
@@ -818,14 +1019,16 @@ pub struct GitOperation {
 pub enum GitOperationKind {
     Fetch,
     Push,
+    Pull,
 }
 
 impl GitOperationKind {
-    /// Present-continuous label for the status bar — "Fetching", "Pushing".
+    /// Present-continuous label for the status bar — "Fetching", "Pushing", "Pulling".
     pub fn label(self) -> &'static str {
         match self {
             GitOperationKind::Fetch => "Fetching",
             GitOperationKind::Push => "Pushing",
+            GitOperationKind::Pull => "Pulling",
         }
     }
 }

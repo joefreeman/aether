@@ -4254,6 +4254,11 @@ impl App {
                         seg.push_str(&format!(" ↓{}", up.behind));
                     }
                 }
+                // A stopped merge/rebase, named. Without it a conflicted `pull --rebase` shows a
+                // bare detached-HEAD hash with no arrows and no explanation.
+                if let Some(op) = gs.operation {
+                    seg.push_str(&format!(" ({})", op.label()));
+                }
                 used += seg.chars().count();
                 left = left.push(t(seg, p.accent_alt));
             }

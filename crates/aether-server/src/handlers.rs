@@ -40,11 +40,12 @@ use aether_protocol::git::{
     GitDeleteBranchResult, GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus,
     GitHead, GitNavigateHunkParams, GitNavigateHunkResult, GitOperation, GitOperationChanged,
     GitOperationChangedParams, GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult,
-    GitPushParams, GitPushResult, GitPushStatus, GitRefreshParams, GitRefreshResult, GitRepoInfo,
-    GitReposParams, GitReposResult, GitResetParams, GitResetResult, GitSetBaselineParams,
-    GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams,
-    GitStashDropParams, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
-    HunkAction, HunkDirection, RepoId, StagedFile,
+    GitPullParams, GitPullResult, GitPullStatus, GitPushParams, GitPushResult, GitPushStatus,
+    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
+    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
+    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
+    HunkDirection, RepoId, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -3425,46 +3426,23 @@ pub async fn git_checkout(
         }
     }
 
-    // Suppress before the spawn: a checkout rewrites many files at once and the reconciliation
-    // below is what accounts for them. Without this the watcher races it and the report — which is
-    // the only thing that tells the user what moved — comes back empty.
-    state.lock().await.git_suppressed.insert(workdir.clone());
+    // A checkout rewrites many files at once, so it runs through the tree-op helper: suppression
+    // around the spawn (without it the watcher races the reconciliation and the report — the only
+    // thing that tells the user what moved — comes back empty) and a reconcile either way.
     let mut args: Vec<&str> = vec!["checkout"];
     if params.create {
         args.push("-b");
     }
     args.push(&params.branch);
-    let outcome = crate::git_cli::run(&workdir, &args).await;
+    let run = run_tree_git(state, &workdir, &args, None, None).await?;
+    let refreshed = run.refreshed;
 
-    let mut s = state.lock().await;
-    s.git_suppressed.remove(&workdir);
-    let output = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            drop(s);
-            return Err(RpcError::internal(format!("running git checkout: {e}")));
-        }
-    };
-
-    // Reconcile either way: a checkout that fails partway still may have touched files, and a
-    // buffer left stale is worse than a redundant pass.
-    let (refreshed, pushes) = reconcile_repo(&mut s, &workdir);
-    drop(s);
-    for (sender, notif) in pushes {
-        let _ = sender.send(notif).await;
-    }
-
-    if !output.success() {
+    if !run.output.success() {
         // git narrates checkout on stderr ("Switched to branch 'x'" included), so a failure's
         // useful text is there; fall back to stdout the way `git_commit` does.
-        let message = if output.stderr.trim().is_empty() {
-            output.stdout
-        } else {
-            output.stderr
-        };
         return Ok(GitCheckoutResult {
             status: GitCheckoutStatus::Refused,
-            message: message.trim_end().to_string(),
+            message: git_failure_message(&run.output),
             refreshed,
             ..Default::default()
         });
@@ -3491,11 +3469,90 @@ pub async fn git_checkout(
     })
 }
 
-/// Run a tree-rewriting stash command (`push` / `apply` / `pop`) with the full checkout ceremony:
-/// dirty-buffer pre-flight, watcher suppression, reconciliation either way, git's stderr surfaced
-/// verbatim. Factored out because the three differ only in argv and the status they report on
-/// success — the hazards are identical, and duplicating them is how one of them ends up missing a
-/// reconcile.
+/// What a tree-rewriting git command produced — see [`run_tree_git`].
+struct TreeRun {
+    output: crate::git_cli::GitOutput,
+    /// Read off the cancel token, never out of the exit status: a killed git and a crashed one look
+    /// identical from the outside.
+    cancelled: bool,
+    refreshed: GitRefreshResult,
+}
+
+/// Run a git command that rewrites the working tree, with the full checkout ceremony: watcher
+/// suppression, reconciliation either way, and — for the network ones — an announced, cancellable
+/// invocation.
+///
+/// Every tree-moving operation shares these hazards and none of them may skip one, which is the
+/// whole argument for a single helper: duplicating the sequence is how one of them ends up without
+/// a reconcile. What callers keep for themselves is the *dirty-buffer pre-flight* (each maps it to
+/// its own refusal status, and checkout has a second pre-flight to interleave with it) and the
+/// classification of the result.
+///
+/// `announce` makes this the network path: `Some` streams progress and honours [`GitCancel`],
+/// `None` is the plain local run stash and checkout want.
+///
+/// **Suppression is held across the network transfer too, and unlike [`fetch_repo`] that is
+/// correct.** The objection there — suppression is keyed by workdir containment, so holding it for
+/// the length of a slow transfer blinds the watcher to the user's own edits — does not apply to an
+/// operation that ends in [`reconcile_repo`], which re-stats every buffer in the repo and refreshes
+/// the explorer and buffer pickers. That pass is a superset of what the suppressed watcher would
+/// have done, so nothing is lost, only deferred to the end. A fetch has no such pass, which is
+/// exactly why it must not suppress.
+async fn run_tree_git(
+    state: &SharedState,
+    workdir: &Path,
+    args: &[&str],
+    announce: Option<GitOperationKind>,
+    refresh_picker: Option<PickerKind>,
+) -> Result<TreeRun, RpcError> {
+    state
+        .lock()
+        .await
+        .git_suppressed
+        .insert(workdir.to_path_buf());
+    let outcome = run_network_git(state, workdir, args, announce).await;
+
+    let mut s = state.lock().await;
+    s.git_suppressed.remove(workdir);
+    let (output, cancelled) = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            drop(s);
+            let verb = args.first().copied().unwrap_or("command");
+            return Err(RpcError::internal(format!("running git {verb}: {e}")));
+        }
+    };
+    // Reconcile either way: a command that failed partway can still have touched files, and a
+    // buffer left stale is worse than a redundant pass.
+    let (refreshed, mut pushes) = reconcile_repo(&mut s, workdir);
+    if let Some(kind) = refresh_picker {
+        pushes.extend(refresh_git_ref_pickers(&mut s, kind));
+    }
+    drop(s);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+
+    Ok(TreeRun {
+        output,
+        cancelled,
+        refreshed,
+    })
+}
+
+/// git's useful text from a failed run: its stderr, falling back to stdout for the commands that
+/// narrate there. Trimmed, because this goes straight into a toast.
+fn git_failure_message(output: &crate::git_cli::GitOutput) -> String {
+    let message = if output.stderr.trim().is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    message.trim_end().to_string()
+}
+
+/// Run a tree-rewriting stash command (`push` / `apply` / `pop`). The three differ only in argv and
+/// the status they report on success.
 async fn run_tree_stash(
     state: &SharedState,
     workdir: std::path::PathBuf,
@@ -3516,46 +3573,23 @@ async fn run_tree_stash(
         });
     }
 
-    state.lock().await.git_suppressed.insert(workdir.clone());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let outcome = crate::git_cli::run(&workdir, &argv).await;
+    // The entry list changed under any open stash picker — including after a *failed* run, which
+    // may still have created or consumed an entry.
+    let run = run_tree_git(state, &workdir, &argv, None, Some(PickerKind::GitStash)).await?;
 
-    let mut s = state.lock().await;
-    s.git_suppressed.remove(&workdir);
-    let output = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            drop(s);
-            return Err(RpcError::internal(format!("running git stash: {e}")));
-        }
-    };
-    // Reconcile either way: a stash that failed partway can still have touched files.
-    let (refreshed, mut pushes) = reconcile_repo(&mut s, &workdir);
-    // The entry list changed under any open stash picker — including a *failed* run, which may
-    // still have created or consumed an entry.
-    pushes.extend(refresh_git_ref_pickers(&mut s, PickerKind::GitStash));
-    drop(s);
-    for (sender, notif) in pushes {
-        let _ = sender.send(notif).await;
-    }
-
-    if !output.success() {
-        let message = if output.stderr.trim().is_empty() {
-            output.stdout
-        } else {
-            output.stderr
-        };
+    if !run.output.success() {
         return Ok(GitStashResult {
             status: GitStashStatus::Refused,
-            message: message.trim_end().to_string(),
-            refreshed,
+            message: git_failure_message(&run.output),
+            refreshed: run.refreshed,
             ..Default::default()
         });
     }
     Ok(GitStashResult {
         status: ok_status,
-        refreshed,
-        message: output.stdout.trim_end().to_string(),
+        refreshed: run.refreshed,
+        message: run.output.stdout.trim_end().to_string(),
         ..Default::default()
     })
 }
@@ -4152,16 +4186,19 @@ pub async fn git_fetch(
     fetch_repo(state, workdir, true).await
 }
 
-/// What `git/push` needs to know about a repo before it can decide anything, read in one pass off
-/// the async thread: where HEAD points, how far it has diverged, and what remotes exist.
-struct PushPreflight {
+/// What a network operation needs to know about a repo before it can decide anything, read in one
+/// pass off the async thread: where HEAD points, how far it has diverged, and what remotes exist.
+///
+/// Shared by push and pull because they ask the same three questions and answer them differently —
+/// a branch with no upstream is push's cue to set one and pull's reason to refuse.
+struct RemotePreflight {
     head: Option<GitHead>,
     upstream: Option<GitUpstreamStatus>,
     remotes: Vec<String>,
 }
 
-fn push_preflight(workdir: &Path) -> PushPreflight {
-    PushPreflight {
+fn remote_preflight(workdir: &Path) -> RemotePreflight {
+    RemotePreflight {
         head: crate::git::discover_repo(workdir).map(|i| i.head),
         upstream: crate::git::repo_upstream(workdir),
         remotes: crate::git::remote_names(workdir),
@@ -4187,7 +4224,7 @@ pub async fn git_push(
     // be told what we already know.
     let pre = {
         let workdir = workdir.clone();
-        tokio::task::spawn_blocking(move || push_preflight(&workdir))
+        tokio::task::spawn_blocking(move || remote_preflight(&workdir))
             .await
             .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
     };
@@ -4294,6 +4331,203 @@ pub async fn git_push(
         message: String::new(),
         upstream: after,
         set_upstream,
+    })
+}
+
+/// Bring the current branch up to date — see [`GitPull`]. The one operation that is both a network
+/// call and a tree move, so it carries both sets of machinery.
+pub async fn git_pull(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitPullParams,
+) -> Result<GitPullResult, RpcError> {
+    let (workdir, git_dir) = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        (
+            std::path::PathBuf::from(&repo.repo_id),
+            std::path::PathBuf::from(&repo.git_dir),
+        )
+    };
+
+    let (pre, operation, conflicts) = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                remote_preflight(&workdir),
+                crate::git::repo_operation(&workdir),
+                crate::git::conflicted_paths(&workdir),
+            )
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+    let refuse = |status| {
+        Ok(GitPullResult {
+            status,
+            ..Default::default()
+        })
+    };
+    // The "pulling is impossible here" refusals come before the "pulling isn't safe right now" one:
+    // telling someone to go and save three buffers for an operation that could never have run is a
+    // wasted instruction. All of these are knowable without the network.
+    if pre.remotes.is_empty() {
+        return refuse(GitPullStatus::NoRemote);
+    }
+    // **Before the detached-HEAD check, deliberately.** A stopped rebase detaches HEAD, so testing
+    // that first would answer "not on a branch" — the symptom — to a user who is mid-rebase from a
+    // pull that conflicted a minute ago, and say nothing about the conflict they still have to
+    // resolve. Reported with the conflicting paths, which is the same answer the conflicted pull
+    // gave and the one still worth acting on.
+    if let Some(operation) = operation {
+        return Ok(GitPullResult {
+            status: GitPullStatus::OperationInProgress,
+            operation: Some(operation),
+            conflicts,
+            ..Default::default()
+        });
+    }
+    match &pre.head {
+        Some(GitHead::Branch { .. }) => {}
+        Some(GitHead::Detached { .. }) => return refuse(GitPullStatus::DetachedHead),
+        // No commits, so no tracking information either — the same answer, and one the user fixes
+        // the same way.
+        Some(GitHead::Unborn { .. }) => return refuse(GitPullStatus::NoUpstream),
+        None => return refuse(GitPullStatus::Refused),
+    }
+    if pre.upstream.is_none() {
+        return refuse(GitPullStatus::NoUpstream);
+    }
+
+    // Git cannot see an unsaved buffer: it guards files on disk, so it would merge underneath one
+    // and leave the user's edits sitting on a base that no longer exists. Refused rather than saved
+    // on their behalf, exactly as checkout does.
+    let blocked = {
+        let s = state.lock().await;
+        dirty_buffers_in_repo(&s, &workdir)
+    };
+    if !blocked.is_empty() {
+        return Ok(GitPullResult {
+            status: GitPullStatus::BlockedByDirtyBuffers,
+            blocked,
+            ..Default::default()
+        });
+    }
+
+    // Where HEAD was, so the outcome can be read from the graph afterwards rather than from git's
+    // summary line. Taken before the run and compared after: that difference is the whole of the
+    // fast-forward / merge / rebase classification.
+    let before = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::git::head_oid(&workdir))
+            .await
+            .ok()
+            .flatten()
+    };
+
+    // Plain `git pull`. No `--ff-only`, no `--rebase`: the user's own config decides, which is
+    // decision 1 applied to strategy rather than to hooks. An editor that forced one would refuse
+    // where the user's terminal would have succeeded.
+    let run = run_tree_git(
+        state,
+        &workdir,
+        &["pull"],
+        Some(GitOperationKind::Pull),
+        None,
+    )
+    .await?;
+
+    // One blocking pass for everything the outcome is read from: the divergence as it now stands,
+    // whatever the index is left conflicted on, how HEAD moved, and — only for the refusal
+    // classification below — whether the working tree is clean.
+    let (upstream, conflicts, moved, clean, stopped_in) = {
+        let workdir = workdir.clone();
+        let before = before.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                crate::git::repo_upstream(&workdir),
+                crate::git::conflicted_paths(&workdir),
+                crate::git::head_move(&workdir, before.as_deref()),
+                crate::git::changed_files_in_repo(&workdir).is_empty(),
+                crate::git::repo_operation(&workdir),
+            )
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+
+    // Conflicts first, ahead of both cancellation and the generic refusal. Git exits non-zero when
+    // a merge stops on one, but the *state the repo is in* is the fact the user has to act on, and
+    // "cancelled" or a wall of stderr would bury it. This also catches a merge the user began in a
+    // terminal and never finished: the pull refused because of it, and naming the conflicted files
+    // is a better account of why than git's "you have not concluded your merge".
+    if !conflicts.is_empty() {
+        return Ok(GitPullResult {
+            status: GitPullStatus::Conflicted,
+            message: git_failure_message(&run.output),
+            upstream,
+            refreshed: run.refreshed,
+            conflicts,
+            // Which of the two stopped is the user's next question — `git merge --abort` and
+            // `git rebase --abort` are different commands — and it comes from the repo rather
+            // than from guessing at their `pull.rebase`.
+            operation: stopped_in,
+            ..Default::default()
+        });
+    }
+    if run.cancelled {
+        return Ok(GitPullResult {
+            status: GitPullStatus::Cancelled,
+            upstream,
+            refreshed: run.refreshed,
+            operation: stopped_in,
+            // Cancelling SIGKILLs git, and the merge half writes the index — so unlike a cancelled
+            // fetch or push this one can leave a lock that makes every later git operation fail.
+            // Checked only here: the lock is normal and transient while git is *running*, so
+            // looking for it on a completed run would report a race as a fault.
+            index_locked: git_dir.join("index.lock").exists(),
+            ..Default::default()
+        });
+    }
+
+    if !run.output.success() {
+        // Both branches moved and git declined to guess how to reconcile them — classified from our
+        // own read of the graph, the same trick [`GitPushStatus::Behind`] uses and for the same
+        // reason: whether git refuses depends on the user's `pull.rebase`/`pull.ff` config, so
+        // predicting it would mean re-implementing git's config precedence.
+        //
+        // **Gated on a clean tree**, which is what keeps it honest. A diverged branch *and*
+        // uncommitted changes the merge would overwrite is a different refusal with the same
+        // ahead/behind signature, and its stderr names the files — telling that user to configure a
+        // pull strategy would send them after the wrong problem.
+        let diverged = clean
+            && upstream
+                .as_ref()
+                .is_some_and(|u| u.ahead > 0 && u.behind > 0);
+        return Ok(GitPullResult {
+            status: if diverged {
+                GitPullStatus::Diverged
+            } else {
+                GitPullStatus::Refused
+            },
+            message: git_failure_message(&run.output),
+            upstream,
+            refreshed: run.refreshed,
+            ..Default::default()
+        });
+    }
+
+    Ok(GitPullResult {
+        status: match moved {
+            crate::git::HeadMove::Unchanged => GitPullStatus::UpToDate,
+            crate::git::HeadMove::FastForward => GitPullStatus::FastForwarded,
+            crate::git::HeadMove::Merge => GitPullStatus::Merged,
+            crate::git::HeadMove::Rewritten => GitPullStatus::Rebased,
+        },
+        upstream,
+        refreshed: run.refreshed,
+        ..Default::default()
     })
 }
 
@@ -4782,6 +5016,16 @@ pub async fn git_apply_hunk(
     // ("put this hunk back to how it was at that commit") and falls through.
     if baseline.rev.is_some() && matches!(params.action, HunkAction::Toggle) {
         return Ok(outcome(&s, ApplyHunkStatus::NotAgainstHead));
+    }
+    // A conflicted path has no stage-0 index entry, so `write_index_blob` would take its
+    // "untracked" branch and write one — which clears the conflict stages, i.e. `git add`'s "mark
+    // resolved". The user pressed *stage this hunk* and would get *resolve this file*, quite
+    // possibly with `<<<<<<<` markers in the content. Revert falls through: restoring a hunk to its
+    // baseline is a buffer edit that touches no index entry.
+    if matches!(params.action, HunkAction::Toggle)
+        && crate::git::path_has_conflict(&repo.workdir, &repo.rel_path)
+    {
+        return Ok(outcome(&s, ApplyHunkStatus::Conflicted));
     }
 
     match params.action {
@@ -8721,6 +8965,7 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
             label: r.label.clone(),
             commit: r.commit.clone(),
         }),
+        operation: baseline.operation,
     })
 }
 

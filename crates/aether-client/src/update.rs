@@ -52,8 +52,9 @@ use aether_protocol::git::{
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
     GitFetchResult, GitFetchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
     GitOperationChanged, GitOperationChangedParams, GitPrepareCommit, GitPrepareCommitParams,
-    GitPrepareCommitResult, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitReset,
-    GitResetParams, GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult, GitPullStatus, GitPush,
+    GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation, GitReset, GitResetParams,
+    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
     GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
     GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
     HunkAction, HunkDirection,
@@ -238,6 +239,9 @@ pub enum Event {
     FetchDone(Result<GitFetchResult, String>),
     /// A `Space g p` push finished.
     PushDone(Result<GitPushResult, String>),
+    /// A `Space g Alt-f` pull finished. Unlike fetch and push this one may have rewritten the
+    /// working tree, so its toast reports the reconciliation as checkout's does.
+    PullDone(Result<GitPullResult, String>),
     /// A `Space g x` cancel was acknowledged. Silent on success — the operation's own result
     /// arrives right behind it and says what happened — and silent when nothing was running,
     /// which just means the operation finished before the keystroke landed.
@@ -1202,6 +1206,104 @@ impl Session {
                 Err(e) => Effects::error(e),
             },
 
+            Event::PullDone(result) => match result {
+                Ok(r) => match r.status {
+                    GitPullStatus::UpToDate => Effects::toast(
+                        match r.upstream.as_ref() {
+                            Some(u) => format!("Already up to date with {}", u.name),
+                            None => "Already up to date".to_string(),
+                        },
+                        ToastKind::Info,
+                    ),
+                    // The three moves read differently on purpose: the user's local history was
+                    // left alone, gained a merge commit, or was rewritten, and which one happened
+                    // is the thing they'd otherwise have to go and check.
+                    GitPullStatus::FastForwarded
+                    | GitPullStatus::Merged
+                    | GitPullStatus::Rebased => {
+                        Effects::toast(pull_summary(&r), ToastKind::Success)
+                    }
+                    // Not an error toast: the files are on disk with markers in them and the next
+                    // step is to open one, so name them rather than relaying git's stderr.
+                    GitPullStatus::Conflicted => Effects::toast(
+                        format!(
+                            "Conflicts in {} — resolve them, then {}",
+                            name_a_few(&r.conflicts),
+                            // The follow-up differs by operation and guessing costs the user a
+                            // wrong command: a merge is finished by committing, a rebase by
+                            // `--continue`. The server read which one stopped, so say it.
+                            match r.operation {
+                                Some(GitRepoOperation::Rebase) => "continue the rebase",
+                                Some(GitRepoOperation::Merge) => "commit the merge",
+                                _ => "finish the operation",
+                            }
+                        ),
+                        ToastKind::Warning,
+                    ),
+                    // The mirror of push's `Behind`, and like it the number and the verb are what
+                    // the user needs — git's own answer here is a paragraph of hint text.
+                    GitPullStatus::Diverged => Effects::toast(
+                        match r.upstream.as_ref() {
+                            Some(u) => format!(
+                                "Diverged from {} ({} ahead, {} behind) — merge or rebase to reconcile",
+                                u.name, u.ahead, u.behind
+                            ),
+                            None => {
+                                "Diverged from the remote — merge or rebase to reconcile".to_string()
+                            }
+                        },
+                        ToastKind::Warning,
+                    ),
+                    // The one refusal whose fix is another key in this same sub-leader.
+                    GitPullStatus::NoUpstream => Effects::toast(
+                        "No upstream — push first (Space g p) to set one",
+                        ToastKind::Warning,
+                    ),
+                    GitPullStatus::DetachedHead => {
+                        Effects::toast("Not on a branch — nothing to pull", ToastKind::Warning)
+                    }
+                    GitPullStatus::NoRemote => {
+                        Effects::toast("No remote configured", ToastKind::Info)
+                    }
+                    GitPullStatus::BlockedByDirtyBuffers => Effects::toast(
+                        format!(
+                            "{} unsaved buffer(s) — save first (Space s), then retry",
+                            r.blocked.len()
+                        ),
+                        ToastKind::Warning,
+                    ),
+                    // Already stopped part-way through something. Names the operation and the
+                    // conflicts still outstanding — the state the user has forgotten they're in,
+                    // which is precisely why the pull they just asked for made no sense.
+                    GitPullStatus::OperationInProgress => Effects::toast(
+                        {
+                            let what = r
+                                .operation
+                                .map(|op| op.label().to_string())
+                                .unwrap_or_else(|| "an operation".to_string());
+                            if r.conflicts.is_empty() {
+                                format!("Still {what} — finish or abort it first")
+                            } else {
+                                format!(
+                                    "Still {what} — resolve {} first",
+                                    name_a_few(&r.conflicts)
+                                )
+                            }
+                        },
+                        ToastKind::Warning,
+                    ),
+                    // A stranded lock isn't an aside: until it's gone, every git operation in this
+                    // repo fails. Say where it is, since removing it is the user's call.
+                    GitPullStatus::Cancelled if r.index_locked => Effects::toast(
+                        "Pull cancelled — .git/index.lock was left behind; remove it before running git again",
+                        ToastKind::Warning,
+                    ),
+                    GitPullStatus::Cancelled => Effects::toast("Pull cancelled", ToastKind::Info),
+                    GitPullStatus::Refused => Effects::error(r.message),
+                },
+                Err(e) => Effects::error(e),
+            },
+
             Event::CancelDone(result) => match result {
                 // Nothing to say either way: a successful cancel is followed immediately by the
                 // operation's own `Cancelled` result, and "nothing was running" means it beat the
@@ -1253,6 +1355,13 @@ impl Session {
                         // the way out is to unset it.
                         ApplyHunkStatus::NotAgainstHead => (
                             "Diffing against a revision — restore the HEAD baseline to stage",
+                            ToastKind::Warning,
+                        ),
+                        // Says what staging would silently have *meant* here. Left deliberately
+                        // without a "stage it anyway" escape: marking a conflict resolved is a
+                        // decision, and this key is not where the user is making it.
+                        ApplyHunkStatus::Conflicted => (
+                            "Conflicted file — staging would mark it resolved; resolve it first",
                             ToastKind::Warning,
                         ),
                     };
@@ -8191,6 +8300,19 @@ impl Session {
                 Event::StashDone,
             ),
 
+            // One announced operation at a time. Not a server rule but a client one, because the
+            // things that represent it are single-slot: the status bar shows one indicator, and
+            // `Space g x` resolves its target *from* that indicator — so a second operation would
+            // leave the user unable to say which one they meant to stop. Slightly over-strict in a
+            // multi-repo workspace (an operation in one repo blocks starting one in another), which
+            // is the same simplification the single indicator already makes.
+            A::GitFetch | A::GitPush | A::GitPull if self.git_operation.is_some() => {
+                Effects::toast(
+                    "A git operation is already running — Space g x stops it",
+                    ToastKind::Info,
+                )
+            }
+
             A::GitFetch => self.request_str::<GitFetch>(
                 GitFetchParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
@@ -8206,6 +8328,14 @@ impl Session {
                     buffer_id: Some(self.buffer.buffer_id),
                 },
                 Event::PushDone,
+            ),
+
+            A::GitPull => self.request_str::<GitPull>(
+                GitPullParams {
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                },
+                Event::PullDone,
             ),
 
             // Cancelling names the repo from the operation itself, never from the active buffer:
@@ -9554,6 +9684,47 @@ fn push_summary(result: &GitPushResult) -> String {
         format!("Pushed — now tracking {target}")
     } else {
         format!("Pushed to {target}")
+    }
+}
+
+/// What a pull did to local history, and what it disturbed on the way.
+///
+/// The verb comes from the server's read of the commit graph, not from git's summary line, and the
+/// three are worth keeping apart: a fast-forward left the user's commits alone, a merge added one,
+/// and a rebase rewrote them. The buffer counts are checkout's sentence for the same reason — a
+/// pull that quietly left three buffers showing pre-merge content is the surprise the
+/// reconciliation pass exists to prevent.
+fn pull_summary(result: &GitPullResult) -> String {
+    let verb = match result.status {
+        GitPullStatus::Merged => "Merged",
+        GitPullStatus::Rebased => "Rebased onto",
+        _ => "Fast-forwarded to",
+    };
+    let target = result
+        .upstream
+        .as_ref()
+        .map(|u| u.name.clone())
+        .unwrap_or_else(|| "the remote".to_string());
+    let mut note = format!("{verb} {target}");
+    let moved = result.refreshed.reloaded.len();
+    if moved > 0 {
+        note.push_str(&format!(" — reloaded {moved} buffer(s)"));
+    }
+    if !result.refreshed.missing.is_empty() {
+        note.push_str(&format!(", {} now gone", result.refreshed.missing.len()));
+    }
+    note
+}
+
+/// Name a short list in a toast: every entry up to three, then a count. Long enough to be
+/// actionable when a merge conflicts in one or two files, short enough not to fill the screen when
+/// it conflicts in thirty.
+fn name_a_few(paths: &[String]) -> String {
+    match paths {
+        [] => "the working tree".to_string(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
     }
 }
 
