@@ -25,10 +25,10 @@ use aether_protocol::envelope::{
     ErrorObject, ErrorResponse, JsonRpc, Notification, Request, Response, RpcMethod,
 };
 use aether_protocol::git::{
-    GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit, GitDeleteBranch, GitFetch,
-    GitNavigateHunk, GitPrepareCommit, GitPull, GitPush, GitRefresh, GitRepos, GitReset,
-    GitSetBaseline, GitSetBlameFollow, GitSetDiffView, GitShow, GitStashApply, GitStashDrop,
-    GitStashPush,
+    GitAbortOperation, GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit,
+    GitDeleteBranch, GitFetch, GitNavigateHunk, GitPrepareCommit, GitPull, GitPush, GitRefresh,
+    GitRepos, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow, GitSetDiffView,
+    GitShow, GitStashApply, GitStashDrop, GitStashPush,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -546,6 +546,8 @@ async fn dispatch(
         GitSetBlameFollow::NAME => run!(GitSetBlameFollow, handlers::git_set_blame_follow),
         GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
+        GitResolveConflict::NAME => run!(GitResolveConflict, handlers::git_resolve_conflict),
+        GitAbortOperation::NAME => run!(GitAbortOperation, handlers::git_abort_operation),
         GitRepos::NAME => run!(GitRepos, handlers::git_repos),
         GitRefresh::NAME => run!(GitRefresh, handlers::git_refresh),
         GitSetBaseline::NAME => run!(GitSetBaseline, handlers::git_set_baseline),

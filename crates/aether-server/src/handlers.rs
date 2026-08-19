@@ -33,19 +33,20 @@ use aether_protocol::directory::{
 use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, ApplyScope, GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef,
-    GitBlameChanged, GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult,
-    GitBufferStatus, GitCancelParams, GitCancelResult, GitChangeCounts, GitCheckoutParams,
-    GitCheckoutResult, GitCheckoutStatus, GitCommitParams, GitCommitResult, GitDeleteBranchParams,
-    GitDeleteBranchResult, GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus,
-    GitHead, GitNavigateHunkParams, GitNavigateHunkResult, GitOperation, GitOperationChanged,
-    GitOperationChangedParams, GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult,
-    GitPullParams, GitPullResult, GitPullStatus, GitPushParams, GitPushResult, GitPushStatus,
-    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitReposParams, GitReposResult,
-    GitResetParams, GitResetResult, GitSetBaselineParams, GitSetBaselineResult,
+    ApplyHunkStatus, ApplyScope, GitAbortOperationParams, GitAbortOperationResult, GitAbortStatus,
+    GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged, GitBlameChangedParams,
+    GitBlameLineParams, GitBlameLineResult, GitBufferStatus, GitCancelParams, GitCancelResult,
+    GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommitParams,
+    GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,
+    GitFetchParams, GitFetchResult, GitFetchStatus, GitHead, GitNavigateHunkParams,
+    GitNavigateHunkResult, GitOperation, GitOperationChanged, GitOperationChangedParams,
+    GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult, GitPullParams, GitPullResult,
+    GitPullStatus, GitPushParams, GitPushResult, GitPushStatus, GitRefreshParams, GitRefreshResult,
+    GitRepoInfo, GitRepoOperation, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
+    GitResolveConflictParams, GitResolveConflictResult, GitSetBaselineParams, GitSetBaselineResult,
     GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
     GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
-    HunkDirection, RepoId, StagedFile,
+    HunkDirection, RepoId, ResolveConflictStatus, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -88,10 +89,11 @@ use aether_protocol::sneak::{
     SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
 };
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, LogicalLineRange,
-    LogicalLineRender, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams,
-    ViewportSubscribeResult, ViewportWindowResult, VirtualRow, VirtualRowKind, Window,
+    BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
+    LogicalLineRange, LogicalLineRender, ScrollPosition, ViewportLinesChanged,
+    ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRow,
+    VirtualRowKind, Window,
 };
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
@@ -2539,6 +2541,10 @@ async fn buffer_open_inner(
     s.promote_dormant(&active_workspace_name, &canonical);
     if let Some((git_baseline, git_unstaged, git_both)) = git {
         s.git_baseline.insert(id, git_baseline);
+        // Mask rather than recompute: the two diffs were run off the lock (the point of doing them
+        // there), and the conflict scan only costs anything on a file the index calls conflicted.
+        recompute_conflicts(&mut s, id);
+        let (git_unstaged, git_both) = mask_hunks_against_conflicts(&s, id, git_unstaged, git_both);
         s.git_unstaged_hunks.insert(id, git_unstaged);
         s.git_both_hunks.insert(id, git_both);
     }
@@ -2786,6 +2792,7 @@ fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> Pendin
             buf.revision,
             search,
             buffer_both_hunks(s, buffer_id),
+            buffer_conflicts(s, buffer_id),
             buffer_diagnostics(s, buffer_id),
             buffer_git_status(s, buffer_id),
             lines_changed_cursor(s, vp),
@@ -2908,17 +2915,29 @@ pub async fn git_prepare_commit(
     };
 
     // Off the lock: status walks the working tree, and reading the previous message opens the repo.
-    let (staged, template) = tokio::task::spawn_blocking({
+    let (staged, template, conflicts) = tokio::task::spawn_blocking({
         let workdir = workdir.clone();
+        let git_dir = git_dir.clone();
         let amend = params.amend;
         move || {
             let staged = crate::git::staged_files(&workdir);
-            let template = commit_template(&workdir, &staged, amend);
-            (staged, template)
+            let template = commit_template(&workdir, &git_dir, &staged, amend);
+            (staged, template, crate::git::conflicted_paths(&workdir))
         }
     })
     .await
     .map_err(|e| RpcError::internal(format!("preparing commit message: {e}")))?;
+
+    // Refuse before opening a message buffer for a commit git is certain to reject. Git's own
+    // refusal ("Committing is not possible because you have unmerged files") arrives after the user
+    // has written the message, and names the state rather than the files.
+    if !conflicts.is_empty() {
+        return Ok(GitPrepareCommitResult {
+            repo_id,
+            blocked_by_conflicts: conflicts,
+            ..Default::default()
+        });
+    }
 
     // `COMMIT_EDITMSG` in the repo's *own* git dir — per-worktree, so two worktrees compose their
     // messages independently. It's also where git itself keeps this file, so an abandoned message
@@ -2929,6 +2948,7 @@ pub async fn git_prepare_commit(
     Ok(GitPrepareCommitResult {
         repo_id,
         path: path_string(&path),
+        blocked_by_conflicts: Vec::new(),
         staged: staged
             .into_iter()
             .map(|(path, status)| StagedFile {
@@ -3029,18 +3049,38 @@ fn resolve_writable_repo(
     }
 }
 
-/// git's own commit template: the message (empty, or the previous one when amending) followed by
-/// a comment block that `--cleanup=strip` discards. Deliberately shaped like the one a terminal
-/// `git commit` produces — this is a file users have read a thousand times.
-fn commit_template(workdir: &std::path::Path, staged: &[(String, &str)], amend: bool) -> String {
+/// git's own commit template: the message — empty, the previous one when amending, or the one the
+/// stopped operation prepared — followed by a comment block that `--cleanup=strip` discards.
+/// Deliberately shaped like the one a terminal `git commit` produces: this is a file users have
+/// read a thousand times.
+///
+/// **Mid-operation the message is already written, and using it is the whole point.** A merge (and
+/// a conflicted cherry-pick or revert) leaves `MERGE_MSG`; a rebase leaves its commit's message in
+/// `rebase-merge/message`. Seeding from them means concluding an operation shows what is about to
+/// be committed and lets it be edited first — which is exactly what `git rebase --continue` hides
+/// behind `$EDITOR`. Without this, `Space g c` mid-merge would overwrite git's own merge message
+/// with a blank one.
+///
+/// Only the merge backend's rebase path is read (`rebase-merge/`); `--apply` keeps its state
+/// elsewhere and falls back to the blank template. The merge backend has been git's default since
+/// 2.26, and the fallback is a blank message, not a wrong one.
+fn commit_template(
+    workdir: &std::path::Path,
+    git_dir: &std::path::Path,
+    staged: &[(String, &str)],
+    amend: bool,
+) -> String {
     let mut out = String::new();
-    if amend {
-        if let Some(previous) = crate::git::head_message(workdir) {
-            out.push_str(&previous);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-        }
+    let seed = if amend {
+        crate::git::head_message(workdir)
+    } else {
+        std::fs::read_to_string(git_dir.join("MERGE_MSG"))
+            .or_else(|_| std::fs::read_to_string(git_dir.join("rebase-merge/message")))
+            .ok()
+    };
+    if let Some(seed) = seed {
+        out.push_str(seed.trim_end());
+        out.push('\n');
     }
     out.push('\n');
     out.push_str("# Please enter the commit message for your changes. Lines starting\n");
@@ -3158,6 +3198,7 @@ pub async fn git_commit(
             commit: None,
             message: message.trim_end().to_string(),
             refreshed,
+            ..Default::default()
         });
     }
 
@@ -3177,11 +3218,136 @@ pub async fn git_commit(
     .ok()
     .flatten();
 
+    // Concluding what the commit was part of. A stopped *merge* is over the moment it's committed
+    // (git clears `MERGE_HEAD` itself), but a rebase — and a multi-commit cherry-pick or revert —
+    // still has patches to apply, and leaving the user to go and find `--continue` in a terminal is
+    // exactly the gap that made a conflicted pull a dead end. Nothing to do when the repo is clean,
+    // which is every ordinary commit.
+    let (continued, conflicts) = continue_stopped_operation(state, &workdir).await?;
+
     Ok(GitCommitResult {
         commit,
         message: String::new(),
         refreshed,
         empty_message: false,
+        operation: continued,
+        conflicts,
+    })
+}
+
+/// If `workdir` is still stopped in an operation, run its `--continue` and report what happened.
+///
+/// Returns the operation that was resumed (`None` when there was none) and any paths the resumed
+/// operation left conflicted — the next patch can stop exactly as the first one did.
+///
+/// Runs through [`run_tree_git`] because `--continue` applies patches: it moves the working tree,
+/// and skipping the watcher suppression or the reconciliation would leave every open buffer stale.
+/// Never needs an editor — the commit has already been made, and [`crate::git_cli`] forecloses the
+/// question anyway.
+async fn continue_stopped_operation(
+    state: &SharedState,
+    workdir: &Path,
+) -> Result<(Option<GitRepoOperation>, Vec<String>), RpcError> {
+    let operation = {
+        let workdir = workdir.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::git::repo_operation(&workdir))
+            .await
+            .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+    let Some(operation) = operation else {
+        return Ok((None, Vec::new()));
+    };
+    let verb = match operation {
+        GitRepoOperation::Rebase => "rebase",
+        GitRepoOperation::CherryPick => "cherry-pick",
+        GitRepoOperation::Revert => "revert",
+        GitRepoOperation::ApplyMailbox => "am",
+        // A merge is concluded by the commit itself, and `git merge --continue` on a repo whose
+        // `MERGE_HEAD` has just been cleared is an error. Bisect isn't a thing to continue at all.
+        GitRepoOperation::Merge | GitRepoOperation::Bisect => {
+            return Ok((Some(operation), Vec::new()))
+        }
+    };
+    run_tree_git(state, workdir, &[verb, "--continue"], None, None).await?;
+
+    let conflicts = {
+        let workdir = workdir.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::git::conflicted_paths(&workdir))
+            .await
+            .unwrap_or_default()
+    };
+    Ok((Some(operation), conflicts))
+}
+
+/// `<op> --abort`: abandon a stopped merge / rebase / cherry-pick / revert and put the tree back.
+pub async fn git_abort_operation(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitAbortOperationParams,
+) -> Result<GitAbortOperationResult, RpcError> {
+    let (workdir, blocked) = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        let workdir = std::path::PathBuf::from(&repo.repo_id);
+        let blocked = dirty_buffers_in_repo(&s, &workdir);
+        (workdir, blocked)
+    };
+
+    let operation = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::git::repo_operation(&workdir))
+            .await
+            .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+    let Some(operation) = operation else {
+        return Ok(GitAbortOperationResult {
+            status: GitAbortStatus::NothingInProgress,
+            ..Default::default()
+        });
+    };
+    // An abort resets the working tree, so an unsaved buffer would lose its edits — the same
+    // pre-flight checkout, stash and pull make, for the same reason.
+    if !blocked.is_empty() {
+        return Ok(GitAbortOperationResult {
+            status: GitAbortStatus::BlockedByDirtyBuffers,
+            operation: Some(operation),
+            blocked,
+            ..Default::default()
+        });
+    }
+
+    let verb = match operation {
+        GitRepoOperation::Merge => "merge",
+        GitRepoOperation::Rebase => "rebase",
+        GitRepoOperation::CherryPick => "cherry-pick",
+        GitRepoOperation::Revert => "revert",
+        GitRepoOperation::ApplyMailbox => "am",
+        // `git bisect` is `reset`, not `abort`, and nothing here starts one — but a user who began
+        // one in a terminal still deserves the way out this key promises.
+        GitRepoOperation::Bisect => "bisect",
+    };
+    let arg = if matches!(operation, GitRepoOperation::Bisect) {
+        "reset"
+    } else {
+        "--abort"
+    };
+    let run = run_tree_git(state, &workdir, &[verb, arg], None, None).await?;
+
+    if !run.output.success() {
+        return Ok(GitAbortOperationResult {
+            status: GitAbortStatus::Refused,
+            operation: Some(operation),
+            message: git_failure_message(&run.output),
+            refreshed: run.refreshed,
+            ..Default::default()
+        });
+    }
+    Ok(GitAbortOperationResult {
+        status: GitAbortStatus::Aborted,
+        operation: Some(operation),
+        refreshed: run.refreshed,
+        ..Default::default()
     })
 }
 
@@ -4805,6 +4971,7 @@ pub async fn git_set_diff_view(
     let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
+    let conflicts = buffer_conflicts(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = s.doc_of(buffer_id);
     let window = render_window(
@@ -4823,6 +4990,7 @@ pub async fn git_set_diff_view(
             sneak,
             diff_view: params.enabled,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -4842,6 +5010,10 @@ pub async fn git_set_diff_view(
 /// infrequent, so a one-off `git diff` is fine, and it keeps navigation correct even when edits
 /// happened with the view off (which skips the per-edit recompute). Returns the (possibly
 /// unchanged) cursor and whether it moved.
+///
+/// **In a conflicted file the targets are the conflict blocks instead.** There are no hunks there
+/// to step between (no baseline to diff against), and the blocks are what the same gesture is
+/// asking for. The client keeps one pair of keys either way.
 pub async fn git_navigate_hunk(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -4855,12 +5027,18 @@ pub async fn git_navigate_hunk(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
-    // Diff against the cached baselines — cheap (no repo I/O) and correct regardless of whether a
-    // viewport is currently driving the per-edit recompute. The anchors are the union of the
-    // HEAD and index diffs, so navigation reaches every change the combined view can show —
-    // including a region reverted back to HEAD's content but staged differently (in the index
-    // diff only).
-    let anchors = {
+    // In a conflicted file the hunks are the wrong targets — there are none, because a conflicted
+    // path has no baseline to diff against — and the things worth stepping between are the conflict
+    // blocks. Same keys, same gesture ("take me to the next thing to deal with"), better answer.
+    let conflicts = buffer_conflicts(&s, params.buffer_id);
+    let anchors: Vec<u32> = if !conflicts.is_empty() {
+        conflicts.iter().map(|r| r.start_line).collect()
+    } else {
+        // Diff against the cached baselines — cheap (no repo I/O) and correct regardless of whether
+        // a viewport is currently driving the per-edit recompute. The anchors are the union of the
+        // HEAD and index diffs, so navigation reaches every change the combined view can show —
+        // including a region reverted back to HEAD's content but staged differently (in the index
+        // diff only).
         let buf = s.doc_of(params.buffer_id);
         let baseline = s.git_baseline.get(&params.buffer_id);
         let head = crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text);
@@ -5017,15 +5195,47 @@ pub async fn git_apply_hunk(
     if baseline.rev.is_some() && matches!(params.action, HunkAction::Toggle) {
         return Ok(outcome(&s, ApplyHunkStatus::NotAgainstHead));
     }
-    // A conflicted path has no stage-0 index entry, so `write_index_blob` would take its
-    // "untracked" branch and write one — which clears the conflict stages, i.e. `git add`'s "mark
-    // resolved". The user pressed *stage this hunk* and would get *resolve this file*, quite
-    // possibly with `<<<<<<<` markers in the content. Revert falls through: restoring a hunk to its
-    // baseline is a buffer edit that touches no index entry.
-    if matches!(params.action, HunkAction::Toggle)
-        && crate::git::path_has_conflict(&repo.workdir, &repo.rel_path)
-    {
-        return Ok(outcome(&s, ApplyHunkStatus::Conflicted));
+    // A conflicted path is a different world: there is no stage-0 index entry and no baseline, so
+    // nothing here has its usual meaning. Whole-file staging becomes "mark resolved" — the identical
+    // git command with the identical intent, "make the index match my file" — and everything else
+    // is refused rather than quietly doing something the key doesn't name.
+    if crate::git::path_has_conflict(&repo.workdir, &repo.rel_path) {
+        if !matches!(
+            (params.action, params.scope),
+            (HunkAction::Toggle, ApplyScope::File)
+        ) {
+            return Ok(outcome(&s, ApplyHunkStatus::Conflicted));
+        }
+        // `git add` writes what's on disk, so an unsaved buffer would mark a *different* file
+        // resolved. Refused rather than saved for them, as everywhere else.
+        if dirty {
+            return Ok(outcome(&s, ApplyHunkStatus::DirtyBuffer));
+        }
+        // Checked from the buffer text, not the cached scan: this is the last gate before the
+        // markers could reach a commit, and it must be true *now*.
+        if !crate::git::conflict_regions(&s.doc_of(buffer_id).text).is_empty() {
+            return Ok(outcome(&s, ApplyHunkStatus::MarkersRemain));
+        }
+        // Through the CLI, not `write_index_blob`: this *is* `git add`, and going through git runs
+        // the user's clean filters and clears the conflict stages the way every other tool expects.
+        let rel = path_string(&repo.rel_path);
+        drop(s);
+        let out = crate::git_cli::run(&repo.workdir, &["add", "--", &rel])
+            .await
+            .map_err(|e| RpcError::internal(format!("running git add: {e}")))?;
+        let mut s = state.lock().await;
+        if !out.success() {
+            return Ok(outcome(&s, ApplyHunkStatus::Unavailable));
+        }
+        // The file is no longer conflicted: reload the baseline so the gutter, the status bar and
+        // the conflict decoration all stop describing a state that has ended.
+        let pushes = refresh_git_for_buffer(&mut s, buffer_id);
+        let result = outcome(&s, ApplyHunkStatus::Resolved);
+        drop(s);
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+        return Ok(result);
     }
 
     match params.action {
@@ -5153,6 +5363,124 @@ pub async fn git_apply_hunk(
             Ok(result)
         }
     }
+}
+
+/// Take a side in the conflict block(s) the cursor or selection addresses (`Space g o` / `t` /
+/// `Alt-o`).
+///
+/// Deliberately an ordinary buffer edit, applied through the same whole-document replacement path as
+/// `git/apply_hunk`'s revert and tagged [`EditKindTag::Resolve`] so each take is one undo step.
+/// Nothing touches the index: the file is still conflicted as far as git is concerned until it is
+/// saved and marked resolved, which is a separate decision made with a separate key.
+pub async fn git_resolve_conflict(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitResolveConflictParams,
+) -> Result<GitResolveConflictResult, RpcError> {
+    let client_id = ctx.client_id;
+    let buffer_id = params.buffer_id;
+    let mut s = state.lock().await;
+
+    let outcome = |s: &ServerState, status: ResolveConflictStatus| -> GitResolveConflictResult {
+        let cursor = s
+            .cursors
+            .get(&(client_id, buffer_id))
+            .copied()
+            .unwrap_or_default();
+        GitResolveConflictResult {
+            cursor: wrap_for_response(s, client_id, buffer_id, cursor),
+            status,
+            resolved: 0,
+            remaining: buffer_conflicts(s, buffer_id).len() as u32,
+        }
+    };
+
+    if s.try_doc_of(buffer_id).is_none() {
+        return Err(RpcError::buffer_not_found(buffer_id));
+    }
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    // `git/apply_hunk`'s addressing rule: a bare cursor takes the block it's in, a wider selection
+    // takes every block it touches — so select-all then `Space g t` is "all of theirs".
+    let (lo, hi) = if cursor.is_point() {
+        (cursor.position.line, cursor.position.line)
+    } else {
+        (
+            cursor.anchor.line.min(cursor.position.line),
+            cursor.anchor.line.max(cursor.position.line),
+        )
+    };
+    let selected: Vec<&crate::git::ConflictRegion> = buffer_conflicts(&s, buffer_id)
+        .iter()
+        .filter(|r| r.overlaps(lo, hi))
+        .collect();
+    if selected.is_empty() {
+        return Ok(outcome(&s, ResolveConflictStatus::NoConflict));
+    }
+    let resolved = selected.len() as u32;
+    // Land the cursor where the resolved content now starts. The block it was sitting in has just
+    // collapsed, so anything else — clamping, or holding the old line — puts it somewhere arbitrary.
+    let landing = selected[0].start_line;
+
+    let doc = s.doc_of(buffer_id);
+    let new_text = crate::git::resolve_conflicts(&doc.text, &selected, params.side);
+    drop(selected);
+
+    let was_dirty = doc.dirty;
+    let old_len = doc.text.len_chars();
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
+    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+    let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Resolve, cursors_before);
+
+    clamp_doc_cursors(&mut s, buffer_id);
+    s.clear_motion_history_for_buffer(buffer_id);
+    s.clear_tree_selection_history_for_buffer(buffer_id);
+    s.clear_virtual_col_for_buffer(buffer_id);
+    let landing = motion::clamp_position(
+        s.doc_of(buffer_id),
+        LogicalPosition {
+            line: landing,
+            col: 0,
+        },
+    );
+    set_cursor(
+        &mut s,
+        (client_id, buffer_id),
+        CursorState {
+            position: landing,
+            anchor: landing,
+            match_bracket: None,
+            jumplist_position: None,
+        },
+    );
+
+    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
+    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let new_line_count = s.doc_of(buffer_id).line_count();
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    // Explicitly, *not* relying on the refresh above: that rescan is gated on the buffer having a
+    // viewport (the per-edit work is only worth doing for something on screen), and the count this
+    // call reports — "how many are left" — has to be true whether or not anyone is looking.
+    recompute_conflicts(&mut s, buffer_id);
+    notify_lsp_change(&mut s, buffer_id);
+
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
+
+    let mut result = outcome(&s, ResolveConflictStatus::Resolved);
+    result.resolved = resolved;
+    drop(s);
+    for (sender, notif) in pushes
+        .into_iter()
+        .chain(search_summary_pushes)
+        .chain(picker_pushes)
+    {
+        let _ = sender.send(notif).await;
+    }
+    Ok(result)
 }
 
 // ---- lsp/* --------------------------------------------------------------------------------------
@@ -6256,16 +6584,7 @@ fn rope_byte_col(
 /// buffer), so there's no repo discovery or blob read. Blame needs no invalidation — its cache
 /// carries the revision it was computed at and re-derives itself when that no longer matches.
 fn rediff_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) {
-    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
-        return;
-    };
-    let Some(doc) = s.try_doc_of(buffer_id) else {
-        return;
-    };
-    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &doc.text);
-    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
-    s.git_unstaged_hunks.insert(buffer_id, unstaged);
-    s.git_both_hunks.insert(buffer_id, both);
+    recompute_git_hunks(s, buffer_id);
 }
 
 /// Re-resolve a buffer's Git baseline from disk (HEAD changed externally — commit / checkout /
@@ -6297,14 +6616,13 @@ fn attach_git_baseline(
     buffer_id: BufferId,
     baseline: crate::git::GitBaseline,
 ) -> PendingPushes {
-    let Some(buf) = s.try_doc_of(buffer_id) else {
+    if s.try_doc_of(buffer_id).is_none() {
         return Vec::new();
-    };
-    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
-    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
+    }
+    // The baseline goes in first: it's what says whether this file is conflicted, which decides
+    // both what the hunks are diffed against and which of them are masked out.
     s.git_baseline.insert(buffer_id, baseline);
-    s.git_unstaged_hunks.insert(buffer_id, unstaged);
-    s.git_both_hunks.insert(buffer_id, both);
+    recompute_git_hunks(s, buffer_id);
     s.git_blame.remove(&buffer_id); // committed history may have changed → recompute on request
                                     // The blame label's push dedupe keys on (line, revision) — both unchanged by an external
                                     // commit — so forget the last pushes and re-arm every follower, or the label would go stale.
@@ -7009,6 +7327,7 @@ fn collect_viewport_refresh(
                 sneak: sneak_entry,
                 diff_view: vp.diff_view,
                 hunks: buffer_both_hunks(s, buffer_id),
+                conflicts: buffer_conflicts(s, buffer_id),
                 diagnostics,
                 git_status: buffer_git_status(s, buffer_id),
             },
@@ -7789,6 +8108,7 @@ pub async fn buffer_cut(
                 revision,
                 search,
                 buffer_both_hunks(&s, params.buffer_id),
+                buffer_conflicts(&s, params.buffer_id),
                 buffer_diagnostics(&s, params.buffer_id),
                 buffer_git_status(&s, params.buffer_id),
                 lines_changed_cursor(&s, vp),
@@ -8253,6 +8573,7 @@ pub async fn viewport_subscribe(
     let search = render_matches(&s, client_id, params.buffer_id);
     let sneak = s.sneaks.get(&(client_id, params.buffer_id));
     let hunks = buffer_both_hunks(&s, params.buffer_id);
+    let conflicts = buffer_conflicts(&s, params.buffer_id);
     let diagnostics = buffer_diagnostics(&s, params.buffer_id);
     let buf = s.doc_of(params.buffer_id);
     // Gutter markers ride `hunks` regardless of the diff toggle; the inline view honours the
@@ -8274,6 +8595,7 @@ pub async fn viewport_subscribe(
             sneak,
             diff_view: params.diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -8394,6 +8716,7 @@ pub async fn viewport_resize(
     let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
+    let conflicts = buffer_conflicts(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = s.doc_of(buffer_id);
     let window = render_window(
@@ -8412,6 +8735,7 @@ pub async fn viewport_resize(
             sneak,
             diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -8468,6 +8792,7 @@ pub async fn viewport_scroll_to_row(
     let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
+    let conflicts = buffer_conflicts(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = s.doc_of(buffer_id);
     let window = render_window(
@@ -8486,6 +8811,7 @@ pub async fn viewport_scroll_to_row(
             sneak,
             diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -8540,6 +8866,7 @@ pub async fn viewport_set_wrap(
     let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
+    let conflicts = buffer_conflicts(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = s.doc_of(buffer_id);
     let window = render_window(
@@ -8558,6 +8885,7 @@ pub async fn viewport_set_wrap(
             sneak,
             diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -8602,6 +8930,7 @@ pub async fn viewport_scroll(
     let search = render_matches(&s, client_id, buffer_id);
     let sneak = s.sneaks.get(&(client_id, buffer_id));
     let hunks = buffer_both_hunks(&s, buffer_id);
+    let conflicts = buffer_conflicts(&s, buffer_id);
     let diagnostics = buffer_diagnostics(&s, buffer_id);
     let buf = s.doc_of(buffer_id);
     let window = render_window(
@@ -8620,6 +8949,7 @@ pub async fn viewport_scroll(
             sneak,
             diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status: buffer_git_status(&s, buffer_id),
         },
@@ -8730,19 +9060,11 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
     if !viewed {
         return;
     }
-    let Some(buf) = s.try_doc_of(buffer_id) else {
-        return;
-    };
-    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
-        return;
-    };
     // Re-diff against the cached index blob — a per-edit in-memory diff with no repo I/O. The
     // combined view recomposes from the cached staged hunks (they only change on git events, not
-    // buffer edits) + the fresh unstaged.
-    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &buf.text);
-    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
-    s.git_unstaged_hunks.insert(buffer_id, unstaged);
-    s.git_both_hunks.insert(buffer_id, both);
+    // buffer edits) + the fresh unstaged. The conflict rescan rides along: the edit may have been
+    // the user resolving a block, and the decoration has to follow it away.
+    recompute_git_hunks(s, buffer_id);
 }
 
 /// The phantom "deleted" rows each anchor line shows above it, derived from the buffer's diff
@@ -8916,6 +9238,34 @@ fn diff_markers_by_line(
     map
 }
 
+/// Which part of a conflict each line inside one belongs to, for the window renderer.
+///
+/// The marker lines are *derived* rather than stored: inside a region, anything that isn't one of
+/// the three content ranges is by definition one of the four markers. That keeps
+/// [`crate::git::ConflictRegion`] describing the block's structure and nothing else, and there is
+/// no fourth line number to keep consistent with the other three.
+fn conflict_lines_by_line(
+    regions: &[crate::git::ConflictRegion],
+    line_count: u32,
+) -> HashMap<u32, ConflictLine> {
+    let mut map = HashMap::new();
+    for r in regions {
+        for line in r.start_line..=r.end_line.min(line_count.saturating_sub(1)) {
+            let kind = if r.ours.contains(&line) {
+                ConflictLine::Ours
+            } else if r.base.as_ref().is_some_and(|b| b.contains(&line)) {
+                ConflictLine::Base
+            } else if r.theirs.contains(&line) {
+                ConflictLine::Theirs
+            } else {
+                ConflictLine::Marker
+            };
+            map.insert(line, kind);
+        }
+    }
+    map
+}
+
 /// The buffer-wide change summary for the status bar: line counts by change class. `added` /
 /// `modified` count the new-side lines of Added / Modified hunks (matching the gutter bars);
 /// `deleted` counts the lines a pure deletion removed. A Modified hunk's replaced old-side lines
@@ -8950,6 +9300,66 @@ fn buffer_both_hunks(s: &ServerState, buffer_id: BufferId) -> &[crate::git::Diff
         .unwrap_or(&[])
 }
 
+/// The buffer's conflict blocks, or an empty slice when the file isn't conflicted — which is every
+/// file, nearly always.
+fn buffer_conflicts(s: &ServerState, buffer_id: BufferId) -> &[crate::git::ConflictRegion] {
+    s.git_conflicts
+        .get(&buffer_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Hide the parts of a freshly-computed diff that sit inside the buffer's conflict blocks.
+///
+/// Call after [`recompute_conflicts`], since it reads the cache that fills. A no-op — and a cheap
+/// one — for every file that isn't conflicted.
+fn mask_hunks_against_conflicts(
+    s: &ServerState,
+    buffer_id: BufferId,
+    unstaged: Vec<crate::git::DiffHunk>,
+    both: Vec<crate::git::DiffHunk>,
+) -> (Vec<crate::git::DiffHunk>, Vec<crate::git::DiffHunk>) {
+    let regions = buffer_conflicts(s, buffer_id);
+    (
+        crate::git::mask_conflicts(unstaged, regions),
+        crate::git::mask_conflicts(both, regions),
+    )
+}
+
+/// Recompute a buffer's diff hunks from its cached baseline, with the conflict blocks masked out.
+/// The shared body of every "the buffer or its baseline changed" path.
+fn recompute_git_hunks(s: &mut ServerState, buffer_id: BufferId) {
+    recompute_conflicts(s, buffer_id);
+    let Some(baseline) = s.git_baseline.get(&buffer_id) else {
+        return;
+    };
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return;
+    };
+    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &doc.text);
+    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
+    let (unstaged, both) = mask_hunks_against_conflicts(s, buffer_id, unstaged, both);
+    s.git_unstaged_hunks.insert(buffer_id, unstaged);
+    s.git_both_hunks.insert(buffer_id, both);
+}
+
+/// Rescan a buffer for conflict markers, on the same triggers as the diff hunks.
+///
+/// Gated on the baseline's `conflicted` flag — the index's word for it — so an ordinary edit never
+/// pays for the scan, and the cache empties the moment a file stops being conflicted (someone
+/// staged the resolution, here or in a terminal, and the watcher reloaded the baseline).
+fn recompute_conflicts(s: &mut ServerState, buffer_id: BufferId) {
+    if !s.git_baseline.get(&buffer_id).is_some_and(|b| b.conflicted) {
+        s.git_conflicts.remove(&buffer_id);
+        return;
+    }
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return;
+    };
+    let regions = crate::git::conflict_regions(&doc.text);
+    s.git_conflicts.insert(buffer_id, regions);
+}
+
 /// Buffer-level Git status for the status bar: branch + staged (HEAD→index) and unstaged
 /// (index→buffer) change counts. `Some` for any file inside a repo; `None` otherwise. Staged counts
 /// come from the baseline's cached HEAD→index diff; unstaged from the per-edit index→buffer diff.
@@ -8965,6 +9375,7 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
             label: r.label.clone(),
             commit: r.commit.clone(),
         }),
+        conflicts: buffer_conflicts(s, buffer_id).len() as u32,
         operation: baseline.operation,
     })
 }
@@ -9821,6 +10232,7 @@ pub fn set_diagnostics_and_refresh(
                 revision,
                 search,
                 buffer_both_hunks(s, buffer_id),
+                buffer_conflicts(s, buffer_id),
                 diags,
                 buffer_git_status(s, buffer_id),
                 lines_changed_cursor(s, vp),
@@ -10043,6 +10455,9 @@ struct WindowDecorations<'a> {
     sneak: Option<&'a SneakEntry>,
     diff_view: bool,
     hunks: &'a [crate::git::DiffHunk],
+    /// Conflict blocks, for a file a stopped merge or rebase left conflicted. Empty otherwise —
+    /// and when it isn't, `hunks` is empty, because a conflicted file has no baseline to diff.
+    conflicts: &'a [crate::git::ConflictRegion],
     diagnostics: &'a [crate::lsp::diagnostics::BufferDiagnostic],
     git_status: Option<GitBufferStatus>,
 }
@@ -10060,6 +10475,7 @@ fn render_window(
         sneak,
         diff_view,
         hunks,
+        conflicts,
         diagnostics,
         git_status,
     } = deco;
@@ -10075,6 +10491,9 @@ fn render_window(
     // known — independent of the diff-view toggle. Phantom "deleted" rows, by contrast, only
     // appear while the diff view is on.
     let markers = diff_markers_by_line(hunks, buf.line_count());
+    // Not gated on `diff_view`, unlike everything else here: the sides of a conflict are not a
+    // review mode you opt into, they're the only way to read the file at all.
+    let conflict_lines = conflict_lines_by_line(conflicts, buf.line_count());
     let intraline = if diff_view {
         intraline_for_window(hunks, buf, first, last_excl)
     } else {
@@ -10132,6 +10551,7 @@ fn render_window(
             render.diff_marker = Some(marker);
             render.diff_stage = stage;
         }
+        render.conflict = conflict_lines.get(&i).copied();
         if let Some(spans) = intraline.lines.get(&i) {
             render.diff_emphasis = spans.clone();
         }
@@ -14187,6 +14607,7 @@ fn collect_doc_edit_pushes(
                 revision,
                 search,
                 buffer_both_hunks(s, vp.buffer_id),
+                buffer_conflicts(s, vp.buffer_id),
                 buffer_diagnostics(s, vp.buffer_id),
                 buffer_git_status(s, vp.buffer_id),
                 lines_changed_cursor(s, vp),
@@ -14240,6 +14661,7 @@ fn collect_doc_lines_changed_pushes(
                 revision,
                 search,
                 buffer_both_hunks(s, vp.buffer_id),
+                buffer_conflicts(s, vp.buffer_id),
                 buffer_diagnostics(s, vp.buffer_id),
                 buffer_git_status(s, vp.buffer_id),
                 lines_changed_cursor(s, vp),
@@ -14256,6 +14678,7 @@ fn build_lines_changed_notif(
     revision: Revision,
     search: Option<&SearchEntry>,
     hunks: &[crate::git::DiffHunk],
+    conflicts: &[crate::git::ConflictRegion],
     diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
     git_status: Option<GitBufferStatus>,
     cursor: Option<CursorState>,
@@ -14279,6 +14702,7 @@ fn build_lines_changed_notif(
             sneak: None,
             diff_view: vp.diff_view,
             hunks,
+            conflicts,
             diagnostics,
             git_status,
         },
@@ -15215,6 +15639,25 @@ fn build_file_git_status(
         .collect()
 }
 
+/// The hunks one open buffer contributes to the Git-changes picker: a row per conflict block plus
+/// the diff outside them when the file is conflicted, otherwise the combined staged+unstaged diff.
+///
+/// The same choice `changed_files_in_repo` makes for files on disk, so a file lists identically
+/// whether or not it happens to be open.
+fn change_hunks(
+    conflicted: bool,
+    text: &ropey::Rope,
+    staged: &[crate::git::DiffHunk],
+    unstaged: &[crate::git::DiffHunk],
+) -> Vec<crate::git::DiffHunk> {
+    if conflicted {
+        // `unstaged` is already HEAD→buffer for a conflicted file: both cached blobs hold HEAD's
+        // content, and `staged` is empty.
+        return crate::git::conflict_change_hunks(text, unstaged.to_vec());
+    }
+    crate::git::compose_both(staged, unstaged)
+}
+
 /// One open buffer's contribution to the Git-changes picker, snapshotted under the lock so the
 /// disk walk that follows runs lock-free. The combined HEAD→buffer hunks are the very list the
 /// gutter renders, so the picker agrees with what the editor shows; `text` (a cheap rope clone)
@@ -15575,7 +16018,7 @@ pub async fn picker_view(
                         // refreshes while the inline diff view is on, so unsaved edits always show.
                         // Same shape as the disk path: a `None` index blob (untracked) diffs the
                         // whole buffer as an addition.
-                        let (head, index, staged) = s
+                        let (head, index, staged, conflicted) = s
                             .git_baseline
                             .get(&id)
                             .map(|base| {
@@ -15583,9 +16026,10 @@ pub async fn picker_view(
                                     base.blob.is_some(),
                                     base.index_blob.clone(),
                                     base.staged_hunks.clone(),
+                                    base.conflicted,
                                 )
                             })
-                            .unwrap_or((false, None, Vec::new()));
+                            .unwrap_or((false, None, Vec::new(), false));
                         let unstaged = crate::git::hunks_from_buffers(
                             index.as_deref().unwrap_or(b""),
                             b.text.to_string().as_bytes(),
@@ -15594,7 +16038,7 @@ pub async fn picker_view(
                             path_index,
                             relative_path,
                             abs_path: abs.to_string_lossy().into_owned(),
-                            hunks: crate::git::compose_both(&staged, &unstaged),
+                            hunks: change_hunks(conflicted, &b.text, &staged, &unstaged),
                             text: b.text.clone(),
                             untracked: !head && index.is_none(),
                         })
@@ -15623,7 +16067,7 @@ pub async fn picker_view(
                             let abs = b.canonical_path.as_deref()?;
                             let (path_index, relative_path) =
                                 crate::workspace_index::workspace_relative_parts(abs, &roots)?;
-                            let (head, index, staged) = s
+                            let (head, index, staged, conflicted) = s
                                 .git_baseline
                                 .get(&buffer_id)
                                 .map(|base| {
@@ -15631,9 +16075,10 @@ pub async fn picker_view(
                                         base.blob.is_some(),
                                         base.index_blob.clone(),
                                         base.staged_hunks.clone(),
+                                        base.conflicted,
                                     )
                                 })
-                                .unwrap_or((false, None, Vec::new()));
+                                .unwrap_or((false, None, Vec::new(), false));
                             let unstaged = crate::git::hunks_from_buffers(
                                 index.as_deref().unwrap_or(b""),
                                 b.text.to_string().as_bytes(),
@@ -15642,7 +16087,7 @@ pub async fn picker_view(
                                 path_index,
                                 relative_path,
                                 abs_path: abs.to_string_lossy().into_owned(),
-                                hunks: crate::git::compose_both(&staged, &unstaged),
+                                hunks: change_hunks(conflicted, &b.text, &staged, &unstaged),
                                 text: b.text.clone(),
                                 untracked: !head && index.is_none(),
                             })

@@ -105,3 +105,9 @@ pub(crate) fn count_one() -> u32 {
 pub(crate) fn count_is_one(n: &u32) -> bool {
     *n == 1
 }
+
+/// Serde helper for counts that are absent at zero — the "nothing to report" default.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn count_is_zero(n: &u32) -> bool {
+    *n == 0
+}

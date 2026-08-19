@@ -59,6 +59,20 @@ pub struct LogicalLineRender {
     /// sub-ranges, so a range-less modified line renders exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diff_emphasis: Vec<EmphasisRange>,
+    /// Which part of a merge conflict this line belongs to, when the file is left conflicted by a
+    /// stopped merge or rebase. `None` everywhere else — including in every file of an
+    /// unconflicted repo, which is the overwhelming case.
+    ///
+    /// **Unlike the diff tint this is not gated on the diff view.** A conflicted file cannot be
+    /// read correctly without knowing which side is which, and the markers delimiting them are
+    /// ordinary buffer text with nothing to distinguish them.
+    ///
+    /// A line carrying this never also carries a `diff_marker`: a conflicted file *is* diffed
+    /// (against HEAD, so a block resolved by hand shows up as an ordinary change), but the blocks
+    /// themselves are masked out of that diff — see `git::mask_conflicts`. The two decorations
+    /// share a file, never a line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<ConflictLine>,
     /// Language-server diagnostics intersecting this logical line, as byte ranges within the line
     /// (already converted from the server's LSP position encoding). A diagnostic spanning multiple
     /// lines contributes one entry — carrying the full message — to each line it touches, so the
@@ -103,6 +117,25 @@ pub enum DiffMarker {
     /// Lines were removed immediately above this one (a pure deletion). The line itself is
     /// unchanged — only the gutter flags it; it carries no background tint.
     Deleted,
+}
+
+/// Which part of a conflict block a line belongs to — see [`LogicalLineRender::conflict`].
+///
+/// The four marker lines are one variant rather than four: they are scenery, styled the same and
+/// deleted by every resolution, and telling `<<<<<<<` from `=======` is what the line's own text is
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictLine {
+    /// A `<<<<<<<`, `|||||||`, `=======` or `>>>>>>>` line.
+    Marker,
+    /// Our side: what the branch being merged *into* has (mid-rebase, confusingly, the upstream —
+    /// git's labels on the marker lines are the authority, which is why they travel too).
+    Ours,
+    /// The common ancestor, under `merge.conflictstyle = diff3` / `zdiff3`. Context only.
+    Base,
+    /// Their side: what is being merged in.
+    Theirs,
 }
 
 /// Which side of the index a change sits on, in the combined staged+unstaged view. Tags both

@@ -169,6 +169,14 @@ pub struct ServerState {
     /// LF-normalized. Populated on open, refreshed when HEAD changes (the watcher), and read by
     /// the per-edit `diff_hunks` so editing never re-runs repo discovery or re-reads the blob.
     pub git_baseline: HashMap<BufferId, crate::git::GitBaseline>,
+    /// Per-buffer conflict blocks, for the files a stopped merge or rebase left conflicted.
+    /// Rescanned from the buffer's markers on the same triggers as the hunk caches, and **only
+    /// while the baseline says the file is conflicted** — so an ordinary buffer never pays for the
+    /// scan, and a file resolved outside the editor stops being decorated as soon as the watcher
+    /// reloads its baseline. Absent means "not conflicted"; present-but-empty means "conflicted in
+    /// the index, but every marker block has been resolved" — the state mark-resolved is waiting
+    /// for.
+    pub git_conflicts: HashMap<BufferId, Vec<crate::git::ConflictRegion>>,
     /// Per-buffer cached whole-file blame, tagged with the revision it was computed at. Lazily
     /// (re)computed on `git/blame_line` when stale, so moving the cursor around a buffer at one
     /// revision never recomputes. Cleared on close.
@@ -534,6 +542,7 @@ impl ServerState {
             git_unstaged_hunks: HashMap::new(),
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
+            git_conflicts: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
             lsp: crate::lsp::manager::LspManager::default(),
@@ -1082,6 +1091,7 @@ impl ServerState {
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
         self.git_baseline.remove(&id);
+        self.git_conflicts.remove(&id);
         self.git_blame.remove(&id);
         self.diagnostics.remove(&id);
         self.document_symbols.remove(&id);
@@ -1605,6 +1615,10 @@ pub enum EditKindTag {
     /// Case transform (`input/transform_case`). Distinct so a recase is its own undo step and
     /// never folds into adjacent typing.
     Transform,
+    /// Taking a side in a merge conflict (`git/resolve_conflict`). Its own tag for the same reason
+    /// as `Revert`: one take, one undo step — which is what makes trying a side and changing your
+    /// mind cost a single `Ctrl-z`.
+    Resolve,
 }
 
 struct UndoEntry {

@@ -21,7 +21,7 @@
 //! buffer edit driven by the handler.
 
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
+    BlameInfo, CommitInfo, ConflictSide, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
 };
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
@@ -128,6 +128,14 @@ pub struct GitBaseline {
     /// is exactly when this baseline reloads — so a rebase started in a *terminal* reaches the
     /// status bar too.
     pub operation: Option<GitRepoOperation>,
+    /// This *file* is left conflicted by that operation — it has index stages 1–3 and no stage 0.
+    ///
+    /// When true both blobs hold HEAD's content and `staged_hunks` is empty: nothing can be staged
+    /// while the index holds conflict stages, and the whole change set reads as unstaged against
+    /// HEAD — "what this merge commit will contain". The conflict blocks themselves are masked out
+    /// of that diff by [`mask_conflicts`], so the diff and conflict decorations never share a line.
+    /// See [`load_baseline`].
+    pub conflicted: bool,
 }
 
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
@@ -163,6 +171,34 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     // become a bare hash and `upstream` `None` — this is the only thing that will explain why.
     let operation = state_operation(&repo);
 
+    // A conflicted file has no stage-0 entry, so the index blob reads as absent — which would make
+    // the staged diff `HEAD → ""` and paint the whole file as a staged deletion. Point *both* blobs
+    // at HEAD instead (the same move the pinned-revision branch below makes): the staged half comes
+    // out empty, which is true — nothing is staged while the index holds conflict stages — and the
+    // unstaged half becomes `HEAD → buffer`, which is exactly "what this merge commit will contain
+    // for this file".
+    //
+    // That diff is meaningful everywhere *except* inside the conflict blocks, where it would only
+    // be describing markers; those lines are masked out where the hunks are computed
+    // (`mask_conflicts`), so the two decorations never land on the same line. Suppressing the whole
+    // file instead would leave a file the user had just resolved by hand showing nothing at all.
+    //
+    // Checked before the pinned revision, in the rare case both apply: mid-merge, what the gutter
+    // *would* have been comparing against is the least of what the user needs to know.
+    if index_has_conflict(&repo, &rel_path) {
+        let head = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
+        return GitBaseline {
+            repo: Some(GitRepo { workdir, rel_path }),
+            blob: head.clone(),
+            index_blob: head,
+            branch,
+            upstream,
+            operation,
+            conflicted: true,
+            ..Default::default()
+        };
+    }
+
     // Diffing against a pinned revision instead of HEAD: point *both* blobs at that commit's
     // content. The existing pipeline then produces exactly the right thing with no special cases
     // downstream — staged (blob → index) comes out empty, unstaged (index → buffer) is the whole
@@ -179,6 +215,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
             staged_hunks: Vec::new(),
             rev: Some(rev.clone()),
             operation,
+            conflicted: false,
         };
     }
 
@@ -199,6 +236,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         staged_hunks,
         rev: None,
         operation,
+        conflicted: false,
     }
 }
 
@@ -752,6 +790,12 @@ pub fn path_has_conflict(workdir: &Path, rel: &Path) -> bool {
     let Ok(repo) = git2::Repository::open(workdir) else {
         return false;
     };
+    index_has_conflict(&repo, rel)
+}
+
+/// [`path_has_conflict`] for a caller that already has the repo open — [`load_baseline`] does, and
+/// it asks this of every file it loads.
+fn index_has_conflict(repo: &git2::Repository, rel: &Path) -> bool {
     let Ok(index) = repo.index() else {
         return false;
     };
@@ -787,6 +831,243 @@ pub fn conflicted_paths(workdir: &Path) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// One conflict left in a buffer by a merge, rebase, cherry-pick or `stash pop`: the marker block
+/// git wrote, in **0-based buffer line** coordinates.
+///
+/// **Read from the buffer's markers, not from the index.** The index is the authority on *which
+/// files* are conflicted ([`path_has_conflict`]) and gates this parse; it cannot say where inside
+/// one, and it stops describing the file the moment the user starts resolving. The markers are what
+/// they are looking at and editing, so they are the only thing that stays true — and they are
+/// written the same way whatever produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictRegion {
+    /// The `<<<<<<<` line.
+    pub start_line: u32,
+    /// The `>>>>>>>` line. Inclusive: the whole region is `start_line..=end_line`.
+    pub end_line: u32,
+    /// Content lines of our side, between the `<<<<<<<` and the `|||||||`/`=======` that follows.
+    /// Empty when our side deleted the region.
+    pub ours: std::ops::Range<u32>,
+    /// The common-ancestor section, present only under `merge.conflictstyle = diff3` / `zdiff3`.
+    /// Dropped by every resolution — it is context, never an outcome.
+    pub base: Option<std::ops::Range<u32>>,
+    /// Content lines of their side, between the `=======` and the `>>>>>>>`.
+    pub theirs: std::ops::Range<u32>,
+    /// What the markers name the two sides: `HEAD` and a branch, or a commit subject mid-rebase.
+    /// Empty when the marker carried no label.
+    pub ours_label: String,
+    pub theirs_label: String,
+}
+
+impl ConflictRegion {
+    /// Whether `line` falls anywhere in the region, markers included.
+    pub fn contains(&self, line: u32) -> bool {
+        line >= self.start_line && line <= self.end_line
+    }
+
+    /// Whether the region overlaps the inclusive line span `lo..=hi`.
+    pub fn overlaps(&self, lo: u32, hi: u32) -> bool {
+        self.start_line <= hi && self.end_line >= lo
+    }
+}
+
+/// Git's default `conflict-marker-size`. A per-path override via gitattributes is possible and not
+/// supported here: a marker of another length simply isn't recognised, which leaves the file
+/// undecorated rather than mis-parsed.
+const MARKER_LEN: usize = 7;
+
+/// Find every conflict marker block in `text`.
+///
+/// A pure function of the buffer, so it is cheap enough for the per-edit path (a line scan, the same
+/// order as the diff it replaces) and testable without a repo. Callers gate it on the index saying
+/// this path is conflicted — otherwise a file that merely *documents* conflict markers, like this
+/// repo's own notes, would light up.
+///
+/// Malformed blocks are dropped rather than guessed at: a region with no `=======`, or one still
+/// open at end of buffer, describes nothing that can be resolved by taking a side. A nested
+/// `<<<<<<<` restarts the region — recursive merges can produce one, and the inner block is the
+/// resolvable one.
+pub fn conflict_regions(text: &ropey::Rope) -> Vec<ConflictRegion> {
+    /// The part of a region seen so far, waiting for its `>>>>>>>`.
+    struct Open {
+        start: u32,
+        ours_label: String,
+        base_start: Option<u32>,
+        separator: Option<u32>,
+    }
+
+    let mut out = Vec::new();
+    let mut open: Option<Open> = None;
+
+    for (i, line) in text.lines().enumerate() {
+        let i = i as u32;
+        let Some((marker, label)) = marker_of(line) else {
+            continue;
+        };
+        match marker {
+            '<' => {
+                open = Some(Open {
+                    start: i,
+                    ours_label: label,
+                    base_start: None,
+                    separator: None,
+                })
+            }
+            // Only the *first* of each divider counts, exactly as git's own re-parse does: a
+            // `=======` inside our side (a heading underline, say) would otherwise re-split the
+            // region around it.
+            '|' => {
+                if let Some(o) = open.as_mut() {
+                    if o.base_start.is_none() && o.separator.is_none() {
+                        o.base_start = Some(i);
+                    }
+                }
+            }
+            '=' => {
+                if let Some(o) = open.as_mut() {
+                    if o.separator.is_none() {
+                        o.separator = Some(i);
+                    }
+                }
+            }
+            '>' => {
+                let Some(o) = open.take() else { continue };
+                // No separator: not a conflict block, whatever else it is.
+                let Some(separator) = o.separator else {
+                    continue;
+                };
+                let ours_end = o.base_start.unwrap_or(separator);
+                out.push(ConflictRegion {
+                    start_line: o.start,
+                    end_line: i,
+                    ours: o.start + 1..ours_end,
+                    base: o.base_start.map(|b| b + 1..separator),
+                    theirs: separator + 1..i,
+                    ours_label: o.ours_label,
+                    theirs_label: label,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Drop the diff hunks that fall inside a conflict block.
+///
+/// Those lines belong to the conflict decoration, and what the diff has to say about them is only
+/// that markers were inserted — noise on top of the thing the user is actually reading. Everything
+/// outside a block keeps its hunk, so a block resolved by hand immediately reads as an ordinary
+/// change against HEAD (gutter, inline diff, changes picker) even though the *file* is still
+/// conflicted in the index until it's marked resolved.
+///
+/// A hunk that straddles a block boundary is dropped whole. In practice hunks don't straddle: git
+/// writes the markers around the disputed lines, so the diff against HEAD lands inside the block.
+pub fn mask_conflicts(hunks: Vec<DiffHunk>, regions: &[ConflictRegion]) -> Vec<DiffHunk> {
+    if regions.is_empty() {
+        return hunks;
+    }
+    hunks
+        .into_iter()
+        .filter(|h| {
+            // A pure deletion occupies no new-side lines; it sits *on* its anchor.
+            let hi = h.anchor_line + h.new_lines.saturating_sub(1);
+            !regions.iter().any(|r| r.overlaps(h.anchor_line, hi))
+        })
+        .collect()
+}
+
+/// What the Git-changes picker lists for a conflicted file: one row per conflict block, plus the
+/// ordinary HEAD→content diff for everything the blocks don't cover.
+///
+/// The blocks are what a picker is for mid-merge — "where are the conflicts" — and the rest is
+/// what the resolution has changed so far. Without the block rows a conflicted file would list as
+/// one enormous hunk (no index entry ⇒ the whole file reads as changed); without the diff rows a
+/// file resolved but not yet marked would vanish from the list entirely.
+///
+/// Each block is reported whole, markers included, so its row previews the `<<<<<<<` line — which
+/// names the side and is unmistakably a conflict — and the picker's query greps both sides.
+pub fn conflict_change_hunks(text: &ropey::Rope, diff: Vec<DiffHunk>) -> Vec<DiffHunk> {
+    let regions = conflict_regions(text);
+    let mut out = mask_conflicts(diff, &regions);
+    out.extend(regions.iter().map(|r| DiffHunk {
+        kind: ChangeKind::Modified,
+        anchor_line: r.start_line,
+        new_lines: r.end_line - r.start_line + 1,
+        deleted: Vec::new(),
+        old_start: r.start_line,
+        stage: DiffStage::Unstaged,
+    }));
+    out.sort_by_key(|h| h.anchor_line);
+    out
+}
+
+/// Rewrite `text` with each of `regions` reduced to one side, markers and all scenery removed.
+///
+/// `regions` must be in ascending order and non-overlapping — as [`conflict_regions`] returns them,
+/// filtered by the caller to the ones the cursor or selection addresses. Every other line is
+/// reproduced exactly, including the file's line endings and any missing final newline, because the
+/// rope's own lines are what get copied.
+pub fn resolve_conflicts(
+    text: &ropey::Rope,
+    regions: &[&ConflictRegion],
+    side: ConflictSide,
+) -> String {
+    let mut out = String::new();
+    let copy = |range: std::ops::Range<u32>, out: &mut String| {
+        for line in range {
+            if (line as usize) < text.len_lines() {
+                out.extend(text.line(line as usize).chunks());
+            }
+        }
+    };
+
+    let mut next = 0u32;
+    for r in regions {
+        copy(next..r.start_line, &mut out);
+        // The diff3 base section is dropped by every side: it is what the lines *were*, never an
+        // outcome the user is choosing.
+        match side {
+            ConflictSide::Ours => copy(r.ours.clone(), &mut out),
+            ConflictSide::Theirs => copy(r.theirs.clone(), &mut out),
+            // File order, so "both" reads the way the block did.
+            ConflictSide::Both => {
+                copy(r.ours.clone(), &mut out);
+                copy(r.theirs.clone(), &mut out);
+            }
+        }
+        next = r.end_line + 1;
+    }
+    copy(next..text.len_lines() as u32, &mut out);
+    out
+}
+
+/// Recognise a conflict marker line: exactly seven of `<`, `|`, `=` or `>`, then end of line or a
+/// space and a label. Returns the marker character and the label (empty when there is none).
+///
+/// The length test is exact in both directions. An eighth marker character means this is a rule or
+/// a heading underline, not a marker — the common false positive in prose and in generated files.
+fn marker_of(line: ropey::RopeSlice<'_>) -> Option<(char, String)> {
+    let mut chars = line.chars();
+    let marker = match chars.next()? {
+        c @ ('<' | '|' | '=' | '>') => c,
+        _ => return None,
+    };
+    for _ in 1..MARKER_LEN {
+        if chars.next()? != marker {
+            return None;
+        }
+    }
+    match chars.next() {
+        None | Some('\n') | Some('\r') => Some((marker, String::new())),
+        Some(' ') => {
+            let label: String = chars.collect();
+            Some((marker, label.trim_end().to_string()))
+        }
+        Some(_) => None,
+    }
 }
 
 /// The file's committed (HEAD) content as raw bytes, or `None` when untracked / not committed.
@@ -1968,7 +2249,17 @@ pub fn changed_files_in_repo(repo_path: &Path) -> Vec<ChangedFile> {
             index_blob.as_deref().unwrap_or(b""),
         );
         let unstaged = hunks_from_buffers(index_blob.as_deref().unwrap_or(b""), &working);
-        let both = compose_both(&staged, &unstaged);
+        // A conflicted file is diffed against HEAD (its index entry is the conflict stages, not a
+        // blob) and listed as a row per conflict block plus whatever the resolution has changed
+        // outside them — see [`conflict_change_hunks`].
+        let both = if entry.status().contains(git2::Status::CONFLICTED) {
+            conflict_change_hunks(
+                &ropey::Rope::from_str(&String::from_utf8_lossy(&working)),
+                hunks_from_buffers(head.as_deref().unwrap_or(b""), &working),
+            )
+        } else {
+            compose_both(&staged, &unstaged)
+        };
         if both.is_empty() {
             continue;
         }
@@ -2557,6 +2848,320 @@ mod tests {
         let crlf = b"one\r\ntwo\r\n".to_vec();
         let lf = normalize_lf(crlf.clone());
         assert_eq!(denormalize_crlf(&lf), crlf);
+    }
+
+    // ---- conflict_regions (marker parsing) ------------------------------------------------------
+
+    /// Lines of a region, as the resolver will read them.
+    fn side(text: &str, range: std::ops::Range<u32>) -> Vec<String> {
+        let rope = rope(text);
+        range
+            .map(|i| rope.line(i as usize).to_string().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn conflict_regions_reads_a_plain_block() {
+        let text = "keep\n\
+                    <<<<<<< HEAD\n\
+                    mine\n\
+                    =======\n\
+                    theirs\n\
+                    also theirs\n\
+                    >>>>>>> feature/x\n\
+                    tail\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert_eq!((r.start_line, r.end_line), (1, 6));
+        assert_eq!(side(text, r.ours.clone()), vec!["mine"]);
+        assert_eq!(side(text, r.theirs.clone()), vec!["theirs", "also theirs"]);
+        assert_eq!(r.base, None);
+        // The labels are the only thing on screen that says whose side is whose.
+        assert_eq!(r.ours_label, "HEAD");
+        assert_eq!(r.theirs_label, "feature/x");
+    }
+
+    #[test]
+    fn conflict_regions_reads_the_diff3_base_section() {
+        // `merge.conflictstyle = diff3` adds the common ancestor. It is context, so it gets its own
+        // range and is dropped by every resolution — but the sides either side of it must still
+        // come out right, which is what a `|||||||`-unaware parser would get wrong.
+        let text = "<<<<<<< HEAD\n\
+                    mine\n\
+                    ||||||| merged common ancestors\n\
+                    original\n\
+                    =======\n\
+                    theirs\n\
+                    >>>>>>> other\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert_eq!(side(text, r.ours.clone()), vec!["mine"]);
+        assert_eq!(
+            side(text, r.base.clone().expect("base section")),
+            vec!["original"]
+        );
+        assert_eq!(side(text, r.theirs.clone()), vec!["theirs"]);
+    }
+
+    #[test]
+    fn conflict_regions_allows_an_empty_side() {
+        // Their side deleted the lines: a real conflict flavour, and the one an off-by-one in the
+        // range arithmetic turns into a panic or a stolen marker line.
+        let text = "<<<<<<< HEAD\nmine\n=======\n>>>>>>> other\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].theirs.is_empty());
+        assert_eq!(side(text, regions[0].ours.clone()), vec!["mine"]);
+    }
+
+    #[test]
+    fn conflict_regions_finds_every_block() {
+        let text = "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n\
+                    middle\n\
+                    <<<<<<< HEAD\nc\n=======\nd\n>>>>>>> x\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1].start_line, 6);
+    }
+
+    #[test]
+    fn conflict_regions_drops_an_unterminated_block() {
+        // Half-resolved by hand: the closing marker is gone, so there is no longer a "their side"
+        // to take. Reporting it anyway would offer a resolution that deletes the rest of the file.
+        let text = "<<<<<<< HEAD\nmine\n=======\ntheirs\n";
+        assert!(conflict_regions(&rope(text)).is_empty());
+        // Nor is a block with no separator a conflict.
+        assert!(conflict_regions(&rope("<<<<<<< HEAD\nmine\n>>>>>>> other\n")).is_empty());
+    }
+
+    #[test]
+    fn conflict_regions_restarts_on_a_nested_marker() {
+        // A recursive merge can nest one block inside another. The inner block is the one that can
+        // be resolved by taking a side, so it wins.
+        let text = "<<<<<<< outer\n\
+                    stale\n\
+                    <<<<<<< inner\n\
+                    mine\n\
+                    =======\n\
+                    theirs\n\
+                    >>>>>>> other\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start_line, 2);
+        assert_eq!(regions[0].ours_label, "inner");
+    }
+
+    #[test]
+    fn conflict_regions_ignores_rules_that_are_not_markers() {
+        // The false positive that matters: prose. A setext heading underline and a horizontal rule
+        // are longer than seven characters, which is exactly how git tells them apart too.
+        let text = "Heading\n========\n<<<<<<<< not a marker\n>>>>>>>>\n";
+        assert!(conflict_regions(&rope(text)).is_empty());
+        // Seven with something glued on is not a marker either.
+        assert!(conflict_regions(&rope("<<<<<<<x\nmine\n=======\nb\n>>>>>>> o\n")).is_empty());
+    }
+
+    #[test]
+    fn conflict_regions_accepts_bare_markers() {
+        // `git checkout --conflict=merge` and several merge drivers write markers with no label.
+        let text = "<<<<<<<\nmine\n=======\ntheirs\n>>>>>>>\n";
+        let regions = conflict_regions(&rope(text));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].ours_label, "");
+    }
+
+    // ---- resolve_conflicts (taking a side) ------------------------------------------------------
+
+    /// Resolve every block in `text` by taking `side`.
+    fn take(text: &str, side: ConflictSide) -> String {
+        let rope = rope(text);
+        let regions = conflict_regions(&rope);
+        let selected: Vec<&ConflictRegion> = regions.iter().collect();
+        resolve_conflicts(&rope, &selected, side)
+    }
+
+    const BLOCK: &str = "keep\n\
+                         <<<<<<< HEAD\n\
+                         mine\n\
+                         =======\n\
+                         theirs\n\
+                         >>>>>>> other\n\
+                         tail\n";
+
+    #[test]
+    fn taking_a_side_keeps_that_side_and_deletes_the_scenery() {
+        assert_eq!(take(BLOCK, ConflictSide::Ours), "keep\nmine\ntail\n");
+        assert_eq!(take(BLOCK, ConflictSide::Theirs), "keep\ntheirs\ntail\n");
+        // Both keeps file order, so the result reads the way the block did.
+        assert_eq!(
+            take(BLOCK, ConflictSide::Both),
+            "keep\nmine\ntheirs\ntail\n"
+        );
+    }
+
+    #[test]
+    fn the_diff3_base_section_is_never_kept() {
+        let text = "<<<<<<< HEAD\nmine\n|||||||\noriginal\n=======\ntheirs\n>>>>>>> other\n";
+        for side in [ConflictSide::Ours, ConflictSide::Theirs, ConflictSide::Both] {
+            let out = take(text, side);
+            assert!(
+                !out.contains("original") && !out.contains("|||"),
+                "the ancestor is context, not an outcome: {side:?} gave {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolving_several_blocks_keeps_the_text_between_them() {
+        let text = "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n\
+                    middle\n\
+                    <<<<<<< HEAD\nc\n=======\nd\n>>>>>>> x\n\
+                    end\n";
+        assert_eq!(take(text, ConflictSide::Ours), "a\nmiddle\nc\nend\n");
+    }
+
+    #[test]
+    fn resolving_only_the_selected_blocks_leaves_the_others_alone() {
+        // What a cursor-scoped take does: the second block is untouched, markers and all.
+        let text =
+            "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n<<<<<<< HEAD\nc\n=======\nd\n>>>>>>> x\n";
+        let rope = rope(text);
+        let regions = conflict_regions(&rope);
+        let out = resolve_conflicts(&rope, &[&regions[0]], ConflictSide::Ours);
+        assert_eq!(out, "a\n<<<<<<< HEAD\nc\n=======\nd\n>>>>>>> x\n");
+    }
+
+    #[test]
+    fn an_empty_side_resolves_to_a_deletion() {
+        // Their side deleted the lines; taking theirs must remove ours rather than keep a marker.
+        let text = "before\n<<<<<<< HEAD\nmine\n=======\n>>>>>>> other\nafter\n";
+        assert_eq!(take(text, ConflictSide::Theirs), "before\nafter\n");
+    }
+
+    #[test]
+    fn resolving_preserves_a_missing_final_newline() {
+        // The rope's own lines are copied, so a file that doesn't end in a newline still doesn't.
+        let text = "<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> other\nlast line";
+        assert_eq!(take(text, ConflictSide::Ours), "mine\nlast line");
+    }
+
+    // ---- mask_conflicts / conflict_change_hunks -------------------------------------------------
+
+    /// A file conflicted in its first block, with an unrelated edit further down: the shape a
+    /// half-resolved merge has, and the one the masking rule exists for.
+    const PART_RESOLVED: &str = "<<<<<<< HEAD\n\
+                                 mine\n\
+                                 =======\n\
+                                 theirs\n\
+                                 >>>>>>> other\n\
+                                 unchanged\n\
+                                 edited by hand\n";
+
+    #[test]
+    fn masking_drops_the_diff_inside_a_block_and_keeps_the_rest() {
+        let rope = rope(PART_RESOLVED);
+        // What a diff against HEAD produces: the whole block reads as changed, plus the later edit.
+        let head = b"mine\nunchanged\noriginal\n";
+        let diff = hunks_from_buffers(head, PART_RESOLVED.as_bytes());
+        assert!(
+            diff.iter().any(|h| h.anchor_line < 5),
+            "precondition: the block itself diffs against HEAD"
+        );
+
+        let masked = mask_conflicts(diff, &conflict_regions(&rope));
+        assert!(
+            masked.iter().all(|h| h.anchor_line > 4),
+            "nothing inside the block survives: {masked:?}"
+        );
+        assert!(
+            !masked.is_empty(),
+            "but the hand edit below it does — that's what makes a resolved region show up"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_conflicts_left_keeps_its_whole_diff() {
+        // The state after taking a side: markers gone, index still conflicted. Masking must be a
+        // no-op here, or the resolution would be invisible in the gutter and the changes picker.
+        let text = "mine\nunchanged\nresolved by hand\n";
+        let diff = hunks_from_buffers(b"mine\nunchanged\noriginal\n", text.as_bytes());
+        assert_eq!(
+            mask_conflicts(diff.clone(), &conflict_regions(&rope(text))),
+            diff
+        );
+    }
+
+    #[test]
+    fn the_changes_picker_lists_blocks_and_the_diff_around_them_in_order() {
+        let rope = rope(PART_RESOLVED);
+        let diff = hunks_from_buffers(b"mine\nunchanged\noriginal\n", PART_RESOLVED.as_bytes());
+        let rows = conflict_change_hunks(&rope, diff);
+
+        // One row for the block (anchored on its `<<<<<<<`), then the hand edit below it.
+        assert_eq!(rows[0].anchor_line, 0);
+        assert_eq!(rows[0].new_lines, 5, "the block is reported whole");
+        assert!(
+            rows.len() >= 2,
+            "the diff outside the block rides along: {rows:?}"
+        );
+        assert!(
+            rows.windows(2)
+                .all(|w| w[0].anchor_line <= w[1].anchor_line),
+            "rows are in line order"
+        );
+    }
+
+    // ---- conflicted files have no diff baseline -------------------------------------------------
+
+    /// Replace `name`'s stage-0 index entry with the three stages a stopped merge leaves.
+    fn conflict_the_index(repo: &git2::Repository, name: &str, ours: &str, theirs: &str) {
+        let entry = |id, stage: u16| git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id,
+            // The stage lives in bits 12–13 of the entry flags; that is what makes these conflict
+            // entries rather than an ordinary staged file.
+            flags: stage << 12,
+            flags_extended: 0,
+            path: name.as_bytes().to_vec(),
+        };
+        let mut index = repo.index().expect("index");
+        index.remove_path(Path::new(name)).expect("drop stage 0");
+        let ours = repo.blob(ours.as_bytes()).expect("blob");
+        let theirs = repo.blob(theirs.as_bytes()).expect("blob");
+        index.add(&entry(ours, 2)).expect("stage 2");
+        index.add(&entry(theirs, 3)).expect("stage 3");
+        index.write().expect("index write");
+    }
+
+    #[test]
+    fn a_conflicted_path_is_diffed_against_head_with_nothing_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        conflict_the_index(&repo, "src.rs", "mine\n", "theirs\n");
+
+        let baseline = load_baseline(&file, &BaselineRevs::new());
+        assert!(baseline.conflicted);
+        // Both blobs hold HEAD, so the whole change set reads as unstaged against it. The
+        // regression this guards is the alternative: with the index blob left absent the staged
+        // diff would be `HEAD → ""`, painting the file as a staged whole-file deletion.
+        assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\n"[..]));
+        assert_eq!(baseline.index_blob, baseline.blob, "nothing is staged");
+        assert!(
+            baseline.staged_hunks.is_empty(),
+            "no staged deletion of the whole file"
+        );
+        // The repo is still resolved — the resolve verbs and mark-resolved need it.
+        assert!(baseline.repo.is_some());
     }
 
     // ---- compute_hunks against a real repo ------------------------------------------------------

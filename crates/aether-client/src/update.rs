@@ -45,7 +45,8 @@ use aether_protocol::envelope::RpcMethod;
 use aether_protocol::envelope::{Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
-    ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
+    ApplyHunkStatus, ApplyScope, ConflictSide, GitAbortOperation, GitAbortOperationParams,
+    GitAbortOperationResult, GitAbortStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
     GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitCancel,
     GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
@@ -54,10 +55,11 @@ use aether_protocol::git::{
     GitOperationChanged, GitOperationChangedParams, GitPrepareCommit, GitPrepareCommitParams,
     GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult, GitPullStatus, GitPush,
     GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation, GitReset, GitResetParams,
-    GitResetResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
-    HunkAction, HunkDirection,
+    GitResetResult, GitResolveConflict, GitResolveConflictParams, GitResolveConflictResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams,
+    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
+    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
+    HunkDirection, ResolveConflictStatus,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -253,6 +255,15 @@ pub enum Event {
         scope: ApplyScope,
         result: Result<GitApplyHunkResult, String>,
     },
+    /// A conflict block was resolved by taking a side. The side rides along so the toast can name
+    /// what was kept — the buffer just changed under the user, and "took theirs" is the only
+    /// confirmation of *which* change that was.
+    ConflictResolved {
+        side: ConflictSide,
+        result: Result<GitResolveConflictResult, String>,
+    },
+    /// `Space g Alt-x`: a stopped merge/rebase was abandoned (or refused).
+    OperationAborted(Result<GitAbortOperationResult, String>),
     DiffViewSet {
         enabled: bool,
         result: Result<ViewportWindowResult, String>,
@@ -947,6 +958,17 @@ impl Session {
 
             Event::CommitPrepared { amend, result } => match result {
                 Ok(prepared) => {
+                    // Conflicts outstanding: git would refuse this commit, so nothing was prepared.
+                    // Named files, because "resolve them" is only actionable if you know which.
+                    if !prepared.blocked_by_conflicts.is_empty() {
+                        return Effects::toast(
+                            format!(
+                                "Still conflicted: {}",
+                                name_a_few(&prepared.blocked_by_conflicts)
+                            ),
+                            ToastKind::Warning,
+                        );
+                    }
                     // Nothing staged is the overwhelmingly common mistake, and `git commit` would
                     // only refuse *after* we'd opened a buffer and made the user write a message.
                     // Amending is exempt: rewording the previous commit stages nothing.
@@ -1017,9 +1039,27 @@ impl Session {
                                 .to_string();
                             let short: String = commit.commit.chars().take(7).collect();
                             let mut fx = self.close_buffer();
+                            // What the commit *concluded*, when it was part of something bigger.
+                            // A rebase that stopped again is the case worth spelling out: the
+                            // commit worked, and there is more to resolve before it's over.
+                            let message = match (&res.operation, res.conflicts.is_empty()) {
+                                (Some(op), false) => format!(
+                                    "Committed {short} — {} stopped at {}",
+                                    op.noun(),
+                                    name_a_few(&res.conflicts)
+                                ),
+                                (Some(op), true) => {
+                                    format!("Committed {short} — finished the {}", op.noun())
+                                }
+                                (None, _) => format!("Committed {short} — {subject}"),
+                            };
                             fx.push(Effect::Toast {
-                                message: format!("Committed {short} — {subject}"),
-                                kind: ToastKind::Success,
+                                message,
+                                kind: if res.conflicts.is_empty() {
+                                    ToastKind::Success
+                                } else {
+                                    ToastKind::Warning
+                                },
                                 group: None,
                             });
                             fx
@@ -1030,6 +1070,31 @@ impl Session {
                         None => Effects::toast(res.message, ToastKind::Warning),
                     }
                 }
+                Err(e) => Effects::error(e),
+            },
+
+            Event::OperationAborted(result) => match result {
+                Ok(res) => match res.status {
+                    GitAbortStatus::Aborted => Effects::toast(
+                        match res.operation {
+                            Some(op) => format!("Abandoned the {}", op.noun()),
+                            None => "Abandoned the operation".to_string(),
+                        },
+                        ToastKind::Success,
+                    ),
+                    // Pressing the way-out key on a repo that isn't stuck should say so, not fail.
+                    GitAbortStatus::NothingInProgress => {
+                        Effects::toast("Nothing in progress to abandon", ToastKind::Info)
+                    }
+                    GitAbortStatus::BlockedByDirtyBuffers => Effects::toast(
+                        format!(
+                            "{} unsaved buffer(s) — save first (Space s), then retry",
+                            res.blocked.len()
+                        ),
+                        ToastKind::Warning,
+                    ),
+                    GitAbortStatus::Refused => Effects::error(res.message),
+                },
                 Err(e) => Effects::error(e),
             },
 
@@ -1357,15 +1422,53 @@ impl Session {
                             "Diffing against a revision — restore the HEAD baseline to stage",
                             ToastKind::Warning,
                         ),
-                        // Says what staging would silently have *meant* here. Left deliberately
-                        // without a "stage it anyway" escape: marking a conflict resolved is a
-                        // decision, and this key is not where the user is making it.
-                        ApplyHunkStatus::Conflicted => (
-                            "Conflicted file — staging would mark it resolved; resolve it first",
+                        // Deliberately no "do it anyway" escape: marking a conflict resolved is a
+                        // decision, and this key is not where it's made.
+                        ApplyHunkStatus::Conflicted => {
+                            ("Conflicted file — resolve it first", ToastKind::Warning)
+                        }
+                        ApplyHunkStatus::Resolved => ("Marked resolved", ToastKind::Success),
+                        // The classic way to break a merge, and silent — nothing else would say so.
+                        ApplyHunkStatus::MarkersRemain => (
+                            "Conflict markers still in this file",
                             ToastKind::Warning,
                         ),
                     };
                     Effects::toast(msg, kind)
+                }
+                Err(e) => Effects::error(e),
+            },
+
+            Event::ConflictResolved { side, result } => match result {
+                Ok(r) => {
+                    self.buffer.cursor = r.cursor;
+                    match r.status {
+                        // The side kept and how many are left — the buffer just changed under the
+                        // user, and reaching zero is what says the file is done. No instructions:
+                        // the keys that do the next step are the ones they just used.
+                        ResolveConflictStatus::Resolved => {
+                            let kept = match side {
+                                ConflictSide::Ours => "ours",
+                                ConflictSide::Theirs => "theirs",
+                                ConflictSide::Both => "both sides",
+                            };
+                            let took = if r.resolved == 1 {
+                                format!("Took {kept}")
+                            } else {
+                                format!("Took {kept} for {} conflicts", r.resolved)
+                            };
+                            let left = match r.remaining {
+                                0 => "none left".to_string(),
+                                n => format!("{n} left"),
+                            };
+                            Effects::toast(format!("{took} — {left}"), ToastKind::Success)
+                        }
+                        // Includes the "this file has no conflicts at all" case: one sentence
+                        // answers both.
+                        ResolveConflictStatus::NoConflict => {
+                            Effects::toast("No conflict here", ToastKind::Info)
+                        }
+                    }
                 }
                 Err(e) => Effects::error(e),
             },
@@ -8287,6 +8390,20 @@ impl Session {
                     },
                 )
             }
+
+            A::ResolveConflict { side } => self.request_str::<GitResolveConflict>(
+                GitResolveConflictParams { buffer_id, side },
+                move |result| Event::ConflictResolved { side, result },
+            ),
+
+            A::GitAbortOperation => self.request_str::<GitAbortOperation>(
+                GitAbortOperationParams {
+                    // Resolved server-side from the buffer we're on, like every other git verb.
+                    repo_id: None,
+                    buffer_id: Some(buffer_id),
+                },
+                Event::OperationAborted,
+            ),
 
             A::GitStashPush => self.request_str::<GitStashPush>(
                 GitStashPushParams {

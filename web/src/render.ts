@@ -7,6 +7,7 @@
 import { decodeRow, utf8ByteLen } from "./text";
 import type {
   BufferWindow,
+  ConflictLine,
   CursorState,
   DiagnosticSeverity,
   DiffStage,
@@ -212,13 +213,20 @@ function renderVisualRow(
   if (diffView && line.diff_marker === "added") rowEl.classList.add("added-bg");
   else if (diffView && line.diff_marker === "modified") rowEl.classList.add("modified-bg");
   if (diffView && stage === "staged") rowEl.classList.add("staged");
+  // A merge conflict's side tints, which unlike the diff ones are *not* gated on the diff view:
+  // the sides are how the file is read at all. They never collide with the diff tints — the server
+  // masks the diff out of the blocks. The marker lines get a class too (their text colour) but no
+  // tint.
+  if (line.conflict) rowEl.classList.add("conflict", `conflict-${line.conflict}`);
   // Current-line highlight (Vim's `cursorline`). `cursorByte` is non-null on exactly the cursor's
   // logical line, so every visual row of that line (under soft wrap) gets tinted as a whole. The CSS
   // rule is ordered after the diff tints so it wins on the cursor's changed line; the gutter
   // change-bar still marks it. Selection/search/cursor backgrounds sit on inner spans, over the tint.
   if (cursorByte !== null) rowEl.classList.add("cursor-line");
 
-  rowEl.appendChild(gutter(line.diff_marker ?? null, diffView, stage));
+  rowEl.appendChild(
+    gutter(line.diff_marker ?? null, diffView, stage, line.conflict ?? null),
+  );
 
   const content = document.createElement("span");
   content.className = "content";
@@ -260,13 +268,18 @@ function renderVisualRow(
   }
 
   // Syntax: highlights are byte offsets within each segment; segments concatenate to form the row.
+  // Skipped entirely on a conflict marker line: whatever the grammar made of `<<<<<<< HEAD` is
+  // noise, and leaving the cells classless lets them take the row's marker colour while selection,
+  // search and cursor spans keep their own (the terminal client's rule, expressed structurally).
   let segBase = 0;
-  for (const seg of row.segments) {
-    for (const h of seg.highlights) {
-      const cls = highlightClass(h.kind);
-      if (cls) markRange(byteStart, n, segBase + h.start, segBase + h.end, (i) => (hl[i] = cls));
+  if (line.conflict !== "marker") {
+    for (const seg of row.segments) {
+      for (const h of seg.highlights) {
+        const cls = highlightClass(h.kind);
+        if (cls) markRange(byteStart, n, segBase + h.start, segBase + h.end, (i) => (hl[i] = cls));
+      }
+      segBase += utf8ByteLen(seg.text);
     }
-    segBase += utf8ByteLen(seg.text);
   }
 
   // Diagnostics & search: byte offsets within the logical line → row-local via row.byte_offset.
@@ -444,9 +457,16 @@ function gutter(
   marker: "added" | "modified" | "deleted" | null,
   diffView: boolean,
   stage: DiffStage,
+  conflict: ConflictLine | null = null,
 ): HTMLElement {
   const g = document.createElement("span");
   g.className = "gutter";
+  // One unbroken bar down the whole block: the gutter says "conflict here", the row tints say
+  // which side each line is on.
+  if (conflict) {
+    g.classList.add("conflict");
+    return g;
+  }
   if (marker === "added" || marker === "modified") g.classList.add(marker);
   else if (marker === "deleted" && !diffView) g.classList.add("deleted");
   // A staged change dims the bar to the muted variant of its kind colour.

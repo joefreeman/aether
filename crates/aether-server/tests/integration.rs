@@ -18,7 +18,8 @@ use aether_protocol::cursor::{
 };
 use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Request, RpcMethod};
 use aether_protocol::git::{
-    ApplyHunkStatus, ApplyScope, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
+    ApplyHunkStatus, ApplyScope, ConflictSide, GitAbortOperation, GitAbortOperationParams,
+    GitAbortOperationResult, GitAbortStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
     GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCancel,
     GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
@@ -28,11 +29,12 @@ use aether_protocol::git::{
     GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
     GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRefresh,
     GitRefreshParams, GitRefreshResult, GitRepoOperation, GitRepos, GitReposParams, GitReposResult,
-    GitReset, GitResetParams, GitResetResult, GitSetBaseline, GitSetBaselineParams,
-    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, GitShow, GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop,
-    GitStashDropParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
-    HunkAction, HunkDirection,
+    GitReset, GitResetParams, GitResetResult, GitResolveConflict, GitResolveConflictParams,
+    GitResolveConflictResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow,
+    GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
+    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
+    ResolveConflictStatus,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -68,7 +70,7 @@ use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
-use aether_protocol::viewport::{DiagnosticSeverity, DiffMarker, EmphasisRange};
+use aether_protocol::viewport::{ConflictLine, DiagnosticSeverity, DiffMarker, EmphasisRange};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
@@ -35142,6 +35144,752 @@ async fn staging_a_hunk_in_a_conflicted_file_is_refused() {
     assert!(
         repo.index().unwrap().has_conflicts(),
         "the conflict must survive — a stage-0 write would have marked it resolved"
+    );
+
+    drop(server);
+}
+
+/// Leave `ours` stopped in a merge whose one file is conflicted in **two** separate places — the
+/// fixture the navigation and multi-region resolution tests need. Returns the buffer on `a.rs`.
+async fn setup_two_block_conflict() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tempfile::TempDir,
+    std::path::PathBuf, // ours
+    u64,                // buffer id for a.rs
+) {
+    let (server, mut ws, dir, base, ours, url, buffer_id) = setup_pull_workspace(false).await;
+    // A shared base with room between the two edits, pushed so both sides start from it.
+    let shared = "top\nb\nc\nd\ne\nf\ng\nh\nbottom\n";
+    std::fs::write(ours.join("a.rs"), shared).unwrap();
+    run_git(&ours, &["commit", "-am", "shared base"]);
+    run_git(&ours, &["push", "origin", "main"]);
+
+    // Their side rewrites the first and last lines...
+    let theirs = base.join("theirs");
+    run_git(&base, &["clone", &url, "theirs"]);
+    std::fs::write(
+        theirs.join("a.rs"),
+        "their top\nb\nc\nd\ne\nf\ng\nh\ntheir bottom\n",
+    )
+    .unwrap();
+    run_git(&theirs, &["commit", "-am", "their work"]);
+    run_git(&theirs, &["push", "origin", "main"]);
+
+    // ...and so do we, differently. Two conflicts, with clean context between them.
+    std::fs::write(
+        ours.join("a.rs"),
+        "my top\nb\nc\nd\ne\nf\ng\nh\nmy bottom\n",
+    )
+    .unwrap();
+    run_git(&ours, &["commit", "-am", "my work"]);
+
+    let res = pull(&mut ws, 20, &ours).await;
+    assert_eq!(res.status, GitPullStatus::Conflicted, "{}", res.message);
+    (server, ws, dir, ours, buffer_id)
+}
+
+/// One `git/navigate_hunk` step from `from_line`.
+async fn navigate_hunk_from(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+    from_line: u32,
+    direction: HunkDirection,
+) -> GitNavigateHunkResult {
+    send_request::<GitNavigateHunk>(
+        ws,
+        id,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line,
+            direction,
+            count: 1,
+            extend: false,
+        },
+    )
+    .await
+}
+
+/// Subscribe a viewport on an already-open buffer and return the window it renders.
+async fn window_of(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+) -> aether_protocol::viewport::Window {
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        id,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    sub.window
+}
+
+/// The conflict markers reach the viewport as per-line sides, so the shells can tell ours from
+/// theirs without re-parsing the text — and the *diff* decoration is gone from the same lines.
+///
+/// The second half is the regression that matters. A conflicted path has no stage-0 index entry, so
+/// before this the staged diff was `HEAD → ""` and every line of the file carried a `Deleted`
+/// marker: a wall of gutter bars claiming the whole file was staged for deletion.
+#[tokio::test]
+async fn a_conflicted_buffer_renders_sides_and_no_diff() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_stopped_rebase().await;
+
+    let window = window_of(&mut ws, 4, buffer_id).await;
+    let sides: Vec<Option<ConflictLine>> = window.lines.iter().map(|l| l.conflict).collect();
+    // `<<<<<<< HEAD` / theirs / `=======` / ours / `>>>>>>> commit` — the rebase replays our commit
+    // on top of theirs, so "ours" is the upstream side and the labels are what say so.
+    assert_eq!(
+        sides,
+        vec![
+            Some(ConflictLine::Marker),
+            Some(ConflictLine::Ours),
+            Some(ConflictLine::Marker),
+            Some(ConflictLine::Theirs),
+            Some(ConflictLine::Marker),
+            None, // trailing empty line
+        ],
+        "got {:?}",
+        window
+            .lines
+            .iter()
+            .map(|l| (l.conflict, l.visual_rows[0].segments[0].text.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        window.lines.iter().all(|l| l.diff_marker.is_none()),
+        "a conflicted file has no baseline to diff, so no line may claim a diff marker"
+    );
+
+    let status = window.git_status.expect("in a repo");
+    assert_eq!(status.conflicts, 1, "one block, for the status bar to name");
+    assert_eq!(status.operation, Some(GitRepoOperation::Rebase));
+    assert!(
+        status.staged.is_empty() && status.unstaged.is_empty(),
+        "and no change counts: got staged {:?} unstaged {:?}",
+        status.staged,
+        status.unstaged
+    );
+
+    drop(server);
+}
+
+/// `c` / `Alt-c` retarget to conflict blocks in a conflicted file. There are no hunks to step
+/// between there (nothing to diff against), so without this the motion is dead exactly where the
+/// user most needs "take me to the next thing to deal with".
+#[tokio::test]
+async fn hunk_navigation_steps_conflict_blocks() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_two_block_conflict().await;
+
+    // The first block starts at line 0 — where the cursor already is — and `Next` moves strictly
+    // forward, so one press lands on the *second* block.
+    let second = navigate_hunk_from(&mut ws, 21, buffer_id, 0, HunkDirection::Next).await;
+    assert!(
+        second.moved && second.cursor.position.line > 0,
+        "{second:?}"
+    );
+    // Nothing past the last block...
+    let past = navigate_hunk_from(
+        &mut ws,
+        22,
+        buffer_id,
+        second.cursor.position.line,
+        HunkDirection::Next,
+    )
+    .await;
+    assert!(!past.moved);
+    // ...and stepping back reaches the first, then stops.
+    let first = navigate_hunk_from(
+        &mut ws,
+        23,
+        buffer_id,
+        second.cursor.position.line,
+        HunkDirection::Prev,
+    )
+    .await;
+    assert_eq!(first.cursor.position.line, 0, "{first:?}");
+    let before = navigate_hunk_from(&mut ws, 24, buffer_id, 0, HunkDirection::Prev).await;
+    assert!(!before.moved);
+
+    // Each landing is a `<<<<<<<` line: the top of a block, not somewhere inside one.
+    let window = window_of(&mut ws, 25, buffer_id).await;
+    for line in [first.cursor.position.line, second.cursor.position.line] {
+        assert_eq!(
+            window.lines[line as usize].conflict,
+            Some(ConflictLine::Marker),
+            "landed mid-block at line {line}"
+        );
+    }
+
+    drop(server);
+}
+
+async fn resolve_conflict(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+    side: ConflictSide,
+) -> GitResolveConflictResult {
+    send_request::<GitResolveConflict>(ws, id, &GitResolveConflictParams { buffer_id, side }).await
+}
+
+/// [`apply_hunk`] with the scope spelled out — `ApplyScope::File` is "mark resolved" on a
+/// conflicted path.
+async fn apply_hunk_scoped(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    buffer_id: u64,
+    action: HunkAction,
+    scope: ApplyScope,
+) -> GitApplyHunkResult {
+    send_request::<GitApplyHunk>(
+        ws,
+        id,
+        &GitApplyHunkParams {
+            buffer_id,
+            action,
+            scope,
+        },
+    )
+    .await
+}
+
+/// Taking a side rewrites the buffer, and is **one undo step** — which is what makes trying a side
+/// and changing your mind cost a single `Ctrl-z` rather than unpicking a multi-line edit.
+#[tokio::test]
+async fn taking_a_side_resolves_the_block_and_undoes_in_one_step() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+    let before = buffer_text(&mut ws, 4, buffer_id).await;
+
+    // The cursor sits at the top of the file, inside the only block.
+    let res = resolve_conflict(&mut ws, 5, buffer_id, ConflictSide::Theirs).await;
+    assert_eq!(res.status, ResolveConflictStatus::Resolved);
+    assert_eq!((res.resolved, res.remaining), (1, 0));
+
+    let after = buffer_text(&mut ws, 6, buffer_id).await;
+    assert!(
+        !after.contains("<<<<<<<") && !after.contains("=======") && !after.contains(">>>>>>>"),
+        "markers must go with the resolution, got {after:?}"
+    );
+    assert_eq!(
+        after, "mine\n",
+        "theirs, mid-rebase, is the commit being replayed"
+    );
+    // Still conflicted as far as git is concerned: resolving is editing, and nothing has been
+    // marked resolved (or even saved) yet.
+    assert!(git2::Repository::open(&ours)
+        .unwrap()
+        .index()
+        .unwrap()
+        .has_conflicts());
+
+    let undo: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        7,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert!(undo.applied);
+    assert_eq!(
+        buffer_text(&mut ws, 8, buffer_id).await,
+        before,
+        "one undo restores the whole block"
+    );
+
+    drop(server);
+}
+
+/// A selection spanning several blocks resolves them all — the addressing `git/apply_hunk` uses,
+/// and the reason there is no separate "take all of theirs in this file" key.
+#[tokio::test]
+async fn a_selection_resolves_every_block_it_covers() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_two_block_conflict().await;
+
+    let _: CursorState =
+        send_request::<CursorSelectAll>(&mut ws, 21, &CursorSelectAllParams { buffer_id }).await;
+    let res = resolve_conflict(&mut ws, 22, buffer_id, ConflictSide::Ours).await;
+    assert_eq!((res.resolved, res.remaining), (2, 0), "{res:?}");
+
+    let text = buffer_text(&mut ws, 23, buffer_id).await;
+    // Mid-*merge*, "ours" is the local branch — the opposite of what it means mid-rebase, where the
+    // replayed commit is "theirs" (see `taking_a_side_resolves_the_block_and_undoes_in_one_step`).
+    // Nothing here has to know that: the markers' own labels are what the user reads.
+    assert_eq!(
+        text, "my top\nb\nc\nd\ne\nf\ng\nh\nmy bottom\n",
+        "ours is the local side mid-merge"
+    );
+    // And the decoration is gone with them.
+    let window = window_of(&mut ws, 24, buffer_id).await;
+    assert!(window.lines.iter().all(|l| l.conflict.is_none()));
+
+    drop(server);
+}
+
+/// Taking both sides keeps them in file order, and only the block the cursor is in.
+#[tokio::test]
+async fn taking_both_keeps_both_sides_of_only_the_cursors_block() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_two_block_conflict().await;
+
+    // Cursor at line 0 — inside the first block, well before the second.
+    let res = resolve_conflict(&mut ws, 21, buffer_id, ConflictSide::Both).await;
+    assert_eq!((res.resolved, res.remaining), (1, 1), "{res:?}");
+
+    let text = buffer_text(&mut ws, 22, buffer_id).await;
+    let head = text.lines().take(2).collect::<Vec<_>>();
+    assert_eq!(
+        head,
+        vec!["my top", "their top"],
+        "ours then theirs, in file order"
+    );
+    assert!(
+        text.contains("<<<<<<<"),
+        "the block the cursor wasn't in keeps its markers: {text:?}"
+    );
+
+    drop(server);
+}
+
+/// With the cursor outside every block, the verbs say so rather than guessing at the nearest one —
+/// resolving the wrong conflict is not something a toast can undo.
+#[tokio::test]
+async fn taking_a_side_outside_a_block_resolves_nothing() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_two_block_conflict().await;
+
+    // Line 5 is clean context between the two blocks.
+    let target = LogicalPosition { line: 5, col: 0 };
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        21,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: target,
+            anchor: target,
+        },
+    )
+    .await;
+    let res = resolve_conflict(&mut ws, 22, buffer_id, ConflictSide::Ours).await;
+    assert_eq!(res.status, ResolveConflictStatus::NoConflict);
+    assert_eq!(res.resolved, 0);
+    assert_eq!(res.remaining, 2, "both blocks still there");
+
+    drop(server);
+}
+
+/// The whole path from "git stopped here" to "the index agrees with me", and the two gates on the
+/// way: markers still present, and edits not yet on disk. `git add` writes what is on *disk*, so
+/// both refusals are about the file the index would actually get.
+#[tokio::test]
+async fn marking_resolved_gates_on_markers_then_on_saving() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+    // Markers still in the file: refused. This is the one that stops a broken merge being committed.
+    let res = apply_hunk_scoped(&mut ws, 4, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    assert_eq!(res.status, ApplyHunkStatus::MarkersRemain);
+
+    // Resolved in the buffer but not saved: still refused, because git would stage the old bytes.
+    let _ = resolve_conflict(&mut ws, 5, buffer_id, ConflictSide::Ours).await;
+    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    assert_eq!(res.status, ApplyHunkStatus::DirtyBuffer);
+
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        7,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let res = apply_hunk_scoped(&mut ws, 8, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    assert_eq!(res.status, ApplyHunkStatus::Resolved);
+
+    // The real assertion: git no longer considers the file conflicted, so the operation can be
+    // concluded. A status alone would pass even if nothing had been written.
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert!(
+        !repo.index().unwrap().has_conflicts(),
+        "the conflict stages must be gone — that is what `git add` does here"
+    );
+    // And the editor stops describing a conflict that has ended.
+    let window = window_of(&mut ws, 9, buffer_id).await;
+    assert_eq!(window.git_status.expect("in a repo").conflicts, 0);
+    assert!(window.lines.iter().all(|l| l.conflict.is_none()));
+
+    drop(server);
+}
+
+/// Reverting inside a conflicted file is refused too. There is no baseline to revert to mid-merge,
+/// so "put this back" would mean silently discarding one side — which is what the conflict verbs
+/// are for, deliberately and by name.
+#[tokio::test]
+async fn reverting_in_a_conflicted_file_is_refused() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+    let before = buffer_text(&mut ws, 4, buffer_id).await;
+
+    for (id, scope) in [(5, ApplyScope::Cursor), (6, ApplyScope::File)] {
+        let res = apply_hunk_scoped(&mut ws, id, buffer_id, HunkAction::Revert, scope).await;
+        assert_eq!(res.status, ApplyHunkStatus::Conflicted, "scope {scope:?}");
+    }
+    assert_eq!(
+        buffer_text(&mut ws, 7, buffer_id).await,
+        before,
+        "and nothing was touched"
+    );
+    assert!(git2::Repository::open(&ours)
+        .unwrap()
+        .index()
+        .unwrap()
+        .has_conflicts());
+
+    drop(server);
+}
+
+/// Resolve, mark resolved, then `Space g c`: the message comes pre-filled from the *rebase's* own
+/// commit message, and the commit runs `rebase --continue` behind it. Without the continuation the
+/// user is left committed but still mid-rebase on a detached HEAD, with no in-editor way on.
+#[tokio::test]
+async fn committing_mid_rebase_uses_its_message_and_continues_the_rebase() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+
+    // Resolve, save, mark resolved — the three steps before the commit.
+    let _ = resolve_conflict(&mut ws, 4, buffer_id, ConflictSide::Theirs).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        5,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    assert_eq!(res.status, ApplyHunkStatus::Resolved);
+
+    // The template is seeded from the rebase's stored message, not blank: this is the commit being
+    // replayed, and its message is the one being reused.
+    let prepared = prepare_commit(&mut ws, 7, &ours, false).await;
+    assert!(
+        prepared.blocked_by_conflicts.is_empty(),
+        "nothing conflicted now: {:?}",
+        prepared.blocked_by_conflicts
+    );
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    assert!(
+        template.starts_with("my edit"),
+        "expected the replayed commit's message, got {template:?}"
+    );
+
+    let res = commit(&mut ws, 8, &ours, false).await;
+    assert!(res.commit.is_some(), "{}", res.message);
+    assert_eq!(
+        res.operation,
+        Some(GitRepoOperation::Rebase),
+        "the commit concluded the rebase, and says so"
+    );
+    assert!(
+        res.conflicts.is_empty(),
+        "nothing left: {:?}",
+        res.conflicts
+    );
+
+    // The real assertion: the rebase is over and HEAD is back on the branch.
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert!(!repo.head_detached().unwrap(), "back on a branch");
+
+    drop(server);
+}
+
+/// Mid-*merge* the same key finishes the merge, and the template is git's own `MERGE_MSG` — without
+/// which `Space g c` would replace git's merge message with a blank one.
+#[tokio::test]
+async fn committing_mid_merge_uses_merge_msg_and_ends_the_merge() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_two_block_conflict().await;
+
+    let _: CursorState =
+        send_request::<CursorSelectAll>(&mut ws, 21, &CursorSelectAllParams { buffer_id }).await;
+    let _ = resolve_conflict(&mut ws, 22, buffer_id, ConflictSide::Ours).await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        23,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let _ = apply_hunk_scoped(&mut ws, 24, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+
+    let prepared = prepare_commit(&mut ws, 25, &ours, false).await;
+    let template = std::fs::read_to_string(&prepared.path).unwrap();
+    assert!(
+        template.contains("Merge branch"),
+        "expected git's own merge message, got {template:?}"
+    );
+
+    let res = commit(&mut ws, 26, &ours, false).await;
+    let made = res.commit.expect("merge commit created");
+    assert!(
+        made.message.starts_with("Merge"),
+        "git's own merge message, kept: {:?}",
+        made.message
+    );
+    // No `--continue` for a merge: committing *is* the end of it.
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_count(),
+        2,
+        "a real merge commit"
+    );
+
+    drop(server);
+}
+
+/// Committing with conflicts still outstanding is refused *before* a message buffer opens. Git's own
+/// refusal arrives after the message is written and names the state rather than the files.
+#[tokio::test]
+async fn preparing_a_commit_refuses_while_files_are_conflicted() {
+    let (server, mut ws, _dir, ours, _buffer_id) = setup_stopped_rebase().await;
+
+    let prepared = prepare_commit(&mut ws, 4, &ours, false).await;
+    assert_eq!(prepared.blocked_by_conflicts, vec!["a.rs".to_string()]);
+    assert!(
+        prepared.path.is_empty(),
+        "nothing prepared, so no buffer to open"
+    );
+
+    drop(server);
+}
+
+/// The way out: abandoning a stopped rebase puts HEAD back on the branch it detached from, so the
+/// editor is never a place you can get stuck.
+#[tokio::test]
+async fn aborting_a_stopped_rebase_puts_the_branch_back() {
+    let (server, mut ws, _dir, ours, _buffer_id) = setup_stopped_rebase().await;
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert!(repo.head_detached().unwrap(), "mid-rebase, as set up");
+
+    let res: GitAbortOperationResult = send_request::<GitAbortOperation>(
+        &mut ws,
+        4,
+        &GitAbortOperationParams {
+            repo_id: Some(ours.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(res.status, GitAbortStatus::Aborted);
+    assert_eq!(res.operation, Some(GitRepoOperation::Rebase));
+
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    assert!(!repo.head_detached().unwrap());
+    // The conflicted file is back to our version, and the buffer showing it was reloaded.
+    assert_eq!(
+        std::fs::read_to_string(ours.join("a.rs")).unwrap(),
+        "mine\n"
+    );
+
+    // Pressing it again on a clean repo says so rather than failing.
+    let res: GitAbortOperationResult = send_request::<GitAbortOperation>(
+        &mut ws,
+        5,
+        &GitAbortOperationParams {
+            repo_id: Some(ours.to_string_lossy().into()),
+            buffer_id: None,
+        },
+    )
+    .await;
+    assert_eq!(res.status, GitAbortStatus::NothingInProgress);
+
+    drop(server);
+}
+
+/// Resolving one block of two leaves a file that is *half* conflicted, and both halves have to read
+/// correctly at once: the block still in dispute shows conflict sides and no diff, and the region
+/// just resolved shows as an ordinary change against HEAD — in the gutter and in the changes list.
+///
+/// The bug this pins: suppressing the diff per *file* meant the resolved half vanished from the
+/// gutter while the changes picker fell back to a diff with no index blob and listed the whole file
+/// as new. Two surfaces, two different wrong answers.
+#[tokio::test]
+async fn a_half_resolved_file_shows_conflicts_and_changes_side_by_side() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_two_block_conflict().await;
+
+    // Cursor starts at line 0, inside the first block.
+    let res = resolve_conflict(&mut ws, 21, buffer_id, ConflictSide::Theirs).await;
+    assert_eq!((res.resolved, res.remaining), (1, 1));
+
+    let window = window_of(&mut ws, 22, buffer_id).await;
+    assert!(
+        window.lines.iter().any(|l| l.conflict.is_some()),
+        "the untouched block still reads as a conflict"
+    );
+    assert!(
+        window.lines.iter().any(|l| l.diff_marker.is_some()),
+        "and the resolved region reads as a change: {:?}",
+        window
+            .lines
+            .iter()
+            .map(|l| (l.conflict, l.diff_marker))
+            .collect::<Vec<_>>()
+    );
+    // The rule that lets both encodings coexist: never on the same line.
+    assert!(
+        window
+            .lines
+            .iter()
+            .all(|l| !(l.conflict.is_some() && l.diff_marker.is_some())),
+        "no line may carry both decorations"
+    );
+    let status = window.git_status.expect("in a repo");
+    assert_eq!(status.conflicts, 1);
+    assert!(
+        status.staged.is_empty(),
+        "nothing is staged while the index holds conflict stages: {:?}",
+        status.staged
+    );
+
+    // The changes picker agrees: one conflict row, one change row — not one whole-file row.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        23,
+        &PickerViewParams {
+            limit: 30,
+            // The file-scoped picker is built from the buffer it names.
+            buffer_id: Some(buffer_id),
+            ..view_params(PickerKind::GitChangesFile)
+        },
+    )
+    .await;
+    let update = view.update.expect("the view carries its initial window");
+    assert_eq!(
+        update.total_matches,
+        2,
+        "expected the remaining block plus the resolved change, got {:?}",
+        update.items()
+    );
+
+    drop(server);
+}
+
+/// `Space c` lists a conflicted file as one row per block — which is how you find the conflicts
+/// again once the pull's toast has faded.
+///
+/// The regression underneath: a conflicted path has no index entry, so the ordinary diff collapses
+/// into the *whole file* as a single hunk. One row saying "everything changed" is no way to find
+/// two conflicts.
+#[tokio::test]
+async fn git_changes_picker_lists_conflict_blocks() {
+    let (server, mut ws, _dir, _ours, _buffer_id) = setup_two_block_conflict().await;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        21,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::GitChanges)
+        },
+    )
+    .await;
+    let update = view.update.expect("the view carries its initial window");
+    assert_eq!(
+        update.total_matches,
+        2,
+        "one row per conflict block, not one whole-file hunk: {:?}",
+        update.items()
+    );
+
+    let items = update.items();
+    let PickerItem::GitChange {
+        relative_path,
+        line,
+        preview,
+        ..
+    } = &items[1]
+    else {
+        panic!("expected a GitChange row, got {:?}", items[1]);
+    };
+    assert_eq!(relative_path, "a.rs");
+    assert_eq!(*line, 0, "the row jumps to the top of the block");
+    // The marker line is the preview: unmistakably a conflict, and it names the side.
+    assert!(
+        preview.starts_with("<<<<<<<"),
+        "expected the block's marker line, got {preview:?}"
+    );
+
+    drop(server);
+}
+
+/// Resolving by hand — editing the markers away — has to take the decoration with it, because the
+/// count reaching zero is what tells the user (and mark-resolved) that the file is done. The scan
+/// runs on the per-edit path for exactly this.
+#[tokio::test]
+async fn resolving_by_hand_clears_the_conflict_decoration() {
+    let (server, mut ws, _dir, _ours, buffer_id) = setup_stopped_rebase().await;
+
+    // Replace the whole buffer with a resolution: select everything, then type over it.
+    let _: CursorState =
+        send_request::<CursorSelectAll>(&mut ws, 4, &CursorSelectAllParams { buffer_id }).await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        5,
+        &InputTextParams {
+            buffer_id,
+            text: "resolved\n".into(),
+            select_pasted: false,
+            replace_selection: true,
+            at: None,
+        },
+    )
+    .await;
+
+    let window = window_of(&mut ws, 6, buffer_id).await;
+    assert!(
+        window.lines.iter().all(|l| l.conflict.is_none()),
+        "the markers are gone, so the sides are too"
+    );
+    assert_eq!(
+        window.git_status.expect("in a repo").conflicts,
+        0,
+        "nothing left to resolve — mark-resolved is now the next step"
     );
 
     drop(server);

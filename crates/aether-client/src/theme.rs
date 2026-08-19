@@ -184,6 +184,18 @@ pub struct Theme {
     pub cursor_line_modified_bg: Rgb,
     pub cursor_line_staged_added_bg: Rgb,
     pub cursor_line_staged_modified_bg: Rgb,
+    // Merge conflicts: which side of a block a line belongs to. A second encoding on top of the
+    // diff one would normally be a mistake, but the two never land on the same line — the server
+    // masks the diff out of the conflict blocks — so the hues only have to be distinguishable from
+    // each other, not composable. Teal for ours, purple for theirs: neither is green/yellow/red, so
+    // neither can be misread as add/modify/delete.
+    pub git_conflict_ours_bg: Rgb,
+    pub git_conflict_theirs_bg: Rgb,
+    /// The `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` lines. Foreground only: they are
+    /// scaffolding between the two tinted bands, and the bands are what carry the colour.
+    pub git_conflict_marker: Rgb,
+    pub cursor_line_conflict_ours_bg: Rgb,
+    pub cursor_line_conflict_theirs_bg: Rgb,
 
     // ---- Markdown reading view ----
     /// Code spans/blocks panel.
@@ -264,6 +276,14 @@ impl Theme {
         cursor_line_modified_bg: rgb(0x4a4632),
         cursor_line_staged_added_bg: rgb(0x3a453c),
         cursor_line_staged_modified_bg: rgb(0x434138),
+        // Hue-shifted from NORD0 rather than lightened, like the diff tints: a wash the text still
+        // reads through. Teal reads against a blue-grey background where a plain blue would sink
+        // into it.
+        git_conflict_ours_bg: rgb(0x263d42),
+        git_conflict_theirs_bg: rgb(0x3e2a4e),
+        git_conflict_marker: NORD9,
+        cursor_line_conflict_ours_bg: rgb(0x2f4d52),
+        cursor_line_conflict_theirs_bg: rgb(0x503664),
         md_code_bg: NORD1,
         md_table_stripe_bg: rgb(0x323845), // between NORD0 and NORD1
         md_alert_important: NORD15,
@@ -330,6 +350,11 @@ impl Theme {
         cursor_line_modified_bg: rgb(0xe6dfc0),
         cursor_line_staged_added_bg: rgb(0xdde7d8),
         cursor_line_staged_modified_bg: rgb(0xe7e3d2),
+        git_conflict_ours_bg: rgb(0xd6e8ec),
+        git_conflict_theirs_bg: rgb(0xe2d2ee),
+        git_conflict_marker: NORD10,
+        cursor_line_conflict_ours_bg: rgb(0xcbe0e5),
+        cursor_line_conflict_theirs_bg: rgb(0xd7c6e5),
         md_code_bg: rgb(0xe1e6ee),
         md_table_stripe_bg: rgb(0xe9edf3),
         md_alert_important: rgb(0x8d6488), // = syn_constant today; free to diverge

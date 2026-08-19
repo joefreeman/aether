@@ -12,7 +12,7 @@ use crate::grid;
 use crate::theme;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window,
+    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window,
 };
 use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
@@ -565,21 +565,36 @@ where
                 } else {
                     None
                 };
-                let row_bg = match (on_cursor_line, diff_bg, line.diff_marker, staged) {
-                    (false, bg, ..) => bg,
-                    (true, None, ..) => Some(p.cursor_line_bg),
-                    (true, Some(_), Some(DiffMarker::Added), false) => Some(p.cursor_line_added_bg),
-                    (true, Some(_), Some(DiffMarker::Modified), false) => {
-                        Some(p.cursor_line_modified_bg)
-                    }
-                    (true, Some(_), Some(DiffMarker::Added), true) => {
-                        Some(p.cursor_line_staged_added_bg)
-                    }
-                    (true, Some(_), Some(DiffMarker::Modified), true) => {
-                        Some(p.cursor_line_staged_modified_bg)
-                    }
-                    (true, Some(_), ..) => Some(p.cursor_line_bg),
+                // A conflict's side tints outrank the diff ones and ignore the diff-view toggle:
+                // the sides are how the file is read at all. They can't actually collide — the
+                // server masks the diff out of the blocks — but the ordering says which wins if the
+                // two ever did. The marker lines and the diff3 base section fall through to the
+                // ordinary backgrounds; see the terminal's `conflict_bg`.
+                let conflict_bg = match (line.conflict, on_cursor_line) {
+                    (Some(ConflictLine::Ours), false) => Some(p.git_conflict_ours_bg),
+                    (Some(ConflictLine::Ours), true) => Some(p.cursor_line_conflict_ours_bg),
+                    (Some(ConflictLine::Theirs), false) => Some(p.git_conflict_theirs_bg),
+                    (Some(ConflictLine::Theirs), true) => Some(p.cursor_line_conflict_theirs_bg),
+                    _ => None,
                 };
+                let row_bg =
+                    conflict_bg.or(match (on_cursor_line, diff_bg, line.diff_marker, staged) {
+                        (false, bg, ..) => bg,
+                        (true, None, ..) => Some(p.cursor_line_bg),
+                        (true, Some(_), Some(DiffMarker::Added), false) => {
+                            Some(p.cursor_line_added_bg)
+                        }
+                        (true, Some(_), Some(DiffMarker::Modified), false) => {
+                            Some(p.cursor_line_modified_bg)
+                        }
+                        (true, Some(_), Some(DiffMarker::Added), true) => {
+                            Some(p.cursor_line_staged_added_bg)
+                        }
+                        (true, Some(_), Some(DiffMarker::Modified), true) => {
+                            Some(p.cursor_line_staged_modified_bg)
+                        }
+                        (true, Some(_), ..) => Some(p.cursor_line_bg),
+                    });
                 if let Some(bg) = row_bg {
                     fill(renderer, row_bounds, bg);
                 }
@@ -696,7 +711,20 @@ where
                 let gutter_marker = line
                     .diff_marker
                     .filter(|m| !(self.content.diff_view && *m == DiffMarker::Deleted));
-                if let Some(marker) = gutter_marker {
+                if line.conflict.is_some() {
+                    // One unbroken bar down the whole block: the gutter says "conflict here", the
+                    // side tints say which half is which.
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: cell.width * 0.5,
+                            height: cell.height,
+                        },
+                        p.git_conflict_marker,
+                    );
+                } else if let Some(marker) = gutter_marker {
                     let color = gutter_color(p, marker, line.diff_stage);
                     if marker == DiffMarker::Deleted {
                         // A pure deletion sits *between* this surviving line and the one above,
@@ -794,6 +822,9 @@ where
                 // the rest of the typed prefix renders normally on its band.
                 let is_label_cell =
                     |dcol: u32| sneak_spans.iter().any(|&(s, _, pe, _)| s == dcol && pe > s);
+                // A conflict marker line is scenery, not code: whatever the grammar made of
+                // `<<<<<<< HEAD` is noise, so the whole row takes the marker colour.
+                let marker_line = line.conflict == Some(ConflictLine::Marker);
                 let mut run = String::new();
                 let mut run_start: u32 = 0;
                 let mut run_kind: Option<&str> = None;
@@ -806,9 +837,12 @@ where
                     if run.is_empty() {
                         return;
                     }
-                    let mut color = kind
-                        .and_then(|k| theme::highlight_color(p.mode, k))
-                        .unwrap_or(p.fg);
+                    let mut color = if marker_line {
+                        p.git_conflict_marker
+                    } else {
+                        kind.and_then(|k| theme::highlight_color(p.mode, k))
+                            .unwrap_or(p.fg)
+                    };
                     if hit && Some(color) == theme::highlight_color(p.mode, "comment") {
                         color = p.fg;
                     }

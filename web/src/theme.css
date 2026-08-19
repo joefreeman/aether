@@ -92,6 +92,15 @@
   --cursor-line-modified-bg: #4a4632;
   --cursor-line-staged-added-bg: #3a453c;
   --cursor-line-staged-modified-bg: #434138;
+  /* Merge conflicts: which side of a block a line is on. A second encoding on top of the diff
+     one, safe because the two never land on the same line — the server masks the diff out of the
+     conflict blocks. Hue-shifted from the background like the diff tints, teal for ours and purple
+     for theirs. */
+  --git-conflict-ours-bg: #263d42;
+  --git-conflict-theirs-bg: #3e2a4e;
+  --git-conflict-marker: var(--nord9);
+  --cursor-line-conflict-ours-bg: #2f4d52;
+  --cursor-line-conflict-theirs-bg: #503664;
   /* Markdown reading view */
   --md-code-bg: var(--nord1); /* code spans/blocks panel */
   --md-table-stripe-bg: #323845; /* alternating table row, between bg and md-code-bg */
@@ -184,6 +193,11 @@
   --cursor-line-modified-bg: #e6dfc0;
   --cursor-line-staged-added-bg: #dde7d8;
   --cursor-line-staged-modified-bg: #e7e3d2;
+  --git-conflict-ours-bg: #d6e8ec;
+  --git-conflict-theirs-bg: #e2d2ee;
+  --git-conflict-marker: var(--nord10);
+  --cursor-line-conflict-ours-bg: #cbe0e5;
+  --cursor-line-conflict-theirs-bg: #d7c6e5;
   --md-code-bg: #e1e6ee;
   --md-table-stripe-bg: #e9edf3;
   --md-alert-important: #8d6488; /* = syn-constant today; free to diverge */
@@ -627,6 +641,16 @@ html, body, #app {
 .row.cursor-line.added-bg.staged { background: var(--cursor-line-staged-added-bg); }
 .row.cursor-line.modified-bg.staged { background: var(--cursor-line-staged-modified-bg); }
 
+/* Merge-conflict sides. Not gated on the diff view (there is no diff to view on a conflicted
+   file), and ordered after the cursorline so the side colour survives the cursor parking on it —
+   the same precedence the diff tints get from their extra class. The marker lines take a text
+   colour only: they draw the boundary between the two bands, so tinting them would blur it. */
+.row.conflict-ours { background: var(--git-conflict-ours-bg); }
+.row.conflict-theirs { background: var(--git-conflict-theirs-bg); }
+.row.cursor-line.conflict-ours { background: var(--cursor-line-conflict-ours-bg); }
+.row.cursor-line.conflict-theirs { background: var(--cursor-line-conflict-theirs-bg); }
+.row.conflict-marker .content { color: var(--git-conflict-marker); }
+
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */
 .gutter {
@@ -648,6 +672,9 @@ html, body, #app {
 .gutter.added.staged { border-left-color: var(--git-staged-added); }
 .gutter.modified.staged { border-left-color: var(--git-staged-modified); }
 .gutter.phantom.staged { border-left-color: var(--git-staged-deleted); }
+/* One unbroken bar down a whole conflict block: the gutter says "conflict here", the row tints
+   say which side each line is on. */
+.gutter.conflict { border-left-color: var(--git-conflict-marker); }
 .gutter.deleted.staged::before { border-left-color: var(--git-staged-deleted); }
 /* Pure deletion with the diff view off: a small triangle straddling the line boundary (the removed
    lines sit "between" this line and the one above), rather than a misleading bar on this line. */

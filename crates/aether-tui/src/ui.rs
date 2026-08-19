@@ -15,8 +15,8 @@ use aether_protocol::search::SearchMatchRange;
 use aether_protocol::settings::ThemeMode;
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
-    DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange, Highlight, VisualRow,
-    WrapMode,
+    ConflictLine, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
+    Highlight, VisualRow, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
@@ -5106,9 +5106,19 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         // uses a green/olive cursorline variant so the diff colour isn't lost — the gutter change-bar
         // still marks it too. Selection and search keep their own span backgrounds, so they paint
         // over the tint via `apply_line_tint`.
+        // A conflict's side tints come first and are *not* gated on the diff view: the file has no
+        // diff to show (no baseline while conflicted), and which side a line belongs to is the only
+        // way to read it.
         let line_tint = if logical_line == cursor_line {
             let marker = if diff_view { render.diff_marker } else { None };
-            Some(cursor_line_bg(marker, render.diff_stage))
+            Some(
+                render
+                    .conflict
+                    .and_then(cursor_line_conflict_bg)
+                    .unwrap_or_else(|| cursor_line_bg(marker, render.diff_stage)),
+            )
+        } else if let Some(side) = render.conflict {
+            conflict_bg(side)
         } else if diff_view {
             render
                 .diff_marker
@@ -5175,7 +5185,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                         show_blame.then_some(blame_text.as_deref()).flatten(),
                     );
                     apply_line_tint(&mut spans, line_tint, viewport_cols);
-                    lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
+                    lines.push(prepend_gutter(
+                        gutter_mark,
+                        render.diff_stage,
+                        render.conflict,
+                        spans,
+                    ));
                     continue;
                 }
             };
@@ -5322,7 +5337,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 show_blame.then_some(blame_text.as_deref()).flatten(),
             );
             apply_line_tint(&mut spans, line_tint, viewport_cols);
-            lines.push(prepend_gutter(gutter_mark, render.diff_stage, spans));
+            lines.push(prepend_gutter(
+                gutter_mark,
+                render.diff_stage,
+                render.conflict,
+                spans,
+            ));
         }
         logical_line = match logical_line.checked_add(1) {
             Some(n) => n,
@@ -5455,7 +5475,16 @@ fn stage_color(stage: DiffStage, bright: Color, dim: Color) -> Color {
 /// The git column of the gutter: a colored bar for added/modified lines, a top marker for a line
 /// with deletions just above it, or blank. One col wide. The stage dims the kind colour when the
 /// change is staged.
-fn git_gutter_cell(mark: Option<DiffMarker>, stage: DiffStage) -> Span<'static> {
+fn git_gutter_cell(
+    mark: Option<DiffMarker>,
+    stage: DiffStage,
+    conflict: Option<ConflictLine>,
+) -> Span<'static> {
+    // One unbroken bar down the whole block, in one colour: the gutter's job here is "this region
+    // is a conflict", and which side each line is on is what the background tints say.
+    if conflict.is_some() {
+        return gutter_bar(c(th().git_conflict_marker));
+    }
     match mark {
         Some(DiffMarker::Added) => gutter_bar(stage_color(
             stage,
@@ -5483,12 +5512,27 @@ fn git_gutter_cell(mark: Option<DiffMarker>, stage: DiffStage) -> Span<'static> 
 }
 
 /// Prepend the gutter cell (git change column) to a row's content spans, producing the final `Line`.
+///
+/// Also where a conflict marker line gets its colour. Every row passes through here, and doing it
+/// on the assembled spans means the recolour lands after syntax highlighting — which on a
+/// `<<<<<<< HEAD` line is whatever the grammar made of text that isn't the language.
 fn prepend_gutter(
     mark: Option<DiffMarker>,
     stage: DiffStage,
+    conflict: Option<ConflictLine>,
     mut spans: Vec<Span<'static>>,
 ) -> Line<'static> {
-    spans.insert(0, git_gutter_cell(mark, stage));
+    if conflict == Some(ConflictLine::Marker) {
+        let fg = c(th().git_conflict_marker);
+        for span in spans.iter_mut() {
+            // Leave anything carrying its own background alone: selection, search and the cursor
+            // cell own both channels, and repainting their text would break them.
+            if span.style.bg.is_none() {
+                span.style = span.style.fg(fg);
+            }
+        }
+    }
+    spans.insert(0, git_gutter_cell(mark, stage, conflict));
     Line::from(spans)
 }
 
@@ -5501,6 +5545,27 @@ fn diff_marker_bg(marker: DiffMarker, stage: DiffStage) -> Option<Color> {
         (DiffMarker::Modified, DiffStage::Staged) => Some(c(th().git_staged_modified_bg)),
         (DiffMarker::Added, _) => Some(c(th().git_added_bg)),
         (DiffMarker::Modified, _) => Some(c(th().git_modified_bg)),
+    }
+}
+
+/// Background tint for a line inside a conflict block. The two sides get a wash each; the base
+/// section (diff3) and the marker lines get none — the base is context rather than an outcome, and
+/// tinting the markers would blur the boundary they exist to draw.
+fn conflict_bg(side: ConflictLine) -> Option<Color> {
+    match side {
+        ConflictLine::Ours => Some(c(th().git_conflict_ours_bg)),
+        ConflictLine::Theirs => Some(c(th().git_conflict_theirs_bg)),
+        ConflictLine::Base | ConflictLine::Marker => None,
+    }
+}
+
+/// [`conflict_bg`]'s cursorline variant, so the cursorline doesn't wash the side colour out.
+/// `None` where the side carries no tint, which falls back to the plain cursorline.
+fn cursor_line_conflict_bg(side: ConflictLine) -> Option<Color> {
+    match side {
+        ConflictLine::Ours => Some(c(th().cursor_line_conflict_ours_bg)),
+        ConflictLine::Theirs => Some(c(th().cursor_line_conflict_theirs_bg)),
+        ConflictLine::Base | ConflictLine::Marker => None,
     }
 }
 
@@ -9378,6 +9443,54 @@ mod tests {
             cells[0].1,
             Some(c(th().fg)),
             "non-overlap keeps hint colour"
+        );
+    }
+
+    #[test]
+    fn conflict_sides_get_a_tint_each_and_the_scenery_gets_none() {
+        assert_eq!(
+            conflict_bg(ConflictLine::Ours),
+            Some(c(th().git_conflict_ours_bg))
+        );
+        assert_eq!(
+            conflict_bg(ConflictLine::Theirs),
+            Some(c(th().git_conflict_theirs_bg))
+        );
+        // The markers draw the boundary; tinting them would blur it. The diff3 base is context.
+        assert_eq!(conflict_bg(ConflictLine::Marker), None);
+        assert_eq!(conflict_bg(ConflictLine::Base), None);
+        // The cursorline variants exist so parking on a side doesn't wash its colour away.
+        assert_eq!(
+            cursor_line_conflict_bg(ConflictLine::Ours),
+            Some(c(th().cursor_line_conflict_ours_bg))
+        );
+        assert_ne!(
+            cursor_line_conflict_bg(ConflictLine::Ours),
+            conflict_bg(ConflictLine::Ours)
+        );
+        assert_eq!(cursor_line_conflict_bg(ConflictLine::Marker), None);
+    }
+
+    #[test]
+    fn a_conflict_marker_line_is_recoloured_but_selection_survives() {
+        let plain = Span::styled("<<<<<<< HEAD".to_string(), Style::default().fg(c(th().fg)));
+        let selected = Span::styled(
+            "HEAD".to_string(),
+            Style::default().fg(c(th().fg)).bg(c(th().bg_visual)),
+        );
+        let line = prepend_gutter(
+            None,
+            DiffStage::Unstaged,
+            Some(ConflictLine::Marker),
+            vec![plain, selected],
+        );
+        // [0] is the gutter bar, which every line of a conflict block carries.
+        assert_eq!(line.spans[0].style.fg, Some(c(th().git_conflict_marker)));
+        assert_eq!(line.spans[1].style.fg, Some(c(th().git_conflict_marker)));
+        assert_eq!(
+            line.spans[2].style.fg,
+            Some(c(th().fg)),
+            "a span with its own background owns both channels — selection must not be repainted"
         );
     }
 

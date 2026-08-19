@@ -484,6 +484,7 @@ fn logical_line_render_virtual_rows_shape() {
         diff_marker: None,
         diff_stage: DiffStage::Unstaged,
         diff_emphasis: vec![],
+        conflict: None,
         diagnostics: vec![],
         sneak_targets: vec![],
     };
@@ -512,6 +513,10 @@ fn logical_line_render_virtual_rows_shape() {
         v.get("diagnostics").is_none(),
         "empty diagnostics omitted from wire"
     );
+    assert!(
+        v.get("conflict").is_none(),
+        "no conflict omitted from wire — every line of every unconflicted file"
+    );
 
     let with_del = LogicalLineRender {
         logical_line: 4,
@@ -526,6 +531,7 @@ fn logical_line_render_virtual_rows_shape() {
         diff_marker: Some(DiffMarker::Modified),
         diff_stage: DiffStage::Staged,
         diff_emphasis: vec![EmphasisRange { start: 0, end: 3 }],
+        conflict: None,
         diagnostics: vec![DiagnosticSpan {
             start: 4,
             end: 9,
@@ -560,6 +566,37 @@ fn logical_line_render_virtual_rows_shape() {
     assert_eq!(back.diff_stage, DiffStage::Staged);
     assert_eq!(back.diff_emphasis, vec![EmphasisRange { start: 0, end: 3 }]);
     assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
+}
+
+#[test]
+fn logical_line_render_conflict_shape() {
+    use aether_protocol::viewport::ConflictLine;
+    // The four sides are snake_case on the wire, and a conflicted line carries no diff marker:
+    // the blocks are masked out of the file's diff, so the two decorations never share a line.
+    let line = |conflict| LogicalLineRender {
+        logical_line: 3,
+        visual_rows: vec![],
+        search_matches: vec![],
+        virtual_rows_above: vec![],
+        diff_marker: None,
+        diff_stage: DiffStage::Unstaged,
+        diff_emphasis: vec![],
+        conflict: Some(conflict),
+        diagnostics: vec![],
+        sneak_targets: vec![],
+    };
+    for (side, wire) in [
+        (ConflictLine::Marker, "marker"),
+        (ConflictLine::Ours, "ours"),
+        (ConflictLine::Base, "base"),
+        (ConflictLine::Theirs, "theirs"),
+    ] {
+        let v = to_value(line(side)).unwrap();
+        assert_eq!(v["conflict"], wire);
+        assert!(v.get("diff_marker").is_none());
+        let back: LogicalLineRender = from_value(v).unwrap();
+        assert_eq!(back.conflict, Some(side));
+    }
 }
 
 #[test]
@@ -657,6 +694,7 @@ fn git_buffer_status_shape() {
         },
         upstream: None,
         baseline: None,
+        conflicts: 0,
         operation: None,
     };
     let v = to_value(&s).unwrap();
@@ -665,6 +703,10 @@ fn git_buffer_status_shape() {
     // different answers, and a client that can't tell them apart would report a never-pushed
     // branch as in sync.
     assert!(v.get("upstream").is_none());
+    assert!(
+        v.get("conflicts").is_none(),
+        "zero conflicts omitted — the state every unconflicted file is in"
+    );
     assert_eq!(
         v["staged"],
         json!({"added": 0, "modified": 1, "deleted": 0})
@@ -703,6 +745,112 @@ fn git_buffer_status_shape() {
         behind: 0,
     }
     .is_level());
+
+    // Mid-rebase: the operation and the file's own outstanding conflict count travel together.
+    // They answer different questions — the repo is stopped, *this file* still has three blocks —
+    // and the status bar shows both.
+    let conflicted = GitBufferStatus {
+        branch: Some("main".into()),
+        conflicts: 3,
+        operation: Some(aether_protocol::git::GitRepoOperation::Rebase),
+        ..Default::default()
+    };
+    let v = to_value(&conflicted).unwrap();
+    assert_eq!(v["conflicts"], 3);
+    assert_eq!(v["operation"], "rebase");
+    let back: GitBufferStatus = from_value(v).unwrap();
+    assert_eq!(back.conflicts, 3);
+}
+
+#[test]
+fn git_abort_and_conclude_shapes() {
+    use aether_protocol::git::{
+        GitAbortOperation, GitAbortOperationParams, GitAbortOperationResult, GitAbortStatus,
+        GitCommitResult, GitPrepareCommitResult, GitRepoOperation,
+    };
+    assert_eq!(GitAbortOperation::NAME, "git/abort_operation");
+    // Both hints omitted: the server resolves the repo from the buffer the user is on.
+    assert_eq!(
+        to_value(GitAbortOperationParams::default()).unwrap(),
+        json!({})
+    );
+    let aborted = GitAbortOperationResult {
+        status: GitAbortStatus::Aborted,
+        operation: Some(GitRepoOperation::Rebase),
+        ..Default::default()
+    };
+    let v = to_value(&aborted).unwrap();
+    assert_eq!(v, json!({"status": "aborted", "operation": "rebase"}));
+    let back: GitAbortOperationResult = from_value(v).unwrap();
+    assert_eq!(back.status, GitAbortStatus::Aborted);
+
+    // A commit that concluded a rebase which then stopped again: success and a to-do list at once,
+    // which is the shape the client's toast branches on.
+    let continued = GitCommitResult {
+        operation: Some(GitRepoOperation::Rebase),
+        conflicts: vec!["a.rs".into()],
+        ..Default::default()
+    };
+    let v = to_value(&continued).unwrap();
+    assert_eq!(v["operation"], "rebase");
+    assert_eq!(v["conflicts"], json!(["a.rs"]));
+    // An ordinary commit carries neither.
+    let plain = to_value(GitCommitResult::default()).unwrap();
+    assert!(plain.get("operation").is_none() && plain.get("conflicts").is_none());
+
+    // Nothing prepared when conflicts remain: the path is absent, so there is no buffer to open.
+    let blocked = GitPrepareCommitResult {
+        repo_id: "/repo".into(),
+        blocked_by_conflicts: vec!["a.rs".into()],
+        ..Default::default()
+    };
+    let v = to_value(&blocked).unwrap();
+    assert_eq!(
+        v,
+        json!({"repo_id": "/repo", "blocked_by_conflicts": ["a.rs"]})
+    );
+}
+
+#[test]
+fn git_resolve_conflict_shapes() {
+    use aether_protocol::git::{
+        ConflictSide, GitResolveConflict, GitResolveConflictParams, GitResolveConflictResult,
+        ResolveConflictStatus,
+    };
+    let p = GitResolveConflictParams {
+        buffer_id: 4,
+        side: ConflictSide::Theirs,
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"buffer_id": 4, "side": "theirs"})
+    );
+    assert_eq!(GitResolveConflict::NAME, "git/resolve_conflict");
+
+    // Both counts ride the result: what just happened, and what is left to do. Zero is omitted, so
+    // "nothing left" is an absent field — which is the state that unlocks marking the file
+    // resolved, and the client's `remaining == 0` branch has to survive that round trip.
+    let done = GitResolveConflictResult {
+        cursor: CursorState::default(),
+        status: ResolveConflictStatus::Resolved,
+        resolved: 2,
+        remaining: 0,
+    };
+    let v = to_value(&done).unwrap();
+    assert_eq!(v["status"], "resolved");
+    assert_eq!(v["resolved"], 2);
+    assert!(v.get("remaining").is_none());
+    let back: GitResolveConflictResult = from_value(v).unwrap();
+    assert_eq!(back.remaining, 0);
+    assert_eq!(back.status, ResolveConflictStatus::Resolved);
+
+    for (side, wire) in [
+        (ConflictSide::Ours, "ours"),
+        (ConflictSide::Theirs, "theirs"),
+        (ConflictSide::Both, "both"),
+    ] {
+        assert_eq!(to_value(side).unwrap(), json!(wire));
+    }
 }
 
 #[test]

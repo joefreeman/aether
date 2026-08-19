@@ -12,7 +12,7 @@
 //! time, and tables are scanned in order so more-specific chords precede catch-alls.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
-use aether_protocol::git::ApplyScope;
+use aether_protocol::git::{ApplyScope, ConflictSide};
 use aether_protocol::input::{BlockUnit, CommentStyle, SurroundTarget};
 use aether_protocol::picker::PickerKind;
 
@@ -437,6 +437,15 @@ pub enum Action {
     RevertChange {
         scope: ApplyScope,
     },
+    /// Take a side in the merge conflict under the cursor: `Space g o` ours, `Space g t` theirs,
+    /// `Space g Alt-o` both. A selection covering several blocks takes them all — the same
+    /// addressing [`Action::ToggleStage`] uses, which is why neither needs a file-scope key.
+    ResolveConflict {
+        side: ConflictSide,
+    },
+    /// `Space g Alt-x` — abandon a stopped merge/rebase. The sibling reading of `Space g x`:
+    /// plain cancels what is *running*, Alt abandons what is *stopped*.
+    GitAbortOperation,
     /// `Space g c` — start a commit: prepare the message file server-side and open it as a buffer.
     /// `amend` (`Space g Alt-c`) rewrites the previous commit instead of adding one.
     GitCommit {
@@ -1278,7 +1287,7 @@ static LEADER: &[Binding] = &[
 /// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
 /// `f`/`Alt-f` fetch/pull,
 /// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord),
-/// `o`/`t`/`Alt-o` conflict take-ours/theirs/both, `w`
+/// `w`
 /// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
 /// reflog is a filter chip on the log picker rather than a key: it's the same rows over a
 /// different ref walk.
@@ -1286,8 +1295,11 @@ static LEADER: &[Binding] = &[
 static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::Cursor }, "Git", "Stage/unstage change (hunk/selection)"),
     bind!(LG, ch('s'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::Cursor }, "Git", "Revert change"),
-    bind!(LG, ch('a'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::File }, "Git", "Stage/unstage whole file"),
+    bind!(LG, ch('a'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::File }, "Git", "Stage/unstage whole file (mark conflict resolved)"),
     bind!(LG, ch('a'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::File }, "Git", "Revert whole file"),
+    bind!(LG, ch('o'), Exact(Mods::NONE), A::ResolveConflict { side: ConflictSide::Ours }, "Git", "Conflict: take ours"),
+    bind!(LG, ch('t'), Exact(Mods::NONE), A::ResolveConflict { side: ConflictSide::Theirs }, "Git", "Conflict: take theirs"),
+    bind!(LG, ch('o'), Exact(Mods::ALT), A::ResolveConflict { side: ConflictSide::Both }, "Git", "Conflict: take both"),
     bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
@@ -1295,6 +1307,7 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('f'), Exact(Mods::ALT), A::GitPull, "Git", "Pull from remote"),
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPush, "Git", "Push commits to remote"),
     bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch, push or pull in progress"),
+    bind!(LG, ch('x'), Exact(Mods::ALT), A::GitAbortOperation, "Git", "Abandon the stopped merge/rebase"),
     bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),

@@ -63,6 +63,7 @@ pub fn render_line(
         diff_marker: None,
         diff_stage: Default::default(),
         diff_emphasis: Vec::new(),
+        conflict: None,
         diagnostics: Vec::new(),
         sneak_targets: Vec::new(),
     }

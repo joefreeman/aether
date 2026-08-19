@@ -79,6 +79,11 @@ pub struct Palette {
     pub cursor_line_modified_bg: Color,
     pub cursor_line_staged_added_bg: Color,
     pub cursor_line_staged_modified_bg: Color,
+    pub git_conflict_ours_bg: Color,
+    pub git_conflict_theirs_bg: Color,
+    pub git_conflict_marker: Color,
+    pub cursor_line_conflict_ours_bg: Color,
+    pub cursor_line_conflict_theirs_bg: Color,
 
     // ---- Markdown reading view ----
     pub md_code_bg: Color,
@@ -137,6 +142,11 @@ impl Palette {
             cursor_line_modified_bg: color(t.cursor_line_modified_bg),
             cursor_line_staged_added_bg: color(t.cursor_line_staged_added_bg),
             cursor_line_staged_modified_bg: color(t.cursor_line_staged_modified_bg),
+            git_conflict_ours_bg: color(t.git_conflict_ours_bg),
+            git_conflict_theirs_bg: color(t.git_conflict_theirs_bg),
+            git_conflict_marker: color(t.git_conflict_marker),
+            cursor_line_conflict_ours_bg: color(t.cursor_line_conflict_ours_bg),
+            cursor_line_conflict_theirs_bg: color(t.cursor_line_conflict_theirs_bg),
             md_code_bg: color(t.md_code_bg),
             md_table_stripe_bg: color(t.md_table_stripe_bg),
             md_alert_important: color(t.md_alert_important),

@@ -129,6 +129,15 @@ pub struct GitBufferStatus {
     /// gutter at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<GitBaselineRef>,
+    /// How many conflict blocks this file still has, when a stopped merge or rebase left it
+    /// conflicted. Zero — and omitted — for every unconflicted file.
+    ///
+    /// Counted from the buffer's markers, so it falls as the user resolves them and reaching zero
+    /// is the signal that the file is ready to be marked resolved. Distinct from `operation`, which
+    /// is about the *repo*: a stopped rebase can have several conflicted files and any number of
+    /// clean ones.
+    #[serde(default, skip_serializing_if = "crate::count_is_zero")]
+    pub conflicts: u32,
     /// A multi-step git operation the repo is stopped in the middle of, if any.
     ///
     /// Surfaced for the same reason `baseline` is: the editor is showing a state that doesn't match
@@ -162,6 +171,20 @@ pub enum GitRepoOperation {
 }
 
 impl GitRepoOperation {
+    /// The operation as a *thing*, for sentences about it — "abandoned the rebase". Distinct from
+    /// [`Self::label`], which is the present-continuous form the status bar shows next to the
+    /// branch; deriving one from the other by trimming would produce "rebas".
+    pub fn noun(self) -> &'static str {
+        match self {
+            GitRepoOperation::Merge => "merge",
+            GitRepoOperation::Rebase => "rebase",
+            GitRepoOperation::CherryPick => "cherry-pick",
+            GitRepoOperation::Revert => "revert",
+            GitRepoOperation::Bisect => "bisect",
+            GitRepoOperation::ApplyMailbox => "patch series",
+        }
+    }
+
     /// Present-continuous label for the status bar — "merging", "rebasing". Lower case: it renders
     /// as an aside next to the branch (`main (rebasing)`), not as a heading.
     pub fn label(self) -> &'static str {
@@ -290,14 +313,156 @@ pub enum ApplyHunkStatus {
     /// ([`GitSetBaseline`]): these hunks have no index relationship to stage into. Reverting
     /// still works. Restore the HEAD baseline to stage.
     NotAgainstHead,
-    /// Staging refused because this file is left conflicted by a merge or rebase.
+    /// Refused because this file is left conflicted by a merge or rebase, and the action asked for
+    /// doesn't mean anything there.
     ///
     /// Not a limitation but a guard against a silent surprise. A conflicted path has no stage-0
     /// index entry, so writing one is `git add`'s "mark resolved" — the user would press *stage
     /// this hunk* and get *resolve this file*, with the other side's changes and possibly the
-    /// conflict markers themselves committed to the index. The staged/unstaged split is meaningless
-    /// here anyway (see `git.rs`), so the gutter can't show what they'd be acting on.
+    /// conflict markers themselves committed to the index. Refused even where the gutter *does*
+    /// show a change (a block resolved by hand diffs against HEAD like any other edit): staging is
+    /// all-or-nothing until the file stops being conflicted.
+    ///
+    /// Covers per-hunk staging and *both* scopes of revert (there is no baseline to revert to
+    /// mid-conflict — "put this back" would mean discarding the merge). The one action that does
+    /// mean something is whole-file staging, which is [`Self::Resolved`].
     Conflicted,
+    /// The conflicted file was marked resolved: `git add`, run for real, on a file whose markers
+    /// are gone. The natural reading of *stage this whole file* on a conflicted path, and the same
+    /// command a terminal would use — so it runs the user's filters and clears the conflict stages
+    /// properly.
+    Resolved,
+    /// Marking resolved refused because conflict markers are still in the file. Committing markers
+    /// is the classic way to break a merge, and it is silent — nothing else would have told them.
+    MarkersRemain,
+}
+
+// ---- git/resolve_conflict -----------------------------------------------------------------------
+
+/// Resolve merge-conflict blocks by taking a side: keep our lines, their lines, or both, and delete
+/// the markers.
+///
+/// **An ordinary buffer edit, not an index operation.** The block is text the merge wrote into the
+/// file, so taking a side is a whole-document replacement like `git/apply_hunk`'s revert — one undo
+/// step, and nothing has happened as far as git is concerned until the file is saved and marked
+/// resolved (`git/apply_hunk` at [`ApplyScope::File`]). That split is deliberate: resolving is
+/// editing, and the user should be able to undo it, keep editing by hand afterwards, or abandon it,
+/// exactly as with any other edit.
+///
+/// Which blocks are addressed follows `git/apply_hunk`'s rule, so the two verbs feel the same: a
+/// bare cursor takes the block it sits in, and any wider selection takes every block it overlaps —
+/// which is how "take all of theirs in this file" is expressed, with no second key for it.
+pub struct GitResolveConflict;
+impl RpcMethod for GitResolveConflict {
+    const NAME: &'static str = "git/resolve_conflict";
+    type Params = GitResolveConflictParams;
+    type Result = GitResolveConflictResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitResolveConflictParams {
+    pub buffer_id: BufferId,
+    pub side: ConflictSide,
+}
+
+/// Which side of a conflict block to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictSide {
+    /// The lines between `<<<<<<<` and `|||||||`/`=======`.
+    Ours,
+    /// The lines between `=======` and `>>>>>>>`.
+    Theirs,
+    /// Both, ours first — the file order, so the result reads as the block did.
+    Both,
+}
+
+/// The common-ancestor section (`merge.conflictstyle = diff3`) is never a side: it is what *was*
+/// there, shown as context. Every resolution drops it along with the markers.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitResolveConflictResult {
+    /// Cursor after the edit, clamped into the resolved text — echoed like
+    /// [`GitApplyHunkResult::cursor`] so the client adopts it unconditionally.
+    pub cursor: CursorState,
+    pub status: ResolveConflictStatus,
+    /// How many blocks this call resolved.
+    #[serde(default, skip_serializing_if = "crate::count_is_zero")]
+    pub resolved: u32,
+    /// How many are left in the buffer. Zero is the interesting value: it means the file is ready
+    /// to be marked resolved, which is what the client says next.
+    #[serde(default, skip_serializing_if = "crate::count_is_zero")]
+    pub remaining: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolveConflictStatus {
+    Resolved,
+    /// Nothing to resolve where the cursor or selection is. Also the answer for a file with no
+    /// conflicts at all — the two are the same thing to say, and `c` is how you get to one.
+    #[default]
+    NoConflict,
+}
+
+// ---- git/abort_operation ------------------------------------------------------------------------
+
+/// Abandon a stopped merge / rebase / cherry-pick / revert: `<op> --abort`, which puts the working
+/// tree and HEAD back where they were before it started.
+///
+/// The way out. A conflicted `pull --rebase` leaves HEAD detached and the tree half-applied; every
+/// other git verb then refuses with "you're mid-rebase", and until this existed the only way back
+/// was a terminal. Bound to `Space g Alt-x` — the sibling reading of `x`: cancel what's *running*,
+/// `Alt-x` abandon what's *stopped*.
+///
+/// Destructive in the way `git checkout` is: it discards the resolution work done so far, so it
+/// carries the same dirty-buffer pre-flight (unsaved edits would be overwritten by the reset).
+/// Nothing else is guarded — abandoning is the point, and the commits it unwinds are the ones the
+/// operation created.
+pub struct GitAbortOperation;
+impl RpcMethod for GitAbortOperation {
+    const NAME: &'static str = "git/abort_operation";
+    type Params = GitAbortOperationParams;
+    type Result = GitAbortOperationResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitAbortOperationParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitAbortOperationResult {
+    pub status: GitAbortStatus,
+    /// The operation that was abandoned (or, for [`GitAbortStatus::BlockedByDirtyBuffers`], the one
+    /// still in progress). `None` only when there was nothing to abort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitRepoOperation>,
+    /// git's own words when it refused, verbatim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Buffers with unsaved edits, blocking the abort.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked: Vec<BufferId>,
+    #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
+    pub refreshed: GitRefreshResult,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitAbortStatus {
+    Aborted,
+    /// The repo isn't stopped in anything. Not an error — pressing the key on a clean repo should
+    /// say so, not fail.
+    #[default]
+    NothingInProgress,
+    /// Unsaved buffers in the repo: the abort rewrites the working tree and would take their edits
+    /// with it. Refused rather than saved on the user's behalf, exactly as checkout and pull do.
+    BlockedByDirtyBuffers,
+    /// git refused; `message` carries its text.
+    Refused,
 }
 
 // ---- git/set_blame_follow -----------------------------------------------------------------------
@@ -437,18 +602,28 @@ pub struct GitPrepareCommitParams {
     pub amend: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitPrepareCommitResult {
     /// The repo this resolved to. Echoed so the follow-up [`GitCommit`] targets exactly what was
     /// prepared, even if the user has moved to another buffer in the meantime.
     pub repo_id: RepoId,
     /// Absolute path of the message file to open. Lives in the repo's *own* git dir, so a linked
-    /// worktree composes its message independently of the main checkout.
+    /// worktree composes its message independently of the main checkout. Empty when the commit was
+    /// refused before a message file was written — see `blocked_by_conflicts`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
     /// What would be committed, for the client to show — and to decide whether it's worth opening
     /// a buffer at all. Empty with `amend: false` means `git commit` would refuse.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub staged: Vec<StagedFile>,
+    /// Files still left conflicted by a stopped merge or rebase. When non-empty **nothing was
+    /// prepared**: git would refuse the commit, and the message buffer should not open.
+    ///
+    /// Checked here rather than left to git because the refusal arrives after the user has written
+    /// a message, and it names the state ("you have unmerged files") rather than the files. Naming
+    /// them makes the next step obvious.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_conflicts: Vec<String>,
 }
 
 /// One path in the index, with the word git would use for it in `git status`.
@@ -503,6 +678,20 @@ pub struct GitCommitResult {
     /// routinely rewrite files (formatters), and those buffers have to be picked up.
     #[serde(default, skip_serializing_if = "GitRefreshResult::is_empty")]
     pub refreshed: GitRefreshResult,
+    /// The multi-step operation this commit concluded — or, when `conflicts` is non-empty, the one
+    /// it is *still* in.
+    ///
+    /// A commit made during a stopped merge finishes it outright, but a rebase (and a multi-commit
+    /// cherry-pick or revert) has more to apply, so the server runs `<op> --continue` behind this
+    /// commit. That is what makes `Space g c` mean "conclude what's outstanding" rather than
+    /// "commit, and now go and find the other command".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitRepoOperation>,
+    /// Files left conflicted by the `--continue` above — the next patch in a rebase can stop just
+    /// like the first one did. Non-empty means the commit succeeded and the operation is still
+    /// running, which is a success and a to-do list at the same time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
 }
 
 // ---- git/reset -----------------------------------------------------------------------------------

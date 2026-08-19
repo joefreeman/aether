@@ -403,6 +403,7 @@ mod tests {
             virtual_rows_above: vec![],
             diff_marker: None,
             diff_stage: Default::default(),
+            conflict: None,
             diff_emphasis: vec![],
             diagnostics: vec![],
             sneak_targets: vec![],

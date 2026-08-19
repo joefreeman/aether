@@ -5557,25 +5557,130 @@ fn pull_reports_a_repo_left_mid_operation() {
     assert!(!toast_messages(&fx).join(" ").contains("index.lock"));
 }
 
-/// Staging inside a conflicted file is refused with the reason, because the silent alternative was
-/// `git add`'s "mark resolved" — a different operation from the one the key names.
+/// Staging a *hunk* inside a conflicted file is refused with the reason, because the silent
+/// alternative was `git add`'s "mark resolved" — a different operation from the one the key names.
+/// The refusal points at the keys that do mean something here, so it's a signpost, not a wall.
 #[test]
 fn staging_a_conflicted_file_explains_the_refusal() {
     use aether_client::update::Event;
     use aether_protocol::git::{ApplyHunkStatus, ApplyScope, GitApplyHunkResult, HunkAction};
 
     let mut s = session();
-    let fx = s.on_event(Event::HunkApplied {
-        action: HunkAction::Toggle,
-        scope: ApplyScope::Cursor,
-        result: Ok(GitApplyHunkResult {
-            cursor: Default::default(),
-            status: ApplyHunkStatus::Conflicted,
-        }),
-    });
-    let msg = toast_messages(&fx).join(" ");
+    let toast = |s: &mut Session, status| {
+        toast_messages(&s.on_event(Event::HunkApplied {
+            action: HunkAction::Toggle,
+            scope: ApplyScope::File,
+            result: Ok(GitApplyHunkResult {
+                cursor: Default::default(),
+                status,
+            }),
+        }))
+        .join(" ")
+    };
+
+    let msg = toast(&mut s, ApplyHunkStatus::Conflicted);
     assert!(
-        msg.contains("resolved") && msg.contains("Conflicted"),
+        msg.contains("Conflicted") && msg.contains("resolve"),
+        "got {msg:?}"
+    );
+    // The two outcomes of the whole-file key on a conflicted path.
+    assert!(toast(&mut s, ApplyHunkStatus::Resolved).contains("Marked resolved"));
+    let msg = toast(&mut s, ApplyHunkStatus::MarkersRemain);
+    assert!(msg.contains("markers"), "got {msg:?}");
+}
+
+/// Taking a side names the side and what's left, because the buffer just changed under the user and
+/// the count decides what they do next: visit the next block, or mark the file resolved.
+#[test]
+fn resolving_a_conflict_names_the_side_and_what_remains() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{ConflictSide, GitResolveConflictResult, ResolveConflictStatus};
+
+    let result = |resolved, remaining| {
+        Ok(GitResolveConflictResult {
+            cursor: Default::default(),
+            status: ResolveConflictStatus::Resolved,
+            resolved,
+            remaining,
+        })
+    };
+
+    let mut s = session();
+    let msg = toast_messages(&s.on_event(Event::ConflictResolved {
+        side: ConflictSide::Theirs,
+        result: result(1, 2),
+    }))
+    .join(" ");
+    assert!(
+        msg.contains("theirs") && msg.contains("2 left"),
+        "got {msg:?}"
+    );
+
+    // Reaching zero is the signal the file is done, and a multi-block take says how many it took.
+    let msg = toast_messages(&s.on_event(Event::ConflictResolved {
+        side: ConflictSide::Both,
+        result: result(2, 0),
+    }))
+    .join(" ");
+    assert!(
+        msg.contains("both sides") && msg.contains("2 conflicts") && msg.contains("none left"),
+        "got {msg:?}"
+    );
+
+    // Nowhere near a block: says so rather than reporting a resolution that didn't happen.
+    let msg = toast_messages(&s.on_event(Event::ConflictResolved {
+        side: ConflictSide::Ours,
+        result: Ok(GitResolveConflictResult::default()),
+    }))
+    .join(" ");
+    assert!(msg.contains("No conflict here"), "got {msg:?}");
+}
+
+/// The two ends of concluding an operation: `Space g Alt-x` abandons it, and a commit that resumed
+/// one says so — including when the resumed operation stopped again, which is a success and a
+/// to-do list at the same time.
+#[test]
+fn finishing_an_operation_reports_what_happened_to_it() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{
+        CommitInfo, GitAbortOperationResult, GitAbortStatus, GitCommitResult, GitRepoOperation,
+    };
+
+    let mut s = session();
+    let msg = toast_messages(
+        &s.on_event(Event::OperationAborted(Ok(GitAbortOperationResult {
+            status: GitAbortStatus::Aborted,
+            operation: Some(GitRepoOperation::Rebase),
+            ..Default::default()
+        }))),
+    )
+    .join(" ");
+    assert!(msg.contains("Abandoned the rebase"), "got {msg:?}");
+
+    // On a clean repo the way-out key says so rather than failing.
+    let msg = toast_messages(&s.on_event(Event::OperationAborted(Ok(
+        GitAbortOperationResult::default(),
+    ))))
+    .join(" ");
+    assert!(msg.contains("Nothing in progress"), "got {msg:?}");
+
+    // A rebase that hit the next conflict: the commit worked, and there is more to do.
+    let commit = CommitInfo {
+        commit: "abcdef1234".into(),
+        author: "Test".into(),
+        email: "t@e.com".into(),
+        date: "2026-08-19 12:00:00 +0100".into(),
+        message: "my edit".into(),
+    };
+    let msg = toast_messages(&s.on_event(Event::Committed(Ok(GitCommitResult {
+        commit: Some(commit),
+        operation: Some(GitRepoOperation::Rebase),
+        conflicts: vec!["a.rs".into()],
+        ..Default::default()
+    }))))
+    .join(" ");
+    assert!(
+        msg.contains("Committed") && msg.contains("rebase stopped at") && msg.contains("a.rs"),
         "got {msg:?}"
     );
 }

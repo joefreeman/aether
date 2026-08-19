@@ -88,6 +88,11 @@ export interface VirtualRow {
 
 export type DiffMarker = "added" | "modified" | "deleted";
 
+/** Which part of a merge-conflict block a line belongs to. Present only on files a stopped merge
+ *  or rebase left conflicted; the blocks are masked out of that file's diff, so a line never
+ *  carries both this and a diff_marker. */
+export type ConflictLine = "marker" | "ours" | "base" | "theirs";
+
 /** Which side of the index a change sits on. Binary by design: where staged and unstaged
  *  overlap (modified, staged, modified again), the unstaged top layer wins. Omitted when
  *  "unstaged". */
@@ -122,6 +127,9 @@ export interface LogicalLineRender {
   diff_stage?: DiffStage;
   /** Intra-line diff emphasis (diff view only): sub-ranges of the line a Modified hunk changed. */
   diff_emphasis?: EmphasisRange[];
+  /** Which side of a merge conflict this line is; absent unless the file is conflicted. Unlike
+   *  the diff tint this is not gated on the diff view. */
+  conflict?: ConflictLine | null;
   diagnostics?: DiagnosticSpan[];
   sneak_targets?: SneakTarget[];
 }

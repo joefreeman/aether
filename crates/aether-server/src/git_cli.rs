@@ -91,6 +91,13 @@ pub async fn run(cwd: &Path, args: &[&str]) -> std::io::Result<GitOutput> {
     if let Some(env) = crate::lsp::shell_env::resolve(cwd).await {
         cmd.envs(&env);
     }
+    // The daemon has no terminal, so a git that decides to open an editor would sit there forever
+    // (and `$EDITOR` from the user's shell may well be an interactive one). Every command here
+    // either needs no message or passes it with `-F`, so "the editor did nothing and succeeded" is
+    // exactly the right answer — `git rebase --continue` then reuses the stored message, and
+    // `git pull`'s merge commit takes its default. Set after the shell environment, deliberately,
+    // so it wins over an inherited `GIT_EDITOR`.
+    cmd.env("GIT_EDITOR", "true");
 
     let out = cmd.output().await?;
     Ok(GitOutput {
@@ -131,6 +138,13 @@ pub async fn run_streaming(
     if let Some(env) = crate::lsp::shell_env::resolve(cwd).await {
         cmd.envs(&env);
     }
+    // The daemon has no terminal, so a git that decides to open an editor would sit there forever
+    // (and `$EDITOR` from the user's shell may well be an interactive one). Every command here
+    // either needs no message or passes it with `-F`, so "the editor did nothing and succeeded" is
+    // exactly the right answer — `git rebase --continue` then reuses the stored message, and
+    // `git pull`'s merge commit takes its default. Set after the shell environment, deliberately,
+    // so it wins over an inherited `GIT_EDITOR`.
+    cmd.env("GIT_EDITOR", "true");
     // Ask for progress explicitly: git suppresses it when stderr isn't a terminal, which ours
     // never is.
     cmd.env("GIT_PROGRESS_DELAY", "0");
