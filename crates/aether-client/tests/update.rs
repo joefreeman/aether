@@ -3374,6 +3374,51 @@ fn requests_are_emitted_in_dispatch_order() {
 }
 
 #[test]
+fn a_jumplist_change_elsewhere_re_views_an_open_jumplist_picker() {
+    // Another client in the context captured or cleared. The push carries nothing: the client
+    // re-views, because a capture can flip the list between grouped and flat and that gate rides
+    // the view response. Selection goes back to the top — it's a different list now.
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::jumplist::JumplistChanged;
+    use aether_protocol::picker::PickerKind;
+
+    let changed = || {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: JumplistChanged::NAME.into(),
+            params: serde_json::json!({}),
+        })
+    };
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Jumplist, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.loaded = true;
+        p.selected = 7;
+        p.offset = 5;
+    }
+    let fx = s.on_event(changed());
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "picker/view");
+    assert_eq!(params["kind"], "jumplist");
+    assert_eq!(params["offset"], 0, "re-views from the top of the new list");
+    assert_eq!(
+        params["reset"], "keep",
+        "the typed query survives — it filters whatever the list is now"
+    );
+    assert_eq!(s.picker.as_ref().unwrap().selected, 0);
+
+    // A different picker open, or none at all: nothing to refresh, no traffic.
+    let _ = s.close_picker();
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false, None);
+    assert!(no_request(&s.on_event(changed())));
+    let _ = s.close_picker();
+    assert!(no_request(&s.on_event(changed())));
+}
+
+#[test]
 fn jumplist_capture_swaps_the_picker_for_the_jumplist() {
     // Picker Ctrl-j sends `jumplist/capture` with the highlighted item (the source picker stays
     // open while it's in flight); the Ok(Some) response swaps it for the Jumplist picker framed
@@ -3442,6 +3487,82 @@ fn jumplist_capture_swaps_the_picker_for_the_jumplist() {
     assert_eq!(view["kind"], "jumplist");
     assert_eq!(view["center_on"]["kind"], "jumplist_entry");
     assert_eq!(view["center_on"]["index"], 0);
+}
+
+#[test]
+fn clearing_the_jumplist_adopts_the_undecorated_cursor_and_toasts() {
+    // `Space Alt-j`. The response carries the caller's cursor with the `k/N` stamp already gone —
+    // adopting it is what makes the status segment disappear on the clear rather than on the next
+    // keystroke. Nothing captured is a keyed Info toast, not an error.
+    use aether_client::update::Event;
+    use aether_protocol::cursor::{CursorState, JumplistPosition};
+    use aether_protocol::jumplist::JumplistClearResult;
+    use aether_protocol::LogicalPosition;
+
+    let mut s = session();
+    s.buffer.cursor = CursorState {
+        position: LogicalPosition { line: 4, col: 9 },
+        anchor: LogicalPosition { line: 4, col: 2 },
+        jumplist_position: Some(JumplistPosition {
+            current: 3,
+            total: 17,
+        }),
+        ..Default::default()
+    };
+
+    // The chord: Space arms the leader, Alt-j discards. The buffer rides along so the response
+    // can bring back a cursor to adopt.
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "jumplist/clear");
+    assert_eq!(params["buffer_id"], s.buffer.buffer_id);
+
+    let fx = s.on_event(Event::JumplistCleared(Ok(JumplistClearResult {
+        cleared: 17,
+        cursor: Some(CursorState {
+            position: LogicalPosition { line: 4, col: 9 },
+            anchor: LogicalPosition { line: 4, col: 2 },
+            ..Default::default()
+        }),
+    })));
+    assert_eq!(
+        s.buffer.cursor.jumplist_position, None,
+        "the status counter goes with the list"
+    );
+    assert_eq!(
+        s.buffer.cursor.position,
+        LogicalPosition { line: 4, col: 9 },
+        "…and the cursor itself is where it was"
+    );
+    assert_eq!(
+        first_toast(&fx),
+        Some((
+            "Cleared 17 results from the jumplist".into(),
+            Some("jumplist".into())
+        )),
+    );
+
+    // Singular, and the already-empty case — same key, so mashing the chord coalesces.
+    let fx = s.on_event(Event::JumplistCleared(Ok(JumplistClearResult {
+        cleared: 1,
+        cursor: None,
+    })));
+    assert_eq!(
+        first_toast(&fx),
+        Some((
+            "Cleared 1 result from the jumplist".into(),
+            Some("jumplist".into())
+        )),
+    );
+    let fx = s.on_event(Event::JumplistCleared(Ok(JumplistClearResult {
+        cleared: 0,
+        cursor: None,
+    })));
+    assert_eq!(
+        first_toast(&fx),
+        Some(("Jumplist is already empty".into(), Some("jumplist".into()))),
+    );
 }
 
 #[test]

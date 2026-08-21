@@ -145,18 +145,14 @@ pub struct ServerState {
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
     /// Per-client navigation history: back/forward across files, browser-style. (Distinct from
-    /// the *jumplist* — the captured picker-results list, [`ServerState::jumplist`].)
+    /// the *jumplist* — the captured picker-results list, which is per *context* rather than per
+    /// client and lives on [`WorkspaceEntry::jumplist`].)
     /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
     /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `buffer/open`'s
     /// `record_nav_from`); driven by the TUI's `nav/back`/`nav/forward`. The web client rides
     /// native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
-    /// Per-client jumplist: the quickfix-style snapshot `jumplist/capture` takes of a picker's
-    /// filtered results, stepped cursor-relative by `jumplist/step` (`]` / `[`). Like
-    /// `nav_history`, transient: replaced by the next capture, cleared on workspace switch (entries
-    /// reference the prior workspace's files) and on disconnect.
-    pub jumplist: HashMap<ClientId, crate::jumplist::Jumplist>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
     /// (`git diff`). Populated on `buffer/open` for file-backed buffers; recomputed as the buffer
     /// changes. Empty / absent for scratch buffers and files outside a repo. Shared by all clients
@@ -454,6 +450,18 @@ pub struct WorkspaceEntry {
     /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
     /// live buffer in this workspace — promotion removes it.
     pub dormant_buffers: Vec<DormantBuffer>,
+    /// This context's jumplist: the quickfix-style snapshot `jumplist/capture` takes of a picker's
+    /// filtered results, stepped cursor-relative by `jumplist/step` (`]` / `[`). `None` until
+    /// something is captured; replaced wholesale by the next capture.
+    ///
+    /// Lives on the entry — not on the client — for the same reason [`Self::mru_buffers`] does, and
+    /// for one more. The reason it shares: a client has no durable identity, so a list hung off a
+    /// `ClientId` dies with the window that captured it, and two shells attached to the same context
+    /// each step a list the other can't see. The reason it doesn't: entries carry absolute paths, so
+    /// a list that followed a worktree rebind would step you into the tree you just left. Because
+    /// the `workspaces` map is keyed by [`crate::worktree::context_id`] — name *plus* bindings —
+    /// storing it here makes both right at once: one list per tree, each surviving the client.
+    pub jumplist: Option<crate::jumplist::Jumplist>,
     /// Projects declared by this workspace's config, whose language servers are pinned open while
     /// it's active. Flattened out of the config's nested `[[roots]]` form, so each carries the
     /// index of the root it was declared under.
@@ -587,7 +595,6 @@ impl ServerState {
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
-            jumplist: HashMap::new(),
             git_unstaged_hunks: HashMap::new(),
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
@@ -727,6 +734,28 @@ impl ServerState {
             .ok_or_else(crate::error::RpcError::no_active_workspace)
     }
 
+    /// The workspace the given client currently has activated, mutably.
+    pub fn active_workspace_mut(&mut self, client_id: ClientId) -> Option<&mut WorkspaceEntry> {
+        let id = self.clients.get(&client_id)?.active_workspace.clone()?;
+        self.workspaces.get_mut(&id)
+    }
+
+    /// The jumplist the given client steps: the one belonging to the context it is standing in.
+    /// See [`WorkspaceEntry::jumplist`] for why the client is a lens onto the context's list rather
+    /// than the owner of a list of its own. `None` with no active workspace, or nothing captured
+    /// there yet.
+    pub fn jumplist(&self, client_id: ClientId) -> Option<&crate::jumplist::Jumplist> {
+        self.active_workspace(client_id)?.jumplist.as_ref()
+    }
+
+    /// Replace the active context's jumplist. Silently drops the list when the client has no active
+    /// workspace — a capture can only come from a picker, which needs one.
+    pub fn set_jumplist(&mut self, client_id: ClientId, list: crate::jumplist::Jumplist) {
+        if let Some(entry) = self.active_workspace_mut(client_id) {
+            entry.jumplist = Some(list);
+        }
+    }
+
     /// Id of the workspace a buffer belongs to. `None` if the buffer is unknown or somehow
     /// untagged (shouldn't happen for live buffers but the lookup is defensive).
     pub fn workspace_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
@@ -811,6 +840,7 @@ impl ServerState {
                 workspace_index,
                 mru_buffers: VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                jumplist: None,
                 // An ephemeral workspace has no config file, so nothing can declare a project in it.
                 projects: Vec::new(),
             },
@@ -1341,12 +1371,6 @@ impl ServerState {
         self.nav_history.remove(&client_id);
     }
 
-    /// Remove the jumplist for the given client. Used on disconnect, like
-    /// `drop_nav_history_for_client` (and on workspace switch, alongside the picker wipe).
-    pub fn drop_jumplist_for_client(&mut self, client_id: ClientId) {
-        self.jumplist.remove(&client_id);
-    }
-
     /// Bump `buffer_id` to the front of its workspace's MRU. Called from `buffer/open` every time
     /// any client lands on a buffer — fresh open, reopen, or attach-by-id. No-op if the buffer
     /// has no recorded workspace (shouldn't happen for live buffers but the lookup is defensive).
@@ -1609,10 +1633,11 @@ impl ServerState {
         self.symbol_path_sent.retain(|(c, b), _| !in_proj(c, b));
 
         // Pickers are per-session UI state — their candidate sets/queries reference the prior
-        // workspace so wipe them all on switch. The jumplist goes with them: its
-        // entries point into the prior workspace's files.
+        // workspace so wipe them all on switch. The jumplist used to go with them, back when it
+        // hung off the client: it stays now, on the entry being left, because the entry is what its
+        // paths point into — so coming back finds it, and stepping in the workspace you switched to
+        // steps *its* list. Same rule, arrived at by ownership rather than by a wipe.
         self.pickers.retain(|(c, _), _| *c != client_id);
-        self.jumplist.remove(&client_id);
     }
 }
 
@@ -2406,6 +2431,7 @@ mod workspace_state_tests {
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
             mru_buffers: VecDeque::new(),
             dormant_buffers: Vec::new(),
+            jumplist: None,
             projects: Vec::new(),
         }
     }

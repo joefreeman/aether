@@ -1,7 +1,13 @@
-//! The jumplist: a per-client snapshot of one picker's filtered results, stepped from Normal mode
-//! with `]` / `[` (`jumplist/step`), stopping (not wrapping) at the ends. Lives in
-//! `ServerState.jumplist` next to the nav history; replaced by the next `jumplist/capture`, wiped
-//! on workspace switch and disconnect.
+//! The jumplist: a snapshot of one picker's filtered results, stepped from Normal mode with `]` /
+//! `[` (`jumplist/step`), stopping (not wrapping) at the ends. Replaced by the next
+//! `jumplist/capture`.
+//!
+//! It belongs to the **context** — `WorkspaceEntry::jumplist`, keyed by workspace name *plus*
+//! worktree bindings — not to the client that captured it. So every shell attached to a context
+//! steps one list, a list outlives the window that made it, and two worktrees of one repo hold two
+//! lists (which they must: entries below carry absolute paths into one tree). Stepping stays
+//! per-client regardless, because it is derived from the stepping client's cursor rather than from
+//! a stored index — there is no "current entry" for two clients to fight over.
 //!
 //! Entries are deliberately flat (quickfix-style): one presentation-neutral `display` string, a
 //! jump target mirroring what selecting the row in the source picker would do, and the source

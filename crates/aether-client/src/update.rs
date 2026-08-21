@@ -83,8 +83,9 @@ use aether_protocol::input::{
     ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
-    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
-    JumplistStepParams, JumplistStepResult, JumplistStepScope,
+    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistChanged, JumplistClear,
+    JumplistClearParams, JumplistClearResult, JumplistStep, JumplistStepParams, JumplistStepResult,
+    JumplistStepScope,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -187,6 +188,9 @@ pub enum Event {
         Direction,
         JumplistStepScope,
     ),
+    /// A `jumplist/clear` resolved (`Space Alt-j`): the context's list is gone. `cleared == 0`
+    /// means there was nothing captured — not a failure, so it toasts rather than errors.
+    JumplistCleared(Result<JumplistClearResult, String>),
     /// An `app/info` snapshot resolved (`Space ?`): open the info dialog, or toast the failure.
     AppInfoLoaded(Result<aether_protocol::app::AppInfo, String>),
     /// The prompt's Yes/Save button (keyboard accept routes through `on_prompt_key`).
@@ -812,6 +816,27 @@ impl Session {
                 Effects::toast_grouped("Jumplist is empty", ToastKind::Info, "jumplist")
             }
             Event::JumplistStepped(Err(e), _, _) => Effects::error_detail("Jump failed", e),
+
+            // `Space Alt-j`. Adopt the re-decorated cursor so the status bar's `k/N` segment goes
+            // with the list rather than lingering until the next keystroke.
+            Event::JumplistCleared(Ok(r)) => {
+                if let Some(cursor) = r.cursor {
+                    self.buffer.cursor = cursor;
+                }
+                let msg = if r.cleared == 0 {
+                    "Jumplist is already empty".to_string()
+                } else {
+                    let noun = if r.cleared == 1 { "result" } else { "results" };
+                    format!("Cleared {} {noun} from the jumplist", r.cleared)
+                };
+                let kind = if r.cleared == 0 {
+                    ToastKind::Info
+                } else {
+                    ToastKind::Success
+                };
+                Effects::toast_grouped(msg, kind, "jumplist")
+            }
+            Event::JumplistCleared(Err(e)) => Effects::error_detail("Clear failed", e),
 
             Event::PromptAccept => self.accept_prompt(),
             Event::PromptCancel => self.decline_prompt(),
@@ -6036,6 +6061,19 @@ impl Session {
                 }
                 Effects::none()
             }
+            // Another client in this context captured or cleared the jumplist out from under our
+            // open Jumplist picker. Re-view rather than patching rows in: a capture can flip the
+            // list between grouped and flat (and in or out of path-scopeable), and both gates ride
+            // the view response, not the push. The selection goes back to the top because this is a
+            // *different* list — holding row 7 across the swap would point at nothing meaningful.
+            JumplistChanged::NAME => match &mut self.picker {
+                Some(p) if p.kind == PickerKind::Jumplist => {
+                    p.selected = 0;
+                    p.level = PickerLevel::Group;
+                    self.picker_refetch(0, false)
+                }
+                _ => Effects::none(),
+            },
             PickerUpdate::NAME => {
                 if let Ok(u) = serde_json::from_value::<PickerUpdateParams>(n.params) {
                     let mut reveal = None;
@@ -6584,6 +6622,17 @@ impl Session {
                 open: true,
             },
             move |r| Event::JumplistStepped(r, direction, scope),
+        )
+    }
+
+    /// `Space Alt-j`: discard the context's captured list. Sends the current buffer so the
+    /// response can carry a cursor with the `k/N` stamp already gone.
+    fn clear_jumplist(&mut self) -> Effects {
+        self.request_str::<JumplistClear>(
+            JumplistClearParams {
+                buffer_id: Some(self.buffer.buffer_id),
+            },
+            Event::JumplistCleared,
         )
     }
 
@@ -8842,6 +8891,7 @@ impl Session {
             A::JumplistStep(direction) => {
                 self.jumplist_step(direction, count, JumplistStepScope::Full)
             }
+            A::ClearJumplist => self.clear_jumplist(),
             A::JumplistStepInFile(direction) => {
                 self.jumplist_step(direction, count, JumplistStepScope::CurrentFile)
             }

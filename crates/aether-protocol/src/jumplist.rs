@@ -5,12 +5,17 @@
 //! picker, `jumplist/capture` snapshots the currently-visible (filtered, ranked) result set
 //! server-side; the client then shows it as the Jumplist picker (Enter jumps), and
 //! `jumplist/step` walks the captured entries cursor-relative from Normal mode (`]` / `[`),
-//! wrapping at the ends. The list is per-client, lives on the server (like nav history), and
-//! survives until the next capture, a workspace switch, or disconnect.
+//! stopping (not wrapping) at the ends.
+//!
+//! The list lives on the server and belongs to the **context** — a workspace resolved against its
+//! worktree bindings — not to the client that captured it. So every shell attached to that context
+//! steps one list, the list outlives the window that made it, and two worktrees of one repo keep
+//! two lists. It survives until the next `jumplist/capture` replaces it or `jumplist/clear`
+//! discards it.
 
 use crate::buffer::BufferOpenResult;
 use crate::cursor::Direction;
-use crate::envelope::RpcMethod;
+use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::picker::{PickerItem, PickerKind};
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
@@ -53,6 +58,66 @@ pub struct JumplistCaptureResult {
     /// `picker/view { center_on: JumplistEntry { index } }` to keep it highlighted.
     pub index: u32,
 }
+
+// ---- jumplist/clear ------------------------------------------------------------------------------
+
+/// Discard the context's captured list — Normal-mode `Space Alt-j`. A separate method from
+/// `jumplist/capture` rather than a flag on it: capture reads a picker and writes entries, this
+/// reads nothing and writes emptiness, and the two share no parameter but the client id.
+///
+/// Clears for **everyone** in the context, since that is who the list belongs to. The response
+/// carries the caller's re-decorated cursor so its status counter drops immediately; other clients'
+/// counters are stale until their next cursor-bearing response, the same as after a capture.
+pub struct JumplistClear;
+impl RpcMethod for JumplistClear {
+    const NAME: &'static str = "jumplist/clear";
+    type Params = JumplistClearParams;
+    type Result = JumplistClearResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JumplistClearParams {
+    /// The buffer the caller is looking at, so `cursor` can come back re-decorated. `None` when it
+    /// is on no buffer at all, which is answerable without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JumplistClearResult {
+    /// Entries discarded — `0` when nothing was captured, which the client toasts differently
+    /// (there is no error either way: clearing an empty list is a no-op, not a failure).
+    pub cleared: u32,
+    /// The caller's cursor on `buffer_id`, re-decorated now the list is gone — so
+    /// `jumplist_position` is `None` and the status bar's `k/N` segment disappears on this
+    /// response rather than on the next keystroke. `None` when no `buffer_id` was sent or the
+    /// caller has no cursor there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<crate::cursor::CursorState>,
+}
+
+// ---- jumplist/changed ----------------------------------------------------------------------------
+
+/// The context's list was replaced or discarded by *another* client — re-view your open Jumplist
+/// picker. Sent only to clients that have one open, and never to the one whose own capture or clear
+/// caused it (that client re-frames its own picker as part of the action).
+///
+/// It carries no payload, and deliberately isn't a `picker/update` with the new rows. A capture can
+/// change the list's **shape**, not just its contents: grouped or flat
+/// ([`crate::picker::PickerKind::groups_in_jumplist`]), worth path-scoping or not. Those two gates
+/// ride the `picker/view` *response* ([`crate::picker::PickerViewResult::collapsible`] and
+/// `::path_filterable`), not the push — so pushing rows alone could leave a client rendering a flat
+/// list as an accordion, or offering dir/glob chips for a list that can't be scoped. Re-viewing
+/// takes the same path a scroll does and gets all of it right at once; the list changing under an
+/// open picker is rare enough that the extra round-trip costs nothing worth saving.
+pub struct JumplistChanged;
+impl NotificationMethod for JumplistChanged {
+    const NAME: &'static str = "jumplist/changed";
+    type Params = JumplistChangedParams;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct JumplistChangedParams {}
 
 // ---- jumplist/step -------------------------------------------------------------------------------
 

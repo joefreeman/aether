@@ -39,7 +39,7 @@ use aether_protocol::input::{
     InputOpenLine, InputPasteBlock, InputReplaceLine, InputSurround, InputTab, InputText,
     InputToggleComment, InputToggleTask, InputTransformCase, InputUnsurround,
 };
-use aether_protocol::jumplist::{JumplistCapture, JumplistStep};
+use aether_protocol::jumplist::{JumplistCapture, JumplistClear, JumplistStep};
 use aether_protocol::lsp::{
     LspDocumentHighlight, LspFormat, LspGotoDefinition, LspHover, LspNavigateDiagnostic,
     LspRestartServer,
@@ -312,7 +312,8 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
         s.drop_nav_history_for_client(client_id);
-        s.drop_jumplist_for_client(client_id);
+        // No jumplist teardown: it belongs to the context, not to this client, so it outlives the
+        // window that captured it (`WorkspaceEntry::jumplist`).
         let pruned_ephemeral = disconnecting_workspace
             .as_deref()
             .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
@@ -543,6 +544,7 @@ async fn dispatch(
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         PickerSetGroup::NAME => run!(PickerSetGroup, handlers::picker_set_group),
         JumplistCapture::NAME => run!(JumplistCapture, handlers::jumplist_capture),
+        JumplistClear::NAME => run!(JumplistClear, handlers::jumplist_clear),
         JumplistStep::NAME => run!(JumplistStep, handlers::jumplist_step),
         DirectoryList::NAME => run!(DirectoryList, handlers::directory_list),
         DirectoryCreate::NAME => run!(DirectoryCreate, handlers::directory_create),

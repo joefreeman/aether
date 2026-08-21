@@ -373,6 +373,10 @@ pub enum Action {
     /// because Alt-bracket collides with terminal escape introducers (`ESC [` / `ESC ]`) — see the
     /// binding site.
     JumplistStepInFile(Direction),
+    /// `Space Alt-j` — discard the captured list, so `]`/`[` go back to reporting it empty. The
+    /// Alt sibling of `Space j` (open the Jumplist picker), and the counterpart of a picker's
+    /// `Ctrl-j`. Clears it for every client in the context, which is who the list belongs to.
+    ClearJumplist,
     /// `Esc` in Normal — drop the active search (clear highlights).
     DropSearch,
 
@@ -1266,6 +1270,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in current buffer"),
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
+    bind!(L, ch('j'), Exact(Mods::ALT), A::ClearJumplist, "Navigation", "Clear jumplist"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
@@ -1596,6 +1601,11 @@ mod tests {
         assert!(matches!(
             lookup(KeyContext::Leader, ch('j'), Mods::NONE).map(|b| b.action),
             Some(Action::OpenPicker(PickerKind::Jumplist))
+        ));
+        // …and its Alt sibling discards the list rather than showing it.
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('j'), Mods::ALT).map(|b| b.action),
+            Some(Action::ClearJumplist)
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('m'), Mods::NONE).map(|b| b.action),

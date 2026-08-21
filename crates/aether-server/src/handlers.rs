@@ -65,8 +65,8 @@ use aether_protocol::input::{
     UndoResult,
 };
 use aether_protocol::jumplist::{
-    JumplistCaptureParams, JumplistCaptureResult, JumplistStepParams, JumplistStepResult,
-    JumplistStepScope, JumplistStepTarget,
+    JumplistCaptureParams, JumplistCaptureResult, JumplistClearParams, JumplistClearResult,
+    JumplistStepParams, JumplistStepResult, JumplistStepScope, JumplistStepTarget,
 };
 use aether_protocol::lsp::{
     DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
@@ -631,6 +631,7 @@ async fn activate_context(
                 worktrees: bindings.clone(),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                jumplist: None,
                 projects,
             },
         );
@@ -1152,6 +1153,7 @@ pub async fn workspace_create(
             workspace_index,
             mru_buffers: std::collections::VecDeque::new(),
             dormant_buffers: Vec::new(),
+            jumplist: None,
             projects: Vec::new(),
         },
     );
@@ -15371,7 +15373,7 @@ fn with_jumplist_position(
     buffer_id: BufferId,
     mut cursor: CursorState,
 ) -> CursorState {
-    let Some(list) = s.jumplist.get(&client_id) else {
+    let Some(list) = s.jumplist(client_id) else {
         return cursor;
     };
     if list.entries.is_empty() {
@@ -16806,6 +16808,47 @@ pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
     }
 }
 
+/// Tell the *other* clients standing in `actor`'s context that its jumplist just changed, so any
+/// open Jumplist picker can re-view. Called after a capture or a clear.
+///
+/// Unlike [`refresh_buffer_pickers`] this pushes no rows — see
+/// [`aether_protocol::jumplist::JumplistChanged`] for why a capture's change of *shape* has to go
+/// through `picker/view` rather than a `picker/update`. Scoped two ways: to clients in the same
+/// context (another context's picker lists its own list, untouched), and to those with the picker
+/// actually open (`subscribed`, which `picker/hide` clears). `actor` is excluded — a capture already
+/// re-frames its own client's picker, and a clear is a Normal-mode chord with none open.
+pub(crate) fn jumplist_changed_pushes(s: &ServerState, actor: ClientId) -> PendingPushes {
+    let Some(context) = s
+        .clients
+        .get(&actor)
+        .and_then(|c| c.active_workspace.as_deref())
+    else {
+        return Vec::new();
+    };
+    s.pickers
+        .iter()
+        .filter(|((c, kind), p)| {
+            *kind == PickerKind::Jumplist && p.subscribed.is_some() && *c != actor
+        })
+        .filter_map(|((c, _), _)| {
+            let session = s.clients.get(c)?;
+            (session.active_workspace.as_deref() == Some(context)).then(|| {
+                (
+                    session.outbound.clone(),
+                    Notification {
+                        jsonrpc: JsonRpc,
+                        method: aether_protocol::jumplist::JumplistChanged::NAME.into(),
+                        params: serde_json::to_value(
+                            aether_protocol::jumplist::JumplistChangedParams {},
+                        )
+                        .expect("infallible"),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 /// If `buffer_id`'s dirty flag changed across the just-completed mutation, collect picker
 /// refresh pushes. Caller captures `was_dirty` before the mutation; this reads the post-
 /// mutation value and decides. No-op (no allocation, no rerank) when dirty didn't change —
@@ -17739,8 +17782,7 @@ pub async fn picker_view(
         PickerKind::Jumplist => {
             let s = state.lock().await;
             picker_state::PickerCandidates::Jumplist(
-                s.jumplist
-                    .get(&client_id)
+                s.jumplist(client_id)
                     .map(|list| list.entries.clone())
                     .unwrap_or_default(),
             )
@@ -18733,8 +18775,8 @@ pub async fn jumplist_capture(
     params: JumplistCaptureParams,
 ) -> Result<Option<JumplistCaptureResult>, RpcError> {
     let client_id = ctx.client_id;
-    let mut s = state.lock().await;
-    let s = &mut *s;
+    let mut guard = state.lock().await;
+    let s = &mut *guard;
     let Some(picker) = s.pickers.get(&(client_id, params.kind)) else {
         return Err(RpcError::new(
             ErrorCode::INVALID_REQUEST,
@@ -18778,7 +18820,7 @@ pub async fn jumplist_capture(
     // entries are entries *of*: the original source kind and query, not the narrowing query
     // typed into the Jumplist picker.
     if params.kind == PickerKind::Jumplist {
-        if let Some(prior) = s.jumplist.get(&client_id) {
+        if let Some(prior) = s.jumplist(client_id) {
             list.source = prior.source;
             list.query = prior.query.clone();
         }
@@ -18799,11 +18841,57 @@ pub async fn jumplist_capture(
         })
         .unwrap_or(0);
     let total = list.entries.len() as u32;
-    s.jumplist.insert(client_id, list);
+    // Replaces whatever this context held — including a list another client captured into it. A
+    // capture has always been a wholesale replacement; sharing the list makes that reach one window
+    // further, and the status bar's source/query label says which capture you are stepping.
+    s.set_jumplist(client_id, list);
+    let pushes = jumplist_changed_pushes(s, client_id);
+    drop(guard);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
     Ok(Some(JumplistCaptureResult {
         total,
         index: index as u32,
     }))
+}
+
+/// Discard the context's captured list — Normal-mode `Space Alt-j`. See
+/// [`aether_protocol::jumplist::JumplistClear`]. Never fails: clearing a list that isn't there (no
+/// capture yet, or no active workspace at all) reports `cleared: 0` rather than an error, which is
+/// what lets the client toast "already empty" instead of "clear failed".
+pub async fn jumplist_clear(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: JumplistClearParams,
+) -> Result<JumplistClearResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut guard = state.lock().await;
+    let s = &mut *guard;
+    let cleared = s
+        .active_workspace_mut(client_id)
+        .and_then(|entry| entry.jumplist.take())
+        .map_or(0, |list| list.entries.len() as u32);
+    // Decorated *after* the take, so the caller's status counter drops on this response rather
+    // than on its next keystroke.
+    let cursor = match params.buffer_id {
+        Some(buffer_id) => {
+            let current = s.cursors.get(&(client_id, buffer_id)).copied();
+            current.map(|c| wrap_for_response(s, client_id, buffer_id, c))
+        }
+        None => None,
+    };
+    // Only when something actually went: clearing an already-empty list changes nothing for anyone.
+    let pushes = if cleared > 0 {
+        jumplist_changed_pushes(s, client_id)
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(JumplistClearResult { cleared, cursor })
 }
 
 /// Step through the jumplist from the cursor's current location — Normal-mode `]` / `[`
@@ -18824,7 +18912,7 @@ pub async fn jumplist_step(
         let buffer = s
             .try_doc_of(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-        let Some(list) = s.jumplist.get(&client_id) else {
+        let Some(list) = s.jumplist(client_id) else {
             return Ok(JumplistStepResult::Empty);
         };
         if list.entries.is_empty() {
@@ -19164,6 +19252,7 @@ mod next_buffer_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                jumplist: None,
                 projects: Vec::new(),
             },
         );
@@ -19498,6 +19587,7 @@ mod subscribe_snapshot_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                jumplist: None,
                 projects: Vec::new(),
             },
         );
@@ -19587,6 +19677,7 @@ mod subscribe_snapshot_tests {
                 )),
                 mru_buffers: std::collections::VecDeque::new(),
                 dormant_buffers: Vec::new(),
+                jumplist: None,
                 projects: Vec::new(),
             },
         );

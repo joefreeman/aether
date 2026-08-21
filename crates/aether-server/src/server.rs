@@ -626,6 +626,7 @@ pub async fn spawn_for_test_full(
                     workspace_index,
                     mru_buffers: std::collections::VecDeque::new(),
                     dormant_buffers: Vec::new(),
+                    jumplist: None,
                     projects: Vec::new(),
                 },
             );
@@ -804,6 +805,7 @@ mod tests {
                         )),
                         mru_buffers: Default::default(),
                         dormant_buffers: Vec::new(),
+                        jumplist: None,
                         projects: Vec::new(),
                     },
                 );

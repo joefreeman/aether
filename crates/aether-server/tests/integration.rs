@@ -48,8 +48,9 @@ use aether_protocol::input::{
     SurroundTarget, ToggleCommentParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
-    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistStep,
-    JumplistStepParams, JumplistStepResult, JumplistStepScope,
+    JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistClear,
+    JumplistClearParams, JumplistClearResult, JumplistStep, JumplistStepParams, JumplistStepResult,
+    JumplistStepScope,
 };
 use aether_protocol::lsp::{
     FormatStatus, LspBufferParams, LspFormat, LspFormatResult, LspGotoDefinition,
@@ -16556,6 +16557,531 @@ async fn jumplist_step_reports_empty_without_a_capture() {
         matches!(outcome, JumplistStepResult::Empty),
         "no captured list: {outcome:?}"
     );
+
+    drop(server);
+}
+
+/// The list belongs to the **context**, so every shell attached to it steps the same one — and each
+/// steps it from its *own* cursor, since a step is cursor-derived rather than indexed.
+#[tokio::test]
+async fn a_capture_is_shared_by_every_client_in_the_context() {
+    // Client 1 captures the three needle hits: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Client 2 joins the same workspace. It never opened a picker, let alone captured one.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let buffer_id2 = open_test_buffer(&mut ws2, 2, "src/main.rs").await;
+
+    // Park the two cursors at opposite ends of main.rs: client 1 on the file's last hit, client 2
+    // above the first. Same list, two positions in it.
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 2, col: 4 }).await;
+    set_point_cursor(&mut ws2, 3, buffer_id2, LogicalPosition { line: 0, col: 0 }).await;
+
+    // Client 2 steps the list it never captured.
+    let target = step_results(&mut ws2, 4, buffer_id2, Direction::Forward)
+        .await
+        .moved()
+        .expect("client 2 sees the context's captured list");
+    assert!(target.path.as_deref().unwrap().ends_with("src/main.rs"));
+    assert_eq!(target.anchor, Some(LogicalPosition { line: 1, col: 4 }));
+    assert_eq!(
+        (target.index, target.total),
+        (2, 3),
+        "the same three entries client 1 captured"
+    );
+
+    // …and client 1, on the same list from its own cursor, is at the end of it. Two clients, one
+    // list, two places in it — which is what makes sharing the contents safe.
+    let outcome = step_results(&mut ws, 23, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::AtEnd),
+        "client 1 steps from *its* cursor, past the last entry: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// A window has no durable identity, so the list must not die with one. Capture, close the client,
+/// reconnect: the context still holds it.
+#[tokio::test]
+async fn a_capture_outlives_the_client_that_made_it() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let _ = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // The window closes. The server tears the client down on its own task, so give it a beat.
+    drop(ws);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let buffer_id2 = open_test_buffer(&mut ws2, 2, "src/main.rs").await;
+    set_point_cursor(&mut ws2, 3, buffer_id2, LogicalPosition { line: 0, col: 0 }).await;
+
+    let target = step_results(&mut ws2, 4, buffer_id2, Direction::Forward)
+        .await
+        .moved()
+        .expect("the capture survived the client that made it");
+    assert_eq!((target.index, target.total), (2, 3));
+
+    drop(server);
+}
+
+/// Switching workspace no longer *wipes* the list — it leaves it on the context it belongs to, so
+/// coming back finds it. (The entries only ever pointed into that context's files, which is what
+/// the wipe was protecting against; ownership does the same job without throwing anything away.)
+#[tokio::test]
+async fn a_capture_survives_switching_away_and_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::create_dir_all(dir_path.join("src")).unwrap();
+    std::fs::write(
+        dir_path.join("src/main.rs"),
+        "fn main() {\n    needle();\n    needle();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir_path.join("src/lib.rs"),
+        "fn needle() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("elsewhere.txt"), "nothing\n").unwrap();
+
+    let mut server = aether_server::spawn_for_test_multi(vec![
+        ("test-proj".to_string(), vec![dir_path]),
+        ("other-proj".to_string(), vec![other.path().to_path_buf()]),
+    ])
+    .await
+    .unwrap();
+    server.keep_alive(dir);
+    server.keep_alive(other);
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let activate = |name: &str| WorkspaceActivateParams {
+        worktrees: None,
+        name: name.into(),
+        open_last: false,
+    };
+
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, 1, &activate("test-proj")).await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Grep)
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Away…
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, 30, &activate("other-proj")).await;
+    let elsewhere = open_test_buffer(&mut ws, 31, "elsewhere.txt").await;
+    set_point_cursor(&mut ws, 32, elsewhere, LogicalPosition { line: 0, col: 0 }).await;
+    let outcome = step_results(&mut ws, 33, elsewhere, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::Empty),
+        "the other workspace has its own (empty) list, not this one's: {outcome:?}"
+    );
+
+    // …and back.
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, 40, &activate("test-proj")).await;
+    let reopened = open_test_buffer(&mut ws, 41, "src/main.rs").await;
+    assert_eq!(reopened, buffer_id, "the same buffer, still open");
+    set_point_cursor(&mut ws, 42, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+    let target = step_results(&mut ws, 43, buffer_id, Direction::Forward)
+        .await
+        .moved()
+        .expect("the capture was still on the context we returned to");
+    assert_eq!((target.index, target.total), (2, 3));
+
+    drop(server);
+}
+
+/// `Space Alt-j`: discard the captured list.
+async fn clear_jumplist(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    request_id: u64,
+    buffer_id: Option<u64>,
+) -> JumplistClearResult {
+    send_request::<JumplistClear>(ws, request_id, &JumplistClearParams { buffer_id }).await
+}
+
+#[tokio::test]
+async fn clearing_the_jumplist_empties_it_and_undecorates_the_cursor() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Park the cursor exactly on the main.rs:1 entry ("needle" spans cols 4..=9) so the status
+    // stamp is showing — that stamp is what the clear has to take down with it.
+    let st: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        22,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line: 1, col: 9 },
+            anchor: LogicalPosition { line: 1, col: 4 },
+        },
+    )
+    .await;
+    assert!(st.jumplist_position.is_some(), "stamped before the clear");
+
+    let cleared = clear_jumplist(&mut ws, 23, Some(buffer_id)).await;
+    assert_eq!(cleared.cleared, 3, "all three captured entries discarded");
+    let cursor = cleared.cursor.expect("the caller's cursor comes back");
+    assert_eq!(
+        cursor.position,
+        LogicalPosition { line: 1, col: 9 },
+        "the cursor itself doesn't move"
+    );
+    assert!(
+        cursor.jumplist_position.is_none(),
+        "…but its k/N stamp goes with the list, on this response"
+    );
+
+    // And the list really is gone: stepping reports Empty, not AtEnd.
+    let outcome = step_results(&mut ws, 24, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::Empty),
+        "nothing captured any more: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// Clearing what isn't there is a no-op, not an error — the client says "already empty" rather
+/// than "clear failed".
+#[tokio::test]
+async fn clearing_an_empty_jumplist_reports_nothing_cleared() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 1, col: 4 }).await;
+
+    let cleared = clear_jumplist(&mut ws, 22, Some(buffer_id)).await;
+    assert_eq!(cleared.cleared, 0);
+    assert!(cleared
+        .cursor
+        .expect("still decorated")
+        .jumplist_position
+        .is_none());
+
+    // Twice over, and after a real capture-then-clear, it stays a no-op.
+    let _ = capture_grep_results(&mut ws, 23, "src/lib.rs", 0, 3).await;
+    assert_eq!(
+        clear_jumplist(&mut ws, 24, Some(buffer_id)).await.cleared,
+        3
+    );
+    assert_eq!(
+        clear_jumplist(&mut ws, 25, Some(buffer_id)).await.cleared,
+        0
+    );
+
+    drop(server);
+}
+
+/// The clear reaches as far as the list does: every client in the context, and no further.
+#[tokio::test]
+async fn clearing_reaches_every_client_in_the_context() {
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+    set_point_cursor(&mut ws, 22, buffer_id, LogicalPosition { line: 0, col: 0 }).await;
+
+    // A second client in the same workspace clears the list client 1 captured.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let cleared = clear_jumplist(&mut ws2, 2, None).await;
+    assert_eq!(cleared.cleared, 3, "client 2 clears the shared list");
+    assert!(
+        cleared.cursor.is_none(),
+        "no buffer named, so nothing to decorate"
+    );
+
+    // Client 1's `]` finds nothing, without it having done anything itself.
+    let outcome = step_results(&mut ws, 23, buffer_id, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::Empty),
+        "the clear reached the other client in the context: {outcome:?}"
+    );
+
+    drop(server);
+}
+
+/// A picker open on one client doesn't quietly go stale when another replaces or discards the list
+/// under it. The notification carries nothing — it says "re-view", because a capture can change the
+/// list's shape and that gate rides the view response, not a push.
+#[tokio::test]
+async fn changing_the_list_tells_other_clients_with_the_picker_open() {
+    use aether_protocol::jumplist::JumplistChanged;
+
+    let (server, mut ws) = setup_grep_with_needle_query().await;
+    let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
+    let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
+
+    // Client 2 joins and opens the Jumplist picker on the shared list.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws2, 2, &view_params(PickerKind::Jumplist)).await;
+    assert_eq!(view.total_candidates, 3, "client 2 is looking at the list");
+    let _ = expect_notification::<PickerUpdate>(&mut ws2).await;
+
+    // Client 1 narrows its grep and re-captures, so the new list is a *different* size.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        22,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "fn needle".into(),
+            generation: 2,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+    let recaptured = capture_grep_results(&mut ws, 23, "src/lib.rs", 0, 0).await;
+    assert_eq!(recaptured.total, 1, "only lib.rs declares `fn needle`");
+    let _: aether_protocol::jumplist::JumplistChangedParams =
+        expect_notification_within::<JumplistChanged>(
+            &mut ws2,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+    // The re-view the notification asks for is what actually refreshes the picker — and it must
+    // pick up the new list under `PickerReset::Keep`, since that's what the client sends.
+    let refreshed: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws2,
+        3,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    assert_eq!(
+        refreshed.total_candidates, 1,
+        "the re-view shows the other client's narrowed list"
+    );
+
+    // …and a clear reaches it the same way, leaving the re-view genuinely empty.
+    assert_eq!(
+        clear_jumplist(&mut ws, 24, Some(buffer_id)).await.cleared,
+        1
+    );
+    let _: aether_protocol::jumplist::JumplistChangedParams =
+        expect_notification_within::<JumplistChanged>(
+            &mut ws2,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+    let refreshed: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws2,
+        4,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    assert_eq!(refreshed.total_candidates, 0, "the list is gone");
+
+    // Clearing again changes nothing for anyone, so nobody is told.
+    assert_eq!(
+        clear_jumplist(&mut ws, 25, Some(buffer_id)).await.cleared,
+        0
+    );
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+        loop {
+            let text = next_text(&mut ws2).await;
+            if let Ok(ClientInbound::Notification(n)) = serde_json::from_str::<ClientInbound>(&text)
+            {
+                if n.method == JumplistChanged::NAME {
+                    return n;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "a no-op clear notifies nobody");
+
+    drop(server);
+}
+
+/// The notification is scoped like the list itself: the client that caused the change doesn't get
+/// told (it re-frames its own picker), and neither does a picker open in a different workspace.
+#[tokio::test]
+async fn the_changed_notification_skips_the_actor_and_other_contexts() {
+    use aether_protocol::jumplist::JumplistChanged;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    std::fs::create_dir_all(dir_path.join("src")).unwrap();
+    std::fs::write(
+        dir_path.join("src/main.rs"),
+        "fn main() {\n    needle();\n    needle();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir_path.join("src/lib.rs"),
+        "fn needle() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("elsewhere.txt"), "nothing\n").unwrap();
+
+    let mut server = aether_server::spawn_for_test_multi(vec![
+        ("test-proj".to_string(), vec![dir_path]),
+        ("other-proj".to_string(), vec![other.path().to_path_buf()]),
+    ])
+    .await
+    .unwrap();
+    server.keep_alive(dir);
+    server.keep_alive(other);
+
+    // Client 1 in test-proj, with a grep run and a Jumplist picker of its own open.
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        10,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Grep)
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        11,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+
+    // Client 2 in the *other* workspace, also sitting on a Jumplist picker.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "other-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _ = send_request::<PickerView>(&mut ws2, 2, &view_params(PickerKind::Jumplist)).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws2).await;
+
+    let _ = capture_grep_results(&mut ws, 12, "src/lib.rs", 0, 3).await;
+
+    // Neither the actor nor the other workspace's picker hears about it.
+    for (label, sock) in [("the actor", &mut ws), ("another context", &mut ws2)] {
+        let heard = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                let text = next_text(sock).await;
+                if let Ok(ClientInbound::Notification(n)) =
+                    serde_json::from_str::<ClientInbound>(&text)
+                {
+                    if n.method == JumplistChanged::NAME {
+                        return n;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(heard.is_err(), "{label} must not be notified");
+    }
 
     drop(server);
 }
@@ -38101,6 +38627,82 @@ async fn each_context_keeps_its_own_buffers() {
     assert!(
         landed.starts_with(repo_root.to_string_lossy().as_ref()),
         "back on the checkout's copy: {landed}"
+    );
+
+    drop(server);
+}
+
+/// …and its **own jumplist**, for a reason stronger than tidiness: captured entries carry absolute
+/// paths into one tree, so a list that followed a rebind would step you into the tree you just
+/// left — the same-looking file, edited in the wrong checkout. Keying entries by their bindings
+/// makes that unrepresentable, and the list you left behind is still there when you come back.
+#[tokio::test]
+async fn each_context_keeps_its_own_jumplist() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    // Untracked, so it exists in the checkout and *not* in a worktree built from HEAD — which makes
+    // "the base's entries" a set the feature tree could not possibly resolve.
+    std::fs::write(repo_root.join("needle.rs"), "needle\n").unwrap();
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // Capture the single hit while standing in the base.
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        11,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Grep)
+        },
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        12,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Grep,
+            query: "needle".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let _ = drain_grep_until_done(&mut ws).await;
+    let captured = capture_grep_results(&mut ws, 13, "needle.rs", 0, 0).await;
+    assert_eq!(captured.total, 1, "one hit, in the checkout");
+
+    // Into the tree: its own context, its own (empty) list. The base's entries do not follow.
+    let bound = bind(&mut ws, 14, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+    let in_tree = open_test_buffer(&mut ws, 15, "a.rs").await;
+    set_point_cursor(&mut ws, 16, in_tree, LogicalPosition { line: 0, col: 0 }).await;
+    let outcome = step_results(&mut ws, 17, in_tree, Direction::Forward).await;
+    assert!(
+        matches!(outcome, JumplistStepResult::Empty),
+        "the tree's context has captured nothing; the base's list must not step here: {outcome:?}"
+    );
+    // Nor can it be *cleared* from here — a clear reaches exactly as far as a step does.
+    assert_eq!(
+        clear_jumplist(&mut ws, 171, Some(in_tree)).await.cleared,
+        0,
+        "clearing the tree's empty list must not reach into the base's"
+    );
+
+    // Back out: the base still holds what was captured there.
+    let back = bind(&mut ws, 18, std::path::Path::new(&wt.path), "").await;
+    assert!(back.workspace.worktrees.is_empty(), "the base again");
+    let in_base = open_test_buffer(&mut ws, 19, "a.rs").await;
+    set_point_cursor(&mut ws, 20, in_base, LogicalPosition { line: 0, col: 0 }).await;
+    let target = step_results(&mut ws, 21, in_base, Direction::Forward)
+        .await
+        .moved()
+        .expect("the base's capture was waiting where it was left");
+    let path = target.path.expect("a file entry");
+    assert!(
+        path.starts_with(repo_root.to_string_lossy().as_ref()) && path.ends_with("needle.rs"),
+        "stepped into the checkout it was captured from, got {path}"
     );
 
     drop(server);

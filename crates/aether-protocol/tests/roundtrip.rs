@@ -4803,13 +4803,26 @@ fn app_info_wire_shapes() {
 fn jumplist_wire_shapes() {
     use aether_protocol::cursor::{CursorState, JumplistPosition};
     use aether_protocol::jumplist::{
-        JumplistCapture, JumplistCaptureParams, JumplistStep, JumplistStepParams,
-        JumplistStepResult, JumplistStepScope, JumplistStepTarget,
+        JumplistCapture, JumplistCaptureParams, JumplistClear, JumplistClearParams,
+        JumplistClearResult, JumplistStep, JumplistStepParams, JumplistStepResult,
+        JumplistStepScope, JumplistStepTarget,
     };
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     assert_eq!(JumplistCapture::NAME, "jumplist/capture");
+    assert_eq!(JumplistClear::NAME, "jumplist/clear");
     assert_eq!(JumplistStep::NAME, "jumplist/step");
+    // The "re-view your open picker" push. Payload-free by design — see the type's docs — so an
+    // empty object must parse, and must keep parsing if a field is ever added.
+    assert_eq!(
+        aether_protocol::jumplist::JumplistChanged::NAME,
+        "jumplist/changed"
+    );
+    assert_eq!(
+        to_value(aether_protocol::jumplist::JumplistChangedParams {}).unwrap(),
+        json!({})
+    );
+    from_value::<aether_protocol::jumplist::JumplistChangedParams>(json!({})).unwrap();
 
     // jumplist/capture params: the highlighted item rides verbatim (the picker/select shape);
     // capture doesn't navigate, so there's no buffer_id.
@@ -4833,6 +4846,40 @@ fn jumplist_wire_shapes() {
     let r: aether_protocol::jumplist::JumplistCaptureResult =
         from_value(json!({ "total": 17, "index": 3 })).unwrap();
     assert_eq!((r.total, r.index), (17, 3));
+
+    // jumplist/clear params: just the buffer to re-decorate a cursor for, omitted when there
+    // isn't one — so an empty object is a valid clear.
+    assert_eq!(
+        to_value(JumplistClearParams { buffer_id: Some(7) }).unwrap(),
+        json!({ "buffer_id": 7 })
+    );
+    assert_eq!(
+        to_value(JumplistClearParams { buffer_id: None }).unwrap(),
+        json!({})
+    );
+    let parsed: JumplistClearParams = from_value(json!({})).unwrap();
+    assert!(parsed.buffer_id.is_none());
+
+    // The clear result: the discarded count, and the caller's cursor with the `k/N` stamp already
+    // gone. The cursor is skipped entirely when there was no buffer to decorate.
+    let r = JumplistClearResult {
+        cleared: 0,
+        cursor: None,
+    };
+    assert_eq!(to_value(&r).unwrap(), json!({ "cleared": 0 }));
+    let r: JumplistClearResult = from_value(json!({
+        "cleared": 5,
+        "cursor": { "position": {"line": 1, "col": 2}, "anchor": {"line": 1, "col": 2} }
+    }))
+    .unwrap();
+    assert_eq!(r.cleared, 5);
+    assert!(
+        r.cursor
+            .expect("a decorated cursor")
+            .jumplist_position
+            .is_none(),
+        "the stamp is gone with the list"
+    );
 
     // jumplist/step params: count stays off the wire at 1, `open` at false, and `scope` at Full;
     // all default back.
