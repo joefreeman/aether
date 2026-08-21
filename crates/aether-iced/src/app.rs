@@ -2828,7 +2828,7 @@ impl App {
             .into()
     }
 
-    /// The workspace-settings dialog (`Space Alt-,`): a centred modal with the editable workspace name,
+    /// The workspace-settings dialog (`Space .`): a centred modal with the editable workspace name,
     /// the list of roots, and an add-root input row — rendered from the core's
     /// `session.workspace_settings`. Keyboard-driven (keys route through `session.on_key`, which the
     /// core handles): Alt-j/k navigate, Enter renames / adds, Delete (then y) removes, Esc closes.

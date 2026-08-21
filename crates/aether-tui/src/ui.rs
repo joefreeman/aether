@@ -159,7 +159,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    // Workspace settings overlay (Space Alt-,): centered modal listing the active workspace's roots.
+    // Workspace settings overlay (Space .): centered modal listing the active workspace's roots.
     if state.workspace_settings.is_some() {
         draw_workspace_settings_overlay(f, state, chunks[0]);
     }

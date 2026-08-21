@@ -531,17 +531,19 @@ pub enum Action {
 
     // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
     // overlay ignores them) ----
-    /// `Space.` — the keyboard-shortcut reference (the Keybindings picker), generated from these
-    /// tables. On `.` rather than `/` because `Space /` is grep, mirroring Normal mode's `/`.
+    /// `Space y` — the keyboard-shortcut reference (the Keybindings picker), generated from these
+    /// tables. An unshifted letter rather than punctuation: the punctuation slots are taken by the
+    /// settings pair, and `Space /` is grep (mirroring Normal mode's `/`).
     OpenHelp,
-    /// `Space Alt-,` — the workspace-settings overlay (roots + rename). TUI-only today. The Alt
-    /// sibling of the app-wide settings on `Space,`: same overlay family, narrower scope.
+    /// `Space .` — the workspace-settings overlay (roots + rename). The neighbour of the app-wide
+    /// settings on `Space ,`: same overlay family, narrower scope. Was `Space Alt-,`, which
+    /// terminal emulators tend to swallow before we see it.
     OpenWorkspaceSettings,
     /// `Space,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
     /// `Space ?` — the application-info dialog: build identity, the daemon we're connected to, and
-    /// where this profile's state lives. Keeps its key through the `,`/`.`//` reshuffle: `?` is a
+    /// where this profile's state lives. Keeps its key through every `,`/`.`//` reshuffle: `?` is a
     /// strong enough "what is this thing?" mnemonic to stand on its own.
     ShowAppInfo,
 
@@ -1282,8 +1284,8 @@ static LEADER: &[Binding] = &[
     // key now `/` is grep: "?" asks about the install, and the shortcut list is one key away on `.`.
     bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
-    bind!(L, ch(','), Exact(Mods::ALT), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
-    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
+    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
+    bind!(L, ch('y'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
@@ -1743,18 +1745,24 @@ mod tests {
         assert!(git(ch('j'), Mods::NONE).is_none());
 
         // The old single-key homes are free — a stale reflex does nothing rather than something
-        // else (`t` commit, `u` uncommit, `y` branches).
+        // else (`t` commit, `u` uncommit).
         for (code, mods) in [
             (ch('t'), Mods::NONE),
             (ch('t'), Mods::ALT),
             (ch('u'), Mods::NONE),
-            (ch('y'), Mods::NONE),
         ] {
             assert!(
                 lookup(KeyContext::Leader, code, mods).is_none(),
                 "{code:?} + {mods:?} must be free on the leader"
             );
         }
+        // `y` (once branches) has since been reclaimed by the keybindings picker. Acceptable
+        // because the landing is inert: a stale reflex opens a searchable list of every binding,
+        // which answers the question a stale reflex is really asking.
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('y'), Mods::NONE).map(|b| b.action),
+            Some(Action::OpenHelp)
+        ));
 
         // Sub-leader rows render with their prefix, so the keybindings picker reads `Space g s`.
         assert_eq!(
@@ -1813,19 +1821,21 @@ mod tests {
     }
 
     #[test]
-    fn leader_punctuation_is_settings_shortcuts_and_grep() {
+    fn leader_punctuation_is_settings_and_grep() {
         let l = |code, mods| lookup(KeyContext::Leader, code, mods).map(|b| b.action);
-        // `,` app-wide, `Alt-,` this workspace: same overlay family, narrower scope on Alt.
+        // `,` app-wide, `.` this workspace: same overlay family, adjacent keys, narrower scope on
+        // the second. Neither may move onto an Alt-chord — terminals eat `Alt-,`.
         assert!(matches!(
             l(ch(','), Mods::NONE),
             Some(Action::OpenAppSettings)
         ));
         assert!(matches!(
-            l(ch(','), Mods::ALT),
+            l(ch('.'), Mods::NONE),
             Some(Action::OpenWorkspaceSettings)
         ));
-        // `.` is the shortcut reference; `/` is grep, mirroring Normal mode's `/` and `Alt-/`.
-        assert!(matches!(l(ch('.'), Mods::NONE), Some(Action::OpenHelp)));
+        assert!(l(ch(','), Mods::ALT).is_none());
+        // The shortcut reference sits on `y`; `/` is grep, mirroring Normal mode's `/` and `Alt-/`.
+        assert!(matches!(l(ch('y'), Mods::NONE), Some(Action::OpenHelp)));
         assert!(matches!(
             l(ch('/'), Mods::NONE),
             Some(Action::OpenPicker(PickerKind::Grep))

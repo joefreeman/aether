@@ -6868,7 +6868,7 @@ impl Session {
         }
     }
 
-    /// Open the workspace-settings overlay (`Space Alt-,`), seeded from the active workspace's name and
+    /// Open the workspace-settings overlay (`Space .`), seeded from the active workspace's name and
     /// roots. Cheap — no RPC. Focus lands on the always-present add-root input row at the bottom,
     /// since most opens (especially the post-create flow) are to add a root; the name field is
     /// above the roots and reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.

@@ -1535,12 +1535,12 @@ fn workspaces_picker_centers_on_the_active_workspace() {
 }
 
 #[test]
-fn space_dot_opens_the_keybindings_picker_with_its_rows() {
+fn space_y_opens_the_keybindings_picker_with_its_rows() {
     use aether_protocol::picker::PickerKind;
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, '.');
-    let params = find_request(&fx, "picker/view").expect("Space . opens via picker/view");
+    let fx = key(&mut s, 'y');
+    let params = find_request(&fx, "picker/view").expect("Space y opens via picker/view");
     assert_eq!(params["kind"], "keybindings");
     assert_eq!(params["reset"], "all");
     // The rows ride the open: the keymap tables live client-side, the server only matches.
@@ -1550,7 +1550,7 @@ fn space_dot_opens_the_keybindings_picker_with_its_rows() {
         "the whole keymap ships ({} rows)",
         rows.len()
     );
-    assert!(rows.iter().any(|r| r["keys"] == "Space ."
+    assert!(rows.iter().any(|r| r["keys"] == "Space y"
         && r["desc"] == "Show keyboard shortcuts"
         && r["mode"] == "Application"));
     // The `Space g` sub-leader's rows carry their prefix in the label and list as Application
@@ -2082,7 +2082,7 @@ fn enter_on_a_keybinding_row_is_a_noop() {
         group: "App".into(),
         desc: "Show keyboard shortcuts".into(),
         mode: "Application".into(),
-        keys: "Space .".into(),
+        keys: "Space y".into(),
         match_indices: vec![],
     }];
     p.total_matches = 1;
@@ -6459,15 +6459,15 @@ fn app_settings_overlay_opens_via_leader_comma() {
         s.app_settings.is_some(),
         "Space , opens the app-settings overlay"
     );
-    // Its Alt sibling is the workspace-scoped overlay — a distinct chord.
+    // Its neighbour on `.` is the workspace-scoped overlay — a distinct chord.
     assert!(s.workspace_settings.is_none());
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    s.on_key(KeyCode::Char(','), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()), ROWS);
     assert!(
         s.workspace_settings.is_some(),
-        "Space Alt-, opens the workspace-settings overlay"
+        "Space . opens the workspace-settings overlay"
     );
     assert!(s.app_settings.is_none());
 }

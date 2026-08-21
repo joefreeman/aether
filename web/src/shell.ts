@@ -531,7 +531,7 @@ interface CoreView {
   read: ReadDoc | null;
 }
 
-/** The workspace-settings overlay (`Space Alt-,`), when open (view.rs `workspace_settings`). Core-owned
+/** The workspace-settings overlay (`Space .`), when open (view.rs `workspace_settings`). Core-owned
  * state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys
  * through the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index`
  * (the add-root input), the projects, and `add_project_index` (the add-project input). */
@@ -1182,7 +1182,7 @@ export class Shell {
   /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
    *  (this runs on every status render). */
   private faviconKey = "";
-  /** The workspace-settings overlay (Space Alt-,). Core-owned state (`session.workspace_settings`); the
+  /** The workspace-settings overlay (Space .). Core-owned state (`session.workspace_settings`); the
    *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
    *  text editing and sync to the core (`workspace_settings_set_name` / `_set_add`); nav/commit/cancel
    *  keys route through their keydown → `on_key`. The labels + root rows are rebuilt each render. */
@@ -1556,7 +1556,7 @@ export class Shell {
     this.faviconEl.rel = "icon";
     document.head.appendChild(this.faviconEl);
     this.faviconDark.addEventListener("change", () => this.updateFavicon());
-    // The workspace-settings overlay (Space Alt-,): a persistent modal whose name + add-root fields are
+    // The workspace-settings overlay (Space .): a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
     this.workspaceSettingsEl = document.createElement("div");
@@ -3536,7 +3536,7 @@ export class Shell {
     return span;
   }
 
-  /** The workspace-settings overlay (`Space Alt-,`): the editable workspace name, the roots list, and an
+  /** The workspace-settings overlay (`Space .`): the editable workspace name, the roots list, and an
    *  add-root input row — all rendered from the core's `session.workspace_settings`. Keyboard-driven
    *  (Alt-j/k navigate, Enter rename/add, Del then y remove, Esc close); keys route through the
    *  global keydown → `on_key`, so this only paints. Mirrors the TUI/iced overlays. */

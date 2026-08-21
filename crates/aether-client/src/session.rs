@@ -334,7 +334,7 @@ impl TextField {
     }
 }
 
-/// The workspace-settings overlay state (`Space Alt-,`), migrated from the TUI's shell-local
+/// The workspace-settings overlay state (`Space .`), migrated from the TUI's shell-local
 /// `WorkspaceSettingsState` into the core so every shell renders it. Shows an editable
 /// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field.
@@ -968,7 +968,7 @@ pub struct Session {
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
-    /// The workspace-settings overlay (`Space Alt-,`); owns the keyboard while open.
+    /// The workspace-settings overlay (`Space .`); owns the keyboard while open.
     pub workspace_settings: Option<WorkspaceSettings>,
     /// The application-settings overlay (`Space,`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,

@@ -231,7 +231,7 @@ pub struct AppState {
     /// the editor window. Synced from the session each frame; the layout itself is cached
     /// shell-side by `(buffer, revision, cols)`.
     pub read: Option<ReadViewState>,
-    /// Active workspace-settings overlay (`Space Alt-,`). When `Some`, draws a centered modal listing
+    /// Active workspace-settings overlay (`Space .`). When `Some`, draws a centered modal listing
     /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub workspace_settings: Option<WorkspaceSettingsState>,
     /// Active application-settings overlay (`Space ,`). When `Some`, draws a centered modal

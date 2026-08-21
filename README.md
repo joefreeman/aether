@@ -39,7 +39,7 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 ## Keybindings
 
-Type `Space .` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
+Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
 app/file/code commands, `Space g` the sub-leader for git operations, and `Tab` reveals hover info
 at the cursor.
@@ -179,10 +179,10 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
 | `Space x`/`Space Alt-x` | Close buffer / save and close it |
 | `Space z` | Open another window |
-| `Space ,`/`Space Alt-,` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
+| `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save current buffer and quit |
-| `Space .`/`Space ?` | Show keyboard shortcuts / about this build |
+| `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
 
 ### Git
 

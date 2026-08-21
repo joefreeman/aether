@@ -187,7 +187,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "toggle", tier: 0, contexts: &[C::Normal], keys: "Space Alt-h",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleHints)),
         text: "Use {} to toggle hints off/on" },
-    HintDef { id: "help", tier: 0, contexts: &[C::Normal], keys: "Space .",
+    HintDef { id: "help", tier: 0, contexts: &[C::Normal], keys: "Space y",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenHelp)),
         text: "Use {} to browse all keybindings" },
     HintDef { id: "quit", tier: 0, contexts: &[C::Normal], keys: "Space q",
