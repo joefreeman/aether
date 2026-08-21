@@ -4,7 +4,7 @@
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipId, ChipValue, DirListingState};
 use aether_protocol::picker::{
-    ExpandedRun, GroupHeader, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
+    GroupHeader, GroupRunRows, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
 };
 
 /// Rows the panel shows at once.
@@ -19,11 +19,11 @@ pub enum Reveal {
     Minimal,
     /// Align the row to the top unless already visible (grep file-jumps — context below).
     Top,
-    /// Reveal the newly selected group's *run*: scroll the minimum that brings the run's last row
+    /// Reveal the just-expanded group's *run*: scroll the minimum that brings the run's last row
     /// into view, capped so the run's header never leaves the top — a run taller than the pane
     /// shows the header at the very top (where it renders itself, so nothing hides under a sticky
     /// pin) with as many items as fit. Emitted by the group-select path (`Event::GroupSet`); shells
-    /// resolve the run's rows from the state's `expanded_run`, applying only when it matches the
+    /// resolve the run's rows from the state's `focus_run`, applying only when it matches the
     /// selection (`header_row == selected`) so a pre-adoption fire against the *old* run is a no-op
     /// — the armed re-emit after the reshaped push lands does the real work.
     Run,
@@ -31,36 +31,41 @@ pub enum Reveal {
 
 /// Which level of the two-level model the selection is on, for the collapsible kinds. **Stored, not
 /// derived**: the row-space facts a derivation would read — `selected` (moved by the `set_group`
-/// reply) and `expanded_run` (moved by the reshaping push) — arrive on separate, order-independent
+/// reply) and `focus_run` (moved by the reshaping push) — arrive on separate, order-independent
 /// messages, and a held `Alt-j` repeat can fire in the gap between them. Deriving the level there
 /// reads a mismatched pair: the *new* selection row can land inside the *stale* run interval,
 /// misclassify as item level, and turn a group step into a local walk into the run. Only explicit
-/// gestures flip this bit (step/select/ascend/query → `Group`; descend / a centred open landing on
-/// an entry → `Item`); [`PickerState::selection_at_item_level`] still requires the run interval to
-/// agree, so a stale bit can never move the selection outside the run either.
+/// gestures flip this bit (step/collapse/query → `Group`; expand-and-descend / a spill / a centred
+/// open landing on an entry → `Item`); [`PickerState::selection_at_item_level`] still requires the
+/// run interval to agree, so a stale bit can never move the selection outside the run either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerLevel {
     /// The selection is a group header; `Alt-j`/`Alt-k` step between groups.
     Group,
-    /// The selection is inside the expanded run; `Alt-j`/`Alt-k` walk its items.
+    /// The selection is inside the focused run; `Alt-j`/`Alt-k` walk its items.
     Item,
 }
 
-/// Where a group-select gesture lands the selection within the newly selected run.
-/// Client-side only: the `picker/set_group` reply carries the run's geometry
-/// ([`aether_protocol::picker::ExpandedRun`]) and the client picks the row — the request's
+/// Where a `picker/set_group` gesture lands the selection within the focused run.
+/// Client-side only: the reply carries the run's geometry
+/// ([`aether_protocol::picker::GroupRunRows`]) and the client picks the row — the request's
 /// completion closure carries this intent into `Event::GroupSet`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupLanding {
-    /// Group-level navigation (`Alt-j`/`Alt-k` on a header, a header click / re-select):
-    /// land on the run's header, staying at group level.
+    /// Group-level navigation (`Alt-j`/`Alt-k` on a header, `Alt-h` collapsing the group the
+    /// selection was in, a header click): land on the run's header, staying at group level.
     Header,
-    /// An item-level spill over the run's *last* row: enter the next group at its first item,
-    /// staying at item level.
+    /// `Alt-l` expanding a group, or an item-level spill over the run's *last* row: enter the
+    /// group at its first item, at item level.
     RunStart,
     /// An item-level spill over the run's *first* row: enter the previous group at its last
     /// item, staying at item level.
     RunEnd,
+    /// `Alt-a`: the row space reshaped under a selection that didn't move, so re-seat it where it
+    /// was — `offset` items into the focused run, or on its header (`None`, and the fallback when
+    /// the run closed under the selection or shrank past the offset). Unlike the landings above
+    /// this one never frames the run: a toggle-all shouldn't move the view.
+    Keep { offset: Option<u32> },
 }
 
 pub struct PickerState {
@@ -81,11 +86,12 @@ pub struct PickerState {
     /// The window's group runs (window-relative starts, server-pushed alongside `items` — the
     /// single source of group boundaries; see `GroupSpan`). Empty for the flat kinds.
     pub groups: Vec<GroupSpan>,
-    /// Collapsible kinds: the expanded run's absolute place in the row space — header row + item
-    /// count, server-pushed alongside `items`. What the two-level navigation does its local math
-    /// against, together with the [`Self::level`] bit. `None` for the other kinds and while the
-    /// result set is empty.
-    pub expanded_run: Option<ExpandedRun>,
+    /// Collapsible kinds: the *focused* run's absolute place in the row space — header row + the
+    /// item rows that follow it (`0` when it's collapsed), server-pushed alongside `items`. Several
+    /// runs can be open at once; this is the one the selection is working in, and what the
+    /// two-level navigation does its local math against together with the [`Self::level`] bit.
+    /// `None` for the other kinds and while the result set is empty.
+    pub focus_run: Option<GroupRunRows>,
     /// The two-level navigation level (collapsible kinds; see [`PickerLevel`] for why this is
     /// stored rather than derived). Fresh opens and query changes are group level; a centred
     /// open landing on an entry is item level.
@@ -177,7 +183,7 @@ pub struct PickerState {
     /// Gates the dir/glob chip chords via [`Self::filter_available`]; false until the first view
     /// result lands, so early chords are clean no-ops.
     pub path_filterable: bool,
-    /// Whether this picker renders as a collapsible accordion — the `picker/view` echo of
+    /// Whether this picker renders as collapsible groups — the `picker/view` echo of
     /// `PickerViewResult::collapsible`, and the authority every group-row decision reads (shells
     /// included) in place of [`PickerKind::collapsible`]. Seeded from the kind so the pre-response
     /// frame lays out the same way, then corrected by the first view: a Jumplist captured from the
@@ -198,7 +204,7 @@ impl PickerState {
             generation: 0,
             items: Vec::new(),
             groups: Vec::new(),
-            expanded_run: None,
+            focus_run: None,
             level: PickerLevel::Group,
             group_gesture_in_flight: false,
             offset: 0,
@@ -337,6 +343,19 @@ impl PickerState {
     pub fn selected_item(&self) -> Option<&PickerItem> {
         self.items
             .get(self.selected.saturating_sub(self.offset) as usize)
+    }
+
+    /// The group span covering absolute row `row` — the last span starting at or above it. For the
+    /// collapsible kinds that's the run the row belongs to, header row or item row alike, and it
+    /// resolves even when the run's header has scrolled off above the window: the server repeats
+    /// the split run's header at `start: 0` (the same span a shell's sticky pin renders). `None`
+    /// for the ungrouped kinds, an empty window, or a row outside it.
+    pub fn governing_span(&self, row: u32) -> Option<&GroupSpan> {
+        let rel = row.checked_sub(self.offset)?;
+        if rel as usize >= self.items.len() {
+            return None;
+        }
+        self.groups.iter().rev().find(|s| s.start <= rel)
     }
 
     /// True when the row at absolute index `abs` is a non-selectable *context* row — a filtered
@@ -607,9 +626,9 @@ impl PickerState {
         if let Some(items) = u.items {
             self.items = items;
             self.groups = u.groups;
-            // Like the spans, the expanded run describes the pushed result set — adopted in
+            // Like the spans, the focused run describes the pushed result set — adopted in
             // lockstep with `items`, kept across count-only ticks.
-            self.expanded_run = u.expanded_run;
+            self.focus_run = u.focus_run;
             // A real window landed — any pending group gesture's reshape is now in hand (or
             // superseded), so `Alt-j`/`Alt-k` repeats may flow again.
             self.group_gesture_in_flight = false;
@@ -670,7 +689,7 @@ impl PickerState {
     }
 
     /// The count of selectable rows the highlight moves over: matches for the flat / derived-header
-    /// kinds; the whole *row space* — headers plus the expanded run's items — for the collapsible
+    /// kinds; the whole *row space* — headers plus every expanded run's items — for the collapsible
     /// kinds, whose `selected`/`offset` index window rows. `total_display_rows` is that row total
     /// (it falls back to `total_matches` on adoption for the flat kinds, so this is safe before the
     /// first grouped push).
@@ -682,17 +701,16 @@ impl PickerState {
         }
     }
 
-    /// The expanded run's item rows as an inclusive absolute-row interval, when a collapsible
-    /// picker has one. The selection is *item level* exactly when it sits inside this interval —
-    /// every other row is a group header.
-    pub fn expanded_item_rows(&self) -> Option<(u32, u32)> {
-        let run = self.expanded_run?;
+    /// The focused run's item rows as an inclusive absolute-row interval, when it is expanded and
+    /// non-empty. The selection is *item level* exactly when it sits inside this interval.
+    pub fn focus_item_rows(&self) -> Option<(u32, u32)> {
+        let run = self.focus_run?;
         (run.len > 0).then(|| (run.header_row + 1, run.header_row + run.len))
     }
 
     /// Two-level navigation level (collapsible kinds): `true` when the selection is *effectively*
     /// at item level — the stored [`Self::level`] bit says so AND the selection sits inside the
-    /// expanded run's rows. The conjunction is the point: the bit can't misroute a group step into
+    /// focused run's rows. The conjunction is the point: the bit can't misroute a group step into
     /// the run when a held repeat fires between the `set_group` reply and its reshaping push (see
     /// [`PickerLevel`]), and the interval can't let a stale bit walk the selection outside the run.
     /// Meaningless for the non-collapsible kinds — callers gate on [`PickerKind::collapsible`]
@@ -700,7 +718,7 @@ impl PickerState {
     pub fn selection_at_item_level(&self) -> bool {
         self.level == PickerLevel::Item
             && self
-                .expanded_item_rows()
+                .focus_item_rows()
                 .is_some_and(|(first, last)| (first..=last).contains(&self.selected))
     }
 
@@ -708,15 +726,16 @@ impl PickerState {
     /// highlight left the fetched window (the caller sends `picker/view`).
     ///
     /// For the collapsible kinds this is the *item-level* move of the two-level model: the
-    /// selection walks the expanded run's rows and stops hard at the run's ends — like the
-    /// jumplist's `]`/`[` at its ends. Group-level moves are `picker/set_group { step }`, routed by
-    /// the caller before it gets here; called at group level this is a no-op.
+    /// selection walks the focused run's rows and stops hard at the run's ends — the caller turns
+    /// a move off either end into a spill into the neighbouring group. Group-level moves are
+    /// `picker/set_group`, routed by the caller before it gets here; called at group level this is
+    /// a no-op.
     pub fn move_selection(&mut self, delta: i64) -> Option<u32> {
         if self.collapsible {
             if !self.selection_at_item_level() {
                 return None; // group level (or incoherent/empty): nothing moves locally
             }
-            let (first, last) = self.expanded_item_rows()?;
+            let (first, last) = self.focus_item_rows()?;
             self.selected = (self.selected as i64 + delta).clamp(first as i64, last as i64) as u32;
             let in_window = self.selected >= self.offset
                 && self.selected < self.offset + self.items.len() as u32;
@@ -1214,7 +1233,7 @@ mod tests {
             groups: vec![label_span(0, "A"), label_span(2, "B")],
             display_offset: Some(14),
             total_display_rows: Some(18),
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1317,7 +1336,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }
@@ -1478,7 +1497,7 @@ mod tests {
             groups: file_spans(&[(0, 0, "a.rs"), (1, 0, "b.rs")]),
             display_offset: Some(0),
             total_display_rows: Some(4),
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1535,8 +1554,8 @@ mod tests {
             ticking: false,
             groups: file_spans(&[(0, 0, "src/a.rs"), (3, 0, "src/b.rs")]),
             display_offset: Some(0),
-            total_display_rows: Some(4), // 2 headers + the expanded run's 2 diagnostics
-            expanded_run: None,
+            total_display_rows: Some(4), // 2 headers + the open run's 2 diagnostics
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1561,7 +1580,7 @@ mod tests {
     #[test]
     fn item_level_needs_both_the_bit_and_the_run_interval() {
         let mut s = PickerState::new(PickerKind::Grep);
-        s.expanded_run = Some(ExpandedRun {
+        s.focus_run = Some(GroupRunRows {
             header_row: 1,
             len: 2,
         });
@@ -1759,7 +1778,7 @@ mod tests {
             ],
             display_offset: Some(1),
             total_display_rows: Some(5),
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1836,7 +1855,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -1927,7 +1946,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });

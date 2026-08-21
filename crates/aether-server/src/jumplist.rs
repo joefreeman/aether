@@ -26,8 +26,8 @@
 //!   its own buffer, so a step out of it lands on the neighbouring entry — `]`/`[` walk a
 //!   captured file list one file at a time; and it carries no group, since a per-file header
 //!   above a row that *is* that file would only repeat it. Grouping is all-or-nothing per
-//!   capture ([`Jumplist::grouped`]), and an ungrouped list renders flat rather than as a
-//!   collapsible accordion.
+//!   capture ([`Jumplist::grouped`]), and an ungrouped list renders flat rather than as
+//!   collapsible groups.
 
 use crate::picker::{PickerCandidates, PickerState};
 use aether_protocol::cursor::Direction;

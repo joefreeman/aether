@@ -378,7 +378,7 @@ interface PickerView {
    *  ungrouped kinds. The shell opens one section + header row per span instead of re-deriving
    *  boundaries from item fields. */
   groups: GroupSpan[];
-  /** Whether this view renders as a collapsible accordion: headers
+  /** Whether this view renders as collapsible groups: headers
    * arrive as real `group` window rows and the row space counts them. Core-owned, and a property of
    * the view rather than the kind — a Jumplist captured from the Files or Buffers picker has no
    * groups and renders flat. */
@@ -392,10 +392,10 @@ interface PickerView {
   empty_note: string | null;
   total_display_rows: number;
   window_base: number;
-  /** Collapsible kinds: the expanded run's absolute rows — its
-   *  header's row-space index and item count — for the `run` reveal's scroll math. Null for
-   *  the other kinds and empty result sets. */
-  expanded_run: { header_row: number; len: number } | null;
+  /** Collapsible kinds: the focused run's absolute rows — its header's row-space index and the
+   *  item rows that follow it (0 when it's collapsed) — for the `run` reveal's scroll math. Null
+   *  for the other kinds and empty result sets. */
+  focus_run: { header_row: number; len: number } | null;
   directory: string | null;
   directory_parent: string | null;
   /** Explorer completion ghost: the rest of the highlighted directory's name, shown dim after the
@@ -4781,14 +4781,14 @@ export class Shell {
       list.scrollTop = 0;
       this.pickerScrollReset = false;
       this.pickerReveal = null;
-    } else if (this.pickerReveal === "run" && p.expanded_run && p.expanded_run.header_row === p.selected) {
+    } else if (this.pickerReveal === "run" && p.focus_run && p.focus_run.header_row === p.selected) {
       // Frame the freshly-opened group run: scroll the minimum that brings the run's last row into
       // view, capped so the header never leaves the top — at the cap the header row itself sits at
       // the very top (its own sticky position), so nothing hides under it. Applied only once the
       // view reflects the selected run (header_row === selected); until then it stays armed, like
       // the selected-row reveal below. Collapsible row space carries no gap pixels, so this is pure
       // row arithmetic.
-      const run = p.expanded_run;
+      const run = p.focus_run;
       const top = run.header_row * this.pickerRowH;
       const bottom = (run.header_row + run.len + 1) * this.pickerRowH;
       const h = list.clientHeight;

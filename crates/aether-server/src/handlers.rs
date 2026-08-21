@@ -78,9 +78,10 @@ use aether_protocol::lsp::{
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, MatchOptions, PickerHideParams, PickerItem, PickerKind, PickerQueryParams,
-    PickerReset, PickerSelectParams, PickerSelectResult, PickerSetGroupParams,
-    PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams, PickerViewResult,
+    BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction, PickerHideParams, PickerItem,
+    PickerKind, PickerQueryParams, PickerReset, PickerSelectParams, PickerSelectResult,
+    PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
+    PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -18238,7 +18239,8 @@ pub async fn picker_view(
         // header; it expands nothing.
         if picker.collapsible() && !matches!(item, PickerItem::Group { .. }) {
             if let Some(group_key) = picker.group_key_of_item(item) {
-                picker.expanded = Some(group_key);
+                picker.expansion.set(group_key.clone(), true);
+                picker.focus = Some(group_key);
             }
         }
         // `row_of` == the ranked position for the flat / derived-header kinds; row space for
@@ -18408,10 +18410,11 @@ pub async fn picker_query(
     picker.query = params.query;
     picker.filters = params.filters;
     picker.generation = params.generation;
-    // A query change resets the client's selection to row 0 — drop the expanded key so the
-    // accordion re-coheres with it: the first run of the *new* ranking opens itself and row 0 is
-    // its header again.
-    picker.expanded = None;
+    // A query change resets the client's selection to row 0 — drop the focus key so group
+    // stepping re-coheres with it, starting from the first run of the *new* ranking. Expansion
+    // itself is deliberately *not* cleared: it's keyed by group, so a group you opened re-opens
+    // when a refined query brings it back, and an `Alt-a` expand-all survives the refinement.
+    picker.focus = None;
     let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
         && picker
             .last_completed_search
@@ -18637,17 +18640,18 @@ pub async fn picker_hide(
         picker.symbol_fanned = None;
         picker.pending_async_load = None;
         picker.seed_symbol_fanout(0);
-        picker.expanded = None;
+        picker.expansion.clear();
+        picker.focus = None;
     }
     Ok(())
 }
 
-/// Select — and thereby expand — one group in a collapsible picker, addressed by `header` (a click,
-/// `Alt-l` on a header the client holds) or by `step` (the group-level `Alt-j`/`Alt-k` — the run
-/// adjacent to the expanded one, resolved here so it works past the fetched window). Accordion
-/// semantics: selecting a group implicitly collapses the previous one; there is no explicit
-/// collapse — group navigation is what moves the expansion. Replies with the selected header's
-/// absolute row in the reshaped space (the client adopts it as its selection) and pushes the
+/// Expand, collapse or move between the groups of a collapsible picker. Groups start collapsed and
+/// any number can be open at once; `Expand`/`Collapse` address one by its header (a key press on a
+/// header row the client holds, a click), `Step` moves the focus to the adjacent run — resolved
+/// here so it works past the fetched window — optionally opening the one it lands on (the
+/// item-level spill), and `ToggleAll` opens or closes everything. Replies with the focused run's
+/// place in the reshaped row space (the client picks its landing row from it) and pushes the
 /// reshaped window through the normal `picker/update` path; the client's offset/generation guards +
 /// refetch reconcile, so response/push arrival order doesn't matter.
 pub async fn picker_set_group(
@@ -18668,42 +18672,57 @@ pub async fn picker_set_group(
     if !picker.collapsible() {
         return Ok(PickerSetGroupResult { run: None });
     }
-    // Resolve the target group against the current ranking FIRST: acting on one that
-    // re-ranked away mid-flight — or a step off the ends — is a benign no-op (`run: None`)
-    // that must not disturb the accordion state. A vanished key left in `expanded` would
-    // surprise-expand if a later streaming batch brought the group back.
-    let group_key = match (&params.header, params.step) {
-        (Some(header), None) => {
-            let key = picker_state::group_key_of_header(header);
-            picker
-                .first_candidate_of_group(&key)
-                .is_some()
-                .then_some(key)
+    // Resolve the target group against the current ranking FIRST: acting on one that re-ranked
+    // away mid-flight — or a step off the ends — is a benign no-op (`run: None`) that must not
+    // disturb the expansion state. A vanished key left in `expansion` would surprise-expand if a
+    // later streaming batch brought the group back.
+    let resolve = |picker: &picker_state::PickerState, header: &GroupHeader| {
+        let key = picker_state::group_key_of_header(header);
+        picker
+            .first_candidate_of_group(&key)
+            .is_some()
+            .then_some(key)
+    };
+    let group_key = match &params.action {
+        PickerGroupAction::Expand { header } | PickerGroupAction::Collapse { header } => {
+            resolve(picker, header)
         }
-        (None, Some(direction)) => picker.step_group_key(direction),
-        // Neither or both halves: a malformed request, not a benign race.
-        _ => {
-            return Err(RpcError::invalid_params(
-                "picker/set_group takes exactly one of header/step",
-            ))
-        }
+        PickerGroupAction::Step { direction, .. } => picker.step_group_key(*direction),
+        // Nothing to address: the toggle acts on every group and leaves the focus where it is.
+        // A fresh picker has no focus key yet — the layout falls back to the first run, so adopt
+        // that as the focus the reply will describe.
+        PickerGroupAction::ToggleAll => picker.focus.clone().or_else(|| picker.first_group_key()),
     };
     let Some(group_key) = group_key else {
         return Ok(PickerSetGroupResult { run: None });
     };
-    picker.expanded = Some(group_key);
-    // The selected run's geometry in the reshaped space — the fresh layout resolves the key
-    // we just installed. The client picks its landing row from it (header for group nav,
-    // first/last item for an item-level spill — the latter is why the *length* rides the
-    // reply rather than just the header row).
-    let run = picker.row_layout().and_then(|layout| {
-        layout
-            .expanded
-            .map(|e| aether_protocol::picker::ExpandedRun {
-                header_row: layout.header_row(e),
-                len: layout.runs[e].len,
-            })
-    });
+    match &params.action {
+        PickerGroupAction::Expand { .. } => picker.expansion.set(group_key.clone(), true),
+        PickerGroupAction::Collapse { .. } => picker.expansion.set(group_key.clone(), false),
+        // A spill walks into the neighbour's items, so it has to open it; a group-level step just
+        // moves the highlight between headers.
+        PickerGroupAction::Step { expand, .. } => {
+            if *expand {
+                picker.expansion.set(group_key.clone(), true);
+            }
+        }
+        // Open everything, unless everything is already open — then close it. The server decides
+        // the direction because only it sees the whole run list.
+        PickerGroupAction::ToggleAll => {
+            let any_collapsed = picker
+                .row_layout()
+                .is_some_and(|layout| layout.expanded.iter().any(|&e| !e));
+            picker.expansion.set_all(any_collapsed);
+        }
+    }
+    picker.focus = Some(group_key);
+    // The focused run's geometry in the reshaped space — the fresh layout resolves the key we just
+    // installed. The client picks its landing row from it (the header for group nav and collapses,
+    // the run's first/last item for a descend or an item-level spill — the latter is why the
+    // *length* rides the reply rather than just the header row).
+    let run = picker
+        .row_layout()
+        .and_then(|layout| layout.focus.map(|pos| layout.run_rows(pos)));
     let update = picker_state::build_update(picker, matcher);
     let outbound = s.clients.get(&client_id).map(|c| c.outbound.clone());
     drop(s);
@@ -18808,7 +18827,7 @@ pub async fn jumplist_capture(
     //
     // Skipped entirely for an ungrouped capture (the file-shaped pickers, whose rows are whole
     // targets already carrying their parts): it would attach a per-file header above each row
-    // that *is* that file, and flip the view to a collapsible accordion of one-row groups.
+    // that *is* that file, and flip the view to a collapsible list of one-row groups.
     if list.grouped {
         let roots = s
             .active_workspace(client_id)

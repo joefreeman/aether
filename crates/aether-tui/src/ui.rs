@@ -1647,7 +1647,7 @@ pub fn picker_window_rows(
 }
 
 /// The span to stamp over the pane's top row for a *collapsible* pinning kind: the governing
-/// run's span, but only when the top view row sits inside the expanded run — when the top row
+/// run's span, but only when the top view row sits inside an open run — when the top row
 /// IS the run's own `Group` header it already renders itself identically, so no stamp (and a
 /// press there hits the row, which is selectable). Shared by the draw and the hit-test so the
 /// two can't disagree about whether row 0 is covered.
@@ -7533,7 +7533,7 @@ mod tests {
     /// The group-run reveal: frame the freshly-opened run — the minimal move that shows its last
     /// row, capped so the header never leaves the pane top.
     #[test]
-    fn run_reveal_frames_the_expanded_run() {
+    fn run_reveal_frames_the_focused_run() {
         // Pane of 6 rows; run header at view row 8 with 3 items (rows 9..=11).
         // Below the pane and it fits: bottom-align its last row.
         assert_eq!(picker_scroll_for_run(4, 6, 8, 3), 6);
@@ -8060,7 +8060,7 @@ mod tests {
         );
     }
 
-    /// Scrolled inside an expanded run, the run's header (long gone above) is stamped over the
+    /// Scrolled inside an open run, the run's header (long gone above) is stamped over the
     /// pane's top row — a press there hits the stamp, not the invisible hit beneath. The stamp
     /// carries the `Group` row's dressing (count), and only exists mid-run: at the run's own
     /// header row the row renders itself (see `picker_click_selects_group_header_rows`).

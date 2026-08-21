@@ -540,7 +540,7 @@ export type PickerItem =
   | {
       kind: "group";
       /** A collapsible group's header row — a real, selectable
-       *  window row, not a derived decoration. Click selects (and expands) the group; Enter
+       *  window row, not a derived decoration. Click toggles the group open or shut; Enter
        *  jumps to its first item — both routed through the core. */
       header: GroupHeader;
       /** Items in the run, shown on the row whether collapsed or expanded. */
@@ -567,7 +567,7 @@ export interface GroupSpan {
   start: number;
   header: GroupHeader;
   /** Collapsible kinds only: the run's item count and whether it is
-   *  the expanded run — the same decoration as its `group` row, so a sticky pin standing in
+   *  expanded — the same decoration as its `group` row, so a sticky pin standing in
    *  for a scrolled-off header renders identically. Absent for the derived-header kinds. */
   count?: number;
   expanded?: boolean;

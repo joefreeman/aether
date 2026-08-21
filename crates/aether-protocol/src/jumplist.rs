@@ -107,7 +107,7 @@ pub struct JumplistClearResult {
 /// ([`crate::picker::PickerKind::groups_in_jumplist`]), worth path-scoping or not. Those two gates
 /// ride the `picker/view` *response* ([`crate::picker::PickerViewResult::collapsible`] and
 /// `::path_filterable`), not the push — so pushing rows alone could leave a client rendering a flat
-/// list as an accordion, or offering dir/glob chips for a list that can't be scoped. Re-viewing
+/// list as collapsible groups, or offering dir/glob chips for a list that can't be scoped. Re-viewing
 /// takes the same path a scroll does and gets all of it right at once; the list changing under an
 /// open picker is rare enough that the extra round-trip costs nothing worth saving.
 pub struct JumplistChanged;

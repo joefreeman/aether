@@ -3399,7 +3399,7 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
         ],
         display_offset: Some(11),
         total_display_rows: Some(20),
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -3435,7 +3435,8 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
 #[test]
 fn collapsible_group_wire_shapes() {
     use aether_protocol::picker::{
-        GroupHeader, GroupSpan, PickerItem, PickerKind, PickerSetGroupParams, PickerSetGroupResult,
+        GroupHeader, GroupSpan, PickerGroupAction, PickerItem, PickerKind, PickerSetGroupParams,
+        PickerSetGroupResult,
     };
 
     // The header row item: internally tagged `group`, with the nested header's own tag; a
@@ -3493,37 +3494,65 @@ fn collapsible_group_wire_shapes() {
     let v = to_value(&span).unwrap();
     assert!(v.get("count").is_none() && v.get("expanded").is_none());
 
-    // `picker/set_group`: the group to select rides as a header OR a step (two-level navigation) —
-    // the absent half is skipped on the wire; the selected header's new row (or nothing) comes
-    // back.
+    // `picker/set_group`: one tagged action per gesture — expand/collapse a named group, step to
+    // the neighbouring one (optionally opening it: the item-level spill), or toggle every group.
+    let header = GroupHeader::File {
+        path_index: 0,
+        relative_path: "src/a.rs".into(),
+    };
     let p = PickerSetGroupParams {
         kind: PickerKind::Grep,
-        header: Some(GroupHeader::File {
-            path_index: 0,
-            relative_path: "src/a.rs".into(),
-        }),
-        step: None,
+        action: PickerGroupAction::Expand {
+            header: header.clone(),
+        },
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["kind"], "grep");
-    assert_eq!(v["header"]["kind"], "file");
-    assert!(v.get("step").is_none(), "absent step skipped");
+    assert_eq!(v["action"]["action"], "expand");
+    assert_eq!(v["action"]["header"]["kind"], "file");
     let back: PickerSetGroupParams = from_value(v).unwrap();
-    assert!(back.header.is_some() && back.step.is_none());
+    assert!(matches!(back.action, PickerGroupAction::Expand { .. }));
 
     let p = PickerSetGroupParams {
         kind: PickerKind::Grep,
-        header: None,
-        step: Some(aether_protocol::cursor::Direction::Forward),
+        action: PickerGroupAction::Collapse { header },
     };
     let v = to_value(&p).unwrap();
-    assert!(v.get("header").is_none(), "absent header skipped");
-    assert_eq!(v["step"], "forward");
+    assert_eq!(v["action"]["action"], "collapse");
     let back: PickerSetGroupParams = from_value(v).unwrap();
-    assert!(back.header.is_none() && back.step.is_some());
+    assert!(matches!(back.action, PickerGroupAction::Collapse { .. }));
+
+    let p = PickerSetGroupParams {
+        kind: PickerKind::Grep,
+        action: PickerGroupAction::Step {
+            direction: aether_protocol::cursor::Direction::Forward,
+            expand: true,
+        },
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["action"]["action"], "step");
+    assert_eq!(v["action"]["direction"], "forward");
+    assert_eq!(v["action"]["expand"], true);
+    let back: PickerSetGroupParams = from_value(v).unwrap();
+    assert!(matches!(
+        back.action,
+        PickerGroupAction::Step {
+            expand: true,
+            direction: aether_protocol::cursor::Direction::Forward
+        }
+    ));
+
+    let p = PickerSetGroupParams {
+        kind: PickerKind::Grep,
+        action: PickerGroupAction::ToggleAll,
+    };
+    let v = to_value(&p).unwrap();
+    assert_eq!(v["action"], json!({ "action": "toggle_all" }));
+    let back: PickerSetGroupParams = from_value(v).unwrap();
+    assert!(matches!(back.action, PickerGroupAction::ToggleAll));
 
     let r = PickerSetGroupResult {
-        run: Some(aether_protocol::picker::ExpandedRun {
+        run: Some(aether_protocol::picker::GroupRunRows {
             header_row: 3,
             len: 7,
         }),
@@ -3535,16 +3564,16 @@ fn collapsible_group_wire_shapes() {
     let v = to_value(&r).unwrap();
     assert!(v.get("run").is_none(), "a vanished group answers empty");
 
-    // The expanded run's geometry on `picker/update` (two-level navigation math): absolute
-    // header row + item count, skipped entirely when absent.
-    let run = aether_protocol::picker::ExpandedRun {
+    // The focused run's geometry on `picker/update` (two-level navigation math): absolute
+    // header row + the item rows following it (0 when collapsed), skipped entirely when absent.
+    let run = aether_protocol::picker::GroupRunRows {
         header_row: 4,
         len: 12,
     };
     let v = to_value(run).unwrap();
     assert_eq!(v["header_row"], 4);
     assert_eq!(v["len"], 12);
-    let back: aether_protocol::picker::ExpandedRun = from_value(v).unwrap();
+    let back: aether_protocol::picker::GroupRunRows = from_value(v).unwrap();
     assert_eq!(back, run);
 }
 
@@ -3792,7 +3821,7 @@ fn picker_update_round_trips_through_notification() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -3825,7 +3854,7 @@ fn picker_update_carries_center_on_symbol() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: Some(Box::new(PickerItem::Symbol {
             path: "/p/a.rs".into(),
             display_path: String::new(),

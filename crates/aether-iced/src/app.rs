@@ -6335,7 +6335,7 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
     // reshaped push lands (the core's `reveal_on_update`) runs against fresh geometry. Collapsible
     // row space carries no gap pixels, so this is pure row arithmetic.
     if let Reveal::Run = reveal {
-        let run = p.expanded_run.filter(|r| r.header_row == p.selected)?;
+        let run = p.focus_run.filter(|r| r.header_row == p.selected)?;
         let run_top = run.header_row as f32 * ui.row_h();
         let run_bottom = (run.header_row + run.len + 1) as f32 * ui.row_h();
         let h = crate::picker::list_height(p, ui);
@@ -7406,7 +7406,7 @@ mod tests {
             ],
             display_offset: Some(0),
             total_display_rows: Some(22),
-            expanded_run: Some(aether_protocol::picker::ExpandedRun {
+            focus_run: Some(aether_protocol::picker::GroupRunRows {
                 header_row: 1,
                 len: 20,
             }),
@@ -7481,7 +7481,7 @@ mod tests {
             groups: vec![label_span(0, "Motion"), label_span(3, "Edit")],
             display_offset: Some(0),
             total_display_rows: Some(25),
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));
@@ -7505,7 +7505,7 @@ mod tests {
     /// row, capped so the header never leaves the top — a run taller than the pane puts the header
     /// at the very top; a pre-adoption fire (the run doesn't match the selection yet) is a no-op.
     #[test]
-    fn run_reveal_frames_the_expanded_run() {
+    fn run_reveal_frames_the_focused_run() {
         let mut s = grep_state();
         let h = crate::picker::list_height(&s, ui());
         // b.rs's run: header at row 1, 20 items (rows 2..=21) — taller than the pane, so the
@@ -7524,7 +7524,7 @@ mod tests {
             Some(row_h())
         );
         // A short run that fits: minimal scroll down puts its last row at the pane bottom.
-        s.expanded_run = Some(aether_protocol::picker::ExpandedRun {
+        s.focus_run = Some(aether_protocol::picker::GroupRunRows {
             header_row: 30,
             len: 3,
         });
@@ -7566,7 +7566,7 @@ mod tests {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         }));

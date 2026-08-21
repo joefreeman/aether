@@ -203,7 +203,7 @@ pub struct Shell {
     picker_scroll: crate::ui::PickerScroll,
     /// Armed by `Effect::RevealPickerSelection(Reveal::Run)` — a group select/step wants the
     /// freshly-opened run framed. Applied by `sync_picker` once the core state is coherent (the
-    /// selected row IS the expanded run's header — the reshaped push may land a batch after the
+    /// selected row IS the focused run's header — the reshaped push may land a batch after the
     /// reply); cleared then, on a scroll reset, and when the picker closes.
     pending_group_reveal: bool,
     /// The in-flight `viewport/subscribe`'s request id. A newer subscribe removes it from
@@ -2482,11 +2482,11 @@ impl Shell {
             self.picker_scroll,
         );
         // A group select/step armed the run reveal: once the core is coherent — the selection IS
-        // the expanded run's header, inside the fetched window — frame the run and disarm. Until
+        // the focused run's header, inside the fetched window — frame the run and disarm. Until
         // then it stays armed: the reshaped push can land a batch after the reply that moved the
         // selection.
         if self.pending_group_reveal {
-            if let Some(run) = core.expanded_run {
+            if let Some(run) = core.focus_run {
                 if run.header_row == core.selected && run.header_row >= core.offset {
                     let header_rel = (run.header_row - core.offset) as usize;
                     if header_rel < rows.len() {

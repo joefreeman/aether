@@ -99,11 +99,11 @@ use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavStep, NavStepParams};
 use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, CaseMode, ExpandedRun, GroupHeader, MatchOptions, PickerFilters, PickerHide,
-    PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams, PickerReset,
-    PickerSelect, PickerSelectParams, PickerSelectResult, PickerSetGroup, PickerSetGroupParams,
-    PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams, PickerViewResult, ScopedPath,
-    MIN_GREP_QUERY_LEN,
+    BufferDirtyState, CaseMode, GroupHeader, GroupRunRows, MatchOptions, PickerFilters,
+    PickerGroupAction, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
+    PickerQueryParams, PickerReset, PickerSelect, PickerSelectParams, PickerSelectResult,
+    PickerSetGroup, PickerSetGroupParams, PickerUpdate, PickerUpdateParams, PickerView,
+    PickerViewParams, PickerViewResult, ScopedPath, MIN_GREP_QUERY_LEN,
 };
 use aether_protocol::search::{
     SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
@@ -344,7 +344,7 @@ pub enum Event {
     /// landing the gesture asked for (captured at request time — the wire carries only the
     /// geometry; the client picks the row). `None` = the group re-ranked away mid-flight, or a step
     /// ran off the ends (both benign stops).
-    GroupSet(Result<Option<ExpandedRun>, String>, GroupLanding),
+    GroupSet(Result<Option<GroupRunRows>, String>, GroupLanding),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
     /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
     /// push, which already switches us off a deleted current buffer.
@@ -2092,14 +2092,20 @@ impl Session {
             Event::PickerClicked(abs) => {
                 if let Some(p) = &mut self.picker {
                     p.selected = abs;
-                    // A header-row click is a *disclosure* gesture: select the group — expanding it
-                    // — rather than jumping. (Enter on a header is the jump; the mouse path to a
-                    // jump is clicking a visible item row.) Re-clicking the open group's header
-                    // re-affirms it.
-                    if let Some(PickerItem::Group { header, .. }) = p.selected_item() {
-                        let header = header.clone();
+                    // A header-row click is a *disclosure* gesture: toggle the group open or shut
+                    // rather than jumping. (Enter on a header is the jump; the mouse path to a
+                    // jump is clicking a visible item row.)
+                    if let Some(PickerItem::Group {
+                        header, expanded, ..
+                    }) = p.selected_item()
+                    {
+                        let (header, expanded) = (header.clone(), *expanded);
                         p.level = PickerLevel::Group;
-                        return self.picker_select_group(header);
+                        return if expanded {
+                            self.picker_collapse_group(header)
+                        } else {
+                            self.picker_expand_group(header, GroupLanding::Header)
+                        };
                     }
                 }
                 self.picker_accept()
@@ -2254,31 +2260,38 @@ impl Session {
                     // (`apply_update`) — whichever side of this reply it lands on.
                     Ok(Some(run)) => run,
                 };
-                // The landing row within the freshly selected run, per the gesture's intent: group
-                // navigation lands on the header; an item-level spill enters at the neighbouring
-                // run's first/last item.
-                p.selected = match landing {
-                    GroupLanding::Header => run.header_row,
-                    GroupLanding::RunStart => run.header_row + 1,
-                    GroupLanding::RunEnd => run.header_row + run.len,
+                // The landing row within the focused run, per the gesture's intent: group
+                // navigation and collapses land on the header; expanding into a group, or an
+                // item-level spill, enters at the run's first/last item. A collapsed run has no
+                // item rows (`len == 0`), so anything asking for one falls back to the header.
+                let item_at = |offset: u32| (offset < run.len).then(|| run.header_row + 1 + offset);
+                let landed = match landing {
+                    GroupLanding::Header => None,
+                    GroupLanding::RunStart => item_at(0),
+                    GroupLanding::RunEnd => item_at(run.len.saturating_sub(1)),
+                    GroupLanding::Keep { offset } => offset.and_then(item_at),
                 };
+                p.selected = landed.unwrap_or(run.header_row);
                 // Stamp the level to match — stored, so a held repeat firing before the
                 // reshaping push lands can't misread the new row against the stale run
                 // interval (see `PickerLevel`).
-                p.level = match landing {
-                    GroupLanding::Header => PickerLevel::Group,
-                    GroupLanding::RunStart | GroupLanding::RunEnd => PickerLevel::Item,
+                p.level = if landed.is_some() {
+                    PickerLevel::Item
+                } else {
+                    PickerLevel::Group
                 };
                 // The reshaping push is offset-guarded like any other; when the adopted row
                 // sits outside the subscribed window (a group step from deep inside a long
                 // run, whose header scrolled off above), the reveal helper chases it with a
-                // refetch. Group navigation frames the whole freshly-opened run (`Run`);
-                // spills reveal minimally — a continuous scan shouldn't yank the view around
-                // (and a bottom landing in an over-tall run must stay visible, which the
-                // header-capped run framing couldn't guarantee).
+                // refetch. Group navigation frames the whole run it lands on (`Run`); everything
+                // else reveals minimally — a continuous scan shouldn't yank the view around (and a
+                // bottom landing in an over-tall run must stay visible, which the header-capped
+                // run framing couldn't guarantee), and `Alt-a` deliberately keeps the view still.
                 self.picker_reveal_selection(match landing {
-                    GroupLanding::Header => Reveal::Run,
-                    GroupLanding::RunStart | GroupLanding::RunEnd => Reveal::Minimal,
+                    // A collapse lands on a header with nothing under it — there's no run to
+                    // frame, so it reveals like any other row.
+                    GroupLanding::Header if run.len > 0 => Reveal::Run,
+                    _ => Reveal::Minimal,
                 })
             }
             Event::PathDeleted { noun, result } => match result {
@@ -3803,12 +3816,14 @@ impl Session {
             return Effects::none();
         };
         // Two-level navigation for the collapsible kinds: with the selection on a group header,
-        // Alt-j/k move *between groups* — a server-resolved step (`picker/set_group { step }`; the
-        // neighbour may sit past the fetched window) that expands the group it lands on. With the
-        // selection among the expanded run's items, moves are local and run-clamped — except at the
-        // run's edges, where they *spill* into the neighbouring group: down off the last item
-        // enters the next group at its first item, up off the first enters the previous at its last
-        // (still item level). The very ends still stop (the step answers `run: None`).
+        // Alt-j/k move *between groups* — a server-resolved step (`picker/set_group`; the neighbour
+        // may sit past the fetched window) that leaves expansion alone, so a walk over headers
+        // stays an overview. With the selection among a run's items, moves are local and
+        // run-clamped — except at the run's edges, where they *spill* into the neighbouring group:
+        // down off the last item enters the next group at its first item, up off the first enters
+        // the previous at its last (still item level). A spill opens the group it walks into and
+        // leaves the one it came from open, so a long Alt-j walk unfolds the list behind it. The
+        // very ends still stop (the step answers `run: None`).
         if p.collapsible {
             // Single-flight: a gesture is mid-reshape — swallow repeats rather than route
             // them against transient state (a second step would skip a group's items).
@@ -3823,7 +3838,7 @@ impl Session {
             if !p.selection_at_item_level() {
                 return self.picker_step_group(direction, GroupLanding::Header);
             }
-            if let Some((first, last)) = p.expanded_item_rows() {
+            if let Some((first, last)) = p.focus_item_rows() {
                 if delta > 0 && p.selected == last {
                     return self.picker_step_group(direction, GroupLanding::RunStart);
                 }
@@ -4806,10 +4821,17 @@ impl Session {
             p.selected = abs;
             // A header row has no new-window target (the client doesn't hold the group's first item
             // while collapsed) — treat the Ctrl-click like a plain click: disclosure, not a jump.
-            if let Some(PickerItem::Group { header, .. }) = p.selected_item() {
-                let header = header.clone();
+            if let Some(PickerItem::Group {
+                header, expanded, ..
+            }) = p.selected_item()
+            {
+                let (header, expanded) = (header.clone(), *expanded);
                 p.level = PickerLevel::Group;
-                return self.picker_select_group(header);
+                return if expanded {
+                    self.picker_collapse_group(header)
+                } else {
+                    self.picker_expand_group(header, GroupLanding::Header)
+                };
             }
         }
         if let Some(target) = self.picker_item_target() {
@@ -5413,20 +5435,29 @@ impl Session {
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_ascend().unwrap_or_else(Effects::none);
             }
-            // Alt-h ascends a level: from an item onto its run's header — a local move, nothing
-            // collapses (moving the *group selection* is what moves the expansion). On a header
-            // it's as shallow as it goes — a no-op, NOT a query wipe: the unwind (clear query → pop
-            // chip) is Alt-Backspace's alone.
+            // Alt-h closes the group: from inside a run it collapses that run and puts the
+            // highlight on its header; on an expanded header it collapses in place. A collapsed
+            // header is as shallow as it goes — a no-op, NOT a query wipe: the unwind (clear
+            // query → pop chip) is Alt-Backspace's alone.
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.collapsible => {
-                if !p.selection_at_item_level() {
-                    return Effects::none();
-                }
-                let Some(run) = p.expanded_run else {
+                // The run the highlight is in, from the window's spans rather than the row itself:
+                // deep inside a long run its header has scrolled off above, and the leading span
+                // is exactly the repeat that covers that case. A collapsed group answers
+                // `expanded: false` here and the press does nothing.
+                let Some(span) = p.governing_span(p.selected) else {
                     return Effects::none();
                 };
-                p.selected = run.header_row;
-                p.level = PickerLevel::Group;
-                return self.picker_reveal_selection(Reveal::Minimal);
+                if span.expanded != Some(true) {
+                    return Effects::none();
+                }
+                let header = span.header.clone();
+                return self.picker_collapse_group(header);
+            }
+            // Alt-a toggles every group at once — expand-all, or collapse-all when nothing is
+            // collapsed. `a` for "all", unshifted: the Alt-letter family is the one that survives
+            // every terminal. A no-op in the flat pickers.
+            KeyCode::Char('a') if mods.alt && !mods.ctrl && p.collapsible => {
+                return self.picker_toggle_all_groups();
             }
             // Alt-Backspace unwind: clear the query first, then (explorer) step to the parent
             // (one segment per press) into roots mode (multi-root only), then pop chips.
@@ -5814,55 +5845,66 @@ impl Session {
         )
     }
 
-    /// Select — and thereby expand — `header`'s group in the open collapsible picker
-    /// (`picker/set_group`). Idempotent; the accordion collapses whatever was open before. The
-    /// response's run geometry lands as [`Event::GroupSet`] (header landing) and seats the
-    /// selection; the server's reshaped window arrives through the normal push path
-    /// (offset-guarded, order-independent).
-    fn picker_select_group(&mut self, header: GroupHeader) -> Effects {
-        let Some(p) = &mut self.picker else {
-            return Effects::none();
-        };
-        p.group_gesture_in_flight = true;
-        let kind = p.kind;
-        self.request::<PickerSetGroup>(
-            PickerSetGroupParams {
-                kind,
-                header: Some(header),
-                step: None,
-            },
-            move |__r| {
-                Event::GroupSet(
-                    __r.map(|r| r.run).map_err(|e| e.message),
-                    GroupLanding::Header,
-                )
-            },
-        )
+    /// Expand `header`'s group in the open collapsible picker and move into it (`Alt-l`, a click
+    /// on a collapsed header). Idempotent — on an already-open group it just re-focuses it, which
+    /// is what keeps `Alt-l` making progress on a header the focus has drifted off.
+    fn picker_expand_group(&mut self, header: GroupHeader, landing: GroupLanding) -> Effects {
+        self.picker_set_group(PickerGroupAction::Expand { header }, landing)
     }
 
-    /// Select the group adjacent to the expanded one (`picker/set_group { step }`), server-resolved
-    /// so it works when the neighbour sits past the fetched window. Serves both group-level
-    /// `Alt-j`/`Alt-k` (`landing: Header`) and the item-level spill over a run edge
-    /// (`RunStart`/`RunEnd` — enter the neighbouring group at its first/last item). A step off the
-    /// ends answers `run: None` — a stop, and [`Event::GroupSet`] leaves the selection alone.
+    /// Collapse `header`'s group and put the selection back on its header (`Alt-h`, a click on an
+    /// expanded header).
+    fn picker_collapse_group(&mut self, header: GroupHeader) -> Effects {
+        self.picker_set_group(PickerGroupAction::Collapse { header }, GroupLanding::Header)
+    }
+
+    /// Focus the group adjacent to the focused one, server-resolved so it works when the neighbour
+    /// sits past the fetched window. Serves both group-level `Alt-j`/`Alt-k` (`landing: Header`,
+    /// expansion untouched) and the item-level spill over a run edge (`RunStart`/`RunEnd` — walk
+    /// into the neighbouring group's items, which has to open it and leaves the run we came from
+    /// open). A step off the ends answers `run: None` — a stop, and [`Event::GroupSet`] leaves the
+    /// selection alone.
     fn picker_step_group(&mut self, direction: Direction, landing: GroupLanding) -> Effects {
+        let expand = landing != GroupLanding::Header;
+        self.picker_set_group(PickerGroupAction::Step { direction, expand }, landing)
+    }
+
+    /// One `picker/set_group` gesture. The response's run geometry lands as [`Event::GroupSet`]
+    /// and seats the selection per `landing`; the server's reshaped window arrives through the
+    /// normal push path (offset-guarded, order-independent).
+    fn picker_set_group(&mut self, action: PickerGroupAction, landing: GroupLanding) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         p.group_gesture_in_flight = true;
         let kind = p.kind;
-        self.request::<PickerSetGroup>(
-            PickerSetGroupParams {
-                kind,
-                header: None,
-                step: Some(direction),
-            },
-            move |__r| Event::GroupSet(__r.map(|r| r.run).map_err(|e| e.message), landing),
-        )
+        self.request::<PickerSetGroup>(PickerSetGroupParams { kind, action }, move |__r| {
+            Event::GroupSet(__r.map(|r| r.run).map_err(|e| e.message), landing)
+        })
+    }
+
+    /// `Alt-a`: expand every group, or collapse every group when none is collapsed (the server
+    /// picks the direction — only it sees the whole run list). The selection stays where it is:
+    /// the landing re-seats it at the same offset into the focused run, which the reshaped row
+    /// space has usually moved.
+    fn picker_toggle_all_groups(&mut self) -> Effects {
+        let Some(p) = &self.picker else {
+            return Effects::none();
+        };
+        if !p.collapsible {
+            return Effects::none();
+        }
+        // How far into the focused run the selection sits, so the reply can put it back there.
+        // `None` on a header: it stays on the header, wherever the reshape moved it to.
+        let offset = p
+            .selection_at_item_level()
+            .then(|| p.focus_item_rows().map(|(first, _)| p.selected - first))
+            .flatten();
+        self.picker_set_group(PickerGroupAction::ToggleAll, GroupLanding::Keep { offset })
     }
 
     /// Reveal the selection after a row move — `Reveal::Minimal` for the local two-level
-    /// descend/ascend, `Reveal::Run` for a group select/step (frame the whole expanded run) —
+    /// local row moves, `Reveal::Run` for a group step onto an open run (frame the whole run) —
     /// chasing it with a window refetch when it sits outside the fetched window. Fires the reveal
     /// both immediately and re-armed for the next push (`reveal_on_update`), so a reshaping window
     /// that hasn't landed yet still gets revealed against fresh geometry when it does.
@@ -5903,28 +5945,15 @@ impl Session {
                 return self.explorer_enter_selected();
             }
         } else if p.collapsible && !p.selection_at_item_level() {
-            // From the selected group's header onto the run's first item (the selected group IS
-            // the expanded one, so the row is right below). On a header that is *not* the open
-            // group — a transient state after a re-rank clamped the selection — re-select that
-            // group instead, so each press still makes progress.
-            if let Some(PickerItem::Group {
-                header,
-                expanded: false,
-                ..
-            }) = p.selected_item()
-            {
+            // Open the highlighted group and move onto its first item. Always the round trip, even
+            // when the group already shows its items: the reply carries the run's geometry in the
+            // reshaped row space, which is what seats the selection — and expanding is idempotent,
+            // so the same press also re-focuses a group the focus has drifted off (after a re-rank
+            // clamped the selection onto another header), which keeps each press making progress.
+            if let Some(PickerItem::Group { header, .. }) = p.selected_item() {
                 let header = header.clone();
-                return self.picker_select_group(header);
+                return self.picker_expand_group(header, GroupLanding::RunStart);
             }
-            let Some((first, _)) = p.expanded_item_rows() else {
-                return Effects::none(); // an empty run has nothing to descend onto
-            };
-            let Some(p) = &mut self.picker else {
-                return Effects::none();
-            };
-            p.selected = first;
-            p.level = PickerLevel::Item;
-            return self.picker_reveal_selection(Reveal::Minimal);
         }
         self.picker_accept()
     }

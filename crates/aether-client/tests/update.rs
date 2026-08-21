@@ -989,7 +989,7 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
         groups: Vec::new(),
         display_offset: Some(0),
         total_display_rows: Some(matches + 1),
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1102,7 +1102,7 @@ fn view_response_does_not_regress_a_query_typed_before_it() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1149,7 +1149,7 @@ fn grep_count_only_ticks_keep_the_window_then_the_first_batch_replaces_it() {
         groups: Vec::new(),
         display_offset: Some(0),
         total_display_rows: Some(matches),
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1222,7 +1222,7 @@ fn picker_query_change_keeps_stale_window_until_the_new_push_lands() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -1654,10 +1654,10 @@ fn alt_l_declines_the_create_row() {
     assert_eq!(s.picker.as_ref().unwrap().query, "novel.rs");
 }
 
-/// A collapsible picker window: a.rs collapsed with 2 hidden hits, b.rs expanded (selected group)
-/// with its 2 hits inline. Row space: [0]=a.rs hdr, [1]=b.rs hdr, [2.3]=hits.
+/// A collapsible picker window: a.rs collapsed with 2 hidden hits, b.rs expanded (the focused
+/// group) with its 2 hits inline. Row space: [0]=a.rs hdr, [1]=b.rs hdr, [2,3]=hits.
 fn grep_with_groups(s: &mut Session) {
-    use aether_protocol::picker::{ExpandedRun, GroupHeader, GroupSpan, PickerItem, PickerKind};
+    use aether_protocol::picker::{GroupHeader, GroupRunRows, GroupSpan, PickerItem, PickerKind};
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
     let p = s.picker.as_mut().unwrap();
     let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
@@ -1697,40 +1697,70 @@ fn grep_with_groups(s: &mut Session) {
         .collect();
     p.total_matches = 4;
     p.total_display_rows = 4;
-    p.expanded_run = Some(ExpandedRun {
+    p.focus_run = Some(GroupRunRows {
         header_row: 1,
         len: 2,
     });
 }
 
 #[test]
-fn alt_l_descends_into_the_selected_group() {
+fn alt_l_expands_the_highlighted_group_and_enters_it() {
+    use aether_client::picker::GroupLanding;
+    use aether_client::update::Event;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
-    // On the selected (expanded) group's header: Alt-l descends onto the run's first item — a local
-    // move, no round-trip.
-    s.picker.as_mut().unwrap().selected = 1;
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    assert!(find_request(&fx, "picker/set_group").is_none());
-    assert_eq!(s.picker.as_ref().unwrap().selected, 2);
-    // On a header that is NOT the open group (transient, post-re-rank): Alt-l re-selects
-    // that group first — each press makes progress.
+    // On a collapsed header: Alt-l expands the group and moves into it. The reply's geometry is
+    // what seats the selection, so the row waits for the round trip.
     s.picker.as_mut().unwrap().selected = 0;
     let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    let params = find_request(&fx, "picker/set_group").expect("Alt-l re-selects the group");
+    let params = find_request(&fx, "picker/set_group").expect("Alt-l expands the group");
     assert_eq!(params["kind"], "grep");
-    assert_eq!(params["header"]["relative_path"], "a.rs");
-    assert!(params.get("step").is_none(), "header-addressed, not a step");
+    assert_eq!(params["action"]["action"], "expand");
+    assert_eq!(params["action"]["header"]["relative_path"], "a.rs");
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 0,
+            len: 2,
+        })),
+        GroupLanding::RunStart,
+    ));
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        1,
+        "lands on the run's first item"
+    );
+    // On an already-open header the same request goes out — idempotent server-side, and the
+    // reply is still what carries the run's geometry.
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.selected = 1;
+        p.level = aether_client::picker::PickerLevel::Group;
+    }
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("Alt-l re-enters an open group");
+    assert_eq!(params["action"]["action"], "expand");
+    assert_eq!(params["action"]["header"]["relative_path"], "b.rs");
 }
 
 #[test]
 fn alt_l_on_a_group_item_opens_it() {
+    use aether_client::picker::GroupLanding;
+    use aether_client::update::Event;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
-    // Header → first item (the descend above), then one press further: an item row has no level
+    // Header → first item (the expand above), then one press further: an item row has no level
     // below it, so Alt-l opens the hit and the picker closes. It used to be a dead key here.
     s.picker.as_mut().unwrap().selected = 1;
     let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 1,
+            len: 2,
+        })),
+        GroupLanding::RunStart,
+    ));
     let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/select").expect("Alt-l opens the hit");
     assert_eq!(params["kind"], "grep");
@@ -1743,33 +1773,46 @@ fn alt_l_on_a_group_item_opens_it() {
 }
 
 #[test]
-fn alt_h_ascends_to_the_header_and_never_touches_the_query() {
+fn alt_h_collapses_the_group_and_never_touches_the_query() {
+    use aether_client::picker::GroupLanding;
+    use aether_client::update::Event;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
-    // On an item row: ascend onto the run's header — a local move, nothing collapses (moving the
-    // group selection is what moves the expansion).
+    // On an item row: collapse the run the highlight is in and land back on its header. The
+    // group is read off the window's spans, so it resolves even deep inside a long run.
     {
         let p = s.picker.as_mut().unwrap();
         p.selected = 3;
         p.level = aether_client::picker::PickerLevel::Item;
     }
     let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
-    assert!(no_request(&fx), "ascend is local — no set_group");
-    // A plain row reveal — run framing is the group *select* gesture's, not ascend's.
-    assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::RevealPickerSelection(aether_client::picker::Reveal::Minimal)
-        )),
-        "ascend reveals minimally"
-    );
+    let params = find_request(&fx, "picker/set_group").expect("Alt-h collapses the group");
+    assert_eq!(params["action"]["action"], "collapse");
+    assert_eq!(params["action"]["header"]["relative_path"], "b.rs");
+    // The reply reports the now-empty run; the landing seats the highlight on its header.
+    let fx = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 1,
+            len: 0,
+        })),
+        GroupLanding::Header,
+    ));
     assert_eq!(
         s.picker.as_ref().unwrap().selected,
         1,
         "lands on the header"
     );
-    // On a header: as shallow as it goes — a no-op. Alt-h never wipes the query
-    // (that's Alt-Backspace's).
+    // A collapse has no run to frame, so it reveals like any other row move.
+    assert!(
+        fx.0.iter().any(|e| matches!(
+            e,
+            Effect::RevealPickerSelection(aether_client::picker::Reveal::Minimal)
+        )),
+        "collapsing reveals minimally"
+    );
+    // On an already-collapsed header: as shallow as it goes — a no-op. Alt-h never wipes the
+    // query (that's Alt-Backspace's).
     let p = s.picker.as_mut().unwrap();
     p.selected = 0;
     p.query = "needle".into();
@@ -1801,30 +1844,46 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     s.picker.as_mut().unwrap().selected = 1;
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("group-level Alt-j steps");
-    assert_eq!(params["step"], "forward");
-    assert!(params.get("header").is_none(), "step-addressed, no header");
+    assert_eq!(params["action"]["action"], "step");
+    assert_eq!(params["action"]["direction"], "forward");
+    assert_eq!(
+        params["action"]["expand"], false,
+        "walking headers leaves expansion alone"
+    );
     // Resolve the gesture (a stop releases the single-flight guard at reply time — no
     // reshaping push follows a stop) so the next key isn't swallowed.
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
     let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("group-level Alt-k steps");
-    assert_eq!(params["step"], "backward");
+    assert_eq!(params["action"]["direction"], "backward");
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
-    // Item level — entered by the *descend gesture* (Alt-l), which is what flips the stored
+    // Item level — entered by the *expand gesture* (Alt-l), which is what flips the stored
     // level bit; poking `selected` into the run alone must not (that's the held-key guard,
     // see `PickerLevel`). Local moves clamp to the run.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
-    assert!(no_request(&fx));
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(aether_protocol::picker::GroupRunRows {
+            header_row: 1,
+            len: 2,
+        })),
+        GroupLanding::RunStart,
+    ));
+    s.picker.as_mut().unwrap().group_gesture_in_flight = false;
     assert_eq!(s.picker.as_ref().unwrap().selected, 2);
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     assert!(find_request(&fx, "picker/set_group").is_none());
     assert_eq!(s.picker.as_ref().unwrap().selected, 3);
     // At the run's last row Alt-j *spills* into the next group — an RPC, not a local
-    // walk-out; the selection waits for the reply. (Landings are exercised in
+    // walk-out; the selection waits for the reply. A spill walks into the neighbour's items,
+    // so it opens it (and leaves this run open). (Landings are exercised in
     // item_level_spills_across_group_edges.)
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
-    assert_eq!(params["step"], "forward");
+    assert_eq!(params["action"]["direction"], "forward");
+    assert_eq!(
+        params["action"]["expand"], true,
+        "a spill opens the group it walks into"
+    );
     assert_eq!(s.picker.as_ref().unwrap().selected, 3);
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::RunStart)); // the very end: a stop
                                                                            // Back inside, Alt-k walks locally…
@@ -1834,12 +1893,78 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     // …and at the run's first row it spills backward.
     let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("upward spill steps back");
-    assert_eq!(params["step"], "backward");
+    assert_eq!(params["action"]["direction"], "backward");
+}
+
+/// `Alt-a` asks the server to toggle every group; the reply re-seats the highlight where it was —
+/// the same offset into the focused run, or its header when the run shut under it.
+#[test]
+fn alt_a_toggles_every_group_and_keeps_the_selection() {
+    use aether_client::picker::{GroupLanding, PickerLevel, Reveal};
+    use aether_client::update::Event;
+    use aether_protocol::picker::{GroupRunRows, PickerKind};
+    let mut s = session();
+    grep_with_groups(&mut s);
+    // From inside b.rs's run (row 3 = its second item).
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.selected = 3;
+        p.level = PickerLevel::Item;
+    }
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/set_group").expect("Alt-a toggles every group");
+    assert_eq!(params["kind"], "grep");
+    assert_eq!(params["action"], json!({ "action": "toggle_all" }));
+    // Expanding everything pushes b.rs's run down past a.rs's two hits; the selection follows
+    // its item, one row further into the run than the header.
+    let fx = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 3,
+            len: 2,
+        })),
+        GroupLanding::Keep { offset: Some(1) },
+    ));
+    assert_eq!(
+        s.picker.as_ref().unwrap().selected,
+        5,
+        "same offset, new row"
+    );
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::RevealPickerSelection(Reveal::Minimal))),
+        "a toggle-all doesn't frame a run"
+    );
+    // Collapsing everything closes the run under the selection: it falls back to the header.
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 1,
+            len: 0,
+        })),
+        GroupLanding::Keep { offset: Some(1) },
+    ));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 1);
+    // On a header the offset is `None` — the highlight stays on the header wherever it moved to.
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 4,
+            len: 3,
+        })),
+        GroupLanding::Keep { offset: None },
+    ));
+    assert_eq!(s.picker.as_ref().unwrap().selected, 4);
+
+    // Flat pickers have no groups to toggle: Alt-a is a dead key there (and must not type an `a`).
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    s.picker.as_mut().unwrap().query = "needle".into();
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.picker.as_ref().unwrap().query, "needle");
 }
 
 /// The held-`Alt-j` race (see `PickerLevel` / `group_gesture_in_flight`): a group step's
 /// outcome arrives as two order-independent messages — the reply moves `selected`, the
-/// reshaping push moves `expanded_run`. A repeat firing between them used to derive "item
+/// reshaping push moves `focus_run`. A repeat firing between them used to derive "item
 /// level" from the *new* selection row against the *stale* run interval and walk into the
 /// run. Now repeats during a gesture are swallowed (single-flight, released by the push's
 /// adoption), and the stored level bit backstops the routing either way.
@@ -1847,7 +1972,7 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
 fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     use aether_client::picker::GroupLanding;
     use aether_client::update::Event;
-    use aether_protocol::picker::ExpandedRun;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
     s.picker.as_mut().unwrap().selected = 1; // b.rs's header — group level
@@ -1857,10 +1982,10 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     assert!(no_request(&fx), "repeat during the gesture is swallowed");
     // The reply lands the next group's header row *in the incoming row space* (row 2), while
-    // the stale local `expanded_run` ({header_row: 1, len: 2}) still claims rows 2..=3 as
+    // the stale local `focus_run` ({header_row: 1, len: 2}) still claims rows 2..=3 as
     // b.rs's items — the misclassifying pair (the reshaping push hasn't been adopted yet).
     let _ = s.on_event(Event::GroupSet(
-        Ok(Some(ExpandedRun {
+        Ok(Some(GroupRunRows {
             header_row: 2,
             len: 4,
         })),
@@ -1875,7 +2000,7 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     // The reshaping push adopts (fresh run + guard release): stepping resumes.
     {
         let p = s.picker.as_mut().unwrap();
-        p.expanded_run = Some(ExpandedRun {
+        p.focus_run = Some(GroupRunRows {
             header_row: 2,
             len: 4,
         });
@@ -1883,7 +2008,7 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     }
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("stepping resumes after adoption");
-    assert_eq!(params["step"], "forward");
+    assert_eq!(params["action"]["direction"], "forward");
 }
 
 /// Item-level `Alt-j`/`Alt-k` spill over the run's edges: down off the last item enters the next
@@ -1893,22 +2018,31 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
 fn item_level_spills_across_group_edges() {
     use aether_client::picker::{GroupLanding, Reveal};
     use aether_client::update::Event;
-    use aether_protocol::picker::ExpandedRun;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
     // Enter b.rs's run (header row 1, items 2..=3) and walk to its last item.
     s.picker.as_mut().unwrap().selected = 1;
-    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS); // descend → 2
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS); // expand + enter
+    let _ = s.on_event(Event::GroupSet(
+        Ok(Some(GroupRunRows {
+            header_row: 1,
+            len: 2,
+        })),
+        GroupLanding::RunStart,
+    )); // → 2
+    s.picker.as_mut().unwrap().group_gesture_in_flight = false;
     let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS); // → 3 (last)
                                                                  // Down off the last item: the same step RPC as group navigation — the landing intent
                                                                  // stays client-side.
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
-    assert_eq!(params["step"], "forward");
+    assert_eq!(params["action"]["direction"], "forward");
+    assert_eq!(params["action"]["expand"], true);
     // The reply carries the newly selected run's geometry; a RunStart landing enters at its
     // first item — item level, minimal reveal.
     let fx = s.on_event(Event::GroupSet(
-        Ok(Some(ExpandedRun {
+        Ok(Some(GroupRunRows {
             header_row: 4,
             len: 5,
         })),
@@ -1926,7 +2060,7 @@ fn item_level_spills_across_group_edges() {
     );
     // A RunEnd landing (an upward spill) enters at the previous run's last item.
     let _ = s.on_event(Event::GroupSet(
-        Ok(Some(ExpandedRun {
+        Ok(Some(GroupRunRows {
             header_row: 0,
             len: 4,
         })),
@@ -1941,7 +2075,7 @@ fn item_level_spills_across_group_edges() {
     // level from the landing row.
     {
         let p = s.picker.as_mut().unwrap();
-        p.expanded_run = Some(ExpandedRun {
+        p.focus_run = Some(GroupRunRows {
             header_row: 0,
             len: 4,
         });
@@ -2008,17 +2142,24 @@ fn enter_on_a_group_header_jumps_to_its_first_item() {
 }
 
 #[test]
-fn clicking_a_group_header_selects_it_instead_of_jumping() {
+fn clicking_a_group_header_toggles_it_instead_of_jumping() {
     use aether_client::update::Event;
     let mut s = session();
     grep_with_groups(&mut s);
-    // A header click is the disclosure gesture: select (and expand) the group — no select,
+    // A header click is the disclosure gesture: open a shut group, shut an open one — no select,
     // no close. The mouse path to a jump is clicking a visible item row.
     let fx = s.on_event(Event::PickerClicked(0));
-    let params = find_request(&fx, "picker/set_group").expect("click selects the group");
-    assert_eq!(params["header"]["relative_path"], "a.rs");
+    let params = find_request(&fx, "picker/set_group").expect("click discloses the group");
+    assert_eq!(params["action"]["action"], "expand");
+    assert_eq!(params["action"]["header"]["relative_path"], "a.rs");
     assert!(find_request(&fx, "picker/select").is_none());
     assert!(s.picker.is_some(), "the picker stays open");
+    // b.rs is the open one, so clicking its header closes it.
+    s.picker.as_mut().unwrap().group_gesture_in_flight = false;
+    let fx = s.on_event(Event::PickerClicked(1));
+    let params = find_request(&fx, "picker/set_group").expect("click discloses the group");
+    assert_eq!(params["action"]["action"], "collapse");
+    assert_eq!(params["action"]["header"]["relative_path"], "b.rs");
     // Clicking an item row accepts it, as ever.
     let fx = s.on_event(Event::PickerClicked(2));
     assert!(find_request(&fx, "picker/select").is_some());
@@ -2028,13 +2169,13 @@ fn clicking_a_group_header_selects_it_instead_of_jumping() {
 fn group_set_landing_seats_the_selection() {
     use aether_client::picker::{GroupLanding, Reveal};
     use aether_client::update::Event;
-    use aether_protocol::picker::ExpandedRun;
+    use aether_protocol::picker::GroupRunRows;
     let mut s = session();
     grep_with_groups(&mut s);
     s.picker.as_mut().unwrap().selected = 3;
     // A Header landing seats the selection on the selected run's header row.
     let fx = s.on_event(Event::GroupSet(
-        Ok(Some(ExpandedRun {
+        Ok(Some(GroupRunRows {
             header_row: 1,
             len: 2,
         })),
@@ -2055,7 +2196,7 @@ fn group_set_landing_seats_the_selection() {
     );
     // A landing outside the fetched window chases with a refetch.
     let fx = s.on_event(Event::GroupSet(
-        Ok(Some(ExpandedRun {
+        Ok(Some(GroupRunRows {
             header_row: 90,
             len: 3,
         })),
@@ -2182,7 +2323,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -3666,7 +3807,7 @@ fn picker_view_response_renders_items_without_the_push() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -3731,7 +3872,7 @@ fn feed_files_window(s: &mut Session, initial: bool, offset: u32, n: u32, total:
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     };
@@ -5372,7 +5513,7 @@ fn selecting_the_create_row_creates_the_file() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -6825,7 +6966,7 @@ fn workspace_create_row_appears_for_a_novel_name_in_the_workspaces_picker() {
         groups: Vec::new(),
         display_offset: None,
         total_display_rows: None,
-        expanded_run: None,
+        focus_run: None,
         center_on: None,
         explorer_peek_missing: false,
     });
@@ -6865,7 +7006,7 @@ fn accepting_the_workspaces_create_row_emits_workspace_create() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: None,
             explorer_peek_missing: false,
         });
@@ -7903,7 +8044,7 @@ fn symbol_push_center_on_lands_the_highlight() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: Some(Box::new(sym(5, "b"))),
             explorer_peek_missing: false,
         })
@@ -7966,7 +8107,7 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
             groups: Vec::new(),
             display_offset: None,
             total_display_rows: None,
-            expanded_run: None,
+            focus_run: None,
             center_on: Some(Box::new(sym(81, "externally_modified"))),
             explorer_peek_missing: false,
         })

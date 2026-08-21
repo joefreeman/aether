@@ -11,8 +11,9 @@ use crate::workspace_index::CachedFile;
 use aether_protocol::cursor::Direction;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BranchCheckout, BufferDirtyState, CaseMode, GroupHeader, GroupSpan, KeybindingEntry,
-    MatchOptions, PickerFilters, PickerItem, PickerKind, PickerSelectResult, PickerUpdateParams,
+    BranchCheckout, BufferDirtyState, CaseMode, GroupHeader, GroupRunRows, GroupSpan,
+    KeybindingEntry, MatchOptions, PickerFilters, PickerItem, PickerKind, PickerSelectResult,
+    PickerUpdateParams,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
@@ -1287,59 +1288,70 @@ pub struct GroupRun {
 pub enum RowRef {
     /// A group's header row — the position of its run in [`RowLayout::runs`].
     Header(usize),
-    /// An item row of the expanded run — the item's ranked-space position (index into
-    /// `ranked`).
+    /// An item row of an expanded run — the item's ranked-space position (index into `ranked`).
     Item(u32),
 }
 
-/// The row space of a collapsible picker: one selectable header row per group run, plus the
-/// expanded run's items inline after its header — everything the window/offset/selection space
-/// counts for these kinds. At most one run is expanded (accordion), so every mapping here is O(1)
-/// arithmetic over the run list.
+/// The row space of a collapsible picker: one selectable header row per group run, plus each
+/// *expanded* run's items inline after its header — everything the window/offset/selection space
+/// counts for these kinds. Any number of runs can be expanded, so the row of a run's header is a
+/// prefix sum rather than arithmetic against one open run: [`Self::header_rows`] materialises it
+/// during the same O(n) walk that finds the runs, and row → run resolution binary-searches it.
 pub struct RowLayout {
     pub runs: Vec<GroupRun>,
-    /// Position in `runs` of the expanded run: [`PickerState::expanded`] resolved against the
-    /// current ranking, falling back to the first run when unset/unresolved — so this is `Some`
-    /// whenever `runs` is non-empty (exactly one group is always open). `None` only for an empty
-    /// result set.
-    pub expanded: Option<usize>,
+    /// Per run, whether its items follow its header ([`PickerState::expansion`] resolved against
+    /// the current ranking). Parallel to `runs`.
+    pub expanded: Vec<bool>,
+    /// Per run, the absolute row of its header. Parallel to `runs`, strictly increasing.
+    header_rows: Vec<u32>,
+    /// Position in `runs` of the focused run: [`PickerState::focus`] resolved against the current
+    /// ranking, falling back to the first run when unset/unresolved — so this is `Some` whenever
+    /// `runs` is non-empty. `None` only for an empty result set.
+    pub focus: Option<usize>,
 }
 
 impl RowLayout {
-    fn expanded_len(&self) -> u32 {
-        self.expanded.map(|i| self.runs[i].len).unwrap_or(0)
-    }
-
-    /// Total rows: one header per run + the expanded run's items.
+    /// Total rows: one header per run + every expanded run's items.
     pub fn total_rows(&self) -> u32 {
-        self.runs.len() as u32 + self.expanded_len()
+        match (self.header_rows.last(), self.expanded.last()) {
+            (Some(&last_row), Some(&expanded)) => {
+                let last = self.runs.last().expect("parallel to header_rows");
+                last_row + 1 + if expanded { last.len } else { 0 }
+            }
+            _ => 0,
+        }
     }
 
-    /// Absolute row of run `pos`'s header: one row per run above it, plus the expanded run's
-    /// items when that run sits above `pos`.
+    /// Absolute row of run `pos`'s header.
     pub fn header_row(&self, pos: usize) -> u32 {
-        pos as u32
-            + match self.expanded {
-                Some(e) if e < pos => self.runs[e].len,
-                _ => 0,
-            }
+        self.header_rows[pos]
+    }
+
+    /// Whether run `pos`'s items follow its header.
+    pub fn is_expanded(&self, pos: usize) -> bool {
+        self.expanded[pos]
+    }
+
+    /// The run whose header row is at or above absolute row `row` — the run `row` belongs to,
+    /// whether `row` is that header or one of its items.
+    fn run_of_row(&self, row: u32) -> Option<usize> {
+        self.header_rows
+            .partition_point(|&h| h <= row)
+            .checked_sub(1)
     }
 
     /// Resolve absolute row `row`; `None` past the end.
     pub fn row_ref(&self, row: u32) -> Option<RowRef> {
-        let total_runs = self.runs.len() as u32;
-        let Some(e) = self.expanded else {
-            return (row < total_runs).then_some(RowRef::Header(row as usize));
-        };
-        let (e_row, e_len) = (e as u32, self.runs[e].len);
-        if row <= e_row {
-            return Some(RowRef::Header(row as usize));
+        let pos = self.run_of_row(row)?;
+        let header = self.header_rows[pos];
+        if row == header {
+            return Some(RowRef::Header(pos));
         }
-        if row <= e_row + e_len {
-            return Some(RowRef::Item(self.runs[e].start + (row - e_row - 1)));
-        }
-        let pos = row - e_len;
-        (pos < total_runs).then_some(RowRef::Header(pos as usize))
+        // Below a header and above the next one: an item of that run, unless the run is the last
+        // one and `row` runs off its end.
+        let offset = row - header - 1;
+        (self.expanded[pos] && offset < self.runs[pos].len)
+            .then(|| RowRef::Item(self.runs[pos].start + offset))
     }
 
     /// The run containing ranked position `rank`.
@@ -1351,9 +1363,23 @@ impl RowLayout {
     /// expanded, else its run's header row (the item itself is hidden behind it).
     pub fn row_of_rank(&self, rank: u32) -> u32 {
         let pos = self.run_of_rank(rank);
-        match self.expanded {
-            Some(e) if e == pos => self.header_row(pos) + (rank - self.runs[pos].start) + 1,
-            _ => self.header_row(pos),
+        if self.expanded[pos] {
+            self.header_rows[pos] + (rank - self.runs[pos].start) + 1
+        } else {
+            self.header_rows[pos]
+        }
+    }
+
+    /// A run's place in the row space, as the wire reports it: header row + the item rows that
+    /// actually follow it (`0` when collapsed).
+    pub fn run_rows(&self, pos: usize) -> GroupRunRows {
+        GroupRunRows {
+            header_row: self.header_rows[pos],
+            len: if self.expanded[pos] {
+                self.runs[pos].len
+            } else {
+                0
+            },
         }
     }
 }
@@ -1445,14 +1471,64 @@ pub struct PickerState {
     /// a rerank. Recorded when a fan-out spawns; a became-ready re-query appends itself
     /// ([`crate::symbols::requery_ready_server`]).
     pub symbol_fanned: Option<(String, Vec<(std::path::PathBuf, String)>)>,
-    /// Collapsible kinds only: the group key of the one expanded run — exactly one group shows its
-    /// items whenever there are groups (accordion; the *selected* group under the two-level
-    /// navigation model). The key is resolved against the current ranking lazily at row-build time,
-    /// so it survives streaming re-ranks and query keystrokes for as long as its group does. `None`
-    /// — a fresh open, or the key's group re-ranked away — falls back to the *first* run at resolve
-    /// time ([`Self::row_layout`]): the top group opens itself, matching the client's
-    /// selection-starts-at-the-top convention.
-    pub expanded: Option<(u32, String)>,
+    /// Collapsible kinds only: which groups show their items. Keys are resolved against the
+    /// current ranking lazily at row-build time, so expansion survives streaming re-ranks and
+    /// query keystrokes for as long as its group does — a group you opened re-opens when a later
+    /// query brings it back.
+    pub expansion: Expansion,
+    /// Collapsible kinds only: the group key of the *focused* run — the one
+    /// [`PickerGroupAction::Step`] moves relative to, and the one whose geometry rides replies and
+    /// pushes ([`PickerUpdateParams::focus_run`]) for the client's local navigation math. Tracks
+    /// the group the client's selection is working in. `None` — a fresh open, a query change, or
+    /// the key's group re-ranked away — falls back to the *first* run at resolve time
+    /// ([`Self::row_layout`]), matching the client's selection-starts-at-the-top convention.
+    pub focus: Option<(u32, String)>,
+}
+
+/// Which groups of a collapsible picker are expanded. `all` flips the default so `Alt-a` on a
+/// 5000-file grep costs one bool rather than 5000 stored keys; `flipped` holds the exceptions to
+/// it — the groups expanded (or, after an expand-all, collapsed) one at a time.
+#[derive(Debug, Default, Clone)]
+pub struct Expansion {
+    all: bool,
+    /// Nested rather than `HashSet<(u32, String)>` so a borrowed `(u32, &str)` group key — what
+    /// [`PickerState::group_key_at`] hands out, once per run per layout build — probes it without
+    /// allocating.
+    flipped: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+}
+
+impl Expansion {
+    pub fn is_expanded(&self, key: (u32, &str)) -> bool {
+        let flipped = self
+            .flipped
+            .get(&key.0)
+            .is_some_and(|paths| paths.contains(key.1));
+        self.all != flipped
+    }
+
+    pub fn set(&mut self, key: (u32, String), expanded: bool) {
+        if expanded == self.all {
+            if let Some(paths) = self.flipped.get_mut(&key.0) {
+                paths.remove(&key.1);
+                if paths.is_empty() {
+                    self.flipped.remove(&key.0);
+                }
+            }
+        } else {
+            self.flipped.entry(key.0).or_default().insert(key.1);
+        }
+    }
+
+    /// `Alt-a`: open everything, or close everything. Both wipe the per-group exceptions, so the
+    /// next `Alt-a` sees a uniform state and flips it back.
+    pub fn set_all(&mut self, expanded: bool) {
+        self.all = expanded;
+        self.flipped.clear();
+    }
+
+    pub fn clear(&mut self) {
+        self.set_all(false);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1619,7 +1695,8 @@ impl PickerState {
             pending_symbol_queries: 0,
             last_completed_search: None,
             symbol_fanned: None,
-            expanded: None,
+            expansion: Expansion::default(),
+            focus: None,
         }
     }
 
@@ -1933,7 +2010,7 @@ impl PickerState {
 
     /// Build the items + match indices for the subscribed window. Returns the slice items and
     /// the effective offset (clamped to the total). For the collapsible kinds the window is in
-    /// row space — `Group` header rows interleaved with the expanded run's items
+    /// row space — `Group` header rows interleaved with the expanded runs' items
     /// ([`Self::build_window_rows`]); for everything else it's the bare ranked slice.
     pub fn build_window_items(
         &self,
@@ -1956,7 +2033,7 @@ impl PickerState {
     }
 
     /// The collapsible kinds' window builder: rows, not bare items — one [`PickerItem::Group`]
-    /// header row per run, the expanded run's items inline after its header.
+    /// header row per run, each expanded run's items inline after its header.
     fn build_window_rows(
         &self,
         layout: &RowLayout,
@@ -1979,7 +2056,7 @@ impl PickerState {
                             .group_header_at(self.ranked[run.start as usize] as usize)
                             .expect("collapsible kinds key every row"),
                         count: run.len,
-                        expanded: layout.expanded == Some(pos),
+                        expanded: layout.is_expanded(pos),
                     });
                 }
                 RowRef::Item(rank) => items.push(self.window_item(rank, &ctx, matcher, &mut buf)),
@@ -2176,7 +2253,7 @@ impl PickerState {
         }
     }
 
-    /// Whether *this picker* renders as a collapsible accordion — the authority behind
+    /// Whether *this picker* renders as collapsible groups — the authority behind
     /// `PickerViewResult::collapsible`, and what every server-side decision about group rows must
     /// consult instead of [`PickerKind::collapsible`].
     ///
@@ -2201,6 +2278,7 @@ impl PickerState {
             return None;
         }
         let mut runs: Vec<GroupRun> = Vec::new();
+        let mut expanded: Vec<bool> = Vec::new();
         let mut last: Option<(u32, &str)> = None;
         for (pos, &ci) in self.ranked.iter().enumerate() {
             let key = self
@@ -2212,17 +2290,31 @@ impl PickerState {
                     start: pos as u32,
                     len: 0,
                 });
+                expanded.push(self.expansion.is_expanded(key));
             }
             runs.last_mut().expect("just pushed").len += 1;
         }
-        let expanded = self
-            .expanded
+        // Header rows as a running total: one row per header, plus the items of every expanded run
+        // above it.
+        let mut header_rows = Vec::with_capacity(runs.len());
+        let mut row = 0;
+        for (pos, run) in runs.iter().enumerate() {
+            header_rows.push(row);
+            row += 1 + if expanded[pos] { run.len } else { 0 };
+        }
+        let focus = self
+            .focus
             .as_ref()
             .and_then(|key| self.run_of_key(&runs, key))
-            // No key, or its group re-ranked away: the first run opens itself — exactly one group
-            // is expanded whenever there are groups.
+            // No key, or its group re-ranked away: the first run — the client's selection resets
+            // to row 0, which is that run's header.
             .or((!runs.is_empty()).then_some(0));
-        Some(RowLayout { runs, expanded })
+        Some(RowLayout {
+            runs,
+            expanded,
+            header_rows,
+            focus,
+        })
     }
 
     /// Position in `runs` of the run whose group key is `key`, if it's in the current ranking.
@@ -2268,14 +2360,24 @@ impl PickerState {
         Some(self.ranked[layout.runs[pos].start as usize] as usize)
     }
 
-    /// The group key of the run adjacent to the expanded one — `picker/set_group { step }`, the
-    /// group-level `Alt-j`/`Alt-k`. Resolved here, against the full run list, so stepping works
-    /// past the client's fetched window. `None` when the step runs off the ends (group navigation
-    /// stops there, like the jumplist's `]`/`[`), the result set is empty, or the kind doesn't
-    /// collapse.
+    /// The owned group key of the first run — the group [`Self::focus`] resolves to when it is
+    /// unset or its key has re-ranked away. `None` when the kind doesn't collapse or the result
+    /// set is empty.
+    pub fn first_group_key(&self) -> Option<(u32, String)> {
+        let layout = self.row_layout()?;
+        let run = layout.runs.first()?;
+        self.group_key_at(self.ranked[run.start as usize] as usize)
+            .map(|(pi, path)| (pi, path.to_string()))
+    }
+
+    /// The group key of the run adjacent to the focused one — [`PickerGroupAction::Step`], the
+    /// group-level `Alt-j`/`Alt-k` and the item-level spill over a run edge. Resolved here,
+    /// against the full run list, so stepping works past the client's fetched window. `None` when
+    /// the step runs off the ends (group navigation stops there, like the jumplist's `]`/`[`), the
+    /// result set is empty, or the kind doesn't collapse.
     pub fn step_group_key(&self, direction: Direction) -> Option<(u32, String)> {
         let layout = self.row_layout()?;
-        let cur = layout.expanded?;
+        let cur = layout.focus?;
         let target = match direction {
             Direction::Forward => cur.checked_add(1)?,
             Direction::Backward => cur.checked_sub(1)?,
@@ -2338,8 +2440,8 @@ impl PickerState {
 
     /// Row-space spans for the collapsible kinds: one span per run whose region intersects the
     /// window, starting at its header row — and, keeping the leading-span invariant, at `0`
-    /// for a window that begins inside the expanded run's items (the split run's header is
-    /// repeated so the window stays self-describing; it's what a shell's sticky pin renders).
+    /// for a window that begins inside a run's items (the split run's header is repeated so the
+    /// window stays self-describing; it's what a shell's sticky pin renders).
     fn build_row_window_spans(
         &self,
         layout: &RowLayout,
@@ -2350,11 +2452,8 @@ impl PickerState {
         for rel in 0..len as u32 {
             match layout.row_ref(offset + rel) {
                 Some(RowRef::Header(pos)) => spans.push(self.run_span(layout, pos, rel)),
-                Some(RowRef::Item(_)) if rel == 0 => {
-                    let pos = layout
-                        .expanded
-                        .expect("item rows only exist in the expanded run");
-                    spans.push(self.run_span(layout, pos, 0));
+                Some(RowRef::Item(rank)) if rel == 0 => {
+                    spans.push(self.run_span(layout, layout.run_of_rank(rank), 0));
                 }
                 _ => {}
             }
@@ -2373,7 +2472,7 @@ impl PickerState {
                 .group_header_at(self.ranked[run.start as usize] as usize)
                 .expect("collapsible kinds key every row"),
             count: Some(run.len),
-            expanded: Some(layout.expanded == Some(pos)),
+            expanded: Some(layout.is_expanded(pos)),
         }
     }
 
@@ -2423,16 +2522,11 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         None => (None, None),
     };
     let groups = state.build_window_spans(offset, items.len());
-    // The expanded run's absolute geometry, for the client's local two-level navigation math.
+    // The focused run's absolute geometry, for the client's local two-level navigation math.
     // `None` for the non-collapsible kinds and empty result sets.
-    let expanded_run = state.row_layout().and_then(|layout| {
-        layout
-            .expanded
-            .map(|e| aether_protocol::picker::ExpandedRun {
-                header_row: layout.header_row(e),
-                len: layout.runs[e].len,
-            })
-    });
+    let focus_run = state
+        .row_layout()
+        .and_then(|layout| layout.focus.map(|pos| layout.run_rows(pos)));
     Some(PickerUpdateParams {
         kind: state.kind,
         generation: state.generation,
@@ -2444,7 +2538,7 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         groups,
         display_offset,
         total_display_rows,
-        expanded_run,
+        focus_run,
         // Set by callers that resolve a cursor-based highlight (DocumentSymbols' async fill).
         center_on: None,
         // Explorer-only; false (skipped on the wire) for every other kind.
@@ -2954,21 +3048,33 @@ mod tests {
         assert_eq!(flat.kind, PickerKind::Diagnostics);
         assert_eq!(flat.grouped_display_metrics(0), None);
 
-        // `DiagnosticsWorkspace` is collapsible: exactly one group is always expanded — with no key
-        // set, the first run (a.rs) opens itself.
+        // `DiagnosticsWorkspace` is collapsible: groups start closed, so a fresh view is headers
+        // only, and each expansion adds its own run's rows.
         let mut proj = PickerState::new(cands);
         proj.kind = PickerKind::DiagnosticsWorkspace;
         proj.rerank(&mut make_matcher());
         assert_eq!(
             proj.grouped_display_metrics(0),
-            Some((0, 4)),
-            "fresh: 2 headers + the auto-expanded a.rs's 2 diagnostics"
+            Some((0, 2)),
+            "fresh: 2 headers, nothing expanded"
         );
-        proj.expanded = Some((0, "src/b.rs".into()));
+        proj.expansion.set((0, "src/b.rs".into()), true);
         assert_eq!(
             proj.grouped_display_metrics(1),
             Some((1, 3)),
-            "b.rs selected: 2 headers + its 1 diagnostic; offset stays the identity"
+            "b.rs expanded: 2 headers + its 1 diagnostic; offset stays the identity"
+        );
+        proj.expansion.set((0, "src/a.rs".into()), true);
+        assert_eq!(
+            proj.grouped_display_metrics(1),
+            Some((1, 5)),
+            "both expanded: 2 headers + all 3 diagnostics"
+        );
+        proj.expansion.set_all(false);
+        assert_eq!(
+            proj.grouped_display_metrics(0),
+            Some((0, 2)),
+            "collapse-all wipes the per-group flags too"
         );
     }
 
@@ -3015,10 +3121,11 @@ mod tests {
         );
         let layout = s.row_layout().expect("collapsible kind");
         assert_eq!(layout.runs.len(), 3, "one run per file, none duplicated");
+        assert_eq!(layout.expanded, vec![false; 3], "fresh rank: all collapsed");
         assert_eq!(
-            layout.expanded,
+            layout.focus,
             Some(0),
-            "fresh rank: the best file's run opens itself"
+            "fresh rank: the best file's run takes the focus"
         );
     }
 
@@ -3030,13 +3137,25 @@ mod tests {
             GroupRun { start: 2, len: 3 },
             GroupRun { start: 5, len: 1 },
         ];
-        // Fully collapsed: three header rows; items are unreachable and map to their headers.
-        // (Constructed directly — `row_layout` itself never produces `expanded: None` for a
-        // non-empty run list any more; the None arithmetic stays as the degenerate path.)
-        let collapsed = RowLayout {
-            runs: runs.clone(),
-            expanded: None,
+        // A layout as `row_layout` builds one: header rows accumulate the items of every expanded
+        // run above them.
+        let build = |expanded: Vec<bool>| {
+            let mut header_rows = Vec::new();
+            let mut row = 0;
+            for (pos, run) in runs.iter().enumerate() {
+                header_rows.push(row);
+                row += 1 + if expanded[pos] { run.len } else { 0 };
+            }
+            RowLayout {
+                runs: runs.clone(),
+                expanded,
+                header_rows,
+                focus: Some(0),
+            }
         };
+
+        // Fully collapsed: three header rows; items are unreachable and map to their headers.
+        let collapsed = build(vec![false, false, false]);
         assert_eq!(collapsed.total_rows(), 3);
         assert_eq!(collapsed.row_ref(0), Some(RowRef::Header(0)));
         assert_eq!(collapsed.row_ref(2), Some(RowRef::Header(2)));
@@ -3044,10 +3163,7 @@ mod tests {
         assert_eq!(collapsed.row_of_rank(4), 1, "hidden item → its header row");
 
         // b expanded: rows are [a, b, b0, b1, b2, c].
-        let layout = RowLayout {
-            runs,
-            expanded: Some(1),
-        };
+        let layout = build(vec![false, true, false]);
         assert_eq!(layout.total_rows(), 6);
         assert_eq!(layout.header_row(0), 0);
         assert_eq!(layout.header_row(1), 1);
@@ -3068,6 +3184,34 @@ mod tests {
             5,
             "run below the expansion → its header"
         );
+        assert_eq!(
+            layout.run_rows(1),
+            GroupRunRows {
+                header_row: 1,
+                len: 3
+            }
+        );
+        assert_eq!(
+            layout.run_rows(2),
+            GroupRunRows {
+                header_row: 5,
+                len: 0
+            },
+            "a collapsed run reports its header row and no item rows"
+        );
+
+        // All three open: rows are [a, a0, a1, b, b0, b1, b2, c, c0].
+        let all = build(vec![true, true, true]);
+        assert_eq!(all.total_rows(), 9);
+        assert_eq!(
+            (all.header_row(0), all.header_row(1), all.header_row(2)),
+            (0, 3, 7)
+        );
+        assert_eq!(all.row_ref(1), Some(RowRef::Item(0)), "a's first item");
+        assert_eq!(all.row_ref(3), Some(RowRef::Header(1)));
+        assert_eq!(all.row_ref(8), Some(RowRef::Item(5)), "c's only item");
+        assert_eq!(all.row_ref(9), None, "past the end");
+        assert_eq!(all.row_of_rank(4), 6, "b's third item");
     }
 
     #[test]
@@ -3092,8 +3236,7 @@ mod tests {
         let mut m = make_matcher();
         s.rerank(&mut m);
 
-        // Fresh (no key): the first run opens itself — a.rs's diagnostics slot in under its header,
-        // b.rs stays a bare row.
+        // Fresh: both groups closed, so the window is two bare header rows.
         let (start, items) = s.build_window_items(0, 10, &mut m);
         assert_eq!(start, 0);
         let expect_group = |item: &PickerItem, rel: &str, count: u32, expanded: bool| {
@@ -3107,22 +3250,30 @@ mod tests {
             };
             assert_eq!((relative_path.as_str(), *c, *e), (rel, count, expanded));
         };
-        assert_eq!(items.len(), 4);
-        expect_group(&items[0], "src/a.rs", 2, true);
-        assert!(matches!(&items[1], PickerItem::Diagnostic { line: 2, .. }));
-        assert!(matches!(&items[2], PickerItem::Diagnostic { line: 9, .. }));
-        expect_group(&items[3], "src/b.rs", 1, false);
+        assert_eq!(items.len(), 2);
+        expect_group(&items[0], "src/a.rs", 2, false);
+        expect_group(&items[1], "src/b.rs", 1, false);
 
-        // Selecting b.rs moves the expansion (accordion): a.rs collapses to a bare header.
-        s.expanded = Some((0, "src/b.rs".into()));
+        // Expanding b.rs slots its diagnostic under its header; a.rs is untouched.
+        s.expansion.set((0, "src/b.rs".into()), true);
         let (_, items) = s.build_window_items(0, 10, &mut m);
         assert_eq!(items.len(), 3);
         expect_group(&items[0], "src/a.rs", 2, false);
         expect_group(&items[1], "src/b.rs", 1, true);
         assert!(matches!(&items[2], PickerItem::Diagnostic { line: 4, .. }));
 
-        // Back to a.rs for the span checks below.
-        s.expanded = Some((0, "src/a.rs".into()));
+        // Both open at once: every run's items follow its own header.
+        s.expansion.set((0, "src/a.rs".into()), true);
+        let (_, items) = s.build_window_items(0, 10, &mut m);
+        assert_eq!(items.len(), 5);
+        expect_group(&items[0], "src/a.rs", 2, true);
+        assert!(matches!(&items[1], PickerItem::Diagnostic { line: 2, .. }));
+        assert!(matches!(&items[2], PickerItem::Diagnostic { line: 9, .. }));
+        expect_group(&items[3], "src/b.rs", 1, true);
+        assert!(matches!(&items[4], PickerItem::Diagnostic { line: 4, .. }));
+
+        // Close b.rs again for the span checks below (a.rs open, b.rs shut).
+        s.expansion.set((0, "src/b.rs".into()), false);
 
         // A window starting mid-run leads with the split run's span at 0, dressed like its
         // header row; a window starting on a header row places the span at that row.
@@ -3162,7 +3313,7 @@ mod tests {
         s.kind = PickerKind::DiagnosticsWorkspace;
         s.rerank(&mut make_matcher());
 
-        // No key set: the first run stands expanded (the fallback), so Forward steps to b.
+        // No key set: the focus falls back to the first run, so Forward steps to b.
         assert_eq!(
             s.step_group_key(Direction::Forward),
             Some((0, "src/b.rs".into()))
@@ -3170,7 +3321,7 @@ mod tests {
         //... and Backward runs off the start — a stop, like the jumplist's `[` at its end.
         assert_eq!(s.step_group_key(Direction::Backward), None);
 
-        s.expanded = Some((0, "src/b.rs".into()));
+        s.focus = Some((0, "src/b.rs".into()));
         assert_eq!(
             s.step_group_key(Direction::Forward),
             Some((0, "src/c.rs".into()))
@@ -3181,11 +3332,11 @@ mod tests {
         );
 
         // At the last run, Forward stops.
-        s.expanded = Some((0, "src/c.rs".into()));
+        s.focus = Some((0, "src/c.rs".into()));
         assert_eq!(s.step_group_key(Direction::Forward), None);
 
         // A key whose group re-ranked away falls back to the first run as the reference.
-        s.expanded = Some((0, "src/gone.rs".into()));
+        s.focus = Some((0, "src/gone.rs".into()));
         assert_eq!(
             s.step_group_key(Direction::Forward),
             Some((0, "src/b.rs".into()))

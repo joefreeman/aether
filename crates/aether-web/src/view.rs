@@ -220,7 +220,7 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // the shell renders one header row per span instead of re-deriving boundaries
                 // from item fields.
                 "groups": p.groups.iter().map(jv).collect::<Vec<_>>(),
-                // Whether this view is a collapsible accordion. A property of the view, not the
+                // Whether this view is collapsible groups. A property of the view, not the
                 // kind — a Jumplist captured from the Files or Buffers picker renders flat — so the
                 // shell reads this rather than keeping its own list of collapsible kinds.
                 "collapsible": p.collapsible,
@@ -237,9 +237,9 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // Display-row index of the loaded window's first rendered row (a grep header sits one
                 // row above the first hit) — where the shell positions the window within the spacer.
                 "window_base": p.window_base(),
-                // Collapsible kinds: the expanded run's absolute rows, for the `Reveal::Run` scroll
+                // Collapsible kinds: the focused run's absolute rows, for the `Reveal::Run` scroll
                 // math. `null` for the other kinds / empty results.
-                "expanded_run": p.expanded_run.map(|r| json!({
+                "focus_run": p.focus_run.map(|r| json!({
                     "header_row": r.header_row,
                     "len": r.len,
                 })),
