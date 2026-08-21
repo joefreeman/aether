@@ -33,8 +33,10 @@ use aether_protocol::git::{
     GitResolveConflictResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
     GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow,
     GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
-    ResolveConflictStatus,
+    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitWorktreeAdd,
+    GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemove,
+    GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus, HunkAction,
+    HunkDirection, ResolveConflictStatus,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -79,8 +81,9 @@ use aether_protocol::viewport::{
     WrapMode,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceDelete,
-    WorkspaceDeleteParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceBindWorktree,
+    WorkspaceBindWorktreeParams, WorkspaceDelete, WorkspaceDeleteParams, WorkspaceOpenPath,
+    WorkspaceOpenPathParams,
 };
 use aether_protocol::LogicalPosition;
 use aether_server::{spawn_for_test, spawn_for_test_multi};
@@ -1176,11 +1179,9 @@ async fn setup_with_buffer(
     let path = dir.path().join("buf.txt");
     std::fs::write(&path, content).unwrap();
     let dir_path = dir.path().to_path_buf();
-    // Keep tempdir alive for the duration of the test by leaking it; the test only runs briefly
-    // and the OS will clean up /tmp on reboot.
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -3122,9 +3123,9 @@ async fn setup_deferred_parse_buffer() -> (
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("big.rs"), large_rust_source()).unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -3307,9 +3308,9 @@ async fn setup_deferred_git_buffer(
         .unwrap();
     std::fs::write(dir.path().join("big.rs"), on_disk).unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -9675,8 +9676,8 @@ async fn setup_with_named_file(
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(file_name), content).unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -11138,9 +11139,9 @@ async fn setup_picker_workspace() -> (
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("docs/intro.md"), "# intro\n").unwrap();
     std::fs::write(dir_path.join("README.md"), "# workspace\n").unwrap();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -11291,7 +11292,6 @@ fn keybindings_view_params(
 async fn keybindings_picker_matches_across_the_composed_row() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("kb-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -11548,7 +11548,6 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("changes-proj", vec![dir_path])
         .await
@@ -11669,7 +11668,6 @@ async fn git_changes_picker_collapses_untracked_directories() {
     }
     std::fs::write(dir.path().join("loose.rs"), "loose\n").unwrap(); // a lone new file
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("collapse-proj", vec![dir_path])
         .await
@@ -11720,7 +11718,6 @@ async fn git_changes_picker_hide_untracked() {
     std::fs::write(dir.path().join("a.rs"), "ONE\n").unwrap(); // a tracked modification
     std::fs::write(dir.path().join("loose.rs"), "loose\n").unwrap(); // a lone untracked file
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("hide-untracked-proj", vec![dir_path])
         .await
@@ -11789,7 +11786,6 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "a.rs", "one\ntwo\n");
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "buf-changes", "a.rs").await;
     // Type at the end of line 0 so the buffer differs from HEAD while the disk file does not.
@@ -11870,7 +11866,6 @@ async fn git_changes_file_is_locked_to_its_buffer() {
     // b.rs changes on disk (not opened); a.rs is opened and edited below.
     std::fs::write(dir.path().join("b.rs"), "X\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "gcf", "a.rs").await;
     let _: CursorState = send_request::<CursorSet>(
@@ -11957,7 +11952,6 @@ async fn changes_pickers_reopen_clean_and_rebuild_their_hunks() {
     git_commit_file(dir.path(), "a.rs", "l0\nl1\nl2\n");
     std::fs::write(dir.path().join("a.rs"), "l0\nCHANGED\nl2\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "reopen-proj", "a.rs").await;
     let view = |kind, buffer_id| PickerViewParams {
@@ -12021,7 +12015,6 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
     // Modify line 1 and line 4 → two disjoint hunks.
     std::fs::write(dir.path().join("a.rs"), "l0\nONE\nl2\nl3\nFOUR\nl5\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "center-proj", "a.rs").await;
     // Put the cursor on line 4 (the second hunk).
@@ -12081,7 +12074,6 @@ async fn picker_set_group_holds_the_accordion_invariant() {
     std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("accordion-proj", vec![dir_path])
         .await
@@ -12204,7 +12196,6 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
     let big: String = (0..10).map(|i| format!("needle {i}\n")).collect();
     std::fs::write(root.join("big.rs"), big).unwrap();
     std::fs::write(root.join("small.rs"), "needle\n").unwrap();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("midspan-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12365,7 +12356,6 @@ async fn git_changes_picker_query_greps_diff_content() {
     std::fs::write(dir.path().join("a.rs"), "ALPHA\nbeta MARKER\ngamma\n").unwrap();
     std::fs::write(dir.path().join("b.rs"), "untouched line\n").unwrap(); // untracked, no marker
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("grep-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12445,7 +12435,6 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
     )
     .unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("jump-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12545,7 +12534,6 @@ async fn git_changes_keep_view_preserves_query_within_one_open() {
     std::fs::write(dir.path().join("a.rs"), "alpha MARKER\n").unwrap();
     std::fs::write(dir.path().join("b.rs"), "no match here\n").unwrap(); // untracked, no marker
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("persist-proj", vec![dir_path])
         .await
@@ -12607,7 +12595,6 @@ async fn git_changes_picker_query_is_a_regex() {
     git_commit_file(dir.path(), "a.rs", "x\n");
     std::fs::write(dir.path().join("a.rs"), "x\nlet count = 1\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("regex-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12685,7 +12672,6 @@ async fn git_changes_picker_filters_by_directory() {
     std::fs::write(dir.path().join("src/a.rs"), "ONE\n").unwrap();
     std::fs::write(dir.path().join("docs/b.md"), "ONE\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("filter-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -12755,7 +12741,6 @@ async fn git_changes_picker_filters_by_exact_file() {
     std::fs::write(dir.path().join("src/a_helper.rs"), "ONE\n").unwrap();
     std::fs::write(dir.path().join("b.md"), "ONE\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("file-filter-proj", vec![dir_path])
         .await
@@ -13036,8 +13021,8 @@ async fn setup_buffer_picker_workspace() -> (
     std::fs::write(dir_path.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(dir_path.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(dir_path.join("README.md"), "# workspace\n").unwrap();
-    std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -13794,7 +13779,6 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
 async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -13910,8 +13894,6 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     let dir_b = tempfile::tempdir().unwrap();
     let a_path = dir_a.path().to_path_buf();
     let b_path = dir_b.path().to_path_buf();
-    std::mem::forget(dir_a);
-    std::mem::forget(dir_b);
     let server = spawn_for_test("test-proj", vec![a_path.clone(), b_path.clone()])
         .await
         .unwrap();
@@ -14017,7 +13999,6 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
 async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14100,7 +14081,6 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
 async fn save_as_creates_missing_parent_directories() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14178,7 +14158,6 @@ async fn save_as_does_not_create_dirs_outside_workspace() {
     let workspace = outer.path().join("proj");
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace_canonical = std::fs::canonicalize(&workspace).unwrap();
-    std::mem::forget(outer);
 
     let server = spawn_for_test("test-proj", vec![workspace_canonical.clone()])
         .await
@@ -14243,7 +14222,6 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("existing.txt"), "old content\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -14319,7 +14297,6 @@ async fn save_as_to_same_path_is_in_place_save() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("doc.txt"), "x\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14406,7 +14383,6 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("target.txt"), "original\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14520,7 +14496,6 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("file.txt"), "before\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14616,7 +14591,6 @@ async fn in_place_save_never_triggers_overwrite_check() {
 async fn in_place_save_after_save_as_targets_new_path() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
         .unwrap();
@@ -14729,7 +14703,6 @@ async fn buffer_close_drops_buffer() {
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -14815,7 +14788,6 @@ async fn buffer_close_last_buffer_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("only.txt"), "x\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -14865,7 +14837,6 @@ async fn buffer_close_drops_viewports() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -15088,7 +15059,6 @@ async fn input_replace_line_swaps_content() {
     // (Easier than asserting via line-state notifications which we'd have to reconstruct.)
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("out.txt");
-    std::mem::forget(dir);
     // We don't actually have a workspace path matching this temp file, so saving would fail.
     // Instead just verify by issuing a fresh open and reading the line count.
     let _ = target;
@@ -15105,7 +15075,6 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     let path = dir.path().join("a.txt");
     std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -15167,7 +15136,6 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     let path = dir.path().join("a.txt");
     std::fs::write(&path, "ab\ncd\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
@@ -15225,9 +15193,9 @@ async fn setup_grep_workspace() -> (
     )
     .unwrap();
     std::fs::write(dir_path.join("README.md"), "no match here\n").unwrap();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -16872,7 +16840,6 @@ async fn jumplist_capture_from_git_changes_picker() {
     std::fs::write(dir.path().join("a.rs"), "one\nTWO\nthree\n").unwrap();
     std::fs::write(dir.path().join("new.rs"), "hello\nworld\n").unwrap();
     let dir_path = dir.path().canonicalize().unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test("changes-proj", vec![dir_path])
         .await
         .unwrap();
@@ -17399,7 +17366,6 @@ async fn workspace_switch_wipes_the_captured_results() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("hay.txt"), "a needle here\n").unwrap();
-    std::mem::forget(dir);
     let server = spawn_for_test_multi(vec![
         ("p1".into(), vec![dir_path.clone()]),
         ("p2".into(), vec![dir_path]),
@@ -17492,9 +17458,9 @@ async fn setup_explorer_workspace() -> (
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(root.join("tests/it.rs"), "// integration\n").unwrap();
     std::fs::write(root.join("README.md"), "hi\n").unwrap();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -17694,10 +17660,10 @@ async fn setup_peek_workspace() -> (
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
     std::fs::write(root.join("src.txt"), "sibling file\n").unwrap();
-    std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![canonical_root.clone()])
+    let mut server = spawn_for_test("test-proj", vec![canonical_root.clone()])
         .await
         .unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -18307,7 +18273,6 @@ async fn directory_create_refuses_outside_workspace_boundary() {
     let workspace = outer.path().join("proj");
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace_canonical = std::fs::canonicalize(&workspace).unwrap();
-    std::mem::forget(outer);
 
     let server = spawn_for_test("test-proj", vec![workspace_canonical.clone()])
         .await
@@ -18427,9 +18392,9 @@ async fn setup_explorer_git_workspace() -> (
     std::fs::write(root.join("sub/deep.rs"), "changed\n").unwrap(); // change beneath sub/
     std::fs::write(root.join("new.rs"), "new\n").unwrap(); // untracked
     std::fs::write(root.join("debug.log"), "noise\n").unwrap(); // ignored
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -18612,9 +18577,9 @@ async fn setup_watched_buffer(
     // identical mtime, which the watcher's self-save filter would mistake for our own write.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -18956,7 +18921,6 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
     // Strictly-greater mtime for the external write (see `setup_watched_buffer`).
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let root_path = root.to_path_buf();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("test-proj", vec![root_path]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -19090,14 +19054,14 @@ async fn setup_overlapping_workspaces_watched_buffer(
     // the self-save filter can't mistake them for our own.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
 
-    let server = spawn_for_test_multi(vec![
+    let mut server = spawn_for_test_multi(vec![
         ("proj-a".into(), vec![dir_path.clone()]),
         ("proj-b".into(), vec![dir_path]),
     ])
     .await
     .unwrap();
+    server.keep_alive(dir);
     let (ws_a, buf_a) = connect_and_open_watched(&server.ws_url(), "proj-a").await;
     let (ws_b, buf_b) = connect_and_open_watched(&server.ws_url(), "proj-b").await;
     (server, ws_a, buf_a, ws_b, buf_b, path)
@@ -19236,7 +19200,6 @@ async fn open_in_second_workspace_sees_pending_changes() {
     let path = dir.path().join("watched.txt");
     std::fs::write(&path, "hello\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test_multi(vec![
         ("proj-a".into(), vec![dir_path.clone()]),
         ("proj-b".into(), vec![dir_path]),
@@ -19281,7 +19244,6 @@ async fn ephemeral_open_attaches_to_named_workspaces_document() {
     let path = dir.path().join("watched.txt");
     std::fs::write(&path, "hello\n").unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test_multi(vec![("proj-a".into(), vec![dir_path.clone()])])
         .await
         .unwrap();
@@ -25835,9 +25797,9 @@ async fn setup_grep_filter_workspace() -> (
     std::fs::write(root.join("changed.rs"), "needle changed\n").unwrap(); // modified
     std::fs::write(root.join("new.rs"), "needle new\n").unwrap(); // untracked
     std::fs::write(root.join("debug.log"), "needle ignored\n").unwrap(); // gitignored
-    std::mem::forget(dir);
 
-    let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![root]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -26061,7 +26023,6 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
     long.push_str("needle");
     long.push_str(&"y".repeat(5000));
     std::fs::write(root.join("minified.js"), &long).unwrap();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -26127,7 +26088,6 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
     let line = "ab".repeat(32);
     let body = vec![line; 2000].join("\n");
     std::fs::write(root.join("flood.txt"), body).unwrap();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("test-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -26293,7 +26253,6 @@ async fn grep_default_excludes_whitelisted_dotfile() {
     drop(tree);
     drop(index);
     drop(repo);
-    std::mem::forget(dir);
 
     let server = spawn_for_test("wl-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -26440,8 +26399,6 @@ async fn grep_filter_root_scope() {
     let (root_a, root_b) = (dir_a.path().to_path_buf(), dir_b.path().to_path_buf());
     std::fs::write(root_a.join("a.txt"), "needle in a\n").unwrap();
     std::fs::write(root_b.join("b.txt"), "needle in b\n").unwrap();
-    std::mem::forget(dir_a);
-    std::mem::forget(dir_b);
     let server = spawn_for_test("test-proj", vec![root_a, root_b])
         .await
         .unwrap();
@@ -26699,7 +26656,6 @@ async fn files_picker_shows_hidden_dirs() {
     drop(repo);
     // A gitignored file must never appear, even though hidden files now do.
     std::fs::write(root.join("secret.txt"), "nope\n").unwrap();
-    std::mem::forget(dir);
 
     let server = spawn_for_test("hidden-proj", vec![root]).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
@@ -26891,8 +26847,8 @@ async fn setup_transient_workspace() -> (
     let dir_path = dir.path().to_path_buf();
     std::fs::write(dir_path.join("a.txt"), "alpha\n").unwrap();
     std::fs::write(dir_path.join("b.txt"), "beta\n").unwrap();
-    std::mem::forget(dir);
-    let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
+    server.keep_alive(dir);
     let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -27057,7 +27013,6 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("doc.md"), &content).unwrap();
     let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
     let server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
 
     // Client 1: the editor (no viewport — edits don't need one).
@@ -27213,8 +27168,6 @@ async fn buffer_asset_route_serves_and_confines() {
     .unwrap();
     let dir_path = dir.path().to_path_buf();
     let outside_path = outside.path().to_path_buf();
-    std::mem::forget(dir);
-    std::mem::forget(outside);
 
     let server = spawn_for_test("test-proj", vec![dir_path.clone()])
         .await
@@ -27837,9 +27790,9 @@ async fn setup_with_external_file() -> (aether_server::ServerHandle, TestWs, Str
         .display()
         .to_string();
     let proj_path = proj_dir.path().to_path_buf();
-    std::mem::forget(proj_dir);
-    std::mem::forget(ext_dir);
-    let server = spawn_for_test("test-proj", vec![proj_path]).await.unwrap();
+    let mut server = spawn_for_test("test-proj", vec![proj_path]).await.unwrap();
+    server.keep_alive(proj_dir);
+    server.keep_alive(ext_dir);
     let (ws, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
@@ -28430,8 +28383,6 @@ async fn a_temporary_workspace_gets_no_language_server() {
         .unwrap()
         .display()
         .to_string();
-    std::mem::forget(dir);
-    std::mem::forget(outside_dir);
 
     let server = aether_server::spawn_for_test_with_lsp(
         "test-proj",
@@ -31279,6 +31230,44 @@ async fn branch_picker_lists_local_branches_with_head_first() {
     drop(server);
 }
 
+/// "Which branch am I on" is the *selection*, like every other picker — not a `●` in a leading
+/// column. The server resolves the HEAD row on a fresh open and echoes it as `effective_center_on`;
+/// the client adopts it as its highlight (`current_branch_item`).
+#[tokio::test]
+async fn the_branch_you_are_on_is_the_initial_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.branch("feature", &head, false).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let centred = view
+        .effective_center_on
+        .expect("a fresh open centres on the branch HEAD is on");
+    assert!(
+        matches!(&centred, PickerItem::GitBranch { name, is_head, .. }
+            if name == "main" && *is_head),
+        "centred on the current branch: {centred:?}"
+    );
+
+    // A re-view must not yank the highlight back — the user may have moved it.
+    let again = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::GitBranches)
+        },
+    )
+    .await;
+    assert!(again.effective_center_on.is_none());
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn branch_picker_filters_on_the_branch_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -31365,6 +31354,33 @@ async fn branch_picker_marks_a_branch_held_by_another_worktree() {
     let main_row = rows.iter().find(|(n, _, _)| n == "main").unwrap();
     assert!(main_row.1, "the main checkout's branch is still HEAD here");
     assert_eq!(main_row.2, None, "and is not held elsewhere");
+
+    // Asked from *inside* the worktree, the answer inverts — and `main`'s holder is the **main
+    // checkout**, not a worktree. Both refuse a checkout, but only one of them is a worktree, and
+    // the row has to say which or the client can only guess from a path.
+    let (server2, mut ws2) = setup_repos_workspace(vec![wt_path.clone()]).await;
+    let view2 = send_request::<PickerView>(&mut ws2, 2, &view_params(PickerKind::GitBranches)).await;
+    let items = view2.update.expect("initial window");
+    let main_here = items
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitBranch {
+                name,
+                checked_out_in,
+                checked_out_in_main,
+                ..
+            } if name == "main" => Some((checked_out_in.clone(), *checked_out_in_main)),
+            _ => None,
+        })
+        .expect("main is listed from inside the worktree");
+    assert_eq!(main_here.0.as_deref(), Some(main.to_string_lossy().as_ref()));
+    assert!(
+        main_here.1,
+        "held by the main working tree, so the client must not call it a worktree"
+    );
+
+    drop(server2);
     drop(server);
 }
 
@@ -31446,11 +31462,11 @@ async fn setup_refresh_workspace(
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    std::mem::forget(dir); // outlive the test; /tmp is cleaned by the OS
     let repo = init_repo_at(&root);
     commit_file(&repo, "a.rs", committed);
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (mut server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    server.keep_alive(dir);
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
@@ -32165,12 +32181,12 @@ async fn setup_checkout_workspace() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    std::mem::forget(dir); // outlive the test; /tmp is cleaned by the OS
     let repo = init_repo_at(&root);
     isolate_repo_config(&repo, &root.join(".git/test-hooks"));
     commit_file(&repo, "a.rs", "one\n");
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (mut server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    server.keep_alive(dir);
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         2,
@@ -32563,7 +32579,6 @@ async fn setup_commit_workspace() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    std::mem::forget(dir);
     let repo = init_repo_at(&root);
     let hooks = root.join(".git/test-hooks");
     isolate_repo_config(&repo, &hooks);
@@ -32575,7 +32590,8 @@ async fn setup_commit_workspace() -> (
     index.add_path(std::path::Path::new("a.rs")).unwrap();
     index.write().unwrap();
 
-    let (server, ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (mut server, ws) = setup_repos_workspace(vec![root.clone()]).await;
+    server.keep_alive(dir);
     (server, ws, root, hooks)
 }
 
@@ -32949,7 +32965,6 @@ async fn uncommit_moves_head_back_and_keeps_the_changes_staged() {
 async fn uncommitting_the_initial_commit_is_refused_with_gits_words() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    std::mem::forget(dir);
     let repo = init_repo_at(&root);
     isolate_repo_config(&repo, &root.join(".git/test-hooks"));
     commit_file(&repo, "a.rs", "one\n");
@@ -36037,6 +36052,1922 @@ async fn a_cancelled_pull_reports_a_stranded_index_lock() {
         res.index_locked,
         "a cancelled pull must notice the lock it may have stranded"
     );
+
+    drop(server);
+}
+
+// -------- git/worktree_add + git/worktree_remove --------------------------------------------------
+
+/// A repo with `a.rs` committed on `main`, isolated config, and the workspace active. Leaks the
+/// tempdir deliberately (like the checkout fixture) so the tree outlives the test body.
+async fn setup_worktree_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    git2::Repository,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    // The `TempDir` is handed back rather than forgotten: `/tmp` here is a tmpfs, so a leaked
+    // fixture survives until reboot, and a suite that leaks one per test exhausts the *inode*
+    // table long before it runs out of bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+    let (server, ws) = setup_repos_workspace(vec![root.clone()]).await;
+    (server, ws, repo, root, dir)
+}
+
+async fn worktree_add(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    root: &std::path::Path,
+    branch: &str,
+    create_branch: bool,
+) -> GitWorktreeAddResult {
+    send_request::<GitWorktreeAdd>(
+        ws,
+        id,
+        &GitWorktreeAddParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            branch: branch.into(),
+            create_branch,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn worktree_add_creates_a_tree_in_the_store_off_the_workspace() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+
+    let res = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    assert_eq!(res.status, GitWorktreeAddStatus::Created);
+    let wt = res.worktree.expect("a created worktree is reported");
+    let path = std::path::PathBuf::from(&wt.path);
+
+    // A real checkout, on the requested branch.
+    assert!(path.join("a.rs").is_file(), "tracked files are checked out");
+    let opened = git2::Repository::open(&path).unwrap();
+    assert_eq!(opened.head().unwrap().shorthand().unwrap(), "feature");
+
+    // The whole point of the centralised store: it is nowhere near the workspace root, so nothing
+    // in the current workspace can see it until it is opened deliberately.
+    assert!(
+        !path.starts_with(&root),
+        "{} must not live under the repo",
+        path.display()
+    );
+    // Namespaced per repo family, so two repos wanting `feature` can't collide.
+    let bucket = path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    assert!(bucket.contains('-'), "store bucket should be <name>-<hash>");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_add_derives_the_directory_and_leaves_the_branch_alone() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+
+    // The Zed #47208 / orca #13011 pair: a slash must flatten into the directory name and must not
+    // nest, while the *branch* keeps every character the user typed.
+    let res = worktree_add(&mut ws, 10, &root, "feature/auth", true).await;
+    assert_eq!(res.status, GitWorktreeAddStatus::Created);
+    let wt = res.worktree.unwrap();
+    let path = std::path::PathBuf::from(&wt.path);
+
+    assert_eq!(path.file_name().unwrap(), "feature-auth");
+    assert_eq!(wt.name, "feature-auth");
+    let opened = git2::Repository::open(&path).unwrap();
+    assert_eq!(
+        opened.head().unwrap().shorthand().unwrap(),
+        "feature/auth",
+        "the branch name must survive the directory derivation untouched"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_add_uniquifies_a_second_tree_for_a_similar_branch() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+
+    let first = worktree_add(&mut ws, 10, &root, "feature/auth", true).await;
+    assert_eq!(first.status, GitWorktreeAddStatus::Created);
+    // `feature-auth` and `feature/auth` sanitise to the same directory name; the second must get
+    // git's numeric suffix rather than colliding.
+    let second = worktree_add(&mut ws, 11, &root, "feature-auth", true).await;
+    assert_eq!(second.status, GitWorktreeAddStatus::Created);
+
+    let a = first.worktree.unwrap();
+    let b = second.worktree.unwrap();
+    assert_eq!(a.name, "feature-auth");
+    assert_eq!(b.name, "feature-auth1");
+    assert_ne!(a.path, b.path);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_add_refuses_a_branch_checked_out_elsewhere_and_says_where() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+
+    let first = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    assert_eq!(first.status, GitWorktreeAddStatus::Created);
+    let existing = first.worktree.unwrap().path;
+
+    // Git allows one checkout of a branch per family. The answer that matters is *where* it is, so
+    // the client can offer to go there instead of reporting a failure.
+    let again = worktree_add(&mut ws, 11, &root, "feature", false).await;
+    assert_eq!(again.status, GitWorktreeAddStatus::AlreadyCheckedOut);
+    assert_eq!(again.checked_out_in.as_deref(), Some(existing.as_str()));
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_add_classifies_a_missing_branch_before_spawning_git() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+    let res = worktree_add(&mut ws, 10, &root, "nope", false).await;
+    assert_eq!(res.status, GitWorktreeAddStatus::NoSuchBranch);
+    assert!(res.worktree.is_none());
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_add_seeds_gitignored_files_named_by_worktreeinclude() {
+    let (server, mut ws, repo, root, _dir) = setup_worktree_workspace().await;
+
+    // `.env` is gitignored *and* named by `.worktreeinclude` → copied. `secret.key` is gitignored
+    // but unnamed → not copied. `tracked.rs` is named but tracked → never duplicated, which is the
+    // rule that keeps seeding from shadowing a checkout.
+    std::fs::write(root.join(".gitignore"), ".env\nsecret.key\n").unwrap();
+    std::fs::write(root.join(".worktreeinclude"), ".env\ntracked.rs\n").unwrap();
+    std::fs::write(root.join("tracked.rs"), "fn main() {}\n").unwrap();
+    commit_file(&repo, ".gitignore", ".env\nsecret.key\n");
+    commit_file(&repo, "tracked.rs", "fn main() {}\n");
+    std::fs::write(root.join(".env"), "TOKEN=abc\n").unwrap();
+    std::fs::write(root.join("secret.key"), "shh\n").unwrap();
+
+    let res = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    assert_eq!(res.status, GitWorktreeAddStatus::Created);
+    assert_eq!(res.seeded_files, 1, "only .env matches AND is ignored");
+    let path = std::path::PathBuf::from(&res.worktree.unwrap().path);
+    assert_eq!(
+        std::fs::read_to_string(path.join(".env")).unwrap(),
+        "TOKEN=abc\n"
+    );
+    assert!(!path.join("secret.key").exists(), "unnamed ignored file");
+    assert!(path.join("tracked.rs").is_file(), "checked out, not copied");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_remove_takes_a_clean_tree_and_refuses_a_dirty_one() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+    let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    let wt = created.worktree.unwrap();
+    let path = std::path::PathBuf::from(&wt.path);
+
+    // Dirty first: an uncommitted change is the entire risk surface, so it must refuse and say
+    // what would be lost rather than ask "are you sure?".
+    std::fs::write(path.join("a.rs"), "changed\n").unwrap();
+    std::fs::write(path.join("new.txt"), "untracked\n").unwrap();
+    let refused: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        11,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(refused.status, GitWorktreeRemoveStatus::Dirty);
+    let at_risk = refused.at_risk.expect("a dirty refusal itemises the risk");
+    assert_eq!(at_risk.modified, 1);
+    assert_eq!(at_risk.untracked, 1);
+    assert!(path.exists(), "a refused removal changes nothing");
+
+    // Clean it, and the same request succeeds.
+    std::fs::write(path.join("a.rs"), "one\n").unwrap();
+    std::fs::remove_file(path.join("new.txt")).unwrap();
+    let removed: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        12,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(removed.status, GitWorktreeRemoveStatus::Removed);
+    assert!(!path.exists(), "the directory is gone");
+    // The branch survives — removing a worktree never discards committed work.
+    let repo = git2::Repository::open(&root).unwrap();
+    assert!(repo.find_branch("feature", git2::BranchType::Local).is_ok());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_remove_force_discards_and_refuses_the_main_worktree() {
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+    let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    let wt = created.worktree.unwrap();
+    let path = std::path::PathBuf::from(&wt.path);
+    std::fs::write(path.join("a.rs"), "changed\n").unwrap();
+
+    let forced: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        11,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(forced.status, GitWorktreeRemoveStatus::Removed);
+    assert!(!path.exists());
+
+    // The main worktree has no admin name, and "you can't remove the repository" is the useful
+    // answer rather than git's phrasing.
+    let main: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        12,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            name: String::new(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(main.status, GitWorktreeRemoveStatus::IsMain);
+    assert!(root.join("a.rs").is_file());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_picker_lists_trees_then_branches_without_the_ones_checked_out() {
+    use aether_protocol::picker::WorktreeRowKind;
+    let (server, mut ws, repo, root, _dir) = setup_worktree_workspace().await;
+    // Two extra branches: one gets a worktree, one doesn't.
+    repo.branch(
+        "spare",
+        &repo.head().unwrap().peel_to_commit().unwrap(),
+        false,
+    )
+    .unwrap();
+    let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    assert_eq!(created.status, GitWorktreeAddStatus::Created);
+
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    let update = view.update.expect("the view carries its initial window");
+    let rows: Vec<(WorktreeRowKind, String)> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Worktree { row, label, .. } => Some((*row, label.clone())),
+            _ => None,
+        })
+        .collect();
+
+    // Main first (labelled by its branch, since it has no admin name), then the linked tree, then
+    // branches with no tree. `feature` is deliberately absent as a *branch* row: it is already a
+    // worktree row, which is how the one-checkout-per-family rule is avoided rather than reported.
+    assert_eq!(rows[0], (WorktreeRowKind::Main, "main".to_string()));
+    assert_eq!(
+        rows[1],
+        (WorktreeRowKind::Existing, "feature".to_string()),
+        "the linked worktree is keyed by its admin name"
+    );
+    assert!(rows.contains(&(WorktreeRowKind::Branch, "spare".to_string())));
+    assert!(
+        !rows.contains(&(WorktreeRowKind::Branch, "feature".to_string())),
+        "a branch with a worktree must not also appear as a branch row"
+    );
+    assert!(!rows.contains(&(WorktreeRowKind::Branch, "main".to_string())));
+
+    drop(server);
+}
+
+// -------- workspace variants (worktree bindings) --------------------------------------------------
+
+/// A workspace with two roots — a repo and a plain notes directory — plus a worktree of the repo
+/// already created. Sessions are on, because a variant's bindings live in that file.
+async fn setup_variant_workspace() -> (
+    aether_server::ServerHandle,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let repo_root = base.join("repo");
+    let notes = base.join("notes");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("todo.md"), "- one\n").unwrap();
+    let repo = init_repo_at(&repo_root);
+    isolate_repo_config(&repo, &repo_root.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+
+    let sessions = base.join("sessions.json");
+    // A second workspace so a test can switch away from `p` — `workspace/delete` refuses while
+    // anyone is still in it.
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![
+            ("p".to_string(), vec![repo_root.clone(), notes.clone()]),
+            ("q".to_string(), vec![notes.clone()]),
+        ],
+        Some(sessions),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    (server, ws, repo_root, notes, dir)
+}
+
+async fn bind(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    repo_id: &std::path::Path,
+    worktree: &str,
+) -> WorkspaceActivateResult {
+    send_request::<WorkspaceBindWorktree>(
+        ws,
+        id,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_id.to_string_lossy().into()),
+            worktree: worktree.into(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn binding_remaps_the_repo_root_and_leaves_the_others_alone() {
+    let (server, mut ws, repo_root, notes, _dir) = setup_variant_workspace().await;
+    let created = worktree_add(&mut ws, 10, &repo_root, "feature", true).await;
+    let wt = created.worktree.unwrap();
+
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    // Binding adjusts the workspace you are in. It does not rename it, and it does not create a
+    // second one — which tree it is on is carried by `worktrees`, not by the id.
+    assert_eq!(bound.workspace.name, "p");
+    // Same shape: same root count, same order. That is what lets a project's positional
+    // `root_index` survive a binding untouched.
+    assert_eq!(bound.workspace.paths.len(), 2);
+    assert_eq!(bound.workspace.paths[0], wt.path);
+    assert_eq!(
+        bound.workspace.paths[1],
+        notes.to_string_lossy(),
+        "a root outside every bound repo must not move"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_second_repo_binds_alongside_the_first() {
+    // §9.2: binding a repo that isn't bound yet adds to what this workspace holds. That is the
+    // whole multi-repo story — run the command once per repo.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let a = base.join("a");
+    let b = base.join("b");
+    for root in [&a, &b] {
+        std::fs::create_dir_all(root).unwrap();
+        let repo = init_repo_at(root);
+        isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+        commit_file(&repo, "f.rs", "one\n");
+    }
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![("p".to_string(), vec![a.clone(), b.clone()])],
+        Some(base.join("sessions.json")),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let wt_a = worktree_add(&mut ws, 10, &a, "oauth", true)
+        .await
+        .worktree
+        .unwrap();
+    let first = bind(&mut ws, 11, &a, &wt_a.name).await;
+    assert_eq!(first.workspace.name, "p");
+
+    // The two worktrees need not share a name — the binding is per repo.
+    let wt_b = worktree_add(&mut ws, 12, &b, "auth-api", true)
+        .await
+        .worktree
+        .unwrap();
+    let second = bind(&mut ws, 13, &b, &wt_b.name).await;
+    assert_eq!(second.workspace.name, "p");
+    assert_eq!(second.workspace.paths[0], wt_a.path);
+    assert_eq!(second.workspace.paths[1], wt_b.path);
+    assert_ne!(
+        second.workspace.paths[0], second.workspace.paths[1],
+        "two repos, two trees, one workspace"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn rebinding_updates_in_place_and_keeps_the_other_bindings() {
+    // Rebinding must not silently drop what else the workspace holds, and must not spawn a second
+    // workspace — the reason the "first-bound repo is special" rule was deleted.
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let oauth = worktree_add(&mut ws, 10, &repo_root, "oauth", true)
+        .await
+        .worktree
+        .unwrap();
+    let hotfix = worktree_add(&mut ws, 11, &repo_root, "hotfix", true)
+        .await
+        .worktree
+        .unwrap();
+
+    let first = bind(&mut ws, 12, &repo_root, &oauth.name).await;
+    assert_eq!(first.workspace.paths[0], oauth.path);
+
+    let second = bind(&mut ws, 13, std::path::Path::new(&oauth.path), &hotfix.name).await;
+    assert_eq!(
+        second.workspace.name, "p",
+        "still the workspace you were standing in"
+    );
+    assert_eq!(second.workspace.paths[0], hotfix.path);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn unbinding_the_last_repo_returns_to_the_configured_roots() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // An empty worktree name is "send this repo back to main". The configured roots are what it
+    // returns to — this is why binding can never strand you, and why nothing has to be created or
+    // destroyed to get back. The repo is named as the workspace *currently* sees it (the worktree),
+    // which is what a picker row carries.
+    let back = bind(&mut ws, 12, std::path::Path::new(&wt.path), "").await;
+    assert_eq!(back.workspace.name, "p");
+    assert_eq!(back.workspace.paths[0], repo_root.to_string_lossy());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn open_buffers_follow_the_switch_and_unsaved_ones_stay_behind() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // One clean buffer in the repo (should follow), one in the notes root (shouldn't move at all),
+    // and one dirty buffer in the repo (should stay behind).
+    let clean: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _note: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        12,
+        &BufferOpenParams {
+            path_index: Some(1),
+            relative_path: Some("todo.md".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    std::fs::write(repo_root.join("b.rs"), "two\n").unwrap();
+    let dirty: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        13,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("b.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _typed: aether_protocol::input::EditResult = send_request::<InputText>(
+        &mut ws,
+        14,
+        &InputTextParams {
+            buffer_id: dirty.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let bound = bind(&mut ws, 15, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+    assert_ne!(bound.workspace.paths[0], repo_root.to_string_lossy());
+
+    // A rebind destroys nothing, so the unsaved buffer isn't refused — it simply doesn't follow to
+    // the other tree, and is still open (and still dirty) at its own path when you unbind.
+    let back = bind(&mut ws, 16, std::path::Path::new(&wt.path), "").await;
+    assert_eq!(back.workspace.name, "p");
+    let view = send_request::<PickerView>(&mut ws, 17, &view_params(PickerKind::Buffers)).await;
+    let update = view.update.expect("the view carries its initial window");
+    assert!(
+        update.items().iter().any(|i| matches!(
+            i,
+            PickerItem::Buffer { buffer_id, status, .. }
+                if *buffer_id == dirty.buffer_id && *status == BufferDirtyState::Unsaved
+        )),
+        "the unsaved buffer is still open in the context it stayed in, still unsaved"
+    );
+    let _ = clean;
+
+    drop(server);
+}
+
+/// Which checkout a file lives in is a fact about *its repo*, so it rides `GitBufferStatus` beside
+/// the branch — not the workspace label, which would have to aggregate across every bound repo and
+/// then couldn't say which root each name belonged to.
+///
+/// The branch alone cannot carry it: git allows one checkout per branch per family, so a worktree
+/// on `feature` and a main checkout on `feature` produce the same string. That is why the status
+/// bar marks the branch (`⧉` in the warning colour) rather than repeating it.
+#[tokio::test]
+async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
+    let (server, mut ws, repo_root, notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    async fn status_of(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+        path_index: u32,
+        rel: &str,
+    ) -> Option<aether_protocol::git::GitBufferStatus> {
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            ws,
+            id,
+            &BufferOpenParams {
+                path_index: Some(path_index),
+                relative_path: Some(rel.into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            ws,
+            id + 1,
+            &ViewportSubscribeParams {
+                buffer_id: open.buffer_id,
+                cols: 80,
+                rows: 24,
+                overscan_rows: 0,
+                scroll: ScrollPosition {
+                    logical_line: 0,
+                    sub_row: 0.0,
+                },
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+                diff_view: false,
+            },
+        )
+        .await;
+        sub.window.git_status
+    }
+
+    // Unbound: the file is in the main checkout.
+    let before = status_of(&mut ws, 11, 0, "a.rs")
+        .await
+        .expect("tracked file carries git status");
+    assert!(!before.worktree, "the main checkout is not a worktree");
+
+    let bound = bind(&mut ws, 13, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // Bound: the same relative path now resolves into the worktree, and says so.
+    let after = status_of(&mut ws, 14, 0, "a.rs")
+        .await
+        .expect("tracked file carries git status");
+    assert!(after.worktree, "a file under a bound root is in a worktree");
+    assert_eq!(after.branch.as_deref(), Some("feature"));
+    // Note what this *can't* be tested against: git forbids one branch in two checkouts, so there
+    // is no fixture where the same branch name appears in both a main tree and a worktree. That is
+    // exactly why the branch string can't carry the fact — `feature` tells you nothing about which
+    // checkout holds it, and the answer isn't derivable from the name at all.
+
+    // A file under the unbound notes root is untouched by the binding — per-repo, not per-workspace.
+    let _ = notes;
+    let note = status_of(&mut ws, 16, 1, "todo.md").await;
+    assert!(
+        note.is_none_or(|g| !g.worktree),
+        "a root outside every bound repo is not in a worktree"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_workspace_whose_worktree_vanished_degrades_to_its_configured_roots() {
+    // §10.6: a `git worktree remove` in a terminal invalidates a binding at any moment. Refusing to
+    // open would leave no way back in, so the root falls back to the configured path instead. This
+    // is the property that makes bindings safe to keep in machine state.
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // Unbind first, so the repo is reachable under its configured root again, and remove the tree.
+    // Our own removal drops the binding (`forget_worktree_bindings`), so it is planted back
+    // afterwards — what is under test is the activation path a *terminal* removal leaves behind.
+    let _ = bind(&mut ws, 12, std::path::Path::new(&wt.path), "").await;
+    let removed: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        13,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(removed.status, GitWorktreeRemoveStatus::Removed);
+
+    let sessions_path = _dir.path().canonicalize().unwrap().join("sessions.json");
+    let mut sessions: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sessions_path).unwrap()).unwrap();
+    sessions["workspaces"]["p"]["worktrees"] =
+        serde_json::json!({ repo_root.to_string_lossy(): wt.name });
+    std::fs::write(&sessions_path, serde_json::to_string(&sessions).unwrap()).unwrap();
+
+    // A fresh client, so the workspace is loaded cold from disk with the dangling binding.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let reopened: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        14,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        reopened.workspace.paths[0],
+        repo_root.to_string_lossy(),
+        "an unresolvable binding degrades that root to the configured path rather than failing"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn the_worktree_you_are_in_is_highlighted_not_hoisted() {
+    // The picker opens *on* the current worktree, like the buffer picker opens on the current
+    // buffer — but by centring, not by reordering. Hoisting it would land the selection too, and
+    // reshuffle the `Worktrees` section on every switch, so the list you scan is never the same
+    // list twice. In the base the main checkout is already current, so the case worth testing is
+    // standing in a variant.
+    use aether_protocol::picker::{PickerItem, WorktreeRowKind};
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    let view = send_request::<PickerView>(&mut ws, 12, &view_params(PickerKind::Worktrees)).await;
+    // The server names the row to highlight; the client adopts it as its selection.
+    let centred = view
+        .effective_center_on
+        .expect("a fresh open centres on the current worktree");
+    assert!(
+        matches!(&centred, PickerItem::Worktree { label, is_current, .. }
+            if label == &wt.name && *is_current),
+        "centred on the worktree we're standing in: {centred:?}"
+    );
+
+    // ...and the rows kept their stable order — main still leads the section.
+    let update = view.update.expect("the view carries its initial window");
+    let kinds: Vec<WorktreeRowKind> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Worktree { row, .. } => Some(*row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds[0],
+        WorktreeRowKind::Main,
+        "the current worktree is highlighted, not moved: {kinds:?}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn worktree_rows_group_into_worktrees_then_branches() {
+    // Two sections, split on the one distinction a row has to make: does a tree exist yet.
+    // Non-collapsible like References, so the headers are client-side decorations that don't take
+    // selection indices — which is what lets the current worktree stay at index 0.
+    use aether_protocol::picker::{GroupHeader, PickerItem, WorktreeRowKind};
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+    let repo = git2::Repository::open(&root).unwrap();
+    repo.branch(
+        "spare",
+        &repo.head().unwrap().peel_to_commit().unwrap(),
+        false,
+    )
+    .unwrap();
+    let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
+    assert_eq!(created.status, GitWorktreeAddStatus::Created);
+
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    let update = view.update.expect("the view carries its initial window");
+
+    let labels: Vec<(u32, String)> = update
+        .groups
+        .iter()
+        .map(|g| match &g.header {
+            GroupHeader::Label { label } => (g.start, label.clone()),
+            other => panic!("worktree groups are label sections, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec![(0, "Worktrees".to_string()), (2, "Branches".to_string())],
+        "existing trees first, then branches with none: {labels:?}"
+    );
+
+    // And the runs hold what their headers claim.
+    let kinds: Vec<WorktreeRowKind> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Worktree { row, .. } => Some(*row),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds[0], WorktreeRowKind::Main);
+    assert_eq!(kinds[1], WorktreeRowKind::Existing);
+    assert_eq!(kinds[2], WorktreeRowKind::Branch);
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn removing_a_worktree_refreshes_the_open_picker() {
+    // Removal is the only worktree row action that leaves the picker *up* — create and bind both
+    // end in a switch that closes it, and removal has no confirm dialog either. So the list has to
+    // be corrected underneath the user, or the tree they just removed stays on screen and the next
+    // press acts on a row that isn't there.
+    use aether_protocol::picker::{PickerItem, WorktreeRowKind};
+    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // Open *and* subscribe — a refresh only reaches a picker with a window.
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    // Keyed on the row *kind*, not the label: the branch keeps its name after the tree goes, so
+    // "is `feature` listed" stays true either way and would answer the wrong question.
+    let lists_tree = |update: &PickerUpdateParams, want: &str| {
+        update.items().iter().any(|i| {
+            matches!(i, PickerItem::Worktree { row: WorktreeRowKind::Existing, label, .. }
+                if label.as_str() == want)
+        })
+    };
+    assert!(
+        lists_tree(&view.update.expect("initial window"), &wt.name),
+        "the tree is listed before it is removed"
+    );
+
+    let (removed, mut updates) = send_request_collecting_updates::<GitWorktreeRemove>(
+        &mut ws,
+        12,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(removed.status, GitWorktreeRemoveStatus::Removed);
+    // Which window arrives when is not fixed: the writer prefers replies to pushes, and the open's
+    // own push may still be in flight. So read on until one reflects the removal.
+    let mut update = updates.pop();
+    for _ in 0..4 {
+        match &update {
+            Some(u) if !lists_tree(u, &wt.name) => break,
+            _ => {
+                update = Some(
+                    expect_notification_within::<PickerUpdate>(
+                        &mut ws,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+    let update = update.expect("a window after the removal");
+
+    assert!(
+        !lists_tree(&update, &wt.name),
+        "the removed tree must not still be listed: {:?}",
+        update.items()
+    );
+    // And it comes back as a *branch* row — nothing checks `feature` out now, which is the same
+    // rebuild the next fresh open would do rather than a row simply deleted from the window.
+    assert!(
+        update.items().iter().any(|i| matches!(
+            i,
+            PickerItem::Worktree { row: WorktreeRowKind::Branch, label, .. } if label == "feature"
+        )),
+        "the branch survives the worktree: {:?}",
+        update.items()
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn selecting_a_worktree_row_resolves_it_and_binds() {
+    // The listing test covered what the picker *shows*; this covers pressing Enter, which is a
+    // separate server path (`position_of` → `select_result`). Without an identity arm for the kind,
+    // every selection failed with "not in the picker's candidate set".
+    use aether_protocol::picker::{PickerItem, PickerSelect, PickerSelectParams, WorktreeRowKind};
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    let update = view.update.expect("the view carries its initial window");
+    let branch_row = update
+        .items()
+        .iter()
+        .find(
+            |i| matches!(i, PickerItem::Worktree { row, .. } if *row == WorktreeRowKind::Existing),
+        )
+        .expect("the linked worktree is listed")
+        .clone();
+
+    let selected: aether_protocol::picker::PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        12,
+        &PickerSelectParams {
+            kind: PickerKind::Worktrees,
+            item: branch_row,
+        },
+    )
+    .await;
+    match selected {
+        aether_protocol::picker::PickerSelectResult::Worktree { name, create, .. } => {
+            assert_eq!(name, wt.name, "an existing row selects by admin name");
+            assert!(create.is_none(), "it already exists — nothing to create");
+        }
+        other => panic!("expected a worktree selection, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+/// The session file as JSON, for asserting on what survived a delete or a rename.
+fn sessions_json(dir: &tempfile::TempDir) -> serde_json::Value {
+    let path = dir.path().canonicalize().unwrap().join("sessions.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn deleting_a_bound_workspace_takes_its_bindings_and_leaves_the_worktree() {
+    // Bindings live on the workspace's own session entry, so deleting it takes them along with no
+    // cascade to forget — a binding stranded in the file would resurrect against an unrelated
+    // workspace that later took the same name. The worktree is not the workspace's to delete.
+    let (server, mut ws, repo_root, _notes, dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+    assert!(
+        !sessions_json(&dir)["workspaces"]["p"]["worktrees"]
+            .as_object()
+            .is_none_or(|m| m.is_empty()),
+        "the binding is recorded on the workspace's own entry"
+    );
+
+    // Switch away — deletion refuses on an active workspace.
+    let _ephemeral: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        12,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _elsewhere: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        13,
+        &WorkspaceActivateParams {
+            name: "q".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let _: () =
+        send_request::<WorkspaceDelete>(&mut ws, 14, &WorkspaceDeleteParams { name: "p".into() })
+            .await;
+
+    let sessions = sessions_json(&dir);
+    assert!(
+        sessions["workspaces"].get("p").is_none(),
+        "the session goes, bindings and all: {sessions}"
+    );
+    // The worktree itself is untouched: it is a git object in a shared store, not the workspace's.
+    assert!(std::path::Path::new(&wt.path).exists());
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn removing_a_worktree_forgets_the_bindings_that_named_it() {
+    // A binding left pointing at a tree we just deleted would open the workspace onto nothing. The
+    // workspace itself survives — it simply goes back to its configured roots, which is the same
+    // thing unbinding does.
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // Unbind first: removing the tree you are standing in is a different problem.
+    let _back = bind(&mut ws, 12, std::path::Path::new(&wt.path), "").await;
+    let removed: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        13,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(removed.status, GitWorktreeRemoveStatus::Removed);
+
+    // Asserted against the session file because that *is* the registry for bindings — nothing else
+    // holds them, so nothing else can disagree.
+    let sessions: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(_dir.path().canonicalize().unwrap().join("sessions.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        sessions["workspaces"]["p"]["worktrees"]
+            .as_object()
+            .is_none_or(|m| m.is_empty()),
+        "no binding may outlive the tree it names: {sessions}"
+    );
+    assert!(
+        sessions["workspaces"].get("p").is_some(),
+        "but the workspace itself survives losing a binding: {sessions}"
+    );
+
+    drop(server);
+}
+
+/// Removing the tree the workspace is *standing in* must put it back on its configured roots first.
+///
+/// Before this, the removal succeeded and left the workspace pointing at a directory that no longer
+/// existed — roots, index, watches and open buffers all aimed at deleted paths, recoverable only by
+/// restarting the server, because nothing re-materialises a workspace whose bindings moved
+/// underneath it.
+/// §9.3's first promise: "the active buffer always follows" — *the* active buffer, not whichever
+/// one the workspace's MRU happens to head.
+///
+/// `open_last` alone can't keep that promise: it lands on the MRU head, which is the same file only
+/// by coincidence. With several buffers it is whichever the rebind listed first, and with none left
+/// to list it is a fresh scratch. So the landing is chosen from the old-buffer → new-file mapping
+/// the rebind builds, and `open_last` stays as the fallback.
+#[tokio::test]
+async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    // Committed *before* the worktree is created, so the branch it checks out has this file — an
+    // uncommitted one has nothing to follow to (see the sibling test).
+    let repo = git2::Repository::open(&repo_root).unwrap();
+    commit_file(&repo, "b.rs", "two\n");
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // Two buffers, both kept (not transient previews), ending *viewing* b.rs while a.rs is the one
+    // that would otherwise be reached first.
+    let mut viewing = 0;
+    for (id, rel) in [(11u64, "a.rs"), (13, "b.rs")] {
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            id,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some(rel.into()),
+                transient: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            &mut ws,
+            id + 1,
+            &ViewportSubscribeParams {
+                buffer_id: open.buffer_id,
+                cols: 80,
+                rows: 24,
+                overscan_rows: 0,
+                scroll: ScrollPosition {
+                    logical_line: 0,
+                    sub_row: 0.0,
+                },
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+                diff_view: false,
+            },
+        )
+        .await;
+        viewing = open.buffer_id;
+    }
+    assert_ne!(viewing, 0);
+
+    let bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        20,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            worktree: wt.name.clone(),
+            open_last: true,
+            // What the real client sends: the buffer it is looking at.
+            buffer_id: Some(viewing),
+            ..Default::default()
+        },
+    )
+    .await;
+    let path = bound
+        .opened
+        .expect("a bind with open_last lands somewhere")
+        .path
+        .expect("…on a file, not a scratch");
+    assert!(
+        path.starts_with(&wt.path) && path.ends_with("b.rs"),
+        "landed on the file it was viewing, on the new tree, got {path}"
+    );
+
+    drop(server);
+}
+
+/// The one case the promise can't keep: a file that **isn't on the target branch** has nothing to
+/// follow to. The buffer closes and the landing falls back to the workspace's usual choice — which,
+/// with nothing else open, is a scratch. Pinned so the fallback is a decision rather than a
+/// surprise. (§9.3 step 3 wants this *reported* too; it isn't yet.)
+#[tokio::test]
+async fn a_file_absent_from_the_target_branch_cannot_follow() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    // Committed *after* the worktree was created, so it exists on `main` and not on `feature`.
+    let repo = git2::Repository::open(&repo_root).unwrap();
+    commit_file(&repo, "only-on-main.rs", "one\n");
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("only-on-main.rs".into()),
+            transient: Some(false),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        12,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            worktree: wt.name.clone(),
+            open_last: true,
+            buffer_id: Some(open.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    let landed = bound.opened.expect("a bind with open_last lands somewhere");
+    assert!(
+        landed.path.is_none(),
+        "nothing to follow to and nothing else open, so the fallback is a scratch: {:?}",
+        landed.path
+    );
+
+    drop(server);
+}
+
+/// Switching back and forth must not accumulate rows. The dormant list gains entries from two
+/// places during a rebind — the paths it remaps, and the buffers it just closed — and either can
+/// land on a path the other already has, or on one a second client has since opened live. Each
+/// shows up as a duplicated row in the buffers picker.
+#[tokio::test]
+async fn switching_back_and_forth_does_not_duplicate_buffers() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    // Two committed files, so both exist on the branch the worktree checks out.
+    let repo = git2::Repository::open(&repo_root).unwrap();
+    commit_file(&repo, "b.rs", "two\n");
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // Two kept buffers, viewing a.rs. b.rs stays dormant across every switch, which is the entry
+    // that gets *remapped* each time — the one that can collide with a freshly followed buffer.
+    let mut viewing = 0;
+    for (id, rel) in [(11u64, "b.rs"), (13, "a.rs")] {
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            id,
+            &BufferOpenParams {
+                path_index: Some(0),
+                relative_path: Some(rel.into()),
+                transient: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        viewing = open.buffer_id;
+    }
+
+    // A second client on the same workspace and the same file, following each switch by path.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _o2: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws2,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            transient: Some(false),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut current_repo = repo_root.to_string_lossy().to_string();
+    for (n, name) in [wt.name.clone(), String::new(), wt.name.clone(), String::new()]
+        .into_iter()
+        .enumerate()
+    {
+        let r: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+            &mut ws,
+            20 + n as u64,
+            &WorkspaceBindWorktreeParams {
+                repo_id: Some(current_repo.clone()),
+                worktree: name.clone(),
+                open_last: true,
+                buffer_id: Some(viewing),
+                ..Default::default()
+            },
+        )
+        .await;
+        current_repo = if name.is_empty() {
+            repo_root.to_string_lossy().to_string()
+        } else {
+            wt.path.clone()
+        };
+        viewing = r.opened.as_ref().map(|o| o.buffer_id).unwrap_or(viewing);
+
+        // Client 2 follows, as the real client does.
+        let closed: aether_protocol::buffer::BufferClosedParams =
+            expect_notification_within::<aether_protocol::buffer::BufferClosed>(
+                &mut ws2,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        if let Some(loc) = closed.next_path {
+            let _o: BufferOpenResult = send_request::<BufferOpen>(
+                &mut ws2,
+                60 + n as u64,
+                &BufferOpenParams {
+                    path_index: Some(loc.path_index),
+                    relative_path: Some(loc.relative_path),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let view =
+            send_request::<PickerView>(&mut ws, 40 + n as u64, &view_params(PickerKind::Buffers))
+                .await;
+        let mut rows: Vec<String> = view
+            .update
+            .expect("window")
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                aether_protocol::picker::PickerItem::Buffer { display, .. } => {
+                    Some(display.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        let mut unique = rows.clone();
+        unique.dedup();
+        assert_eq!(rows, unique, "switch {n} duplicated a row: {rows:?}");
+        assert_eq!(rows.len(), 2, "both files stay listed, once each: {rows:?}");
+    }
+
+    drop(server);
+}
+
+/// Unsaved work stays where it was edited (§9.3) — but the **view still moves**. Otherwise the
+/// landing falls back to the workspace's MRU head, which is that very buffer: you ask to switch
+/// trees and stay on the old tree's file, now displayed as an absolute path because it sits outside
+/// every root. That is `git-worktree.nvim` #88 wearing a different hat.
+///
+/// The cost, which is the design's and not this test's: the unsaved copy stays listed at its own
+/// path, so the picker shows two rows with the same file name.
+#[tokio::test]
+async fn the_view_moves_even_when_unsaved_work_stays_behind() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            transient: Some(false),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Bind: the clean buffer follows onto the worktree.
+    let r: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        12,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            worktree: wt.name.clone(),
+            open_last: true,
+            buffer_id: Some(open.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    let on_tree = r.opened.expect("landed").buffer_id;
+
+    // Type into it, so it is unsaved when we switch back.
+    let _e: EditResult = send_request::<InputText>(
+        &mut ws,
+        13,
+        &InputTextParams {
+            buffer_id: on_tree,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    // Unbind: a dirty buffer stays behind, on the worktree's path.
+    let back: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        14,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(wt.path.clone()),
+            worktree: String::new(),
+            open_last: true,
+            buffer_id: Some(on_tree),
+            ..Default::default()
+        },
+    )
+    .await;
+    let landed = back
+        .opened
+        .expect("landed somewhere")
+        .path
+        .expect("on a file");
+    assert!(
+        landed.starts_with(&repo_root.to_string_lossy().to_string()),
+        "the view followed the unbind onto the configured root, got {landed}"
+    );
+
+    let view = send_request::<PickerView>(&mut ws, 15, &view_params(PickerKind::Buffers)).await;
+    let rows: Vec<String> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            aether_protocol::picker::PickerItem::Buffer { display, .. } => Some(display.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|r| r == "a.rs"),
+        "the file you are now on is listed relative to its root: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.starts_with(&wt.path)),
+        "and the unsaved copy is still there, at the path it was edited at: {rows:?}"
+    );
+
+    drop(server);
+}
+
+/// The single-buffer case, which the MRU head happens to get right too.
+#[tokio::test]
+async fn the_rebinding_client_lands_on_the_same_file_on_the_new_tree() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(open.path.as_deref().is_some_and(|p| p.ends_with("a.rs")));
+
+    let bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        12,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            worktree: wt.name.clone(),
+            open_last: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let landed = bound.opened.expect("a bind with open_last lands somewhere");
+    let path = landed
+        .path
+        .expect("…and it should be a file, not a scratch");
+    assert!(
+        path.starts_with(&wt.path) && path.ends_with("a.rs"),
+        "landed on the same file on the new tree, got {path}"
+    );
+
+    drop(server);
+}
+
+/// The failure the debug log caught: **rebind, then rebind back.** The second time, the initiating
+/// client's `open_last` landing buffer materialises the followed file first — consuming the dormant
+/// entry and giving it a *different* id — so a successor named by id was already dead when the
+/// other client asked for it (`unknown buffer_id: 6`). It then sat on the old tree's buffer, which
+/// is why the terminal client kept showing `test1` after the switch back to main.
+#[tokio::test]
+async fn the_other_client_follows_a_rebind_back_to_the_configured_roots() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws2,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Client 2 follows a rebind, exactly as the real client does.
+    async fn follow(
+        ws2: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u64,
+    ) -> String {
+        let closed: aether_protocol::buffer::BufferClosedParams =
+            expect_notification_within::<aether_protocol::buffer::BufferClosed>(
+                ws2,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        let loc = closed
+            .next_path
+            .expect("the successor is a path, which no activation can invalidate");
+        let opened: BufferOpenResult = send_request::<BufferOpen>(
+            ws2,
+            id,
+            &BufferOpenParams {
+                path_index: Some(loc.path_index),
+                relative_path: Some(loc.relative_path),
+                ..Default::default()
+            },
+        )
+        .await;
+        opened.path.expect("a file-backed buffer has a path")
+    }
+
+    // Bind, with `open_last` — the initiator lands on a buffer, which is what consumes the dormant
+    // entry and made an id-based successor stale.
+    let _bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        11,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(repo_root.to_string_lossy().into()),
+            worktree: wt.name.clone(),
+            open_last: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let on_tree = follow(&mut ws2, 12).await;
+    assert!(on_tree.starts_with(&wt.path), "followed onto the worktree: {on_tree}");
+
+    // …and back. This is the direction that was broken.
+    let _back: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
+        &mut ws,
+        13,
+        &WorkspaceBindWorktreeParams {
+            repo_id: Some(wt.path.clone()),
+            worktree: String::new(),
+            open_last: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let on_main = follow(&mut ws2, 14).await;
+    assert!(
+        on_main.starts_with(&repo_root.to_string_lossy().to_string()),
+        "and back onto the configured root: {on_main}"
+    );
+    let _ = open;
+
+    drop(server);
+}
+
+/// A workspace is one thing however many clients are in it: rebinding moves its roots for all of
+/// them. The *other* clients therefore have to be told what closed and what replaced it — without
+/// that they keep buffer ids the server has just dropped, and every request on one comes back
+/// `unknown buffer_id`.
+/// Every handler that edits a workspace's shape owes the other clients in it a `workspace/changed`
+/// — not just the worktree rebind that made the gap visible. A second client that keeps a stale
+/// root list resolves every path it renders against a shape the workspace no longer has.
+#[tokio::test]
+async fn editing_a_workspaces_roots_tells_the_other_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let first = base.join("one");
+    let second = base.join("two");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![first.clone()]).await;
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "repos-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let added: aether_protocol::workspace::WorkspaceInfo = send_request::<aether_protocol::workspace::WorkspaceAddRoot>(
+        &mut ws,
+        2,
+        &aether_protocol::workspace::WorkspaceAddRootParams {
+            workspace: "repos-proj".into(),
+            path: second.to_string_lossy().into(),
+        },
+    )
+    .await;
+    assert_eq!(added.paths.len(), 2, "the caller sees it in its own result");
+
+    let info: aether_protocol::workspace::WorkspaceInfo =
+        expect_notification_within::<aether_protocol::workspace::WorkspaceChanged>(
+            &mut ws2,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(info.name, "repos-proj");
+    assert_eq!(
+        info.paths.len(),
+        2,
+        "and so does everyone else standing in it"
+    );
+    assert!(info.paths.iter().any(|p| p == &second.to_string_lossy()));
+
+    drop(server);
+}
+
+/// A rebind must **remap** the dormant list, not replace it.
+///
+/// The followed set of one rebind *is* the dormant list of the next, so assigning over the top of
+/// it — as the first cut did — made a second rebind drop everything the first had carried across.
+/// (`docs/worktrees.md` §9.3 step 4.)
+#[tokio::test]
+async fn a_second_rebind_keeps_what_the_first_carried_across() {
+    use aether_protocol::picker::PickerItem;
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // One open buffer in the repo. The first bind closes it and lists it dormant on the new tree.
+    let _open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        11,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let bound = bind(&mut ws, 12, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    let listed = |update: &PickerUpdateParams| -> Vec<String> {
+        update
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                PickerItem::Buffer { display, .. } => Some(display.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let view = send_request::<PickerView>(&mut ws, 13, &view_params(PickerKind::Buffers)).await;
+    let after_first = listed(&view.update.expect("initial window"));
+    assert!(
+        after_first.iter().any(|d| d.contains("a.rs")),
+        "the first rebind carried it across: {after_first:?}"
+    );
+
+    // Unbind. Nothing is open under a moved root now, so the second rebind contributes no followed
+    // buffers of its own — everything in the list is what the first one left.
+    let back = bind(&mut ws, 14, std::path::Path::new(&wt.path), "").await;
+    assert_eq!(back.workspace.paths[0], repo_root.to_string_lossy());
+
+    let view = send_request::<PickerView>(&mut ws, 15, &view_params(PickerKind::Buffers)).await;
+    let after_second = listed(&view.update.expect("initial window"));
+    assert!(
+        after_second.iter().any(|d| d.contains("a.rs")),
+        "and the second must not drop it: {after_second:?}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn rebinding_tells_the_other_clients_on_the_workspace() {
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+
+    // A second client in the same workspace, viewing a file in the repo.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws2,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws2,
+        3,
+        &ViewportSubscribeParams {
+            buffer_id: open.buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // The first client rebinds. The second is not the initiator, so it must hear about it.
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // The new shape must arrive *before* the close, or the client resolves the successor's path
+    // against roots the workspace no longer has and mislabels everything it renders.
+    let mut saw_changed = false;
+    let closed: aether_protocol::buffer::BufferClosedParams = loop {
+        let text = tokio::time::timeout(std::time::Duration::from_secs(5), next_text(&mut ws2))
+            .await
+            .expect("the other client is told what happened");
+        match serde_json::from_str::<ClientInbound>(&text).expect("parseable") {
+            ClientInbound::Notification(n)
+                if n.method == aether_protocol::workspace::WorkspaceChanged::NAME =>
+            {
+                let info: aether_protocol::workspace::WorkspaceInfo =
+                    serde_json::from_value(n.params).expect("typed");
+                assert_eq!(info.name, "p");
+                assert_eq!(
+                    info.paths[0], wt.path,
+                    "carrying the roots it now has, not the ones it had"
+                );
+                saw_changed = true;
+            }
+            ClientInbound::Notification(n)
+                if n.method == aether_protocol::buffer::BufferClosed::NAME =>
+            {
+                assert!(saw_changed, "the shape change has to land first");
+                break serde_json::from_value(n.params).expect("typed");
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(
+        closed.buffer_id, open.buffer_id,
+        "the buffer it was viewing is the one that closed"
+    );
+
+    // The successor is the *same file on the new tree*, named as a **path**: the id the server
+    // could offer is a dormant placeholder, and the initiator's own landing buffer may already have
+    // materialised it under a different id (this is the race the debug log caught — the second
+    // rebind's `unknown buffer_id`). A path opens the same file whichever client gets there first.
+    let loc = closed.next_path.clone().expect("handed a path, not an id");
+    let reopened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws2,
+        4,
+        &BufferOpenParams {
+            path_index: Some(loc.path_index),
+            relative_path: Some(loc.relative_path),
+            ..Default::default()
+        },
+    )
+    .await;
+    let path = reopened.path.expect("a file-backed buffer has a path");
+    assert!(
+        path.starts_with(&wt.path),
+        "landed on the worktree's copy: {path}"
+    );
+    assert!(path.ends_with("a.rs"), "same file: {path}");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn removing_the_worktree_you_are_in_returns_you_to_the_configured_roots() {
+    let (server, mut ws, repo_root, _notes, dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path, "standing in the worktree");
+
+    // A clean buffer in the tree, so the removal has something open to rescue.
+    let _open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        12,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Remove it while it is the active tree — named as *this* context sees the repo (the worktree).
+    let removed: GitWorktreeRemoveResult = send_request::<GitWorktreeRemove>(
+        &mut ws,
+        13,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(wt.path.clone()),
+            name: wt.name.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(removed.status, GitWorktreeRemoveStatus::Removed);
+    assert!(
+        !std::path::Path::new(&wt.path).exists(),
+        "the tree really is gone"
+    );
+
+    // The workspace is back on its configured roots — not pointing into the hole.
+    let after: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        14,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        after.workspace.paths[0],
+        repo_root.to_string_lossy(),
+        "the roots followed the unbind, without a restart"
+    );
+    let sessions = sessions_json(&dir);
+    assert!(
+        sessions["workspaces"]["p"]["worktrees"]
+            .as_object()
+            .is_none_or(|m| m.is_empty()),
+        "and the binding went with it: {sessions}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn removal_refuses_while_a_buffer_in_the_tree_has_unsaved_edits() {
+    // git can't see this: the file on disk is clean, the unsaved work is in the editor. `--force`
+    // would take it out from under the buffer, so the refusal is ours to make.
+    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let _bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        12,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _typed: aether_protocol::input::EditResult = send_request::<InputText>(
+        &mut ws,
+        13,
+        &InputTextParams {
+            buffer_id: open.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let err = send_request_expect_error::<GitWorktreeRemove>(
+        &mut ws,
+        14,
+        &GitWorktreeRemoveParams {
+            repo_id: Some(wt.path.clone()),
+            name: wt.name.clone(),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        err["code"],
+        serde_json::json!(aether_protocol::error::ErrorCode::DIRTY_BUFFERS_PREVENT_REMOVE.code()),
+        "even --force must not discard an editor buffer's unsaved edits"
+    );
+    assert!(std::path::Path::new(&wt.path).exists());
 
     drop(server);
 }

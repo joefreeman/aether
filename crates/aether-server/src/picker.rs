@@ -482,6 +482,22 @@ pub struct GitStashCandidate {
     pub row: crate::git::StashRow,
 }
 
+/// One worktree-picker candidate. Carries the finished row rather than a repo handle: the list is
+/// built once per open from libgit2 reads, and re-deriving a row per keystroke to fuzzy-match a
+/// name would be work for nothing.
+#[derive(Debug, Clone)]
+pub struct WorktreeCandidate {
+    pub repo_id: String,
+    pub kind: aether_protocol::picker::WorktreeRowKind,
+    /// The match target *and* the row text: an admin name, or a branch name for a branch row.
+    pub label: String,
+    pub branch: String,
+    pub path: String,
+    pub is_current: bool,
+    pub prunable: bool,
+    pub locked: bool,
+}
+
 /// Shortest query treated as a hash abbreviation — git's own floor for an abbreviated object name.
 /// Below it, a hex-looking query is far more likely to be prose ("add", "fed") than an id.
 pub const HASH_PREFIX_MIN: usize = 4;
@@ -628,6 +644,7 @@ pub enum PickerCandidates {
     /// One repo's stash entries, newest first. Rebuilt on every fresh open and after any stash
     /// mutation — like [`Self::GitBranches`], a stale list here would offer entries that are gone.
     GitStash(Vec<GitStashCandidate>),
+    Worktrees(Vec<WorktreeCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -660,6 +677,7 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => v.len(),
             PickerCandidates::GitLog(v) => v.len(),
             PickerCandidates::GitStash(v) => v.len(),
+            PickerCandidates::Worktrees(v) => v.len(),
         }
     }
 
@@ -688,6 +706,7 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => v.clear(),
             PickerCandidates::GitLog(v) => v.clear(),
             PickerCandidates::GitStash(v) => v.clear(),
+            PickerCandidates::Worktrees(v) => v.clear(),
         }
     }
 
@@ -712,6 +731,7 @@ impl PickerCandidates {
             // `GitChangesFile`: same rows, different scope and its own state slot.
             PickerCandidates::GitLog(_) => PickerKind::GitLog,
             PickerCandidates::GitStash(_) => PickerKind::GitStash,
+            PickerCandidates::Worktrees(_) => PickerKind::Worktrees,
         }
     }
 
@@ -740,6 +760,7 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => &v[idx].row.name,
             PickerCandidates::GitLog(v) => &v[idx].haystack,
             PickerCandidates::GitStash(v) => &v[idx].row.message,
+            PickerCandidates::Worktrees(v) => &v[idx].label,
         }
     }
 
@@ -918,6 +939,7 @@ impl PickerCandidates {
                     ahead: c.row.ahead,
                     behind: c.row.behind,
                     checked_out_in: c.row.checked_out_in.clone(),
+                    checked_out_in_main: c.row.checked_out_in_main,
                     match_indices,
                 }
             }
@@ -929,6 +951,20 @@ impl PickerCandidates {
                     oid: c.row.oid.clone(),
                     message: c.row.message.clone(),
                     timestamp: c.row.timestamp,
+                    match_indices,
+                }
+            }
+            PickerCandidates::Worktrees(v) => {
+                let c = &v[idx];
+                PickerItem::Worktree {
+                    repo_id: c.repo_id.clone(),
+                    row: c.kind,
+                    label: c.label.clone(),
+                    branch: c.branch.clone(),
+                    path: c.path.clone(),
+                    is_current: c.is_current,
+                    prunable: c.prunable,
+                    locked: c.locked,
                     match_indices,
                 }
             }
@@ -1076,6 +1112,12 @@ impl PickerCandidates {
             (PickerCandidates::GitStash(v), PickerItem::GitStash { oid, .. }) => {
                 v.iter().position(|c| c.row.oid == *oid)
             }
+            // A worktree row is identified by `(kind, label)`: admin names are unique within a
+            // family and branch names within a repo, but the two are separate namespaces that can
+            // coincide — a worktree named `feature` and a branch named `feature` are different rows.
+            (PickerCandidates::Worktrees(v), PickerItem::Worktree { row, label, .. }) => {
+                v.iter().position(|c| c.kind == *row && c.label == *label)
+            }
             _ => None,
         }
     }
@@ -1100,7 +1142,8 @@ impl PickerCandidates {
             | PickerCandidates::Jumplist(_)
             | PickerCandidates::GitBranches(_)
             | PickerCandidates::GitLog(_)
-            | PickerCandidates::GitStash(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::GitStash(_)
+            | PickerCandidates::Worktrees(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1223,6 +1266,30 @@ impl PickerCandidates {
             PickerCandidates::GitLog(_) => None,
             // A stash is the same: preview via `git/show`, mutate via the `git/stash_*` chords.
             PickerCandidates::GitStash(_) => None,
+            // A worktree row *does* select: it is the one git picker whose Enter changes where you
+            // are rather than firing a mutation at the highlighted row.
+            PickerCandidates::Worktrees(v) => {
+                use aether_protocol::picker::{WorktreeCreate, WorktreeRowKind};
+                let c = &v[idx];
+                Some(PickerSelectResult::Worktree {
+                    repo_id: c.repo_id.clone(),
+                    name: match c.kind {
+                        WorktreeRowKind::Existing => c.label.clone(),
+                        _ => String::new(),
+                    },
+                    create: match c.kind {
+                        WorktreeRowKind::Branch => Some(WorktreeCreate {
+                            branch: c.label.clone(),
+                            create_branch: false,
+                        }),
+                        WorktreeRowKind::Create => Some(WorktreeCreate {
+                            branch: c.label.clone(),
+                            create_branch: true,
+                        }),
+                        _ => None,
+                    },
+                })
+            }
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker
@@ -2112,6 +2179,17 @@ impl PickerState {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
             PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+            // A bool discriminant like References': the two sections are "a tree exists" and "it
+            // doesn't". Must agree with `group_header_at` below — they are a pair, and a kind
+            // present in only one of them silently produces no spans at all.
+            PickerCandidates::Worktrees(v) => Some((
+                matches!(
+                    v[ci].kind,
+                    aether_protocol::picker::WorktreeRowKind::Main
+                        | aether_protocol::picker::WorktreeRowKind::Existing
+                ) as u32,
+                "",
+            )),
             // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
             // jumplist's label groups.
             PickerCandidates::WorkspaceSymbols(v) => Some((LABEL_KEY, v[ci].display_path.as_str())),
@@ -2161,6 +2239,22 @@ impl PickerState {
             }),
             PickerCandidates::Keybindings(v) => Some(GroupHeader::Label {
                 label: v[ci].entry.group.clone(),
+            }),
+            // Two sections, split on the one distinction a row has to make: does a tree exist for
+            // this yet. Selecting anything under `Worktrees` switches you somewhere that already
+            // exists; anything under `Branches` creates a tree first — including the client's
+            // synthetic `+ Create` row, which is appended last and so lands under that header
+            // without needing a case of its own.
+            //
+            // The main checkout is deliberately *not* its own section: it is a worktree, and
+            // splitting it out would assert a kind distinction git doesn't have to say one word
+            // about one row.
+            PickerCandidates::Worktrees(v) => Some(GroupHeader::Label {
+                label: match v[ci].kind {
+                    aether_protocol::picker::WorktreeRowKind::Main
+                    | aether_protocol::picker::WorktreeRowKind::Existing => "Worktrees".into(),
+                    _ => "Branches".into(),
+                },
             }),
             PickerCandidates::Jumplist(v) => v[ci].group.clone(),
             _ => None,

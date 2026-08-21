@@ -1537,15 +1537,19 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     if picker_empty_message(picker).is_some() {
         return 1; // one row for the loading / empty message ("Finding references…", "No diagnostics", …)
     }
+    // The synthetic "+ Create …" row is client-side, so it is in neither `total_matches` nor the
+    // server's `total_display_rows` — it has to be added on whichever path we take. Worktrees is
+    // the first kind to be *both* grouped and creatable, which is how it came to be missing here.
+    let create = picker.synthetic_create_idx.is_some() as u32;
     if picker.kind.is_some_and(|k| k.renders_group_headers()) {
         let rows = picker.total_display_rows.unwrap_or(picker.total_matches);
         if picker.groups.is_empty() {
-            return rows;
+            return rows + create;
         }
         let gaps = rows.saturating_sub(picker.total_matches).saturating_sub(1);
-        return rows + gaps;
+        return rows + gaps + create;
     }
-    picker.total_matches + picker.synthetic_create_idx.is_some() as u32
+    picker.total_matches + create
 }
 
 /// The picker box, collapsed to its content when the result set is shorter than the full-size
@@ -2556,6 +2560,7 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::GitLog) => "Search history…",
         Some(aether_protocol::picker::PickerKind::GitLogFile) => "Search this file's history…",
         Some(aether_protocol::picker::PickerKind::GitStash) => "Find stash…",
+        Some(aether_protocol::picker::PickerKind::Worktrees) => "Switch worktree…",
         None => "Search…",
     }
 }
@@ -2981,7 +2986,6 @@ fn picker_item_spans(
     }
     if let PickerItem::GitBranch {
         name,
-        is_head,
         subject,
         timestamp,
         ahead,
@@ -2994,13 +2998,31 @@ fn picker_item_spans(
         return git_branch_item_spans(
             GitBranchRow {
                 name,
-                is_head: *is_head,
                 subject,
                 timestamp: *timestamp,
                 ahead: *ahead,
                 behind: *behind,
                 checked_out_in: checked_out_in.as_deref(),
             },
+            match_indices,
+            highlighted,
+            max_width,
+        );
+    }
+    if let PickerItem::Worktree {
+        label,
+        branch,
+        prunable,
+        locked,
+        match_indices,
+        ..
+    } = item
+    {
+        return worktree_item_spans(
+            label,
+            branch,
+            *prunable,
+            *locked,
             match_indices,
             highlighted,
             max_width,
@@ -3159,6 +3181,7 @@ fn picker_item_spans(
         | PickerItem::GitBranch { .. }
         | PickerItem::GitCommit { .. }
         | PickerItem::GitStash { .. }
+        | PickerItem::Worktree { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -4102,8 +4125,9 @@ fn lsp_server_item_spans(
     let hint = lsp_progress_hint(progress);
     // Status-dot cell (two cols, like the git bullets), then the name fills the budget left
     // after the tail and hint.
+    // No leading cell to reserve: "which one am I on" is the initial selection, as in every other
+    // picker (`current_branch_item`), not a `●` in a column every row pays for.
     let name_budget = max_width
-        .saturating_sub(2)
         .saturating_sub(tail.width())
         .saturating_sub(hint.width());
 
@@ -4223,7 +4247,6 @@ fn git_branch_item_spans(
 ) -> Vec<Span<'static>> {
     let GitBranchRow {
         name,
-        is_head,
         subject,
         timestamp,
         ahead,
@@ -4236,8 +4259,8 @@ fn git_branch_item_spans(
         .fg(c(th().match_highlight))
         .add_modifier(Modifier::BOLD);
 
-    // Right-hand decorations, innermost first. Each is omitted entirely when it has nothing to
-    // say, so an ordinary branch in an ordinary repo renders as just `name  subject · date`.
+    // Flowing middle: the commit line. Omitted entirely when it has nothing to say, so an ordinary
+    // branch in an ordinary repo renders as just `name  subject · date`.
     let mut tail = String::new();
     if !subject.is_empty() {
         tail.push_str("  ");
@@ -4247,19 +4270,29 @@ fn git_branch_item_spans(
         tail.push_str(if tail.is_empty() { "  " } else { " · " });
         tail.push_str(&crate::shell::time_ago(timestamp));
     }
-    if ahead > 0 || behind > 0 {
-        tail.push_str(&format!("  ↑{ahead} ↓{behind}"));
+    // Divergence, right-aligned at the row's edge and in the same accent the status bar gives it —
+    // it annotates the branch, not the commit, and the two clusters should read alike. Each arrow
+    // appears only when it has a count, matching `git status`'s silence and the status bar's.
+    let mut arrows = String::new();
+    if ahead > 0 {
+        arrows.push_str(&format!("↑{ahead}"));
     }
-    // Basename only: the full path would dominate the row, and the point is *which* worktree, not
-    // where it lives.
-    let held = checked_out_in.map(|p| {
-        let leaf = p.rsplit('/').next().unwrap_or(p);
-        format!("  ⧉ {leaf}")
-    });
+    if behind > 0 {
+        if !arrows.is_empty() {
+            arrows.push(' ');
+        }
+        arrows.push_str(&format!("↓{behind}"));
+    }
+    // The `⧉` mark rides directly after the name: it is a property *of the branch*, not of the
+    // commit line it would otherwise be lost in. Glyph only — see `labels::WORKTREE_HELD_MARK`.
+    let held =
+        checked_out_in.map(|_| format!("  {}", aether_client::labels::WORKTREE_HELD_MARK));
 
+    // No leading cell to reserve: "which one am I on" is the initial selection, as in every other
+    // picker (`current_branch_item`), not a `●` in a column every row pays for.
     let name_budget = max_width
-        .saturating_sub(2)
         .saturating_sub(tail.width())
+        .saturating_sub(arrows.width())
         .saturating_sub(held.as_deref().map(|h| h.width()).unwrap_or(0));
 
     let truncated: String = name
@@ -4282,10 +4315,103 @@ fn git_branch_item_spans(
         .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        if is_head { "● " } else { "  " }.to_string(),
-        Style::default().fg(c(th().accent)).bg(bg),
+    let mut used = truncated.width();
+    spans.extend(match_highlighted_spans(
+        truncated,
+        &kept_indices,
+        base,
+        match_style,
     ));
+    if let Some(held) = held {
+        // Warning-coloured, not dim: this is the row's *disabled* tell, not decoration.
+        used += held.width();
+        spans.push(Span::styled(
+            held,
+            Style::default().fg(c(th().warning)).bg(bg),
+        ));
+    }
+    used += tail.width();
+    spans.push(Span::styled(
+        tail,
+        Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
+    ));
+    if !arrows.is_empty() {
+        // Pad to the right edge so the counts line up down the list, the way grep's line numbers
+        // and the changes picker's `+/-` summary already do.
+        spans.push(Span::styled(
+            " ".repeat(max_width.saturating_sub(used + arrows.width())),
+            base,
+        ));
+        spans.push(Span::styled(
+            arrows,
+            Style::default().fg(c(th().accent_alt)).bg(bg),
+        ));
+    }
+    spans
+}
+
+/// One worktree row: `feature-auth   feature/auth`, with the branch trailing dim.
+///
+/// The admin name leads because it is the row's identity and what removal is keyed on; the branch
+/// trails because "the same tree on a different branch" is the thing you are usually choosing
+/// between. A branch row has no admin name yet, so it renders the branch alone.
+///
+/// Rows carry no marker of their own: the `Worktrees` / `Branches` group headers already say which
+/// kind a row is, and the current worktree is the one highlighted on open. Both distinctions are
+/// made once, where they read as structure rather than as decoration on every line.
+#[allow(clippy::too_many_arguments)]
+fn worktree_item_spans(
+    label: &str,
+    branch: &str,
+    prunable: bool,
+    locked: bool,
+    match_indices: &[u32],
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = picker_row_bg(highlighted);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
+
+    let mut tail = String::new();
+    if !branch.is_empty() && branch != label {
+        tail.push_str("  ");
+        tail.push_str(branch);
+    }
+    // Both of these change what the row can *do*, so they are stated rather than decorated.
+    let mut flags = String::new();
+    if locked {
+        flags.push_str("  locked");
+    }
+    if prunable {
+        flags.push_str("  missing");
+    }
+
+    let name_budget = max_width
+        .saturating_sub(tail.width())
+        .saturating_sub(flags.width());
+    let truncated: String = label
+        .chars()
+        .scan(0usize, |w, ch| {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if *w + cw > name_budget {
+                None
+            } else {
+                *w += cw;
+                Some(ch)
+            }
+        })
+        .collect();
+    let kept = truncated.chars().count() as u32;
+    let kept_indices: Vec<u32> = match_indices
+        .iter()
+        .copied()
+        .filter(|&i| i < kept)
+        .collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
     spans.extend(match_highlighted_spans(
         truncated,
         &kept_indices,
@@ -4296,10 +4422,9 @@ fn git_branch_item_spans(
         tail,
         Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
     ));
-    if let Some(held) = held {
-        // Warning-coloured, not dim: this is the row's *disabled* tell, not decoration.
+    if !flags.is_empty() {
         spans.push(Span::styled(
-            held,
+            flags,
             Style::default().fg(c(th().warning)).bg(bg),
         ));
     }
@@ -4329,18 +4454,23 @@ fn git_commit_item_spans(
         .fg(c(th().match_highlight))
         .add_modifier(Modifier::BOLD);
 
+    // Author and date are **right-aligned at the row's edge**, matching the GUI and web clients:
+    // they are a fixed-shape annotation on every row, so a common right margin makes them a column
+    // you can scan, where flowing them behind a ragged subject does not.
     let mut tail = String::new();
     if !author.is_empty() {
-        tail.push_str("  ");
         tail.push_str(author);
     }
     if timestamp > 0 {
-        tail.push_str(if tail.is_empty() { "  " } else { " · " });
+        if !tail.is_empty() {
+            tail.push_str(" · ");
+        }
         tail.push_str(&crate::shell::time_ago(timestamp));
     }
+    // Two columns of breathing room so a full-width subject can't touch the metadata.
     let subject_budget = max_width
         .saturating_sub(short_hash.width() + 2)
-        .saturating_sub(tail.width());
+        .saturating_sub(if tail.is_empty() { 0 } else { tail.width() + 2 });
     let truncated: String = subject
         .chars()
         .scan(0usize, |w, ch| {
@@ -4367,20 +4497,29 @@ fn git_commit_item_spans(
         match_style,
     ));
     spans.push(Span::styled("  ".to_string(), base));
+    let subject_width = truncated.width();
     spans.extend(match_highlighted_spans(
         truncated,
         &kept_indices,
         base,
         match_style,
     ));
-    spans.push(Span::styled(tail, dim));
+    if !tail.is_empty() {
+        // Pad to the right edge, the way grep's line numbers and the changes picker's `+/-`
+        // summary already do.
+        let used = short_hash.width() + 2 + subject_width + tail.width();
+        spans.push(Span::styled(
+            " ".repeat(max_width.saturating_sub(used)),
+            base,
+        ));
+        spans.push(Span::styled(tail, dim));
+    }
     spans
 }
 
 /// The fields of [`PickerItem::GitBranch`] a row needs, borrowed for rendering.
 struct GitBranchRow<'a> {
     name: &'a str,
-    is_head: bool,
     subject: &'a str,
     timestamp: i64,
     ahead: u32,
@@ -6265,11 +6404,8 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // Persisted workspace → `[name] ` chrome; an ephemeral "(no workspace)" context (or no
         // workspace yet) shows just the file label, no bracket.
         let workspace_prefix =
-            if aether_client::labels::shows_workspace_chrome(&state.workspace_name) {
-                format!("[{}] ", state.workspace_name)
-            } else {
-                String::new()
-            };
+            aether_client::labels::status_workspace_prefix(&state.workspace_name)
+                .unwrap_or_default();
         // Buffer-state dot just after the file label — colour-coded (unsaved / changed / deleted
         // on disk), matching the web client's favicon colours.
         let status_dot = state.buffer_status().map(|kind| {
@@ -6747,7 +6883,21 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
         return parts;
     }
     if let Some(branch) = &status.branch {
-        let mut label = format!("⎇  {branch}");
+        // `⧉` for a linked worktree, in the same warning colour the branch picker marks a
+        // worktree-held branch with — one glyph, one colour, one meaning across the app. It
+        // replaces `⎇` rather than adding to it: it is the same fact (which checkout you are in)
+        // at a finer grain, and the cluster has no width to spend on a second mark. Warning rather
+        // than the metadata colour deliberately: a binding is persistent state you can forget you
+        // are in, so it has to be the thing your eye catches, not the thing it skims.
+        // One space after `⧉`, two after `⎇`: the glyphs are the same cell width but not the same
+        // ink — `⧉` is a filled pair of squares that reads as touching the text at two spaces,
+        // where `⎇` is sparse and needs the extra gap.
+        let (glyph, style) = if status.worktree {
+            ("⧉ ", bg.fg(c(th().warning)))
+        } else {
+            ("⎇  ", meta)
+        };
+        let mut label = format!("{glyph}{branch}");
         // Upstream divergence rides the branch label in the same colour: it annotates the branch
         // rather than the file, unlike the change counts. Level (or no upstream at all) renders
         // nothing — `git status` is silent in both cases too, and a permanent `↑0 ↓0` would be
@@ -6765,7 +6915,7 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
         if let Some(op) = status.operation {
             label.push_str(&format!(" ({})", op.label()));
         }
-        parts.push(Span::styled(label, meta));
+        parts.push(Span::styled(label, style));
     }
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [
@@ -8471,6 +8621,12 @@ mod tests {
         // A single group (display rows = matches + 1) adds no gaps — and never underflows.
         p.total_matches = 7;
         assert_eq!(picker_content_rows(&p), 8);
+        // Grouped *and* creatable — the Worktrees picker, and the first kind to be both. The
+        // create row is in neither `total_matches` nor the server's display rows, so it has to be
+        // added on this path too; the grouped branch used to return before reaching it.
+        p.synthetic_create_idx = Some(7);
+        assert_eq!(picker_content_rows(&p), 9);
+        p.synthetic_create_idx = None;
         p.groups.clear();
         // An empty async picker reserves a row for its "Finding…" loading line...
         p.kind = Some(PickerKind::References);

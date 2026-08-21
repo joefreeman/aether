@@ -254,6 +254,12 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 "create": p.pending_create().map(|pc| json!({
                     "name": pc.name,
                     "is_dir": pc.is_dir,
+                    // Rendered text, decided in the core beside the decision to offer the row —
+                    // the three shells used to word it themselves and disagreed.
+                    "label": p.create_row_label(),
+                    // Whether to reserve the leading status cell, so the row column-aligns with
+                    // the entries above it (only the Explorer's carry one).
+                    "bullet": p.create_row_reserves_status_cell(),
                     "abs": p.total_matches,
                 })),
                 "chips": chips,

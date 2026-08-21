@@ -128,6 +128,13 @@ pub struct GitBaseline {
     /// is exactly when this baseline reloads — so a rebase started in a *terminal* reaches the
     /// status bar too.
     pub operation: Option<GitRepoOperation>,
+    /// True when this file's repo is a **linked worktree** rather than the main checkout.
+    ///
+    /// Read here beside `branch` because it is the same kind of fact — a property of the checkout
+    /// the file lives in, resolved while the repo is already open. The status bar needs it because
+    /// the branch alone cannot say it: git allows one checkout per branch per family, so "on
+    /// `test1`" looks identical whether that is the main tree or a worktree.
+    pub worktree: bool,
     /// This *file* is left conflicted by that operation — it has index stages 1–3 and no stage 0.
     ///
     /// When true both blobs hold HEAD's content and `staged_hunks` is empty: nothing can be staged
@@ -170,6 +177,9 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     // Read while the repo is open. A stopped rebase detaches HEAD, so `branch` above is about to
     // become a bare hash and `upstream` `None` — this is the only thing that will explain why.
     let operation = state_operation(&repo);
+    // Cheap (`git_repository_is_worktree` reads a flag set at open time) and asked for every
+    // baseline, so it rides along rather than costing a second discovery later.
+    let worktree = repo.is_worktree();
 
     // A conflicted file has no stage-0 entry, so the index blob reads as absent — which would make
     // the staged diff `HEAD → ""` and paint the whole file as a staged deletion. Point *both* blobs
@@ -188,6 +198,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     if index_has_conflict(&repo, &rel_path) {
         let head = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
         return GitBaseline {
+            worktree,
             repo: Some(GitRepo { workdir, rel_path }),
             blob: head.clone(),
             index_blob: head,
@@ -207,6 +218,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     if let Some(rev) = revs.get(&workdir) {
         let bytes = rev_blob_bytes(&repo, &rev.commit, &rel_path).map(normalize_lf);
         return GitBaseline {
+            worktree,
             repo: Some(GitRepo { workdir, rel_path }),
             blob: bytes.clone(),
             index_blob: bytes,
@@ -228,6 +240,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         index_blob.as_deref().unwrap_or(b""),
     );
     GitBaseline {
+        worktree,
         repo: Some(GitRepo { workdir, rel_path }),
         blob,
         index_blob,
@@ -412,7 +425,7 @@ fn upstream_divergence(repo: &git2::Repository, head: &GitHead) -> Option<GitUps
 ///
 /// The unborn case is checked *last*: a repo with commits has a resolvable `head()`, and only a
 /// fresh one falls through to reading HEAD's symbolic target directly.
-fn head_state(repo: &git2::Repository) -> Option<GitHead> {
+pub(crate) fn head_state(repo: &git2::Repository) -> Option<GitHead> {
     if let Ok(head) = repo.head() {
         if head.is_branch() {
             let name = head.shorthand().ok()?.to_string();
@@ -501,9 +514,14 @@ pub struct BranchRow {
     /// upstream. Computed locally, so they're only as fresh as the last fetch — stage 3's job.
     pub ahead: u32,
     pub behind: u32,
-    /// Workdir of *another* worktree that has this branch checked out. Git refuses the same branch
-    /// in two worktrees, so the picker must show this before the user tries.
+    /// Workdir of *another* checkout in this family that has this branch. Git refuses the same
+    /// branch in two checkouts, so the picker must show this before the user tries.
     pub checked_out_in: Option<String>,
+    /// True when that other checkout is the repo's **main** working tree rather than a linked
+    /// worktree. Both refuse the checkout identically, but they are not the same place to be sent:
+    /// "it's in the main tree" and "it's in a worktree" are different sentences, and without this
+    /// the client can only guess from a path.
+    pub checked_out_in_main: bool,
 }
 
 /// Every local branch of the repo at `workdir`, HEAD first and then most-recently-committed first.
@@ -551,7 +569,8 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
             upstream: upstream.and_then(|u| u.name().ok().flatten().map(String::from)),
             ahead: ahead as u32,
             behind: behind as u32,
-            checked_out_in: elsewhere.get(&name).cloned(),
+            checked_out_in: elsewhere.get(&name).map(|(p, _)| p.clone()),
+            checked_out_in_main: elsewhere.get(&name).is_some_and(|(_, main)| *main),
             name,
         });
     }
@@ -566,8 +585,8 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
     out
 }
 
-/// Which branches are checked out in a worktree *other than* `workdir`, mapped to that worktree's
-/// path.
+/// Which branches are checked out in a checkout *other than* `workdir`, mapped to that checkout's
+/// path and whether it is the **main** working tree.
 ///
 /// Both directions have to be covered: `worktrees()` lists only the *linked* worktrees, so a linked
 /// worktree asking this question would never see the main checkout. The main working tree is
@@ -576,16 +595,18 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
 fn branches_checked_out_elsewhere(
     repo: &git2::Repository,
     workdir: &Path,
-) -> HashMap<String, String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+) -> HashMap<String, (String, bool)> {
+    // `(path, is_main)` — the main working tree first, then the linked ones. Which kind holds a
+    // branch is carried through rather than re-derived: from a path alone the caller cannot tell.
+    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
     if let Some(main) = repo.commondir().parent() {
-        candidates.push(main.to_path_buf());
+        candidates.push((main.to_path_buf(), true));
     }
     if let Ok(names) = repo.worktrees() {
         for name in names.iter() {
             let Ok(Some(name)) = name else { continue };
             if let Ok(worktree) = repo.find_worktree(name) {
-                candidates.push(worktree.path().to_path_buf());
+                candidates.push((worktree.path().to_path_buf(), false));
             }
         }
     }
@@ -594,7 +615,7 @@ fn branches_checked_out_elsewhere(
         .canonicalize()
         .unwrap_or_else(|_| workdir.to_path_buf());
     let mut map = HashMap::new();
-    for path in candidates {
+    for (path, is_main) in candidates {
         let Ok(canonical) = path.canonicalize() else {
             continue; // a pruned worktree whose directory is gone
         };
@@ -606,7 +627,7 @@ fn branches_checked_out_elsewhere(
         };
         if let Some(GitHead::Branch { name, .. }) = head_state(&other) {
             map.entry(name)
-                .or_insert_with(|| canonical.to_string_lossy().into_owned());
+                .or_insert_with(|| (canonical.to_string_lossy().into_owned(), is_main));
         }
     }
     map
@@ -619,7 +640,9 @@ fn branches_checked_out_elsewhere(
 /// (and explain, naming the worktree) before spawning a `git checkout` that could only fail.
 pub fn branch_checked_out_elsewhere(workdir: &Path, branch: &str) -> Option<String> {
     let repo = git2::Repository::open(workdir).ok()?;
-    branches_checked_out_elsewhere(&repo, workdir).remove(branch)
+    branches_checked_out_elsewhere(&repo, workdir)
+        .remove(branch)
+        .map(|(path, _)| path)
 }
 
 /// Whether `branch` is fully merged into HEAD — the check `git branch -d` makes before refusing.

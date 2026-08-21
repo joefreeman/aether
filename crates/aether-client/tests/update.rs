@@ -3973,6 +3973,61 @@ fn ctrl_alt_x_cuts_the_selection_and_enters_insert() {
 
 /// Find the first `Effect::Request` whose method matches (the multi-request flows — re-list,
 /// create — emit more than one, so `the_request`'s exactly-one assertion doesn't fit).
+/// A request that names a buffer the server has already closed is stale by definition — the server
+/// owns buffer lifetime, and it has told us (or is about to). Another client rebinding a worktree
+/// closes the clean file-backed buffers under the roots that moved — several at once, under a
+/// client that may be mid-keystroke — so each in-flight request came back as its own error toast.
+#[test]
+fn a_request_on_a_buffer_the_server_closed_is_dropped_silently() {
+    use aether_client::transport::RpcError;
+    use aether_protocol::error::ErrorCode;
+    let mut s = session();
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
+    let token = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("an edit went out");
+
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "input/text",
+            code: ErrorCode::BUFFER_NOT_FOUND.0,
+            message: "unknown buffer_id: 7".into(),
+        }),
+    );
+    assert!(
+        fx.0.is_empty(),
+        "no toast, no follow-up (got {} effects)",
+        fx.0.len()
+    );
+
+    // Any *other* failure still surfaces — this is a narrow rule about a vanished buffer, not a
+    // blanket swallow.
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
+    let token = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("an edit went out");
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "input/text",
+            code: ErrorCode::INVALID_POSITION.0,
+            message: "nope".into(),
+        }),
+    );
+    assert!(has_error_toast(&fx), "other errors still show");
+}
+
 fn find_request<'a>(fx: &'a Effects, method: &str) -> Option<&'a serde_json::Value> {
     fx.0.iter().find_map(|e| match e {
         Effect::Request {
@@ -4167,6 +4222,7 @@ fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session
         ahead: 0,
         behind: 0,
         checked_out_in: held.map(str::to_string),
+        checked_out_in_main: false,
         match_indices: vec![],
     };
     {
@@ -4179,6 +4235,82 @@ fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session
         p.selected = 1; // "feature"
     }
     s
+}
+
+/// A worktree picker holding the three row kinds, highlighting the linked tree `feature`.
+fn worktree_picker_session() -> aether_client::session::Session {
+    use aether_protocol::picker::{PickerItem, PickerKind, WorktreeRowKind};
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Worktrees, None, None, false, None);
+    let row = |row: WorktreeRowKind, label: &str| PickerItem::Worktree {
+        repo_id: "/p".into(),
+        row,
+        label: label.into(),
+        branch: label.into(),
+        path: format!("/store/{label}"),
+        is_current: false,
+        prunable: false,
+        locked: false,
+        match_indices: vec![],
+    };
+    {
+        let p = s.picker.as_mut().expect("picker open");
+        p.items = vec![
+            row(WorktreeRowKind::Main, "main"),
+            row(WorktreeRowKind::Existing, "feature"),
+            row(WorktreeRowKind::Branch, "spare"),
+        ];
+        p.total_matches = 3;
+        p.selected = 1; // the linked tree
+    }
+    s
+}
+
+/// Removal is on `Ctrl-d` like every other picker's "remove the highlighted thing" (it was `Alt-x`
+/// until 2026-08-20), and it does *not* stage a confirm: the refusal is the confirmation.
+#[test]
+fn worktree_picker_ctrl_d_removes_without_a_confirm() {
+    let mut s = worktree_picker_session();
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+
+    let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-d removes");
+    assert_eq!(req["name"], json!("feature"));
+    assert_eq!(req["repo_id"], json!("/p"), "the row's repo, not a re-resolve");
+    assert!(
+        req.get("force").is_none_or(|f| f == &json!(false)),
+        "the first press is never forced — its refusal is what itemises the risk"
+    );
+    assert!(
+        s.prompt.is_none(),
+        "no modal: a confirm carrying no facts would only train people to confirm"
+    );
+}
+
+/// `Ctrl-Alt-d` is the escalation from having read that refusal. Alt rather than Shift, because a
+/// terminal reports Ctrl-Shift-D indistinguishably from Ctrl-d.
+#[test]
+fn worktree_picker_ctrl_alt_d_forces() {
+    let mut s = worktree_picker_session();
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL_ALT, None, ROWS);
+
+    let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-Alt-d removes");
+    assert_eq!(req["name"], json!("feature"));
+    assert_eq!(req["force"], json!(true));
+}
+
+/// The rows that have no tree to remove say so client-side rather than failing at the server.
+#[test]
+fn worktree_picker_ctrl_d_refuses_the_rows_without_a_tree() {
+    for (index, row) in [(0, "main"), (2, "spare")] {
+        let mut s = worktree_picker_session();
+        s.picker.as_mut().unwrap().selected = index;
+        let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+        assert!(
+            find_request(&fx, "git/worktree_remove").is_none(),
+            "{row} has no worktree to remove"
+        );
+    }
 }
 
 /// Enter on a branch row checks it out, naming the repo the *row* carried rather than
@@ -4228,6 +4360,29 @@ fn branch_picker_refuses_a_branch_held_by_another_worktree() {
     assert!(
         s.picker.is_some(),
         "and the picker stays open to pick another"
+    );
+    // The refusal must not name the worktree: admin names are derived from branch names, so the
+    // basename is normally the branch itself and the message read "feature is checked out in
+    // feature". The row's `⧉ <name>` already says which tree; the toast points at the way forward.
+    let toast = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            aether_client::effect::Effect::Toast { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("a refusal says why");
+    assert!(
+        !toast.contains("in feature"),
+        "must not read as \"feature is checked out in feature\": {toast}"
+    );
+    assert!(
+        toast.contains("another worktree"),
+        "a linked worktree holds it: {toast}"
+    );
+    assert!(
+        !toast.contains("Space"),
+        "and names no keybinding — those go stale, and the hint system owns key discovery: {toast}"
     );
 }
 
@@ -4299,6 +4454,37 @@ fn branch_picker_ctrl_d_confirms_then_deletes() {
     assert!(
         req.get("force").is_none_or(|f| f == &json!(false)),
         "the first attempt is never forced"
+    );
+}
+
+/// The *main* checkout can be the holder — from inside a worktree that is the ordinary case for
+/// `main` — and calling it "a worktree" was simply wrong. Both refuse identically; they are
+/// different places to be sent.
+#[test]
+fn a_branch_held_by_the_main_checkout_says_so() {
+    use aether_protocol::picker::PickerItem;
+    let mut s = branch_picker_session(Some("/src/aether"));
+    if let Some(PickerItem::GitBranch {
+        checked_out_in_main,
+        ..
+    }) = s.picker.as_mut().unwrap().items.get_mut(1)
+    {
+        *checked_out_in_main = true;
+    }
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+
+    assert!(find_request(&fx, "git/checkout").is_none());
+    let toast = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            aether_client::effect::Effect::Toast { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("a refusal says why");
+    assert!(
+        toast.contains("the main checkout"),
+        "the main tree is not \"a worktree\": {toast}"
     );
 }
 
@@ -5454,12 +5640,16 @@ fn pull_outcomes_name_what_happened_to_local_history() {
     );
     assert!(!has_error_toast(&fx));
 
-    // The refusal whose fix is another key on this same sub-leader.
+    // The refusal whose fix is another action on this same sub-leader. Named as an *act*, not a
+    // chord: a toast that spells a keybinding goes stale the moment the keymap moves, and key
+    // discovery is the hint system's job.
     let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
         status: GitPullStatus::NoUpstream,
         ..Default::default()
     })));
-    assert!(toast_messages(&fx).join(" ").contains("Space g p"));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(msg.contains("push"), "points at the fix: {msg}");
+    assert!(!msg.contains("Space"), "without naming a key: {msg}");
 
     // The pre-flight refusal points at saving, exactly as checkout's does.
     let fx = s.on_event(Event::PullDone(Ok(GitPullResult {

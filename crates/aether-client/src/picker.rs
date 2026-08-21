@@ -399,6 +399,7 @@ impl PickerState {
             PickerKind::Explorer => self.explorer_pending_create(),
             PickerKind::Workspaces => self.workspace_pending_create(),
             PickerKind::GitBranches => self.branch_pending_create(),
+            PickerKind::Worktrees => self.worktree_pending_create(),
             _ => None,
         }
     }
@@ -491,8 +492,15 @@ impl PickerState {
     fn workspace_pending_create(&self) -> Option<PendingCreate> {
         let name = self.query.trim();
         // Workspace names must be a single non-empty segment (the server stores them as a TOML file
-        // stem and refuses path separators).
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
+        // stem and refuses path separators), and `ephemeral` is reserved — a workspace by that name
+        // would give its worktree variants ids that read as no-workspace contexts. The server
+        // refuses all of these; suppressing the row here just stops offering a create that can't
+        // succeed.
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == aether_protocol::RESERVED_WORKSPACE_NAME
+        {
             return None;
         }
         // Suppress when a listed workspace already carries this exact name (Enter would activate it).
@@ -533,6 +541,68 @@ impl PickerState {
             name: name.to_string(),
             is_dir: false,
         })
+    }
+
+    /// The worktree picker's create row: a branch name that neither a worktree nor a local branch
+    /// already carries. Selecting it creates the branch *and* a worktree for it.
+    ///
+    /// Matched against branch names, not admin names: the query is a branch, and the directory is
+    /// derived from it server-side. A worktree row whose *admin name* happens to equal the query
+    /// therefore doesn't suppress the row — its branch may well be something else, and offering to
+    /// create that branch is right.
+    fn worktree_pending_create(&self) -> Option<PendingCreate> {
+        let name = self.query.trim();
+        if name.is_empty() {
+            return None;
+        }
+        // Same reasoning as `branch_pending_create`: git's ref-name rules are not worth
+        // reimplementing client-side, and the server's refusal surfaces verbatim.
+        let exact = self.items.iter().any(|it| {
+            matches!(
+                it,
+                PickerItem::Worktree { row, label, branch, .. }
+                    if (*row == aether_protocol::picker::WorktreeRowKind::Branch && label == name)
+                        || branch == name
+            )
+        });
+        if exact {
+            return None;
+        }
+        Some(PendingCreate {
+            name: name.to_string(),
+            is_dir: false,
+        })
+    }
+
+    /// The full text of the synthetic "+ Create …" row, or `None` when there is no such row.
+    ///
+    /// Lives in the core, next to the [`Self::pending_create`] decision it labels, because the
+    /// three shells were each carrying their own copy of the wording — and each had special-cased
+    /// exactly one kind (Workspaces), so every other picker offering a create row said "+ Create
+    /// file", including the branch picker, where the thing being created is a *branch*.
+    pub fn create_row_label(&self) -> Option<String> {
+        let pc = self.pending_create()?;
+        Some(match self.kind {
+            PickerKind::Workspaces => format!("+ Create workspace {}", pc.name),
+            // Both name a *branch*: `Space g b` creates and checks one out; the worktree picker
+            // creates one and a worktree for it. Neither creates a file.
+            PickerKind::GitBranches => format!("+ Create branch {}", pc.name),
+            PickerKind::Worktrees => format!("+ Create worktree for new branch {}", pc.name),
+            _ if pc.is_dir => format!("+ Create directory {}/", pc.name),
+            _ => format!("+ Create file {}", pc.name),
+        })
+    }
+
+    /// Whether the synthetic "+ Create …" row should reserve the leading status cell that this
+    /// kind's real rows carry, so the two column-align.
+    ///
+    /// Only the Explorer's do, among the kinds that offer a create row at all: its entries lead
+    /// with a git-status dot, where workspace, branch and worktree rows start at the text. Reserving
+    /// it unconditionally indented those three create rows two columns past every row above them —
+    /// and the rule has to be asked *of the kind*, because it changed under us: branch rows carried
+    /// a `●` HEAD marker until that moved to the selection.
+    pub fn create_row_reserves_status_cell(&self) -> bool {
+        self.kind == PickerKind::Explorer
     }
 
     /// Absolute selection index the create row occupies — one past the final match.
@@ -955,6 +1025,9 @@ pub enum ItemKey<'a> {
     GitCommit(&'a str),
     /// A stash entry's hash — stable where its `stash@{n}` position isn't.
     GitStash(&'a str),
+    /// `(row kind, label)` — an admin name is unique within a family and a branch name within a
+    /// repo, but the two namespaces overlap, so the kind is part of the identity.
+    Worktree(aether_protocol::picker::WorktreeRowKind, &'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1056,6 +1129,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch(repo_id, name),
         PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit(hash),
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash(oid),
+        PickerItem::Worktree { row, label, .. } => ItemKey::Worktree(*row, label),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,
@@ -2028,6 +2102,66 @@ mod tests {
                 is_dir: false
             })
         );
+    }
+
+    /// The create row has to start where the rows above it start. Only the Explorer's entries lead
+    /// with a status dot, so only its create row reserves that column — the others sat two columns
+    /// out. The rule is asked of the kind because it *moved*: branch rows had a `●` HEAD marker
+    /// until that became the initial selection instead.
+    #[test]
+    fn only_the_explorer_create_row_reserves_the_status_cell() {
+        let reserves = |kind| {
+            let mut s = PickerState::new(kind);
+            s.query = "thing".into();
+            s.create_row_reserves_status_cell()
+        };
+        assert!(reserves(PickerKind::Explorer));
+        for kind in [
+            PickerKind::Workspaces,
+            PickerKind::GitBranches,
+            PickerKind::Worktrees,
+        ] {
+            assert!(!reserves(kind), "{kind:?} rows start at the text");
+        }
+    }
+
+    #[test]
+    fn create_row_names_what_it_actually_creates() {
+        // Every shell used to word this itself and special-case exactly one kind, so the branch
+        // picker — where the thing created is a *branch* — offered "+ Create file".
+        let labelled = |kind, query: &str| {
+            let mut s = PickerState::new(kind);
+            s.query = query.into();
+            s.create_row_label()
+        };
+        assert_eq!(
+            labelled(PickerKind::GitBranches, "feature").as_deref(),
+            Some("+ Create branch feature")
+        );
+        assert_eq!(
+            labelled(PickerKind::Worktrees, "feature").as_deref(),
+            Some("+ Create worktree for new branch feature")
+        );
+        assert_eq!(
+            labelled(PickerKind::Workspaces, "notes").as_deref(),
+            Some("+ Create workspace notes")
+        );
+
+        // The Explorer keeps the file/directory wording, which is what it really does.
+        let mut s = explorer_with(&["a.rs"]);
+        s.query = "b.rs".into();
+        assert_eq!(s.create_row_label().as_deref(), Some("+ Create file b.rs"));
+        // A trailing slash offers a *directory*, but only once the server has said the peeked
+        // directory is missing — its existence can't be read off a listing of its contents.
+        s.query = "sub/".into();
+        s.explorer_peek_missing = true;
+        assert_eq!(
+            s.create_row_label().as_deref(),
+            Some("+ Create directory sub/")
+        );
+
+        // No query, no row — and so no label.
+        assert_eq!(labelled(PickerKind::Worktrees, ""), None);
     }
 
     #[test]

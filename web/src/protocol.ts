@@ -208,6 +208,10 @@ export interface GitBufferStatus {
   staged?: GitChangeCounts;
   unstaged?: GitChangeCounts;
   upstream?: GitUpstreamStatus | null;
+  /** True when this file lives in a linked worktree rather than the repo's main checkout. The
+   *  branch alone can't say it — git allows one checkout per branch per family, so the same name
+   *  reads identically either way. Absent means false. */
+  worktree?: boolean;
 }
 
 // ---- cursor -------------------------------------------------------------------------------------
@@ -349,7 +353,8 @@ export type PickerKind =
   | "git_branches"
   | "git_log"
   | "git_log_file"
-  | "git_stash";
+  | "git_stash"
+  | "worktrees";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -409,6 +414,25 @@ export type PickerItem =
       behind?: number;
       /** Workdir of another worktree holding this branch — the row is not checkout-able. */
       checked_out_in?: string | null;
+      match_indices?: number[];
+    }
+  | {
+      kind: "worktree";
+      /** Which repo the row belongs to — echoed onto every action it triggers. */
+      repo_id: string;
+      /** What the row is: the main checkout, an existing linked worktree, a branch with no
+       *  worktree, or the synthetic create row. Drives the glyph and what selecting it does. */
+      row: "main" | "existing" | "branch" | "create";
+      /** The row text and match target: an admin name, or a branch name for a branch row. */
+      label: string;
+      /** Branch checked out in this worktree, when it is on one. */
+      branch?: string;
+      /** Absolute working directory; empty for a branch or create row. */
+      path?: string;
+      is_current?: boolean;
+      /** The admin entry outlived its directory — prunable, and rendered as such. */
+      prunable?: boolean;
+      locked?: boolean;
       match_indices?: number[];
     }
   | {

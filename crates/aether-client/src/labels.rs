@@ -134,12 +134,33 @@ pub fn workspace_display(workspace: &str) -> String {
     }
 }
 
+/// The mark a branch row carries when **another checkout in the family already has this branch**:
+/// git allows one checkout per branch, so the row is telling you it can't be checked out here.
+///
+/// The glyph alone. It used to trail the holding checkout's directory name, which was noise in the
+/// ordinary case — admin names are derived from branch names, so it read `feature ⧉ feature` — and
+/// ambiguous in the rest: the name is the *repo's* directory when the main checkout holds it. Which
+/// checkout it is belongs in the refusal, which has room for a sentence.
+pub const WORKTREE_HELD_MARK: &str = "⧉";
+
 /// Whether a workspace id should be wrapped in the `[workspace]` chrome shown in the status bar and
 /// window title. False for the empty (no workspace active) state *and* for an ephemeral context —
 /// neither is a real, named workspace, so we show just the buffer label with no bracket rather than
 /// a `[(no workspace)]` that reads like a workspace literally named that.
 pub fn shows_workspace_chrome(workspace: &str) -> bool {
     !workspace.is_empty() && !aether_protocol::is_ephemeral_workspace_id(workspace)
+}
+
+/// The status bar's `[workspace] ` prefix, or `None` when this context gets no chrome
+/// ([`shows_workspace_chrome`]).
+///
+/// Composed here rather than in each shell because the *text* is [`workspace_display`]'s job, not
+/// the raw id's. Three shells each doing `format!("[{}] ", id)` is how they came to disagree.
+///
+/// It says nothing about worktrees: a binding is per *repo*, and the status bar's git cluster shows
+/// it at that grain, on the branch of the buffer it actually applies to (`docs/worktrees.md` §9.5).
+pub fn status_workspace_prefix(workspace: &str) -> Option<String> {
+    shows_workspace_chrome(workspace).then(|| format!("[{}] ", workspace_display(workspace)))
 }
 
 /// Max characters the window-title path label is shown at before [`truncate_path`] elides it.
@@ -313,6 +334,8 @@ pub fn title_body(workspace: &str, label: &str) -> Option<String> {
         // editing), with no `[workspace]` bracket — or nothing when there's no label.
         return (!label.is_empty()).then_some(label);
     }
+    // Display form, not the raw id.
+    let workspace = workspace_display(workspace);
     Some(if label.is_empty() {
         format!("[{workspace}]")
     } else {
@@ -574,3 +597,4 @@ mod tests {
         assert!(shows_workspace_chrome("demo"));
     }
 }
+

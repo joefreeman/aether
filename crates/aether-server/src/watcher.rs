@@ -20,9 +20,11 @@
 //! which made first activation take seconds and every `cargo build` flood the event channel.
 //! Instead we walk each root with the same `ignore` rules the workspace index uses and register a
 //! NonRecursive watch per kept directory (110 vs 12k dirs here). `.git` internals are excluded
-//! from that walk, so the pieces `git_change_workdir` relies on (`HEAD`, `index`, `packed-refs`,
-//! `refs/**`) get targeted watches of their own. Directories created later are picked up by a
-//! debounced re-walk ([`schedule_rescan`]) triggered from create/rename events.
+//! from that walk, so the pieces [`classify_git_change`] relies on (`HEAD`, `index`,
+//! `packed-refs`, `refs/**`) get targeted watches of their own. In a **linked worktree** those
+//! pieces are split across two directories — the worktree's own git dir and the family's common
+//! dir — and both are watched; see [`push_git_targets`]. Directories created later are picked up
+//! by a debounced re-walk ([`schedule_rescan`]) triggered from create/rename events.
 
 use crate::handlers::PendingPushes;
 use crate::handlers::{
@@ -227,22 +229,90 @@ fn watch_targets(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// The git-internals watches for a directory hosting a `.git` dir: `.git` itself (catches `HEAD`,
-/// `index`, `packed-refs` — everything `git_change_workdir` keys on at the top level) and the
-/// `refs/**` directory tree (branch tips move under it on commit/checkout). Skipped when `.git`
-/// is a file (worktrees/submodules point elsewhere; refreshing those repos' buffers still happens
-/// on edit, just not on external git operations).
+/// The git-internals watches for a directory hosting a repo.
+///
+/// Ordinary checkout (`.git` is a directory): `.git` itself (catches `HEAD`, `index`,
+/// `packed-refs` — everything [`classify_git_change`] keys on at the top level) and the `refs/**`
+/// directory tree (branch tips move under it on commit/checkout).
+///
+/// **Linked worktree (`.git` is a *file*)**: the interesting state is split in two, and watching
+/// only one half sees nothing. `HEAD` and `index` live in the worktree's own git dir
+/// (`<main>/.git/worktrees/<name>/`), while `refs/**` and `packed-refs` live in the *common* dir
+/// shared with every other worktree of the repo — see the shared/per-worktree table in
+/// `docs/worktrees.md` §4.2. Both get watched. Without this a worktree got **no git-internals
+/// watch at all**, so a commit or checkout made outside the editor was invisible in it.
+///
+/// A submodule's `.git` is a file too and takes the same path; its "common dir" is just its own
+/// git dir, so it ends up correctly watched by the same code.
+///
+/// Caveat: for a linked worktree these targets sit *outside* the workspace root, so
+/// [`unwatch_workspace_paths`] (which drops by `starts_with`) won't release them. Watches are
+/// already never released in the ordinary case, so this adds no new class of leak.
 fn push_git_targets(dir: &Path, out: &mut Vec<PathBuf>) {
     let git = dir.join(".git");
-    if !git.is_dir() {
+    if git.is_dir() {
+        push_git_dir_targets(&git, out);
         return;
     }
-    let refs = git.join("refs");
+    if !git.is_file() {
+        return;
+    }
+    let Some(git_dir) = read_gitdir_pointer(&git) else {
+        return;
+    };
+    // Per-worktree half: HEAD and index live directly in the worktree's git dir.
+    out.push(git_dir.clone());
+    // Shared half: refs/** and packed-refs live in the common dir.
+    if let Some(common) = read_common_dir(&git_dir) {
+        push_git_dir_targets(&common, out);
+    }
+}
+
+/// Watch a git dir itself (top-level `HEAD` / `index` / `packed-refs`) plus its `refs/**` tree.
+fn push_git_dir_targets(git_dir: &Path, out: &mut Vec<PathBuf>) {
+    let refs = git_dir.join("refs");
     if refs.is_dir() {
         collect_dirs_recursive(&refs, out);
         out.push(refs);
     }
-    out.push(git);
+    out.push(git_dir.to_path_buf());
+}
+
+/// Resolve a `.git` *file* (`gitdir: <path>`) to the git dir it names.
+///
+/// The path is normally absolute; a relative one is resolved against the `.git` file's own
+/// directory. **Note the `ignore` crate does not do this** — it uses the recorded path verbatim,
+/// which is why `docs/worktrees.md` §4.7 says never to *create* worktrees with `--relative-paths`.
+/// Reading one someone else created is still supported.
+fn read_gitdir_pointer(git_file: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_file).ok()?;
+    let rest = content.trim().strip_prefix("gitdir:")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(resolve_against(Path::new(rest), git_file.parent()?))
+}
+
+/// The common dir of a git dir: the `commondir` file's contents (usually the relative `../..`),
+/// or the git dir itself when there is no such file (an ordinary, non-worktree repo).
+fn read_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let rest = content.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(resolve_against(Path::new(rest), git_dir))
+}
+
+/// Absolutize `path` against `base` when relative, then canonicalize so `../..` segments collapse.
+/// Watch targets and event paths have to compare equal, and events arrive already resolved.
+fn resolve_against(path: &Path, base: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
 /// All directories under `dir`, recursively (excluding `dir` itself). Only used for `refs/**`,
@@ -401,7 +471,7 @@ async fn handle_event(state: &SharedState, event: Event) {
         // diff reflect the new HEAD without needing a buffer edit. (Only sees `.git` changes when
         // it's within a watched workspace root — the common repo-root-is-workspace-root case.)
         let git_workdirs: HashSet<PathBuf> =
-            paths.iter().filter_map(|p| git_change_workdir(p)).collect();
+            paths.iter().flat_map(|p| git_change_workdirs(p)).collect();
         if !git_workdirs.is_empty() {
             let affected: Vec<BufferId> = s
                 .git_baseline
@@ -458,11 +528,32 @@ fn is_suppressed(path: &Path, suppressed: &HashSet<PathBuf>) -> bool {
     suppressed.iter().any(|workdir| path.starts_with(workdir))
 }
 
-/// If `path` is a meaningful file inside a `.git` directory — `HEAD`, `index`, `packed-refs`, or
-/// anything under `refs/` (the things commit/checkout/stage touch) — return the repo's working
-/// directory (the parent of `.git`). Ignores `*.lock` temp files and noise like `logs/` and
-/// `objects/`. The returned workdir is what each buffer's cached `GitRepo.workdir` is keyed on.
-fn git_change_workdir(path: &Path) -> Option<PathBuf> {
+/// What a change to a path inside a `.git` directory means, before any filesystem lookup.
+///
+/// Split out from [`git_change_workdirs`] so the classification — which is all the interesting
+/// rules — stays pure and unit-testable against synthetic paths, while the part that has to read
+/// `worktrees/<name>/gitdir` off disk is a thin resolution step on top.
+#[derive(Debug, PartialEq, Eq)]
+enum GitChange {
+    /// A change in a repo's own git dir. `workdir` is the parent of `.git`.
+    Own {
+        workdir: PathBuf,
+        /// The file lives in the *common* dir, so every linked worktree of this repo sees it too
+        /// (`refs/**`, `packed-refs`). `HEAD` and `index` are per-worktree and set this `false`.
+        shared: bool,
+    },
+    /// A change in a linked worktree's private git dir, `<main>/.git/worktrees/<name>/…`. The
+    /// worktree's own working directory is recorded on disk, not derivable from this path.
+    Linked { main_git_dir: PathBuf, name: String },
+}
+
+/// Classify a filesystem event path against the git-internals layout. `None` for anything that
+/// isn't a meaningful git file: `*.lock` temp files, `logs/`, `objects/`, `COMMIT_EDITMSG`, and
+/// ordinary source files.
+///
+/// The shared/per-worktree split is git's own, from `common_list[]` in `path.c` — see
+/// `docs/worktrees.md` §4.2.
+fn classify_git_change(path: &Path) -> Option<GitChange> {
     let comps: Vec<_> = path.components().collect();
     let git_idx = comps.iter().position(|c| c.as_os_str() == ".git")?;
     let inner: PathBuf = comps[git_idx + 1..].iter().map(|c| c.as_os_str()).collect();
@@ -470,14 +561,97 @@ fn git_change_workdir(path: &Path) -> Option<PathBuf> {
     if inner_str.ends_with(".lock") {
         return None;
     }
-    let meaningful = inner_str == "HEAD"
-        || inner_str == "index"
-        || inner_str == "packed-refs"
-        || inner.starts_with("refs");
-    if !meaningful {
+
+    // `<main>/.git/worktrees/<name>/…` — a linked worktree's private git dir. Checked first: the
+    // main repo's `.git` is the one carrying the `.git` component, but the change belongs to the
+    // *worktree*, and attributing it to the main workdir is the bug this replaced.
+    if let Ok(rest) = inner.strip_prefix("worktrees") {
+        let mut rest = rest.components();
+        let name = rest.next()?.as_os_str().to_str()?.to_string();
+        let tail: PathBuf = rest.map(|c| c.as_os_str()).collect();
+        if !is_meaningful_git_file(&tail) {
+            return None;
+        }
+        return Some(GitChange::Linked {
+            main_git_dir: comps[..=git_idx].iter().map(|c| c.as_os_str()).collect(),
+            name,
+        });
+    }
+
+    if !is_meaningful_git_file(&inner) {
         return None;
     }
-    Some(comps[..git_idx].iter().map(|c| c.as_os_str()).collect())
+    Some(GitChange::Own {
+        workdir: comps[..git_idx].iter().map(|c| c.as_os_str()).collect(),
+        shared: inner_str == "packed-refs" || inner.starts_with("refs"),
+    })
+}
+
+/// The files worth reacting to inside a git dir: what commit / checkout / stage / fetch touch.
+fn is_meaningful_git_file(inner: &Path) -> bool {
+    let s = inner.to_string_lossy();
+    s == "HEAD" || s == "index" || s == "packed-refs" || inner.starts_with("refs")
+}
+
+/// Every working directory whose git state a change to `path` invalidates.
+///
+/// Usually one. Two cases give more or different:
+/// - a **shared** file (`refs/**`, `packed-refs`) is seen by the whole worktree family, so a
+///   `git fetch` or a commit on a branch checked out elsewhere has to refresh all of them;
+/// - a **linked worktree's** `HEAD`/`index` resolves to that worktree's workdir, read from
+///   `worktrees/<name>/gitdir`, never the main one whose `.git` the path runs through.
+///
+/// The returned workdirs are what each buffer's cached `GitRepo.workdir` is keyed on.
+fn git_change_workdirs(path: &Path) -> Vec<PathBuf> {
+    match classify_git_change(path) {
+        None => Vec::new(),
+        Some(GitChange::Linked { main_git_dir, name }) => {
+            worktree_workdir(&main_git_dir, &name).into_iter().collect()
+        }
+        Some(GitChange::Own {
+            workdir,
+            shared: false,
+        }) => vec![workdir],
+        Some(GitChange::Own {
+            workdir,
+            shared: true,
+        }) => {
+            let mut out = linked_worktree_workdirs(&workdir.join(".git"));
+            out.push(workdir);
+            out
+        }
+    }
+}
+
+/// The working directory of one linked worktree, from its admin entry. `worktrees/<name>/gitdir`
+/// holds the path of the worktree's own `.git` *file*, so the workdir is that path's parent —
+/// the CLI is keyed by path and libgit2 by admin id, and this file is the only bridge between them
+/// (`docs/worktrees.md` §4.8).
+fn worktree_workdir(main_git_dir: &Path, name: &str) -> Option<PathBuf> {
+    let admin = main_git_dir.join("worktrees").join(name);
+    let content = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+    let recorded = content.trim();
+    if recorded.is_empty() {
+        return None;
+    }
+    let dot_git = resolve_against(Path::new(recorded), &admin);
+    Some(dot_git.parent()?.to_path_buf())
+}
+
+/// Every linked worktree of the repo whose git dir is `main_git_dir`. Empty for a repo that has
+/// none (no `worktrees/` directory), which is the overwhelmingly common case and costs one failed
+/// `read_dir`.
+fn linked_worktree_workdirs(main_git_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(main_git_dir.join("worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            worktree_workdir(main_git_dir, name.to_str()?)
+        })
+        .collect()
 }
 
 fn handle_buffer_event(
@@ -545,8 +719,36 @@ fn handle_buffer_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{git_change_workdir, is_suppressed, watch_targets};
+    use super::{
+        classify_git_change, git_change_workdirs, is_suppressed, watch_targets, GitChange,
+    };
     use std::path::{Path, PathBuf};
+
+    /// A main repo at `main/` with one linked worktree at `wt/`, wired the way git wires them:
+    /// the worktree's `.git` is a *file* pointing at `main/.git/worktrees/<name>`, that admin
+    /// directory's `gitdir` file points back at the worktree's `.git` file, and `commondir`
+    /// points at the main `.git`. No git binary involved — these four files *are* the linkage.
+    fn worktree_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize up front: macOS tempdirs live under a `/private` symlink, and the
+        // resolution path canonicalizes, so the expected values have to as well.
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let main = base.join("main");
+        let wt = base.join("wt");
+        let admin = main.join(".git/worktrees").join(name);
+        std::fs::create_dir_all(main.join(".git/refs/heads")).unwrap();
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        // git writes the relative `../..` here; resolving it is part of what's under test.
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        (dir, main, wt)
+    }
 
     /// Build the directory tree the walk-target tests share:
     ///
@@ -663,17 +865,20 @@ mod tests {
 
     #[test]
     fn detects_meaningful_git_files() {
-        for inner in [
-            "HEAD",
-            "index",
-            "packed-refs",
-            "refs/heads/main",
-            "refs/tags/v1",
+        for (inner, shared) in [
+            ("HEAD", false),
+            ("index", false),
+            ("packed-refs", true),
+            ("refs/heads/main", true),
+            ("refs/tags/v1", true),
         ] {
             let p = PathBuf::from(format!("/home/u/proj/.git/{inner}"));
             assert_eq!(
-                git_change_workdir(&p),
-                Some(PathBuf::from("/home/u/proj")),
+                classify_git_change(&p),
+                Some(GitChange::Own {
+                    workdir: PathBuf::from("/home/u/proj"),
+                    shared,
+                }),
                 "{inner} should map to the workdir",
             );
         }
@@ -687,12 +892,84 @@ mod tests {
             "/home/u/proj/.git/objects/ab/cd", // object write
             "/home/u/proj/.git/COMMIT_EDITMSG",
             "/home/u/proj/src/main.rs", // ordinary source file
+            // The worktree admin files themselves: linkage, not repo state.
+            "/home/u/proj/.git/worktrees/wt/gitdir",
+            "/home/u/proj/.git/worktrees/wt/commondir",
+            "/home/u/proj/.git/worktrees/wt/index.lock",
         ] {
             assert_eq!(
-                git_change_workdir(Path::new(p)),
+                classify_git_change(Path::new(p)),
                 None,
                 "{p} should be ignored"
             );
+        }
+    }
+
+    #[test]
+    fn classifies_linked_worktree_git_dir_by_name() {
+        // The path runs through the *main* repo's `.git`, but the change belongs to the worktree.
+        for inner in ["HEAD", "index", "refs/bisect/bad"] {
+            let p = PathBuf::from(format!("/home/u/proj/.git/worktrees/feature/{inner}"));
+            assert_eq!(
+                classify_git_change(&p),
+                Some(GitChange::Linked {
+                    main_git_dir: PathBuf::from("/home/u/proj/.git"),
+                    name: "feature".to_string(),
+                }),
+                "{inner} should be attributed to the worktree, not the main workdir",
+            );
+        }
+    }
+
+    #[test]
+    fn linked_worktree_head_resolves_to_the_worktrees_own_workdir() {
+        // The regression this whole split exists for: an agent commits in a worktree, and the
+        // editor has to know *which* tree moved. Answering "the main one" is what it used to do.
+        let (_dir, main, wt) = worktree_fixture("feature");
+        assert_eq!(
+            git_change_workdirs(&main.join(".git/worktrees/feature/HEAD")),
+            vec![wt],
+        );
+    }
+
+    #[test]
+    fn shared_refs_change_fans_out_to_every_worktree() {
+        // `refs/**` lives in the common dir, so a fetch (or a commit on a branch checked out
+        // elsewhere) invalidates the whole family — not just the main checkout.
+        let (_dir, main, wt) = worktree_fixture("feature");
+        let mut got = git_change_workdirs(&main.join(".git/refs/remotes/origin/main"));
+        got.sort();
+        let mut want = vec![main.clone(), wt];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn per_worktree_files_do_not_fan_out() {
+        // HEAD and index are per-worktree: a checkout in the main tree says nothing about the
+        // others, and refreshing them would be wasted work on every keystroke-adjacent event.
+        let (_dir, main, _wt) = worktree_fixture("feature");
+        assert_eq!(
+            git_change_workdirs(&main.join(".git/HEAD")),
+            vec![main.clone()],
+        );
+        assert_eq!(git_change_workdirs(&main.join(".git/index")), vec![main]);
+    }
+
+    #[test]
+    fn watch_targets_cover_a_linked_worktrees_split_git_state() {
+        // Before this, `.git`-as-a-file returned early and a worktree got no git watch at all.
+        // Both halves are needed: HEAD/index in the worktree's own git dir, refs in the common one.
+        let (_dir, main, wt) = worktree_fixture("feature");
+        std::fs::write(wt.join("a.rs"), "fn main() {}\n").unwrap();
+        let targets = watch_targets(std::slice::from_ref(&wt));
+        for included in [
+            main.join(".git/worktrees/feature"), // per-worktree: HEAD, index
+            main.join(".git"),                   // shared: packed-refs
+            main.join(".git/refs"),              // shared: branch tips
+            main.join(".git/refs/heads"),
+        ] {
+            assert!(targets.contains(&included), "missing {included:?}");
         }
     }
 }

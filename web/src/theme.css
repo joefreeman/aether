@@ -390,6 +390,9 @@ html, body, #app {
 .git-staged-added { color: var(--git-staged-added); }
 .git-staged-deleted { color: var(--git-staged-deleted); }
 .git-branch { color: var(--accent-alt); }  /* Frost blue — secondary, distinct from the nord4 path */
+/* A linked worktree, marked `⧉` — the warning colour the branch picker uses for a worktree-held
+   branch (`.picker-meta-warn`), so the mark reads the same wherever it appears. */
+.git-branch-worktree { color: var(--warning); }
 .git-base { color: var(--accent-alt); }    /* Frost blue — current diff base [HEAD]/[index] */
 .status-icon {
   width: 1.05em;
@@ -1285,12 +1288,13 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--git-modified); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--git-deleted); }
-/* Branch picker: the current branch's dot, matching the native clients' accent bullet. */
-.picker-bullet-head { color: var(--accent); }
 /* Branch-row meta spans. `-warn` is the "checked out in another worktree" marker, which is a
    disabled-state tell rather than decoration, so it must not read as dim. */
 .picker-meta-dim { color: var(--fg-dim); }
 .picker-meta-warn { color: var(--warning); }
+/* Divergence counts on branch rows, in the frost blue the status bar gives them — they annotate the
+   branch, not the commit line, so they must not read as more dim metadata. */
+.picker-meta-accent { color: var(--accent-alt); }
 /* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the
    far edge. Colours match the editor status bar / favicon; the dot itself is the shared
    `.buffer-status-dot` circle, so size parity with the status bar holds by construction. */
@@ -1298,7 +1302,11 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-dirty-unsaved { color: var(--state-unsaved); }
 .picker-dirty-externally_modified { color: var(--state-changed); }
 .picker-dirty-externally_deleted { color: var(--state-deleted); }
-.picker-row.create .picker-main { color: var(--ok); } /* "+ create …" row in green */
+/* The "+ Create …" row's text, in the frost blue the native client gives it. On its own class
+   rather than under `.picker-row.create`, which is the *positioning* class the virtual-scroll path
+   adds — an empty result list renders the same row as an ordinary child and would otherwise lose
+   the colour, so it read green with results and plain white without. */
+.picker-create-main { color: var(--accent); }
 /* Picker group header (grep/git-changes files, reference sections, keybinding groups) —
    non-selectable, bold; the path in frost blue (matches the terminal). */
 /* Same box as a normal row (so it's exactly one display row tall, keeping virtual-scroll aligned).

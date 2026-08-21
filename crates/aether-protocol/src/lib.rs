@@ -59,6 +59,17 @@ pub fn is_ephemeral_workspace_id(id: &str) -> bool {
     id.starts_with(EPHEMERAL_WORKSPACE_PREFIX)
 }
 
+/// The workspace name reserved by [`EPHEMERAL_WORKSPACE_PREFIX`]. A workspace may not be called
+/// this. The server enforces it in `validate_workspace_name`; the constant lives here so the two
+/// namespaces are declared together rather than in two files that can drift apart.
+///
+/// The original reason was worktree *variants*, whose ids were `<workspace>/<variant>` — a
+/// workspace called `ephemeral` would have produced ids that read as no-workspace contexts. Variants
+/// are gone (a workspace now carries its worktree bindings directly), so nothing constructs such an
+/// id today. The reservation stays anyway: it costs one refused name, and lifting it would let
+/// someone claim `ephemeral` in a way that a future id namespace could not take back.
+pub const RESERVED_WORKSPACE_NAME: &str = "ephemeral";
+
 /// The build version a client announces on connect (`?version=`); the server requires an
 /// exact match against its own copy of this string. Server and all clients ship in one binary, so
 /// "same release" always means identical versions — any difference means a freshly-installed binary

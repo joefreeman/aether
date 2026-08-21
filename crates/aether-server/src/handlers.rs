@@ -45,8 +45,10 @@ use aether_protocol::git::{
     GitRepoInfo, GitRepoOperation, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
     GitResolveConflictParams, GitResolveConflictResult, GitSetBaselineParams, GitSetBaselineResult,
     GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
-    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, HunkAction,
-    HunkDirection, RepoId, ResolveConflictStatus, StagedFile,
+    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, GitWorktreeAddParams,
+    GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
+    GitWorktreeRemoveStatus, GitWorktreeRow, HunkAction, HunkDirection, RepoId,
+    ResolveConflictStatus, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -97,11 +99,12 @@ use aether_protocol::viewport::{
 };
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
-    WorkspaceAddRootParams, WorkspaceCreateParams, WorkspaceDeleteParams,
-    WorkspaceInferLanguageParams, WorkspaceInferLanguageResult, WorkspaceInfo, WorkspaceListParams,
-    WorkspaceListResult, WorkspaceOpenPathParams, WorkspaceProject, WorkspaceRemoveProjectParams,
-    WorkspaceRemoveRootParams, WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed,
-    WorkspaceRenamedParams, WorkspaceSummary,
+    WorkspaceAddRootParams, WorkspaceBindWorktreeParams, WorkspaceCreateParams,
+    WorkspaceDeleteParams, WorkspaceInferLanguageParams, WorkspaceInferLanguageResult,
+    WorkspaceInfo, WorkspaceListParams, WorkspaceListResult, WorkspaceOpenPathParams,
+    WorkspaceProject, WorkspaceRemoveProjectParams, WorkspaceRemoveRootParams,
+    WorkspaceRemoveRootResult, WorkspaceRenameParams, WorkspaceRenamed, WorkspaceRenamedParams,
+    WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
 use aether_protocol::{BufferId, ClientId, Revision};
@@ -194,7 +197,7 @@ pub async fn settings_set(
     crate::config::write_app_settings(&params)
         .map_err(|e| RpcError::internal(format!("writing app settings: {e}")))?;
 
-    let changed = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+    let changed = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
         let s = state.lock().await;
         s.clients
@@ -417,18 +420,14 @@ pub(crate) fn reconcile_workspace_pins(
         let Some(spec) = crate::lsp::config::server_spec(&resolved.language) else {
             continue;
         };
-        let key = crate::lsp::manager::LspServerKey::new(
-            workspace_id.to_string(),
-            resolved.root,
-            &resolved.language,
-        );
+        let key = crate::lsp::manager::LspServerKey::new(resolved.root, &resolved.language);
         // `ensure` yields a generation only for a *fresh* handle; one already running (lazily
         // launched by a buffer, or shared with a sibling project in the same root) just needs the
         // pin.
-        if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+        if let Some(generation) = s.lsp.ensure(&key, spec.command, workspace_id) {
             launches.push((key.clone(), spec, generation));
         }
-        s.lsp.pin(&key);
+        s.lsp.pin(&key, workspace_id);
         wanted.insert(key);
     }
 
@@ -438,13 +437,18 @@ pub(crate) fn reconcile_workspace_pins(
         .lsp
         .servers
         .iter()
-        .filter(|(k, h)| k.workspace == workspace_id && h.pinned && !wanted.contains(*k))
+        .filter(|(k, h)| h.pinned_by.contains(workspace_id) && !wanted.contains(*k))
         .map(|(k, _)| k.clone())
         .collect();
     for key in stale {
         if let Some(h) = s.lsp.servers.get_mut(&key) {
-            h.pinned = false;
-            if h.open_buffers.is_empty() && h.registered_buffers.is_empty() {
+            h.pinned_by.remove(workspace_id);
+            // Only reap once *nobody* pins it: another context declaring the same project keeps
+            // the same process, and undeclaring here must not pull it out from under them.
+            if h.pinned_by.is_empty()
+                && h.open_buffers.is_empty()
+                && h.registered_buffers.is_empty()
+            {
                 s.lsp.servers.remove(&key);
             }
         }
@@ -459,6 +463,7 @@ fn workspace_project_views_by_id(s: &ServerState, workspace_id: &str) -> Vec<Wor
         .map(workspace_project_views)
         .unwrap_or_default()
 }
+
 
 pub async fn workspace_activate(
     state: &SharedState,
@@ -475,36 +480,69 @@ pub async fn workspace_activate(
     // Cold path: read the workspace's config from disk *outside* the state lock — file I/O and
     // canonicalization can be slow on cold caches, and we hold the lock for many concurrent
     // operations.
-    let cold_load: Option<(
-        String,
-        Vec<std::path::PathBuf>,
-        Vec<crate::config::ProjectRef>,
-    )> = if already_loaded {
+    //
+    // A workspace is its **configured roots** (the TOML, or an in-memory registration) plus its
+    // **worktree bindings** (the session file). The two live apart deliberately: a binding that no
+    // longer resolves is stale machine state, dropped on load, where a stale root would be a broken
+    // config file to explain (`docs/worktrees.md` §8.2). Which is also why binding can never strand
+    // you — the configured roots are always still there to fall back to.
+    let (sessions_path, loaded) = {
+        let s = state.lock().await;
+        let loaded = s.workspaces.get(&params.name).map(|e| {
+            (
+                e.base_paths.clone().unwrap_or_else(|| e.paths.clone()),
+                e.projects.clone(),
+            )
+        });
+        (s.sessions_path.clone(), loaded)
+    };
+    let bindings = worktree_bindings(sessions_path.as_deref(), &params.name);
+
+    let cold_load: Option<ColdLoad> = if already_loaded {
         None
     } else {
-        let cfg = match crate::config::load_workspace(&params.name) {
-            Ok(c) => c,
-            // A config that isn't there and one that won't parse are different problems: the first
-            // is a wrong name, the second a broken (or stale-format) file the user has to go and
-            // fix. Reporting both as "unknown workspace" sends them hunting for a missing file.
-            Err(crate::config::LoadWorkspaceError::NotFound) => {
-                tracing::warn!(name = %params.name, "workspace/activate: no such workspace");
-                return Err(RpcError::unknown_workspace(&params.name));
-            }
-            Err(crate::config::LoadWorkspaceError::Invalid(e)) => {
-                tracing::warn!(name = %params.name, error = %e, "workspace/activate: unreadable config");
-                return Err(RpcError::invalid_params(e));
-            }
-        };
-        let canonical_paths: Vec<std::path::PathBuf> = cfg
-            .paths()
-            .iter()
-            .map(|p| crate::config::canonicalize_workspace_path(p))
-            .collect::<Result<_, _>>()
-            .map_err(|e| RpcError::invalid_path(format!("canonicalizing workspace path: {e}")))?;
-        let projects = cfg.project_refs();
-        Some((cfg.name, canonical_paths, projects))
+        // In-memory registration (an embedding, a test): its roots are the configured ones, so
+        // skip the config read entirely.
+        if let Some((configured, projects)) = loaded.clone() {
+            let (roots, base_paths) = materialise(&params.name, configured, &bindings, false).await?;
+            Some((params.name.clone(), roots, projects, base_paths))
+        } else {
+            let cfg = match crate::config::load_workspace(&params.name) {
+                Ok(c) => c,
+                // A config that isn't there and one that won't parse are different problems: the first
+                // is a wrong name, the second a broken (or stale-format) file the user has to go and
+                // fix. Reporting both as "unknown workspace" sends them hunting for a missing file.
+                Err(crate::config::LoadWorkspaceError::NotFound) => {
+                    tracing::warn!(name = %params.name, "workspace/activate: no such workspace");
+                    return Err(RpcError::unknown_workspace(&params.name));
+                }
+                Err(crate::config::LoadWorkspaceError::Invalid(e)) => {
+                    tracing::warn!(name = %params.name, error = %e, "workspace/activate: unreadable config");
+                    return Err(RpcError::invalid_params(e));
+                }
+            };
+            let configured: Vec<std::path::PathBuf> = cfg
+                .paths()
+                .iter()
+                .map(|p| crate::config::canonicalize_workspace_path(p))
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    RpcError::invalid_path(format!("canonicalizing workspace path: {e}"))
+                })?;
+            let projects = cfg.project_refs();
+            let (roots, base_paths) = materialise(&cfg.name, configured, &bindings, true).await?;
+            Some((cfg.name, roots, projects, base_paths))
+        }
     };
+
+    // An already-loaded *bound* workspace re-materialises before we go any further. Its roots are
+    // derived from bindings and from what those bindings resolve to, and both can have moved since
+    // it was loaded — another client rebound it, or a `git worktree remove` in a terminal made a
+    // binding dangle. Taking the hot path unconditionally would re-enter a workspace pointing at a
+    // directory that is no longer there.
+    if already_loaded && !bindings.is_empty() {
+        rebind_loaded_workspace(state, client_id, &params.name, None).await?;
+    }
 
     let mut s = state.lock().await;
 
@@ -529,7 +567,7 @@ pub async fn workspace_activate(
 
     // Install the workspace entry on the cold path. Reuse the existing entry (and its shared
     // `WorkspaceIndex`) on the hot path.
-    if let Some((name, canonical_paths, projects)) = cold_load {
+    if let Some((name, canonical_paths, projects, base_paths)) = cold_load {
         let workspace_index = Arc::new(crate::workspace_index::WorkspaceIndex::new(
             canonical_paths.clone(),
         ));
@@ -538,6 +576,7 @@ pub async fn workspace_activate(
             crate::state::WorkspaceEntry {
                 id: params.name.clone(),
                 name: Some(name),
+                base_paths,
                 paths: canonical_paths.clone(),
                 workspace_index,
                 mru_buffers: std::collections::VecDeque::new(),
@@ -973,6 +1012,13 @@ pub(crate) async fn flush_backups(state: &SharedState) {
 /// rejects empty names and names containing path separators — the name becomes a `<name>.toml`
 /// filename, so a `/`, `\`, `.`, or `..` could escape the workspaces dir. Shared by
 /// `workspace/create` and `workspace/rename`.
+///
+/// Also rejects the single reserved word `ephemeral`. Workspace ids namespace on the separator —
+/// `aether`, `aether/feature-auth` (a worktree variant), `ephemeral/3` (a no-workspace context) —
+/// so a workspace actually *called* `ephemeral` would give its variants ids that
+/// [`aether_protocol::is_ephemeral_workspace_id`] reads as throwaway contexts. That misreading is
+/// silent, and it costs a persisted workspace its session, so the collision is refused at the one
+/// place a name is chosen. See `docs/worktrees.md` §10.2.
 fn validate_workspace_name(raw: &str) -> Result<String, RpcError> {
     let name = raw.trim().to_string();
     if name.is_empty() {
@@ -982,6 +1028,11 @@ fn validate_workspace_name(raw: &str) -> Result<String, RpcError> {
         return Err(RpcError::invalid_params(
             "workspace name must not contain path separators",
         ));
+    }
+    if name == aether_protocol::RESERVED_WORKSPACE_NAME {
+        return Err(RpcError::invalid_params(format!(
+            "\"{name}\" is a reserved workspace name",
+        )));
     }
     Ok(name)
 }
@@ -1031,6 +1082,7 @@ pub async fn workspace_create(
         crate::state::WorkspaceEntry {
             id: name.clone(),
             name: Some(name.clone()),
+            base_paths: None,
             paths: Vec::new(),
             workspace_index,
             mru_buffers: std::collections::VecDeque::new(),
@@ -1209,7 +1261,7 @@ pub async fn workspace_open_path(
 /// registers with the watcher, rebuilds the workspace index. Returns the updated workspace info.
 pub async fn workspace_add_root(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     params: WorkspaceAddRootParams,
 ) -> Result<WorkspaceInfo, RpcError> {
     let canonical = crate::config::canonicalize_workspace_path(std::path::Path::new(&params.path))
@@ -1246,6 +1298,9 @@ pub async fn workspace_add_root(
         .map(|p| p.display().to_string())
         .collect();
     let entry_projects = workspace_project_views(workspace);
+    // The workspace is one thing however many clients are in it, so the others need the new shape
+    // — their `workspace_paths` is what every path they render is resolved against.
+    let pushes = workspace_changed_pushes(&s, &params.workspace, ctx.client_id);
     let watcher = s.watcher.clone();
     drop(s);
 
@@ -1257,6 +1312,9 @@ pub async fn workspace_add_root(
         tokio::task::spawn_blocking(move || {
             crate::watcher::watch_workspace_paths(&w, &[canonical])
         });
+    }
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
     }
     Ok(WorkspaceInfo {
         name: params.workspace,
@@ -1272,7 +1330,7 @@ pub async fn workspace_add_root(
 /// "that marker doesn't exist" is far more useful now than a silently ignored row later.
 pub async fn workspace_add_project(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     params: WorkspaceAddProjectParams,
 ) -> Result<WorkspaceInfo, RpcError> {
     // A project is a directory relative to its root. An empty path means the root itself; store it
@@ -1319,7 +1377,9 @@ pub async fn workspace_add_project(
     // Start it now rather than at the next activation — the point of a pin is that indexing is
     // already under way by the time you want it.
     let launches = reconcile_workspace_pins(&mut s, &params.workspace);
-    let pushes = refresh_lsp_server_pickers(&mut s);
+    let mut pushes = refresh_lsp_server_pickers(&mut s);
+    // Projects ride on `WorkspaceInfo` too, so the other clients' copy is stale without this.
+    pushes.extend(workspace_changed_pushes(&s, &params.workspace, ctx.client_id));
     let entry_projects = workspace_project_views_by_id(&s, &params.workspace);
     drop(s);
 
@@ -1371,7 +1431,7 @@ pub async fn workspace_infer_language(
 /// Undeclare a project, unpinning its server (which then reaps unless buffers hold it up).
 pub async fn workspace_remove_project(
     state: &SharedState,
-    _ctx: &mut ConnectionCtx,
+    ctx: &mut ConnectionCtx,
     params: WorkspaceRemoveProjectParams,
 ) -> Result<WorkspaceInfo, RpcError> {
     // Matched as stored, not resolved: the entries most worth removing are the ones whose marker no
@@ -1407,7 +1467,9 @@ pub async fn workspace_remove_project(
     // Reconcile drops the pin this project was holding; a server another project still wants, or
     // that has buffers open, stays up.
     let launches = reconcile_workspace_pins(&mut s, &params.workspace);
-    let pushes = refresh_lsp_server_pickers(&mut s);
+    let mut pushes = refresh_lsp_server_pickers(&mut s);
+    // Projects ride on `WorkspaceInfo` too, so the other clients' copy is stale without this.
+    pushes.extend(workspace_changed_pushes(&s, &params.workspace, ctx.client_id));
     let entry_projects = workspace_project_views_by_id(&s, &params.workspace);
     drop(s);
 
@@ -1558,7 +1620,11 @@ pub async fn workspace_remove_root(
     // the workspace. Mirrors buffer/close.
     let next_buffer_id = next_buffer_for_client(&s, client_id);
     let watcher = s.watcher.clone();
-    let mut pushes = refresh_buffer_pickers(&mut s);
+    // Shape first, then what closed — same order as a worktree rebind, and for the same reason:
+    // the close makes a client open its successor, and that open resolves the path against the
+    // roots it holds.
+    let mut pushes = workspace_changed_pushes(&s, &params.workspace, client_id);
+    pushes.extend(refresh_buffer_pickers(&mut s));
     pushes.extend(buffer_closed_pushes(&s, &other_clients));
     drop(s);
 
@@ -2592,12 +2658,8 @@ async fn buffer_open_inner(
                     crate::lsp::config::workspace_marker(&language),
                     &roots,
                 );
-                let key = crate::lsp::manager::LspServerKey::new(
-                    active_workspace_name.clone(),
-                    root,
-                    &language,
-                );
-                if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+                let key = crate::lsp::manager::LspServerKey::new(root, &language);
+                if let Some(generation) = s.lsp.ensure(&key, spec.command, &active_workspace_name) {
                     lsp_launch = Some((key.clone(), spec, generation));
                 }
                 s.lsp.register_doc(id, &key);
@@ -3496,6 +3558,1091 @@ pub async fn git_set_baseline(
         let _ = sender.send(notif).await;
     }
     Ok(GitSetBaselineResult { baseline, buffers })
+}
+
+/// What a cold `workspace/activate` reads before taking the state lock: the base workspace's name,
+/// the roots to install (already materialised through any variant bindings), its declared projects,
+/// and — for a variant only — the *base* roots those were remapped from.
+type ColdLoad = (
+    String,
+    Vec<std::path::PathBuf>,
+    Vec<crate::config::ProjectRef>,
+    Option<Vec<std::path::PathBuf>>,
+);
+
+/// Bind (or unbind) a repo to a worktree in a workspace variant, then activate the result — see
+/// [`WorkspaceBindWorktree`].
+pub async fn workspace_bind_worktree(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: WorkspaceBindWorktreeParams,
+) -> Result<WorkspaceActivateResult, RpcError> {
+    let client_id = ctx.client_id;
+    let (workspace_id, repo_workdir, sessions_path) = {
+        let s = state.lock().await;
+        let workspace_id = match params.workspace.clone() {
+            Some(id) => id,
+            None => s.active_workspace_or_err(client_id)?.id.clone(),
+        };
+        let repo = resolve_writable_repo(&s, client_id, params.repo_id.as_ref(), None)?;
+        // Bindings are keyed by the repo **as the workspace's configured roots see it**, not by
+        // whatever worktree of it happens to be current. Standing in a workspace already bound to
+        // `feature`, the active repo *is* that worktree — keying on it would write a second binding
+        // for the same repo and leave the first to fight it. The two are the same *family*, which is
+        // what the common dir identifies, so that is what the lookup matches on.
+        let configured = configured_workspace_roots(&s, &workspace_id)?;
+        let workdir = base_repo_for_family(&configured, Path::new(&repo.common_dir))
+            .unwrap_or_else(|| std::path::PathBuf::from(&repo.repo_id));
+        (workspace_id, workdir, s.sessions_path.clone())
+    };
+    // An ephemeral context has no config file, so it has no configured roots to remap and nothing
+    // to persist a binding against.
+    if aether_protocol::is_ephemeral_workspace_id(&workspace_id) {
+        return Err(RpcError::invalid_params(
+            "worktrees need a configured workspace",
+        ));
+    }
+
+    let mut bindings = worktree_bindings(sessions_path.as_deref(), &workspace_id);
+    // Structural cleanup on the way through: a binding whose repo no longer sits under any
+    // configured root is unreachable, and the workspace should not keep carrying it. This is the
+    // machine-state counterpart of the config nesting `projects` inside their root — there a
+    // dangling reference is unrepresentable, here it is representable, so it is pruned.
+    {
+        let s = state.lock().await;
+        let configured = configured_workspace_roots(&s, &workspace_id)?;
+        drop(s);
+        crate::worktree::prune_unreachable_bindings(&configured, &mut bindings);
+    }
+    if params.worktree.is_empty() {
+        bindings.remove(&repo_workdir);
+    } else {
+        bindings.insert(repo_workdir.clone(), params.worktree.clone());
+    }
+
+    // There is no target to choose: the bindings belong to the workspace we are standing in, and
+    // that is where we stay. Binding used to spawn a second workspace id (`aether/feature-auth`) the
+    // first time it was called from an unbound workspace, which made one keypress mean "adjust this"
+    // or "create and leave" depending on state that wasn't on screen. Having two trees of one repo
+    // open at once is a second workspace, made deliberately — not a side effect of pressing Enter.
+    //
+    // Persist before activating: activation materialises roots *from* the bindings, so a write that
+    // landed after it would open the old shape.
+    write_worktree_bindings(sessions_path.as_deref(), &workspace_id, bindings)?;
+
+    // Same workspace, different roots — rebuild it in place around the new shape, carrying the open
+    // buffers to the same relative paths (§9.3).
+    let rebound =
+        rebind_loaded_workspace(state, client_id, &workspace_id, params.buffer_id).await?;
+
+    if !rebound.stayed.is_empty() {
+        // Logged, not reported: the buffers are still open at their old paths, and the switcher's
+        // per-workspace unsaved dot is the standing answer to "where did my edits go".
+        tracing::info!(
+            workspace = %workspace_id,
+            dirty_left_behind = rebound.stayed.len(),
+            "unsaved buffers stayed on the previous tree"
+        );
+    }
+    // The file this client was looking at, on the new tree — §9.3's first promise, and the one the
+    // activation below cannot keep on its own. `open_last` lands on the workspace's MRU head, which
+    // is only *incidentally* the buffer you were in: with several buffers open it is whichever the
+    // rebind happened to list first, and with none left to list it is a fresh scratch. So the
+    // landing is chosen here, where the mapping from old buffer to new file is known, and the
+    // generic choice stays as the fallback for everything this doesn't cover.
+    let landing = match rebound.landing {
+        Some(path) => workspace_location_of_workspace(state, &workspace_id, &path).await,
+        None => None,
+    };
+    let mut result = workspace_activate(
+        state,
+        ctx,
+        WorkspaceActivateParams {
+            name: workspace_id.clone(),
+            open_last: params.open_last && landing.is_none(),
+        },
+    )
+    .await?;
+    if params.open_last {
+        if let Some(loc) = landing {
+            result.opened = Some(
+                buffer_open(
+                    state,
+                    ctx,
+                    BufferOpenParams {
+                        path_index: Some(loc.path_index),
+                        relative_path: Some(loc.relative_path),
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            );
+        }
+    }
+    Ok(result)
+}
+
+/// `path` as a root index + root-relative path in `workspace_id`. The client-scoped
+/// [`workspace_location_of`] asks the same question of whatever workspace a client is standing in;
+/// this one names the workspace, for a caller that has just changed its shape.
+async fn workspace_location_of_workspace(
+    state: &SharedState,
+    workspace_id: &str,
+    path: &Path,
+) -> Option<aether_protocol::buffer::BufferLocation> {
+    let s = state.lock().await;
+    let entry = s.workspaces.get(workspace_id)?;
+    entry.paths.iter().enumerate().find_map(|(i, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|rel| aether_protocol::buffer::BufferLocation {
+                path_index: i as u32,
+                relative_path: rel.to_string_lossy().into_owned(),
+            })
+    })
+}
+
+/// Rebuild an already-loaded workspace around freshly-changed bindings, carrying its open buffers
+/// across. Returns the buffers that stayed behind because they were unsaved.
+///
+/// This is §9.3 for the in-place case: the roots move, so every buffer under a remapped root has to
+/// be reopened at the same *relative* path in the new tree. Left alone they would silently keep
+/// editing the other worktree — the `git-worktree.nvim` #88 failure, tractable for us only because
+/// the server owns the buffer↔workspace association and can do the whole switch under one lock.
+///
+/// **Dirty buffers stay behind and do not block the switch.** `workspace/remove_root` refuses on
+/// them because it is *destroying* a context; a rebind destroys nothing, and a dirty buffer left in
+/// the previous shape is exactly what you find when you switch back.
+///
+/// **A workspace is one thing, however many clients are in it.** Its roots move for all of them, so
+/// every *other* client on it is told what closed and what replaced it (`buffer/closed`), the same
+/// way `workspace/remove_root` and `workspace/delete` tell them. `client_id` is the initiator, who
+/// is excluded — its own reply carries the new state.
+async fn rebind_loaded_workspace(
+    state: &SharedState,
+    client_id: ClientId,
+    workspace_id: &str,
+    was_viewing: Option<BufferId>,
+) -> Result<RebindOutcome, RpcError> {
+    let (sessions_path, configured) = {
+        let s = state.lock().await;
+        (
+            s.sessions_path.clone(),
+            configured_workspace_roots(&s, workspace_id)?,
+        )
+    };
+    let bindings = worktree_bindings(sessions_path.as_deref(), workspace_id);
+    let bindings_now_empty = bindings.is_empty();
+    let (roots, _unresolved) = {
+        let configured = configured.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree::materialise_roots(&configured, &bindings)
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("resolving worktree bindings: {e}")))?
+    };
+
+    let mut s = state.lock().await;
+    let Some(entry) = s.workspaces.get(workspace_id) else {
+        return Ok(RebindOutcome::default());
+    };
+    let old_roots = entry.paths.clone();
+    if old_roots == roots {
+        return Ok(RebindOutcome::default());
+    }
+
+
+    // Which open buffers move, and where to. A buffer under no remapped root doesn't move at all —
+    // that's the shared non-repo root case, and it keeps its document, rope and undo stack.
+    let mut follow: Vec<(BufferId, std::path::PathBuf)> = Vec::new();
+    let mut stayed: Vec<BufferId> = Vec::new();
+    // Where a buffer that *stayed* would have gone, for the landing below. Not a `buffer/closed`
+    // successor — nothing closed — so it is kept apart from `successor`.
+    let mut stayed_successor: std::collections::HashMap<BufferId, std::path::PathBuf> =
+        Default::default();
+    let mut close: Vec<BufferId> = Vec::new();
+    for id in s.buffers_in_workspace(workspace_id) {
+        let Some(doc) = s.try_doc_of(id) else {
+            continue;
+        };
+        let Some(path) = doc.canonical_path.clone() else {
+            continue; // a scratch has no path to remap
+        };
+        let Some(mapped) = remap_path(&path, &old_roots, &roots) else {
+            continue; // outside every moved root
+        };
+        if doc.dirty {
+            // Unsaved work stays where it was edited (§9.3) — but the *view* still moves. Recording
+            // the mapping without closing anything means a client that was looking at this buffer
+            // lands on the same file in the new tree, with its unsaved copy left open behind it.
+            // Without this the landing fell back to the MRU head, which is this very buffer: you
+            // asked to switch trees and stayed on the old tree's file, now shown as an absolute
+            // path because it sits outside every root. That is the `git-worktree.nvim` #88 failure
+            // wearing a different hat.
+            if mapped.exists() {
+                stayed_successor.insert(id, mapped);
+            }
+            stayed.push(id);
+            continue;
+        }
+        close.push(id);
+        if mapped.exists() {
+            // Paired with the buffer it replaces, so every *other* client viewing that buffer can
+            // be handed the same file on the new tree rather than an arbitrary survivor.
+            follow.push((id, mapped));
+        }
+    }
+    // Captured BEFORE teardown, which drops the viewports and MRU entries this reads. Without it
+    // the other clients on this workspace keep buffer ids the server has just closed, and every
+    // request they make on one comes back `unknown buffer_id` — the workspace moved under them
+    // with nothing said.
+    let affected = clients_affected_by_close(&s, &close, client_id);
+    for id in &close {
+        s.close_buffer(*id);
+    }
+
+    // The followed set becomes the workspace's dormant list: listed in the picker, materialised
+    // when opened. Reuses the session-restore shape rather than eagerly opening N files, which on a
+    // wide open set would stall the switch for no benefit.
+    //
+    // Ids come from the allocator first, because it borrows `s` mutably on its own and the entry
+    // does too.
+    // Keyed by the buffer it replaces, and carried as a **path**: the dormant id below is not a
+    // stable handle for another client (see `BufferClosedParams::next_path`).
+    let mut successor: std::collections::HashMap<BufferId, std::path::PathBuf> = Default::default();
+    let dormant: Vec<crate::state::DormantBuffer> = follow
+        .into_iter()
+        .map(|(was, path)| {
+            successor.insert(was, path.clone());
+            crate::state::DormantBuffer {
+                id: s.allocate_buffer_id(),
+                source: crate::state::DormantSource::File(path),
+            }
+        })
+        .collect();
+    if let Some(entry) = s.workspaces.get_mut(workspace_id) {
+        entry.paths = roots.clone();
+        entry.workspace_index =
+            Arc::new(crate::workspace_index::WorkspaceIndex::new(roots.clone()));
+        // Dormant entries that were already here are **remapped, not discarded** — a buffer listed
+        // from a restored session but never opened is still in the picker, and replacing the list
+        // wholesale silently dropped it. Ones under a moved root follow to the same relative path
+        // (keeping their reserved id, since nothing has materialised them); ones outside every
+        // moved root, and scratches, are left exactly as they are. This is `docs/worktrees.md`
+        // §9.3 step 4's "dormant buffers" clause, which the first cut missed.
+        for d in &mut entry.dormant_buffers {
+            if let crate::state::DormantSource::File(path) = &d.source {
+                if let Some(mapped) = remap_path(path, &old_roots, &roots) {
+                    d.source = crate::state::DormantSource::File(mapped);
+                }
+            }
+        }
+        // Then the buffers this rebind just closed, which are dormant now too.
+        entry.dormant_buffers.extend(dormant);
+    }
+    // Both halves above can produce a path that is already listed — a remapped entry landing on a
+    // path this rebind also followed, or one whose file another client has since opened live. The
+    // list's invariant is restored once, here, rather than proved at each route in.
+    s.dedupe_dormant(workspace_id);
+    if let Some(entry) = s.workspaces.get_mut(workspace_id) {
+        // The configured roots are what unbinding restores, so they are recorded the moment a
+        // binding exists and dropped the moment none does — leave a stale `Some` here and the next
+        // rebind would remap against a shape the workspace no longer has.
+        entry.base_paths = (!bindings_now_empty).then(|| configured.clone());
+    }
+    let landing = was_viewing
+        .and_then(|id| successor.get(&id).or_else(|| stayed_successor.get(&id)).cloned());
+
+    // Tell the other clients on this workspace. The new shape goes *first*, so their roots are
+    // current before they open the successor below and resolve its path against them — otherwise
+    // every label is computed against roots the workspace no longer has. Then what closed and what
+    // replaced it: each is handed the same file on the new tree when it exists there (a dormant id,
+    // materialised when they open it) and the workspace's usual successor when it doesn't. Built
+    // after teardown so that fallback reflects the settled MRU.
+    let mut pushes = workspace_changed_pushes(&s, workspace_id, client_id);
+    pushes.extend(refresh_buffer_pickers(&mut s));
+    pushes.extend(buffer_closed_pushes_with(&s, &affected, &successor));
+    let watcher = s.watcher.clone();
+    drop(s);
+
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    if let Some(w) = watcher {
+        crate::watcher::unwatch_workspace_paths(&w, &old_roots);
+        crate::watcher::watch_workspace_paths(&w, &roots);
+    }
+    Ok(RebindOutcome { stayed, landing })
+}
+
+/// What a rebind leaves the caller to act on.
+#[derive(Default)]
+struct RebindOutcome {
+    /// Buffers that stayed behind because they were unsaved.
+    stayed: Vec<BufferId>,
+    /// Where the *initiating* client should land: the file it was viewing, on the new tree. `None`
+    /// when it wasn't viewing anything remapped (a scratch, a root that didn't move, or a file that
+    /// doesn't exist on the target) — the caller then falls back to the workspace's usual choice.
+    landing: Option<std::path::PathBuf>,
+}
+
+/// Resolve a workspace's live roots from its configured ones and its bindings, for activation.
+///
+/// Returns the roots to open plus the `base_paths` to record: `Some(configured)` for a bound
+/// workspace — the shape its roots are a remapping *of*, and what unbinding restores — and `None`
+/// for an unbound one, whose roots are already its configured ones.
+///
+/// `repair` gates the `git worktree repair` retry: worth it on a cold load from disk, skipped for an
+/// in-memory registration, which has no repo that could have moved out from under it.
+async fn materialise(
+    workspace: &str,
+    configured: Vec<std::path::PathBuf>,
+    bindings: &std::collections::BTreeMap<std::path::PathBuf, String>,
+    repair: bool,
+) -> Result<(Vec<std::path::PathBuf>, Option<Vec<std::path::PathBuf>>), RpcError> {
+    if bindings.is_empty() {
+        return Ok((configured, None));
+    }
+    let (roots, unresolved) = if repair {
+        materialise_with_repair(&configured, bindings.clone()).await?
+    } else {
+        crate::worktree::materialise_roots(&configured, bindings)
+    };
+    if !unresolved.is_empty() {
+        tracing::warn!(
+            workspace = %workspace,
+            worktrees = ?unresolved,
+            "worktree bindings could not be resolved; those roots fall back to the configured path"
+        );
+    }
+    Ok((roots, Some(configured)))
+}
+
+/// Materialise bound roots, running `git worktree repair` once if any binding fails to
+/// resolve and then trying again.
+///
+/// The centralised store means a repo and its worktrees never move together, so moving the repo
+/// breaks every binding at once — and `repair` is exactly the command for that, rewriting the admin
+/// entries to point where the trees actually are. Cheap to attempt and a no-op when nothing is
+/// broken, but only attempted when something *is*: it is a mutation, and running it on every
+/// activation would put a write in the read path.
+///
+/// Bindings that still don't resolve leave their root at the configured path. A workspace that
+/// can't fully materialise degrades rather than refusing to open — refusing would leave no way
+/// back in.
+async fn materialise_with_repair(
+    base_roots: &[std::path::PathBuf],
+    bindings: std::collections::BTreeMap<std::path::PathBuf, String>,
+) -> Result<(Vec<std::path::PathBuf>, Vec<String>), RpcError> {
+    let first = {
+        let base_roots = base_roots.to_vec();
+        let bindings = bindings.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree::materialise_roots(&base_roots, &bindings)
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("resolving worktree bindings: {e}")))?
+    };
+    if first.1.is_empty() {
+        return Ok(first);
+    }
+    // Repair from each bound repo — the admin entries live in its common dir.
+    for workdir in bindings.keys() {
+        let _ = crate::git_cli::run(workdir, &["worktree", "repair"]).await;
+    }
+    let base_roots = base_roots.to_vec();
+    tokio::task::spawn_blocking(move || crate::worktree::materialise_roots(&base_roots, &bindings))
+        .await
+        .map_err(|e| RpcError::internal(format!("resolving worktree bindings: {e}")))
+}
+
+/// A workspace's **configured** roots — what its TOML declares, canonicalized, in declaration
+/// order. The shape its bindings remap, and what unbinding restores.
+fn configured_workspace_roots(
+    s: &ServerState,
+    id: &str,
+) -> Result<Vec<std::path::PathBuf>, RpcError> {
+    // Prefers what is already loaded: a bound workspace carries its configured roots on the entry,
+    // and an unbound one's `paths` are them. Only an unloaded workspace falls through to the TOML,
+    // which keeps an interactive rebind off the disk — and lets an in-memory workspace (tests,
+    // embeddings, one registered by `spawn_for_test`) work at all, since it has no file to read.
+    if let Some(entry) = s.workspaces.get(id) {
+        return Ok(entry
+            .base_paths
+            .clone()
+            .unwrap_or_else(|| entry.paths.clone()));
+    }
+    let cfg = crate::config::load_workspace(id).map_err(|_| RpcError::unknown_workspace(id))?;
+    cfg.paths()
+        .iter()
+        .map(|p| crate::config::canonicalize_workspace_path(p))
+        .collect::<Result<_, _>>()
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing workspace path: {e}")))
+}
+
+/// `path`'s equivalent under the new root list: the same *relative* location beneath whichever root
+/// contains it. `None` when no root does, or when that root didn't move.
+fn remap_path(
+    path: &Path,
+    old_roots: &[std::path::PathBuf],
+    new_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    // Root lists are the same length and order by construction — that is what materialisation
+    // preserves, and what lets projects' positional `root_index` survive a variant.
+    for (old, new) in old_roots.iter().zip(new_roots) {
+        if old == new {
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(old) {
+            return Some(new.join(relative));
+        }
+    }
+    None
+}
+
+/// The **configured** workspace root whose repo belongs to `common_dir`'s family — the workdir a
+/// binding for that repo is keyed by.
+///
+/// Worktrees of one repo share a common dir and nothing else: different workdirs, different HEADs,
+/// different indexes. So "which repo is this, in configured terms" is a common-dir question, and
+/// asking it by workdir would answer "a different repo" for every worktree of the same project.
+fn base_repo_for_family(
+    configured_roots: &[std::path::PathBuf],
+    common_dir: &Path,
+) -> Option<std::path::PathBuf> {
+    configured_roots.iter().find_map(|root| {
+        crate::git::discover_repo(root)
+            .filter(|i| i.common_dir == common_dir)
+            .map(|i| i.workdir)
+    })
+}
+
+
+
+/// The worktree bindings recorded for one workspace id — empty for an unbound workspace, and for
+/// any id the session file has never seen.
+///
+/// Read straight off disk rather than cached in memory: bindings change rarely, are needed on
+/// activation and on bind/unbind only, and the session file is the single source of truth for them
+/// — a second copy in `ServerState` would be one more thing to keep in step.
+fn worktree_bindings(
+    sessions_path: Option<&Path>,
+    workspace_id: &str,
+) -> std::collections::BTreeMap<std::path::PathBuf, String> {
+    let Some(path) = sessions_path else {
+        return Default::default();
+    };
+    crate::config::load_workspace_sessions_at(path)
+        .ok()
+        .and_then(|s| s.workspaces.get(workspace_id).map(|e| e.worktrees.clone()))
+        .unwrap_or_default()
+}
+
+/// Write `bindings` for `workspace_id`, creating the session entry if it doesn't exist.
+///
+/// An emptied map clears the bindings but **keeps the entry**: the workspace still exists, it is
+/// just back on its configured roots. (It used to delete the entry, because an unbound *variant*
+/// was not a variant at all — that is no longer a thing a workspace can stop being.)
+fn write_worktree_bindings(
+    sessions_path: Option<&Path>,
+    workspace_id: &str,
+    bindings: std::collections::BTreeMap<std::path::PathBuf, String>,
+) -> Result<(), RpcError> {
+    let Some(path) = sessions_path else {
+        return Ok(());
+    };
+    let mut sessions = crate::config::load_workspace_sessions_at(path).unwrap_or_default();
+    sessions
+        .workspaces
+        .entry(workspace_id.to_string())
+        .or_default()
+        .worktrees = bindings;
+    crate::config::write_workspace_sessions_at(path, &sessions)
+        .map_err(|e| RpcError::internal(format!("writing worktree bindings: {e}")))
+}
+
+/// The worktree picker's rows: **the worktree you are in first**, then the main checkout, then the
+/// family's other linked worktrees, then local branches no worktree has.
+///
+/// Current-first is how Buffers and Workspaces already land their selection — MRU and recency put
+/// "where you are" at index 0, and the default selection is index 0. So the same ordering gives
+/// this picker the same behaviour with no extra mechanism, and makes Enter-on-open a no-op the way
+/// selecting the current buffer is.
+///
+/// **A branch checked out somewhere never appears as a branch row** — it is already a worktree row.
+/// That is how the one-checkout-per-family rule is avoided rather than reported: git just errors
+/// and magit declined to intercept (#4294), while we already compute the answer.
+///
+/// The `+ Create <query>` row is not built here; the client adds it from the query, like every
+/// other create affordance.
+fn build_worktree_candidates(workdir: &Path) -> Vec<picker_state::WorktreeCandidate> {
+    use aether_protocol::picker::WorktreeRowKind;
+    let repo_id = path_string(workdir);
+    let rows = crate::worktree::list(workdir);
+    let mut out: Vec<picker_state::WorktreeCandidate> = Vec::new();
+    let mut checked_out: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in &rows {
+        let branch = match &row.head {
+            Some(GitHead::Branch { name, .. }) | Some(GitHead::Unborn { name }) => name.clone(),
+            Some(GitHead::Detached { oid }) => oid.clone(),
+            None => String::new(),
+        };
+        if matches!(row.head, Some(GitHead::Branch { .. })) {
+            checked_out.insert(branch.clone());
+        }
+        out.push(picker_state::WorktreeCandidate {
+            repo_id: repo_id.clone(),
+            kind: if row.is_main {
+                WorktreeRowKind::Main
+            } else {
+                WorktreeRowKind::Existing
+            },
+            // The main worktree has no admin name, so it matches and renders on its branch.
+            label: if row.is_main {
+                branch.clone()
+            } else {
+                row.name.clone()
+            },
+            branch,
+            path: row.path.clone(),
+            is_current: row.is_current,
+            prunable: row.prunable,
+            locked: row.locked,
+        });
+    }
+
+    for row in crate::git::list_branches(workdir) {
+        if checked_out.contains(&row.name) {
+            continue;
+        }
+        out.push(picker_state::WorktreeCandidate {
+            repo_id: repo_id.clone(),
+            kind: WorktreeRowKind::Branch,
+            label: row.name,
+            branch: String::new(),
+            path: String::new(),
+            is_current: false,
+            prunable: false,
+            locked: false,
+        });
+    }
+    out
+}
+
+/// The row for the worktree the caller is standing in, as the picker's initial highlight on a fresh
+/// open — the analogue of the buffer picker landing on the current buffer.
+///
+/// Done by *centring*, not by ordering. Hoisting the current row to the top would land the selection
+/// too, but it reshuffles the `Worktrees` section every time you switch, so the list you scan is
+/// never the same list twice. The rows keep a stable order and the highlight moves instead.
+///
+/// Only on a fresh open: a re-view (scroll, resume) must keep whatever the user has highlighted.
+fn current_worktree_item(
+    picker: &picker_state::PickerState,
+    reset: PickerReset,
+) -> Option<PickerItem> {
+    if reset != PickerReset::All {
+        return None;
+    }
+    let picker_state::PickerCandidates::Worktrees(v) = &picker.candidates else {
+        return None;
+    };
+    let idx = v.iter().position(|c| c.is_current)?;
+    Some(picker.candidates.make_item(idx, Vec::new()))
+}
+
+/// The row for the branch HEAD is on, as the branch picker's initial highlight on a fresh open.
+///
+/// Same move as [`current_worktree_item`], and for the same reason: "where you are" is the
+/// selection, not a glyph on the row. The branch picker used to mark HEAD with a `●` in a reserved
+/// leading column — the one picker still doing that — while Buffers, Workspaces and Worktrees all
+/// express it by opening *on* the row. This is what let the marker go.
+///
+/// Only on a fresh open: a re-view (scroll, resume) must keep whatever the user has highlighted.
+fn current_branch_item(
+    picker: &picker_state::PickerState,
+    reset: PickerReset,
+) -> Option<PickerItem> {
+    if reset != PickerReset::All {
+        return None;
+    }
+    let picker_state::PickerCandidates::GitBranches(v) = &picker.candidates else {
+        return None;
+    };
+    let idx = v.iter().position(|c| c.row.is_head)?;
+    Some(picker.candidates.make_item(idx, Vec::new()))
+}
+
+/// Create a worktree — see [`aether_protocol::git::GitWorktreeAdd`].
+///
+/// Shape mirrors push and pull: everything decidable without spawning git is decided first (all
+/// three refusals below are permanent, so a round trip could only confirm them), then the checkout
+/// runs streamed and cancellable, then the result is classified from *our* reads rather than from
+/// git's wording.
+///
+/// The one thing that is neither: the family lock. `git worktree add` rewrites `.git/config` in the
+/// common dir under git's own lockfile, so two concurrent adds in one family leave one dead with
+/// `could not lock config file`. Waiting is right where refusing would be an error the user has to
+/// understand — two agents asking at once is the expected case (`docs/worktrees.md` §4.4).
+pub async fn git_worktree_add(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitWorktreeAddParams,
+) -> Result<GitWorktreeAddResult, RpcError> {
+    let (workdir, common_dir, store_override) = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        (
+            std::path::PathBuf::from(&repo.repo_id),
+            std::path::PathBuf::from(&repo.common_dir),
+            s.worktree_store.clone(),
+        )
+    };
+    let branch = params.branch.trim().to_string();
+    if branch.is_empty() {
+        return Ok(GitWorktreeAddResult {
+            status: GitWorktreeAddStatus::InvalidBranchName,
+            ..Default::default()
+        });
+    }
+
+    let refuse = |status| {
+        Ok(GitWorktreeAddResult {
+            status,
+            ..Default::default()
+        })
+    };
+    let pre = {
+        let workdir = workdir.clone();
+        let branch = branch.clone();
+        let create = params.create_branch;
+        tokio::task::spawn_blocking(move || worktree_add_preflight(&workdir, &branch, create))
+            .await
+            .map_err(|e| RpcError::internal(format!("reading repo state: {e}")))?
+    };
+    match pre.status {
+        GitWorktreeAddStatus::Created => {}
+        GitWorktreeAddStatus::AlreadyCheckedOut => {
+            return Ok(GitWorktreeAddResult {
+                status: GitWorktreeAddStatus::AlreadyCheckedOut,
+                checked_out_in: pre.checked_out_in,
+                ..Default::default()
+            })
+        }
+        other => return refuse(other),
+    }
+
+    // Serialise on the family before choosing a name: the uniquifier reads the worktree list and
+    // the store directory, and both are exactly what a concurrent add is about to change.
+    let lock = state.lock().await.worktree_lock(&common_dir);
+    let _guard = lock.lock().await;
+
+    let store_dir = crate::worktree::store_root(store_override.as_deref())
+        .map_err(|e| RpcError::internal(format!("resolving worktree store: {e}")))?
+        .join(crate::worktree::repo_key(&common_dir));
+    std::fs::create_dir_all(&store_dir)
+        .map_err(|e| RpcError::internal(format!("creating worktree store: {e}")))?;
+
+    let existing: Vec<String> = crate::worktree::list(&workdir)
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    let admin = crate::worktree::unique_admin_name(
+        &existing,
+        &store_dir,
+        &crate::worktree::admin_name_for_branch(&branch),
+    );
+    let path = store_dir.join(&admin);
+    let path_str = path.to_string_lossy().into_owned();
+
+    // `git worktree add` derives its admin id from the *directory basename*, which is exactly the
+    // name we just uniquified — so git's own id and ours agree without passing one explicitly.
+    let args: Vec<&str> = if params.create_branch {
+        vec!["worktree", "add", "-b", &branch, &path_str]
+    } else {
+        vec!["worktree", "add", &path_str, &branch]
+    };
+    let (output, cancelled) =
+        match run_network_git(state, &workdir, &args, Some(GitOperationKind::WorktreeAdd)).await {
+            Ok(v) => v,
+            Err(e) => return Err(RpcError::internal(format!("running git worktree add: {e}"))),
+        };
+
+    if cancelled || !output.success() {
+        // A killed or failed `worktree add` can leave a half-populated directory *and* an admin
+        // entry. Clean both up here, while we still know the tree is ours and was created seconds
+        // ago — this is the one context in which removing a worktree needs no confirmation.
+        cleanup_failed_worktree(&workdir, &path).await;
+        if cancelled {
+            return refuse(GitWorktreeAddStatus::Cancelled);
+        }
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitWorktreeAddResult {
+            status: GitWorktreeAddStatus::Refused,
+            message: message.trim_end().to_string(),
+            ..Default::default()
+        });
+    }
+
+    let (seeded_files, has_submodules, row) = {
+        let source = workdir.clone();
+        let dest = path.clone();
+        let admin = admin.clone();
+        tokio::task::spawn_blocking(move || {
+            let seeded = crate::worktree::seed_from_include_file(&source, &dest);
+            let submodules = crate::worktree::has_submodules(&source);
+            let row = crate::worktree::list(&source)
+                .into_iter()
+                .find(|r| r.name == admin);
+            (seeded, submodules, row)
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("finishing worktree: {e}")))?
+    };
+
+    tracing::info!(worktree = %admin, branch = %branch, seeded_files, "worktree created");
+    Ok(GitWorktreeAddResult {
+        status: GitWorktreeAddStatus::Created,
+        worktree: row.or(Some(GitWorktreeRow {
+            name: admin,
+            path: path_str,
+            ..Default::default()
+        })),
+        seeded_files,
+        has_submodules,
+        ..Default::default()
+    })
+}
+
+/// Everything about a `worktree add` that can be answered without spawning git.
+struct WorktreeAddPreflight {
+    status: GitWorktreeAddStatus,
+    checked_out_in: Option<String>,
+}
+
+fn worktree_add_preflight(workdir: &Path, branch: &str, create: bool) -> WorktreeAddPreflight {
+    let ok = |status| WorktreeAddPreflight {
+        status,
+        checked_out_in: None,
+    };
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return ok(GitWorktreeAddStatus::Refused);
+    };
+    // No commit means no tree to check out. Git's own complaint here names `HEAD` and reads like an
+    // internal error, so this is worth answering ourselves.
+    if matches!(crate::git::head_state(&repo), Some(GitHead::Unborn { .. })) {
+        return ok(GitWorktreeAddStatus::Unborn);
+    }
+    let exists = repo.find_branch(branch, git2::BranchType::Local).is_ok();
+    if create {
+        if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}")) {
+            return ok(GitWorktreeAddStatus::InvalidBranchName);
+        }
+        // An existing branch with `create` set falls through to git, whose "already exists" is
+        // clearer than anything we'd invent.
+        return ok(GitWorktreeAddStatus::Created);
+    }
+    if !exists {
+        return ok(GitWorktreeAddStatus::NoSuchBranch);
+    }
+    // Git allows one checkout of a branch across the whole family. The picker normally keeps this
+    // off the list entirely (§10.5), so reaching it means the list went stale — the client's move
+    // is still to *go there* rather than report a failure.
+    if let Some(other) = crate::git::branch_checked_out_elsewhere(workdir, branch) {
+        return WorktreeAddPreflight {
+            status: GitWorktreeAddStatus::AlreadyCheckedOut,
+            checked_out_in: Some(other),
+        };
+    }
+    ok(GitWorktreeAddStatus::Created)
+}
+
+/// Undo a `worktree add` that was cancelled or failed part-way.
+///
+/// `git worktree remove --force` first, because it takes the admin entry with it. Only if that
+/// fails do we delete the directory and prune — and `prune` is safe *here*, unlike anywhere else,
+/// precisely because we just watched this entry become invalid (§4.8: prune has no grace period).
+async fn cleanup_failed_worktree(workdir: &Path, path: &Path) {
+    let path_str = path.to_string_lossy().into_owned();
+    let removed = crate::git_cli::run(workdir, &["worktree", "remove", "--force", &path_str])
+        .await
+        .is_ok_and(|o| o.success());
+    if removed {
+        return;
+    }
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    let _ = crate::git_cli::run(workdir, &["worktree", "prune"]).await;
+}
+
+/// Remove a worktree — see [`aether_protocol::git::GitWorktreeRemove`].
+///
+/// The guard is git's own refusal, not a reimplementation of it; what we add is the *itemisation*,
+/// so the client can say "2 modified, 1 untracked" instead of "are you sure?". Removing a worktree
+/// never touches its branch, so committed work is never in that list.
+pub async fn git_worktree_remove(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitWorktreeRemoveParams,
+) -> Result<GitWorktreeRemoveResult, RpcError> {
+    let (workdir, common_dir) = {
+        let s = state.lock().await;
+        let repo =
+            resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
+        (
+            std::path::PathBuf::from(&repo.repo_id),
+            std::path::PathBuf::from(&repo.common_dir),
+        )
+    };
+    let refuse = |status| {
+        Ok(GitWorktreeRemoveResult {
+            status,
+            ..Default::default()
+        })
+    };
+
+    let rows = {
+        let workdir = workdir.clone();
+        tokio::task::spawn_blocking(move || crate::worktree::list(&workdir))
+            .await
+            .map_err(|e| RpcError::internal(format!("listing worktrees: {e}")))?
+    };
+    let Some(target) = rows.iter().find(|r| r.name == params.name) else {
+        // The main worktree carries no admin name, so an empty name can only mean it.
+        if params.name.is_empty() {
+            return refuse(GitWorktreeRemoveStatus::IsMain);
+        }
+        return refuse(GitWorktreeRemoveStatus::NotFound);
+    };
+    if target.is_main {
+        return refuse(GitWorktreeRemoveStatus::IsMain);
+    }
+    // Locking is a deliberate act — a tree on removable media, a long-running experiment — so it is
+    // never escalated past automatically, not even by `force`.
+    if target.locked {
+        return refuse(GitWorktreeRemoveStatus::Locked);
+    }
+    let target_path = std::path::PathBuf::from(&target.path);
+
+    // Aether's own unsaved work, which git cannot see: a buffer open on a file in this tree with
+    // edits that were never written. `--force` would take the file out from under it. Refused
+    // rather than reported, unlike the switch in §9.3 — this really does destroy the context.
+    {
+        let s = state.lock().await;
+        let dirty: Vec<BufferId> = s
+            .documents
+            .iter()
+            .filter(|(_, d)| d.dirty)
+            .filter_map(|(doc_id, d)| {
+                let path = d.canonical_path.as_deref()?;
+                path.starts_with(&target_path).then_some(*doc_id)
+            })
+            .flat_map(|doc_id| {
+                s.buffers
+                    .iter()
+                    .filter(move |(_, b)| b.document == doc_id)
+                    .map(|(id, _)| *id)
+            })
+            .collect();
+        if !dirty.is_empty() {
+            let mut err = RpcError::new(
+                ErrorCode::DIRTY_BUFFERS_PREVENT_REMOVE,
+                format!(
+                    "{} buffer(s) in {} have unsaved changes",
+                    dirty.len(),
+                    target_path.display()
+                ),
+            );
+            err.data = Some(serde_json::json!({ "dirty_buffer_ids": dirty }));
+            return Err(err);
+        }
+    }
+
+    // A prunable row's directory is already gone, so `git worktree remove` has nothing to remove
+    // and would refuse. Pruning is right *here* and nowhere else: we have just watched `validate`
+    // fail for this specific entry, which is the condition §4.8 says must hold before running a
+    // command that has no grace period.
+    if target.prunable {
+        release_worktree_bindings(state, ctx.client_id, &target.name).await?;
+        let cwd = main_worktree_dir(&rows).unwrap_or_else(|| workdir.clone());
+        let lock = state.lock().await.worktree_lock(&common_dir);
+        let _guard = lock.lock().await;
+        let out = crate::git_cli::run(&cwd, &["worktree", "prune"])
+            .await
+            .map_err(|e| RpcError::internal(format!("running git worktree prune: {e}")))?;
+        drop(_guard);
+        refresh_worktree_pickers(state).await;
+        return if out.success() {
+            refuse(GitWorktreeRemoveStatus::Removed)
+        } else {
+            Ok(GitWorktreeRemoveResult {
+                status: GitWorktreeRemoveStatus::Refused,
+                message: out.stderr.trim_end().to_string(),
+                ..Default::default()
+            })
+        };
+    }
+
+    if !params.force && !target.prunable {
+        let at_risk = {
+            let path = target_path.clone();
+            tokio::task::spawn_blocking(move || crate::worktree::at_risk(&path))
+                .await
+                .map_err(|e| RpcError::internal(format!("reading worktree status: {e}")))?
+        };
+        if at_risk.modified > 0 || at_risk.untracked > 0 || at_risk.operation_in_progress {
+            return Ok(GitWorktreeRemoveResult {
+                status: GitWorktreeRemoveStatus::Dirty,
+                at_risk: Some(at_risk),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Take every workspace off this tree before it goes, so nothing is left pointing into the hole
+    // (see `release_worktree_bindings`). After the dirty-buffer guard above, so unsaved work still
+    // refuses the whole operation rather than being moved first and refused second.
+    release_worktree_bindings(state, ctx.client_id, &params.name).await?;
+
+    let lock = state.lock().await.worktree_lock(&common_dir);
+    let _guard = lock.lock().await;
+
+    // Run from the *main* worktree, never from inside the tree being removed: a command whose cwd
+    // vanishes underneath it is a class of failure worth not having.
+    let cwd = main_worktree_dir(&rows).unwrap_or_else(|| workdir.clone());
+    let path_str = target.path.clone();
+    let mut args = vec!["worktree", "remove"];
+    if params.force {
+        args.push("--force");
+    }
+    args.push(&path_str);
+    let output = crate::git_cli::run(&cwd, &args)
+        .await
+        .map_err(|e| RpcError::internal(format!("running git worktree remove: {e}")))?;
+
+    if !output.success() {
+        let message = if output.stderr.trim().is_empty() {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        return Ok(GitWorktreeRemoveResult {
+            status: GitWorktreeRemoveStatus::Refused,
+            message: message.trim_end().to_string(),
+            ..Default::default()
+        });
+    }
+    // Bindings held by workspaces that aren't loaded were not touched above (there was nothing to
+    // re-materialise), so drop those now — a binding naming a tree that no longer exists would open
+    // the workspace onto nothing the next time it is activated.
+    forget_worktree_bindings(state, &params.name).await?;
+    refresh_worktree_pickers(state).await;
+    tracing::info!(worktree = %params.name, "worktree removed");
+    refuse(GitWorktreeRemoveStatus::Removed)
+}
+
+/// Push a corrected row set to every open worktree picker.
+///
+/// Removal is the only worktree row action that leaves the picker **up**: creating or binding both
+/// end in a switch that closes it, and there is no confirm dialog here to close it either (the
+/// refusal is the confirmation — see the client's chord). So the list has to be corrected
+/// underneath the user, or the tree they just removed stays on screen and the next press acts on a
+/// row that no longer exists.
+///
+/// By push rather than a client-side re-open, for the reason the stash and branch pickers already
+/// take this route: the list is repo-wide, and a push keeps the query and the highlight that a
+/// fresh open would wipe.
+async fn refresh_worktree_pickers(state: &SharedState) {
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_git_ref_pickers(&mut s, PickerKind::Worktrees)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+}
+
+/// The main worktree's directory, from a listing. `None` for a family whose main tree wasn't
+/// recoverable (a bare or `--separate-git-dir` repo), where the caller falls back to its own.
+fn main_worktree_dir(rows: &[GitWorktreeRow]) -> Option<std::path::PathBuf> {
+    rows.iter()
+        .find(|r| r.is_main)
+        .map(|r| std::path::PathBuf::from(&r.path))
+}
+
+/// Take every **loaded** workspace off `worktree` before the tree is deleted: drop the bindings and
+/// re-materialise the roots, so the workspaces are back on their configured paths and their buffers
+/// are reopened there.
+///
+/// Without this, removing the worktree a workspace is standing in leaves that workspace pointing at
+/// a directory that no longer exists — roots, workspace index, watches and open buffers all aimed
+/// at deleted paths, with only a server restart to recover, since nothing re-materialises a
+/// workspace whose bindings changed underneath it. `docs/worktrees.md` §9.4 said to unbind first;
+/// this is that, done for the user rather than demanded of them.
+///
+/// Runs **before** the removal, not after: the point is that no buffer is left open on a file that
+/// is about to be deleted. The cost is that a removal which then fails leaves you unbound — visible,
+/// recoverable in one keystroke, and far better than the reverse (a removal that succeeds while a
+/// workspace keeps pointing into the hole it left).
+async fn release_worktree_bindings(
+    state: &SharedState,
+    client_id: ClientId,
+    worktree: &str,
+) -> Result<(), RpcError> {
+    let sessions_path = state.lock().await.sessions_path.clone();
+    let loaded: Vec<String> = {
+        let s = state.lock().await;
+        s.workspaces.keys().cloned().collect()
+    };
+    let bound: Vec<String> = loaded
+        .into_iter()
+        .filter(|id| {
+            worktree_bindings(sessions_path.as_deref(), id)
+                .values()
+                .any(|name| name == worktree)
+        })
+        .collect();
+    if bound.is_empty() {
+        return Ok(());
+    }
+    forget_worktree_bindings(state, worktree).await?;
+    for id in bound {
+        rebind_loaded_workspace(state, client_id, &id, None).await?;
+    }
+    Ok(())
+}
+
+/// Drop every binding naming `worktree`, from every workspace that holds one.
+///
+/// The workspaces themselves survive — losing a binding just puts those roots back on the
+/// configured path, which is the same thing unbinding does. Runs after a successful removal, and
+/// after a prune, which are the two moments a worktree stops existing by our own hand.
+///
+/// Doing it here rather than leaving the next activation to notice keeps the roots honest: a
+/// workspace pointing into a directory we just deleted would open onto nothing.
+async fn forget_worktree_bindings(state: &SharedState, worktree: &str) -> Result<(), RpcError> {
+    let Some(path) = state.lock().await.sessions_path.clone() else {
+        return Ok(());
+    };
+    let mut sessions = crate::config::load_workspace_sessions_at(&path).unwrap_or_default();
+    let mut changed = false;
+    for entry in sessions.workspaces.values_mut() {
+        let before = entry.worktrees.len();
+        entry.worktrees.retain(|_, name| name != worktree);
+        changed |= entry.worktrees.len() != before;
+    }
+    if !changed {
+        return Ok(());
+    }
+    crate::config::write_workspace_sessions_at(&path, &sessions)
+        .map_err(|e| RpcError::internal(format!("updating worktree bindings: {e}")))
 }
 
 /// Reconcile every open buffer in a repo with the working tree after it moved wholesale.
@@ -7614,17 +8761,102 @@ fn clients_affected_by_close(
     out
 }
 
+/// `workspace/changed` for every *other* client standing in `workspace_id`, carrying the shape it
+/// now has.
+///
+/// The workspace is one server-side entity, so a change to its shape is a change for everyone in
+/// it — but only the client that asked for it gets a `WorkspaceInfo` back in its RPC result. This
+/// is that payload for everyone else.
+///
+/// Call it **after** the entry is mutated (it reads the live shape) and send after the lock drops.
+/// Every handler that edits roots or projects owes this push; without it a second client keeps a
+/// stale root list, and every path it renders is resolved against a shape the workspace no longer
+/// has.
+fn workspace_changed_pushes(
+    s: &ServerState,
+    workspace_id: &str,
+    except: ClientId,
+) -> PendingPushes {
+    let Some(entry) = s.workspaces.get(workspace_id) else {
+        return Vec::new();
+    };
+    let info = WorkspaceInfo {
+        name: workspace_id.to_string(),
+        paths: entry.paths.iter().map(|p| p.display().to_string()).collect(),
+        projects: workspace_project_views(entry),
+    };
+    s.clients
+        .iter()
+        .filter(|(id, session)| {
+            **id != except && session.active_workspace.as_deref() == Some(workspace_id)
+        })
+        .map(|(_, session)| {
+            (
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: aether_protocol::workspace::WorkspaceChanged::NAME.into(),
+                    params: serde_json::to_value(&info).unwrap_or(serde_json::Value::Null),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Build the `buffer/closed` pushes for the clients captured by [`clients_affected_by_close`],
 /// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
 /// settled MRU. Clients that have since disconnected are skipped.
 fn buffer_closed_pushes(s: &ServerState, affected: &[(ClientId, BufferId)]) -> PendingPushes {
+    buffer_closed_pushes_with(s, affected, &Default::default())
+}
+
+/// `path` as a root index + root-relative path in the client's active workspace, when it is inside
+/// one of its roots. `None` for anything outside them — the caller then falls back to an id.
+fn workspace_location_of(
+    s: &ServerState,
+    client_id: ClientId,
+    path: &Path,
+) -> Option<aether_protocol::buffer::BufferLocation> {
+    let entry = s.active_workspace(client_id)?;
+    entry.paths.iter().enumerate().find_map(|(i, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|rel| aether_protocol::buffer::BufferLocation {
+                path_index: i as u32,
+                relative_path: rel.to_string_lossy().into_owned(),
+            })
+    })
+}
+
+/// [`buffer_closed_pushes`], with a per-buffer successor override given as a **path**.
+///
+/// A worktree rebind closes each buffer and reopens it at the same *relative* path on the new tree,
+/// so it knows something the generic rule can't: which file replaces which. Handed back as a path
+/// rather than an id, because the id it could offer — a reserved dormant entry — is not stable:
+/// the initiating client activates straight after the rebind, and a landing buffer on that same
+/// file materialises the entry under a different id, leaving whoever opens second asking for one
+/// that no longer exists. `buffer/open` on a path already open returns the existing buffer, so both
+/// clients converge whichever order they arrive in.
+fn buffer_closed_pushes_with(
+    s: &ServerState,
+    affected: &[(ClientId, BufferId)],
+    successor: &std::collections::HashMap<BufferId, std::path::PathBuf>,
+) -> PendingPushes {
     affected
         .iter()
         .filter_map(|&(client_id, buffer_id)| {
             let session = s.clients.get(&client_id)?;
+            let next_path = successor
+                .get(&buffer_id)
+                .and_then(|path| workspace_location_of(s, client_id, path));
             let params = BufferClosedParams {
                 buffer_id,
-                next_buffer_id: next_buffer_for_client(s, client_id),
+                // Only as the fallback: a path wins when there is one.
+                next_buffer_id: next_path
+                    .is_none()
+                    .then(|| next_buffer_for_client(s, client_id))
+                    .flatten(),
+                next_path,
             };
             Some((
                 session.outbound.clone(),
@@ -9377,6 +10609,7 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
         }),
         conflicts: buffer_conflicts(s, buffer_id).len() as u32,
         operation: baseline.operation,
+        worktree: baseline.worktree,
     })
 }
 
@@ -14527,6 +15760,8 @@ fn workspace_candidates(
             crate::config::sort_names_by_recency(&mut names, &sessions);
         }
     }
+    // One row per workspace. There is no second tier: a workspace bound to a worktree is still
+    // that one workspace, on different roots (`docs/worktrees.md` §9.5).
     let mut out: Vec<picker_state::WorkspaceCandidate> = names
         .iter()
         .map(|name| picker_state::WorkspaceCandidate {
@@ -14913,6 +16148,9 @@ pub(crate) fn refresh_git_ref_pickers(s: &mut ServerState, kind: PickerKind) -> 
                 picker_state::PickerCandidates::GitBranches(v) => {
                     v.first().map(|c| c.repo_id.clone())
                 }
+                picker_state::PickerCandidates::Worktrees(v) => {
+                    v.first().map(|c| c.repo_id.clone())
+                }
                 _ => None,
             }
         };
@@ -14941,6 +16179,12 @@ pub(crate) fn refresh_git_ref_pickers(s: &mut ServerState, kind: PickerKind) -> 
                     })
                     .collect(),
             ),
+            // Removal is the one row action here that leaves the picker *open* — it has no confirm
+            // dialog to close it and no switch to follow — so without this the tree you just
+            // removed stays listed, and pressing the key again acts on a row that isn't there.
+            PickerKind::Worktrees => {
+                picker_state::PickerCandidates::Worktrees(build_worktree_candidates(&workdir))
+            }
             _ => continue,
         };
         let ServerState {
@@ -16245,6 +17489,24 @@ pub async fn picker_view(
         // Scroll / resume re-view: the empty placeholder `preserve_existing` keeps, like the
         // branch picker — re-resolving carries no `buffer_id` and would fail a scroll.
         PickerKind::GitStash => picker_state::PickerCandidates::GitStash(Vec::new()),
+        // Worktrees rebuild on a fresh open, like the branch and stash pickers: the list changes
+        // under every create and remove, and it is small. **Writable**, not readable: every row
+        // leads to a mutation of the repo or of where you are working, so a repo reached only
+        // through an open buffer must not be offered one.
+        PickerKind::Worktrees if params.reset == PickerReset::All => {
+            let workdir = {
+                let s = state.lock().await;
+                std::path::PathBuf::from(
+                    resolve_writable_repo(&s, client_id, None, params.buffer_id)?.repo_id,
+                )
+            };
+            picker_state::PickerCandidates::Worktrees(
+                tokio::task::spawn_blocking(move || build_worktree_candidates(&workdir))
+                    .await
+                    .unwrap_or_default(),
+            )
+        }
+        PickerKind::Worktrees => picker_state::PickerCandidates::Worktrees(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -16561,7 +17823,13 @@ pub async fn picker_view(
     // takes precedence over the client-passed `center_on`.
     let limit = params.limit.max(1);
     let mut effective_offset = params.offset;
-    let effective_center_on = cursor_resolved_item.or_else(|| params.center_on.clone());
+    let effective_center_on = cursor_resolved_item
+        .or_else(|| params.center_on.clone())
+        // Nothing to resolve from the cursor here, and the client can't name the row before it has
+        // seen it — so the server supplies it, and everything below (framing, the echo back, the
+        // client adopting it as its highlight) is the machinery that already exists.
+        .or_else(|| current_worktree_item(picker, params.reset))
+        .or_else(|| current_branch_item(picker, params.reset));
     if let Some(item) = effective_center_on.as_ref() {
         // Collapsible kinds: framing an item implies revealing it — expand its group before
         // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames
@@ -17532,6 +18800,7 @@ mod next_buffer_tests {
             crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
+                    base_paths: None,
                 paths: vec![root.clone()],
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root],
@@ -17612,6 +18881,18 @@ mod workspace_name_tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_the_reserved_ephemeral_name() {
+        // A workspace called `ephemeral` would give its worktree variants ids of the form
+        // `ephemeral/<x>`, which `is_ephemeral_workspace_id` reads as a throwaway context —
+        // silently costing a persisted workspace its session. Refused where the name is chosen.
+        assert!(validate_workspace_name("ephemeral").is_err());
+        assert!(validate_workspace_name("  ephemeral  ").is_err());
+        // Only the exact word: nothing else in that neighbourhood is reserved.
+        assert!(validate_workspace_name("ephemerals").is_ok());
+        assert!(validate_workspace_name("my-ephemeral").is_ok());
     }
 }
 
@@ -17852,6 +19133,7 @@ mod subscribe_snapshot_tests {
             crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
+                    base_paths: None,
                 paths: vec![root.clone()],
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],
@@ -17939,6 +19221,7 @@ mod subscribe_snapshot_tests {
             crate::state::WorkspaceEntry {
                 id: "p".to_string(),
                 name: Some("p".to_string()),
+                    base_paths: None,
                 paths: vec![root.clone()],
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],

@@ -148,6 +148,16 @@ pub struct GitBufferStatus {
     /// that has since faded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<GitRepoOperation>,
+    /// True when this file lives in a **linked worktree** rather than the repo's main checkout.
+    ///
+    /// Surfaced for the same reason `baseline` and `operation` are: the editor is showing a state
+    /// the branch name alone cannot express. Git allows one checkout per branch per family, so
+    /// `test1` reads identically whether it is the main tree or a worktree — and which one it is
+    /// decides where your edits land on disk, and whether `git worktree remove` can pull the floor
+    /// out. Clients mark the branch rather than adding a field: it is a property *of* that branch's
+    /// checkout, not a second fact beside it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktree: bool,
 }
 
 /// A multi-step git operation a repo is stopped part-way through — what `.git/MERGE_HEAD`,
@@ -1209,6 +1219,10 @@ pub enum GitOperationKind {
     Fetch,
     Push,
     Pull,
+    /// Creating a worktree. Not a network operation like the other three, but the same shape from
+    /// the user's side: a full checkout takes long enough to need saying so, and long enough to
+    /// want stopping.
+    WorktreeAdd,
 }
 
 impl GitOperationKind {
@@ -1218,6 +1232,7 @@ impl GitOperationKind {
             GitOperationKind::Fetch => "Fetching",
             GitOperationKind::Push => "Pushing",
             GitOperationKind::Pull => "Pulling",
+            GitOperationKind::WorktreeAdd => "Creating worktree",
         }
     }
 }
@@ -1457,6 +1472,224 @@ pub enum GitStashStatus {
     /// the picker was open.
     Gone,
     /// git refused (a conflicting apply, most often); `message` carries its text verbatim.
+    Refused,
+}
+
+// ---- git/worktree_* -----------------------------------------------------------------------------
+
+/// One worktree of a repo family, as the `Space g w` picker lists them.
+///
+/// Two identities, and they are not interchangeable (`docs/worktrees.md` §1): `path` is the
+/// [`RepoId`] — one worktree, its own HEAD and index — while `name` is the *admin id*, the
+/// directory under `.git/worktrees/`. The CLI is keyed by path and libgit2 by admin id, which is
+/// why both travel together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeRow {
+    /// libgit2 admin name. **Empty for the main worktree, which genuinely has none** — git's
+    /// porcelain output omits the attribute for it, and absence is how the main tree is identified
+    /// rather than a sentinel we invented.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Absolute path of the working directory — this row's [`RepoId`].
+    pub path: String,
+    /// Where this worktree's HEAD points. Its own, not the family's: that is the whole point of a
+    /// worktree. `None` for a `prunable` row, whose directory is gone and has no HEAD to read —
+    /// an absent head and a detached one are different facts and collapsing them would show a
+    /// deleted tree as if it were merely off-branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<GitHead>,
+    /// The main worktree (the one whose `.git` is a directory). Always exactly one, listed first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_main: bool,
+    /// The worktree the request resolved against — where the user is right now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_current: bool,
+    /// `git worktree lock` — deliberately pinned against pruning (a tree on removable media, say).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// The admin entry exists but the working directory doesn't: a tree deleted with `rm -rf`
+    /// instead of `git worktree remove`. Prunable, and the *only* condition under which we prune
+    /// (§4.8 — `git worktree prune` has no grace period, so it must never be run speculatively).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prunable: bool,
+}
+
+/// Create a worktree of a repo, checked out on `branch`.
+///
+/// **Shells out to `git worktree add`.** libgit2 can list and validate worktrees but must not
+/// create them: it can't produce a detached HEAD, has no `--force`, uses the admin name verbatim
+/// as both a directory and a branch name, and its error path rolls nothing back — see
+/// `docs/worktrees.md` §5 for the audit.
+///
+/// The worktree lands in the app-managed store, namespaced per repo family
+/// ([`crate::settings::AppSettings::worktree_store`]). Callers do not choose a path: the directory
+/// name is *derived* from the branch, sanitised and uniquified the way git derives its own admin
+/// ids, and **never flows back into the branch name** — conflating the two is the bug behind
+/// Zed #47208 and orca #13011 (§4.3).
+///
+/// A full checkout, so this is slow, streams progress and is cancellable through [`GitCancel`],
+/// exactly like fetch and push.
+pub struct GitWorktreeAdd;
+impl RpcMethod for GitWorktreeAdd {
+    const NAME: &'static str = "git/worktree_add";
+    type Params = GitWorktreeAddParams;
+    type Result = GitWorktreeAddResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitWorktreeAddParams {
+    /// Omit to let the server resolve it from the active buffer. Clients that got the repo from a
+    /// picker row should send the id the *row* carried — resolution runs off the active buffer,
+    /// which may have moved since the list was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Branch to check out in the new worktree — or, with `create_branch`, the branch to create.
+    /// A *branch* name, never a directory name: the directory is derived from it.
+    pub branch: String,
+    /// `git worktree add -b`: create `branch` at the current HEAD rather than checking out an
+    /// existing one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_branch: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeAddResult {
+    pub status: GitWorktreeAddStatus,
+    /// The new worktree, on success. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<GitWorktreeRow>,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// Workdir of the worktree that already has `branch` checked out, on
+    /// [`GitWorktreeAddStatus::AlreadyCheckedOut`]. The client's move is to go *there* rather than
+    /// report an error — the picker normally prevents this, so reaching it means the list was stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_out_in: Option<String>,
+    /// Gitignored files copied in from the source worktree (`.worktreeinclude`, §10.9). Reported
+    /// because a silent file copy is a surprise, and because "0" is the number to look at when a
+    /// build in the new tree fails.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub seeded_files: u32,
+    /// The repo has submodules. **A warning carried on success, not a refusal**: git's own
+    /// git-worktree(1) BUGS section still advises against multiple checkouts of a superproject and
+    /// the failure mode is silent commit loss (§4.9), but refusing outright would block a workflow
+    /// that does work if you know the hazard. Naming it is the honest middle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_submodules: bool,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How a [`GitWorktreeAdd`] resolved. Same discipline as [`GitCheckoutStatus`]: every discriminated
+/// variant is one the *server* determined from its own libgit2 reads, never from matching git's
+/// wording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeAddStatus {
+    #[default]
+    Created,
+    /// Git allows one checkout of a branch across the whole family. Detected before spawning, so
+    /// the client can offer to switch to the worktree that has it — which is what the research
+    /// found no other editor doing (magit #4294).
+    AlreadyCheckedOut,
+    /// The branch doesn't exist and `create_branch` wasn't set, or does exist and it was.
+    NoSuchBranch,
+    /// `create_branch` with a name git won't accept as a ref.
+    InvalidBranchName,
+    /// HEAD is unborn — there is no commit to base a worktree on. Asked before spawning; git's own
+    /// complaint here is about `HEAD` and reads like an internal error.
+    Unborn,
+    /// Git failed; `message` is its stderr.
+    Refused,
+    /// The user stopped it ([`GitCancel`]). A cancelled checkout can leave a partial directory,
+    /// which the server removes before reporting.
+    Cancelled,
+}
+
+/// Remove a worktree and its admin entry.
+///
+/// **Never `rm -rf`, and never a bare `git worktree prune`** — prune sets `expire = TIME_MAX`, so
+/// the three-month grace window people assume exists comes only from `git gc` passing `--expire`
+/// (§4.8). This runs `git worktree remove`, whose own refusal on a dirty or untracked-bearing tree
+/// is the guard rather than something reimplemented here.
+///
+/// Deleting the worktree never deletes its branch, so **committed work is never at risk**: the
+/// objects live in the shared common dir. The entire risk surface is uncommitted changes and
+/// untracked files, which is exactly what the refusal covers.
+pub struct GitWorktreeRemove;
+impl RpcMethod for GitWorktreeRemove {
+    const NAME: &'static str = "git/worktree_remove";
+    type Params = GitWorktreeRemoveParams;
+    type Result = GitWorktreeRemoveResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GitWorktreeRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    /// Admin name of the worktree to remove ([`GitWorktreeRow::name`]). Never a path: names are
+    /// stable and unique within a family, and a path can be stale by the time it is acted on.
+    pub name: String,
+    /// `git worktree remove --force`: discard uncommitted changes and untracked files. The client
+    /// is expected to reach this only by escalating from a [`GitWorktreeRemoveStatus::Dirty`]
+    /// refusal that told the user what they would lose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeRemoveResult {
+    pub status: GitWorktreeRemoveStatus,
+    /// git's own output when it refused, verbatim. Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// What a forced removal would discard, on [`GitWorktreeRemoveStatus::Dirty`]. Sent so the
+    /// confirmation can *show what is at risk* — a bare "are you sure?" only trains people to
+    /// confirm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_risk: Option<GitWorktreeAtRisk>,
+}
+
+/// The uncommitted work in a worktree that removing it would destroy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeAtRisk {
+    /// Tracked files with working-tree or staged changes.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub modified: u32,
+    /// Untracked, non-ignored files. Counted separately because they are the ones with no copy
+    /// anywhere — a modified tracked file at least has its HEAD version.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub untracked: u32,
+    /// A merge, rebase or cherry-pick is stopped mid-flight in this worktree.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub operation_in_progress: bool,
+}
+
+/// How a [`GitWorktreeRemove`] resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitWorktreeRemoveStatus {
+    #[default]
+    Removed,
+    /// No worktree of that admin name in this family.
+    NotFound,
+    /// The main worktree isn't removable — it's the repo. Distinguished because "you can't remove
+    /// the repository" is more useful than git's phrasing.
+    IsMain,
+    /// Uncommitted changes or untracked files would be lost; `at_risk` says what. Pre-flighted with
+    /// libgit2 rather than read out of git's refusal, which is what lets the client itemise it.
+    Dirty,
+    /// `git worktree lock` is holding it. Unlocking is a deliberate act, so this is never
+    /// escalated past automatically — not even by `force`.
+    Locked,
+    /// Git failed; `message` is its stderr.
     Refused,
 }
 

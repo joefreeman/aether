@@ -94,6 +94,18 @@ pub fn profile_state_dir() -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
+/// `<data>/aether` — durable, user-visible data that is **not** machine state.
+///
+/// Deliberately not under [`profile_state_dir`] and deliberately not per-profile. The only thing
+/// here is the worktree store, and both properties are load-bearing for it: a worktree holds
+/// uncommitted work, so nothing that sweeps state may reach it, and a worktree created under one
+/// profile is still a checkout of the same repo under another. See [`crate::worktree`].
+pub fn data_dir() -> anyhow::Result<PathBuf> {
+    let base = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not determine XDG base directories"))?;
+    Ok(base.data_dir().join("aether"))
+}
+
 /// Root directory for this profile's unsaved-buffer backups
 /// (`<state>/aether/profiles/<name>/backups/`). One subtree per workspace beneath it. See
 /// [`crate::backup`] and `docs/unsaved-persistence.md`.
@@ -697,6 +709,21 @@ pub struct WorkspaceSession {
     /// scratches and transient previews are omitted.
     #[serde(default)]
     pub buffers: Vec<SessionBuffer>,
+    /// **Worktree bindings**, present only on a *variant* (`docs/worktrees.md` §8.3). Maps a repo's
+    /// workdir to the admin name of the worktree this context uses for it; a repo with no entry
+    /// uses its main checkout, which is why the base workspace's own entry never carries this.
+    ///
+    /// It lives here rather than in the workspace's TOML deliberately. A binding is not something
+    /// the user types — it names an app-managed object and can be invalidated at any moment by a
+    /// `git worktree remove` in a terminal. As machine state a stale binding is dropped on load,
+    /// the way a dormant buffer whose file vanished already is; as user config it would be a broken
+    /// file to surface and explain. It also keeps generated entries out of the hand-editable TOML,
+    /// which `workspace/add_root` and `remove_root` rewrite wholesale.
+    ///
+    /// Keyed by **repo**, never by root or root index: a root added later in an already-bound repo
+    /// then follows automatically, and reordering roots can't silently re-point a binding.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worktrees: BTreeMap<PathBuf, String>,
 }
 
 /// One entry in a workspace's persisted buffer list. A scratch buffer has no path, so the list is a
@@ -741,8 +768,29 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
                 .with_context(|| format!("reading workspace sessions at {}", path.display()))
         }
     };
-    serde_json::from_str(&content)
-        .with_context(|| format!("parsing workspace sessions at {}", path.display()))
+    let mut sessions: WorkspaceSessions = serde_json::from_str(&content)
+        .with_context(|| format!("parsing workspace sessions at {}", path.display()))?;
+    drop_stale_variant_sessions(&mut sessions);
+    Ok(sessions)
+}
+
+/// Drop session entries left behind by worktree **variants** — the `<workspace>/<variant>` ids that
+/// existed while binding a repo spawned a second workspace instead of adjusting the one you were in.
+///
+/// Nothing creates such an id any more, and nothing can activate one: `workspace/activate` reads
+/// the name as a config file, and `aether/feature-auth.toml` has never existed. Left in place they
+/// would be invisible dead weight that a workspace named `aether/feature-auth` could never claim.
+///
+/// Dropped on load rather than migrated into their workspace's bindings: two of them could disagree
+/// about the same repo, so there is no answer to migrate *to* — and this is machine state, where
+/// the rule has always been that what no longer resolves is discarded rather than explained
+/// (`docs/worktrees.md` §8.2). The workspace itself is untouched, as is every worktree.
+fn drop_stale_variant_sessions(sessions: &mut WorkspaceSessions) {
+    sessions.workspaces.retain(|id, _| {
+        // The ephemeral namespace also carries a separator and is not a variant. It is never
+        // written to this file, but excluding it keeps the rule stated where it is applied.
+        !id.contains('/') || aether_protocol::is_ephemeral_workspace_id(id)
+    });
 }
 
 /// Write (or overwrite) the workspace-session file, creating the config directory if needed.
@@ -764,6 +812,8 @@ pub fn write_workspace_sessions_at(
 /// file. Called when a workspace is deleted so its session doesn't linger as an orphan.
 pub fn remove_workspace_session_at(path: &Path, name: &str) -> anyhow::Result<()> {
     let mut sessions = load_workspace_sessions_at(path)?;
+    // One entry, keyed by the workspace's own name — including its worktree bindings, which live on
+    // that entry. There is no second tier to cascade to.
     if sessions.workspaces.remove(name).is_some() {
         write_workspace_sessions_at(path, &sessions)?;
     }
@@ -1481,6 +1531,7 @@ mod tests {
         sessions.workspaces.insert(
             "work".into(),
             WorkspaceSession {
+                worktrees: Default::default(),
                 last_activated_at: 1000,
                 buffers: vec![
                     SessionBuffer::File {
@@ -1496,6 +1547,7 @@ mod tests {
         sessions.workspaces.insert(
             "dots".into(),
             WorkspaceSession {
+                worktrees: Default::default(),
                 last_activated_at: 2000,
                 buffers: vec![],
             },
@@ -1510,6 +1562,7 @@ mod tests {
         sessions.workspaces.insert(
             "beta".into(),
             WorkspaceSession {
+                worktrees: Default::default(),
                 last_activated_at: 100,
                 buffers: vec![],
             },
@@ -1517,6 +1570,7 @@ mod tests {
         sessions.workspaces.insert(
             "alpha".into(),
             WorkspaceSession {
+                worktrees: Default::default(),
                 last_activated_at: 200,
                 buffers: vec![],
             },
@@ -1965,5 +2019,71 @@ mod tests {
             language: None,
         };
         assert_eq!(infer_project_language(&project, &roots, &[declared]), None);
+    }
+
+    /// A bound workspace and a same-prefixed unrelated one, in the session file.
+    fn sessions_with_bindings() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut sessions = WorkspaceSessions::default();
+        sessions.workspaces.insert(
+            "p".into(),
+            WorkspaceSession {
+                worktrees: [(PathBuf::from("/src/p"), "feature".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..WorkspaceSession::default()
+            },
+        );
+        // A same-prefixed workspace, which must survive operations on `p`.
+        sessions
+            .workspaces
+            .insert("printer".into(), WorkspaceSession::default());
+        write_workspace_sessions_at(&path, &sessions).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn variant_session_entries_are_dropped_on_load() {
+        // Left over from when binding spawned a second workspace. Nothing can activate one —
+        // `aether/feature-auth.toml` has never existed — so they are dead weight, and there is no
+        // answer to migrate them *to* (two of them can disagree about the same repo).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"workspaces":{"p":{},"p/feature":{},"ephemeral/3":{}}}"#,
+        )
+        .unwrap();
+        let loaded = load_workspace_sessions_at(&path).unwrap();
+        assert!(loaded.workspaces.contains_key("p"));
+        assert!(!loaded.workspaces.contains_key("p/feature"));
+        // The ephemeral namespace carries a separator too and must not be read as a variant.
+        assert!(loaded.workspaces.contains_key("ephemeral/3"));
+    }
+
+    #[test]
+    fn removing_a_workspace_session_takes_its_bindings_and_nothing_else() {
+        let (_dir, path) = sessions_with_bindings();
+        remove_workspace_session_at(&path, "p").unwrap();
+        let after = load_workspace_sessions_at(&path).unwrap();
+        // The bindings live on the entry, so they go with it — no separate cleanup to forget.
+        assert!(!after.workspaces.contains_key("p"));
+        assert!(after.workspaces.contains_key("printer"));
+    }
+
+    #[test]
+    fn renaming_a_workspace_session_carries_its_bindings_across() {
+        let (_dir, path) = sessions_with_bindings();
+        rename_workspace_session_at(&path, "p", "renamed").unwrap();
+        let after = load_workspace_sessions_at(&path).unwrap();
+        let moved = after.workspaces.get("renamed").expect("the entry moved");
+        assert_eq!(
+            moved.worktrees.get(Path::new("/src/p")).map(String::as_str),
+            Some("feature"),
+            "a rename must not put the workspace back on its main checkout"
+        );
+        assert!(!after.workspaces.contains_key("p"));
+        assert!(after.workspaces.contains_key("printer"));
     }
 }

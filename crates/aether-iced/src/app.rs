@@ -4177,8 +4177,7 @@ impl App {
         // Persisted workspace → `[name] ` prefix. No workspace (boot/connecting/chooser) or an
         // ephemeral "(no workspace)" context → no prefix, so the bar shows just the file label
         // rather than a stray `[]` or a `[(no workspace)]` that reads like a real workspace.
-        if crate::labels::shows_workspace_chrome(&self.session.workspace) {
-            let prefix = format!("[{}] ", self.session.workspace);
+        if let Some(prefix) = crate::labels::status_workspace_prefix(&self.session.workspace) {
             used += prefix.chars().count();
             left = left.push(t(prefix, p.fg));
         }
@@ -4245,7 +4244,18 @@ impl App {
                 // Upstream divergence rides the branch label in the same colour: it annotates the
                 // branch rather than the file, unlike the change counts. Level (or no upstream at
                 // all) renders nothing, matching `git status`'s own silence in both cases.
-                let mut seg = format!("⎇  {branch}");
+                // `⧉` for a linked worktree, in the warning colour the branch picker already
+                // uses for a worktree-held branch — same glyph, same colour, same meaning. It
+                // replaces `⎇` rather than adding a mark: it is the same fact (which checkout you
+                // are in) at a finer grain. Warning rather than the metadata colour because a
+                // binding is persistent state you can forget you are in.
+                // One space after `⧉`, two after `⎇` — same cell width, different ink weight.
+                let (glyph, colour) = if gs.worktree {
+                    ("⧉ ", p.warning)
+                } else {
+                    ("⎇  ", p.accent_alt)
+                };
+                let mut seg = format!("{glyph}{branch}");
                 if let Some(up) = &gs.upstream {
                     if up.ahead > 0 {
                         seg.push_str(&format!(" ↑{}", up.ahead));
@@ -4260,7 +4270,7 @@ impl App {
                     seg.push_str(&format!(" ({})", op.label()));
                 }
                 used += seg.chars().count();
-                left = left.push(t(seg, p.accent_alt));
+                left = left.push(t(seg, colour));
             }
             for (sigil, color, un, st) in classes {
                 if un == 0 && st == 0 {
@@ -6378,7 +6388,12 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
-        ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
+        ConfirmKind::DeleteWorkspace { name } => {
+            format!(
+                "Delete workspace \"{}\"",
+                aether_client::labels::workspace_display(name)
+            )
+        }
         ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
         ConfirmKind::DropStash { message } => format!("Drop stash \"{message}\""),
         ConfirmKind::DeleteUnmergedBranch { name } => {

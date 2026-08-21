@@ -1283,12 +1283,12 @@ static LEADER: &[Binding] = &[
 /// leader — plain is the common gesture, Alt its variant. Largely magit's alphabet (`s` stage,
 /// `c` commit, `b` branch, `d` diff), which is free muscle memory for anyone arriving from it.
 ///
-/// Reserved for docs/git-phase-2.md's remaining stages, so the shape is decided once rather than
-/// key by key: `Alt-d` diff against a revision (`git/set_baseline`, already built server-side),
+/// Reserved for the remaining stages, so the shape is decided once rather than key by key. `w` was
+/// one of these and is now worktrees (docs/worktrees.md); still held: `Alt-d` diff against a
+/// revision (`git/set_baseline`, already built server-side),
 /// `f`/`Alt-f` fetch/pull,
 /// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord),
-/// `w`
-/// worktrees, `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
+/// `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
 /// reflog is a filter chip on the log picker rather than a key: it's the same rows over a
 /// different ref walk.
 #[rustfmt::skip]
@@ -1313,6 +1313,7 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
     bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
     bind!(LG, ch('z'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
+    bind!(LG, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Worktrees), "Git", "Worktrees"),
     bind!(LG, ch('z'), Exact(Mods::ALT), A::GitStashPush, "Git", "Stash working tree"),
 ];
 

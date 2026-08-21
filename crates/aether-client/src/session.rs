@@ -822,6 +822,10 @@ pub struct Session {
 
     pub workspace: String,
     pub workspace_paths: Vec<String>,
+    /// Set when a `workspace/changed` push lands: another client changed the shape of the workspace
+    /// we are standing in. Consumed by the `buffer/closed` pushes that follow it, so those read as
+    /// "the workspace moved" rather than "someone closed your file".
+    pub(crate) workspace_moved_under_us: bool,
     /// The active workspace's declared projects (`docs/projects.md`), mirrored from every
     /// `WorkspaceInfo` the server sends. Read by the settings overlay when it opens; kept on the
     /// session rather than fetched on demand so opening the overlay stays a keystroke, like roots.
@@ -884,6 +888,18 @@ pub struct Session {
     /// can render and toggle it: the fetching itself is the *server's* loop, and the client learns
     /// its results the ordinary way, through the refreshed ahead/behind counts in the status bar.
     pub git_auto_fetch: bool,
+    /// Where app-managed git worktrees are created (`docs/worktrees.md` §8.4). Held only so a
+    /// `settings/set` for some *other* key round-trips it unchanged — the client never reads it,
+    /// and there is no overlay row for it (a path isn't a toggle or a stepped size).
+    pub worktree_store: String,
+    /// The repo a `git/worktree_add` is running for, when that create is the first half of a bind
+    /// (`docs/worktrees.md` §9.1 rows 3 and 4: selecting a branch means "work on it here", which is
+    /// create *then* bind).
+    ///
+    /// Held across the round trip because the admin name to bind is derived server-side and doesn't
+    /// exist until the create returns. Cleared on every outcome, so a refusal can't leave a later
+    /// unrelated create binding something.
+    pub pending_worktree_bind: Option<String>,
     /// The long-running git operation in flight, if any, with the repo it belongs to — pushed by
     /// the server (`git/operation_changed`) and rendered as the status bar's activity indicator.
     /// The repo id rides along because it's what `Space g x` cancels; without it the client would
@@ -1320,6 +1336,7 @@ impl Session {
             pending_rpcs: std::collections::HashMap::new(),
             next_token: 0,
             workspace: workspace.name,
+            workspace_moved_under_us: false,
             workspace_paths: workspace.paths,
             workspace_projects: workspace.projects,
             tether: None,
@@ -1342,6 +1359,8 @@ impl Session {
             theme: aether_protocol::settings::default_theme(),
             hints_enabled: true,
             git_auto_fetch: false,
+            worktree_store: String::new(),
+            pending_worktree_bind: None,
             git_operation: None,
             diff_view: false,
             read: None,

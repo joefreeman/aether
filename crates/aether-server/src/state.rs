@@ -54,6 +54,9 @@ pub struct ServerState {
     /// timeout. Only **user-initiated** operations are registered: the periodic fetcher runs
     /// unannounced and uncancellable, which is what keeps it out of the way.
     pub git_operations: HashMap<PathBuf, crate::git_cli::CancelHandle>,
+    /// Serialises worktree creation and removal per **repo family**, keyed by canonicalized
+    /// common dir. See [`Self::worktree_lock`].
+    pub worktree_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
     /// Repos currently diffed against a revision other than HEAD (`git/set_baseline`), keyed by
     /// canonicalized workdir. In memory only: this is an inspection mode ("what have I changed
     /// since I branched?"), not a preference — coming back to a restored session still diffing
@@ -221,6 +224,15 @@ pub struct ServerState {
     /// unset so they never write backups to disk, and the idle reaper keeps its dirty-buffer guard
     /// (with backups off, reaping a dirty buffer would lose work). See `docs/unsaved-persistence.md`.
     pub backups_path: Option<PathBuf>,
+    /// Where app-managed git worktrees are created ([`crate::worktree::store_root`]). Same
+    /// convention as [`Self::sessions_path`]: `Some` in the real server, `None` in tests and
+    /// embeddings — except that here `None` means *fall back to the default location* rather than
+    /// disable the feature, because a worktree with nowhere to go is not a worktree.
+    ///
+    /// It is a field rather than a plain call to the default so tests can point it at a tempdir.
+    /// The alternative — an environment variable set per test — races: `set_var` is process-global
+    /// and the suite runs in parallel.
+    pub worktree_store: Option<PathBuf>,
     /// Where to read/write the hint learning state ([`crate::config::HintsState`],
     /// docs/hints.md). Same convention as [`Self::sessions_path`]: `Some` in the real server (and
     /// in tests that point it at a tempfile); `None` disables persistence — `hints/record` still
@@ -398,6 +410,14 @@ pub struct WorkspaceEntry {
     /// The persisted workspace name, or `None` for an ephemeral workspace. `Some` ⇔ a `<name>.toml`
     /// exists on disk ⇔ this workspace survives losing its last buffer.
     pub name: Option<String>,
+    /// The workspace's **configured** roots — what [`Self::paths`] is a worktree remapping *of*.
+    /// `None` when no repo is bound, in which case `paths` already are them.
+    ///
+    /// Kept here rather than re-read from the TOML on every rebind for two reasons: rebinding is
+    /// interactive and a config read is disk I/O in the middle of it, and an in-memory workspace
+    /// (tests, embeddings) has no TOML to read at all. It is also the only copy of the pre-remap
+    /// shape once `paths` has been materialised.
+    pub base_paths: Option<Vec<PathBuf>>,
     /// Canonicalized workspace paths. Each is either a file or a directory. Read from the config for
     /// a persisted workspace; for an ephemeral one they're synthesized from the files it hosts (one
     /// per directory — see [`ServerState::adopt_ephemeral_root`]), which is bookkeeping for the
@@ -515,6 +535,7 @@ impl ServerState {
             watcher: None,
             git_suppressed: std::collections::HashSet::new(),
             git_operations: HashMap::new(),
+            worktree_locks: HashMap::new(),
             git_baseline_revs: crate::git::BaselineRevs::new(),
             buffers: HashMap::new(),
             documents: HashMap::new(),
@@ -555,6 +576,7 @@ impl ServerState {
                 .unwrap_or(0),
             sessions_path: None,
             backups_path: None,
+            worktree_store: None,
             hints_path: None,
             hints: crate::config::HintsState::default(),
             hints_dirty: false,
@@ -686,6 +708,38 @@ impl ServerState {
     /// The display number for a *new* ephemeral workspace: the lowest positive integer not in use by
     /// another live ephemeral workspace. Mirrors [`Self::next_scratch_number`] — numbers stay small
     /// and a freed one is reused once its workspace is pruned — so the picker shows `(workspace 1)`,
+    /// The mutual-exclusion lock for worktree creation and removal in one repo **family**.
+    ///
+    /// `git worktree add` rewrites `.git/config`, which lives in the *common* dir and is guarded by
+    /// git's own lockfile: two concurrent adds in one family leave one dead with `could not lock
+    /// config file` (`docs/worktrees.md` §4.4). [`ServerState::git_operations`] is the wrong tool —
+    /// it is a *cancellation registry*, not a lock, and it is keyed by workdir, which every
+    /// worktree of a family has a different one of while sharing the config being written.
+    ///
+    /// The value is a mutex rather than a busy flag so a second caller **waits** instead of being
+    /// refused. Two agents asking for a worktree at the same moment is the expected case, not an
+    /// error the user should have to understand and retry.
+    ///
+    /// Take the `Arc` under the state lock, drop the state guard, *then* await the mutex — holding
+    /// the whole server's state across a checkout would stall every other client:
+    ///
+    /// ```ignore
+    /// let lock = state.lock().await.worktree_lock(&common_dir);
+    /// let _guard = lock.lock().await;
+    /// ```
+    ///
+    /// Entries are never pruned: one `PathBuf` plus an `Arc` per repo family the process has
+    /// touched, in a daemon that idle-reaps anyway.
+    pub fn worktree_lock(&mut self, common_dir: &Path) -> Arc<Mutex<()>> {
+        self.worktree_locks
+            .entry(common_dir.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// The display number for a *new* ephemeral workspace: the lowest positive integer not in use by
+    /// another live ephemeral workspace. Mirrors [`Self::next_scratch_number`] — numbers stay small
+    /// and a freed one is reused once its workspace is pruned — so the picker shows `(workspace 1)`,
     /// `(workspace 2)`, … rather than an ever-climbing counter. Because ephemeral workspaces are pruned
     /// the moment they empty, the lowest-free number is always unique among the live set, so it
     /// doubles as the id suffix.
@@ -723,6 +777,7 @@ impl ServerState {
             WorkspaceEntry {
                 id: id.clone(),
                 name: None,
+                    base_paths: None,
                 paths: Vec::new(),
                 workspace_index,
                 mru_buffers: VecDeque::new(),
@@ -1140,9 +1195,10 @@ impl ServerState {
     /// on-disk config. A no-op for the workspace entry when it was never loaded; still closes any
     /// of its buffers that exist.
     pub fn delete_workspace(&mut self, name: &str) -> Vec<BufferId> {
-        let closed = self.buffers_in_workspace(name);
-        for &id in &closed {
-            self.close_buffer(id);
+        let mut closed = Vec::new();
+        for buffer in self.buffers_in_workspace(name) {
+            self.close_buffer(buffer);
+            closed.push(buffer);
         }
         self.workspaces.remove(name);
         closed
@@ -1349,6 +1405,36 @@ impl ServerState {
                 .dormant_buffers
                 .retain(|d| d.path() != Some(canonical));
         }
+    }
+
+    /// Restore the dormant list's invariant in `workspace_name`: **at most one entry per path, and
+    /// none for a path that already has a live buffer.**
+    ///
+    /// `promote_dormant` keeps this at the one moment a path is materialised, which is enough while
+    /// entries only ever arrive one at a time. A worktree rebind adds a whole set at once *and*
+    /// rewrites the paths of the entries already there, so two of them can land on the same file —
+    /// and a live buffer opened by another client can appear beside one. Both show up as a
+    /// duplicated row in the buffers picker.
+    ///
+    /// Enforced here rather than trusted at each call site: the rebind has several routes in
+    /// (remap, extend, another client's open racing the landing), and an invariant that has to hold
+    /// after all of them is cheaper to restore once than to prove at each.
+    pub fn dedupe_dormant(&mut self, workspace_name: &str) {
+        let live: std::collections::HashSet<PathBuf> = self
+            .buffers
+            .keys()
+            .filter(|id| self.buffer_workspaces.get(id).map(String::as_str) == Some(workspace_name))
+            .filter_map(|id| self.try_doc_of(*id).and_then(|d| d.canonical_path.clone()))
+            .collect();
+        let Some(workspace) = self.workspaces.get_mut(workspace_name) else {
+            return;
+        };
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        workspace.dormant_buffers.retain(|d| match d.path() {
+            // A scratch has no path to collide on; it is identified by its number.
+            None => true,
+            Some(path) => !live.contains(path) && seen.insert(path.to_path_buf()),
+        });
     }
 
     /// Remove and return the dormant buffer with `id` in `workspace_name`, if any. Used by
@@ -2235,10 +2321,50 @@ impl Viewport {
 mod workspace_state_tests {
     use super::*;
 
+    /// Deleting a workspace must not take a *same-prefixed* one with it: `p` and `printer` are
+    /// unrelated workspaces, and a prefix match would have destroyed the second. (Worth keeping
+    /// after the variant ids that motivated the prefix check were removed — the hazard was real.)
+    #[test]
+    fn deleting_a_workspace_leaves_a_same_prefixed_one_alone() {
+        let mut s = ServerState::new();
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        s.workspaces.insert(
+            "printer".into(),
+            workspace_entry("printer", vec![PathBuf::from("/printer")]),
+        );
+
+        s.delete_workspace("p");
+        assert!(!s.workspaces.contains_key("p"));
+        assert!(s.workspaces.contains_key("printer"));
+    }
+
+    #[test]
+    fn renaming_a_workspace_carries_its_buffers_and_bindings() {
+        let mut s = ServerState::new();
+        let mut bound = workspace_entry("p", vec![PathBuf::from("/store/p/feature")]);
+        bound.base_paths = Some(vec![PathBuf::from("/p")]);
+        s.workspaces.insert("p".into(), bound);
+        s.buffer_workspaces.insert(7, "p".into());
+
+        s.rename_workspace("p", "renamed").expect("renamed");
+        let moved = s.workspaces.get("renamed").expect("the entry moved");
+        assert_eq!(moved.name.as_deref(), Some("renamed"));
+        // The remapped shape rides on the entry, so a rename can't strand it on the old key —
+        // which is the whole reason bindings no longer need a cascade of their own.
+        assert_eq!(moved.base_paths.as_deref(), Some(&[PathBuf::from("/p")][..]));
+        assert!(!s.workspaces.contains_key("p"));
+        assert_eq!(
+            s.buffer_workspaces.get(&7).map(String::as_str),
+            Some("renamed")
+        );
+    }
+
     fn workspace_entry(name: &str, paths: Vec<PathBuf>) -> WorkspaceEntry {
         WorkspaceEntry {
             id: name.to_string(),
             name: Some(name.to_string()),
+            base_paths: None,
             paths: paths.clone(),
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
             mru_buffers: VecDeque::new(),
@@ -2681,6 +2807,7 @@ mod workspace_state_tests {
         sessions.workspaces.insert(
             "p".into(),
             crate::config::WorkspaceSession {
+                worktrees: Default::default(),
                 last_activated_at: 1,
                 buffers: vec![crate::config::SessionBuffer::File {
                     path: PathBuf::from("/p/a.rs"),

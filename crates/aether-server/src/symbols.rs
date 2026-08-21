@@ -339,15 +339,24 @@ pub async fn merge_results(
 pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager::LspServerKey) {
     let pending: Vec<(ClientId, u64, String, SymbolServer, Vec<PathBuf>)> = {
         let mut s = state.lock().await;
-        let Some(server) = s
+        // A server is keyed by `(root, language)` and can serve several contexts, so the ones to
+        // re-query are all of them — each with its own roots and its own open pickers.
+        let owners: Vec<String> = s
             .lsp
-            .symbol_servers(&key.workspace)
-            .into_iter()
-            .find(|srv| srv.root == key.root && srv.language == key.language)
-        else {
+            .servers
+            .get(key)
+            .map(|h| h.workspaces.iter().cloned().collect())
+            .unwrap_or_default();
+        let Some((workspace_id, server)) = owners.iter().find_map(|id| {
+            s.lsp
+                .symbol_servers(id)
+                .into_iter()
+                .find(|srv| srv.root == key.root && srv.language == key.language)
+                .map(|srv| (id.clone(), srv))
+        }) else {
             return; // not pinned, or doesn't do workspace symbols
         };
-        let Some(roots) = s.workspaces.get(&key.workspace).map(|w| w.paths.clone()) else {
+        let Some(roots) = s.workspaces.get(&workspace_id).map(|w| w.paths.clone()) else {
             return;
         };
         let pending: Vec<_> = s
@@ -360,7 +369,7 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
                     && s.clients
                         .get(client_id)
                         .and_then(|c| c.active_workspace.as_deref())
-                        == Some(key.workspace.as_str())
+                        == Some(workspace_id.as_str())
                     // Respect the picker's Dir chips: a scoped-out server was pruned from the
                     // fan-out at query time, and readiness doesn't change what it can
                     // contribute. (If the scope is later removed, `symbol_fanned` won't cover

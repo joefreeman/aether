@@ -237,6 +237,7 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitLog => "Search history…",
         PickerKind::GitLogFile => "Search this file's history…",
         PickerKind::GitStash => "Find stash…",
+        PickerKind::Worktrees => "Switch worktree…",
         PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
@@ -491,24 +492,29 @@ pub fn overlay<'a>(
                         .on_exit(PickerMsg::Unhovered(abs)),
                 );
             }
-            DisplayRow::Create { abs, name, is_dir } => {
+            DisplayRow::Create { abs, .. } => {
                 let selected = abs == state.selected;
-                let label = if state.kind == aether_protocol::picker::PickerKind::Workspaces {
-                    format!("+ Create workspace {name}")
-                } else if is_dir {
-                    format!("+ Create directory {name}/")
+                // Wording comes from the core, which owns the decision to offer the row at all,
+                // and so does whether to reserve the leading status cell — only the Explorer's
+                // entries have one, and the create row has to column-align with the rows above it.
+                let label = state.create_row_label().unwrap_or_default();
+                let text_el = text(label)
+                    .size(ui.body())
+                    .font(iced::Font {
+                        style: iced::font::Style::Italic,
+                        ..iced::Font::DEFAULT
+                    })
+                    .color(p.accent);
+                let inner: iced::Element<'_, PickerMsg> = if state.create_row_reserves_status_cell()
+                {
+                    row![dot_cell(None, ui), text_el]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center)
+                        .into()
                 } else {
-                    format!("+ Create file {name}")
+                    text_el.into()
                 };
-                let row_el = container(
-                    text(label)
-                        .size(ui.body())
-                        .font(iced::Font {
-                            style: iced::font::Style::Italic,
-                            ..iced::Font::DEFAULT
-                        })
-                        .color(p.accent),
-                )
+                let row_el = container(inner)
                 .width(Length::Fill)
                 .height(ui.row_h())
                 .padding([3, 12])
@@ -1594,6 +1600,44 @@ fn render_item<'a>(
             .align_y(iced::Alignment::Center)
             .into()
         }
+        PickerItem::Worktree {
+            label,
+            branch,
+            prunable,
+            locked,
+            match_indices,
+            ..
+        } => {
+            // `feature-auth   feature/auth`. The admin name leads because it is what removal is
+            // keyed on; the branch trails because "the same tree on another branch" is what you are
+            // usually choosing between. No per-row marker: the `Worktrees` / `Branches` headers say
+            // which kind a row is, and the current worktree is the one highlighted on open.
+            let mut m = String::new();
+            if !branch.is_empty() && branch != label {
+                m.push_str(branch);
+            }
+            // Stated, not decorated: both change what the row can do.
+            let mut flags = String::new();
+            if *locked {
+                flags.push_str("locked");
+            }
+            if *prunable {
+                flags.push_str(if flags.is_empty() { "missing" } else { "  missing" });
+            }
+            row![
+                highlighted(label, match_indices, p.fg_bright, SANS, hovered, ui, p),
+                iced::widget::Space::new().width(Length::Fill),
+                meta(m, ui, p),
+                text(flags)
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(p.warning)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
         PickerItem::GitStash {
             index,
             message,
@@ -1662,7 +1706,6 @@ fn render_item<'a>(
         }
         PickerItem::GitBranch {
             name,
-            is_head,
             subject,
             timestamp,
             ahead,
@@ -1671,8 +1714,8 @@ fn render_item<'a>(
             match_indices,
             ..
         } => {
-            // Accent dot on the current branch (the LSP/buffer rows' dot cell, so the pickers line
-            // up), name, then dim metadata: tip subject, relative date, ahead/behind.
+            // Name, the `⧉` mark if another checkout holds it, then dim metadata (tip subject,
+            // relative date) filling the middle, and the divergence counts last at the right edge.
             let mut m = subject.clone();
             if *timestamp > 0 {
                 if !m.is_empty() {
@@ -1680,26 +1723,54 @@ fn render_item<'a>(
                 }
                 m.push_str(&crate::app::time_ago(*timestamp));
             }
-            if *ahead > 0 || *behind > 0 {
-                m.push_str(&format!("  ↑{ahead} ↓{behind}"));
+            // Each arrow only when it has a count, matching the status bar and `git status`.
+            let mut arrows = String::new();
+            if *ahead > 0 {
+                arrows.push_str(&format!("↑{ahead}"));
             }
-            let mut r = row![
-                dot_cell(is_head.then_some(p.accent), ui),
-                highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
-                iced::widget::Space::new().width(Length::Fill),
-                meta(m, ui, p),
-            ]
+            if *behind > 0 {
+                if !arrows.is_empty() {
+                    arrows.push(' ');
+                }
+                arrows.push_str(&format!("↓{behind}"));
+            }
+            // No dot cell: "which one am I on" is the initial selection (`current_branch_item`),
+            // as in every other picker, not a column every row pays for.
+            let mut r = row![highlighted(
+                name,
+                match_indices,
+                p.fg_bright,
+                SANS,
+                hovered,
+                ui,
+                p
+            )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            // Not decoration: git refuses the same branch in two worktrees, so this is the row's
-            // "you cannot check this out" tell and it gets the warning colour, not the dim one.
-            if let Some(held) = checked_out_in {
-                let leaf = held.rsplit('/').next().unwrap_or(held);
+            // Directly after the name, because it is a property of the *branch*. Not decoration:
+            // git refuses the same branch in two checkouts, so this is the row's "you cannot check
+            // this out" tell, and it gets the warning colour rather than the dim one.
+            if checked_out_in.is_some() {
                 r = r.push(
-                    text(format!("⧉ {leaf}"))
+                    text(aether_client::labels::WORKTREE_HELD_MARK)
                         .size(ui.small())
                         .font(SANS)
                         .color(p.warning),
+                );
+            }
+            // The commit line sits directly after the name, left-aligned — it reads as a
+            // continuation of the row, not as trailing metadata, and it matches the terminal
+            // client. Only the divergence counts are pushed to the right edge.
+            r = r.push(meta(m, ui, p));
+            r = r.push(iced::widget::Space::new().width(Length::Fill));
+            if !arrows.is_empty() {
+                // The accent the status bar gives divergence: it annotates the branch, not the
+                // commit line, so it doesn't read as more dim metadata.
+                r = r.push(
+                    text(arrows)
+                        .size(ui.small())
+                        .font(SANS)
+                        .color(p.accent_alt),
                 );
             }
             r.into()

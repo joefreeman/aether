@@ -209,6 +209,26 @@ pub struct BufferClosedParams {
     /// The buffer the client should switch to, or `None` to open a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_buffer_id: Option<BufferId>,
+    /// Where to switch to, as a **path** — preferred over `next_buffer_id` when present.
+    ///
+    /// A worktree rebind knows which file replaces which, but it can only name the replacement by
+    /// reserving a *dormant* id, and a dormant id is not stable: the client that asked for the
+    /// rebind activates immediately afterwards, and if its landing buffer is that same file it
+    /// materialises the entry under a **different** id. Whoever opens second then asks for an id
+    /// that no longer exists.
+    ///
+    /// A path has no such race. `buffer/open` on a path already open returns the existing buffer,
+    /// so both clients converge on one buffer whichever order they arrive in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_path: Option<BufferLocation>,
+}
+
+/// A file inside the workspace, as a root index plus the path relative to that root — the shape
+/// `buffer/open` takes, so a client can pass it straight back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferLocation {
+    pub path_index: u32,
+    pub relative_path: String,
 }
 
 // ---- buffer/reload ------------------------------------------------------------------------------

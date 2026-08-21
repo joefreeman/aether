@@ -109,6 +109,7 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   git_log: "Search history…",
   git_log_file: "Search this file\u2019s history…",
   git_stash: "Find stash…",
+  worktrees: "Switch worktree…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -342,7 +343,9 @@ function confirmMessage(c: ConfirmKind): string {
     case "remove_project":
       return `Stop pinning project "${c.path}"?`;
     case "delete_workspace":
-      return `Delete workspace "${c.name}"?`;
+      // A variant isn't a workspace on disk — discarding it drops its worktree bindings and leaves
+      // both the worktree and the base workspace alone. Mirrors the native shells' wording.
+      return `Delete workspace "${workspaceDisplay(c.name)}"?`;
     case "delete_branch":
       return `Delete branch "${c.name}"?`;
     case "delete_unmerged_branch":
@@ -387,7 +390,14 @@ interface PickerView {
   completion: string | null;
   /** The Explorer's synthetic "+ Create …" affordance (view.rs `create`); null when not offered.
    *  `abs` is its selection index, one past the last match. */
-  create: { name: string; is_dir: boolean; abs: number } | null;
+  create: {
+    name: string;
+    is_dir: boolean;
+    label: string;
+    abs: number;
+    /** Reserve the leading status cell, so the row aligns with entries that have one. */
+    bullet: boolean;
+  } | null;
   chips: { label: string; flag: boolean }[];
   chip_selected: number | null;
   chip_editor: ChipEditorView | null;
@@ -425,6 +435,9 @@ interface RowDesc {
   /** Coloured right-aligned meta (e.g. a git change's `+A -R` summary), rendered as separate spans
    *  in place of the plain `meta` text. Mutually exclusive with `meta`. */
   metaParts?: { text: string; cls: string }[];
+  /** A small coloured mark between the primary and the suffix — branch rows' `⧉`, which is the
+   *  row's "you can't check this out" tell and must not read as dim metadata. */
+  mark?: { text: string; cls: string };
   prefix?: string;
   prefixClass?: string;
   /** Fuzzy-match offsets into `prefix` (code points), bolded like `matches`. */
@@ -648,6 +661,19 @@ function showsWorkspaceChrome(workspace: string): boolean {
   return workspace.length > 0 && !workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
 }
 
+/** The mark a branch row carries when another checkout in the family already has this branch —
+ *  mirrors `labels::WORKTREE_HELD_MARK`. Glyph only: which checkout it is belongs in the refusal,
+ *  which has room for a sentence. */
+const WORKTREE_HELD_MARK = "⧉";
+
+/** A workspace id as a human reads it. Mirrors the native clients' `labels::workspace_display`:
+ *  an ephemeral context is `(workspace N)`, anything else is its own name. */
+function workspaceDisplay(workspace: string): string {
+  return workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX)
+    ? `(workspace ${workspace.slice(EPHEMERAL_WORKSPACE_PREFIX.length)})`
+    : workspace;
+}
+
 /** The explorer breadcrumb: the listed directory shown *within* its workspace root (ported from the
  *  old client's `explorerDisplayPath`). Empty at a single root's top; `root: rel/` under multi-root.
  *  (Deferred polish: the disambiguated root label + path-budget elision — uses the basename here.) */
@@ -839,37 +865,56 @@ function describePickerItem(
       // italic "(workspace N)" (mirrors the native clients — `labels::workspace_display`, slanted like
       // a transient buffer); its id isn't a meaningful match haystack, so drop the highlight indices.
       const ephemeral = item.name.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
-      const n = item.name.slice(EPHEMERAL_WORKSPACE_PREFIX.length);
       return {
-        primary: ephemeral ? `(workspace ${n})` : item.name,
+        primary: workspaceDisplay(item.name),
         matches: ephemeral ? [] : item.match_indices,
         italic: ephemeral,
         dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
       };
     }
     case "git_branch": {
-      // Accent dot on the current branch (the shared bullet cell, so the pickers stay aligned),
-      // then dim metadata: tip subject, relative date, ahead/behind. The worktree marker is NOT
-      // decoration — git refuses the same branch in two worktrees, so it's the row's "you can't
-      // check this out" tell and gets the warning colour.
-      const parts: { text: string; cls: string }[] = [];
+      // Name, then the `⧉` mark when another checkout holds this branch — directly after the name,
+      // because it is a property of the branch rather than of the commit line. NOT decoration: git
+      // refuses the same branch in two checkouts, so it is the row's "you can't check this out"
+      // tell and gets the warning colour. Then dim metadata (tip subject, relative date) and the
+      // divergence counts last, in the accent the status bar gives them.
+      // The commit line sits directly after the name, left-aligned (`suffix`, which flows with
+      // the row) — it reads as a continuation of the row rather than trailing metadata, matching
+      // the terminal client. Only the divergence counts go in the right-aligned meta group.
       const dim: string[] = [];
       if (item.subject) dim.push(item.subject);
       if (item.timestamp) dim.push(timeAgo(item.timestamp));
-      if (dim.length) parts.push({ text: dim.join(" · "), cls: "picker-meta-dim" });
-      if (item.ahead || item.behind) {
-        parts.push({ text: `↑${item.ahead ?? 0} ↓${item.behind ?? 0}`, cls: "picker-meta-dim" });
-      }
-      if (item.checked_out_in) {
-        const leaf = item.checked_out_in.split("/").filter(Boolean).pop() ?? item.checked_out_in;
-        parts.push({ text: `⧉ ${leaf}`, cls: "picker-meta-warn" });
-      }
+      // Each arrow only when it has a count, matching the status bar and `git status`.
+      const arrows: string[] = [];
+      if (item.ahead) arrows.push(`↑${item.ahead}`);
+      if (item.behind) arrows.push(`↓${item.behind}`);
+      const parts: { text: string; cls: string }[] = [];
+      if (arrows.length) parts.push({ text: arrows.join(" "), cls: "picker-meta-accent" });
       return {
         primary: item.name,
         matches: item.match_indices,
+        mark: item.checked_out_in
+          ? { text: WORKTREE_HELD_MARK, cls: "picker-meta-warn" }
+          : undefined,
+        suffix: dim.join(" · "),
         metaParts: parts,
-        bullet: true,
-        bulletStatus: item.is_head ? "head" : undefined,
+        // No bullet cell: "which one am I on" is the initial selection, as in the worktree,
+        // workspace and buffer pickers, not a column every row pays for.
+      };
+    }
+    case "worktree": {
+      // `feature-auth   feature/auth`. The admin name leads (it is what removal is keyed on), the
+      // branch trails dim. No per-row marker: the `Worktrees` / `Branches` headers say which kind a
+      // row is, and the current worktree is the one highlighted on open.
+      const parts: { text: string; cls: string }[] = [];
+      const branch = item.branch ?? "";
+      if (branch && branch !== item.label) parts.push({ text: branch, cls: "picker-meta-dim" });
+      if (item.locked) parts.push({ text: "locked", cls: "picker-meta-warn" });
+      if (item.prunable) parts.push({ text: "missing", cls: "picker-meta-warn" });
+      return {
+        primary: item.label,
+        matches: item.match_indices,
+        metaParts: parts,
       };
     }
     case "git_stash": {
@@ -4325,17 +4370,21 @@ export class Shell {
       e.preventDefault(); // keep focus on the query input; create via the core
       if (this.session) this.runEffects(this.session.picker_click(c.abs) as CoreEffect[]);
     });
-    const bullet = document.createElement("span");
-    bullet.className = "picker-bullet"; // empty cell, keeps names column-aligned with entries
-    row.append(bullet);
+    // Reserve the leading status cell only for kinds whose entries have one (the Explorer's git
+    // dot). Doing it unconditionally indented the workspace, branch and worktree create rows two
+    // columns past every row above them.
+    if (c.bullet) {
+      const bullet = document.createElement("span");
+      bullet.className = "picker-bullet"; // empty cell, keeps names column-aligned with entries
+      row.append(bullet);
+    }
     const main = document.createElement("span");
-    main.className = "picker-main picker-italic";
-    main.textContent =
-      p.kind === "workspaces"
-        ? `+ Create workspace ${c.name}`
-        : c.is_dir
-          ? `+ Create directory ${c.name}/`
-          : `+ Create file ${c.name}`;
+    // The colour rides this class, not the row's `create` class: that one is added only on the
+    // virtual-scroll path (it positions the row absolutely), so the empty-list path rendered the
+    // same row uncoloured.
+    main.className = "picker-main picker-italic picker-create-main";
+    // Wording comes from the core, which owns the decision to offer the row at all.
+    main.textContent = c.label;
     row.append(main);
     return row;
   }
@@ -4546,6 +4595,12 @@ export class Shell {
         (d.italic ? " picker-italic" : "");
       main.append(matched(d.primary, d.matches));
       row.append(main);
+      if (d.mark) {
+        const m = document.createElement("span");
+        m.className = `picker-suffix ${d.mark.cls}`;
+        m.textContent = d.mark.text;
+        row.append(m);
+      }
       if (d.suffix) {
         const s = document.createElement("span");
         s.className = "picker-suffix";
@@ -4579,8 +4634,8 @@ export class Shell {
     const spacer = document.createElement("div");
     spacer.className = "picker-spacer";
     spacer.append(win);
-    // The Explorer's "+ Create …" row trails the final match (non-grep), absolutely placed within the
-    // spacer at display-row `total_matches` so it follows the last item.
+    // The "+ Create …" row trails the final display row, absolutely placed within the spacer so it
+    // follows the last item (and, for a grouped kind, the last group's rows).
     let createRow: HTMLElement | null = null;
     if (p.create && p.offset + p.items.length >= p.total_matches) {
       createRow = this.makePickerCreateRow(p);
@@ -4610,7 +4665,12 @@ export class Shell {
       const gapsAbove = grouped ? Math.max(0, p.window_base - p.offset) : 0;
       win.style.top = `${p.window_base * this.pickerRowH + gapsAbove * GROUP_GAP_PX}px`;
       spacer.style.height = `${(p.total_display_rows + (createRow ? 1 : 0)) * this.pickerRowH + totalGaps * GROUP_GAP_PX}px`;
-      if (createRow) createRow.style.top = `${p.total_matches * this.pickerRowH}px`;
+      // Below *every* display row, not just the matches: for a grouped kind the headers are rows
+      // too, so `total_matches` would place the create row on top of the last items. Worktrees is
+      // the first kind that is both grouped and creatable, which is what surfaced this.
+      if (createRow) {
+        createRow.style.top = `${p.total_display_rows * this.pickerRowH + totalGaps * GROUP_GAP_PX}px`;
+      }
       list.style.setProperty("--picker-row-h", `${this.pickerRowH}px`);
     };
     applyGeometry();
@@ -4679,7 +4739,7 @@ export class Shell {
       dot.style.color = color;
       fileGroup.append(dot);
     }
-    const proj = showsWorkspaceChrome(v.workspace) ? `[${v.workspace}] ` : "";
+    const proj = showsWorkspaceChrome(v.workspace) ? `[${workspaceDisplay(v.workspace)}] ` : "";
     fileGroup.append(proj);
     // Char widths of everything with a fixed size, accumulated as we build: the breadcrumb at the
     // end of the left segment gets whatever's left, and there's no column grid to ask. Approximate
@@ -4718,11 +4778,18 @@ export class Shell {
       gitGroup.className = "status-git-group";
       if (gs.branch) {
         const b = document.createElement("span");
-        b.className = "status-git git-branch";
+        b.className = gs.worktree
+          ? "status-git git-branch-worktree"
+          : "status-git git-branch";
         // Upstream divergence rides the branch label in the same colour: it annotates the branch
         // rather than the file, unlike the change counts. Level (or no upstream at all) renders
         // nothing, matching `git status`'s own silence in both cases.
-        let label = `⎇  ${gs.branch}`;
+        // `⧉` for a linked worktree, in the same warning colour the branch picker marks a
+        // worktree-held branch with — one glyph, one colour, one meaning. It replaces `⎇` rather
+        // than adding a mark, and takes the warning colour rather than the metadata one because a
+        // binding is persistent state you can forget you are in.
+        // One space after `⧉`, two after `⎇` — same cell width, different ink weight.
+        let label = `${gs.worktree ? "⧉ " : "⎇  "}${gs.branch}`;
         const up = gs.upstream;
         if (up) {
           if (up.ahead > 0) label += ` ↑${up.ahead}`;

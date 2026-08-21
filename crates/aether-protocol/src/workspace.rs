@@ -379,8 +379,89 @@ impl NotificationMethod for WorkspaceRenamed {
     type Params = WorkspaceRenamedParams;
 }
 
+/// Pushed to a client when its active workspace's **shape** changes under it: a root added or
+/// removed, a project declared or undeclared, or a worktree rebound (which moves every root at
+/// once). Anything, in short, that changes the [`WorkspaceInfo`] the workspace would report.
+///
+/// The client's own RPC results already carry a fresh [`WorkspaceInfo`] whenever *it* changes the
+/// workspace; this is the same payload for changes it didn't make. Without it a second client keeps
+/// the old roots and every path it renders is resolved against a shape the workspace no longer has —
+/// wrong labels, wrong `path_index`, and a `buffer/closed` successor that lands somewhere it can't
+/// describe.
+///
+/// Sent before the `buffer/closed` pushes that accompany a rebind, so the roots are already current
+/// when the client opens the successor.
+pub struct WorkspaceChanged;
+impl NotificationMethod for WorkspaceChanged {
+    const NAME: &'static str = "workspace/changed";
+    type Params = WorkspaceInfo;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceRenamedParams {
     pub old_name: String,
     pub new_name: String,
+}
+
+// ---- workspace/bind_worktree + unbind_worktree ---------------------------------------------------
+
+/// Point one of a workspace's repos at one of its worktrees, and re-activate the workspace.
+///
+/// **One rule: this always adjusts the workspace you are in.** It never creates a workspace, never
+/// switches to another, and never asks which one you meant. A workspace is its configured roots plus
+/// a set of worktree bindings; this call edits that set, the roots re-materialise around it
+/// (`docs/worktrees.md` §6.0), and your open buffers follow to the same relative paths (§9.3).
+///
+/// So there are exactly two outcomes, and the bindings alone decide which:
+///
+/// - **A binding added or changed** → those roots resolve into a worktree instead of the main
+///   checkout. Every other binding, the name, and the session are untouched.
+/// - **A binding removed** (empty `worktree`) → that repo goes back to its main checkout. The
+///   configured roots are the fallback, which is why this can never strand you: the worktree
+///   bindings are machine state, the roots are the workspace's own config (§8.2).
+///
+/// The rules dropped along the way were all dropped for one reason — they turned invisible state
+/// into a discriminator. "First-bound repo is special" made the same gesture behave differently on
+/// one repo than another. "A set another variant holds moves you there" made it depend on what
+/// *other* contexts contained. And **worktree variants** — a second workspace id `<base>/<name>`
+/// spawned automatically the first time you bound from an unbound workspace — made the same
+/// keypress mean "adjust this" or "create and leave" depending on where you already were. All three
+/// are gone; binding is the same act everywhere.
+///
+/// Having two trees of one repo open at once is therefore no longer this call's job. It is an
+/// ordinary second workspace, created deliberately.
+///
+/// The worktree must already exist — [`crate::git::GitWorktreeAdd`] makes it. Splitting the two
+/// keeps a filesystem checkout and a state-file write as separate operations, which is the rule for
+/// when to add a method rather than extend one.
+pub struct WorkspaceBindWorktree;
+impl RpcMethod for WorkspaceBindWorktree {
+    const NAME: &'static str = "workspace/bind_worktree";
+    type Params = WorkspaceBindWorktreeParams;
+    type Result = WorkspaceActivateResult;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WorkspaceBindWorktreeParams {
+    /// Workspace to bind in. Defaults to the caller's active workspace, which is what the picker
+    /// sends — there is no case where you bind in a workspace you are not standing in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The repo to bind, as its workdir. Defaults to the one the active buffer resolves to, the
+    /// same rule every `Space g` surface uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<crate::git::RepoId>,
+    /// The buffer the caller is looking at, so the rebind can land it on the *same file* on the new
+    /// tree (§9.3: "the active buffer always follows"). The server cannot work this out for itself —
+    /// a client may hold several viewports — and without it the landing falls back to the
+    /// workspace's MRU head, which is the right file only by coincidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<crate::BufferId>,
+    /// Admin name of the worktree to bind this repo to. **Empty means unbind** — send the repo back
+    /// to its main checkout, which is what selecting the `main` row does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree: String,
+    /// Open the resulting workspace's landing buffer, like `workspace/activate { open_last }`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_last: bool,
 }

@@ -2396,36 +2396,33 @@ impl Shell {
         // (`pending_create`); the shell appends it as a trailing row (italicised via
         // `synthetic_create_idx`) once the fetched window reaches the list's end, mirroring the
         // core's `display_rows`. Purely visual: Enter routes through the core's `picker_accept`,
-        // which sees the create row on the *core* selection and creates the file/dir.
+        // which sees the create row on the *core* selection and creates whatever that kind creates
+        // — a file, a workspace, a branch, a worktree. The wording comes from the core too.
         p.synthetic_create_idx = None;
-        if let Some(pc) = core.pending_create() {
-            if core.offset + core.items.len() as u32 >= core.total_matches {
-                use aether_protocol::picker::PickerItem;
-                let item = if core.kind == aether_protocol::picker::PickerKind::Workspaces {
-                    // Workspaces rows carry no leading status-dot cell, so the create row mustn't
-                    // either — render it as a Workspace, not a DirEntry (which reserves that column
-                    // and would indent it past the real workspace rows).
-                    PickerItem::Workspace {
-                        name: format!("+ Create workspace {}", pc.name),
-                        unsaved_buffers: 0,
-                        match_indices: Vec::new(),
-                    }
-                } else {
-                    let label = if pc.is_dir {
-                        format!("+ Create directory {}/", pc.name)
-                    } else {
-                        format!("+ Create file {}", pc.name)
-                    };
-                    PickerItem::DirEntry {
-                        name: label,
-                        is_dir: false,
-                        match_indices: Vec::new(),
-                        git_status: None,
-                    }
-                };
-                p.items.push(item);
-                p.synthetic_create_idx = Some(p.items.len() - 1);
-            }
+        if core.pending_create().is_some()
+            && core.offset + core.items.len() as u32 >= core.total_matches
+        {
+            use aether_protocol::picker::PickerItem;
+            let label = core.create_row_label().unwrap_or_default();
+            // Carrier chosen for its *shape*: `DirEntry` reserves the leading status-dot column,
+            // `Workspace` starts at the text. Which one is right is the kind's question, not this
+            // list's — see `create_row_reserves_status_cell`.
+            let item = if core.create_row_reserves_status_cell() {
+                PickerItem::DirEntry {
+                    name: label,
+                    is_dir: false,
+                    match_indices: Vec::new(),
+                    git_status: None,
+                }
+            } else {
+                PickerItem::Workspace {
+                    name: label,
+                    unsaved_buffers: 0,
+                    match_indices: Vec::new(),
+                }
+            };
+            p.items.push(item);
+            p.synthetic_create_idx = Some(p.items.len() - 1);
         }
         p.chips = core.chips.iter().map(chip_value_view).collect();
         p.chip_selected = core.chip_selected;
@@ -2573,7 +2570,12 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),
-        ConfirmKind::DeleteWorkspace { name } => format!("Delete workspace \"{name}\""),
+        ConfirmKind::DeleteWorkspace { name } => {
+            format!(
+                "Delete workspace \"{}\"",
+                aether_client::labels::workspace_display(name)
+            )
+        }
         ConfirmKind::DeleteBranch { name } => format!("Delete branch \"{name}\""),
         // Names the entry, because "drop the stash" is ambiguous with several in the list — and
         // this is the one stash action the editor can't undo.

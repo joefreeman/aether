@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 /// The full set of application settings. Every field has a serde default so an older (or empty)
 /// `settings.toml` round-trips forward as new settings are added — a missing key reads as its
 /// default rather than failing the parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Not `Copy`: [`Self::worktree_store`] is a path. The derive was there because every field
+/// happened to be a scalar, not because anything needed it — and letting that accident dictate what
+/// a setting is allowed to *be* is the tail wagging the dog. Clones are per-RPC, not per-frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Soft-wrap mode applied to viewports. The client seeds `Session.wrap` from this at boot and
     /// the app-settings overlay toggles it.
@@ -65,6 +68,24 @@ pub struct AppSettings {
     /// config surface.
     #[serde(default = "default_git_auto_fetch")]
     pub git_auto_fetch: bool,
+    /// Where app-managed git worktrees are created (`docs/worktrees.md` §8.4). Absolute path; empty
+    /// means the default, `$XDG_DATA_HOME/aether/worktrees`.
+    ///
+    /// **The store is centralised and outside every workspace root on purpose** — a worktree nested
+    /// under a root gets swallowed by the workspace index, shows up as an untracked path in status,
+    /// and duplicates every search hit. It also sits outside the profile *state* subtree, which is
+    /// documented as sweepable: worktrees hold uncommitted work.
+    ///
+    /// Worth a setting rather than an environment variable, despite being set once and rarely: this
+    /// app is launched from a desktop entry as often as from a shell (`ae --gui %f`), and a variable
+    /// exported in a shell rc simply never reaches that process. A setting reaches every launcher.
+    ///
+    /// **No row in the settings overlay.** The overlay is a keyboard-stepped list of toggles and
+    /// preset sizes; a filesystem path is neither, and inventing a text-entry control for one
+    /// rarely-touched key would be a lot of surface for it. Hand-edit `settings.toml`, or set it
+    /// with `settings/set`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worktree_store: String,
 }
 
 fn default_wrap() -> WrapMode {
@@ -122,6 +143,7 @@ impl Default for AppSettings {
             markdown_read: default_markdown_read(),
             theme: default_theme(),
             git_auto_fetch: default_git_auto_fetch(),
+            worktree_store: String::new(),
         }
     }
 }

@@ -170,6 +170,18 @@ pub enum PickerKind {
     /// the client fires against the highlighted row, so there is no `PickerSelectResult` for it.
     /// `refs/stash` is shared across worktrees, so a linked worktree lists the whole repo's.
     GitStash,
+    /// The worktrees of **one repo** — the active one, resolved exactly as every other `Space g`
+    /// surface resolves it (`docs/worktrees.md` §9.1). Rows are [`PickerItem::Worktree`]: the
+    /// family's existing trees, then local branches not checked out anywhere, then a create row
+    /// from the query.
+    ///
+    /// Deliberately per-repo rather than grouped across a multi-repo workspace. It keeps "one row
+    /// = one repo's binding" true by construction, and consistency with the other git pickers is
+    /// worth more than saving the keystroke that opens a file in the other repo first.
+    ///
+    /// Moving between *contexts* wholesale — base ↔ variant — is the workspace switcher's job, not
+    /// this picker's.
+    Worktrees,
 }
 
 impl PickerKind {
@@ -231,7 +243,8 @@ impl PickerKind {
     /// Whether this picker renders header rows above grouped runs of items (and the server
     /// pushes [`GroupSpan`]s describing them). A superset of [`Self::groups_by_file`]: the
     /// file-grouped kinds plus the section-labelled ones — References (a `Definition` section
-    /// and a `References` section), Keybindings (one section per binding group), Jumplist and
+    /// and a `References` section), Worktrees (a `Worktrees` section and a `Branches` section),
+    /// Keybindings (one section per binding group), Jumplist and
     /// WorkspaceSymbols (file-or-label headers). The header
     /// *content* differs per kind — file path vs section label — and so does the header row's
     /// nature: for the [`Self::collapsible`] kinds it's a real, selectable window row
@@ -247,6 +260,7 @@ impl PickerKind {
                 | PickerKind::WorkspaceSymbols
                 | PickerKind::Keybindings
                 | PickerKind::Jumplist
+                | PickerKind::Worktrees
         )
     }
 
@@ -733,11 +747,16 @@ pub enum PickerItem {
         ahead: u32,
         #[serde(default, skip_serializing_if = "is_zero")]
         behind: u32,
-        /// Workdir of another worktree holding this branch, when one does. Git refuses the same
-        /// branch in two worktrees, so the client refuses the checkout on this before the round
+        /// Workdir of another checkout in this family holding this branch, when one does. Git
+        /// refuses the same branch in two checkouts, so the client refuses on this before the round
         /// trip — the row has to carry it for that to be possible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checked_out_in: Option<String>,
+        /// Whether that other checkout is the repo's **main** working tree rather than a linked
+        /// worktree. Both refuse the checkout, but they are different places to be sent, and the
+        /// client cannot tell them apart from a path.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        checked_out_in_main: bool,
         /// Char offsets into `name` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
@@ -837,6 +856,41 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "is_zero_i64")]
         timestamp: i64,
         /// Char offsets into `message` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One row of the worktree picker ([`PickerKind::Worktrees`]). Identity is `(kind, label)`:
+    /// admin names are unique within a family and branch names are unique within a repo, and the
+    /// two never share a row.
+    Worktree {
+        /// The repo this row belongs to, echoed onto every action it triggers — resolution runs
+        /// off the active buffer, which may have moved since the list was built.
+        repo_id: crate::git::RepoId,
+        /// What this row is. Drives both the rendering and what selecting it does.
+        row: WorktreeRowKind,
+        /// The row's text and fuzzy haystack: the worktree's admin name, or the branch name for a
+        /// branch row. The main worktree renders as its branch, since it has no admin name.
+        label: String,
+        /// The branch checked out in this worktree, when the row is a worktree and it is on one.
+        /// Shown beside the label — the same worktree on a different branch is the thing you are
+        /// usually choosing between.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        branch: String,
+        /// Absolute path of the working directory. Empty for a branch or create row, which has no
+        /// tree yet.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
+        /// This row is the worktree the user is currently in.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_current: bool,
+        /// The admin entry outlived its directory (`rm -rf` instead of `git worktree remove`).
+        /// Rendered dimmed; the only condition under which pruning is offered.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prunable: bool,
+        /// `git worktree lock` is holding it — never removed automatically, not even with force.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        locked: bool,
+        /// Char offsets into `label` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -1337,6 +1391,46 @@ pub enum PickerSelectResult {
     Workspace {
         name: String,
     },
+    /// A worktree row was selected. Carries everything the follow-up needs so the client never has
+    /// to re-resolve a row it is already holding: the repo the row belongs to (resolution runs off
+    /// the active buffer, which may have moved), the admin name — empty for the main worktree —
+    /// and, for a row that does not exist yet, the branch to create it from.
+    Worktree {
+        repo_id: crate::git::RepoId,
+        /// Admin name of an existing worktree, or empty for the main one.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        /// Set when the row is a branch or a create row: the worktree has to be made first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create: Option<WorktreeCreate>,
+    },
+}
+
+/// What a [`PickerItem::Worktree`] row *is*. The three cases need different rendering and do
+/// different things when selected, and collapsing them into "has a path or doesn't" loses the
+/// distinction between a branch that exists and a name being invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRowKind {
+    /// The repo's main checkout. Always first, and it has no admin name — selecting it means
+    /// "send this repo back to main in this context".
+    Main,
+    /// An existing linked worktree of the family, including ones created in a terminal.
+    Existing,
+    /// A local branch that no worktree has checked out. Selecting it creates one.
+    Branch,
+    /// The `+ Create <query>` row: neither the branch nor the worktree exists yet.
+    Create,
+}
+
+/// The half of a [`PickerSelectResult::Worktree`] that describes a worktree which doesn't exist
+/// yet. `branch` is always a *branch* name — the directory is derived server-side and never typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreate {
+    pub branch: String,
+    /// The branch doesn't exist either (a `+ Create <query>` row), so it is created at HEAD.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_branch: bool,
 }
 
 // ---- picker/hide --------------------------------------------------------------------------------

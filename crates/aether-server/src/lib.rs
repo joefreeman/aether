@@ -26,6 +26,7 @@ mod symbols;
 mod syntax;
 mod watcher;
 mod workspace_index;
+mod worktree;
 mod wrap;
 
 pub use config::{
@@ -85,7 +86,7 @@ pub fn lsp_view(s: &state::ServerState) -> LspManagerView {
         .map(|h| LspServerView {
             language: h.language.clone(),
             ready: matches!(h.status, aether_protocol::lsp::LspStatus::Ready),
-            pinned: h.pinned,
+            pinned: !h.pinned_by.is_empty(),
             open_buffers: h.open_buffers.len(),
         })
         .collect()

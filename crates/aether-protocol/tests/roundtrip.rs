@@ -696,6 +696,7 @@ fn git_buffer_status_shape() {
         baseline: None,
         conflicts: 0,
         operation: None,
+        worktree: false,
     };
     let v = to_value(&s).unwrap();
     assert_eq!(v["branch"], "main");
@@ -1956,6 +1957,22 @@ fn lsp_status_changed_notification_roundtrip() {
     assert!(v.get("id").is_none(), "notifications carry no id");
 }
 
+/// `workspace/changed` is a bare `WorkspaceInfo` — the same payload an RPC result carries, so a
+/// client that didn't make the change adopts it through the same path.
+#[test]
+fn workspace_changed_is_a_workspace_info() {
+    use aether_protocol::workspace::{WorkspaceChanged, WorkspaceInfo};
+    assert_eq!(WorkspaceChanged::NAME, "workspace/changed");
+    let info = WorkspaceInfo {
+        name: "aether".into(),
+        paths: vec!["/store/aether-3f9c/feature".into()],
+        projects: Vec::new(),
+    };
+    let v = to_value(&info).unwrap();
+    assert_eq!(v["name"], "aether");
+    assert_eq!(v["paths"][0], "/store/aether-3f9c/feature");
+}
+
 #[test]
 fn workspace_info_shape() {
     let p = WorkspaceInfo {
@@ -2287,11 +2304,12 @@ fn buffer_open_scratch_form() {
 
 #[test]
 fn buffer_closed_notification_shape() {
-    use aether_protocol::buffer::BufferClosedParams;
+    use aether_protocol::buffer::{BufferClosedParams, BufferLocation};
     // With a next buffer to switch to.
     let some = to_value(BufferClosedParams {
         buffer_id: 4,
         next_buffer_id: Some(7),
+        next_path: None,
     })
     .unwrap();
     assert_eq!(some, json!({"buffer_id": 4, "next_buffer_id": 7}));
@@ -2299,6 +2317,7 @@ fn buffer_closed_notification_shape() {
     let none = to_value(BufferClosedParams {
         buffer_id: 4,
         next_buffer_id: None,
+        next_path: None,
     })
     .unwrap();
     assert_eq!(none, json!({"buffer_id": 4}));
@@ -2306,6 +2325,26 @@ fn buffer_closed_notification_shape() {
     let parsed: BufferClosedParams = from_value(json!({"buffer_id": 9})).unwrap();
     assert_eq!(parsed.buffer_id, 9);
     assert_eq!(parsed.next_buffer_id, None);
+    assert_eq!(parsed.next_path, None);
+
+    // A worktree rebind names the successor by **path** instead — the id it could offer is a
+    // dormant placeholder the initiator's own landing buffer can materialise under a different id.
+    let moved = to_value(BufferClosedParams {
+        buffer_id: 4,
+        next_buffer_id: None,
+        next_path: Some(BufferLocation {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        moved,
+        json!({
+            "buffer_id": 4,
+            "next_path": { "path_index": 0, "relative_path": "src/main.rs" },
+        })
+    );
 }
 
 #[test]
@@ -2829,6 +2868,7 @@ fn picker_item_git_branch_is_tagged() {
         ahead: 0,
         behind: 0,
         checked_out_in: None,
+        checked_out_in_main: false,
         match_indices: vec![0, 1],
     };
     let v = to_value(&plain).unwrap();
@@ -2842,12 +2882,14 @@ fn picker_item_git_branch_is_tagged() {
             "timestamp": 1_700_000_000i64,
             "match_indices": [0, 1],
         }),
-        "is_head/upstream/ahead/behind/checked_out_in all omitted at their defaults"
+        "is_head/upstream/ahead/behind/checked_out_in* all omitted at their defaults"
     );
     assert_eq!(from_value::<PickerItem>(v).unwrap(), plain);
 
     // The decorated row: current branch, tracking an upstream it has diverged from, and held by
-    // another worktree. `checked_out_in` is what stops the client offering a doomed checkout.
+    // another checkout. `checked_out_in` is what stops the client offering a doomed checkout, and
+    // `checked_out_in_main` is what lets it say *where* — "the main checkout" and "another
+    // worktree" are different sentences, and a path alone can't tell them apart.
     let decorated = PickerItem::GitBranch {
         repo_id: "/home/u/proj".into(),
         name: "main".into(),
@@ -2857,7 +2899,8 @@ fn picker_item_git_branch_is_tagged() {
         upstream: Some("origin/main".into()),
         ahead: 2,
         behind: 1,
-        checked_out_in: Some("/home/u/proj-worktrees/main".into()),
+        checked_out_in: Some("/home/u/proj".into()),
+        checked_out_in_main: true,
         match_indices: vec![],
     };
     let v = to_value(&decorated).unwrap();
@@ -2865,7 +2908,8 @@ fn picker_item_git_branch_is_tagged() {
     assert_eq!(v["upstream"], "origin/main");
     assert_eq!(v["ahead"], 2);
     assert_eq!(v["behind"], 1);
-    assert_eq!(v["checked_out_in"], "/home/u/proj-worktrees/main");
+    assert_eq!(v["checked_out_in"], "/home/u/proj");
+    assert_eq!(v["checked_out_in_main"], true);
     assert_eq!(from_value::<PickerItem>(v).unwrap(), decorated);
 }
 
@@ -3413,6 +3457,7 @@ fn collapsible_kinds_are_pinned() {
     for kind in [
         PickerKind::References,
         PickerKind::Keybindings,
+        PickerKind::Worktrees,
         PickerKind::GitChangesFile,
         PickerKind::Files,
         PickerKind::Diagnostics,
@@ -3420,6 +3465,11 @@ fn collapsible_kinds_are_pinned() {
     ] {
         assert!(!kind.collapsible(), "{kind:?}");
     }
+    // Worktrees groups but does not collapse — the same shape as References. That combination is
+    // what keeps its headers out of the selection indices, so the current worktree stays at index 0
+    // and Enter-on-open remains a no-op.
+    assert!(PickerKind::Worktrees.renders_group_headers());
+    assert!(!PickerKind::Worktrees.groups_by_file());
 }
 
 #[test]
@@ -4440,9 +4490,10 @@ fn app_settings_wire_shape_and_defaults() {
         markdown_read: false,
         theme: aether_protocol::settings::ThemeMode::Light,
         git_auto_fetch: true,
+        worktree_store: String::new(),
     };
     assert_eq!(
-        to_value(s).unwrap(),
+        to_value(&s).unwrap(),
         json!({
             "wrap": "none",
             "ligatures": false,
@@ -4494,7 +4545,7 @@ fn app_settings_wire_shape_and_defaults() {
     assert_eq!(parsed, AppSettings::default());
 
     // Full round-trip.
-    let back: AppSettings = from_value(to_value(s).unwrap()).unwrap();
+    let back: AppSettings = from_value(to_value(&s).unwrap()).unwrap();
     assert_eq!(back, s);
 }
 
@@ -4908,4 +4959,177 @@ fn block_edit_wire_shapes() {
     assert_eq!(v, json!({ "buffer_id": 3 }));
     let p: ToggleTaskParams = serde_json::from_value(json!({ "buffer_id": 3 })).unwrap();
     assert_eq!(p.set, None, "a missing `set` flips");
+}
+
+#[test]
+fn worktree_add_params_round_trip() {
+    use aether_protocol::git::GitWorktreeAddParams;
+    // The minimal shape: resolution left to the server, an existing branch.
+    let v = to_value(GitWorktreeAddParams {
+        branch: "feature/auth".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "branch": "feature/auth" }));
+    // `create_branch` is the only flag, and it is absent when false.
+    let v = to_value(GitWorktreeAddParams {
+        repo_id: Some("/src/aether".into()),
+        buffer_id: Some(7),
+        branch: "wip".into(),
+        create_branch: true,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "repo_id": "/src/aether",
+            "buffer_id": 7,
+            "branch": "wip",
+            "create_branch": true,
+        })
+    );
+}
+
+#[test]
+fn worktree_add_result_shape() {
+    use aether_protocol::git::{
+        GitHead, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRow,
+    };
+    // A plain success carries only the status and the row — every count and flag is skipped when
+    // it has nothing to say, so the common case stays small.
+    let v = to_value(GitWorktreeAddResult {
+        status: GitWorktreeAddStatus::Created,
+        worktree: Some(GitWorktreeRow {
+            name: "feature-auth".into(),
+            path: "/store/aether-3f9c/feature-auth".into(),
+            head: Some(GitHead::Branch {
+                name: "feature/auth".into(),
+                upstream: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "status": "created",
+            "worktree": {
+                "name": "feature-auth",
+                "path": "/store/aether-3f9c/feature-auth",
+                "head": { "state": "branch", "name": "feature/auth" },
+            },
+        })
+    );
+    // The main worktree has no admin name and a prunable row has no head — both are *absent*, and
+    // the row must decode that way rather than needing a sentinel.
+    let row: GitWorktreeRow =
+        serde_json::from_value(json!({ "path": "/src/aether", "is_main": true })).unwrap();
+    assert_eq!(row.name, "");
+    assert_eq!(row.head, None);
+    assert!(row.is_main);
+}
+
+#[test]
+fn worktree_remove_itemises_what_is_at_risk() {
+    use aether_protocol::git::{
+        GitWorktreeAtRisk, GitWorktreeRemoveResult, GitWorktreeRemoveStatus,
+    };
+    let v = to_value(GitWorktreeRemoveResult {
+        status: GitWorktreeRemoveStatus::Dirty,
+        at_risk: Some(GitWorktreeAtRisk {
+            modified: 2,
+            untracked: 1,
+            operation_in_progress: false,
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "status": "dirty", "at_risk": { "modified": 2, "untracked": 1 } })
+    );
+    // A clean removal says nothing further — no zeroed counts to read as "1 file at risk".
+    let v = to_value(GitWorktreeRemoveResult {
+        status: GitWorktreeRemoveStatus::Removed,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "status": "removed" }));
+}
+
+#[test]
+fn worktree_picker_row_and_select_shapes() {
+    use aether_protocol::picker::{
+        PickerItem, PickerSelectResult, WorktreeCreate, WorktreeRowKind,
+    };
+    let v = to_value(PickerItem::Worktree {
+        repo_id: "/src/aether".into(),
+        row: WorktreeRowKind::Branch,
+        label: "feature".into(),
+        branch: String::new(),
+        path: String::new(),
+        is_current: false,
+        prunable: false,
+        locked: false,
+        match_indices: vec![0],
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "worktree",
+            "repo_id": "/src/aether",
+            "row": "branch",
+            "label": "feature",
+            "match_indices": [0],
+        })
+    );
+    // Selecting an existing tree carries its admin name and no create half; selecting a branch row
+    // carries the branch to make it from. The two never both appear.
+    let v = to_value(PickerSelectResult::Worktree {
+        repo_id: "/src/aether".into(),
+        name: "feature-auth".into(),
+        create: None,
+    })
+    .unwrap();
+    assert_eq!(v["name"], json!("feature-auth"));
+    assert!(v.get("create").is_none());
+    let v = to_value(PickerSelectResult::Worktree {
+        repo_id: "/src/aether".into(),
+        name: String::new(),
+        create: Some(WorktreeCreate {
+            branch: "wip".into(),
+            create_branch: true,
+        }),
+    })
+    .unwrap();
+    assert!(v.get("name").is_none());
+    assert_eq!(
+        v["create"],
+        json!({ "branch": "wip", "create_branch": true })
+    );
+}
+
+#[test]
+fn app_settings_carry_a_path_and_stay_backward_compatible() {
+    use aether_protocol::settings::AppSettings;
+    // The empty default is skipped, so a settings file that has never set a store round-trips
+    // byte-identically to one written before the key existed.
+    let v = to_value(AppSettings::default()).unwrap();
+    assert!(v.get("worktree_store").is_none());
+    // And an older file (no key at all) still parses — every field carries a serde default.
+    let old = json!({ "wrap": "soft", "ligatures": true });
+    let parsed: AppSettings = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.worktree_store, "");
+
+    let with = AppSettings {
+        worktree_store: "/mnt/fast/worktrees".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        to_value(&with).unwrap()["worktree_store"],
+        json!("/mnt/fast/worktrees")
+    );
 }

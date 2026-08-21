@@ -28,7 +28,7 @@ use aether_protocol::git::{
     GitAbortOperation, GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit,
     GitDeleteBranch, GitFetch, GitNavigateHunk, GitPrepareCommit, GitPull, GitPush, GitRefresh,
     GitRepos, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow, GitSetDiffView,
-    GitShow, GitStashApply, GitStashDrop, GitStashPush,
+    GitShow, GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd, GitWorktreeRemove,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -55,9 +55,9 @@ use aether_protocol::viewport::{
     ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
 };
 use aether_protocol::workspace::{
-    WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceCreate, WorkspaceDelete,
-    WorkspaceInferLanguage, WorkspaceList, WorkspaceOpenPath, WorkspaceRemoveProject,
-    WorkspaceRemoveRoot, WorkspaceRename,
+    WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceBindWorktree,
+    WorkspaceCreate, WorkspaceDelete, WorkspaceInferLanguage, WorkspaceList, WorkspaceOpenPath,
+    WorkspaceRemoveProject, WorkspaceRemoveRoot, WorkspaceRename,
 };
 use aether_protocol::ClientId;
 use anyhow::Context;
@@ -353,17 +353,19 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
 /// host still sat out its TCP timeout with the only way out being to quit the editor, which is the
 /// precise scenario [`GitCancel`] was built to prevent.
 ///
-/// Kept to a hard-coded three rather than made a property of "slow" handlers. Detaching costs the
+/// Kept to a hard-coded list rather than made a property of "slow" handlers. Detaching costs the
 /// ordering guarantee — a detached request can now interleave with later ones from the same client
-/// — and these three are the only ones that both take unbounded time and touch nothing the next
-/// keystroke depends on. Anything editing a buffer must stay in line.
+/// — and these are the only ones that both take unbounded time and touch nothing the next
+/// keystroke depends on. `worktree_add` qualifies for the same reason despite being local rather
+/// than networked: it is a full checkout, into a directory no open buffer points at.
+/// Anything editing a buffer must stay in line.
 fn is_detachable(request: &Request) -> bool {
     // Matched against the parsed `method`, never against the raw frame. A substring probe would be
     // cheaper and catastrophically wrong: `input/text` params carry arbitrary user text, so pasting
     // the string "git/pull" into a buffer would detach that *edit* from the ordered dispatch.
     matches!(
         request.method.as_str(),
-        GitFetch::NAME | GitPush::NAME | GitPull::NAME
+        GitFetch::NAME | GitPush::NAME | GitPull::NAME | GitWorktreeAdd::NAME
     )
 }
 
@@ -457,6 +459,9 @@ async fn dispatch(
         WorkspaceCreate::NAME => run!(WorkspaceCreate, handlers::workspace_create),
         WorkspaceOpenPath::NAME => run!(WorkspaceOpenPath, handlers::workspace_open_path),
         WorkspaceAddRoot::NAME => run!(WorkspaceAddRoot, handlers::workspace_add_root),
+        WorkspaceBindWorktree::NAME => {
+            run!(WorkspaceBindWorktree, handlers::workspace_bind_worktree)
+        }
         WorkspaceRemoveRoot::NAME => run!(WorkspaceRemoveRoot, handlers::workspace_remove_root),
         WorkspaceAddProject::NAME => run!(WorkspaceAddProject, handlers::workspace_add_project),
         WorkspaceRemoveProject::NAME => {
@@ -562,6 +567,8 @@ async fn dispatch(
         GitDeleteBranch::NAME => run!(GitDeleteBranch, handlers::git_delete_branch),
         GitFetch::NAME => run!(GitFetch, handlers::git_fetch),
         GitPush::NAME => run!(GitPush, handlers::git_push),
+        GitWorktreeAdd::NAME => run!(GitWorktreeAdd, handlers::git_worktree_add),
+        GitWorktreeRemove::NAME => run!(GitWorktreeRemove, handlers::git_worktree_remove),
         GitPull::NAME => run!(GitPull, handlers::git_pull),
         GitCancel::NAME => run!(GitCancel, handlers::git_cancel),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),

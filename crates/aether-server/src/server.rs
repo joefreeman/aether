@@ -403,6 +403,8 @@ pub struct ServerHandle {
     /// that no RPC can set without writing to the real config dir.
     pub state: SharedState,
     join: tokio::task::JoinHandle<()>,
+    /// Values whose lifetime is tied to this server's — see [`ServerHandle::keep_alive`].
+    keep_alive: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl ServerHandle {
@@ -417,11 +419,43 @@ impl ServerHandle {
             aether_protocol::PROTOCOL_VERSION
         )
     }
+
+    /// Tie a value's lifetime to this handle — in practice a fixture's `TempDir`, so its tree is
+    /// removed when the test drops the server.
+    ///
+    /// Type-erased because `tempfile` is a dev-dependency: naming `TempDir` here would drag it into
+    /// the production build for a test seam. Nothing ever reads the values back; they exist only to
+    /// be dropped.
+    ///
+    /// The problem this solves: a fixture builds a tree, hands back the *paths*, and its own
+    /// `TempDir` would drop at the end of the fixture — taking the tree with it. The old answer was
+    /// `std::mem::forget`, on the reasoning that "the OS cleans /tmp". On a **tmpfs** it doesn't:
+    /// nothing is reclaimed until reboot, so every run of the suite leaked one directory per
+    /// fixture. They accumulated to ~140k, exhausting the tmpfs **inode** table (not its bytes) and
+    /// failing every test that wanted to create a git repo, with `No space left on device` on a
+    /// filesystem that was 66% free.
+    ///
+    /// A handle is the natural owner: every fixture already returns one, and every test already
+    /// drops it at the end.
+    pub fn keep_alive<T: std::any::Any + Send>(&mut self, value: T) {
+        self.keep_alive.push(Box::new(value));
+    }
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.join.abort();
+    }
+}
+
+/// Removes a directory tree when dropped. Parked on a test [`ServerHandle`] via
+/// [`ServerHandle::keep_alive`] for trees the server *creates* rather than is handed — the test
+/// worktree store, which no `TempDir` owns because the path is chosen before anything exists at it.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -554,12 +588,20 @@ pub async fn spawn_for_test_full(
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
 
+    let worktree_store = std::env::temp_dir().join(format!("aether-test-worktrees-{port}"));
     let state = Arc::new(Mutex::new(ServerState::new()));
     {
         let mut s = state.lock().await;
         s.sessions_path = sessions_path;
         s.backups_path = backups_dir;
         s.hints_path = hints_path;
+        // Every test server gets its own worktree store, unconditionally and without a parameter —
+        // unlike the fields above, whose `None` means "feature off". There is no off for this one:
+        // leaving it unset would let a `git/worktree_add` in any test write a real checkout into
+        // the developer's `~/.local/share/aether/worktrees`. Keyed by port, which is unique per
+        // server, so parallel tests can't collide. Swept when the handle drops (see below) — a
+        // worktree is a full checkout, and leaking one per test is how /tmp ran out of inodes.
+        s.worktree_store = Some(worktree_store.clone());
         // In-process dummy language servers (test seam — see `lsp::dummy`). Seeded before the run
         // task starts so any buffer opened afterwards launches the dummy, not a real process.
         for (language, config) in dummy_lsp {
@@ -579,6 +621,7 @@ pub async fn spawn_for_test_full(
                 WorkspaceEntry {
                     id: name.clone(),
                     name: Some(name.clone()),
+                    base_paths: None,
                     paths: paths.clone(),
                     workspace_index,
                     mru_buffers: std::collections::VecDeque::new(),
@@ -608,12 +651,15 @@ pub async fn spawn_for_test_full(
             let _ = run_with_listener(listener, state, None).await;
         }
     });
-    Ok(ServerHandle {
+    let mut handle = ServerHandle {
         port,
         workspace_name,
         state,
         join,
-    })
+        keep_alive: Vec::new(),
+    };
+    handle.keep_alive(RemoveOnDrop(worktree_store));
+    Ok(handle)
 }
 
 fn handle_existing_runtime_file(path: &std::path::Path) -> anyhow::Result<()> {
@@ -750,6 +796,7 @@ mod tests {
                     crate::state::WorkspaceEntry {
                         id: "p".into(),
                         name: Some("p".into()),
+                            base_paths: None,
                         paths: Vec::new(),
                         workspace_index: Arc::new(crate::workspace_index::WorkspaceIndex::new(
                             Vec::new(),
