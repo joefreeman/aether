@@ -21339,23 +21339,23 @@ fn index_text(dir: &std::path::Path, name: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn apply_hunk_toggle_round_trips_a_modification() {
+async fn apply_hunk_stages_then_unstages_a_modification() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
     std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "stage-proj", "edit.rs").await;
 
-    // Bare cursor anywhere on the changed line addresses the whole hunk; the first toggle stages.
+    // Bare cursor anywhere on the changed line addresses the whole hunk.
     set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
         "alpha\nBETA\ngamma\n"
     );
 
-    // The region now holds nothing unstaged, so a second toggle pulls it back out.
-    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    // The inverse key pulls exactly that region back out again.
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Unstage).await;
     assert_eq!(r.status, ApplyHunkStatus::Unstaged);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
@@ -21406,7 +21406,7 @@ async fn a_file_outside_the_roots_but_inside_the_repo_gets_a_baseline_and_stages
     .await;
 
     set_cursor(&mut ws, 3, open.buffer_id, 1, 2).await;
-    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(
         index_text(&repo_root, "other/outside.rs").unwrap(),
@@ -21460,7 +21460,7 @@ async fn a_file_in_an_unreachable_repo_stays_a_guest() {
     .await;
 
     set_cursor(&mut ws, 3, open.buffer_id, 1, 2).await;
-    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, open.buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Unavailable);
     assert_eq!(
         index_text(&dep_root, "dep.rs").unwrap(),
@@ -21490,7 +21490,7 @@ async fn apply_hunk_stage_requires_clean_buffer() {
         },
     )
     .await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::DirtyBuffer);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
@@ -21511,7 +21511,7 @@ async fn apply_hunk_stages_selected_lines_of_a_block() {
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "lines-proj", "edit.rs").await;
 
     select_lines(&mut ws, 3, buffer_id, 1, 2).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\nx\ny\n");
 
@@ -21527,7 +21527,7 @@ async fn apply_hunk_stages_deletion_via_its_anchor_line() {
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "del-proj", "edit.rs").await;
 
     set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(
         r.status,
         ApplyHunkStatus::NoChange,
@@ -21535,7 +21535,7 @@ async fn apply_hunk_stages_deletion_via_its_anchor_line() {
     );
 
     set_cursor(&mut ws, 5, buffer_id, 1, 0).await;
-    let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\nc\n");
 
@@ -21551,7 +21551,7 @@ async fn apply_hunk_stages_eof_deletion_from_last_line() {
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "eof-proj", "edit.rs").await;
 
     set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(index_text(dir.path(), "edit.rs").unwrap(), "a\n");
 
@@ -21572,7 +21572,7 @@ async fn apply_hunk_stages_untracked_file() {
         "no index entry before staging"
     );
     set_cursor(&mut ws, 3, buffer_id, 0, 0).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(index_text(dir.path(), "new.rs").unwrap(), "hello\nworld\n");
 
@@ -21589,15 +21589,15 @@ async fn apply_hunk_unstages_region_back_to_head() {
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "unstage-proj", "edit.rs").await;
 
     set_cursor(&mut ws, 3, buffer_id, 1, 0).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Unstage).await;
     assert_eq!(r.status, ApplyHunkStatus::Unstaged);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
         "alpha\nbeta\ngamma\n"
     );
 
-    // Unstaging re-opened the buffer-vs-index difference, so the next toggle stages it again.
-    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    // Unstaging re-opened the buffer-vs-index difference, so staging puts it back.
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
@@ -21620,7 +21620,7 @@ async fn apply_hunk_unstage_maps_cursor_through_unstaged_edits() {
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "unmap-proj", "edit.rs").await;
 
     set_cursor(&mut ws, 3, buffer_id, 3, 0).await;
-    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Unstage).await;
     assert_eq!(r.status, ApplyHunkStatus::Unstaged);
     assert_eq!(
         index_text(dir.path(), "edit.rs").unwrap(),
@@ -21753,7 +21753,7 @@ async fn apply_hunk_outside_a_repo_is_unavailable() {
     std::fs::write(dir.path().join("loose.rs"), "x\n").unwrap();
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "norepo2-proj", "loose.rs").await;
 
-    let r = apply_hunk(&mut ws, 3, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 3, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Unavailable);
 
     drop(server);
@@ -21788,7 +21788,7 @@ async fn apply_hunk_stage_refreshes_status_counts() {
     .await;
 
     set_cursor(&mut ws, 4, buffer_id, 1, 0).await;
-    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Toggle).await;
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Stage).await;
     assert_eq!(r.status, ApplyHunkStatus::Staged);
 
     let notif: ViewportLinesChangedParams =
@@ -32397,8 +32397,8 @@ async fn set_baseline_rejects_an_unknown_revision_without_clearing() {
     drop(server);
 }
 
-/// Staging is refused against a revision baseline: the hunks have no index relationship, so a
-/// toggle would write content the user never asked to stage. Reverting still works.
+/// Staging is refused against a revision baseline: the hunks have no index relationship, so it
+/// would write content the user never asked to stage. Reverting still works.
 #[tokio::test]
 async fn staging_is_refused_against_a_revision_baseline() {
     let (server, mut ws, repo, root, buffer_id) = setup_refresh_workspace("one\n").await;
@@ -32411,17 +32411,17 @@ async fn staging_is_refused_against_a_revision_baseline() {
     let _ = refresh(&mut ws, 3, &root).await;
     set_baseline(&mut ws, 4, &root, Some(&first)).await;
 
-    let toggled: GitApplyHunkResult = send_request::<GitApplyHunk>(
+    let staged: GitApplyHunkResult = send_request::<GitApplyHunk>(
         &mut ws,
         5,
         &GitApplyHunkParams {
             scope: Default::default(),
             buffer_id,
-            action: HunkAction::Toggle,
+            action: HunkAction::Stage,
         },
     )
     .await;
-    assert_eq!(toggled.status, ApplyHunkStatus::NotAgainstHead);
+    assert_eq!(staged.status, ApplyHunkStatus::NotAgainstHead);
 
     // Revert is still meaningful — put this hunk back to how it was at that commit.
     let _: aether_protocol::cursor::CursorState = send_request::<CursorSet>(
@@ -33882,8 +33882,8 @@ async fn git_log_matches_hashes_by_prefix_including_longer_than_rendered() {
     drop(server);
 }
 
-/// Whole-file staging: `Space g a` stages every change in the file wherever the cursor is, and
-/// toggles back the same way — the hunk rule read over the whole file (unstaged-first). This is the
+/// Whole-file staging: `Space g Alt-s` stages every change in the file wherever the cursor is, and
+/// `Space g Alt-u` takes them all back out — the hunk rule read over the whole file. This is the
 /// commoner gesture than picking off hunks, which is why it has its own chord rather than needing a
 /// select-all first.
 #[tokio::test]
@@ -33902,7 +33902,7 @@ async fn apply_hunk_file_scope_stages_and_unstages_everything() {
         4,
         &GitApplyHunkParams {
             buffer_id,
-            action: HunkAction::Toggle,
+            action: HunkAction::Stage,
             scope: ApplyScope::File,
         },
     )
@@ -33914,13 +33914,13 @@ async fn apply_hunk_file_scope_stages_and_unstages_everything() {
         "both changes staged, not just the one under the cursor"
     );
 
-    // Nothing unstaged remains, so the same chord unstages the file entirely.
+    // ...and the unstage key takes the whole file back out again.
     let r: GitApplyHunkResult = send_request::<GitApplyHunk>(
         &mut ws,
         5,
         &GitApplyHunkParams {
             buffer_id,
-            action: HunkAction::Toggle,
+            action: HunkAction::Unstage,
             scope: ApplyScope::File,
         },
     )
@@ -33948,7 +33948,7 @@ async fn apply_hunk_file_scope_on_a_clean_file_reports_no_change() {
         3,
         &GitApplyHunkParams {
             buffer_id,
-            action: HunkAction::Toggle,
+            action: HunkAction::Stage,
             scope: ApplyScope::File,
         },
     )
@@ -33958,7 +33958,7 @@ async fn apply_hunk_file_scope_on_a_clean_file_reports_no_change() {
     drop(server);
 }
 
-/// The revert half: `Space g Alt-a` restores the whole file to its baseline in one undoable edit,
+/// The revert half: `Space g Alt-r` restores the whole file to its baseline in one undoable edit,
 /// wherever the cursor is.
 #[tokio::test]
 async fn apply_hunk_file_scope_reverts_the_whole_file() {
@@ -33992,6 +33992,103 @@ async fn apply_hunk_file_scope_reverts_the_whole_file() {
 
 // -------- git stash ------------------------------------------------------------------------------
 
+/// `--staged` takes the index and leaves the rest of the tree alone — the half of the working tree
+/// the plain stash can't separate. Both facts have to hold: the staged change is gone from the file
+/// *and* the unstaged one is still in it.
+///
+/// Skipped below git 2.35, which has no `--staged` at all; the refusal for those is
+/// [`GitStashStatus::StagedUnsupported`], asserted in the version check's own unit tests rather
+/// than here (there is no second git to run).
+#[tokio::test]
+async fn git_stash_push_staged_takes_the_index_and_leaves_the_tree() {
+    if !git_at_least(2, 35) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n");
+
+    // Stage a change at the top, then make one at the bottom that stays unstaged. The distance is
+    // load-bearing: `--staged` removes the stashed change from the tree by reverse-applying its
+    // patch, so an unstaged edit close enough to sit in the same hunk context makes git refuse
+    // with "patch does not apply" — its own limitation, which the server surfaces verbatim.
+    std::fs::write(
+        root.join("a.rs"),
+        "STAGED\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+    )
+    .unwrap();
+    git_stage_file(&root, "a.rs");
+    std::fs::write(
+        root.join("a.rs"),
+        "STAGED\ntwo\nthree\nfour\nfive\nsix\nUNSTAGED\n",
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let pushed: GitStashResult = send_request::<GitStashPush>(
+        &mut ws,
+        2,
+        &GitStashPushParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            message: None,
+            staged: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        pushed.status,
+        GitStashStatus::Pushed,
+        "git said: {}",
+        pushed.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "one\ntwo\nthree\nfour\nfive\nsix\nUNSTAGED\n",
+        "the staged line went back to HEAD; the unstaged edit stayed put"
+    );
+
+    drop(server);
+}
+
+/// The narrower emptiness question `--staged` has to ask: this tree is *not* clean, so the plain
+/// stash would have taken something — but there is nothing in the index, and git would have said
+/// "no local changes" on a successful exit. Reporting a stash that didn't happen sends the user
+/// looking for an entry that doesn't exist.
+#[tokio::test]
+async fn git_stash_push_staged_reports_nothing_to_stash_with_only_unstaged_work() {
+    if !git_at_least(2, 35) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "UNSTAGED\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let pushed: GitStashResult = send_request::<GitStashPush>(
+        &mut ws,
+        2,
+        &GitStashPushParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            message: None,
+            staged: true,
+        },
+    )
+    .await;
+    assert_eq!(pushed.status, GitStashStatus::NothingToStash);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "UNSTAGED\n",
+        "and nothing was taken"
+    );
+
+    drop(server);
+}
+
 /// The whole loop: stash the working tree, see the entry listed, pop it back. Push and pop rewrite
 /// the tree, so both reconcile the open buffer — which is what stops it sitting on content that no
 /// longer exists on disk.
@@ -34013,6 +34110,7 @@ async fn git_stash_push_lists_and_pops() {
             repo_id: Some(repo_id.clone()),
             buffer_id: None,
             message: Some("wip on the thing".into()),
+            staged: false,
         },
     )
     .await;
@@ -34081,6 +34179,7 @@ async fn git_stash_push_on_a_clean_tree_says_so() {
             repo_id: Some(root.to_string_lossy().into_owned()),
             buffer_id: None,
             message: None,
+            staged: false,
         },
     )
     .await;
@@ -34121,6 +34220,7 @@ async fn git_stash_push_refuses_with_unsaved_buffers() {
             repo_id: Some(root.to_string_lossy().into_owned()),
             buffer_id: None,
             message: None,
+            staged: false,
         },
     )
     .await;
@@ -34152,6 +34252,7 @@ async fn git_stash_actions_refuse_a_vanished_entry() {
         repo_id: Some(repo_id.clone()),
         buffer_id: None,
         message: Some(format!("entry {id}")),
+        staged: false,
     };
     let _: GitStashResult = send_request::<GitStashPush>(&mut ws, 2, &push(1)).await;
     std::fs::write(root.join("a.rs"), "AGAIN\n").unwrap();
@@ -34235,6 +34336,7 @@ async fn dropping_a_stash_refreshes_the_open_picker() {
                 repo_id: Some(repo_id.clone()),
                 buffer_id: None,
                 message: Some(format!("entry {id}")),
+                staged: false,
             },
         )
         .await;
@@ -34308,6 +34410,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
                 repo_id: Some(repo_id.clone()),
                 buffer_id: None,
                 message: Some(format!("entry {id}")),
+                staged: false,
             },
         )
         .await;
@@ -34418,6 +34521,26 @@ fn advance_upstream_ref(repo: &git2::Repository) {
 /// environment — hence the repo-local isolation `isolate_repo_config` uses), these spawns are ours,
 /// so they get the strong isolation directly: no global or system config, and an identity from the
 /// environment rather than from whatever the developer has configured.
+/// Whether the installed git is at least `major.minor` — the same gate the server applies before
+/// using a flag that isn't old enough to assume, so a test for one can skip rather than fail on a
+/// machine whose git predates it.
+fn git_at_least(major: u32, minor: u32) -> bool {
+    let Ok(out) = std::process::Command::new("git").arg("--version").output() else {
+        return false;
+    };
+    let line = String::from_utf8_lossy(&out.stdout);
+    let Some(rest) = line.trim().strip_prefix("git version ") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let parsed = (|| {
+        let a: u32 = parts.next()?.trim().parse().ok()?;
+        let b: u32 = parts.next()?.trim().parse().ok()?;
+        Some((a, b))
+    })();
+    parsed.is_some_and(|v| v >= (major, minor))
+}
+
 fn run_git(cwd: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
@@ -35433,13 +35556,83 @@ async fn buffer_status_reports_a_stopped_rebase() {
 async fn staging_a_hunk_in_a_conflicted_file_is_refused() {
     let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
 
-    let res = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Toggle).await;
+    let res = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
     assert_eq!(res.status, ApplyHunkStatus::Conflicted);
 
     let repo = git2::Repository::open(&ours).unwrap();
     assert!(
         repo.index().unwrap().has_conflicts(),
         "the conflict must survive — a stage-0 write would have marked it resolved"
+    );
+
+    drop(server);
+}
+
+/// Unstaging inside a conflicted file is refused at *both* scopes, where staging the whole file
+/// is the one thing that does mean something there ("mark resolved").
+///
+/// There is no stage-0 entry to pull out of, so an unstage has nothing to act on — and the
+/// gesture that puts a conflict back is `Space g d`, not a key that says "unstage". As with the
+/// staging refusal, the surviving conflict stages are the real assertion.
+#[tokio::test]
+async fn unstaging_a_conflicted_file_is_refused_at_both_scopes() {
+    let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
+
+    for (id, scope) in [(4, ApplyScope::Cursor), (5, ApplyScope::File)] {
+        let res = apply_hunk_scoped(&mut ws, id, buffer_id, HunkAction::Unstage, scope).await;
+        assert_eq!(
+            res.status,
+            ApplyHunkStatus::Conflicted,
+            "unstage must be refused at {scope:?}"
+        );
+    }
+
+    let repo = git2::Repository::open(&ours).unwrap();
+    assert!(
+        repo.index().unwrap().has_conflicts(),
+        "the conflict must survive an unstage that was refused"
+    );
+
+    drop(server);
+}
+
+/// The property the direction split exists for: a key that says "stage" only ever stages. Pressed
+/// again on a region it has already staged it reports there is nothing to do — where the old
+/// toggle would silently have unstaged it, undoing the press before it.
+#[tokio::test]
+async fn staging_twice_stages_once_and_then_says_there_is_nothing_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "edit.rs", "alpha\nbeta\ngamma\n");
+    std::fs::write(dir.path().join("edit.rs"), "alpha\nBETA\ngamma\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "twice-proj", "edit.rs").await;
+
+    set_cursor(&mut ws, 3, buffer_id, 1, 2).await;
+    let r = apply_hunk(&mut ws, 4, buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    let staged = index_text(dir.path(), "edit.rs").unwrap();
+    assert_eq!(staged, "alpha\nBETA\ngamma\n");
+
+    let r = apply_hunk(&mut ws, 5, buffer_id, HunkAction::Stage).await;
+    assert_eq!(
+        r.status,
+        ApplyHunkStatus::NoChange,
+        "a second stage has nothing to stage"
+    );
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        staged,
+        "and above all it must not have unstaged what the first press staged"
+    );
+
+    // The mirror: unstaging twice takes it out once and then says the same thing.
+    let r = apply_hunk(&mut ws, 6, buffer_id, HunkAction::Unstage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    let r = apply_hunk(&mut ws, 7, buffer_id, HunkAction::Unstage).await;
+    assert_eq!(r.status, ApplyHunkStatus::NoChange);
+    assert_eq!(
+        index_text(dir.path(), "edit.rs").unwrap(),
+        "alpha\nbeta\ngamma\n",
+        "the repeat left the index at HEAD rather than re-staging"
     );
 
     drop(server);
@@ -35805,12 +35998,12 @@ async fn taking_a_side_outside_a_block_resolves_nothing() {
 async fn marking_resolved_gates_on_markers_then_on_saving() {
     let (server, mut ws, _dir, ours, buffer_id) = setup_stopped_rebase().await;
     // Markers still in the file: refused. This is the one that stops a broken merge being committed.
-    let res = apply_hunk_scoped(&mut ws, 4, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    let res = apply_hunk_scoped(&mut ws, 4, buffer_id, HunkAction::Stage, ApplyScope::File).await;
     assert_eq!(res.status, ApplyHunkStatus::MarkersRemain);
 
     // Resolved in the buffer but not saved: still refused, because git would stage the old bytes.
     let _ = resolve_conflict(&mut ws, 5, buffer_id, ConflictSide::Ours).await;
-    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Stage, ApplyScope::File).await;
     assert_eq!(res.status, ApplyHunkStatus::DirtyBuffer);
 
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -35824,7 +36017,7 @@ async fn marking_resolved_gates_on_markers_then_on_saving() {
         },
     )
     .await;
-    let res = apply_hunk_scoped(&mut ws, 8, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    let res = apply_hunk_scoped(&mut ws, 8, buffer_id, HunkAction::Stage, ApplyScope::File).await;
     assert_eq!(res.status, ApplyHunkStatus::Resolved);
 
     // The real assertion: git no longer considers the file conflicted, so the operation can be
@@ -35888,7 +36081,7 @@ async fn committing_mid_rebase_uses_its_message_and_continues_the_rebase() {
         },
     )
     .await;
-    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    let res = apply_hunk_scoped(&mut ws, 6, buffer_id, HunkAction::Stage, ApplyScope::File).await;
     assert_eq!(res.status, ApplyHunkStatus::Resolved);
 
     // The template is seeded from the rebase's stored message, not blank: this is the commit being
@@ -35946,7 +36139,7 @@ async fn committing_mid_merge_uses_merge_msg_and_ends_the_merge() {
         },
     )
     .await;
-    let _ = apply_hunk_scoped(&mut ws, 24, buffer_id, HunkAction::Toggle, ApplyScope::File).await;
+    let _ = apply_hunk_scoped(&mut ws, 24, buffer_id, HunkAction::Stage, ApplyScope::File).await;
 
     let prepared = prepare_commit(&mut ws, 25, &ours, false).await;
     let template = std::fs::read_to_string(&prepared.path).unwrap();

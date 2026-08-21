@@ -421,49 +421,70 @@ pub enum Action {
     CopyWebUrl,
 
     // ---- git (the verbs live on the `Space g` sub-leader; see [`KeyContext::LeaderGit`]) ----
-    /// `Space g d` — toggle the inline diff.
+    /// `Space i` — toggle the inline diff. On the leader rather than the git sub-leader because
+    /// it's a *view* of the buffer you're in, like `Space v`'s reading view, not an operation on
+    /// the repo: nothing about it writes, and it reads as "inline" rather than as a git verb.
     ToggleDiffView,
     /// `c` / `Alt-c` in Normal — cursor-local hunk navigation, so *not* behind `Space g`: they're
     /// repeatable motions ([`Action::is_repeatable`]) and a three-key prefix would ruin them.
     NextHunk,
     PrevHunk,
-    /// Stage/unstage a change: `Space g s` takes the hunk under the cursor (or the selected
-    /// lines), `Space g a` the whole file — the more common gesture, and the reason the scope is a
+    /// Stage a change: `Space g s` takes the hunk under the cursor (or the selected lines),
+    /// `Space g Alt-s` the whole file — the more common gesture, and the reason the scope is a
     /// parameter rather than a separate action.
-    ToggleStage {
+    StageChange {
         scope: ApplyScope,
     },
-    /// The same two scopes, reverting instead: `Space g Alt-s` and `Space g Alt-a`.
+    /// Unstage, on the same two scopes: `Space g u` and `Space g Alt-u`.
+    ///
+    /// A separate action from [`Action::StageChange`] rather than one toggling key, because a
+    /// toggle's effect depends on index state the user would have to read off the gutter before
+    /// pressing — and the two directions aren't equally cheap to get wrong.
+    UnstageChange {
+        scope: ApplyScope,
+    },
+    /// The same two scopes again, reverting instead: `Space g r` and `Space g Alt-r`. Undoable
+    /// (it's an ordinary buffer edit), which is why it needs no confirm.
     RevertChange {
         scope: ApplyScope,
     },
-    /// Take a side in the merge conflict under the cursor: `Space g o` ours, `Space g t` theirs,
-    /// `Space g Alt-o` both. A selection covering several blocks takes them all — the same
-    /// addressing [`Action::ToggleStage`] uses, which is why neither needs a file-scope key.
+    /// Take a side in the merge conflict under the cursor: `Space g <` ours, `Space g >` theirs,
+    /// `Space g =` both. The keys name the *marker glyphs* rather than the sides, because the
+    /// position of a side is invariant while its meaning is not — during a rebase "ours" is the
+    /// commit you're replaying onto, not your work, and a key reading `o` would be lying in the
+    /// one situation where the distinction matters most.
+    ///
+    /// A selection covering several blocks takes them all — the same addressing
+    /// [`Action::StageChange`] uses, which is why neither needs a file-scope key.
     ResolveConflict {
         side: ConflictSide,
     },
-    /// `Space g Alt-x` — abandon a stopped merge/rebase. The sibling reading of `Space g x`:
-    /// plain cancels what is *running*, Alt abandons what is *stopped*.
+    /// `Space g d` — abandon a stopped merge/rebase (`<op> --abort`).
+    ///
+    /// The one git verb behind a confirm: the reset rewrites the working tree from disk, so every
+    /// conflict resolution made in it is discarded and the undo stack cannot reach any of it. The
+    /// confirm also stands in for the key's history — `d` was the diff toggle until the inline
+    /// diff moved to `Space i`, and old muscle memory must not be able to throw work away.
     GitAbortOperation,
     /// `Space g c` — start a commit: prepare the message file server-side and open it as a buffer.
     /// `amend` (`Space g Alt-c`) rewrites the previous commit instead of adding one.
     GitCommit {
         amend: bool,
     },
-    /// `Space g u` — take back the last commit, leaving its changes staged
-    /// (`git reset --soft HEAD^`).
+    /// `Space g z` — take back the last commit, leaving its changes staged
+    /// (`git reset --soft HEAD^`). No confirm: nothing is discarded, and the commit stays in the
+    /// reflog either way.
     GitUncommit,
     /// `Space g f` — fetch from the remote, refreshing the ahead/behind counts in the status bar.
     /// Touches no file, so unlike the other git verbs it needs no unsaved-work pre-flight. The
     /// periodic fetcher (the `git_auto_fetch` app setting) runs the same operation on a timer.
     GitFetch,
-    /// `Space g p` — publish the current branch's commits (`↑ahead`). Never force-pushes; `Alt-p`
-    /// is deliberately left unbound rather than made the force variant.
+    /// `Space g Alt-p` — publish the current branch's commits (`↑ahead`). Never force-pushes: the
+    /// Alt slot here is the *outward* sibling of pull, not an escalation of it, and force-push has
+    /// no key at all.
     GitPush,
-    /// `Space g Alt-f` — bring the branch up to date with its upstream (`↓behind`). The `Alt` pair
-    /// of fetch, because that's what it is: a fetch that then moves the working tree, which is why
-    /// this one refuses when buffers are unsaved and fetch doesn't.
+    /// `Space g p` — bring the branch up to date with its upstream (`↓behind`). Refuses when
+    /// buffers are unsaved (it moves the working tree, which fetch doesn't).
     ///
     /// Runs plain `git pull`, so the user's own `pull.rebase` decides between merge and rebase.
     GitPull,
@@ -473,10 +494,13 @@ pub enum Action {
     /// to a verb would make it the one key on `Space g` that does something instead of backing
     /// out. Escape belongs to the chord.
     GitCancel,
-    /// `Space g Alt-z` — shelve the working tree (`git stash push`), taking git's own
-    /// `WIP on <branch>` message. The stash *picker* (`Space g z`) is where entries are previewed,
-    /// applied, popped and dropped.
-    GitStashPush,
+    /// `Space g t` — shelve the working tree (`git stash push`), taking git's own
+    /// `WIP on <branch>` message. `staged` (`Space g Alt-t`) narrows it to the index
+    /// (`--staged`, git 2.35+), the "set this half aside" gesture. The stash *picker*
+    /// (`Space g a`) is where entries are previewed, applied, popped and dropped.
+    GitStashPush {
+        staged: bool,
+    },
 
     // ---- LSP ----
     GotoDefinition,
@@ -1275,45 +1299,63 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
     bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
     bind!(L, ch('v'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reading view"),
+    // The inline diff sits beside the reading view, not under `Space g`: both are ways of looking
+    // at the buffer you're already in, and neither writes anything. `i` for *inline* — `d` on the
+    // git sub-leader now abandons a stopped merge, which is not a key to leave a view toggle's
+    // muscle memory pointing at.
+    bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
 ];
 
 /// The `Space g` sub-leader: git operations on the repo. Same plain/Alt sibling convention as the
-/// leader — plain is the common gesture, Alt its variant. Largely magit's alphabet (`s` stage,
-/// `c` commit, `b` branch, `d` diff), which is free muscle memory for anyone arriving from it.
+/// leader — plain is the common gesture, Alt its variant, and the pair always names *one* verb at
+/// two scopes or in two directions (`s`/`Alt-s` stage hunk/file, `l`/`Alt-l` log repo/file).
 ///
-/// Reserved for the remaining stages, so the shape is decided once rather than key by key. `w` was
-/// one of these and is now worktrees (docs/worktrees.md); still held: `Alt-d` diff against a
-/// revision (`git/set_baseline`, already built server-side),
-/// `f`/`Alt-f` fetch/pull,
-/// `p` push (`Alt-p` deliberately left free — force-push is too cheap a chord),
-/// `r` the repo picker, `m` the full-file blame column, `y` copy commit permalink. The
-/// reflog is a filter chip on the log picker rather than a key: it's the same rows over a
-/// different ref walk.
+/// Three keys don't spell their verb, and each buys something for it:
+/// - `<`/`>`/`=` name the conflict markers themselves. Ours/theirs is not a stable idea — during a
+///   rebase "ours" is the branch you're replaying *onto* — but the marker order is: git writes
+///   stage 2 above the `=======` and stage 3 below it for every operation that can conflict. The
+///   keys point at what's on screen. (`|` is free for the diff3 base section, if taking it ever
+///   becomes a verb.)
+/// - `d` abandons a stopped merge. It reads as *discard*, and it is the only key here behind a
+///   confirm — which is also what makes it safe to have taken over the old diff-toggle key.
+/// - `a` is the stash *picker*, one letter off its verb on `t`, because three stash operations
+///   (push, push-staged, browse) don't fit one plain/Alt pair.
+///
+/// Still reserved, so the shape is decided once rather than key by key: `m` the full-file blame
+/// column, `y` copy commit permalink, `Alt-g` (free — the repo picker's likely home now that `r`
+/// is revert). Diffing against a revision (`git/set_baseline`, already built server-side) belongs
+/// with the diff toggle on `Space Alt-i`, not here. The reflog is a filter chip on the log picker
+/// rather than a key: it's the same rows over a different ref walk.
 #[rustfmt::skip]
 static LEADER_GIT: &[Binding] = &[
-    bind!(LG, ch('s'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::Cursor }, "Git", "Stage/unstage change (hunk/selection)"),
-    bind!(LG, ch('s'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::Cursor }, "Git", "Revert change"),
-    bind!(LG, ch('a'), Exact(Mods::NONE), A::ToggleStage { scope: ApplyScope::File }, "Git", "Stage/unstage whole file (mark conflict resolved)"),
-    bind!(LG, ch('a'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::File }, "Git", "Revert whole file"),
-    bind!(LG, ch('o'), Exact(Mods::NONE), A::ResolveConflict { side: ConflictSide::Ours }, "Git", "Conflict: take ours"),
-    bind!(LG, ch('t'), Exact(Mods::NONE), A::ResolveConflict { side: ConflictSide::Theirs }, "Git", "Conflict: take theirs"),
-    bind!(LG, ch('o'), Exact(Mods::ALT), A::ResolveConflict { side: ConflictSide::Both }, "Git", "Conflict: take both"),
+    bind!(LG, ch('s'), Exact(Mods::NONE), A::StageChange { scope: ApplyScope::Cursor }, "Git", "Stage change (hunk/selection)"),
+    bind!(LG, ch('s'), Exact(Mods::ALT), A::StageChange { scope: ApplyScope::File }, "Git", "Stage whole file (mark conflict resolved)"),
+    bind!(LG, ch('u'), Exact(Mods::NONE), A::UnstageChange { scope: ApplyScope::Cursor }, "Git", "Unstage change (hunk/selection)"),
+    bind!(LG, ch('u'), Exact(Mods::ALT), A::UnstageChange { scope: ApplyScope::File }, "Git", "Unstage whole file"),
+    bind!(LG, ch('r'), Exact(Mods::NONE), A::RevertChange { scope: ApplyScope::Cursor }, "Git", "Revert change (hunk/selection)"),
+    bind!(LG, ch('r'), Exact(Mods::ALT), A::RevertChange { scope: ApplyScope::File }, "Git", "Revert whole file"),
+    // `IgnoreShift` on all three: the char already encodes the Shift, and shells differ on whether
+    // they also report the modifier (`<`/`>` are shifted on US layouts, `=` on German and French).
+    // Mirrors the `?` and `}`/`{` bindings.
+    bind!(LG, ch('<'), IgnoreShift(Mods::NONE), A::ResolveConflict { side: ConflictSide::Ours }, "Git", "Conflict: keep the top section (<<<<<<<)"),
+    bind!(LG, ch('>'), IgnoreShift(Mods::NONE), A::ResolveConflict { side: ConflictSide::Theirs }, "Git", "Conflict: keep the bottom section (>>>>>>>)"),
+    bind!(LG, ch('='), IgnoreShift(Mods::NONE), A::ResolveConflict { side: ConflictSide::Both }, "Git", "Conflict: keep both sections"),
     bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
-    bind!(LG, ch('u'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
+    bind!(LG, ch('z'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
-    bind!(LG, ch('f'), Exact(Mods::ALT), A::GitPull, "Git", "Pull from remote"),
-    bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPush, "Git", "Push commits to remote"),
+    bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPull, "Git", "Pull from remote"),
+    bind!(LG, ch('p'), Exact(Mods::ALT), A::GitPush, "Git", "Push commits to remote"),
     bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch, push or pull in progress"),
-    bind!(LG, ch('x'), Exact(Mods::ALT), A::GitAbortOperation, "Git", "Abandon the stopped merge/rebase"),
-    bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches and worktrees"),
-    bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    bind!(LG, ch('d'), Exact(Mods::NONE), A::GitAbortOperation, "Git", "Abandon the stopped merge/rebase"),
+    bind!(LG, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches and worktrees"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
     bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
-    bind!(LG, ch('z'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
-    bind!(LG, ch('z'), Exact(Mods::ALT), A::GitStashPush, "Git", "Stash working tree"),
+    bind!(LG, ch('a'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
+    bind!(LG, ch('t'), Exact(Mods::NONE), A::GitStashPush { staged: false }, "Git", "Stash working tree"),
+    bind!(LG, ch('t'), Exact(Mods::ALT), A::GitStashPush { staged: true }, "Git", "Stash staged changes"),
 ];
 
 #[cfg(test)]
@@ -1616,27 +1658,41 @@ mod tests {
         assert!(lookup(KeyContext::Leader, ch('g'), Mods::ALT).is_none());
 
         let git = |code, mods| lookup(KeyContext::LeaderGit, code, mods).map(|b| b.action);
+        // The index verbs: plain is the hunk under the cursor, Alt the whole file. Stage and
+        // unstage are *separate keys* — pressing `s` twice must never quietly undo the first press,
+        // which is exactly what a toggle on one key would do.
         assert!(matches!(
             git(ch('s'), Mods::NONE),
-            Some(Action::ToggleStage {
+            Some(Action::StageChange {
                 scope: ApplyScope::Cursor
             })
         ));
         assert!(matches!(
             git(ch('s'), Mods::ALT),
-            Some(Action::RevertChange {
-                scope: ApplyScope::Cursor
-            })
-        ));
-        // The same pair one scope wider: `a` takes the whole file, the commoner gesture.
-        assert!(matches!(
-            git(ch('a'), Mods::NONE),
-            Some(Action::ToggleStage {
+            Some(Action::StageChange {
                 scope: ApplyScope::File
             })
         ));
         assert!(matches!(
-            git(ch('a'), Mods::ALT),
+            git(ch('u'), Mods::NONE),
+            Some(Action::UnstageChange {
+                scope: ApplyScope::Cursor
+            })
+        ));
+        assert!(matches!(
+            git(ch('u'), Mods::ALT),
+            Some(Action::UnstageChange {
+                scope: ApplyScope::File
+            })
+        ));
+        assert!(matches!(
+            git(ch('r'), Mods::NONE),
+            Some(Action::RevertChange {
+                scope: ApplyScope::Cursor
+            })
+        ));
+        assert!(matches!(
+            git(ch('r'), Mods::ALT),
             Some(Action::RevertChange {
                 scope: ApplyScope::File
             })
@@ -1650,24 +1706,48 @@ mod tests {
             Some(Action::GitCommit { amend: true })
         ));
         assert!(matches!(
-            git(ch('u'), Mods::NONE),
+            git(ch('z'), Mods::NONE),
             Some(Action::GitUncommit)
         ));
         assert!(matches!(
-            git(ch('b'), Mods::NONE),
+            git(ch('g'), Mods::NONE),
             Some(Action::OpenPicker(PickerKind::GitBranches))
         ));
+        // Pull is plain, push is its outward Alt sibling — not the other way round, and neither is
+        // a force variant.
+        assert!(matches!(git(ch('p'), Mods::NONE), Some(Action::GitPull)));
+        assert!(matches!(git(ch('p'), Mods::ALT), Some(Action::GitPush)));
+        // Stash: the verb on `t`, `--staged` on its Alt, the picker one letter away on `a`.
+        assert!(matches!(
+            git(ch('t'), Mods::NONE),
+            Some(Action::GitStashPush { staged: false })
+        ));
+        assert!(matches!(
+            git(ch('t'), Mods::ALT),
+            Some(Action::GitStashPush { staged: true })
+        ));
+        assert!(matches!(
+            git(ch('a'), Mods::NONE),
+            Some(Action::OpenPicker(PickerKind::GitStash))
+        ));
+        // `d` abandons the stopped operation. It was the diff toggle until the inline diff moved
+        // to `Space i`, which is why the action behind it is confirm-gated in the core.
         assert!(matches!(
             git(ch('d'), Mods::NONE),
+            Some(Action::GitAbortOperation)
+        ));
+        // The inline diff is on the leader now, and nothing on the git sub-leader answers `i`.
+        assert!(matches!(
+            lookup(KeyContext::Leader, ch('i'), Mods::NONE).map(|b| b.action),
             Some(Action::ToggleDiffView)
         ));
+        assert!(git(ch('i'), Mods::NONE).is_none());
         // A key with no git meaning resolves to nothing, so the chord just cancels.
         assert!(git(ch('j'), Mods::NONE).is_none());
 
         // The old single-key homes are free — a stale reflex does nothing rather than something
-        // else (`a` stage, `i` diff, `t` commit, `u` uncommit, `y` branches).
+        // else (`t` commit, `u` uncommit, `y` branches).
         for (code, mods) in [
-            (ch('i'), Mods::NONE),
             (ch('t'), Mods::NONE),
             (ch('t'), Mods::ALT),
             (ch('u'), Mods::NONE),
@@ -1686,6 +1766,53 @@ mod tests {
                 .as_deref(),
             Some("Space g Alt-s")
         );
+    }
+
+    /// The conflict keys name the marker glyphs, and every one of them is a shifted character on
+    /// some layout (`<`/`>` on US, `=` on German and French). Terminals report the resolved char
+    /// *with* SHIFT set while the GUI and web shells report it without — so both must resolve, or
+    /// the keys work in one shell and vanish in another.
+    #[test]
+    fn conflict_keys_are_the_marker_glyphs_and_survive_a_reported_shift() {
+        let git = |code, mods| lookup(KeyContext::LeaderGit, code, mods).map(|b| b.action);
+        for mods in [Mods::NONE, Mods::SHIFT] {
+            assert!(
+                matches!(
+                    git(ch('<'), mods),
+                    Some(Action::ResolveConflict {
+                        side: ConflictSide::Ours
+                    })
+                ),
+                "`<` must take the top section with mods {mods:?}"
+            );
+            assert!(
+                matches!(
+                    git(ch('>'), mods),
+                    Some(Action::ResolveConflict {
+                        side: ConflictSide::Theirs
+                    })
+                ),
+                "`>` must take the bottom section with mods {mods:?}"
+            );
+            assert!(
+                matches!(
+                    git(ch('='), mods),
+                    Some(Action::ResolveConflict {
+                        side: ConflictSide::Both
+                    })
+                ),
+                "`=` must keep both sections with mods {mods:?}"
+            );
+        }
+        // Alt is not a variant of these: the sides are exhausted by three keys, and an Alt-chord
+        // here would only be a mis-press away from a resolution nobody asked for.
+        assert!(git(ch('<'), Mods::ALT).is_none());
+        assert!(git(ch('>'), Mods::ALT).is_none());
+        assert!(git(ch('='), Mods::ALT).is_none());
+        // The letters the sides used to live on are free — `o`/`t` said "ours"/"theirs", which is
+        // the very naming these keys exist to stop using.
+        assert!(git(ch('o'), Mods::NONE).is_none());
+        assert!(git(ch('o'), Mods::ALT).is_none());
     }
 
     #[test]

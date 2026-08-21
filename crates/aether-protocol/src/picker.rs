@@ -131,7 +131,7 @@ pub enum PickerKind {
     /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
     /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
     Jumplist,
-    /// The local branches **and worktrees** of one repo (`Space g b`), fuzzy-matched on branch
+    /// The local branches **and worktrees** of one repo (`Space g g`), fuzzy-matched on branch
     /// name, checked-out branches first then most-recently-committed. The repo is resolved
     /// server-side from [`PickerViewParams::buffer_id`] by the same rule `git/prepare_commit` uses,
     /// so a single-repo workspace never sees a chooser.
@@ -186,7 +186,7 @@ pub enum PickerKind {
     /// against its parent to know whether the path was touched — which is why the cap counts
     /// commits *examined*, not rows produced.
     GitLogFile,
-    /// The repo's stash entries (`Space g z`, docs/git-phase-2.md stage 5), newest first. Rows are
+    /// The repo's stash entries (`Space g a`, docs/git-phase-2.md stage 5), newest first. Rows are
     /// [`PickerItem::GitStash`]; `Enter` previews the entry as a read-only virtual buffer, exactly
     /// as the log picker shows a commit — a stash *is* a commit, so it costs no new read path.
     ///

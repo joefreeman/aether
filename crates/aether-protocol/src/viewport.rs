@@ -142,7 +142,7 @@ pub enum ConflictLine {
 /// per-line markers ([`LogicalLineRender::diff_stage`]) and phantom rows ([`VirtualRow::stage`]).
 /// `Unstaged` is the default and is omitted from the wire, so a stage-unaware renderer degrades
 /// to a single-colour look. Deliberately binary: where the two layers overlap, the unstaged top
-/// layer wins — bright means "`Space g s` will stage this", dim means "staged; `Space g s` pulls it
+/// layer wins — bright means "`Space g s` will stage this", dim means "staged; `Space g u` pulls it
 /// back out".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

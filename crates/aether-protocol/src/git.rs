@@ -229,16 +229,15 @@ pub struct GitSetDiffViewParams {
 
 // ---- git/apply_hunk -----------------------------------------------------------------------------
 
-/// Toggle the staged state of — or revert — the change under the cursor or the selected lines.
+/// Stage, unstage, or revert the change under the cursor or the selected lines.
 /// Cursor-relative like the input commands: the server resolves the client's cursor/selection,
 /// so no positions ride the wire. A bare cursor (anchor == position) addresses the whole hunk it
 /// sits on (a pure deletion belongs to the line its phantom rows render above, or the last line
 /// at end-of-buffer); a wider selection is snapped to whole lines and taken at line granularity.
 ///
-/// Toggle writes the repository index and requires a non-dirty buffer (the index must not hold
-/// content that exists nowhere on disk — the client tells the user to save first). Revert is an
-/// ordinary buffer edit through the undo stack and works on a dirty buffer. The result's
-/// [`ApplyHunkStatus`] reports which direction a toggle resolved to.
+/// Staging and unstaging write the repository index and require a non-dirty buffer (the index must
+/// not hold content that exists nowhere on disk — the client tells the user to save first). Revert
+/// is an ordinary buffer edit through the undo stack and works on a dirty buffer.
 pub struct GitApplyHunk;
 impl RpcMethod for GitApplyHunk {
     const NAME: &'static str = "git/apply_hunk";
@@ -267,9 +266,9 @@ pub enum ApplyScope {
     #[default]
     Cursor,
     /// The whole file, wherever the cursor is — `git add <file>` / `git restore --staged <file>`
-    /// in one keystroke, which is the more common gesture than picking off hunks. Toggling
-    /// resolves its direction over the whole file, unstaged-first, exactly as it does for a hunk:
-    /// anything unstaged stages, and a file with nothing unstaged unstages entirely.
+    /// in one keystroke, which is the more common gesture than picking off hunks. The action is
+    /// read over every change in the file rather than the one under the cursor; otherwise it means
+    /// exactly what it means for a hunk.
     File,
 }
 
@@ -282,24 +281,32 @@ impl ApplyScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HunkAction {
-    /// Flip the addressed change's staged state, unstaged-first (mirroring `Revert`'s layering):
-    /// anything unstaged in the region is staged (index ← buffer, `git add -p`-style); when the
-    /// region holds nothing unstaged, its staged change is pulled back out (index ← HEAD). The
-    /// region's stage is visible in the combined view's colours, so the direction is readable
-    /// before pressing — and reported back via [`ApplyHunkStatus`] after.
-    Toggle,
+    /// Stage the region's unstaged change (index ← buffer, `git add -p`-style; an untracked file's
+    /// empty index baseline makes this the hunk-wise `git add`). A region with nothing unstaged in
+    /// it is [`ApplyHunkStatus::NoChange`] — already-staged is not an error, but it is not work
+    /// either, and saying so beats a silent no-op.
+    Stage,
+    /// Pull the region's staged change back out of the index (index region ← HEAD) — the exact
+    /// inverse of [`Self::Stage`], and `NoChange` when the region holds nothing staged.
+    ///
+    /// Stage and unstage are separate actions rather than one direction-resolving toggle: a toggle
+    /// makes the key's effect depend on index state the user would have to read off the gutter
+    /// first, and the two directions are not equally recoverable (unstaging discards nothing,
+    /// staging can sweep up more than was aimed at). One key, one direction.
+    Unstage,
     /// Restore baseline content in the buffer for the addressed change (undoable edit). Peels the
     /// top layer of the H→I→B change stack: an unstaged change reverts to the index's content;
     /// a staged-only region (buffer == index ≠ HEAD) reverts to HEAD's — pressing again on a
-    /// re-modified region therefore peels unstaged first, then staged. View-independent, like
-    /// `Toggle`.
+    /// re-modified region therefore peels unstaged first, then staged. View-independent, like the
+    /// index actions.
     Revert,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitApplyHunkResult {
-    /// Cursor after the action — unchanged for a toggle, clamped into the edited text for
-    /// revert. Always echoed so the client can adopt it unconditionally (mirrors `lsp/format`).
+    /// Cursor after the action — unchanged for a stage or unstage (neither touches the buffer),
+    /// clamped into the edited text for revert. Always echoed so the client can adopt it
+    /// unconditionally (mirrors `lsp/format`).
     pub cursor: CursorState,
     pub status: ApplyHunkStatus,
 }
@@ -307,15 +314,18 @@ pub struct GitApplyHunkResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyHunkStatus {
-    /// A toggle staged the region's unstaged change(s).
+    /// [`HunkAction::Stage`] staged the region's unstaged change(s).
     Staged,
-    /// A toggle pulled the region's staged change(s) back out of the index.
+    /// [`HunkAction::Unstage`] pulled the region's staged change(s) back out of the index.
     Unstaged,
     /// A revert restored baseline content in the buffer.
     Reverted,
-    /// No matching change under the cursor / in the selection, in either direction.
+    /// Nothing for *this action* to do in the addressed region: no change under the cursor / in
+    /// the selection, or none facing the direction asked for (a stage where everything is already
+    /// staged, an unstage where nothing is). The client words it from the action it sent, since
+    /// only it knows which question was asked.
     NoChange,
-    /// Toggle refused because the buffer has unsaved edits — save first.
+    /// An index write refused because the buffer has unsaved edits — save first.
     DirtyBuffer,
     /// The buffer isn't in a Git repository (or the index write failed).
     Unavailable,
@@ -333,7 +343,8 @@ pub enum ApplyHunkStatus {
     /// show a change (a block resolved by hand diffs against HEAD like any other edit): staging is
     /// all-or-nothing until the file stops being conflicted.
     ///
-    /// Covers per-hunk staging and *both* scopes of revert (there is no baseline to revert to
+    /// Covers per-hunk staging, unstaging at either scope (a conflicted path has no stage-0 entry
+    /// to pull *out* of the index), and *both* scopes of revert (there is no baseline to revert to
     /// mid-conflict — "put this back" would mean discarding the merge). The one action that does
     /// mean something is whole-file staging, which is [`Self::Resolved`].
     Conflicted,
@@ -421,13 +432,13 @@ pub enum ResolveConflictStatus {
 ///
 /// The way out. A conflicted `pull --rebase` leaves HEAD detached and the tree half-applied; every
 /// other git verb then refuses with "you're mid-rebase", and until this existed the only way back
-/// was a terminal. Bound to `Space g Alt-x` — the sibling reading of `x`: cancel what's *running*,
-/// `Alt-x` abandon what's *stopped*.
+/// was a terminal. Bound to `Space g d`.
 ///
 /// Destructive in the way `git checkout` is: it discards the resolution work done so far, so it
-/// carries the same dirty-buffer pre-flight (unsaved edits would be overwritten by the reset).
-/// Nothing else is guarded — abandoning is the point, and the commits it unwinds are the ones the
-/// operation created.
+/// carries the same dirty-buffer pre-flight (unsaved edits would be overwritten by the reset) —
+/// and, alone among the git verbs, a client-side confirm naming the operation and the files still
+/// conflicted. The reset reaches past the undo stack: the buffers are rewritten from disk, so
+/// nothing the editor holds can put a discarded resolution back.
 pub struct GitAbortOperation;
 impl RpcMethod for GitAbortOperation {
     const NAME: &'static str = "git/abort_operation";
@@ -1373,6 +1384,10 @@ pub struct GitShowParams {
 /// Stash the working tree (`git stash push`). Rewrites the working tree, so it carries the same
 /// dirty-buffer pre-flight and reconciliation as a checkout: unsaved buffers would be stranded on a
 /// base that no longer exists on disk.
+///
+/// [`GitStashPushParams::staged`] narrows it to the index (`--staged`), which needs git 2.35 —
+/// below that the flag doesn't exist and the server refuses with [`GitStashStatus::StagedUnsupported`]
+/// rather than letting git fail with an unknown-option usage dump.
 pub struct GitStashPush;
 impl RpcMethod for GitStashPush {
     const NAME: &'static str = "git/stash_push";
@@ -1390,6 +1405,11 @@ pub struct GitStashPushParams {
     /// Optional label. `None` takes git's own `WIP on <branch>: <commit> <subject>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Shelve only what's staged (`git stash push --staged`), leaving unstaged work in the tree.
+    /// The "put this half aside" gesture — it's what you reach for once the index holds a coherent
+    /// change and the tree doesn't yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub staged: bool,
 }
 
 /// Restore a stash into the working tree — `git stash apply`, or `pop` to drop it afterwards.
@@ -1473,11 +1493,15 @@ pub enum GitStashStatus {
     Gone,
     /// git refused (a conflicting apply, most often); `message` carries its text verbatim.
     Refused,
+    /// `staged: true` on a git older than 2.35, which has no `--staged`. Its own status rather than
+    /// a [`Self::Refused`] carrying git's usage dump: the user asked for a thing this git cannot do,
+    /// and that sentence is the client's to write.
+    StagedUnsupported,
 }
 
 // ---- git/worktree_* -----------------------------------------------------------------------------
 
-/// One worktree of a repo family, as the `Space g w` picker lists them.
+/// One worktree of a repo family, as the `Space g g` picker lists them.
 ///
 /// Two identities, and they are not interchangeable (`docs/worktrees.md` §1): `path` is the
 /// [`RepoId`] — one worktree, its own HEAD and index — while `name` is the *admin id*, the

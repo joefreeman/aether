@@ -2305,6 +2305,37 @@ pub struct ChangedFile {
     pub untracked: bool,
 }
 
+/// Whether the index holds anything HEAD doesn't — "is there a staged change here at all".
+///
+/// The emptiness question for `git stash push --staged`, which the combined
+/// [`changed_files_in_repo`] can't answer: a tree with only unstaged edits is not clean, yet holds
+/// nothing that stash would take, and git reports that with a *successful* exit. Untracked files
+/// never count — not being in the index is what untracked means.
+pub fn has_staged_changes(repo_path: &Path) -> bool {
+    let Ok(canonical) = repo_path.canonicalize() else {
+        return false;
+    };
+    let Ok(repo) = git2::Repository::discover(&canonical) else {
+        return false;
+    };
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return false;
+    };
+    statuses.iter().any(|entry| {
+        entry.status().intersects(
+            git2::Status::INDEX_NEW
+                | git2::Status::INDEX_MODIFIED
+                | git2::Status::INDEX_DELETED
+                | git2::Status::INDEX_RENAMED
+                | git2::Status::INDEX_TYPECHANGE,
+        )
+    })
+}
+
 /// Diff every changed file in the repo at `repo_path` against HEAD (combined staged+unstaged),
 /// opening the repo **once** — discovery, the HEAD tree, and the index are resolved a single time
 /// and reused for every file, instead of re-discovering the repo per file (the slow part when a
@@ -3450,6 +3481,36 @@ mod tests {
         let sig = git2::Signature::now("Test", "t@e.com").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
+    }
+
+    /// The case the combined change list gets wrong, and the reason this function exists: an
+    /// unstaged-only tree is *not* clean, but there is nothing in it for `stash push --staged` to
+    /// take — and git would report taking it with a successful exit.
+    #[test]
+    fn has_staged_changes_ignores_unstaged_and_untracked_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo_with_files(root, &[("a.rs", "one\n")]);
+        assert!(
+            !has_staged_changes(root),
+            "a fresh commit leaves nothing staged"
+        );
+
+        // Unstaged edit + an untracked file: the repo has changes, none of them in the index.
+        std::fs::write(root.join("a.rs"), "two\n").unwrap();
+        std::fs::write(root.join("new.rs"), "new\n").unwrap();
+        assert!(
+            !changed_files_in_repo(root).is_empty(),
+            "the repo is not clean"
+        );
+        assert!(!has_staged_changes(root), "but nothing is staged");
+
+        // Stage the edit and the question flips.
+        let repo = git2::Repository::open(root).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+        assert!(has_staged_changes(root));
     }
 
     #[test]

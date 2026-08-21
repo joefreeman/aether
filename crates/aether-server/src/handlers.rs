@@ -5234,16 +5234,34 @@ pub async fn git_stash_push(
             resolve_writable_repo(&s, ctx.client_id, params.repo_id.as_ref(), params.buffer_id)?;
         std::path::PathBuf::from(&repo.repo_id)
     };
+    // `--staged` arrived in git 2.35. Asked before running, because an older git answers an
+    // unknown option with its usage text — a wall of output that says nothing about what the user
+    // pressed. Only probed when the flag is actually wanted: it costs a child process.
+    if params.staged && !crate::git_cli::at_least(&workdir, 2, 35).await {
+        return Ok(GitStashResult {
+            status: GitStashStatus::StagedUnsupported,
+            ..Default::default()
+        });
+    }
     // "Nothing to stash" is a success exit for git, so ask *before* running rather than parsing
     // its narration afterwards: reporting "stashed" when nothing was is a lie the user would act
-    // on (they'd go looking for an entry that doesn't exist).
-    let clean = {
+    // on (they'd go looking for an entry that doesn't exist). `--staged` asks the narrower
+    // question — a tree with only unstaged work is not clean, but it holds nothing this stash
+    // would take.
+    let nothing_to_stash = {
         let workdir = workdir.clone();
-        tokio::task::spawn_blocking(move || crate::git::changed_files_in_repo(&workdir).is_empty())
-            .await
-            .unwrap_or(false)
+        let staged = params.staged;
+        tokio::task::spawn_blocking(move || {
+            if staged {
+                !crate::git::has_staged_changes(&workdir)
+            } else {
+                crate::git::changed_files_in_repo(&workdir).is_empty()
+            }
+        })
+        .await
+        .unwrap_or(false)
     };
-    if clean {
+    if nothing_to_stash {
         return Ok(GitStashResult {
             status: GitStashStatus::NothingToStash,
             ..Default::default()
@@ -5251,6 +5269,9 @@ pub async fn git_stash_push(
     }
 
     let mut args = vec!["stash".to_string(), "push".to_string()];
+    if params.staged {
+        args.push("--staged".to_string());
+    }
     if let Some(message) = params.message.as_deref().filter(|m| !m.trim().is_empty()) {
         args.push("-m".to_string());
         args.push(message.to_string());
@@ -6577,16 +6598,19 @@ pub async fn git_navigate_hunk(
     })
 }
 
-/// Toggle the staged state of — or revert — the change under the cursor (bare cursor → the whole
-/// hunk it sits on) or the selected lines (any wider selection, snapped to whole lines). The
-/// server resolves the client's cursor/selection authoritatively — no positions in the params.
+/// Stage, unstage or revert the change under the cursor (bare cursor → the whole hunk it sits on)
+/// or the selected lines (any wider selection, snapped to whole lines). The server resolves the
+/// client's cursor/selection authoritatively — no positions in the params.
 ///
-/// - **Toggle** flips the region's staged state, unstaged-first: anything unstaged is staged
-///   (index ← buffer, resolved against the index→buffer diff); otherwise the region's staged
-///   change is pulled back out (index region ← HEAD, resolved against the HEAD→index diff with
-///   the cursor/selection carried from buffer to index coordinates across any unstaged edits).
-///   Requires a non-dirty buffer: the index must never hold content that exists nowhere on disk.
-///   The result status reports which direction it resolved to.
+/// - **Stage** writes the region's unstaged change into the index (index ← buffer, resolved
+///   against the index→buffer diff).
+/// - **Unstage** pulls the region's staged change back out (index region ← HEAD, resolved against
+///   the HEAD→index diff with the cursor/selection carried from buffer to index coordinates across
+///   any unstaged edits — the region is addressed in buffer lines, and the two coordinate spaces
+///   differ by exactly the unstaged edits).
+///
+///   Both require a non-dirty buffer: the index must never hold content that exists nowhere on
+///   disk. A region with nothing facing the requested direction is `NoChange`, not an error.
 /// - **Revert** peels the top layer of the HEAD→index→buffer stack as an ordinary undoable
 ///   buffer edit: unstaged changes revert to the index's content; a staged-only region reverts
 ///   to HEAD's. Works on a dirty buffer.
@@ -6626,9 +6650,8 @@ pub async fn git_apply_hunk(
     // Bare cursor (the editor's resting single-char selection) addresses the whole hunk; anything
     // wider snaps to its line span and stages/reverts at line granularity.
     let sel = match params.scope {
-        // Every line, wherever the cursor is. The direction logic below is unchanged: a file
-        // holding anything unstaged stages entirely, one holding only staged changes unstages
-        // entirely — the hunk rule, read over the whole file.
+        // Every line, wherever the cursor is — the hunk rule read over the whole file, with the
+        // action itself unchanged: stage takes everything unstaged, unstage everything staged.
         ApplyScope::File => crate::git::HunkSelection::Lines {
             lo: 0,
             hi: u32::MAX,
@@ -6650,21 +6673,24 @@ pub async fn git_apply_hunk(
     };
     let head_blob = baseline.blob.clone();
     let index_blob = baseline.index_blob.clone();
-    // Staging into the index requires the gutter to *be* about the index. Against a pinned
-    // revision both blobs hold that commit's content, so a toggle would write the merge of it and
-    // the buffer into the index — content the user never asked to stage. Revert stays meaningful
-    // ("put this hunk back to how it was at that commit") and falls through.
-    if baseline.rev.is_some() && matches!(params.action, HunkAction::Toggle) {
+    // Index writes require the gutter to *be* about the index. Against a pinned revision both
+    // blobs hold that commit's content, so staging would write the merge of it and the buffer into
+    // the index — content the user never asked to stage — and there is no index relationship to
+    // unstage out of either. Revert stays meaningful ("put this hunk back to how it was at that
+    // commit") and falls through.
+    if baseline.rev.is_some() && !matches!(params.action, HunkAction::Revert) {
         return Ok(outcome(&s, ApplyHunkStatus::NotAgainstHead));
     }
     // A conflicted path is a different world: there is no stage-0 index entry and no baseline, so
     // nothing here has its usual meaning. Whole-file staging becomes "mark resolved" — the identical
     // git command with the identical intent, "make the index match my file" — and everything else
-    // is refused rather than quietly doing something the key doesn't name.
+    // is refused rather than quietly doing something the key doesn't name. Unstaging is refused at
+    // *both* scopes: with no stage-0 entry there is nothing to pull out, and the inverse gesture
+    // (putting the conflict back) is `Space g d`, not a key that says "unstage".
     if crate::git::path_has_conflict(&repo.workdir, &repo.rel_path) {
         if !matches!(
             (params.action, params.scope),
-            (HunkAction::Toggle, ApplyScope::File)
+            (HunkAction::Stage, ApplyScope::File)
         ) {
             return Ok(outcome(&s, ApplyHunkStatus::Conflicted));
         }
@@ -6701,21 +6727,30 @@ pub async fn git_apply_hunk(
     }
 
     match params.action {
-        HunkAction::Toggle => {
+        action @ (HunkAction::Stage | HunkAction::Unstage) => {
             if dirty {
                 return Ok(outcome(&s, ApplyHunkStatus::DirtyBuffer));
             }
             let index_bytes = index_blob.as_deref().unwrap_or(b"");
-            // Unstaged-first, mirroring revert's layering: stage anything unstaged in the region
-            // (index ← buffer; an untracked file's empty index baseline makes this the hunk-wise
-            // `git add`). When the region holds nothing unstaged, pull its staged change back out
-            // (index region ← HEAD) — the cursor/selection lives in buffer lines, so carry it to
-            // index lines across the unstaged (index→buffer) diff first.
-            let staged_merge =
-                crate::git::merge_selected(index_bytes, buffer_text.as_bytes(), &sel, true);
-            let (merged, status) = match staged_merge {
-                Some(content) => (content, ApplyHunkStatus::Staged),
-                None => {
+            let (merged, status) = match action {
+                // Stage: index ← buffer over the region. An untracked file's empty index baseline
+                // makes this the hunk-wise `git add`.
+                HunkAction::Stage => {
+                    match crate::git::merge_selected(
+                        index_bytes,
+                        buffer_text.as_bytes(),
+                        &sel,
+                        true,
+                    ) {
+                        Some(content) => (content, ApplyHunkStatus::Staged),
+                        // Nothing unstaged in the region — already staged, or not a change at all.
+                        None => return Ok(outcome(&s, ApplyHunkStatus::NoChange)),
+                    }
+                }
+                // Unstage: index region ← HEAD. The region is addressed in *buffer* lines, so carry
+                // it into index lines across the unstaged (index→buffer) diff first — the two
+                // coordinate spaces differ by exactly the edits that haven't been staged.
+                _ => {
                     let unstaged =
                         crate::git::diff_hunks(Some(index_bytes), &s.doc_of(buffer_id).text);
                     let sel_index = match sel {
@@ -6827,8 +6862,9 @@ pub async fn git_apply_hunk(
     }
 }
 
-/// Take a side in the conflict block(s) the cursor or selection addresses (`Space g o` / `t` /
-/// `Alt-o`).
+/// Take a side in the conflict block(s) the cursor or selection addresses (`Space g <` / `>` /
+/// `=`, keyed to the marker glyphs rather than to ours/theirs — the side's *position* is invariant
+/// across merge, rebase and cherry-pick where its meaning is not).
 ///
 /// Deliberately an ordinary buffer edit, applied through the same whole-document replacement path as
 /// `git/apply_hunk`'s revert and tagged [`EditKindTag::Resolve`] so each take is one undo step.
@@ -6866,7 +6902,7 @@ pub async fn git_resolve_conflict(
         .copied()
         .unwrap_or_default();
     // `git/apply_hunk`'s addressing rule: a bare cursor takes the block it's in, a wider selection
-    // takes every block it touches — so select-all then `Space g t` is "all of theirs".
+    // takes every block it touches — so select-all then `Space g >` is "all of the bottom side".
     let (lo, hi) = if cursor.is_point() {
         (cursor.position.line, cursor.position.line)
     } else {

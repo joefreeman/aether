@@ -251,7 +251,14 @@ pub enum Event {
     },
     /// Any `git/stash_*` outcome. One event for all three because the client does the same thing
     /// with each: toast what happened, and refresh the stash picker if it's open.
-    StashDone(Result<GitStashResult, String>),
+    ///
+    /// `staged` distinguishes the two pushes, which is a wording difference the *result* can't
+    /// carry: "stashed the working tree" after a `--staged` push would claim the unstaged work
+    /// went with it, when it is still sitting there.
+    StashDone {
+        staged: bool,
+        result: Result<GitStashResult, String>,
+    },
     /// A `Space g f` fetch finished. Only the *asked-for* fetch reports: the periodic one runs
     /// server-side and speaks through the status bar, since a toast every quarter of an hour is
     /// exactly the interruption a background refresh is supposed to avoid.
@@ -279,7 +286,7 @@ pub enum Event {
         side: ConflictSide,
         result: Result<GitResolveConflictResult, String>,
     },
-    /// `Space g Alt-x`: a stopped merge/rebase was abandoned (or refused).
+    /// `Space g d`: a stopped merge/rebase was abandoned (or refused).
     OperationAborted(Result<GitAbortOperationResult, String>),
     DiffViewSet {
         enabled: bool,
@@ -1313,10 +1320,16 @@ impl Session {
                 },
             },
 
-            Event::StashDone(result) => match result {
+            Event::StashDone { staged, result } => match result {
                 Ok(r) => {
                     let (msg, kind) = match r.status {
+                        GitStashStatus::Pushed if staged => {
+                            ("Stashed staged changes", ToastKind::Success)
+                        }
                         GitStashStatus::Pushed => ("Stashed working tree", ToastKind::Success),
+                        GitStashStatus::NothingToStash if staged => {
+                            ("Nothing staged to stash", ToastKind::Info)
+                        }
                         GitStashStatus::NothingToStash => ("Nothing to stash", ToastKind::Info),
                         GitStashStatus::Applied => ("Applied stash", ToastKind::Success),
                         GitStashStatus::Popped => ("Popped stash", ToastKind::Success),
@@ -1327,6 +1340,12 @@ impl Session {
                         // The picker was showing a snapshot; something removed the entry since.
                         GitStashStatus::Gone => ("That stash is gone", ToastKind::Warning),
                         GitStashStatus::Refused => ("", ToastKind::Error),
+                        // Names the version, because the fix is entirely outside the editor and
+                        // "unsupported" alone would send them looking for a setting.
+                        GitStashStatus::StagedUnsupported => (
+                            "Stashing only staged changes needs git 2.35 or newer",
+                            ToastKind::Warning,
+                        ),
                     };
                     if r.status == GitStashStatus::Refused {
                         return Effects::error(r.message);
@@ -1499,8 +1518,8 @@ impl Session {
             } => match result {
                 Ok(r) => {
                     self.buffer.cursor = r.cursor;
-                    // The wording names what was acted on — "Staged file" after `Space g a` and
-                    // "Staged change" after `Space g s` — because at a glance the toast is the
+                    // The wording names what was acted on — "Staged file" after `Space g Alt-s`
+                    // and "Staged change" after `Space g s` — because at a glance the toast is the
                     // only confirmation of *how much* just moved into the index.
                     let whole_file = scope == ApplyScope::File;
                     let (msg, kind) = match r.status {
@@ -1516,11 +1535,16 @@ impl Session {
                         ApplyHunkStatus::Staged => ("Staged change", ToastKind::Success),
                         ApplyHunkStatus::Unstaged => ("Unstaged change", ToastKind::Success),
                         ApplyHunkStatus::Reverted => ("Reverted change", ToastKind::Success),
+                        // Worded from the action *sent*, which is the only thing that knows which
+                        // question was asked: with explicit directions, "no change here" on a
+                        // hunk that's sitting there staged would read as a bug.
                         ApplyHunkStatus::NoChange => (
                             match (action, whole_file) {
-                                (HunkAction::Toggle, false) => "No change here",
+                                (HunkAction::Stage, false) => "Nothing to stage here",
+                                (HunkAction::Unstage, false) => "Nothing to unstage here",
                                 (HunkAction::Revert, false) => "No change to revert here",
-                                (HunkAction::Toggle, true) => "Nothing to stage in this file",
+                                (HunkAction::Stage, true) => "Nothing to stage in this file",
+                                (HunkAction::Unstage, true) => "Nothing to unstage in this file",
                                 (HunkAction::Revert, true) => "Nothing to revert in this file",
                             },
                             ToastKind::Info,
@@ -1562,15 +1586,19 @@ impl Session {
                         // user, and reaching zero is what says the file is done. No instructions:
                         // the keys that do the next step are the ones they just used.
                         ResolveConflictStatus::Resolved => {
+                            // Positional, like the keys: "ours" is the word the `<`/`>` bindings
+                            // exist to avoid, and during a rebase it names the side that *isn't*
+                            // the user's work. The marker order never moves, so this is always
+                            // true and always checkable against what's on screen.
                             let kept = match side {
-                                ConflictSide::Ours => "ours",
-                                ConflictSide::Theirs => "theirs",
-                                ConflictSide::Both => "both sides",
+                                ConflictSide::Ours => "the top section",
+                                ConflictSide::Theirs => "the bottom section",
+                                ConflictSide::Both => "both sections",
                             };
                             let took = if r.resolved == 1 {
-                                format!("Took {kept}")
+                                format!("Kept {kept}")
                             } else {
-                                format!("Took {kept} for {} conflicts", r.resolved)
+                                format!("Kept {kept} in {} conflicts", r.resolved)
                             };
                             let left = match r.remaining {
                                 0 => "none left".to_string(),
@@ -3332,6 +3360,28 @@ impl Session {
 
     /// `Space m` — blame the cursor line and resolve the commit's details, one round-trip
     /// (`include_commit_info`, docs/protocol-composites.md, G).
+    /// The multi-step operation this buffer's repo is stopped in, if any — read off the status the
+    /// window already carries, which is the same fact the status bar is displaying.
+    ///
+    /// `None` covers both "nothing is stopped" and "we have no window yet to say so"; the caller
+    /// treats them alike, because the server re-checks before doing anything either way.
+    fn stopped_operation(&self) -> Option<GitRepoOperation> {
+        self.window.as_ref()?.git_status.as_ref()?.operation
+    }
+
+    /// `git/abort_operation` for the buffer's repo — reached from `Space g d` once its confirm is
+    /// accepted, or directly when there was no operation to confirm about.
+    fn abort_operation(&mut self, buffer_id: BufferId) -> Effects {
+        self.request_str::<GitAbortOperation>(
+            GitAbortOperationParams {
+                // Resolved server-side from the buffer we're on, like every other git verb.
+                repo_id: None,
+                buffer_id: Some(buffer_id),
+            },
+            Event::OperationAborted,
+        )
+    }
+
     pub fn show_commit_info(&mut self) -> Effects {
         self.request_str::<GitBlameLine>(
             GitBlameLineParams {
@@ -5152,7 +5202,12 @@ impl Session {
                     pop,
                 };
                 let hide = self.close_picker();
-                return hide.and(self.request_str::<GitStashApply>(params, Event::StashDone));
+                return hide.and(self.request_str::<GitStashApply>(params, |result| {
+                    Event::StashDone {
+                        staged: false,
+                        result,
+                    }
+                }));
             }
             // `Ctrl-d` deletes the highlighted thing, as in every other picker — behind a confirm,
             // because a dropped stash is not something the editor can give back.
@@ -7745,8 +7800,12 @@ impl Session {
                     buffer_id: None,
                     oid,
                 },
-                Event::StashDone,
+                |result| Event::StashDone {
+                    staged: false,
+                    result,
+                },
             ),
+            ConfirmAction::AbandonOperation { buffer_id } => self.abort_operation(buffer_id),
             ConfirmAction::ReloadDiscard => self.reload(true),
             ConfirmAction::CloseDiscard => self.close_buffer(),
             ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
@@ -8835,11 +8894,11 @@ impl Session {
                     Event::HunkNav,
                 )
             }
-            A::ToggleStage { scope } | A::RevertChange { scope } => {
-                let hunk_action = if matches!(action, A::ToggleStage { .. }) {
-                    HunkAction::Toggle
-                } else {
-                    HunkAction::Revert
+            A::StageChange { scope } | A::UnstageChange { scope } | A::RevertChange { scope } => {
+                let hunk_action = match action {
+                    A::StageChange { .. } => HunkAction::Stage,
+                    A::UnstageChange { .. } => HunkAction::Unstage,
+                    _ => HunkAction::Revert,
                 };
                 self.request_str::<GitApplyHunk>(
                     GitApplyHunkParams {
@@ -8860,16 +8919,27 @@ impl Session {
                 move |result| Event::ConflictResolved { side, result },
             ),
 
-            A::GitAbortOperation => self.request_str::<GitAbortOperation>(
-                GitAbortOperationParams {
-                    // Resolved server-side from the buffer we're on, like every other git verb.
-                    repo_id: None,
-                    buffer_id: Some(buffer_id),
-                },
-                Event::OperationAborted,
-            ),
+            // The one git verb that asks first. The abort resets the working tree from disk, so
+            // every conflict resolution in it goes and the undo stack can't reach any of it — and
+            // unlike the other destructive keys (revert is undoable, a stash is stored, an
+            // uncommit keeps its changes), there is nothing to reach for afterwards.
+            //
+            // Confirmed only when we know an operation is stopped: the status bar's indicator is
+            // that knowledge, and it's also what names the operation in the question. With none in
+            // flight the request goes straight out and the server answers `NothingInProgress` —
+            // there is nothing to lose and so nothing to ask about.
+            A::GitAbortOperation => {
+                if let Some(operation) = self.stopped_operation() {
+                    self.prompt = Some(Prompt::Confirm {
+                        kind: ConfirmKind::AbandonOperation { operation },
+                        action: ConfirmAction::AbandonOperation { buffer_id },
+                    });
+                    return Effects::none();
+                }
+                self.abort_operation(buffer_id)
+            }
 
-            A::GitStashPush => self.request_str::<GitStashPush>(
+            A::GitStashPush { staged } => self.request_str::<GitStashPush>(
                 GitStashPushParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
                     repo_id: None,
@@ -8877,8 +8947,9 @@ impl Session {
                     // No prompt: `git stash` with no message is the common gesture, and git's own
                     // `WIP on <branch>` names the entry well enough to recognise in the picker.
                     message: None,
+                    staged,
                 },
-                Event::StashDone,
+                move |result| Event::StashDone { staged, result },
             ),
 
             // One announced operation at a time. Not a server rule but a client one, because the

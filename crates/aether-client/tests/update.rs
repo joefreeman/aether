@@ -4189,13 +4189,13 @@ fn changes_pickers_open_fresh_and_centre_on_the_cursor() {
     }
 }
 
-/// `Space g b` opens the branch picker, carrying the active buffer as the repo-resolution hint —
+/// `Space g g` opens the branch picker, carrying the active buffer as the repo-resolution hint —
 /// the same rule `git/prepare_commit` uses, so the client never needs to know repo ids.
 #[test]
-fn space_g_b_opens_the_branch_picker() {
+fn space_g_g_opens_the_branch_picker() {
     let mut s = session();
-    let fx = git_leader(&mut s, 'b');
-    let view = find_request(&fx, "picker/view").expect("Space g b opens a picker");
+    let fx = git_leader(&mut s, 'g');
+    let view = find_request(&fx, "picker/view").expect("Space g g opens a picker");
     assert_eq!(view["kind"], json!("git_branches"));
     assert_eq!(
         view["buffer_id"],
@@ -5358,12 +5358,20 @@ fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
     );
     assert!(fx.0.is_empty(), "the prefix alone does nothing");
 
-    let fx = s.on_key(KeyCode::Char('d'), Mods::NONE, Some("d".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('f'), Mods::NONE, Some("f".into()), ROWS);
     assert!(
-        find_request(&fx, "git/set_diff_view").is_some(),
-        "Space g d toggles the inline diff"
+        find_request(&fx, "git/fetch").is_some(),
+        "Space g f fetches"
     );
     assert!(matches!(s.pending, Pending::None), "the chord is spent");
+
+    // The inline diff left the sub-leader for `Space i` — one key, no prefix.
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
+    assert!(
+        find_request(&fx, "git/set_diff_view").is_some(),
+        "Space i toggles the inline diff"
+    );
 
     // An unbound second key cancels: no request, and `j` must not move the cursor either.
     let _ = key(&mut s, ' ');
@@ -5376,20 +5384,56 @@ fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
     assert!(matches!(s.pending, Pending::None));
 }
 
-/// `Space g s` / `Space g Alt-s` stage and revert the change at the cursor — the pair that used to
-/// live on `Space a` / `Space Alt-a`.
+/// The index verbs are one key each, in one direction each: `s` stages, `u` unstages, `r` reverts,
+/// and Alt widens the same verb to the whole file. Nothing here resolves a direction from state —
+/// pressing `s` twice must stage twice, not stage and then quietly undo it.
 #[test]
-fn space_g_s_stages_and_alt_s_reverts() {
+fn space_g_stages_unstages_and_reverts_at_two_scopes() {
     let mut s = session();
-    let fx = git_leader(&mut s, 's');
-    let params = find_request(&fx, "git/apply_hunk").expect("Space g s stages");
-    assert_eq!(params["action"], json!("toggle"));
+    let hunk = |s: &mut Session, ch: char, mods: Mods| {
+        let _ = key(s, ' ');
+        let _ = key(s, 'g');
+        let text = (mods == Mods::NONE).then(|| ch.to_string());
+        let fx = s.on_key(KeyCode::Char(ch), mods, text, ROWS);
+        let params = find_request(&fx, "git/apply_hunk").expect("git/apply_hunk fired");
+        (
+            params["action"].as_str().unwrap().to_string(),
+            params
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cursor")
+                .to_string(),
+        )
+    };
 
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
-    let params = find_request(&fx, "git/apply_hunk").expect("Space g Alt-s reverts");
-    assert_eq!(params["action"], json!("revert"));
+    assert_eq!(
+        hunk(&mut s, 's', Mods::NONE),
+        ("stage".into(), "cursor".into())
+    );
+    assert_eq!(
+        hunk(&mut s, 's', Mods::ALT),
+        ("stage".into(), "file".into())
+    );
+    assert_eq!(
+        hunk(&mut s, 'u', Mods::NONE),
+        ("unstage".into(), "cursor".into())
+    );
+    assert_eq!(
+        hunk(&mut s, 'u', Mods::ALT),
+        ("unstage".into(), "file".into())
+    );
+    assert_eq!(
+        hunk(&mut s, 'r', Mods::NONE),
+        ("revert".into(), "cursor".into())
+    );
+    assert_eq!(
+        hunk(&mut s, 'r', Mods::ALT),
+        ("revert".into(), "file".into())
+    );
+
+    // Twice in a row is twice the same request — the property a toggle could not have.
+    assert_eq!(hunk(&mut s, 's', Mods::NONE).0, "stage");
+    assert_eq!(hunk(&mut s, 's', Mods::NONE).0, "stage");
 }
 
 #[test]
@@ -5559,14 +5603,157 @@ fn a_finished_fetch_reports_what_it_found() {
 }
 
 #[test]
-fn space_g_p_pushes() {
+fn space_g_alt_p_pushes() {
     let mut s = session();
     let _ = key(&mut s, ' ');
     let _ = key(&mut s, 'g');
-    let fx = key(&mut s, 'p');
+    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
     let req = find_request(&fx, "git/push").expect("git/push fired");
     assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
     assert!(req.get("buffer_id").is_some());
+}
+
+/// `Space g d` is the one git verb that asks first, and it asks *because of what it reaches*: the
+/// abort resets the working tree from disk, so conflict resolutions in it are past the undo stack.
+/// The question names the operation, which is also the only way the user can tell which of a merge
+/// and a rebase they are about to throw away.
+#[test]
+fn abandoning_a_stopped_operation_confirms_and_names_it() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitBufferStatus, GitRepoOperation};
+    use aether_protocol::viewport::Window;
+
+    let window = |operation| Window {
+        first_logical_line: 0,
+        last_logical_line_exclusive: 1,
+        line_count: 1,
+        max_scroll_logical_line: 0,
+        total_visual_rows: 1,
+        first_visual_row: 0,
+        max_line_width: 0,
+        git_status: Some(GitBufferStatus {
+            operation,
+            ..Default::default()
+        }),
+        lines: vec![],
+    };
+
+    let mut s = session();
+    s.window = Some(window(Some(GitRepoOperation::Rebase)));
+    let fx = git_leader(&mut s, 'd');
+    assert!(
+        find_request(&fx, "git/abort_operation").is_none(),
+        "nothing is abandoned before the question is answered"
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::AbandonOperation { operation },
+            ..
+        }) => assert_eq!(*operation, GitRepoOperation::Rebase),
+        other => panic!("expected an abandon confirm, got {other:?}"),
+    }
+
+    // Accepting sends it, resolved from the buffer like every other git verb.
+    let fx = s.on_event(Event::PromptAccept);
+    let params = find_request(&fx, "git/abort_operation").expect("the confirmed abort runs");
+    assert_eq!(params["buffer_id"], json!(s.buffer.buffer_id));
+    assert!(params.get("repo_id").is_none_or(|v| v.is_null()));
+
+    // Declining leaves the repo exactly as it was.
+    s.window = Some(window(Some(GitRepoOperation::Merge)));
+    let _ = git_leader(&mut s, 'd');
+    let fx = s.on_event(Event::PromptCancel);
+    assert!(find_request(&fx, "git/abort_operation").is_none());
+    assert!(s.prompt.is_none(), "declining closes the prompt");
+
+    // With nothing stopped there is nothing to lose, so the key goes straight through and lets the
+    // server answer "nothing in progress".
+    s.window = Some(window(None));
+    let fx = git_leader(&mut s, 'd');
+    assert!(s.prompt.is_none(), "no operation, no question");
+    assert!(find_request(&fx, "git/abort_operation").is_some());
+}
+
+/// The stash pair: `t` takes the working tree, `Alt-t` only what's staged. The flag has to reach
+/// the wire *and* the wording, because "stashed the working tree" after a `--staged` push would
+/// claim the unstaged work went too — when it is still sitting in the buffer.
+#[test]
+fn space_g_t_stashes_the_tree_and_alt_t_only_the_index() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitStashResult, GitStashStatus};
+
+    let mut s = session();
+    let fx = git_leader(&mut s, 't');
+    let params = find_request(&fx, "git/stash_push").expect("Space g t stashes");
+    assert!(
+        params.get("staged").is_none_or(|v| v == &json!(false)),
+        "the plain stash takes the whole tree"
+    );
+
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "git/stash_push").expect("Space g Alt-t stashes the index");
+    assert_eq!(params["staged"], json!(true));
+
+    let toast = |s: &mut Session, staged, status| {
+        toast_messages(&s.on_event(Event::StashDone {
+            staged,
+            result: Ok(GitStashResult {
+                status,
+                ..Default::default()
+            }),
+        }))
+        .join(" ")
+    };
+    assert!(toast(&mut s, false, GitStashStatus::Pushed).contains("working tree"));
+    let msg = toast(&mut s, true, GitStashStatus::Pushed);
+    assert!(msg.contains("staged changes"), "got {msg:?}");
+    assert!(!msg.contains("working tree"), "got {msg:?}");
+    // The narrower emptiness answer, for the tree that has changes but none of them staged.
+    let msg = toast(&mut s, true, GitStashStatus::NothingToStash);
+    assert!(msg.contains("Nothing staged"), "got {msg:?}");
+    // And the git that is too old for the flag names the version, since the fix is outside here.
+    let msg = toast(&mut s, true, GitStashStatus::StagedUnsupported);
+    assert!(msg.contains("2.35"), "got {msg:?}");
+}
+
+/// "No change here" is the wrong sentence once the directions are separate keys: on a hunk that is
+/// sitting there staged, `Space g s` has nothing to do and `Space g u` has plenty. The toast is
+/// worded from the action that was sent, which is the only thing that knows which was asked.
+#[test]
+fn nothing_to_do_is_worded_from_the_direction_asked_for() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{ApplyHunkStatus, ApplyScope, GitApplyHunkResult, HunkAction};
+
+    let mut s = session();
+    let toast = |s: &mut Session, action, scope| {
+        toast_messages(&s.on_event(Event::HunkApplied {
+            action,
+            scope,
+            result: Ok(GitApplyHunkResult {
+                cursor: Default::default(),
+                status: ApplyHunkStatus::NoChange,
+            }),
+        }))
+        .join(" ")
+    };
+
+    let stage = toast(&mut s, HunkAction::Stage, ApplyScope::Cursor);
+    let unstage = toast(&mut s, HunkAction::Unstage, ApplyScope::Cursor);
+    assert!(
+        stage.contains("stage") && !stage.contains("unstage"),
+        "got {stage:?}"
+    );
+    assert!(unstage.contains("unstage"), "got {unstage:?}");
+    assert_ne!(
+        stage, unstage,
+        "the two directions must not share a sentence"
+    );
+
+    // The file scope says so, so "nothing here" can't be read as "nothing at the cursor".
+    assert!(toast(&mut s, HunkAction::Unstage, ApplyScope::File).contains("in this file"));
 }
 
 /// `Esc` on the git sub-leader backs out — it must never be a verb.
@@ -5674,22 +5861,19 @@ fn push_outcomes_name_their_next_step() {
 /// modifier, and the one that moves the working tree is the one it would be worst to fire by
 /// accident.
 #[test]
-fn space_g_alt_f_pulls_and_plain_f_still_fetches() {
+fn space_g_p_pulls_and_f_still_fetches() {
     let mut s = session();
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('f'), Mods::ALT, None, ROWS);
+    let fx = git_leader(&mut s, 'p');
     let req = find_request(&fx, "git/pull").expect("git/pull fired");
     assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
     assert!(req.get("buffer_id").is_some());
     assert!(
         find_request(&fx, "git/fetch").is_none(),
-        "Alt-f must not also fetch"
+        "pull must not also fetch"
     );
 
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'g');
-    let fx = key(&mut s, 'f');
+    // Fetch keeps its own key: it's the one remote verb that moves nothing.
+    let fx = git_leader(&mut s, 'f');
     assert!(find_request(&fx, "git/fetch").is_some());
     assert!(find_request(&fx, "git/pull").is_none());
 }
@@ -5906,7 +6090,7 @@ fn staging_a_conflicted_file_explains_the_refusal() {
     let mut s = session();
     let toast = |s: &mut Session, status| {
         toast_messages(&s.on_event(Event::HunkApplied {
-            action: HunkAction::Toggle,
+            action: HunkAction::Stage,
             scope: ApplyScope::File,
             result: Ok(GitApplyHunkResult {
                 cursor: Default::default(),
@@ -5949,9 +6133,15 @@ fn resolving_a_conflict_names_the_side_and_what_remains() {
         result: result(1, 2),
     }))
     .join(" ");
+    // Positional wording, matching the keys: "theirs" is exactly the word that would be wrong
+    // mid-rebase, where the bottom section holds the user's own commit.
     assert!(
-        msg.contains("theirs") && msg.contains("2 left"),
+        msg.contains("bottom section") && msg.contains("2 left"),
         "got {msg:?}"
+    );
+    assert!(
+        !msg.contains("theirs"),
+        "ours/theirs must not resurface: {msg:?}"
     );
 
     // Reaching zero is the signal the file is done, and a multi-block take says how many it took.
@@ -5961,7 +6151,7 @@ fn resolving_a_conflict_names_the_side_and_what_remains() {
     }))
     .join(" ");
     assert!(
-        msg.contains("both sides") && msg.contains("2 conflicts") && msg.contains("none left"),
+        msg.contains("both sections") && msg.contains("2 conflicts") && msg.contains("none left"),
         "got {msg:?}"
     );
 
@@ -5974,7 +6164,7 @@ fn resolving_a_conflict_names_the_side_and_what_remains() {
     assert!(msg.contains("No conflict here"), "got {msg:?}");
 }
 
-/// The two ends of concluding an operation: `Space g Alt-x` abandons it, and a commit that resumed
+/// The two ends of concluding an operation: `Space g d` abandons it, and a commit that resumed
 /// one says so — including when the resumed operation stopped again, which is a success and a
 /// to-do list at the same time.
 #[test]
@@ -6038,10 +6228,15 @@ fn a_second_git_operation_is_refused_while_one_is_running() {
         },
     ));
 
-    for (keys, method) in [(Mods::NONE, "git/fetch"), (Mods::ALT, "git/pull")] {
+    for (ch, mods, method) in [
+        ('f', Mods::NONE, "git/fetch"),
+        ('p', Mods::NONE, "git/pull"),
+        ('p', Mods::ALT, "git/push"),
+    ] {
         let _ = key(&mut s, ' ');
         let _ = key(&mut s, 'g');
-        let fx = s.on_key(KeyCode::Char('f'), keys, None, ROWS);
+        let text = (mods == Mods::NONE).then(|| ch.to_string());
+        let fx = s.on_key(KeyCode::Char(ch), mods, text, ROWS);
         assert!(
             find_request(&fx, method).is_none(),
             "{method} must not start while another operation runs"
@@ -6051,9 +6246,7 @@ fn a_second_git_operation_is_refused_while_one_is_running() {
 
     // Cleared, it works again.
     s.git_operation = None;
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('f'), Mods::ALT, None, ROWS);
+    let fx = git_leader(&mut s, 'p');
     assert!(find_request(&fx, "git/pull").is_some());
 }
 
@@ -10998,12 +11191,12 @@ fn a_refused_commit_keeps_the_buffer_and_retries_on_the_next_close() {
     assert_eq!(method, "git/commit");
 }
 
-/// `Space g u` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
+/// `Space g z` uncommits, and the toast names what came back — "Uncommitted: Add a line" is a
 /// sentence the user can check against their intent; a hash movement isn't.
 #[test]
-fn space_g_u_uncommits_and_names_what_came_back() {
+fn space_g_z_uncommits_and_names_what_came_back() {
     let mut s = session();
-    let fx = git_leader(&mut s, 'u');
+    let fx = git_leader(&mut s, 'z');
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/reset");
     assert_eq!(params["rev"], json!("HEAD^"));
@@ -11042,7 +11235,7 @@ fn space_g_u_uncommits_and_names_what_came_back() {
 #[test]
 fn uncommitting_with_no_parent_shows_gits_refusal() {
     let mut s = session();
-    let fx = git_leader(&mut s, 'u');
+    let fx = git_leader(&mut s, 'z');
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(
         token,

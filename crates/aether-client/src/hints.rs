@@ -309,7 +309,7 @@ pub static CURRICULUM: &[HintDef] = &[
         text: "Use {} to copy the link URL or block source" },
 
     // ---- tier 4: git, picker deep-cuts, and the off switch ----
-    HintDef { id: "diff", tier: 4, contexts: &[C::Normal], keys: "Space g d",
+    HintDef { id: "diff", tier: 4, contexts: &[C::Normal], keys: "Space i",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleDiffView)),
         text: "Use {} to toggle the inline diff" },
     HintDef { id: "hunk-nav", tier: 4, contexts: &[C::Normal], keys: "c",

@@ -2583,6 +2583,12 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DeleteUnmergedBranch { name } => {
             format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
         }
+        // Says what goes, not just what stops: the tree is reset from disk, so resolutions made in
+        // it are past undo's reach — which is the whole reason this key asks at all.
+        ConfirmKind::AbandonOperation { operation } => format!(
+            "Abandon the {} — every conflict resolution in the working tree is discarded",
+            operation.label()
+        ),
     }
 }
 

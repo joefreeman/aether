@@ -241,6 +241,30 @@ pub async fn version(cwd: &Path) -> Option<String> {
     out.success().then(|| out.trimmed_stdout().to_string())
 }
 
+/// Whether the installed git is at least `major.minor` — the capability check behind the flags
+/// that aren't old enough to assume (`stash push --staged`, git 2.35).
+///
+/// Unreadable or unparseable is `false`: a capability we can't confirm is one we don't use, which
+/// turns into a refusal the user can act on rather than a raw usage dump from git.
+pub async fn at_least(cwd: &Path, major: u32, minor: u32) -> bool {
+    version(cwd)
+        .await
+        .as_deref()
+        .and_then(parse_version)
+        .is_some_and(|v| v >= (major, minor))
+}
+
+/// `(major, minor)` out of a `git --version` line. Every platform's string leads with the same two
+/// numbers — `git version 2.43.0`, `git version 2.39.3 (Apple Git-145)`,
+/// `git version 2.42.0.windows.2` — and no check here needs more than that.
+fn parse_version(line: &str) -> Option<(u32, u32)> {
+    let rest = line.trim().strip_prefix("git version ")?;
+    let mut parts = rest.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    Some((major, minor))
+}
+
 /// [`version`], for callers that may not have a directory to probe in.
 ///
 /// Falls back to the daemon's own working directory rather than declining to answer, so that
@@ -276,6 +300,33 @@ mod tests {
         assert!(v.starts_with("git version"), "unexpected version: {v}");
         // Trimmed: callers put this straight into a dialog row.
         assert!(!v.ends_with('\n'));
+    }
+
+    /// The platform suffixes are the point: a vendor's trailing junk must not cost us a feature
+    /// the git underneath it has.
+    #[test]
+    fn parse_version_reads_major_minor_through_platform_suffixes() {
+        assert_eq!(parse_version("git version 2.43.0"), Some((2, 43)));
+        assert_eq!(
+            parse_version("git version 2.39.3 (Apple Git-145)"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_version("git version 2.42.0.windows.2"), Some((2, 42)));
+        // Nothing to read is never "new enough" — the caller refuses rather than guesses.
+        assert_eq!(parse_version("hg version 6.4"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    /// The 2.35 boundary `stash push --staged` sits on, checked from both sides so an off-by-one
+    /// in the comparison can't pass.
+    #[test]
+    fn version_comparison_is_inclusive_of_the_named_release() {
+        let v = |s| parse_version(s).unwrap();
+        assert!(v("git version 2.35.0") >= (2, 35));
+        assert!(v("git version 2.43.0") >= (2, 35));
+        assert!(v("git version 3.0.0") >= (2, 35));
+        assert!(v("git version 2.34.1") < (2, 35));
+        assert!(v("git version 1.9.5") < (2, 35));
     }
 
     #[tokio::test]

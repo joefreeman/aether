@@ -290,7 +290,8 @@ type ConfirmKind =
   | { kind: "delete_workspace"; name: string }
   | { kind: "delete_branch"; name: string }
   | { kind: "delete_unmerged_branch"; name: string }
-  | { kind: "drop_stash"; message: string };
+  | { kind: "drop_stash"; message: string }
+  | { kind: "abandon_operation"; operation: string };
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
@@ -354,6 +355,10 @@ function confirmMessage(c: ConfirmKind): string {
       return `"${c.name}" isn't merged — delete anyway, discarding its commits?`;
     case "drop_stash":
       return `Drop stash "${c.message}"?`;
+    case "abandon_operation":
+      // The reset rewrites the tree from disk: resolutions made in it are past undo. Says what
+      // goes rather than only what stops, matching the native shells.
+      return `Abandon the ${c.operation} — every conflict resolution in the working tree is discarded?`;
   }
 }
 

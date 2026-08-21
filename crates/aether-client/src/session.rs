@@ -7,7 +7,7 @@ use super::keymap::Action;
 use super::picker::PickerState;
 use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
-use aether_protocol::git::{CommitInfo, GitOperation};
+use aether_protocol::git::{CommitInfo, GitOperation, GitRepoOperation};
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
@@ -665,6 +665,12 @@ pub enum ConfirmKind {
     /// Dropping a stash entry. Confirmed because the editor can't give it back: unlike a pop
     /// (which restores the work first), a drop discards it outright.
     DropStash { message: String },
+    /// Abandoning a stopped merge / rebase / cherry-pick (`Space g d`). The only git *verb* behind
+    /// a confirm, and the reason is reach rather than severity: `<op> --abort` resets the working
+    /// tree from disk, so the buffers are rewritten under the user and every conflict resolution
+    /// in them is past what undo can restore. Revert is an undoable edit, a stash is stored, an
+    /// uncommit keeps its changes — this one alone leaves nothing to reach for.
+    AbandonOperation { operation: GitRepoOperation },
 }
 
 /// What a successful save is followed by — threads the save-and-quit (`Space Alt-q`) and
@@ -740,6 +746,9 @@ pub enum ConfirmAction {
     /// Self-contained like `DeleteBranch`: the picker highlight may have moved — or the picker
     /// closed — by the time the confirm resolves, so the row's identity travels with the action.
     DropStash { repo_id: String, oid: String },
+    /// Abandon the repo's stopped operation (`git/abort_operation`). Carries the buffer whose repo
+    /// it resolves from, as every other git verb does.
+    AbandonOperation { buffer_id: BufferId },
 }
 
 /// Outcome of a `buffer/save` attempt: saved, or refused pending user confirmation.

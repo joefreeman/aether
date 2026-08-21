@@ -6407,6 +6407,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DeleteUnmergedBranch { name } => {
             format!("\"{name}\" isn't merged — delete anyway, discarding its commits")
         }
+        ConfirmKind::AbandonOperation { operation } => format!(
+            "Abandon the {} — every conflict resolution in the working tree is discarded",
+            operation.label()
+        ),
     }
 }
 

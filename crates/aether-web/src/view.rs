@@ -395,6 +395,11 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::DeleteUnmergedBranch { name } => {
             json!({ "kind": "delete_unmerged_branch", "name": name })
         }
+        // The *label*, not the variant: the wording is the shell's, and the TS has no business
+        // knowing git's operation taxonomy to spell one word.
+        ConfirmKind::AbandonOperation { operation } => {
+            json!({ "kind": "abandon_operation", "operation": operation.label() })
+        }
     }
 }
 

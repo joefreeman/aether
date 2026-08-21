@@ -16,13 +16,14 @@ use aether_protocol::envelope::{
     RpcMethod,
 };
 use aether_protocol::git::{
-    ApplyHunkStatus, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBaselineRef, GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams,
-    GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitHead, GitNavigateHunk,
-    GitNavigateHunkParams, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepoInfo, GitRepos,
-    GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, HunkAction,
-    HunkDirection,
+    ApplyHunkStatus, ApplyScope, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
+    GitApplyHunkResult, GitBaselineRef, GitBlameChanged, GitBlameChangedParams, GitBlameLine,
+    GitBlameLineParams, GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitHead,
+    GitNavigateHunk, GitNavigateHunkParams, GitRefresh, GitRefreshParams, GitRefreshResult,
+    GitRepoInfo, GitRepos, GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
+    HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
@@ -435,15 +436,36 @@ fn git_apply_hunk_roundtrip() {
     let p = GitApplyHunkParams {
         scope: Default::default(),
         buffer_id: 4,
-        action: HunkAction::Toggle,
+        action: HunkAction::Stage,
     };
     assert_eq!(
         to_value(&p).unwrap(),
-        json!({"buffer_id": 4, "action": "toggle"})
+        json!({"buffer_id": 4, "action": "stage"})
     );
     assert_eq!(GitApplyHunk::NAME, "git/apply_hunk");
 
-    // The status reports which direction a toggle resolved to.
+    // Each direction is its own word on the wire: the client picks one per key, and the server
+    // never resolves a direction of its own.
+    for (action, wire) in [
+        (HunkAction::Stage, "stage"),
+        (HunkAction::Unstage, "unstage"),
+        (HunkAction::Revert, "revert"),
+    ] {
+        let p = GitApplyHunkParams {
+            scope: ApplyScope::File,
+            buffer_id: 4,
+            action,
+        };
+        assert_eq!(
+            to_value(&p).unwrap(),
+            json!({"buffer_id": 4, "action": wire, "scope": "file"})
+        );
+        let back: GitApplyHunkParams = from_value(to_value(&p).unwrap()).unwrap();
+        assert_eq!(back.action, action);
+        assert_eq!(back.scope, ApplyScope::File);
+    }
+
+    // The status reports what the action did.
     for (status, wire) in [
         (ApplyHunkStatus::Staged, "staged"),
         (ApplyHunkStatus::Unstaged, "unstaged"),
@@ -459,6 +481,45 @@ fn git_apply_hunk_roundtrip() {
         let back: GitApplyHunkResult = from_value(v).unwrap();
         assert_eq!(back.status, status);
     }
+}
+
+/// `staged` is the newest field on the oldest stash call, so both directions matter: it must stay
+/// off the wire when false (an older server would reject an unknown field), and a message from a
+/// client that has never heard of it must still deserialize.
+#[test]
+fn git_stash_push_staged_flag_shape() {
+    assert_eq!(GitStashPush::NAME, "git/stash_push");
+    let plain = GitStashPushParams {
+        repo_id: None,
+        buffer_id: Some(3),
+        message: None,
+        staged: false,
+    };
+    assert_eq!(to_value(&plain).unwrap(), json!({"buffer_id": 3}));
+
+    let staged = GitStashPushParams {
+        repo_id: None,
+        buffer_id: Some(3),
+        message: None,
+        staged: true,
+    };
+    assert_eq!(
+        to_value(&staged).unwrap(),
+        json!({"buffer_id": 3, "staged": true})
+    );
+
+    // Absent reads as false — the whole-tree stash every older client sends.
+    let back: GitStashPushParams = from_value(json!({"buffer_id": 3})).unwrap();
+    assert!(!back.staged);
+
+    // The refusal for a git too old to have the flag is its own status, not a generic failure.
+    let res = GitStashResult {
+        status: GitStashStatus::StagedUnsupported,
+        ..Default::default()
+    };
+    assert_eq!(to_value(&res).unwrap()["status"], "staged_unsupported");
+    let back: GitStashResult = from_value(to_value(&res).unwrap()).unwrap();
+    assert_eq!(back.status, GitStashStatus::StagedUnsupported);
 }
 
 #[test]
