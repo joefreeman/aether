@@ -595,7 +595,7 @@ pub enum GitHead {
 /// `git/commit { message }` — the alternative is reimplementing a text editor inside a dialog, in
 /// an editor.
 ///
-/// `docs/todo.md` originally proposed doing this through `GIT_EDITOR` and the tether. That path
+/// An earlier design proposed doing this through `GIT_EDITOR` and the tether. That path
 /// still exists and is still wanted for operations git itself must drive (`rebase -i` via
 /// `GIT_SEQUENCE_EDITOR`), but for a plain commit it spawns a second client process to write a
 /// message in the client the user is already sitting in.
@@ -722,9 +722,9 @@ pub struct GitCommitResult {
 ///
 /// **Soft only, deliberately.** A soft reset touches no file: the commits it unwinds come back as
 /// staged changes, ready to be recommitted. `--mixed` and `--hard` rewrite the index and working
-/// tree, which needs the dirty-buffer pre-flight described in `docs/git-phase-2.md` decision 3 —
-/// enumerate what would be lost, refuse or stash, never silently discard. That isn't built, so
-/// this doesn't pretend to offer it.
+/// tree, which needs the dirty-buffer pre-flight every other tree-moving verb makes — enumerate
+/// what would be lost, refuse or stash, never silently discard. That isn't built, so this doesn't
+/// pretend to offer it.
 ///
 /// Generic in `rev` rather than a bare "uncommit" so a log picker's "reset to this commit" is the
 /// same call with a different revision. `HEAD^` is the uncommit case, and the common one: wrong
@@ -828,9 +828,9 @@ pub struct GitCheckoutResult {
 /// [`ApplyHunkStatus`]: the client picks a different message and a different follow-up for each,
 /// and inferring that from which fields happen to be populated is how those get out of step.
 ///
-/// Every variant here is one the *server* determines — from its own buffer state, or from a
-/// libgit2 read. Git's stderr is never parsed into these; whatever only git knows arrives as
-/// [`Self::Refused`] with its text intact (`docs/git-phase-2.md` decision 1).
+/// Every variant here is one the *server* determines — from its own buffer state, or from a libgit2
+/// read. Git's stderr is never parsed into these; whatever only git knows arrives as
+/// [`Self::Refused`] with its text intact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitCheckoutStatus {
@@ -1071,8 +1071,9 @@ pub enum GitPushStatus {
 ///
 /// **Plain `git pull`** — the user's own `pull.rebase`, `pull.ff`, `rebase.autoStash` and
 /// `merge.conflictstyle` decide what happens, exactly as they would in a terminal. That is
-/// `docs/git-phase-2.md` decision 1 applied to a strategy rather than to hooks: an editor that
-/// forced `--ff-only` would refuse where the user's own git would have rebased. The cost is that a
+/// The house rule — run the user's git rather than our idea of it — applied to a strategy rather
+/// than to hooks: an editor that forced `--ff-only` would refuse where the user's own git would
+/// have rebased. The cost is that a
 /// pull can leave the tree mid-merge, which is what [`GitPullStatus::Conflicted`] exists to report.
 ///
 /// Nothing here is pre-flighted that git could decide better. Uncommitted changes on disk, a merge
@@ -1158,10 +1159,9 @@ pub enum GitPullStatus {
     /// The merge or rebase stopped with conflicts; `conflicts` names the files. **The tree has
     /// moved** and the repo is left mid-operation, exactly as a terminal would leave it.
     ///
-    /// Aether has no conflict resolution yet (`docs/git-phase-2.md` stage 6), so this reports the
-    /// state rather than offering to fix it. It is still a distinct outcome and not a
-    /// [`Self::Refused`]: the user's next step is to edit the marked files, not to read git's
-    /// stderr and work out what happened.
+    /// Aether has no conflict resolution yet, so this reports the state rather than offering to fix
+    /// it. It is still a distinct outcome and not a [`Self::Refused`]: the user's next step is to
+    /// edit the marked files, not to read git's stderr and work out what happened.
     Conflicted,
     /// The branch and its upstream have both moved and git declined to guess how to reconcile them
     /// (no `pull.rebase` or `pull.ff` configured — git's own refusal since 2.27).
@@ -1343,8 +1343,8 @@ pub struct GitBaselineRef {
 
 // ---- git/show ------------------------------------------------------------------------------------
 
-/// Materialise a revision as a read-only **virtual buffer** — a buffer with no file behind it
-/// (docs/git-phase-2.md decision 4). Two shapes, one call:
+/// Materialise a revision as a read-only **virtual buffer** — a buffer with no file behind it. Two
+/// shapes, one call:
 ///
 /// - **no `path`** — the commit itself: its metadata and message, then the patch against its first
 ///   parent (against the empty tree for a root commit), which is what `git show` prints.
@@ -1503,10 +1503,9 @@ pub enum GitStashStatus {
 
 /// One worktree of a repo family, as the `Space g g` picker lists them.
 ///
-/// Two identities, and they are not interchangeable (`docs/worktrees.md` §1): `path` is the
-/// [`RepoId`] — one worktree, its own HEAD and index — while `name` is the *admin id*, the
-/// directory under `.git/worktrees/`. The CLI is keyed by path and libgit2 by admin id, which is
-/// why both travel together.
+/// Two identities, and they are not interchangeable: `path` is the [`RepoId`] — one worktree, its
+/// own HEAD and index — while `name` is the *admin id*, the directory under `.git/worktrees/`. The
+/// CLI is keyed by path and libgit2 by admin id, which is why both travel together.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitWorktreeRow {
     /// libgit2 admin name. **Empty for the main worktree, which genuinely has none** — git's
@@ -1533,7 +1532,7 @@ pub struct GitWorktreeRow {
     pub locked: bool,
     /// The admin entry exists but the working directory doesn't: a tree deleted with `rm -rf`
     /// instead of `git worktree remove`. Prunable, and the *only* condition under which we prune
-    /// (§4.8 — `git worktree prune` has no grace period, so it must never be run speculatively).
+    /// (`git worktree prune` has no grace period, so it must never be run speculatively).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prunable: bool,
 }
@@ -1542,14 +1541,13 @@ pub struct GitWorktreeRow {
 ///
 /// **Shells out to `git worktree add`.** libgit2 can list and validate worktrees but must not
 /// create them: it can't produce a detached HEAD, has no `--force`, uses the admin name verbatim
-/// as both a directory and a branch name, and its error path rolls nothing back — see
-/// `docs/worktrees.md` §5 for the audit.
+/// as both a directory and a branch name, and its error path rolls nothing back.
 ///
 /// The worktree lands in the app-managed store, namespaced per repo family
 /// ([`crate::settings::AppSettings::worktree_store`]). Callers do not choose a path: the directory
 /// name is *derived* from the branch, sanitised and uniquified the way git derives its own admin
 /// ids, and **never flows back into the branch name** — conflating the two is the bug behind
-/// Zed #47208 and orca #13011 (§4.3).
+/// Zed #47208 and orca #13011.
 ///
 /// A full checkout, so this is slow, streams progress and is cancellable through [`GitCancel`],
 /// exactly like fetch and push.
@@ -1592,14 +1590,14 @@ pub struct GitWorktreeAddResult {
     /// report an error — the picker normally prevents this, so reaching it means the list was stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_out_in: Option<String>,
-    /// Gitignored files copied in from the source worktree (`.worktreeinclude`, §10.9). Reported
+    /// Gitignored files copied in from the source worktree (`.worktreeinclude`). Reported
     /// because a silent file copy is a surprise, and because "0" is the number to look at when a
     /// build in the new tree fails.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub seeded_files: u32,
     /// The repo has submodules. **A warning carried on success, not a refusal**: git's own
     /// git-worktree(1) BUGS section still advises against multiple checkouts of a superproject and
-    /// the failure mode is silent commit loss (§4.9), but refusing outright would block a workflow
+    /// the failure mode is silent commit loss, but refusing outright would block a workflow
     /// that does work if you know the hazard. Naming it is the honest middle.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_submodules: bool,
@@ -1639,7 +1637,7 @@ pub enum GitWorktreeAddStatus {
 ///
 /// **Never `rm -rf`, and never a bare `git worktree prune`** — prune sets `expire = TIME_MAX`, so
 /// the three-month grace window people assume exists comes only from `git gc` passing `--expire`
-/// (§4.8). This runs `git worktree remove`, whose own refusal on a dirty or untracked-bearing tree
+///. This runs `git worktree remove`, whose own refusal on a dirty or untracked-bearing tree
 /// is the guard rather than something reimplemented here.
 ///
 /// Deleting the worktree never deletes its branch, so **committed work is never at risk**: the
@@ -1804,9 +1802,8 @@ pub struct GitBlameLineParams {
     pub buffer_id: BufferId,
     /// 0-based buffer line whose blame is wanted.
     pub line: u32,
-    /// Also resolve the blamed commit's full details into `commit_info` — the blame-then-
-    /// lookup client chain folded into one round-trip (docs/protocol-composites.md, G).
-    /// No effect for an uncommitted or unblamed line.
+    /// Also resolve the blamed commit's full details into `commit_info` — the blame-then-lookup
+    /// client chain folded into one round-trip. No effect for an uncommitted or unblamed line.
     #[serde(default)]
     pub include_commit_info: bool,
 }

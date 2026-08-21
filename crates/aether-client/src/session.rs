@@ -1,7 +1,6 @@
-//! Session state — the platform-free heart of a window's editing context
-//! (docs/client-core.md): connection lifecycle, buffer identity, modal state, search,
-//! prompts. The shell keeps the presentation companions (pixel scroll, animation, parsed
-//! hover markdown) on its own struct.
+//! Session state — the platform-free heart of a window's editing context: connection lifecycle,
+//! buffer identity, modal state, search, prompts. The shell keeps the presentation companions
+//! (pixel scroll, animation, parsed hover markdown) on its own struct.
 
 use super::keymap::Action;
 use super::picker::PickerState;
@@ -97,9 +96,9 @@ pub enum Mode {
     Normal,
     Insert,
     Search,
-    /// The markdown reading view (docs/markdown-view.md). Key dispatch goes through
-    /// [`crate::keymap::KeyContext::Read`]; the rendered document itself lives in
-    /// [`Session::read`]. Search entered from Read returns to Read.
+    /// The markdown reading view. Key dispatch goes through [`crate::keymap::KeyContext::Read`];
+    /// the rendered document itself lives in [`Session::read`]. Search entered from Read returns to
+    /// Read.
     Read,
 }
 
@@ -118,7 +117,7 @@ pub struct SearchState {
     /// prompt (`Alt-c` / `Alt-w` / `Alt-e`) and reset to the defaults on every `/` — options are
     /// part of the search you're running, not standing configuration, exactly as every picker's
     /// chips are (`PickerReset::All` on open). `Up` recalls a past query with the options it ran
-    /// under (docs/input-history.md §4a); Esc restores the pre-prompt search and its options.
+    /// under; Esc restores the pre-prompt search and its options.
     pub options: MatchOptions,
     /// Which option chip is "selected" for keyboard editing, mirroring the grep picker's
     /// `chip_selected`. `Some(i)` indexes [`SearchState::option_chips`]; Left/Right walk the row,
@@ -150,8 +149,8 @@ impl SearchState {
     }
 }
 
-/// `Up`/`Down` recall for the overlay text inputs (docs/input-history.md): the buffer-search
-/// prompt, the grep query, and the glob / path chip editors.
+/// `Up`/`Down` recall for the overlay text inputs: the buffer-search prompt, the grep query, and
+/// the glob / path chip editors.
 ///
 /// Each entry carries the *configuration* it ran under as well as the text, so a recall reproduces
 /// the search rather than just its words — see [`HistoryEntry`].
@@ -359,17 +358,17 @@ pub struct WorkspaceSettings {
     /// committed on blur (focus leaving the field) via `workspace/rename`.
     pub name: TextField,
     pub roots: Vec<String>,
-    /// Declared projects (`docs/projects.md`), server-resolved. Each carries the language its
-    /// pinned server speaks, or the reason it can't be used.
+    /// Declared projects, server-resolved. Each carries the language its pinned server speaks, or
+    /// the reason it can't be used.
     pub projects: Vec<WorkspaceProject>,
     pub selected: usize,
     /// Text being typed into the add-root input row.
     pub add: TextField,
-    /// The add-project row's path editor (`docs/projects.md`) — the same component the save-as
-    /// prompt uses, so declaring a project reuses the muscle memory of saving somewhere: a root
-    /// typeahead segment in multi-root workspaces, then a directory-completing path field. A
-    /// project is stored relative to its root, so the root genuinely isn't in the path and has to
-    /// be chosen; that's exactly what this editor's root field is for.
+    /// The add-project row's path editor — the same component the save-as prompt uses, so declaring
+    /// a project reuses the muscle memory of saving somewhere: a root typeahead segment in
+    /// multi-root workspaces, then a directory-completing path field. A project is stored relative
+    /// to its root, so the root genuinely isn't in the path and has to be chosen; that's exactly
+    /// what this editor's root field is for.
     pub add_project: Box<crate::path_editor::PathEditor>,
     /// The add-project row's optional language segment — a typeahead over
     /// [`aether_protocol::lsp::SERVER_LANGUAGES`], the languages a server exists for. Left empty the
@@ -523,7 +522,7 @@ impl WorkspaceSettings {
     }
 }
 
-/// The application-settings overlay (`Space ,`): global preferences (not per-workspace),
+/// The application-settings overlay (`Space,`): global preferences (not per-workspace),
 /// rendered by every shell from `session.app_settings`. Distinct from [`WorkspaceSettings`], which
 /// edits the active workspace's name and roots.
 ///
@@ -549,11 +548,11 @@ pub enum AppSettingId {
     /// Size of everything around it — status bar, pickers, dialogs.
     UiFontSize,
     Hints,
-    /// Open markdown buffers as the reading view (docs/markdown-view.md §1.6).
+    /// Open markdown buffers as the reading view.
     MarkdownRead,
     /// Light vs dark colour theme (the toggle is "light on/off"; off is dark).
     Theme,
-    /// Periodic background `git fetch` (docs/git-phase-2.md stage 3).
+    /// Periodic background `git fetch`.
     GitAutoFetch,
 }
 
@@ -812,9 +811,8 @@ pub enum PasteKind {
     AtCursor,
     /// Insert-mode `Ctrl-Alt-v`: replace the whole line.
     Line,
-    /// Read-mode `Ctrl-v`/`Ctrl-Alt-v`: paste as its own block before the selection, or in
-    /// place of the selected block(s) — `input/paste_block`, separator-normalized
-    /// (docs/markdown-view.md §12).
+    /// Read-mode `Ctrl-v`/`Ctrl-Alt-v`: paste as its own block before the selection, or in place of
+    /// the selected block(s) — `input/paste_block`, separator-normalized.
     Block { replace: bool },
 }
 
@@ -844,18 +842,18 @@ pub struct Session {
     /// we are standing in. Consumed by the `buffer/closed` pushes that follow it, so those read as
     /// "the workspace moved" rather than "someone closed your file".
     pub(crate) workspace_moved_under_us: bool,
-    /// The active workspace's declared projects (`docs/projects.md`), mirrored from every
-    /// `WorkspaceInfo` the server sends. Read by the settings overlay when it opens; kept on the
-    /// session rather than fetched on demand so opening the overlay stays a keystroke, like roots.
+    /// The active workspace's declared projects, mirrored from every `WorkspaceInfo` the server
+    /// sends. Read by the settings overlay when it opens; kept on the session rather than fetched
+    /// on demand so opening the overlay stays a keystroke, like roots.
     pub workspace_projects: Vec<WorkspaceProject>,
-    /// The buffer this client's lifetime is *tethered* to (docs/tether.md): closing it — by us or
-    /// by another client — exits the client instead of switching to a successor, giving `ae path`
-    /// the `$EDITOR` contract (edit, close, process ends) inside the client–server model. Set by
-    /// the shells at bootstrap when a file positional was given without an explicit `--workspace`
-    /// (the quick-edit invocation; window-spawns always name the workspace, so they don't tether).
-    /// Released — one-way — by un-keeping the buffer (`Space k`), by a deliberate workspace
-    /// switch, or by a daemon restart (buffer ids don't survive it). The status bar marks the
-    /// tethered buffer with a dim `*`.
+    /// The buffer this client's lifetime is *tethered* to: closing it — by us or by another client —
+    /// exits the client instead of switching to a successor, giving `ae path` the `$EDITOR`
+    /// contract (edit, close, process ends) inside the client–server model. Set by the shells at
+    /// bootstrap when a file positional was given without an explicit `--workspace` (the quick-edit
+    /// invocation; window-spawns always name the workspace, so they don't tether). Released —
+    /// one-way — by un-keeping the buffer (`Space k`), by a deliberate workspace switch, or by a
+    /// daemon restart (buffer ids don't survive it). The status bar marks the tethered buffer with
+    /// a dim `*`.
     pub tether: Option<BufferId>,
     /// The commit message buffer this client opened, if any — see [`PendingCommit`].
     pub pending_commit: Option<PendingCommit>,
@@ -865,8 +863,8 @@ pub struct Session {
     pub count: Option<u32>,
     pub last_repeat: Option<RepeatTarget>,
     pub search: SearchState,
-    /// `Up`/`Down` recall for every overlay text input (docs/input-history.md). Session-wide, not
-    /// per-overlay: the lists are workspace-scoped and only one input has the keyboard at a time.
+    /// `Up`/`Down` recall for every overlay text input. Session-wide, not per-overlay: the lists
+    /// are workspace-scoped and only one input has the keyboard at a time.
     pub history: InputHistory,
     /// Active sneak word-jump session (`s`/`S`), or `None` when not sneaking. While `Some`, the key
     /// handler interprets keystrokes as query/label input rather than normal-mode bindings.
@@ -880,11 +878,11 @@ pub struct Session {
     pub viewport_id: Option<ViewportId>,
     pub window: Option<Window>,
     pub wrap: WrapMode,
-    /// Coding ligatures in the editor font — an app-wide setting (`Space ,`), seeded from
+    /// Coding ligatures in the editor font — an app-wide setting (`Space,`), seeded from
     /// `settings/get` at boot. The shells read it each render to pick their text shaping
     /// (native) / font feature (web); the core just holds the value.
     pub ligatures: bool,
-    /// Buffer text size in px — an app-wide setting (`Space ,`), seeded from `settings/get` at
+    /// Buffer text size in px — an app-wide setting (`Space,`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
     /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
     pub buffer_font_size: u32,
@@ -893,22 +891,22 @@ pub struct Session {
     /// separately from [`Self::buffer_font_size`]: chrome density and code size are different
     /// preferences.
     pub ui_font_size: u32,
-    /// Colour theme — an app-wide setting (`Space ,`), seeded from `settings/get` at boot and
+    /// Colour theme — an app-wide setting (`Space,`), seeded from `settings/get` at boot and
     /// synced via `settings/changed`. The shells resolve it to a role→shade table
     /// ([`crate::theme::Theme::of`]) each render; the core just holds the mode.
     pub theme: ThemeMode,
-    /// Hints on/off — an app-wide setting (`Space ,`), seeded from `settings/get` at
-    /// boot and synced via `settings/changed`. Gates the hint engine (docs/hints.md); the corner
-    /// hint disappears (and observation stops) when off.
+    /// Hints on/off — an app-wide setting (`Space,`), seeded from `settings/get` at boot and synced
+    /// via `settings/changed`. Gates the hint engine; the corner hint disappears (and observation
+    /// stops) when off.
     pub hints_enabled: bool,
-    /// Periodic background `git fetch` on/off — an app-wide setting (`Space ,`), seeded from
+    /// Periodic background `git fetch` on/off — an app-wide setting (`Space,`), seeded from
     /// `settings/get` at boot and synced via `settings/changed`. Held here only so the overlay row
     /// can render and toggle it: the fetching itself is the *server's* loop, and the client learns
     /// its results the ordinary way, through the refreshed ahead/behind counts in the status bar.
     pub git_auto_fetch: bool,
-    /// Where app-managed git worktrees are created (`docs/worktrees.md` §8.4). Held only so a
-    /// `settings/set` for some *other* key round-trips it unchanged — the client never reads it,
-    /// and there is no overlay row for it (a path isn't a toggle or a stepped size).
+    /// Where app-managed git worktrees are created. Held only so a `settings/set` for some *other*
+    /// key round-trips it unchanged — the client never reads it, and there is no overlay row for it
+    /// (a path isn't a toggle or a stepped size).
     pub worktree_store: String,
     /// The long-running git operation in flight, if any, with the repo it belongs to — pushed by
     /// the server (`git/operation_changed`) and rendered as the status bar's activity indicator.
@@ -920,29 +918,28 @@ pub struct Session {
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
-    /// The markdown reading view of the current buffer, when active (docs/markdown-view.md).
+    /// The markdown reading view of the current buffer, when active.
     pub read: Option<ReadView>,
     /// This session's live read-vs-source choice for markdown, flipped by `Space v`. Session
     /// state, not a per-buffer memory: reaching for source is a *task* ("show me the raw
     /// markdown to fix this link"), not a property of a document — editing works in the reading
-    /// view itself (§12), so being mid-edit is no reason to want source. Seeded from
+    /// view itself, so being mid-edit is no reason to want source. Seeded from
     /// [`Self::markdown_read_default`] and re-seeded whenever that setting changes; `Space v`
     /// deliberately does **not** write through to the setting, which is app-wide and shared with
     /// every other client.
     pub(crate) read_on: bool,
-    /// App-wide "open markdown as reading view" setting (`Space ,`), seeded from `settings/get`
+    /// App-wide "open markdown as reading view" setting (`Space,`), seeded from `settings/get`
     /// and synced via `settings/changed`. The persisted *default* [`Self::read_on`] starts from,
     /// not the live state.
     pub markdown_read_default: bool,
-    /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and
-    /// consumed by `adopt_switch`: jump-shaped opens land in the editor, not the reading view
-    /// (docs/markdown-view.md §1.6).
+    /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and consumed
+    /// by `adopt_switch`: jump-shaped opens land in the editor, not the reading view.
     pub(crate) open_route_jumped: bool,
-    /// The `#fragment` of a followed cross-file link (`[x](./other.md#section)`), set just
-    /// before the open and consumed once the target document's reading view adopts — the
-    /// heading's position isn't knowable until the target is fetched and parsed
-    /// (docs/markdown-view.md §2.4). Cleared by any fresh `open_path_at`, by a switch that
-    /// lands in the editor, and by a failed content fetch, so a stale anchor never fires.
+    /// The `#fragment` of a followed cross-file link (`[x](./other.md#section)`), set just before
+    /// the open and consumed once the target document's reading view adopts — the heading's
+    /// position isn't knowable until the target is fetched and parsed. Cleared by any fresh
+    /// `open_path_at`, by a switch that lands in the editor, and by a failed content fetch, so a
+    /// stale anchor never fires.
     pub(crate) pending_read_anchor: Option<String>,
     pub diagnostics: DiagnosticCounts,
     pub lsp: Option<LspServerStatus>,
@@ -973,7 +970,7 @@ pub struct Session {
     pub picker: Option<PickerState>,
     /// The workspace-settings overlay (`Space Alt-,`); owns the keyboard while open.
     pub workspace_settings: Option<WorkspaceSettings>,
-    /// The application-settings overlay (`Space ,`); owns the keyboard while open.
+    /// The application-settings overlay (`Space,`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,
     pub conn: ConnState,
     /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
@@ -985,21 +982,20 @@ pub struct Session {
     /// busy→idle `lsp/status_changed` blip doesn't spuriously toast. See the `LspStatusChanged`
     /// handler in [`crate::update`].
     pub(crate) lsp_restart_pending: std::collections::HashSet<String>,
-    /// The hint engine (docs/hints.md): curriculum progress, per-context display
-    /// slots, sampling. Dormant until the `hints/state` snapshot adopts, and gated by
-    /// [`Self::hints_enabled`]. Shells read [`crate::update`]'s `hint_view()` and drive
-    /// `on_hint_tick()`.
+    /// The hint engine: curriculum progress, per-context display slots, sampling. Dormant until the
+    /// `hints/state` snapshot adopts, and gated by [`Self::hints_enabled`]. Shells read
+    /// [`crate::update`]'s `hint_view` and drive `on_hint_tick`.
     pub hints: crate::hints::HintEngine,
 }
 
-/// The markdown reading view of the current buffer (docs/markdown-view.md): the parsed document,
-/// its navigable element list, and the source text they were parsed from. Present iff the buffer
-/// is displayed as a reading view — [`Session::mode`] is `Read` whenever this is `Some`, except
-/// while a search prompt entered *from* Read holds the keyboard.
+/// The markdown reading view of the current buffer: the parsed document, its navigable element
+/// list, and the source text they were parsed from. Present iff the buffer is displayed as a
+/// reading view — [`Session::mode`] is `Read` whenever this is `Some`, except while a search prompt
+/// entered *from* Read holds the keyboard.
 ///
 /// There is no focus field: the focused element is a pure function of the server cursor
-/// ([`Self::focus`]), so outline jumps, jumplist steps and search all land correctly with no
-/// extra sync (docs/markdown-view.md §1.3).
+/// ([`Self::focus`]), so outline jumps, jumplist steps and search all land correctly with no extra
+/// sync.
 pub struct ReadView {
     pub buffer_id: BufferId,
     /// Content revision the document was parsed at; a change notification with a newer revision
@@ -1015,18 +1011,17 @@ pub struct ReadView {
     /// re-fetch after an external change).
     pub loading: bool,
     /// Fenced-code tree-sitter highlights, keyed by the code block's span start — filled
-    /// asynchronously from `syntax/highlight_snippet` results (docs/markdown-view.md §2.8);
-    /// offsets index the block's `code` string. Fences render monochrome until theirs arrive.
+    /// asynchronously from `syntax/highlight_snippet` results; offsets index the block's `code`
+    /// string. Fences render monochrome until theirs arrive.
     pub code_highlights: std::collections::HashMap<u32, Vec<aether_protocol::viewport::Highlight>>,
     /// Bumped whenever `code_highlights` grows — the shells' layout-cache invalidation key
     /// (revision alone doesn't move when highlights land).
     pub hl_gen: u64,
-    /// A fully-parsed document held back while a cross-file anchor's `cursor/move` is in
-    /// flight (docs/markdown-view.md §2.4): the visible view stays `loading` so the first
-    /// paint happens with the cursor already on the heading — the editor's
-    /// paint-once-in-place property. Installed by the cursor reply
-    /// (`Session::install_staged_read`); dropped whenever the view is replaced, torn down,
-    /// or newer content adopts.
+    /// A fully-parsed document held back while a cross-file anchor's `cursor/move` is in flight:
+    /// the visible view stays `loading` so the first paint happens with the cursor already on the
+    /// heading — the editor's paint-once-in-place property. Installed by the cursor reply
+    /// (`Session::install_staged_read`); dropped whenever the view is replaced, torn down, or newer
+    /// content adopts.
     pub staged: Option<Box<ReadView>>,
 }
 
@@ -1098,10 +1093,10 @@ impl ReadView {
         }
     }
 
-    /// The focused element for a cursor: innermost containing, else next after, else last
-    /// (docs/markdown-view.md §1.3). `None` only for an empty/unloaded document. This is the
-    /// *action* focus (`Enter`, `Ctrl-c`); rendering splits it into two projections of the same
-    /// cursor — [`Self::block_focus`] and [`Self::target_focus`].
+    /// The focused element for a cursor: innermost containing, else next after, else last. `None`
+    /// only for an empty/unloaded document. This is the *action* focus (`Enter`, `Ctrl-c`);
+    /// rendering splits it into two projections of the same cursor — [`Self::block_focus`] and
+    /// [`Self::target_focus`].
     pub fn focus(&self, cursor: LogicalPosition) -> Option<usize> {
         crate::markdown::element_at(&self.elements, self.byte_of(cursor))
     }
@@ -1203,10 +1198,10 @@ impl ReadView {
         self.block_focus(cursor.position)
     }
 
-    /// The target as the shells should *display* it: suppressed while the selection is
-    /// extended (docs/markdown-view.md §12.1) — a block-range selection plus an armed pill is
-    /// two selections on screen at once. Behavioral sites (`l`/`h` stepping) keep the
-    /// position-grain [`Self::target_focus`]; their Gotos collapse the selection anyway.
+    /// The target as the shells should *display* it: suppressed while the selection is extended — a
+    /// block-range selection plus an armed pill is two selections on screen at once. Behavioral
+    /// sites (`l`/`h` stepping) keep the position-grain [`Self::target_focus`]; their Gotos
+    /// collapse the selection anyway.
     pub fn display_target(&self, cursor: &aether_protocol::cursor::CursorState) -> Option<usize> {
         if !cursor.is_point() || self.projections_stale() {
             return None;
@@ -1252,7 +1247,7 @@ impl ReadView {
         let (a, p) = (self.byte_of(cursor.anchor), self.byte_of(cursor.position));
         let (min, max) = (a.min(p), a.max(p));
         // Resolution shared with the server's structural edits — the one definition of "which
-        // blocks does this selection cover" (aether-markdown, §12): a point resolves like
+        // blocks does this selection cover" (aether-markdown): a point resolves like
         // [`Self::block_focus`] (innermost containing block), a range by whole-line extent.
         let (tb, bb) =
             crate::markdown::edit::selection_block_range(&self.text, &self.elements, min, max)?;
@@ -1264,13 +1259,12 @@ impl ReadView {
         ))
     }
 
-    /// The append byte of `elements[idx]`'s block: the caret gap *before* this byte is
-    /// "after the last content char" — the terminating newline when present, or one past the
-    /// span for a final block without one. `i`/`a`/`Ctrl-o`'s landing math
-    /// (docs/markdown-view.md §12).
+    /// The append byte of `elements[idx]`'s block: the caret gap *before* this byte is "after the
+    /// last content char" — the terminating newline when present, or one past the span for a final
+    /// block without one. `i`/`a`/`Ctrl-o`'s landing math.
     ///
     /// Trailing blank lines are walked off first. Separator blanks belong to the gaps *between*
-    /// blocks (§12.1), but a loose list item's parser span swallows the one after it, so the raw
+    /// blocks, but a loose list item's parser span swallows the one after it, so the raw
     /// last byte was the separator's newline and `a` landed a line low — typing then opened a new
     /// block in the gap instead of extending the item.
     pub fn block_append_byte(&self, idx: usize) -> u32 {
@@ -1297,10 +1291,9 @@ impl ReadView {
         }
     }
 
-    /// The byte of the last *content* char of `elements[idx]` — excluding the block's
-    /// terminating newline when present. The end of `Ctrl-e`'s content-only change range: the
-    /// newline (and every separator) survives the rewrite, so the document's block structure
-    /// does (docs/markdown-view.md §12).
+    /// The byte of the last *content* char of `elements[idx]` — excluding the block's terminating
+    /// newline when present. The end of `Ctrl-e`'s content-only change range: the newline (and
+    /// every separator) survives the rewrite, so the document's block structure does.
     pub fn block_content_end(&self, idx: usize) -> u32 {
         let span = self.elements[idx].span();
         let end = (span.end as usize).min(self.text.len());
@@ -1474,7 +1467,7 @@ impl Session {
             .collect()
     }
 
-    /// This session's live read-vs-source choice (`Space v` flips it; the §12 edit transitions
+    /// This session's live read-vs-source choice (`Space v` flips it; the edit transitions
     /// deliberately don't). Exposed read-only so tests can pin that contract.
     pub fn read_on(&self) -> bool {
         self.read_on

@@ -1,8 +1,7 @@
-//! The platform-free Aether client (docs/client-core.md): modal input model, keymap
-//! tables, picker/chip state, session state, and the update function — everything a client
-//! *is*, minus rendering and transport. Shells (`aether-iced` today; a TUI port and perhaps
-//! a wasm + DOM shell later) feed events in, execute the returned [`effect::Effect`]s, and
-//! paint the state.
+//! The platform-free Aether client: modal input model, keymap tables, picker/chip state, session
+//! state, and the update function — everything a client *is*, minus rendering and transport. Shells
+//! (`aether-iced` today; a TUI port and perhaps a wasm + DOM shell later) feed events in, execute
+//! the returned [`effect::Effect`]s, and paint the state.
 //!
 //! The membership test is portability: everything here must compile for every conceivable
 //! shell, wasm included. Native transport (the WebSocket actor) and discovery (reading
@@ -17,9 +16,8 @@ pub mod grid;
 pub mod hints;
 pub mod keymap;
 pub mod labels;
-// The markdown block model lives in the shared `aether-markdown` crate (docs/markdown-view.md
-// §12 phase 3a) — the server resolves structural edits against the same parse the reading view
-// renders from. Re-exported under the old path so shells and the wasm boundary are unchanged.
+// The markdown block model lives in the shared `aether-markdown` crate — the server resolves
+// structural edits against the same parse the reading view renders from. Re-exported under the old path so shells and the wasm boundary are unchanged.
 pub use aether_markdown as markdown;
 pub mod path_editor;
 pub mod picker;

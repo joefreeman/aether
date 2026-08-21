@@ -34,7 +34,7 @@ pub use config::{
     profile_idle_timeout_secs, running_server_pid, set_active_profile, ProfileEntry,
     WorkspaceConfig, WorkspaceMatch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_PROFILE, SERVER_PORT,
 };
-/// Declared projects (`docs/projects.md`); re-exported for [`spawn_for_test_with_projects`].
+/// Declared projects; re-exported for [`spawn_for_test_with_projects`].
 pub use config::{ProjectEntry, ProjectRef};
 /// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
 pub use lsp::dummy::{

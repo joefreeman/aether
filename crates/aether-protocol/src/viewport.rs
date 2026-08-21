@@ -1,4 +1,4 @@
-//! Viewport messages — §7 of the protocol doc.
+//! Viewport messages.
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};

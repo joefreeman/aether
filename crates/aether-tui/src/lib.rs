@@ -33,9 +33,9 @@ use std::io::{stdout, Stdout};
 
 /// Run the terminal client to completion. `workspace`/`file` are the (optional) CLI positionals,
 /// `tether` marks the quick-edit invocation (file positional, no explicit `--workspace` — the
-/// opened buffer tethers the client, docs/tether.md), `version` is the handshake version string,
-/// and `server_url` is the (profile-resolved) WebSocket address to dial; the caller (`ae`) parses
-/// these and provides the tokio runtime this is awaited on.
+/// opened buffer tethers the client), `version` is the handshake version string, and `server_url`
+/// is the (profile-resolved) WebSocket address to dial; the caller (`ae`) parses these and provides
+/// the tokio runtime this is awaited on.
 pub async fn run(
     workspace: Option<String>,
     file: Option<String>,

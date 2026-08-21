@@ -2,8 +2,8 @@
 //!
 //! Kept here rather than on `syntax::LanguageConfig` for now: LSP is staged, and a separate table
 //! avoids touching the syntax registry until the launch path is wired. If/when this stabilizes it
-//! can fold into `LanguageConfig` so language detection and LSP launch share one source of truth
-//! (see `docs/lsp.md` §2.3). Keys match `LanguageConfig::name`.
+//! can fold into `LanguageConfig` so language detection and LSP launch share one source of truth.
+//! Keys match `LanguageConfig::name`.
 
 /// How a language's *workspace* root is recognized, for servers that analyze a whole workspace at
 /// once. Preferred over the nearest [`LspServerSpec::root_markers`] match so a Cargo workspace (or
@@ -58,10 +58,10 @@ pub fn canonical_language(language: &str) -> &str {
 /// The language a project marker file identifies — the reverse of [`LspServerSpec::root_markers`],
 /// matched on the marker's *file name*.
 ///
-/// Used to resolve a declared project (`docs/projects.md`) to the server it should pin: the path's
-/// parent is the root, and its file name selects the server. Markers shared by several languages
-/// resolve to the [`canonical_language`] of the group (`package.json` → `typescript`), which is the
-/// key those servers all live under anyway.
+/// Used to resolve a declared project to the server it should pin: the path's parent is the root,
+/// and its file name selects the server. Markers shared by several languages resolve to the
+/// [`canonical_language`] of the group (`package.json` → `typescript`), which is the key those
+/// servers all live under anyway.
 ///
 /// Two entries deserve a note. `config.yml` is a generic name that means `sqls` only because a user
 /// deliberately declared it — this is exactly why projects are declared rather than discovered by

@@ -1,6 +1,6 @@
-//! Picker state — the platform-free half of the picker (docs/client-core.md): query and
-//! generation staleness, selection and identity, chip/filter state, display-row math. The
-//! rendering half lives in the shell (`src/picker.rs`).
+//! Picker state — the platform-free half of the picker: query and generation staleness, selection
+//! and identity, chip/filter state, display-row math. The rendering half lives in the shell
+//! (`src/picker.rs`).
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipId, ChipValue, DirListingState};
 use aether_protocol::picker::{
@@ -19,27 +19,25 @@ pub enum Reveal {
     Minimal,
     /// Align the row to the top unless already visible (grep file-jumps — context below).
     Top,
-    /// Reveal the newly selected group's *run* (docs/picker-groups.md §9): scroll the minimum
-    /// that brings the run's last row into view, capped so the run's header never leaves the
-    /// top — a run taller than the pane shows the header at the very top (where it renders
-    /// itself, so nothing hides under a sticky pin) with as many items as fit. Emitted by the
-    /// group-select path (`Event::GroupSet`); shells resolve the run's rows from the state's
-    /// `expanded_run`, applying only when it matches the selection (`header_row == selected`)
-    /// so a pre-adoption fire against the *old* run is a no-op — the armed re-emit after the
-    /// reshaped push lands does the real work.
+    /// Reveal the newly selected group's *run*: scroll the minimum that brings the run's last row
+    /// into view, capped so the run's header never leaves the top — a run taller than the pane
+    /// shows the header at the very top (where it renders itself, so nothing hides under a sticky
+    /// pin) with as many items as fit. Emitted by the group-select path (`Event::GroupSet`); shells
+    /// resolve the run's rows from the state's `expanded_run`, applying only when it matches the
+    /// selection (`header_row == selected`) so a pre-adoption fire against the *old* run is a no-op
+    /// — the armed re-emit after the reshaped push lands does the real work.
     Run,
 }
 
-/// Which level of the two-level model (docs/picker-groups.md §9) the selection is on, for the
-/// collapsible kinds. **Stored, not derived**: the row-space facts a derivation would read —
-/// `selected` (moved by the `set_group` reply) and `expanded_run` (moved by the reshaping
-/// push) — arrive on separate, order-independent messages, and a held `Alt-j` repeat can fire
-/// in the gap between them. Deriving the level there reads a mismatched pair: the *new*
-/// selection row can land inside the *stale* run interval, misclassify as item level, and
-/// turn a group step into a local walk into the run. Only explicit gestures flip this bit
-/// (step/select/ascend/query → `Group`; descend / a centred open landing on an entry →
-/// `Item`); [`PickerState::selection_at_item_level`] still requires the run interval to agree,
-/// so a stale bit can never move the selection outside the run either.
+/// Which level of the two-level model the selection is on, for the collapsible kinds. **Stored, not
+/// derived**: the row-space facts a derivation would read — `selected` (moved by the `set_group`
+/// reply) and `expanded_run` (moved by the reshaping push) — arrive on separate, order-independent
+/// messages, and a held `Alt-j` repeat can fire in the gap between them. Deriving the level there
+/// reads a mismatched pair: the *new* selection row can land inside the *stale* run interval,
+/// misclassify as item level, and turn a group step into a local walk into the run. Only explicit
+/// gestures flip this bit (step/select/ascend/query → `Group`; descend / a centred open landing on
+/// an entry → `Item`); [`PickerState::selection_at_item_level`] still requires the run interval to
+/// agree, so a stale bit can never move the selection outside the run either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerLevel {
     /// The selection is a group header; `Alt-j`/`Alt-k` step between groups.
@@ -57,8 +55,8 @@ pub enum GroupLanding {
     /// Group-level navigation (`Alt-j`/`Alt-k` on a header, a header click / re-select):
     /// land on the run's header, staying at group level.
     Header,
-    /// An item-level spill over the run's *last* row (docs/picker-groups.md §9): enter the
-    /// next group at its first item, staying at item level.
+    /// An item-level spill over the run's *last* row: enter the next group at its first item,
+    /// staying at item level.
     RunStart,
     /// An item-level spill over the run's *first* row: enter the previous group at its last
     /// item, staying at item level.
@@ -67,10 +65,10 @@ pub enum GroupLanding {
 
 pub struct PickerState {
     pub kind: PickerKind,
-    /// Whether the active workspace declares any projects (`docs/projects.md`). Only the
-    /// workspace-symbols picker reads it, to tell "your query matched nothing" from "nothing can
-    /// answer here yet" — two very different things to show an empty list for. Stamped when the
-    /// picker opens; a project added mid-picker is a re-open away.
+    /// Whether the active workspace declares any projects. Only the workspace-symbols picker reads
+    /// it, to tell "your query matched nothing" from "nothing can answer here yet" — two very
+    /// different things to show an empty list for. Stamped when the picker opens; a project added
+    /// mid-picker is a re-open away.
     pub workspace_has_projects: bool,
     /// The query value. Text editing (caret, insert, delete) is owned by each shell's input —
     /// native `text_input`/`<input>` in the rich clients, a shell-local editor in the TUI — which
@@ -83,10 +81,10 @@ pub struct PickerState {
     /// The window's group runs (window-relative starts, server-pushed alongside `items` — the
     /// single source of group boundaries; see `GroupSpan`). Empty for the flat kinds.
     pub groups: Vec<GroupSpan>,
-    /// Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute place in the
-    /// row space — header row + item count, server-pushed alongside `items`. What the
-    /// two-level navigation does its local math against, together with the [`Self::level`]
-    /// bit. `None` for the other kinds and while the result set is empty.
+    /// Collapsible kinds: the expanded run's absolute place in the row space — header row + item
+    /// count, server-pushed alongside `items`. What the two-level navigation does its local math
+    /// against, together with the [`Self::level`] bit. `None` for the other kinds and while the
+    /// result set is empty.
     pub expanded_run: Option<ExpandedRun>,
     /// The two-level navigation level (collapsible kinds; see [`PickerLevel`] for why this is
     /// stored rather than derived). Fresh opens and query changes are group level; a centred
@@ -115,13 +113,12 @@ pub struct PickerState {
     /// Matched by identity ([`item_key`]) — the listed item carries live decoration
     /// (git status, match indices) the anchor doesn't.
     pub pending_center: Option<PickerItem>,
-    /// Whether this picker instance knows the server slot's generation yet. False from open
-    /// until the `picker/view` response adopts `r.generation` — or a query keystroke claims the
-    /// number first (the server obeys `picker/query`'s generation, so from that point the
-    /// client's is authoritative and the response's carried snapshot must not regress it, nor
-    /// clobber the typed query). Pushes can't arrive before the response — shells deliver
-    /// server messages in wire order (docs/client-core.md) — so this only guards against the
-    /// client's own request pipelining.
+    /// Whether this picker instance knows the server slot's generation yet. False from open until
+    /// the `picker/view` response adopts `r.generation` — or a query keystroke claims the number
+    /// first (the server obeys `picker/query`'s generation, so from that point the client's is
+    /// authoritative and the response's carried snapshot must not regress it, nor clobber the typed
+    /// query). Pushes can't arrive before the response — shells deliver server messages in wire
+    /// order — so this only guards against the client's own request pipelining.
     pub generation_adopted: bool,
     /// Scroll the highlight into view when the next update lands (set by keyboard moves that
     /// forced a refetch and by centred opens — scroll-driven refetches must NOT yank the view).
@@ -139,9 +136,9 @@ pub struct PickerState {
     /// by the server (the listing shows the peeked dir's *contents*, so the client can't tell on
     /// its own). Gates whether a trailing-slash query offers "+ Create directory".
     pub explorer_peek_missing: bool,
-    /// The filter set in effect, stored as the ordered chip list — the client's single source
-    /// of truth (docs/picker-filters.md). The wire `PickerFilters` is derived per send and
-    /// converted back on open/resume; insertion order is session-ephemeral.
+    /// The filter set in effect, stored as the ordered chip list — the client's single source of
+    /// truth. The wire `PickerFilters` is derived per send and converted back on open/resume;
+    /// insertion order is session-ephemeral.
     pub chips: Vec<ChipValue>,
     /// Index into the chip row. While set, editing keys act on the chip (Enter edits,
     /// Backspace/Delete removes, Left/Right move). Entered via Left/Backspace at query
@@ -171,9 +168,9 @@ pub struct PickerState {
     /// of the selection — chasing there would yank the window back to the selection and fight the
     /// scroll (a blank, oscillating scrollbar).
     pub refetch_chases_selection: bool,
-    /// True once any real window (`items: Some`) has been adopted — before that, an empty
-    /// `items` means "not loaded yet", not "no results". The hint facts read this so the
-    /// workspace chooser's empty-list hint can't fire on the pre-load flash (docs/hints.md).
+    /// True once any real window (`items: Some`) has been adopted — before that, an empty `items`
+    /// means "not loaded yet", not "no results". The hint facts read this so the workspace
+    /// chooser's empty-list hint can't fire on the pre-load flash.
     pub loaded: bool,
     /// Jumplist only: whether the captured list is worth path-scoping (spans more than one file,
     /// with at least one in-root entry) — the `picker/view` echo of the server-computed flag.
@@ -183,8 +180,8 @@ pub struct PickerState {
     /// Whether this picker renders as a collapsible accordion — the `picker/view` echo of
     /// `PickerViewResult::collapsible`, and the authority every group-row decision reads (shells
     /// included) in place of [`PickerKind::collapsible`]. Seeded from the kind so the pre-response
-    /// frame lays out the same way, then corrected by the first view: a Jumplist captured from
-    /// the Files or Buffers picker has no groups and renders flat (docs/jumplist.md).
+    /// frame lays out the same way, then corrected by the first view: a Jumplist captured from the
+    /// Files or Buffers picker has no groups and renders flat.
     pub collapsible: bool,
 }
 
@@ -239,10 +236,10 @@ impl PickerState {
             && (self.kind != PickerKind::Jumplist || self.path_filterable)
     }
 
-    /// Workspace rows this (Workspaces) picker is showing, or `None` when it isn't the
-    /// Workspaces picker or hasn't adopted a window yet — before that, an empty item list means
-    /// "not loaded", not "no workspaces". Feeds the hint facts (docs/hints.md): zero teaches
-    /// creating a workspace, some teach opening one.
+    /// Workspace rows this (Workspaces) picker is showing, or `None` when it isn't the Workspaces
+    /// picker or hasn't adopted a window yet — before that, an empty item list means "not loaded",
+    /// not "no workspaces". Feeds the hint facts: zero teaches creating a workspace, some teach
+    /// opening one.
     pub fn listed_workspaces(&self) -> Option<u32> {
         (self.kind == PickerKind::Workspaces && self.loaded).then(|| {
             self.items
@@ -271,9 +268,9 @@ impl PickerState {
     }
 
     /// The filter set to send *while a valued-chip editor is open*: the committed chips with the
-    /// editor's in-progress glob/dir value folded in, so results update live as you type
-    /// (docs/picker-filters.md). The in-progress value is exactly what `Enter` would commit
-    /// ([`ChipEditor::preview_scope`] / [`chips::normalize_glob`]) — what-you-see-is-what-you-get.
+    /// editor's in-progress glob/dir value folded in, so results update live as you type. The
+    /// in-progress value is exactly what `Enter` would commit ([`ChipEditor::preview_scope`] /
+    /// [`chips::normalize_glob`]) — what-you-see-is-what-you-get.
     ///
     /// Returns `None` when the preview is *indeterminate* — a non-empty dir path whose suggestion
     /// listing is still loading — so the caller holds the current results rather than flapping
@@ -616,8 +613,8 @@ impl PickerState {
             // A real window landed — any pending group gesture's reshape is now in hand (or
             // superseded), so `Alt-j`/`Alt-k` repeats may flow again.
             self.group_gesture_in_flight = false;
-            // A real window landed: "no rows" now means genuinely empty, not not-yet-loaded.
-            // The hint facts (docs/hints.md) key the chooser's create-vs-open hint on this.
+            // A real window landed: "no rows" now means genuinely empty, not not-yet-loaded. The
+            // hint facts key the chooser's create-vs-open hint on this.
             self.loaded = true;
         }
         // Adopt the push's counts + display geometry from a real window (`Some`) or a count tick
@@ -643,9 +640,8 @@ impl PickerState {
             let key = item_key(&center);
             if let Some(pos) = self.items.iter().position(|i| item_key(i) == key) {
                 self.selected = self.offset + pos as u32;
-                // The centred row decides the level (docs/picker-groups.md §9): a cursor-
-                // anchored open lands on an entry/hunk — item level; a header anchor stays
-                // group level.
+                // The centred row decides the level: a cursor-anchored open lands on an entry/hunk —
+                // item level; a header anchor stays group level.
                 if self.collapsible {
                     self.level = if matches!(self.items[pos], PickerItem::Group { .. }) {
                         PickerLevel::Group
@@ -673,11 +669,11 @@ impl PickerState {
         true
     }
 
-    /// The count of selectable rows the highlight moves over: matches for the flat /
-    /// derived-header kinds; the whole *row space* — headers plus the expanded run's items —
-    /// for the collapsible kinds (docs/picker-groups.md), whose `selected`/`offset` index
-    /// window rows. `total_display_rows` is that row total (it falls back to `total_matches`
-    /// on adoption for the flat kinds, so this is safe before the first grouped push).
+    /// The count of selectable rows the highlight moves over: matches for the flat / derived-header
+    /// kinds; the whole *row space* — headers plus the expanded run's items — for the collapsible
+    /// kinds, whose `selected`/`offset` index window rows. `total_display_rows` is that row total
+    /// (it falls back to `total_matches` on adoption for the flat kinds, so this is safe before the
+    /// first grouped push).
     fn selectable_rows(&self) -> u32 {
         if self.collapsible {
             self.total_display_rows
@@ -687,20 +683,20 @@ impl PickerState {
     }
 
     /// The expanded run's item rows as an inclusive absolute-row interval, when a collapsible
-    /// picker has one (docs/picker-groups.md §9). The selection is *item level* exactly when
-    /// it sits inside this interval — every other row is a group header.
+    /// picker has one. The selection is *item level* exactly when it sits inside this interval —
+    /// every other row is a group header.
     pub fn expanded_item_rows(&self) -> Option<(u32, u32)> {
         let run = self.expanded_run?;
         (run.len > 0).then(|| (run.header_row + 1, run.header_row + run.len))
     }
 
-    /// Two-level navigation level (collapsible kinds, docs/picker-groups.md §9): `true` when
-    /// the selection is *effectively* at item level — the stored [`Self::level`] bit says so
-    /// AND the selection sits inside the expanded run's rows. The conjunction is the point:
-    /// the bit can't misroute a group step into the run when a held repeat fires between the
-    /// `set_group` reply and its reshaping push (see [`PickerLevel`]), and the interval can't
-    /// let a stale bit walk the selection outside the run. Meaningless for the
-    /// non-collapsible kinds — callers gate on [`PickerKind::collapsible`] first.
+    /// Two-level navigation level (collapsible kinds): `true` when the selection is *effectively*
+    /// at item level — the stored [`Self::level`] bit says so AND the selection sits inside the
+    /// expanded run's rows. The conjunction is the point: the bit can't misroute a group step into
+    /// the run when a held repeat fires between the `set_group` reply and its reshaping push (see
+    /// [`PickerLevel`]), and the interval can't let a stale bit walk the selection outside the run.
+    /// Meaningless for the non-collapsible kinds — callers gate on [`PickerKind::collapsible`]
+    /// first.
     pub fn selection_at_item_level(&self) -> bool {
         self.level == PickerLevel::Item
             && self
@@ -711,11 +707,10 @@ impl PickerState {
     /// Move the highlight by `delta`, returning the new window offset to fetch when the
     /// highlight left the fetched window (the caller sends `picker/view`).
     ///
-    /// For the collapsible kinds this is the *item-level* move of the two-level model
-    /// (docs/picker-groups.md §9): the selection walks the expanded run's rows and stops hard
-    /// at the run's ends — like the jumplist's `]`/`[` at its ends. Group-level moves are
-    /// `picker/set_group { step }`, routed by the caller before it gets here; called at group
-    /// level this is a no-op.
+    /// For the collapsible kinds this is the *item-level* move of the two-level model: the
+    /// selection walks the expanded run's rows and stops hard at the run's ends — like the
+    /// jumplist's `]`/`[` at its ends. Group-level moves are `picker/set_group { step }`, routed by
+    /// the caller before it gets here; called at group level this is a no-op.
     pub fn move_selection(&mut self, delta: i64) -> Option<u32> {
         if self.collapsible {
             if !self.selection_at_item_level() {
@@ -763,9 +758,9 @@ impl PickerState {
     /// A window that begins mid-group still leads with its group's header: the server repeats
     /// the split group's header at `start: 0`.
     ///
-    /// The collapsible kinds (docs/picker-groups.md) skip the span interleave entirely: their
-    /// headers arrive as real, selectable [`PickerItem::Group`] window rows, so items map 1:1
-    /// to `Item` display rows and the spans only feed the sticky pin + the split-window lead.
+    /// The collapsible kinds skip the span interleave entirely: their headers arrive as real,
+    /// selectable [`PickerItem::Group`] window rows, so items map 1:1 to `Item` display rows and
+    /// the spans only feed the sticky pin + the split-window lead.
     pub fn display_rows(&self) -> Vec<DisplayRow<'_>> {
         let mut rows = Vec::with_capacity(self.items.len() + self.groups.len() + 1);
         let mut spans = self.groups.iter().peekable();
@@ -849,10 +844,10 @@ impl PickerState {
     /// renders the gap as a real blank line, purely locally. One gap sits *before* every group
     /// header except the list's very first — equivalently, after each group but the last.
     ///
-    /// Total gaps across the whole result set: `total groups − 1`. Total groups falls out of
-    /// the display metrics (`total_display_rows − total_matches`), so this needs no extra wire
-    /// data. Zero for flat kinds, empty results, and the collapsible kinds — their headers are
-    /// uniform window rows (docs/picker-groups.md), not gap-separated decorations.
+    /// Total gaps across the whole result set: `total groups − 1`. Total groups falls out of the
+    /// display metrics (`total_display_rows − total_matches`), so this needs no extra wire data.
+    /// Zero for flat kinds, empty results, and the collapsible kinds — their headers are uniform
+    /// window rows, not gap-separated decorations.
     pub fn total_gap_count(&self) -> u32 {
         if self.groups.is_empty() || self.collapsible {
             return 0;
@@ -938,8 +933,7 @@ impl PickerState {
             PickerKind::References => "No references found",
             PickerKind::DocumentSymbols => "No symbols found",
             // Two distinct states, and conflating them would be the difference between "your query
-            // matched nothing" and "this feature can't work here yet" — see
-            // `docs/workspace-symbols.md` § Scope.
+            // matched nothing" and "this feature can't work here yet".
             PickerKind::WorkspaceSymbols if !self.workspace_has_projects => {
                 "No projects configured"
             }
@@ -1238,8 +1232,8 @@ mod tests {
         let flat = PickerState::new(PickerKind::Files);
         assert_eq!(flat.total_gap_count(), 0);
         assert_eq!(flat.gaps_above_window(), 0);
-        // Nor do the collapsible kinds — their headers are uniform window rows
-        // (docs/picker-groups.md), not gap-separated decorations.
+        // Nor do the collapsible kinds — their headers are uniform window rows, not gap-separated
+        // decorations.
         let mut grep = PickerState::new(PickerKind::Grep);
         grep.groups = file_spans(&[(0, 0, "a.rs")]);
         grep.total_display_rows = 6;
@@ -1448,8 +1442,8 @@ mod tests {
 
     #[test]
     fn grep_display_rows_align_with_server_offsets() {
-        // Collapsible grep (docs/picker-groups.md): headers arrive as real `Group` window rows
-        // and the offset/selection space IS the display space — no interleave, no reconcile.
+        // Collapsible grep: headers arrive as real `Group` window rows and the offset/selection
+        // space IS the display space — no interleave, no reconcile.
         let hit = |path: &str, line: u32| PickerItem::GrepHit {
             path_index: 0,
             relative_path: path.into(),
@@ -1502,9 +1496,9 @@ mod tests {
 
     #[test]
     fn workspace_diagnostics_count_file_headers_in_window_math() {
-        // DiagnosticsWorkspace is collapsible (docs/picker-groups.md): its headers are real
-        // `Group` window rows, so the window math is the identity — no interleave, and the
-        // selection walks headers and items alike.
+        // DiagnosticsWorkspace is collapsible: its headers are real `Group` window rows, so the
+        // window math is the identity — no interleave, and the selection walks headers and items
+        // alike.
         let diag = |path: &str, line: u32| PickerItem::Diagnostic {
             path_index: 0,
             relative_path: path.into(),
@@ -1708,7 +1702,7 @@ mod tests {
             "the Group row + its two hunks, nothing added"
         );
         assert!(rows.iter().all(|r| matches!(r, DisplayRow::Item { .. })));
-        // ...and the buffer-locked GitChangesFile is a single file with no header at all — the
+        //...and the buffer-locked GitChangesFile is a single file with no header at all — the
         // server sends no spans and no Group rows, so the same items render flat.
         let mut file = PickerState::new(PickerKind::GitChangesFile);
         file.items = items;

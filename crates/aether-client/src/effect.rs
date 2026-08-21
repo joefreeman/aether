@@ -1,8 +1,8 @@
-//! Effects — what core logic asks its shell to do. The core mutates its own state and
-//! returns these; the shell executes them (performing RPC requests, presenting toasts,
-//! touching the clipboard) and feeds outcomes back into the core. Pure data: the core is
-//! sans-IO — it never constructs futures, so the whole surface is inspectable and the
-//! update loop unit-testable with canned results (docs/client-core.md).
+//! Effects — what core logic asks its shell to do. The core mutates its own state and returns
+//! these; the shell executes them (performing RPC requests, presenting toasts, touching the
+//! clipboard) and feeds outcomes back into the core. Pure data: the core is sans-IO — it never
+//! constructs futures, so the whole surface is inspectable and the update loop unit-testable with
+//! canned results.
 
 use super::keymap::{ScrollDir, ScrollUnit, ViewportPlace};
 use super::session::{HoverText, PasteKind};
@@ -20,17 +20,15 @@ pub enum ShellAction {
     PlaceCursor(ViewportPlace),
     /// Flip soft-wrap and re-render the viewport (paired with [`Effect::SaveContentAnchor`]).
     ToggleWrap,
-    /// Open a URL — or an absolute file path — with the system handler (the reading view's
-    /// `Enter` on an external link or image; docs/markdown-view.md §2.4). The GUI reuses its
-    /// hover-link opener (allow-listed schemes + spawn), the TUI spawns the same system opener,
-    /// the web shell opens a new tab. Never a relative path: the core resolves against the
-    /// buffer's directory before emitting.
+    /// Open a URL — or an absolute file path — with the system handler (the reading view's `Enter`
+    /// on an external link or image). The GUI reuses its hover-link opener (allow-listed schemes +
+    /// spawn), the TUI spawns the same system opener, the web shell opens a new tab. Never a
+    /// relative path: the core resolves against the buffer's directory before emitting.
     OpenUrl(String),
-    /// Open a file that lives beside the buffer — a *local* image's `Enter`
-    /// (docs/markdown-view.md §2.4). Native shells open `absolute` with the system handler; a
-    /// browser can't touch local paths, so the web shell opens the server's confined
-    /// `/asset/{buffer_id}/{relative}` route in a new tab instead (the same route its
-    /// `<img>` tags already load from).
+    /// Open a file that lives beside the buffer — a *local* image's `Enter`. Native shells open
+    /// `absolute` with the system handler; a browser can't touch local paths, so the web shell
+    /// opens the server's confined `/asset/{buffer_id}/{relative}` route in a new tab instead (the
+    /// same route its `<img>` tags already load from).
     OpenBufferFile {
         absolute: String,
         buffer_id: BufferId,
@@ -119,10 +117,9 @@ pub enum RevealStyle {
 }
 
 pub enum Effect {
-    /// Perform this JSON-RPC call and feed the outcome back through
-    /// `Session::on_rpc_result` with the same token. Requests are performed in emission
-    /// order on the single connection — sequenced flows rely on it. (The sans-IO
-    /// replacement for `Spawn`-ing an RPC future; docs/client-core.md.)
+    /// Perform this JSON-RPC call and feed the outcome back through `Session::on_rpc_result` with
+    /// the same token. Requests are performed in emission order on the single connection —
+    /// sequenced flows rely on it. (The sans-IO replacement for `Spawn`-ing an RPC future)
     Request {
         token: u64,
         method: &'static str,
@@ -180,10 +177,10 @@ pub enum Effect {
         attempt: u32,
     },
     /// Call `Session::on_hint_tick` with the current wall clock, promptly. Emitted when the
-    /// `hints/state` snapshot adopts: the engine is sans-IO (time reaches it only through the
-    /// tick entry point), so without this the first hint would wait out the shell's periodic
-    /// tick interval — the shell answers with one out-of-band tick and the first hint shows
-    /// right after adoption instead of seconds later (docs/hints.md).
+    /// `hints/state` snapshot adopts: the engine is sans-IO (time reaches it only through the tick
+    /// entry point), so without this the first hint would wait out the shell's periodic tick
+    /// interval — the shell answers with one out-of-band tick and the first hint shows right after
+    /// adoption instead of seconds later.
     HintTickNow,
     /// Quit the application. A shell with no process to quit (the web — a browser tab) maps this
     /// to a no-op; the mandatory chooser's Esc relies on that (the core keeps the picker open and

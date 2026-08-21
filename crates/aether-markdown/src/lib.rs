@@ -1,9 +1,9 @@
 //! The shared markdown block model: one parser for presentation *and* edits.
 //!
-//! Extracted from the client core (docs/markdown-view.md §12, phase 3a) so the server can
-//! resolve structural edits against literally the same parse the reading view renders from —
-//! block boundaries agree by construction, one `Cargo.lock`, one code path. The client
-//! re-exports this crate as `aether_client::markdown`, so shells and wasm are unchanged.
+//! Extracted from the client core (phase 3a) so the server can resolve structural edits against
+//! literally the same parse the reading view renders from — block boundaries agree by construction,
+//! one `Cargo.lock`, one code path. The client re-exports this crate as `aether_client::markdown`,
+//! so shells and wasm are unchanged.
 //!
 //! ---
 //!
@@ -16,7 +16,7 @@
 //!
 //! - **LSP hover popovers**: the original user; content arrives as markdown text, source
 //!   positions are irrelevant.
-//! - **The markdown reading view** (docs/markdown-view.md): parses whole buffers. Every block
+//! - **The markdown reading view**: parses whole buffers. Every block
 //!   and interactive inline carries its **source byte span**, the foundation of the read view's
 //!   source map — focus derivation, outline jumps and edit-toggle fidelity all resolve through
 //!   those spans. The flattened [`Element`] list built by [`elements`] is the navigable form.
@@ -100,9 +100,9 @@ pub enum Block {
         src: String,
         alt: String,
         span: Span,
-        /// The image markup itself (the promoted inline's span — no trailing whitespace):
-        /// the Enter-target span, leaving the block a *rest byte* so `l` opts into the image
-        /// like it opts into links (docs/markdown-view.md §2.3).
+        /// The image markup itself (the promoted inline's span — no trailing whitespace): the
+        /// Enter-target span, leaving the block a *rest byte* so `l` opts into the image like it
+        /// opts into links.
         inner_span: Span,
     },
     /// YAML front matter (`---` fenced, document start). Raw text; not interpreted.
@@ -172,9 +172,9 @@ pub enum ColAlign {
     Right,
 }
 
-/// An inline (span-level) node. Interactive inlines (link, image, footnote ref) carry source
-/// spans — they're focusable elements in the reading view; plain text runs don't (match
-/// painting, which needs text-run spans, is a later phase — docs/markdown-view.md §10 step 5).
+/// An inline (span-level) node. Interactive inlines (link, image, footnote ref) carry source spans —
+/// they're focusable elements in the reading view; plain text runs don't (match painting, which
+/// needs text-run spans, is a later phase).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Inline {
@@ -211,8 +211,8 @@ pub enum Inline {
     HardBreak,
 }
 
-/// The extension set both consumers parse with (docs/markdown-view.md §2.2). Smart punctuation
-/// is display-only prettiness — the replacement text still carries exact source ranges.
+/// The extension set both consumers parse with. Smart punctuation is display-only prettiness — the
+/// replacement text still carries exact source ranges.
 fn options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -259,8 +259,8 @@ pub fn parse(md: &str) -> Vec<Block> {
     b.out
 }
 
-/// Replace any paragraph whose content is exactly one image with [`Block::Image`], recursively —
-/// a display image rather than a run of text (docs/markdown-view.md §2.2).
+/// Replace any paragraph whose content is exactly one image with [`Block::Image`], recursively — a
+/// display image rather than a run of text.
 fn promote_lone_images(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         match block {
@@ -648,9 +648,9 @@ fn inlines_text(inlines: &[Inline]) -> String {
 // ---- the element list ---------------------------------------------------------------------------
 
 /// A navigable element of the rendered document, in document order (outer before inner at equal
-/// starts). The reading view's focus model runs entirely over this list: block-grain elements
-/// are `j`/`k` stops, interactive ones are `Tab` stops and `Enter` targets, headings serve the
-/// `o`/`Alt-o` motion and anchor-link resolution (docs/markdown-view.md §1.3, §2.3).
+/// starts). The reading view's focus model runs entirely over this list: block-grain elements are
+/// `j`/`k` stops, interactive ones are `Tab` stops and `Enter` targets, headings serve the
+/// `o`/`Alt-o` motion and anchor-link resolution.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Element {
@@ -733,7 +733,7 @@ pub fn elements(blocks: &[Block]) -> Vec<Element> {
 /// **Every block is an element, at any depth.** A quote's paragraphs, a list item's second
 /// paragraph, a fence inside an item: all of them are reading stops and all of them can be
 /// selected and edited, because focus resolves innermost-first and so the inner block wins over
-/// its container wherever there is one (docs/markdown-view.md §12.6). Containers used to list
+/// its container wherever there is one. Containers used to list
 /// only *some* of their children — headings and list items, because those arms happened to push
 /// unconditionally — which is why "act on the inner thing" worked for a heading in a quote but
 /// not for a paragraph in the same quote.
@@ -897,8 +897,8 @@ fn unique_slug(text: &str, seen: &mut HashMap<String, u32>) -> String {
 }
 
 /// The element the reading cursor at byte `pos` focuses: the **innermost** element containing
-/// `pos`, else the first element starting after it, else the last element. `None` only for an
-/// empty document. This is the pure "focus = f(cursor)" derivation (docs/markdown-view.md §1.3).
+/// `pos`, else the first element starting after it, else the last element. `None` only for an empty
+/// document. This is the pure "focus = f(cursor)" derivation.
 pub fn element_at(elements: &[Element], pos: u32) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, el) in elements.iter().enumerate() {
@@ -958,8 +958,8 @@ pub fn element_at_matching(
 }
 
 /// Indices of the interactive elements (links, images, footnote refs) whose spans nest inside
-/// `container`, in document order — the reading view's within-block link ring
-/// (docs/markdown-view.md §2.3: `h`/`l` step the Enter target inside the focused block).
+/// `container`, in document order — the reading view's within-block link ring (`h`/`l` step the
+/// Enter target inside the focused block).
 pub fn interactive_within(elements: &[Element], container: Span) -> Vec<usize> {
     elements
         .iter()
@@ -974,9 +974,9 @@ pub fn interactive_within(elements: &[Element], container: Span) -> Vec<usize> {
 
 /// The byte a block-grain step lands on to select `block` *without* auto-targeting a leading
 /// interactive: the first byte of its span outside every interactive child, so a lone-link
-/// paragraph shows the position bar alone and `l` opts into the link
-/// (docs/markdown-view.md §2.3). Falls back to the span start when no such byte exists — a
-/// block image IS its own target, and staying targeted is the honest state there.
+/// paragraph shows the position bar alone and `l` opts into the link. Falls back to the span start
+/// when no such byte exists — a block image IS its own target, and staying targeted is the honest
+/// state there.
 pub fn block_rest_byte(elements: &[Element], block: usize) -> u32 {
     let span = elements[block].span();
     let mut pos = span.start;
@@ -1026,8 +1026,8 @@ pub fn heading_by_slug(elements: &[Element], slug: &str) -> Option<usize> {
         .position(|e| matches!(e, Element::Heading { slug: s, .. } if s == slug))
 }
 
-/// Every fenced code block that names a language, recursively, as `(span, language, code)` —
-/// the reading view's highlight fan-out (docs/markdown-view.md §2.8).
+/// Every fenced code block that names a language, recursively, as `(span, language, code)` — the
+/// reading view's highlight fan-out.
 pub fn fenced_code_blocks(blocks: &[Block]) -> Vec<(Span, String, String)> {
     let mut out = Vec::new();
     collect_fences(blocks, &mut out);
@@ -1528,10 +1528,10 @@ mod tests {
 
     #[test]
     fn container_children_are_reading_stops_of_their_own() {
-        // Every block is an element at any depth (docs/markdown-view.md §12.6), so focus —
-        // which resolves innermost-first — lands on the inner block rather than its container.
-        // Containers used to list only headings and list items, which is why "act on the inner
-        // thing" worked for a heading in a quote but not a paragraph in the same quote.
+        // Every block is an element at any depth, so focus — which resolves innermost-first — lands
+        // on the inner block rather than its container. Containers used to list only headings and
+        // list items, which is why "act on the inner thing" worked for a heading in a quote but not
+        // a paragraph in the same quote.
         let spans = |md: &str| -> Vec<(u32, u32)> {
             elements(&parse(md))
                 .iter()

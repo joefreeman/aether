@@ -4,7 +4,7 @@
 //! back the server's capabilities); [`shutdown`] tears it down. The `did_*` helpers send the
 //! document-sync notifications. Phase 1 uses **full-document sync**: every change resends the whole
 //! buffer text — correct and trivial; incremental ranges (using a `TextChange` from `apply_edit`)
-//! are a later optimization (see `docs/lsp.md`).
+//! are a later optimization.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -27,9 +27,9 @@ pub struct ServerCaps {
     /// Many servers don't (pyright, bash-language-server, marksman, …); `lsp/format` uses this to
     /// say "no formatter for X" rather than a vague "nothing to format".
     pub document_formatting: bool,
-    /// Whether the server advertises `workspaceSymbolProvider`. The workspace-symbols picker
-    /// (`docs/workspace-symbols.md`) skips servers without it rather than sending a request they'll
-    /// error on — several of the small servers (yaml, css, dockerfile) don't implement it.
+    /// Whether the server advertises `workspaceSymbolProvider`. The workspace-symbols picker skips
+    /// servers without it rather than sending a request they'll error on — several of the small
+    /// servers (yaml, css, dockerfile) don't implement it.
     pub workspace_symbol: bool,
 }
 

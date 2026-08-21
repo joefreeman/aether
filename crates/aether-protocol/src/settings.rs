@@ -39,13 +39,13 @@ pub struct AppSettings {
     /// only, GUI/web honour it, the terminal ignores it.
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: u32,
-    /// Hints: the passive corner suggestion that walks through the curriculum
-    /// (docs/hints.md). The off-switch only — learning state lives in `hints.json`, not here.
+    /// Hints: the passive corner suggestion that walks through the curriculum. The off-switch only —
+    /// learning state lives in `hints.json`, not here.
     #[serde(default = "default_hints")]
     pub hints: bool,
-    /// Open markdown buffers as the reading view by default (docs/markdown-view.md §1.6):
-    /// file-shaped opens land in Read mode, jump-shaped opens (grep hits, diagnostics) land in
-    /// the editor either way. Client-side behaviour the server only stores.
+    /// Open markdown buffers as the reading view by default: file-shaped opens land in Read mode,
+    /// jump-shaped opens (grep hits, diagnostics) land in the editor either way. Client-side
+    /// behaviour the server only stores.
     #[serde(default = "default_markdown_read")]
     pub markdown_read: bool,
     /// Colour theme, app-wide across every client. Purely a client-side render choice the server
@@ -68,8 +68,8 @@ pub struct AppSettings {
     /// config surface.
     #[serde(default = "default_git_auto_fetch")]
     pub git_auto_fetch: bool,
-    /// Where app-managed git worktrees are created (`docs/worktrees.md` §8.4). Absolute path; empty
-    /// means the default, `$XDG_DATA_HOME/aether/worktrees`.
+    /// Where app-managed git worktrees are created. Absolute path; empty means the default,
+    /// `$XDG_DATA_HOME/aether/worktrees`.
     ///
     /// **The store is centralised and outside every workspace root on purpose** — a worktree nested
     /// under a root gets swallowed by the workspace index, shows up as an untracked path in status,

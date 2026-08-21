@@ -1,11 +1,10 @@
 //! Conversion between Aether's internal columns and LSP `character` offsets.
 //!
 //! Aether is UTF-8 throughout: ropey stores UTF-8 and the protocol's `col` is a *byte* offset into
-//! a line's UTF-8 (see `docs/protocol.md` §3). LSP positions instead count code units in a
-//! *negotiated* encoding — UTF-16 by default, but UTF-8 (and UTF-32) are negotiable via the
-//! `positionEncoding` capability (LSP 3.17). We advertise UTF-8 first and fall back. This module is
-//! the single place the two coordinate systems meet, so nothing else in the server has to think
-//! about UTF-16.
+//! a line's UTF-8. LSP positions instead count code units in a *negotiated* encoding — UTF-16 by
+//! default, but UTF-8 (and UTF-32) are negotiable via the `positionEncoding` capability (LSP 3.17).
+//! We advertise UTF-8 first and fall back. This module is the single place the two coordinate
+//! systems meet, so nothing else in the server has to think about UTF-16.
 //!
 //! These functions operate on one line's text, which must exclude the trailing newline (LSP
 //! positions never index the line terminator). The caller pairs the column with a line number to

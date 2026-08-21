@@ -1,6 +1,6 @@
-//! The sans-IO payoff (docs/client-core.md): the update loop tested as a pure state
-//! machine — key events in, `Effect::Request`s out, canned JSON results back in — with no
-//! transport, no mock, no async runtime.
+//! The sans-IO payoff: the update loop tested as a pure state machine — key events in,
+//! `Effect::Request`s out, canned JSON results back in — with no transport, no mock, no async
+//! runtime.
 
 use aether_client::effect::{Effect, Effects, ShellAction, ToastKind};
 use aether_client::keymap::{KeyCode, Mods};
@@ -974,12 +974,12 @@ fn streaming_grep_view_snapshot_does_not_wipe_pushed_rows() {
 
 #[test]
 fn view_response_does_not_regress_a_query_typed_before_it() {
-    // Request pipelining: the user types into a fresh picker before its `picker/view` response
-    // has arrived. Typing claims the generation (the server adopts `picker/query`'s number), so
-    // the response's carried snapshot — the slot's pre-reopen generation and its resumed (empty)
-    // query — must not regress either: adopting them would clobber the typed query and orphan
-    // the query's own push. (Pushes can't race the response itself — shells deliver server
-    // messages in wire order, docs/client-core.md — so pipelining is the one case this gates.)
+    // Request pipelining: the user types into a fresh picker before its `picker/view` response has
+    // arrived. Typing claims the generation (the server adopts `picker/query`'s number), so the
+    // response's carried snapshot — the slot's pre-reopen generation and its resumed (empty) query —
+    // must not regress either: adopting them would clobber the typed query and orphan the query's
+    // own push. (Pushes can't race the response itself — shells deliver server messages in wire
+    // order — so pipelining is the one case this gates.)
     use aether_client::update::Event;
     use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
     use aether_protocol::picker::{
@@ -1599,9 +1599,8 @@ fn alt_l_declines_the_create_row() {
     assert_eq!(s.picker.as_ref().unwrap().query, "novel.rs");
 }
 
-/// A collapsible picker window (docs/picker-groups.md): a.rs collapsed with 2 hidden hits,
-/// b.rs expanded (selected group) with its 2 hits inline. Row space: [0]=a.rs hdr,
-/// [1]=b.rs hdr, [2..3]=hits.
+/// A collapsible picker window: a.rs collapsed with 2 hidden hits, b.rs expanded (selected group)
+/// with its 2 hits inline. Row space: [0]=a.rs hdr, [1]=b.rs hdr, [2.3]=hits.
 fn grep_with_groups(s: &mut Session) {
     use aether_protocol::picker::{ExpandedRun, GroupHeader, GroupSpan, PickerItem, PickerKind};
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
@@ -1653,8 +1652,8 @@ fn grep_with_groups(s: &mut Session) {
 fn alt_l_descends_into_the_selected_group() {
     let mut s = session();
     grep_with_groups(&mut s);
-    // On the selected (expanded) group's header: Alt-l descends onto the run's first item —
-    // a local move, no round-trip (docs/picker-groups.md §9).
+    // On the selected (expanded) group's header: Alt-l descends onto the run's first item — a local
+    // move, no round-trip.
     s.picker.as_mut().unwrap().selected = 1;
     let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
     assert!(find_request(&fx, "picker/set_group").is_none());
@@ -1692,8 +1691,8 @@ fn alt_l_on_a_group_item_opens_it() {
 fn alt_h_ascends_to_the_header_and_never_touches_the_query() {
     let mut s = session();
     grep_with_groups(&mut s);
-    // On an item row: ascend onto the run's header — a local move, nothing collapses
-    // (moving the group selection is what moves the expansion, docs/picker-groups.md §9).
+    // On an item row: ascend onto the run's header — a local move, nothing collapses (moving the
+    // group selection is what moves the expansion).
     {
         let p = s.picker.as_mut().unwrap();
         p.selected = 3;
@@ -1742,8 +1741,8 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     use aether_client::update::Event;
     let mut s = session();
     grep_with_groups(&mut s);
-    // Group level (selection on a header): Alt-j/k are a server-resolved group *step* —
-    // the neighbour may sit past the fetched window (docs/picker-groups.md §9).
+    // Group level (selection on a header): Alt-j/k are a server-resolved group *step* — the
+    // neighbour may sit past the fetched window.
     s.picker.as_mut().unwrap().selected = 1;
     let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
     let params = find_request(&fx, "picker/set_group").expect("group-level Alt-j steps");
@@ -1832,10 +1831,9 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     assert_eq!(params["step"], "forward");
 }
 
-/// Item-level `Alt-j`/`Alt-k` spill over the run's edges (docs/picker-groups.md §9): down
-/// off the last item enters the next group at its *first* item, up off the first enters the
-/// previous at its *last* — both staying at item level, revealed minimally (a continuous
-/// scan, not a run framing).
+/// Item-level `Alt-j`/`Alt-k` spill over the run's edges: down off the last item enters the next
+/// group at its *first* item, up off the first enters the previous at its *last* — both staying at
+/// item level, revealed minimally (a continuous scan, not a run framing).
 #[test]
 fn item_level_spills_across_group_edges() {
     use aether_client::picker::{GroupLanding, Reveal};
@@ -1941,10 +1939,9 @@ fn explorer_alt_h_ascends_regardless_of_the_query() {
 fn enter_on_a_group_header_jumps_to_its_first_item() {
     let mut s = session();
     grep_with_groups(&mut s);
-    // Enter on a header IS a jump (docs/picker-groups.md §9): the Group row rides
-    // `picker/select` and the server resolves it to the group's first item — so
-    // type-query-then-Enter takes the top hit without a mandatory descend. The picker
-    // closes like any accept.
+    // Enter on a header IS a jump: the Group row rides `picker/select` and the server resolves it
+    // to the group's first item — so type-query-then-Enter takes the top hit without a mandatory
+    // descend. The picker closes like any accept.
     s.picker.as_mut().unwrap().selected = 0;
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     assert!(find_request(&fx, "picker/set_group").is_none());
@@ -1990,8 +1987,8 @@ fn group_set_landing_seats_the_selection() {
     ));
     assert_eq!(s.picker.as_ref().unwrap().selected, 1);
     assert!(no_request(&fx), "in-window: no refetch needed");
-    // Group navigation frames the whole freshly-opened run, not just its header row —
-    // immediately and re-armed for the reshaped push (docs/picker-groups.md §9).
+    // Group navigation frames the whole freshly-opened run, not just its header row — immediately
+    // and re-armed for the reshaped push.
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::RevealPickerSelection(Reveal::Run))),
@@ -2703,7 +2700,7 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
     let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
     assert!(no_request(&fx), "no edit RPC leaves the client");
 
-    // ...and `i` doesn't even change mode, so the next keystroke isn't text either.
+    //...and `i` doesn't even change mode, so the next keystroke isn't text either.
     let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
     assert!(no_request(&fx));
     assert!(matches!(s.mode, aether_client::session::Mode::Normal));
@@ -3293,7 +3290,7 @@ fn disconnected_drops_server_requests_but_allows_quit() {
         "server requests are dropped while disconnected"
     );
 
-    // ...but client-only actions still run, so the user can always quit (`Space q` → Exit).
+    //...but client-only actions still run, so the user can always quit (`Space q` → Exit).
     let mut s = session();
     let _ = s.on_event(Event::ConnectionLost);
     let _ = key(&mut s, ' '); // leader
@@ -3967,7 +3964,7 @@ fn ctrl_alt_x_cuts_the_selection_and_enters_insert() {
     assert_eq!(method, "buffer/cut");
     assert_eq!(params["scope"], json!("selection"));
 
-    // ...but unlike Ctrl-x (which stays in Normal) it leaves us in Insert at the gap.
+    //...but unlike Ctrl-x (which stays in Normal) it leaves us in Insert at the gap.
     assert_eq!(s.mode, Mode::Insert);
 }
 
@@ -6071,7 +6068,7 @@ fn pull_reports_a_repo_left_mid_operation() {
     })));
     let msg = toast_messages(&fx).join(" ");
     assert!(msg.contains("index.lock"), "got {msg:?}");
-    // ...and an ordinary cancel still says nothing alarming.
+    //...and an ordinary cancel still says nothing alarming.
     let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
         status: GitPullStatus::Cancelled,
         ..Default::default()
@@ -6309,7 +6306,7 @@ fn reload_moved_to_space_alt_k() {
         "Space Alt-k reloads"
     );
 
-    // ...and its old home, Space a, no longer reloads. (It's unbound outright now stage-hunk
+    //...and its old home, Space a, no longer reloads. (It's unbound outright now stage-hunk
     // has moved to the git sub-leader, so this doubles as the ignore-an-unbound-key path.)
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
@@ -6370,7 +6367,7 @@ fn copy_path_warns_for_scratch_buffer() {
     );
 }
 
-// ---- application settings (Space ,) -----------------------------------------------------------
+// ---- application settings (Space,) -----------------------------------------------------------
 
 #[test]
 fn app_settings_overlay_opens_via_leader_comma() {
@@ -6803,7 +6800,7 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
         vec!["history/state", "buffer/open"],
         "opens a fresh scratch in the new workspace"
     );
-    // The settings overlay auto-opens, focused on the add-root input (index = roots.len() + 1 = 1).
+    // The settings overlay auto-opens, focused on the add-root input (index = roots.len + 1 = 1).
     let ps = s.workspace_settings.as_ref().expect("settings opened");
     assert_eq!(ps.workspace_name, "fresh");
     assert!(ps.roots.is_empty());
@@ -6958,7 +6955,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
     );
     assert_eq!(s.workspace_projects.len(), 1);
 
-    // ...and the settings overlay shows them without needing a workspace event first.
+    //...and the settings overlay shows them without needing a workspace event first.
     s.open_workspace_settings();
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.projects.len(), 1);
@@ -7011,7 +7008,7 @@ fn settings_tab_traverses_fields_including_the_editor_segments() {
     assert_eq!(ps.add_project.root_filter.text, "beta");
     assert_eq!(ps.add_project.field, ChipEditorField::Path);
 
-    // ...and Shift-Tab walks back out the same way.
+    //...and Shift-Tab walks back out the same way.
     s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.add_project.field, ChipEditorField::Root);
@@ -7405,13 +7402,13 @@ fn settings_navigation_reaches_the_add_project_row() {
     assert_eq!(ps.row(), SettingsRow::AddProject);
     assert!(ps.on_add_project_language);
 
-    // ...and only Tab off *that* cycles round to the first field.
+    //...and only Tab off *that* cycles round to the first field.
     s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::Name,
     );
-    // ...and Shift-Tab off the first wraps back to the last.
+    //...and Shift-Tab off the first wraps back to the last.
     s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
@@ -7787,8 +7784,8 @@ fn symbol_center_on_far_down_adopts_the_framed_window() {
 }
 
 /// Closing the last buffer of an ephemeral "(workspace N)" context doesn't spawn a scratch — it
-/// leaves the context. A session *launched* for the file (`ae /path`) tethers to it
-/// (docs/tether.md), so the close quits, vim-like.
+/// leaves the context. A session *launched* for the file (`ae /path`) tethers to it, so the close
+/// quits, vim-like.
 #[test]
 fn ephemeral_last_buffer_close_when_launched_quits() {
     let mut s = session();
@@ -7860,7 +7857,7 @@ fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
     );
 }
 
-// ---- the tether (docs/tether.md) --------------------------------------------------------------
+// ---- the tether --------------------------------------------------------------
 
 /// A quick-edit session in a *real* workspace (`ae file`, workspace inferred — the git-commit
 /// case): `Space x` on the tethered buffer exits the client instead of switching to a successor.
@@ -8347,7 +8344,7 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
 #[test]
 fn space_z_asks_the_shell_to_open_a_new_window() {
     let mut s = session();
-    // `Space z` — was `Space Alt-x` until that chord became save-and-close (docs/tether.md).
+    // `Space z` — was `Space Alt-x` until that chord became save-and-close.
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('z'), Mods::NONE, Some("z".into()), ROWS);
     assert!(
@@ -8363,7 +8360,7 @@ fn space_z_asks_the_shell_to_open_a_new_window() {
     );
 }
 
-// ---- hints (docs/hints.md) --------------------------------------------------------
+// ---- hints --------------------------------------------------------
 
 /// A non-placeholder session (hints display nowhere on the boot placeholder).
 fn hint_session() -> Session {
@@ -8404,7 +8401,7 @@ fn hint_records(fx: &Effects) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Drive a session through the connect sequence with hints on: `startup()` → canned settings +
+/// Drive a session through the connect sequence with hints on: `startup` → canned settings +
 /// (empty) hints snapshot → one tick to stamp the clock and sample the first hint. Returns the
 /// events the tick emitted.
 fn adopt_hints(s: &mut Session) -> Effects {
@@ -8827,9 +8824,9 @@ fn hints_workspace_chooser_hint_tracks_the_list() {
 #[test]
 fn hints_boot_chooser_drives_the_corner() {
     use aether_protocol::picker::{PickerItem, PickerKind};
-    // The boot chooser (every shell) is the core Workspaces picker over a placeholder session;
-    // its hints run through the ordinary tick/view path — the picker context outranks the
-    // placeholder check (docs/hints.md).
+    // The boot chooser (every shell) is the core Workspaces picker over a placeholder session; its
+    // hints run through the ordinary tick/view path — the picker context outranks the placeholder
+    // check.
     let mut s = session();
     adopt_hints(&mut s);
     let _ = s.open_picker(PickerKind::Workspaces, None, None, false, None);
@@ -8873,7 +8870,7 @@ fn hints_boot_chooser_drives_the_corner() {
     );
 }
 
-// ---- input history (docs/input-history.md) --------------------------------------------------
+// ---- input history --------------------------------------------------
 
 /// The plain values of one recall list — most assertions don't care about the carried filters.
 fn hist(s: &Session, kind: aether_protocol::history::HistoryKind) -> Vec<&str> {
@@ -9256,7 +9253,7 @@ fn re_recording_a_term_updates_its_filters_in_place() {
     );
 }
 
-// ---- markdown reading view (docs/markdown-view.md) ----------------------------------------------
+// ---- markdown reading view ----------------------------------------------
 
 fn md_session() -> Session {
     let mut s = session();
@@ -9461,13 +9458,12 @@ fn read_l_focuses_the_link_in_block_and_enter_opens_it() {
     );
 }
 
-/// `v`/`Alt-v`: the editor's half-page cursor motion, verbatim — the server resolves it in
-/// editor wrap geometry and the returned cursor derives focus (best-effort distance, framed
-/// landing — docs/markdown-view.md §2.3).
+/// `v`/`Alt-v`: the editor's half-page cursor motion, verbatim — the server resolves it in editor
+/// wrap geometry and the returned cursor derives focus (best-effort distance, framed landing).
 #[test]
 fn read_v_rides_the_editor_half_page_motion() {
     let mut s = read_session();
-    // The viewport subscription stays alive in Read (§1.5); the motion needs its id for the
+    // The viewport subscription stays alive in Read; the motion needs its id for the
     // editor wrap geometry.
     s.viewport_id = Some(7);
     let fx = key(&mut s, 'v');
@@ -9741,7 +9737,7 @@ fn read_extended_selection_suppresses_the_display_target() {
     let read = s.read.as_ref().unwrap();
     assert!(read.target_focus(s.buffer.cursor.position).is_some());
     assert!(read.display_target(&s.buffer.cursor).is_some());
-    // …and goes away as soon as the selection is extended (§12: one selection at a time).
+    // …and goes away as soon as the selection is extended (one selection at a time).
     s.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
     let read = s.read.as_ref().unwrap();
     assert!(read.target_focus(s.buffer.cursor.position).is_some());
@@ -9872,7 +9868,7 @@ fn read_ctrl_o_refused_stays_in_the_reading_view() {
 fn read_transitions_do_not_record_a_presentation_preference() {
     use aether_client::session::Mode;
     // `Space v` back into the editor is the explicit "source, please" signal and flips the
-    // session's choice; the §12 edit transitions must not — you can edit *in* the reading view,
+    // session's choice; the edit transitions must not — you can edit *in* the reading view,
     // so dropping into Insert says nothing about how the next document should open.
     let mut s = read_session();
     assert!(s.read_on(), "Space v into the view set the session choice");
@@ -9886,9 +9882,9 @@ fn read_transitions_do_not_record_a_presentation_preference() {
 }
 
 /// The choice is one session-wide flag, not a per-buffer memory: leaving one document for source
-/// means the next markdown document opens in source too (docs/markdown-view.md §1.6). The
-/// alternative — remembering per buffer — treats "I dropped into raw markdown to fix a link" as a
-/// durable property of that document, which it isn't.
+/// means the next markdown document opens in source too. The alternative — remembering per buffer —
+/// treats "I dropped into raw markdown to fix a link" as a durable property of that document, which
+/// it isn't.
 #[test]
 fn read_choice_is_session_wide_not_per_buffer() {
     use aether_client::session::Mode;
@@ -10254,17 +10250,17 @@ fn read_table_contains_no_editing_action() {
                     // Whole-buffer select and collapse: cursor-only, like the swap.
                     | Action::SelectAll
                     | Action::CollapseSelection
-                    // §12's curated edits: undo/redo act on the buffer but create no new
+                    // The curated edits: undo/redo act on the buffer but create no new
                     // text shape from Read; each future edit action is added here
-                    // deliberately, keeping the §1.4 discipline as an explicit list.
+                    // deliberately, keeping the discipline as an explicit list.
                     | Action::Undo
                     | Action::Redo
-                    // §12 phase 2: the to-the-editor transitions — they place the cursor
+                    // Phase 2: the to-the-editor transitions — they place the cursor
                     // and hand over to the editor's own insert/change machinery.
                     | Action::ReadInsert { .. }
                     | Action::ReadChange
                     | Action::ReadOpenBlock { .. }
-                    // §12 phase 3: the structural edits — selection-relative server ops,
+                    // Phase 3: the structural edits — selection-relative server ops,
                     // atomic, refusals as applied:false.
                     | Action::MoveBlock { .. }
                     | Action::ReadCutBlock
@@ -10399,7 +10395,7 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
 /// decides, not the route. A whole-target entry (captured from the Files/Buffers picker) has no
 /// position, so a markdown one reads; a positioned entry lands in the editor where its line:col
 /// means something. Regression: the step handler used to force the editor unconditionally, which
-/// disagreed with select once position-less entries existed (docs/jumplist.md).
+/// disagreed with select once position-less entries existed.
 #[test]
 fn jumplist_step_presentation_follows_the_entry_shape() {
     use aether_client::session::Mode;
@@ -10693,10 +10689,10 @@ fn read_enter_on_a_remote_image_opens_the_url() {
     );
 }
 
-/// The two focus projections (docs/markdown-view.md §1.3): the block-grain reading position
-/// (the bar) and the interactive-grain Enter target (the pill) both derive from the one server
-/// cursor. A Tab-focused link keeps its containing paragraph as the position, with the link as
-/// the target; stepping to a plain paragraph clears the target with no invalidation logic.
+/// The two focus projections: the block-grain reading position (the bar) and the interactive-grain
+/// Enter target (the pill) both derive from the one server cursor. A Tab-focused link keeps its
+/// containing paragraph as the position, with the link as the target; stepping to a plain paragraph
+/// clears the target with no invalidation logic.
 #[test]
 fn focus_projections_compose_block_bar_and_link_target() {
     use aether_client::markdown::Element;

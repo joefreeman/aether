@@ -43,7 +43,7 @@ pub struct BufferCandidate {
 }
 
 /// One workspace-picker candidate. Built fresh per `picker/view` from
-/// `config::list_workspace_names()` — the configured-workspaces set changes only via the user
+/// `config::list_workspace_names` — the configured-workspaces set changes only via the user
 /// editing `~/.config/aether/workspaces/*.toml` and we re-list on each open anyway.
 #[derive(Debug, Clone)]
 pub struct WorkspaceCandidate {
@@ -382,9 +382,8 @@ impl SymbolCandidate {
     }
 }
 
-/// One workspace-symbols candidate — a symbol from an LSP `workspace/symbol` response
-/// (`docs/workspace-symbols.md`). `name` is the fuzzy haystack; `(line, col)` drives the `FileAt`
-/// jump.
+/// One workspace-symbols candidate — a symbol from an LSP `workspace/symbol` response. `name` is
+/// the fuzzy haystack; `(line, col)` drives the `FileAt` jump.
 ///
 /// Cross-file *and* potentially cross-root: rust-analyzer and gopls report symbols from
 /// dependencies and the standard library, which live outside every workspace root. So it carries its
@@ -601,7 +600,7 @@ pub enum PickerCandidates {
     /// against a possibly-changed set.
     Symbols(Vec<SymbolCandidate>),
     /// Workspace-wide symbols from the pinned projects' servers. Grows as each server answers
-    /// (`docs/workspace-symbols.md` § Merging), like Grep's streaming hits rather than a snapshot.
+    /// like Grep's streaming hits rather than a snapshot.
     WorkspaceSymbols(Vec<WorkspaceSymbolCandidate>),
     /// The workspace's working-tree hunks, grouped by file. Built fresh on every `picker/view`
     /// (a snapshot of the repo state at open); the query fuzzy-filters the file path while keeping
@@ -611,11 +610,10 @@ pub enum PickerCandidates {
     /// preserved across scroll/resume re-views (the re-view sends no rows), like Diagnostics.
     /// Static for the picker's lifetime — bindings can't change under a running client.
     Keybindings(Vec<KeybindingCandidate>),
-    /// The client's jumplist (docs/jumplist.md), cloned from
-    /// `ServerState.results` on every `picker/view` — cheap, in-memory, and the backing list
-    /// persists regardless of the picker. Positional identity (`PickerItem::JumplistEntry::index`) is
-    /// stable for the picker's lifetime: the list only changes via a re-capture, which resets
-    /// the picker.
+    /// The client's jumplist, cloned from `ServerState.results` on every `picker/view` — cheap,
+    /// in-memory, and the backing list persists regardless of the picker. Positional identity
+    /// (`PickerItem::JumplistEntry::index`) is stable for the picker's lifetime: the list only
+    /// changes via a re-capture, which resets the picker.
     Jumplist(Vec<crate::jumplist::JumplistEntry>),
     /// One repo's local branches, resolved on `picker/view` from the active buffer. Rebuilt on
     /// every view and after any operation that moves HEAD (like [`Self::LspServers`], never
@@ -905,8 +903,8 @@ impl PickerCandidates {
             }
             PickerCandidates::Jumplist(v) => PickerItem::JumplistEntry {
                 index: idx as u32,
-                // `None` for a whole-target entry — no line to render, rather than a fictional
-                // line 1 (docs/jumplist.md).
+                // `None` for a whole-target entry — no line to render, rather than a fictional line
+                // 1.
                 line: v[idx].position.map(|p| p.line),
                 display: v[idx].display.clone(),
                 match_indices,
@@ -1107,7 +1105,7 @@ impl PickerCandidates {
             | PickerCandidates::Symbols(_)
             // Fuzzy here *orders* but must never filter — the server did the matching, and its
             // query conventions (rust-analyzer's `#`/`*`) would fail a literal fuzzy match. See
-            // `rerank`'s workspace-symbols arm and `docs/workspace-symbols.md` § Merging.
+            // `rerank`'s workspace-symbols arm.
             | PickerCandidates::WorkspaceSymbols(_)
             | PickerCandidates::Keybindings(_)
             | PickerCandidates::Jumplist(_)
@@ -1294,16 +1292,16 @@ pub enum RowRef {
     Item(u32),
 }
 
-/// The row space of a collapsible picker (docs/picker-groups.md): one selectable header row
-/// per group run, plus the expanded run's items inline after its header — everything the
-/// window/offset/selection space counts for these kinds. At most one run is expanded
-/// (accordion), so every mapping here is O(1) arithmetic over the run list.
+/// The row space of a collapsible picker: one selectable header row per group run, plus the
+/// expanded run's items inline after its header — everything the window/offset/selection space
+/// counts for these kinds. At most one run is expanded (accordion), so every mapping here is O(1)
+/// arithmetic over the run list.
 pub struct RowLayout {
     pub runs: Vec<GroupRun>,
     /// Position in `runs` of the expanded run: [`PickerState::expanded`] resolved against the
-    /// current ranking, falling back to the first run when unset/unresolved — so this is
-    /// `Some` whenever `runs` is non-empty (exactly one group is always open,
-    /// docs/picker-groups.md §9). `None` only for an empty result set.
+    /// current ranking, falling back to the first run when unset/unresolved — so this is `Some`
+    /// whenever `runs` is non-empty (exactly one group is always open). `None` only for an empty
+    /// result set.
     pub expanded: Option<usize>,
 }
 
@@ -1424,7 +1422,7 @@ pub struct PickerState {
     /// runs off the lock, so the picker opens empty and is populated by a spawned task). `Some(epoch)`
     /// while a resolve is outstanding; the epoch is a monotonic token so a stale task — one whose
     /// picker was reset/reopened (minting a newer epoch) — notices the mismatch on completion and
-    /// drops its result instead of clobbering the current load. `is_some()` also drives the
+    /// drops its result instead of clobbering the current load. `is_some` also drives the
     /// "loading" (`ticking`) state for the row count + spinner. Cleared to `None` when the matching
     /// task applies its result. Distinct from `generation` (which a *query* change bumps): a query
     /// while loading must re-filter the pending result, not cancel the resolve.
@@ -1447,13 +1445,12 @@ pub struct PickerState {
     /// a rerank. Recorded when a fan-out spawns; a became-ready re-query appends itself
     /// ([`crate::symbols::requery_ready_server`]).
     pub symbol_fanned: Option<(String, Vec<(std::path::PathBuf, String)>)>,
-    /// Collapsible kinds only (docs/picker-groups.md §9): the group key of the one expanded
-    /// run — exactly one group shows its items whenever there are groups (accordion; the
-    /// *selected* group under the two-level navigation model). The key is resolved against
-    /// the current ranking lazily at row-build time, so it survives streaming re-ranks and
-    /// query keystrokes for as long as its group does. `None` — a fresh open, or the key's
-    /// group re-ranked away — falls back to the *first* run at resolve time
-    /// ([`Self::row_layout`]): the top group opens itself, matching the client's
+    /// Collapsible kinds only: the group key of the one expanded run — exactly one group shows its
+    /// items whenever there are groups (accordion; the *selected* group under the two-level
+    /// navigation model). The key is resolved against the current ranking lazily at row-build time,
+    /// so it survives streaming re-ranks and query keystrokes for as long as its group does. `None`
+    /// — a fresh open, or the key's group re-ranked away — falls back to the *first* run at resolve
+    /// time ([`Self::row_layout`]): the top group opens itself, matching the client's
     /// selection-starts-at-the-top convention.
     pub expanded: Option<(u32, String)>,
 }
@@ -1785,8 +1782,8 @@ impl PickerState {
                     // renders as duplicate groups and traps the expanded-group resolution in the
                     // first of them. Files sort by their best row's score; rows within a file by
                     // their own score, unscored rows last in the merge's line order; files nucleo
-                    // matched nothing in trail in the merge's path order, unhighlighted. `ranked[0]`
-                    // is still the globally best match. See `docs/workspace-symbols.md` § Merging.
+                    // matched nothing in trail in the merge's path order, unhighlighted.
+                    // `ranked[0]` is still the globally best match..
                     let mut own: Vec<Option<u32>> = vec![None; v.len()];
                     let mut best: std::collections::HashMap<&str, u32> =
                         std::collections::HashMap::new();
@@ -1925,7 +1922,7 @@ impl PickerState {
     }
 
     /// Locate a ranked index for `item` (used by `view { center_on }`). Returns `None` if the
-    /// item is no longer present (file deleted, buffer closed, no longer matches the query, ...).
+    /// item is no longer present (file deleted, buffer closed, no longer matches the query,...).
     pub fn rank_of(&self, item: &PickerItem) -> Option<u32> {
         let cand_idx = self.candidates.position_of(item)? as u32;
         self.ranked
@@ -1958,9 +1955,8 @@ impl PickerState {
         (start, items)
     }
 
-    /// The collapsible kinds' window builder (docs/picker-groups.md): rows, not bare items —
-    /// one [`PickerItem::Group`] header row per run, the expanded run's items inline after
-    /// its header.
+    /// The collapsible kinds' window builder: rows, not bare items — one [`PickerItem::Group`]
+    /// header row per run, the expanded run's items inline after its header.
     fn build_window_rows(
         &self,
         layout: &RowLayout,
@@ -2185,9 +2181,9 @@ impl PickerState {
     /// consult instead of [`PickerKind::collapsible`].
     ///
     /// The kind predicate is the rule; the exception is a Jumplist captured from a file-shaped
-    /// picker, whose entries are whole targets carrying no group (docs/jumplist.md). Grouping is
-    /// all-or-nothing per capture, so the first entry answers for the list — and an empty one has
-    /// no rows to key either way.
+    /// picker, whose entries are whole targets carrying no group. Grouping is all-or-nothing per
+    /// capture, so the first entry answers for the list — and an empty one has no rows to key
+    /// either way.
     pub fn collapsible(&self) -> bool {
         self.kind.collapsible()
             && match &self.candidates {
@@ -2196,11 +2192,10 @@ impl PickerState {
             }
     }
 
-    /// The collapsible views' row-space layout ([`RowLayout`], docs/picker-groups.md); `None`
-    /// for the flat ones. Derived per call from `ranked` — an O(n) walk, the same cost
-    /// [`Self::grouped_display_metrics`] pays per push for the derived-header kinds — never
-    /// stored: `ranked` is rebuilt by streaming re-ranks and the layout must always describe
-    /// the current permutation.
+    /// The collapsible views' row-space layout ([`RowLayout`]); `None` for the flat ones. Derived
+    /// per call from `ranked` — an O(n) walk, the same cost [`Self::grouped_display_metrics`] pays
+    /// per push for the derived-header kinds — never stored: `ranked` is rebuilt by streaming
+    /// re-ranks and the layout must always describe the current permutation.
     pub fn row_layout(&self) -> Option<RowLayout> {
         if !self.collapsible() {
             return None;
@@ -2224,8 +2219,8 @@ impl PickerState {
             .expanded
             .as_ref()
             .and_then(|key| self.run_of_key(&runs, key))
-            // No key, or its group re-ranked away: the first run opens itself — exactly one
-            // group is expanded whenever there are groups (docs/picker-groups.md §9).
+            // No key, or its group re-ranked away: the first run opens itself — exactly one group
+            // is expanded whenever there are groups.
             .or((!runs.is_empty()).then_some(0));
         Some(RowLayout { runs, expanded })
     }
@@ -2238,9 +2233,9 @@ impl PickerState {
         })
     }
 
-    /// Total window rows: bare `ranked` items for the flat / derived-header kinds; headers plus
-    /// the expanded run's items for the collapsible kinds, whose whole offset/window/selection
-    /// space counts rows (docs/picker-groups.md).
+    /// Total window rows: bare `ranked` items for the flat / derived-header kinds; headers plus the
+    /// expanded run's items for the collapsible kinds, whose whole offset/window/selection space
+    /// counts rows.
     pub fn total_rows(&self) -> u32 {
         match self.row_layout() {
             Some(layout) => layout.total_rows(),
@@ -2273,11 +2268,11 @@ impl PickerState {
         Some(self.ranked[layout.runs[pos].start as usize] as usize)
     }
 
-    /// The group key of the run adjacent to the expanded one — `picker/set_group { step }`,
-    /// the group-level `Alt-j`/`Alt-k` (docs/picker-groups.md §9). Resolved here, against the
-    /// full run list, so stepping works past the client's fetched window. `None` when the
-    /// step runs off the ends (group navigation stops there, like the jumplist's `]`/`[`),
-    /// the result set is empty, or the kind doesn't collapse.
+    /// The group key of the run adjacent to the expanded one — `picker/set_group { step }`, the
+    /// group-level `Alt-j`/`Alt-k`. Resolved here, against the full run list, so stepping works
+    /// past the client's fetched window. `None` when the step runs off the ends (group navigation
+    /// stops there, like the jumplist's `]`/`[`), the result set is empty, or the kind doesn't
+    /// collapse.
     pub fn step_group_key(&self, direction: Direction) -> Option<(u32, String)> {
         let layout = self.row_layout()?;
         let cur = layout.expanded?;
@@ -2384,7 +2379,7 @@ impl PickerState {
 
     /// Grouped display-row metrics for a window starting at ranked index `offset`: the display-row
     /// index of that item (one header row per group is interleaved above the rows) and the
-    /// total display rows (`ranked.len()` rows + the number of groups). `None` for the kinds
+    /// total display rows (`ranked.len` rows + the number of groups). `None` for the kinds
     /// that don't render group headers. Mirrors the clients' header-per-group rendering so their
     /// virtual-scroll spacer + positioning are exact. Display rows are an abstract uniform
     /// unit — clients map them to terminal lines / `ROW_H` / measured pixel heights.
@@ -2392,8 +2387,8 @@ impl PickerState {
         if !self.kind.renders_group_headers() {
             return None;
         }
-        // Collapsible kinds: the row space IS the display space — headers are real window
-        // rows (docs/picker-groups.md) — so there is nothing to reconcile.
+        // Collapsible kinds: the row space IS the display space — headers are real window rows — so
+        // there is nothing to reconcile.
         if let Some(layout) = self.row_layout() {
             return Some((offset, layout.total_rows()));
         }
@@ -2428,8 +2423,8 @@ pub fn build_update(state: &PickerState, matcher: &mut Matcher) -> Option<Picker
         None => (None, None),
     };
     let groups = state.build_window_spans(offset, items.len());
-    // The expanded run's absolute geometry, for the client's local two-level navigation math
-    // (docs/picker-groups.md §9). `None` for the non-collapsible kinds and empty result sets.
+    // The expanded run's absolute geometry, for the client's local two-level navigation math.
+    // `None` for the non-collapsible kinds and empty result sets.
     let expanded_run = state.row_layout().and_then(|layout| {
         layout
             .expanded
@@ -2477,11 +2472,11 @@ fn smartcase_query(query: &str) -> (String, bool) {
     }
 }
 
-/// Resolve a `picker/select` item to its per-kind result. Returns `None` if the item is no
-/// longer in the candidate set the picker last ranked against, *or* if the item exists but
-/// isn't selectable (e.g. an Explorer directory entry — those navigate via `picker/view`).
-/// A `Group` header row resolves to its run's *first item* (docs/picker-groups.md §9):
-/// `Enter` on a header is a jump to the group's top hit, not a disclosure gesture.
+/// Resolve a `picker/select` item to its per-kind result. Returns `None` if the item is no longer
+/// in the candidate set the picker last ranked against, *or* if the item exists but isn't
+/// selectable (e.g. an Explorer directory entry — those navigate via `picker/view`). A `Group`
+/// header row resolves to its run's *first item*: `Enter` on a header is a jump to the group's top
+/// hit, not a disclosure gesture.
 pub fn resolve_select(state: &PickerState, item: &PickerItem) -> Option<PickerSelectResult> {
     let idx = if let PickerItem::Group { header, .. } = item {
         state.first_candidate_of_group(&group_key_of_header(header))?
@@ -2931,10 +2926,10 @@ mod tests {
 
     #[test]
     fn workspace_diagnostics_row_space_metrics() {
-        // `PickerCandidates::Diagnostics` backs two kinds: the flat buffer-locked `Diagnostics`
-        // (no header accounting at all) and the collapsible `DiagnosticsWorkspace`, whose
-        // window space IS the row space (docs/picker-groups.md): display metrics are the
-        // identity offset plus the row total — headers per file, items only when expanded.
+        // `PickerCandidates::Diagnostics` backs two kinds: the flat buffer-locked `Diagnostics` (no
+        // header accounting at all) and the collapsible `DiagnosticsWorkspace`, whose window space
+        // IS the row space: display metrics are the identity offset plus the row total — headers
+        // per file, items only when expanded.
         let cand = |rel: &str, line: u32| DiagnosticCandidate {
             path_index: 0,
             relative_path: rel.into(),
@@ -2959,8 +2954,8 @@ mod tests {
         assert_eq!(flat.kind, PickerKind::Diagnostics);
         assert_eq!(flat.grouped_display_metrics(0), None);
 
-        // `DiagnosticsWorkspace` is collapsible: exactly one group is always expanded — with
-        // no key set, the first run (a.rs) opens itself (docs/picker-groups.md §9).
+        // `DiagnosticsWorkspace` is collapsible: exactly one group is always expanded — with no key
+        // set, the first run (a.rs) opens itself.
         let mut proj = PickerState::new(cands);
         proj.kind = PickerKind::DiagnosticsWorkspace;
         proj.rerank(&mut make_matcher());
@@ -3036,9 +3031,8 @@ mod tests {
             GroupRun { start: 5, len: 1 },
         ];
         // Fully collapsed: three header rows; items are unreachable and map to their headers.
-        // (Constructed directly — `row_layout()` itself never produces `expanded: None` for a
-        // non-empty run list any more (docs/picker-groups.md §9); the None arithmetic stays
-        // as the degenerate path.)
+        // (Constructed directly — `row_layout` itself never produces `expanded: None` for a
+        // non-empty run list any more; the None arithmetic stays as the degenerate path.)
         let collapsed = RowLayout {
             runs: runs.clone(),
             expanded: None,
@@ -3098,8 +3092,8 @@ mod tests {
         let mut m = make_matcher();
         s.rerank(&mut m);
 
-        // Fresh (no key): the first run opens itself (docs/picker-groups.md §9) — a.rs's
-        // diagnostics slot in under its header, b.rs stays a bare row.
+        // Fresh (no key): the first run opens itself — a.rs's diagnostics slot in under its header,
+        // b.rs stays a bare row.
         let (start, items) = s.build_window_items(0, 10, &mut m);
         assert_eq!(start, 0);
         let expect_group = |item: &PickerItem, rel: &str, count: u32, expanded: bool| {
@@ -3173,7 +3167,7 @@ mod tests {
             s.step_group_key(Direction::Forward),
             Some((0, "src/b.rs".into()))
         );
-        // ... and Backward runs off the start — a stop, like the jumplist's `[` at its end.
+        //... and Backward runs off the start — a stop, like the jumplist's `[` at its end.
         assert_eq!(s.step_group_key(Direction::Backward), None);
 
         s.expanded = Some((0, "src/b.rs".into()));

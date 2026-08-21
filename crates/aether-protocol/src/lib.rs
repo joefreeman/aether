@@ -1,6 +1,6 @@
 //! Aether protocol types.
 //!
-//! Wire format: JSON-RPC 2.0 over WebSocket. See `docs/protocol.md` for the full schema.
+//! Wire format: JSON-RPC 2.0 over WebSocket. for the full schema.
 
 use serde::{Deserialize, Serialize};
 

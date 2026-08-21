@@ -1,9 +1,8 @@
-//! Hint learning state (docs/hints.md). The client observes bindings being used and
-//! reports increment-shaped events (`hints/record`); the server aggregates them into per-hint
-//! records, stamps days, derives retirement, and persists the result (`hints.json`, app-global
-//! like `settings.toml`). Clients fetch one snapshot on connect (`hints/state`). The hint
-//! *definitions* (curriculum, copy, contexts) live client-side with the keymap — the wire carries
-//! only opaque hint ids.
+//! Hint learning state. The client observes bindings being used and reports increment-shaped events
+//! (`hints/record`); the server aggregates them into per-hint records, stamps days, derives
+//! retirement, and persists the result (`hints.json`, app-global like `settings.toml`). Clients
+//! fetch one snapshot on connect (`hints/state`). The hint *definitions* (curriculum, copy,
+//! contexts) live client-side with the keymap — the wire carries only opaque hint ids.
 
 use crate::envelope::RpcMethod;
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,7 @@ use std::collections::BTreeMap;
 pub const LEARNED_USES: u32 = 3;
 
 /// Distinct calendar days those uses must span — one burst of presses isn't "learned". The cheap
-/// substitute for spaced repetition (docs/hints.md §1.5).
+/// substitute for spaced repetition.
 pub const LEARNED_DAYS: u32 = 2;
 
 /// How much an explicit dismissal (`Space h`) adds to a hint's shows-without-follow fatigue
@@ -31,8 +30,8 @@ pub fn day_from_unix_ms(unix_ms: u64) -> u32 {
 }
 
 /// Learning state for one *unretired* hint. Retired hints collapse to a bare id in the
-/// [`HintsStateResult::retired`] list — no record survives retirement (deliberate: docs/hints.md
-/// §1.8). Every field has a serde default so records written by older builds parse forward.
+/// [`HintsStateResult::retired`] list — no record survives retirement (deliberate). Every field
+/// has a serde default so records written by older builds parse forward.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct HintRecord {
     /// Times the hint's trigger fired, saturating at [`LEARNED_USES`].
@@ -97,7 +96,7 @@ pub struct HintsRecordResult {
 }
 
 /// Fetch the full learning-state snapshot. Called once per connection, alongside `settings/get`;
-/// concurrent windows drift until their next connect (accepted — docs/hints.md §1.8).
+/// concurrent windows drift until their next connect (accepted).
 pub struct HintsState;
 impl RpcMethod for HintsState {
     const NAME: &'static str = "hints/state";

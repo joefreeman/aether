@@ -1,7 +1,7 @@
-//! The core update function, grown arm by arm (docs/client-core.md phase 3): each migrated
-//! subsystem moves its `Message` variants into [`Event`], its handler logic into
-//! [`Session::on_event`], and its RPC chains into effect-returning methods here. The shell
-//! bridges with a single `Message::Core(Event)` variant and an effect executor.
+//! The core update function, grown arm by arm: each migrated subsystem moves its `Message`
+//! variants into [`Event`], its handler logic into
+//! [`Session::on_event`], and its RPC chains into effect-returning methods here. The shell bridges
+//! with a single `Message::Core(Event)` variant and an effect executor.
 
 use super::chips::{self, ChipEditor, ChipEditorField, ChipId};
 use super::effect::{
@@ -145,8 +145,8 @@ pub enum Event {
     /// An edit resolved: adopt the new revision + cursor.
     EditDone(Result<EditResult, String>),
     UndoRedoDone(Result<UndoResult, String>),
-    /// A structural block edit resolved (docs/markdown-view.md §12): adopt revision + cursor,
-    /// clipboard the cut payload, toast a reasoned refusal, refresh the reading view's parse.
+    /// A structural block edit resolved: adopt revision + cursor, clipboard the cut payload, toast
+    /// a reasoned refusal, refresh the reading view's parse.
     BlockEditDone(Result<BlockEditResult, String>),
     /// `Ctrl-o`/`Ctrl-Alt-o` resolved: the same adoption, and — only once the server says the
     /// block was actually opened — the hand-over to the editor in Insert.
@@ -159,9 +159,9 @@ pub enum Event {
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
     /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
-    /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt
-    /// (docs/markdown-view.md §3.1). Guarded against staleness — the buffer may have switched, or
-    /// moved to a newer revision, while the fetch was in flight.
+    /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt. Guarded
+    /// against staleness — the buffer may have switched, or moved to a newer revision, while the
+    /// fetch was in flight.
     ReadContent(Result<BufferContentResult, String>),
     /// A `syntax/highlight_snippet` result for one fenced code block of the reading view, keyed
     /// by the fence's span start at `(buffer, revision)` parse time — stale results are dropped.
@@ -336,10 +336,10 @@ pub enum Event {
         key: (u32, String),
         language: Option<String>,
     },
-    /// `picker/set_group` resolved (docs/picker-groups.md §9): the selected run's geometry in
-    /// the reshaped row space, plus the landing the gesture asked for (captured at request
-    /// time — the wire carries only the geometry; the client picks the row). `None` = the
-    /// group re-ranked away mid-flight, or a step ran off the ends (both benign stops).
+    /// `picker/set_group` resolved: the selected run's geometry in the reshaped row space, plus the
+    /// landing the gesture asked for (captured at request time — the wire carries only the
+    /// geometry; the client picks the row). `None` = the group re-ranked away mid-flight, or a step
+    /// ran off the ends (both benign stops).
     GroupSet(Result<Option<ExpandedRun>, String>, GroupLanding),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
     /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
@@ -380,8 +380,8 @@ pub enum Event {
     /// attach to it; `None` → the context is empty, so leave it (quit on native, chooser on web —
     /// see [`App::leave_ephemeral_workspace`]).
     EphemeralClosed(Result<Option<BufferId>, String>),
-    /// `buffer/close` resolved for the [tether](Session::tether) (docs/tether.md): the client's
-    /// job is done, so exit. No successor to adopt — the close was issued without `open_next`.
+    /// `buffer/close` resolved for the [tether](Session::tether): the client's job is done, so
+    /// exit. No successor to adopt — the close was issued without `open_next`.
     TetherClosed(Result<(), String>),
     /// `buffer/set_transient` resolved for the un-keep that *releases* the tether (`Space k` on
     /// the tethered buffer): drop the tether — one-way — and toast the release. The transient
@@ -390,14 +390,13 @@ pub enum Event {
     /// `settings/get` resolved at boot: seed the session from the persisted app settings (notably
     /// the soft-wrap default). A failure is non-fatal — we keep the defaults.
     AppSettingsLoaded(Result<AppSettings, String>),
-    /// `hints/state` resolved at boot (alongside the settings fetch): adopt the hint
-    /// learning snapshot (docs/hints.md). The engine stays dormant until this lands — which is
-    /// also the "server connection succeeded" gate for the very first hint. Failure is non-fatal:
-    /// no hints this session.
+    /// `hints/state` resolved at boot (alongside the settings fetch): adopt the hint learning
+    /// snapshot. The engine stays dormant until this lands — which is also the "server connection
+    /// succeeded" gate for the very first hint. Failure is non-fatal: no hints this session.
     HintsStateLoaded(Result<HintsStateResult, String>),
-    /// `history/state` resolved: adopt the active workspace's `Up`/`Down` recall lists
-    /// (docs/input-history.md). Fetched at boot and after every workspace switch. Failure is
-    /// non-fatal — the lists stay as they were and recall just has less to offer.
+    /// `history/state` resolved: adopt the active workspace's `Up`/`Down` recall lists. Fetched at
+    /// boot and after every workspace switch. Failure is non-fatal — the lists stay as they were
+    /// and recall just has less to offer.
     HistoryLoaded(Result<HistoryStateResult, String>),
     /// `settings/set` (from the app-settings overlay) resolved: a failure surfaces as a toast (the
     /// optimistic local change already applied; this only reports persistence trouble).
@@ -511,7 +510,7 @@ impl Session {
             Event::CursorMsg(Ok(cursor)) => {
                 self.buffer.cursor = cursor;
                 // A staged cross-file-anchor parse installs now — the cursor is on the
-                // heading, so the first paint lands in place (§2.4).
+                // heading, so the first paint lands in place.
                 self.install_staged_read()
                     .and(Effects::one(Effect::RevealCursor(RevealStyle::Follow)))
             }
@@ -669,7 +668,7 @@ impl Session {
                     return self.refetch_read_content();
                 }
                 // A followed cross-file anchor is pending: stage the parse instead of
-                // installing it — the document paints once, already in place (§2.4).
+                // installing it — the document paints once, already in place.
                 if self.pending_read_anchor.is_some() {
                     let mut staged = ReadView::loading(self.buffer.buffer_id);
                     staged.adopt(c.revision, c.text);
@@ -774,9 +773,9 @@ impl Session {
                 Some(open) => {
                     // A step is jump-shaped exactly when its entry carries a position — the same
                     // test `open_path_at` applies, so `]` and Enter on the same row present the
-                    // target identically (docs/markdown-view.md §1.6). A positioned entry (a grep
-                    // hit, a diagnostic) lands in the editor, where its line:col means something;
-                    // a whole-target entry is "open this file", so a markdown one reads.
+                    // target identically. A positioned entry (a grep hit, a diagnostic) lands in
+                    // the editor, where its line:col means something; a whole-target entry is "open
+                    // this file", so a markdown one reads.
                     self.open_route_jumped = t.position.is_some();
                     self.adopt_navigation(open)
                 }
@@ -1641,7 +1640,7 @@ impl Session {
                         p.offset = r.effective_offset;
                         // Adopt the layout gate first: the centring reveal just below branches on
                         // it, and for a Jumplist it can differ from the kind's default (a capture
-                        // from a file-shaped picker renders flat — docs/jumplist.md).
+                        // from a file-shaped picker renders flat).
                         p.collapsible = r.collapsible;
                         if let Some(center) = r.effective_center_on {
                             p.pending_center = Some(center);
@@ -1992,10 +1991,10 @@ impl Session {
             Event::PickerClicked(abs) => {
                 if let Some(p) = &mut self.picker {
                     p.selected = abs;
-                    // A header-row click is a *disclosure* gesture (docs/picker-groups.md
-                    // §9): select the group — expanding it — rather than jumping. (Enter on
-                    // a header is the jump; the mouse path to a jump is clicking a visible
-                    // item row.) Re-clicking the open group's header re-affirms it.
+                    // A header-row click is a *disclosure* gesture: select the group — expanding it
+                    // — rather than jumping. (Enter on a header is the jump; the mouse path to a
+                    // jump is clicking a visible item row.) Re-clicking the open group's header
+                    // re-affirms it.
                     if let Some(PickerItem::Group { header, .. }) = p.selected_item() {
                         let header = header.clone();
                         p.level = PickerLevel::Group;
@@ -2153,9 +2152,9 @@ impl Session {
                     // (`apply_update`) — whichever side of this reply it lands on.
                     Ok(Some(run)) => run,
                 };
-                // The landing row within the freshly selected run, per the gesture's intent
-                // (docs/picker-groups.md §9): group navigation lands on the header; an
-                // item-level spill enters at the neighbouring run's first/last item.
+                // The landing row within the freshly selected run, per the gesture's intent: group
+                // navigation lands on the header; an item-level spill enters at the neighbouring
+                // run's first/last item.
                 p.selected = match landing {
                     GroupLanding::Header => run.header_row,
                     GroupLanding::RunStart => run.header_row + 1,
@@ -2496,10 +2495,9 @@ impl Session {
         )
     }
 
-    /// Fire an edit RPC; the result lands as [`Event::EditDone`].
-    /// Allocate a token, park the result mapping, and emit `Effect::Request` — the
-    /// sans-IO replacement for spawning an RPC future (docs/client-core.md). The shell
-    /// performs the call and feeds the outcome back through [`Session::on_rpc_result`].
+    /// Fire an edit RPC; the result lands as [`Event::EditDone`]. Allocate a token, park the result
+    /// mapping, and emit `Effect::Request` — the sans-IO replacement for spawning an RPC future.
+    /// The shell performs the call and feeds the outcome back through [`Session::on_rpc_result`].
     fn request<M>(
         &mut self,
         params: M::Params,
@@ -2620,8 +2618,8 @@ impl Session {
                 text: text.repeat(count.max(1) as usize),
                 select_pasted: true,
                 replace_selection: false,
-                // Insert at the selection start — the collapse rides the edit
-                // (docs/protocol-composites.md, D) instead of a prior cursor/set.
+                // Insert at the selection start — the collapse rides the edit instead of a prior
+                // cursor/set.
                 at: Some(SelectionEdge::Start),
             }),
             PasteKind::Replace { count } => self.edit::<InputText>(InputTextParams {
@@ -2803,9 +2801,9 @@ impl Session {
         Effects::one(Effect::Resubscribe).and(read_fx)
     }
 
-    /// Decide the freshly adopted buffer's read/edit presentation (docs/markdown-view.md §1.6):
-    /// markdown buffers follow this session's live read-vs-source choice
-    /// ([`Session::read_on`]), with two overrides that outrank it, one each way:
+    /// Decide the freshly adopted buffer's read/edit presentation: markdown buffers follow this
+    /// session's live read-vs-source choice ([`Session::read_on`]), with two overrides that outrank
+    /// it, one each way:
     ///
     /// - A **jump-shaped** open (grep hit, reference, a positioned jumplist entry) lands in the
     ///   editor — it is going to a `line:col`, which only means something over the source.
@@ -2830,19 +2828,19 @@ impl Session {
         }
     }
 
-    /// Apply the open-route presentation rules (docs/markdown-view.md §1.6) to a freshly
-    /// *booted* session: `ae file.md` launches install the session directly, never passing
-    /// through `adopt_switch`, so the shells call this once after boot. `jumped` = the launch
-    /// carried a jump target (`ae file:line`), which lands in the editor like any other jump.
+    /// Apply the open-route presentation rules to a freshly *booted* session: `ae file.md` launches
+    /// install the session directly, never passing through `adopt_switch`, so the shells call this
+    /// once after boot. `jumped` = the launch carried a jump target (`ae file:line`), which lands
+    /// in the editor like any other jump.
     pub fn boot_read_presentation(&mut self, jumped: bool) -> Effects {
         self.open_route_jumped = jumped;
         self.sync_read_on_switch()
     }
 
     /// [`Self::boot_read_presentation`] with an explicit read/source choice, overriding the
-    /// open-route rules: the web shell records the current presentation in the URL (`view=`),
-    /// so a refresh restores exactly what was on screen — the `#line:col` cursor restore in the
-    /// same URL must not read as a jump-shaped open (docs/markdown-view.md §1.6).
+    /// open-route rules: the web shell records the current presentation in the URL (`view=`), so a
+    /// refresh restores exactly what was on screen — the `#line:col` cursor restore in the same URL
+    /// must not read as a jump-shaped open.
     pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Effects {
         self.read_on = read;
         self.boot_read_presentation(false)
@@ -2862,8 +2860,8 @@ impl Session {
 
     /// Ask the server to highlight every fenced code block of the freshly parsed document —
     /// tree-sitter lives server-side, so this is the reading view's route to editor-grade code
-    /// colour (docs/markdown-view.md §2.8). One request per fence; results adopt via
-    /// [`Event::ReadHighlights`] and paint in as they land.
+    /// colour. One request per fence; results adopt via [`Event::ReadHighlights`] and paint in as
+    /// they land.
     fn read_fence_requests(&mut self) -> Effects {
         let fences = {
             let Some(read) = self.read.as_ref() else {
@@ -2911,7 +2909,7 @@ impl Session {
     }
 
     /// React to a change signal for `buffer_id` at `revision`: when the reading view shows that
-    /// buffer at an older revision, re-fetch (docs/markdown-view.md §3.1).
+    /// buffer at an older revision, re-fetch.
     fn maybe_refresh_read(&mut self, buffer_id: BufferId, revision: u64) -> Effects {
         // `!=`, not `>`: revisions identify buffer states, they don't order them — undo
         // *restores* the undone entry's older revision number (dirty-tracking relies on
@@ -2933,7 +2931,7 @@ impl Session {
     /// health, external-change flags), plus the first window. Pure core state — the shell owns the
     /// pixel work it does afterward (seeding the scroll, revealing the cursor). One definition
     /// shared by every shell: the native shells pass the typed result; the wasm shell deserialises
-    /// the same struct. Shells must never write these fields directly (docs/web-core.md).
+    /// the same struct. Shells must never write these fields directly.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) {
         self.viewport_id = Some(res.viewport_id);
         self.diagnostics = res.buffer_status.diagnostics;
@@ -2963,13 +2961,12 @@ impl Session {
         });
     }
 
-    /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh
-    /// scratch). Closing the [tether](Session::tether) instead exits the client — no successor
-    /// needed (docs/tether.md). In an *ephemeral* context, never replace it with a scratch — an
-    /// empty ephemeral workspace is pointless — so we close without `open_next` and either attach
-    /// to a remaining sibling buffer or leave the context entirely (see
-    /// [`Self::leave_ephemeral_workspace`]).
-    /// Drop a pending commit whose message buffer is closing.
+    /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh scratch).
+    /// Closing the [tether](Session::tether) instead exits the client — no successor needed. In an
+    /// *ephemeral* context, never replace it with a scratch — an empty ephemeral workspace is
+    /// pointless — so we close without `open_next` and either attach to a remaining sibling buffer
+    /// or leave the context entirely (see [`Self::leave_ephemeral_workspace`]). Drop a pending
+    /// commit whose message buffer is closing.
     ///
     /// Without this the entry outlives its buffer, and `Space g c` would then "switch to the
     /// message already open" — at a buffer id that no longer exists.
@@ -3149,7 +3146,7 @@ impl Session {
                 None => (None, None, Some(path)),
             };
         // A jump-shaped open (a grep hit, a reference) is a working context — it lands in the
-        // editor even when the target is markdown (docs/markdown-view.md §1.6).
+        // editor even when the target is markdown.
         self.open_route_jumped = jump_to.is_some();
         self.request_str::<BufferOpen>(
             BufferOpenParams {
@@ -3166,10 +3163,10 @@ impl Session {
         )
     }
 
-    /// Record a committed value to its input-history list (docs/input-history.md) and, when that
-    /// actually changed the list, tell the server so it persists and other windows see it. The
-    /// local apply is not optimism — it's the same [`HistoryLists::record`] rule the server runs,
-    /// so the two can't disagree; the round-trip is fire-and-forget.
+    /// Record a committed value to its input-history list and, when that actually changed the list,
+    /// tell the server so it persists and other windows see it. The local apply is not optimism —
+    /// it's the same [`HistoryLists::record`] rule the server runs, so the two can't disagree; the
+    /// round-trip is fire-and-forget.
     pub fn record_history(&mut self, kind: HistoryKind, entry: HistoryEntry) -> Effects {
         if !self.history.record(kind, entry.clone()) {
             return Effects::none();
@@ -3359,9 +3356,9 @@ impl Session {
     }
 
     /// `Space m` — blame the cursor line and resolve the commit's details, one round-trip
-    /// (`include_commit_info`, docs/protocol-composites.md, G).
-    /// The multi-step operation this buffer's repo is stopped in, if any — read off the status the
-    /// window already carries, which is the same fact the status bar is displaying.
+    /// (`include_commit_info`). The multi-step operation this
+    /// buffer's repo is stopped in, if any — read off the status the window already carries, which
+    /// is the same fact the status bar is displaying.
     ///
     /// `None` covers both "nothing is stopped" and "we have no window yet to say so"; the caller
     /// treats them alike, because the server re-checks before doing anything either way.
@@ -3428,7 +3425,7 @@ impl Session {
     ) -> Effects {
         let mut fresh = PickerState::new(kind);
         // Stamped at open so the workspace-symbols picker can distinguish "no matches" from
-        // "nothing can answer here" (docs/workspace-symbols.md § Scope).
+        // "nothing can answer here".
         fresh.workspace_has_projects = !self.workspace_projects.is_empty();
         self.picker = Some(fresh);
         // A fresh input owns the keyboard now; anything the last one was recalling is over.
@@ -3695,14 +3692,13 @@ impl Session {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
-        // Two-level navigation for the collapsible kinds (docs/picker-groups.md §9): with the
-        // selection on a group header, Alt-j/k move *between groups* — a server-resolved step
-        // (`picker/set_group { step }`; the neighbour may sit past the fetched window) that
-        // expands the group it lands on. With the selection among the expanded run's items,
-        // moves are local and run-clamped — except at the run's edges, where they *spill*
-        // into the neighbouring group: down off the last item enters the next group at its
-        // first item, up off the first enters the previous at its last (still item level).
-        // The very ends still stop (the step answers `run: None`).
+        // Two-level navigation for the collapsible kinds: with the selection on a group header,
+        // Alt-j/k move *between groups* — a server-resolved step (`picker/set_group { step }`; the
+        // neighbour may sit past the fetched window) that expands the group it lands on. With the
+        // selection among the expanded run's items, moves are local and run-clamped — except at the
+        // run's edges, where they *spill* into the neighbouring group: down off the last item
+        // enters the next group at its first item, up off the first enters the previous at its last
+        // (still item level). The very ends still stop (the step answers `run: None`).
         if p.collapsible {
             // Single-flight: a gesture is mid-reshape — swallow repeats rather than route
             // them against transient state (a second step would skip a group's items).
@@ -3794,10 +3790,10 @@ impl Session {
         p.generation_adopted = true;
         p.selected = 0;
         p.offset = 0;
-        // Selection resets to row 0 — the (auto-expanded) top group's header: group level,
-        // matching the server's expansion reset on `picker/query` (docs/picker-groups.md §9).
-        // Any mid-flight group gesture is superseded (its push may be generation-discarded,
-        // so it can't be relied on to release the repeat guard).
+        // Selection resets to row 0 — the (auto-expanded) top group's header: group level, matching
+        // the server's expansion reset on `picker/query`. Any mid-flight group gesture is
+        // superseded (its push may be generation-discarded, so it can't be relied on to release the
+        // repeat guard).
         p.level = PickerLevel::Group;
         p.group_gesture_in_flight = false;
         // A new query starts a fresh window cycle — abandon any in-flight scroll refetch so its
@@ -4235,13 +4231,13 @@ impl Session {
         }
     }
 
-    /// Re-run the live query when an open glob/dir editor's in-progress value changes the
-    /// effective filter set, so results update as you type (docs/picker-filters.md). A no-op
-    /// when the editor leaves the effective filters unchanged (focus moves, edits that don't
-    /// move the would-commit value), when a dir listing is still loading (hold — `live_filters`
-    /// returns `None`), or outside the streaming kinds. Also the path back to the committed set
-    /// when the editor closes: with no editor open `live_filters` is the committed `wire_filters`,
-    /// so a cancel that had a preview applied reverts here.
+    /// Re-run the live query when an open glob/dir editor's in-progress value changes the effective
+    /// filter set, so results update as you type. A no-op when the editor leaves the effective
+    /// filters unchanged (focus moves, edits that don't move the would-commit value), when a dir
+    /// listing is still loading (hold — `live_filters` returns `None`), or outside the streaming
+    /// kinds. Also the path back to the committed set when the editor closes: with no editor open
+    /// `live_filters` is the committed `wire_filters`, so a cancel that had a preview applied
+    /// reverts here.
     fn sync_live_filters(&mut self) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &self.picker else {
@@ -4407,9 +4403,9 @@ impl Session {
         let Some(ed) = p.chip_editor.take() else {
             return Effects::none();
         };
-        // The committed field text goes to the input history (docs/input-history.md), whether or
-        // not it changed the chip row: re-committing the same scope is still a use, and recording
-        // the *typed* text (not the parsed scope) is what lets recall replay it verbatim.
+        // The committed field text goes to the input history, whether or not it changed the chip
+        // row: re-committing the same scope is still a use, and recording the *typed* text (not the
+        // parsed scope) is what lets recall replay it verbatim.
         let recorded = if ed.is_dir() {
             (HistoryKind::Path, ed.input.text.trim().to_string())
         } else {
@@ -4467,13 +4463,13 @@ impl Session {
         Effects::none()
     }
 
-    /// Alt-Backspace: progressively unwind — clear the query, then (explorer) pop one
-    /// directory segment per press — landing the highlight on the directory just left — into roots
-    /// mode in multi-root workspaces, and only then pop the rightmost filter chip. The breadcrumb
-    /// sits closest to the cursor and unwinds first; chips have their own toggle bindings.
-    /// Deliberately *not* bound to Alt-h: clearing input is Alt-Backspace's job alone — Alt-h
-    /// only ever goes structurally shallower (ascend to the group header, explorer ascend)
-    /// and never touches the query (docs/picker-groups.md §3.1).
+    /// Alt-Backspace: progressively unwind — clear the query, then (explorer) pop one directory
+    /// segment per press — landing the highlight on the directory just left — into roots mode in
+    /// multi-root workspaces, and only then pop the rightmost filter chip. The breadcrumb sits
+    /// closest to the cursor and unwinds first; chips have their own toggle bindings. Deliberately
+    /// *not* bound to Alt-h: clearing input is Alt-Backspace's job alone — Alt-h only ever goes
+    /// structurally shallower (ascend to the group header, explorer ascend) and never touches the
+    /// query.
     fn picker_back(&mut self) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
@@ -4698,9 +4694,8 @@ impl Session {
     pub fn picker_click_new_window(&mut self, abs: u32) -> Effects {
         if let Some(p) = &mut self.picker {
             p.selected = abs;
-            // A header row has no new-window target (the client doesn't hold the group's
-            // first item while collapsed) — treat the Ctrl-click like a plain click:
-            // disclosure, not a jump (docs/picker-groups.md §9).
+            // A header row has no new-window target (the client doesn't hold the group's first item
+            // while collapsed) — treat the Ctrl-click like a plain click: disclosure, not a jump.
             if let Some(PickerItem::Group { header, .. }) = p.selected_item() {
                 let header = header.clone();
                 p.level = PickerLevel::Group;
@@ -4847,11 +4842,10 @@ impl Session {
                 // dismisses it like any other picker.
                 return Effects::none();
             }
-            // A group's header row IS a jump target (docs/picker-groups.md §9): Enter
-            // resolves server-side to the group's *first item* — so type-query-then-Enter
-            // takes the top group's top hit without a mandatory descend. (Click is the
-            // disclosure gesture instead — see `Event::PickerClicked`.) Falls through to the
-            // ordinary `picker/select` below.
+            // A group's header row IS a jump target: Enter resolves server-side to the group's
+            // *first item* — so type-query-then-Enter takes the top group's top hit without a
+            // mandatory descend. (Click is the disclosure gesture instead — see
+            // `Event::PickerClicked`.) Falls through to the ordinary `picker/select` below.
             PickerItem::Group { .. } => {}
             _ => {}
         }
@@ -4864,11 +4858,10 @@ impl Session {
             } else {
                 Effects::none()
             };
-        // Resolve the pick *before* closing. `picker/hide` releases the picker's state
-        // server-side, and requests go out in enqueue order (docs/protocol-composites.md), so a
-        // `picker/select` behind the close would have no candidate set left to resolve its item
-        // against — an `invalid params` error instead of a jump. Closing second also reads right:
-        // the row is resolved, then the list goes away.
+        // Resolve the pick *before* closing. `picker/hide` releases the picker's state server-side,
+        // and requests go out in enqueue order, so a `picker/select` behind the close would have no
+        // candidate set left to resolve its item against — an `invalid params` error instead of a
+        // jump. Closing second also reads right: the row is resolved, then the list goes away.
         let select = self.request::<PickerSelect>(PickerSelectParams { kind, item }, move |__r| {
             Event::PickerSelected {
                 result: __r.map_err(|e| e.to_string()),
@@ -4912,12 +4905,11 @@ impl Session {
             return Effects::none();
         };
         self.history.reset();
-        // Closing is what commits the query to the input history (docs/input-history.md) — grep
-        // searches per keystroke, so recording on change would store `h`, `ha`, `han`… Only the
-        // query the user actually settled on lands, and only if it was long enough to have run a
-        // search at all. Covers accept and dismiss alike: both funnel through here.
-        // The whole chip row rides along, so recalling the query later reproduces the search it
-        // was — scope, match options and all.
+        // Closing is what commits the query to the input history — grep searches per keystroke, so
+        // recording on change would store `h`, `ha`, `han`… Only the query the user actually
+        // settled on lands, and only if it was long enough to have run a search at all. Covers
+        // accept and dismiss alike: both funnel through here. The whole chip row rides along, so
+        // recalling the query later reproduces the search it was — scope, match options and all.
         let mut fx = match p.kind.history_kind() {
             Some(kind) if p.query.chars().count() >= MIN_GREP_QUERY_LEN => {
                 let entry = HistoryEntry {
@@ -5232,18 +5224,18 @@ impl Session {
                 let fx = self.observe_picker_cmd(PickerCmd::CloseBuffer);
                 return fx.and(self.picker_close_buffer());
             }
-            // Ctrl-j: capture the picker's filtered results into the jumplist and jump to
-            // the highlighted row (docs/jumplist.md) — `]`/`[` then step the captured set.
-            // Position-shaped kinds only (`captures_to_jumplist`). Safe on the clipboard front
-            // (unlike Ctrl-c/v/x/a, GUI query inputs don't claim it) and distinct from Enter in
-            // the TUI (crossterm raw mode maps the 0x0A byte to Ctrl-j, not Enter).
+            // Ctrl-j: capture the picker's filtered results into the jumplist and jump to the
+            // highlighted row — `]`/`[` then step the captured set. Position-shaped kinds only
+            // (`captures_to_jumplist`). Safe on the clipboard front (unlike Ctrl-c/v/x/a, GUI query
+            // inputs don't claim it) and distinct from Enter in the TUI (crossterm raw mode maps
+            // the 0x0A byte to Ctrl-j, not Enter).
             KeyCode::Char('j') if mods.ctrl && !mods.alt && p.kind.captures_to_jumplist() => {
                 return self.jumplist_capture();
             }
-            // Up/Down recall this picker's query history (docs/input-history.md) — grep only,
-            // the one kind whose query is a question you re-ask rather than a live filter over a
-            // candidate set. They're free here precisely because the *list* moves on Alt-k/j, and
-            // they reach the core in every shell (no text input claims a bare arrow-up).
+            // Up/Down recall this picker's query history — grep only, the one kind whose query is a
+            // question you re-ask rather than a live filter over a candidate set. They're free here
+            // precisely because the *list* moves on Alt-k/j, and they reach the core in every shell
+            // (no text input claims a bare arrow-up).
             KeyCode::Up | KeyCode::Down if no_chord && p.kind.history_kind().is_some() => {
                 let dir = if code == KeyCode::Up {
                     VerticalDirection::Up
@@ -5305,11 +5297,10 @@ impl Session {
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
                 return self.explorer_ascend().unwrap_or_else(Effects::none);
             }
-            // Alt-h ascends a level: from an item onto its run's header — a local move,
-            // nothing collapses (moving the *group selection* is what moves the expansion,
-            // §9). On a header it's as shallow as it goes — a no-op, NOT a query wipe: the
-            // unwind (clear query → pop chip) is Alt-Backspace's alone
-            // (docs/picker-groups.md §3.1).
+            // Alt-h ascends a level: from an item onto its run's header — a local move, nothing
+            // collapses (moving the *group selection* is what moves the expansion). On a header
+            // it's as shallow as it goes — a no-op, NOT a query wipe: the unwind (clear query → pop
+            // chip) is Alt-Backspace's alone.
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.collapsible => {
                 if !p.selection_at_item_level() {
                     return Effects::none();
@@ -5326,8 +5317,8 @@ impl Session {
             // Alt-h used to share this and no longer does — it duplicated Alt-Backspace on the
             // query and now only ever ascends (the arms above).
             KeyCode::Backspace if mods.alt && !mods.ctrl => return self.picker_back(),
-            // Filter-chip chords (docs/picker-filters.md). Booleans toggle in place; valued
-            // filters open the editor line. Gated per kind inside the helpers.
+            // Filter-chip chords. Booleans toggle in place; valued filters open the editor line.
+            // Gated per kind inside the helpers.
             KeyCode::Char('c') if mods.alt && !mods.ctrl => {
                 return self.toggle_picker_filter(ChipId::Case);
             }
@@ -5507,11 +5498,10 @@ impl Session {
             {
                 ed.field = ChipEditorField::Root;
             }
-            // Up/Down recall this field's prior values (docs/input-history.md): globs and paths
-            // keep separate lists — a `*.rs` is never a path — and the root typeahead has none
-            // (it's a fixed candidate set, cycled with Alt-j/k). The recalled path text is
-            // whatever was committed, so it replays through the same listing refresh a typed
-            // value would.
+            // Up/Down recall this field's prior values: globs and paths keep separate lists — a
+            // `*.rs` is never a path — and the root typeahead has none (it's a fixed candidate set,
+            // cycled with Alt-j/k). The recalled path text is whatever was committed, so it replays
+            // through the same listing refresh a typed value would.
             KeyCode::Up | KeyCode::Down if no_chord && !in_root => {
                 let dir = if code == KeyCode::Up {
                     VerticalDirection::Up
@@ -5665,8 +5655,8 @@ impl Session {
     }
 
     /// Open a file the *operating system* handed us: macOS "Open With" / a Dock drop delivering
-    /// `application:openURLs:` to an already-running client (docs/client-core.md), and whatever
-    /// Linux's desktop integration eventually sends. `path` is absolute — the OS resolved it.
+    /// `application:openURLs:` to an already-running client, and whatever Linux's desktop
+    /// integration eventually sends. `path` is absolute — the OS resolved it.
     ///
     /// Deliberately the same path as the `Space Alt-w` overlay's commit, so a file arriving from the
     /// desktop behaves exactly like one the user typed: a real (non-transient) buffer, its workspace
@@ -5706,10 +5696,10 @@ impl Session {
     }
 
     /// Select — and thereby expand — `header`'s group in the open collapsible picker
-    /// (`picker/set_group`, docs/picker-groups.md §9). Idempotent; the accordion collapses
-    /// whatever was open before. The response's run geometry lands as [`Event::GroupSet`]
-    /// (header landing) and seats the selection; the server's reshaped window arrives
-    /// through the normal push path (offset-guarded, order-independent).
+    /// (`picker/set_group`). Idempotent; the accordion collapses whatever was open before. The
+    /// response's run geometry lands as [`Event::GroupSet`] (header landing) and seats the
+    /// selection; the server's reshaped window arrives through the normal push path
+    /// (offset-guarded, order-independent).
     fn picker_select_group(&mut self, header: GroupHeader) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
@@ -5731,12 +5721,11 @@ impl Session {
         )
     }
 
-    /// Select the group adjacent to the expanded one (`picker/set_group { step }`),
-    /// server-resolved so it works when the neighbour sits past the fetched window. Serves
-    /// both group-level `Alt-j`/`Alt-k` (`landing: Header`) and the item-level spill over a
-    /// run edge (`RunStart`/`RunEnd` — enter the neighbouring group at its first/last item,
-    /// docs/picker-groups.md §9). A step off the ends answers `run: None` — a stop, and
-    /// [`Event::GroupSet`] leaves the selection alone.
+    /// Select the group adjacent to the expanded one (`picker/set_group { step }`), server-resolved
+    /// so it works when the neighbour sits past the fetched window. Serves both group-level
+    /// `Alt-j`/`Alt-k` (`landing: Header`) and the item-level spill over a run edge
+    /// (`RunStart`/`RunEnd` — enter the neighbouring group at its first/last item). A step off the
+    /// ends answers `run: None` — a stop, and [`Event::GroupSet`] leaves the selection alone.
     fn picker_step_group(&mut self, direction: Direction, landing: GroupLanding) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
@@ -5754,11 +5743,10 @@ impl Session {
     }
 
     /// Reveal the selection after a row move — `Reveal::Minimal` for the local two-level
-    /// descend/ascend, `Reveal::Run` for a group select/step (frame the whole expanded run,
-    /// docs/picker-groups.md §9) — chasing it with a window refetch when it sits outside the
-    /// fetched window. Fires the reveal both immediately and re-armed for the next push
-    /// (`reveal_on_update`), so a reshaping window that hasn't landed yet still gets revealed
-    /// against fresh geometry when it does.
+    /// descend/ascend, `Reveal::Run` for a group select/step (frame the whole expanded run) —
+    /// chasing it with a window refetch when it sits outside the fetched window. Fires the reveal
+    /// both immediately and re-armed for the next push (`reveal_on_update`), so a reshaping window
+    /// that hasn't landed yet still gets revealed against fresh geometry when it does.
     fn picker_reveal_selection(&mut self, reveal: Reveal) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
@@ -5882,9 +5870,9 @@ impl Session {
                 Effects::none()
             }
             BufferChanged::NAME => {
-                // The revision-only change signal for edits outside the pushed window — the
-                // reading view's cue to re-fetch (docs/markdown-view.md §3). Editor rendering
-                // ignores it (the window on screen is untouched by an out-of-window edit).
+                // The revision-only change signal for edits outside the pushed window — the reading
+                // view's cue to re-fetch. Editor rendering ignores it (the window on screen is
+                // untouched by an out-of-window edit).
                 let Ok(p) = serde_json::from_value::<BufferChangedParams>(n.params) else {
                     return Effects::none();
                 };
@@ -5961,8 +5949,8 @@ impl Session {
                         // together with the window the server re-framed around it — behind its
                         // staleness guards, exactly like the view response's `effective_center_on`.
                         // A rejected push is genuinely stale: shells deliver server messages in
-                        // wire order (docs/client-core.md), so a push can't outrun the view
-                        // response that establishes the slot's generation.
+                        // wire order, so a push can't outrun the view response that establishes the
+                        // slot's generation.
                         if p.apply_update(u) && p.pending_center.is_none() {
                             reveal = p.reveal_on_update.take();
                         }
@@ -6046,8 +6034,8 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<BufferClosedParams>(n.params) else {
                     return Effects::none();
                 };
-                // The tether closed out from under us: this client's job is over, however the
-                // close happened (docs/tether.md — the future `ae --web file` waiter rides this).
+                // The tether closed out from under us: this client's job is over, however the close
+                // happened (the future `ae --web file` waiter rides this).
                 if self.tether == Some(p.buffer_id) {
                     return Effects::one(Effect::Exit);
                 }
@@ -6161,10 +6149,10 @@ impl Session {
     /// highlights disappear immediately.
     ///
     /// The prompt opens at its defaults — empty query *and* default match options — the same way
-    /// every picker opens at [`PickerReset::All`]. Options used to be sticky across `/`
-    /// presses, but a case or regex toggle left over from an earlier search silently changes what
-    /// the next one matches; `Up` recalls a past query together with the options it ran under
-    /// (docs/input-history.md §4a) when you do want the old configuration back. The snapshot is
+    /// every picker opens at [`PickerReset::All`]. Options used to be sticky across `/` presses,
+    /// but a case or regex toggle left over from an earlier search silently changes what the next
+    /// one matches; `Up` recalls a past query together with the options it ran under
+    /// when you do want the old configuration back. The snapshot is
     /// taken *before* the reset, so Esc still restores a committed search exactly as it was.
     pub fn enter_search(&mut self, extend_to_cursor: bool) -> Effects {
         self.search.snapshot = Some(SearchSnapshot {
@@ -6420,9 +6408,8 @@ impl Session {
                 None => return Effects::none(),
             }
         };
-        // Revive + count ride the nav RPC itself (docs/protocol-composites.md, I): the
-        // server re-sets the query first (skipping the step when it has no matches), then
-        // steps `count` times.
+        // Revive + count ride the nav RPC itself: the server re-sets the query first (skipping the
+        // step when it has no matches), then steps `count` times.
         self.request_str::<SearchStep>(
             SearchStepParams {
                 buffer_id: self.buffer.buffer_id,
@@ -6436,8 +6423,8 @@ impl Session {
         )
     }
 
-    /// `Alt-/`: search for the selected text, literally — the server derives and escapes
-    /// the query from its own selection state (docs/protocol-composites.md, H).
+    /// `Alt-/`: search for the selected text, literally — the server derives and escapes the query
+    /// from its own selection state.
     pub fn search_from_selection(&mut self) -> Effects {
         self.request_str::<SearchSet>(
             SearchSetParams {
@@ -6481,9 +6468,8 @@ impl Session {
 
     /// `]`/`[` (full) and `Alt-]`/`Alt-[` (`CurrentFile` scope): step through the jumplist —
     /// resolve cursor-relative (stopping, not wrapping, at the ends), open transient at the entry,
-    /// record nav, all one server-side composite (docs/protocol-composites.md, J;
-    /// docs/jumplist.md). The direction and scope ride into the event so a boundary result can
-    /// toast the right message.
+    /// record nav, all one server-side composite. The direction and scope ride into the event so a
+    /// boundary result can toast the right message.
     pub fn jumplist_step(
         &mut self,
         direction: Direction,
@@ -6502,10 +6488,10 @@ impl Session {
         )
     }
 
-    /// Picker `Ctrl-j`: snapshot the picker's filtered results into the jumplist and jump
-    /// to the highlighted row — capture + select in one composite (docs/jumplist.md). The
-    /// picker closes like an accept; `]`/`[` then step the captured set. No-op while an async
-    /// resolve is still filling the list (the snapshot would be partial).
+    /// Picker `Ctrl-j`: snapshot the picker's filtered results into the jumplist and jump to the
+    /// highlighted row — capture + select in one composite. The picker closes like an accept;
+    /// `]`/`[` then step the captured set. No-op while an async resolve is still filling the list
+    /// (the snapshot would be partial).
     fn jumplist_capture(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
@@ -6816,8 +6802,8 @@ impl Session {
     /// success" gate is simplified: Enter / blur emits the rename request and navigation is free;
     /// the result event reconciles the name (or sets the error).
     ///
-    /// Selection model: index 0 is the name field, `1..=roots.len()` the root rows, and
-    /// `roots.len() + 1` the add-root input row. Alt-j/k move between fields; Left/Right move the
+    /// Selection model: index 0 is the name field, `1..=roots.len` the root rows, and
+    /// `roots.len + 1` the add-root input row. Alt-j/k move between fields; Left/Right move the
     /// caret inside a text field. Delete / Ctrl-d on a root row opens the shared confirm prompt
     /// (`request_remove_root`); Enter on the input row commits the add.
     pub fn on_workspace_settings_key(
@@ -7229,12 +7215,12 @@ impl Session {
         // reconnect too, which reconciles the local mirror against the server's counters.
         let fx =
             fx.and(self.request_str::<HintsState>(HintsStateParams {}, Event::HintsStateLoaded));
-        // So do the input-history lists (docs/input-history.md). Empty at a boot chooser — no
-        // workspace is active yet — and refetched by the switch that activates one.
+        // So do the input-history lists. Empty at a boot chooser — no workspace is active yet — and
+        // refetched by the switch that activates one.
         fx.and(self.fetch_history())
     }
 
-    // ---- hints (docs/hints.md) ------------------------------------------------------
+    // ---- hints ------------------------------------------------------
 
     /// The hint context the session is in right now — which curriculum pool the corner draws
     /// from. `None` means hints have nowhere to display: the boot placeholder (with no picker),
@@ -7272,8 +7258,8 @@ impl Session {
         }
     }
 
-    /// The session facts that condition hint display eligibility beyond the context id — the
-    /// engine is sans-IO, so it learns these only when stamped in (docs/hints.md).
+    /// The session facts that condition hint display eligibility beyond the context id — the engine
+    /// is sans-IO, so it learns these only when stamped in.
     fn hint_facts(&self) -> HintFacts {
         HintFacts {
             workspaces_listed: self.picker.as_ref().and_then(|p| p.listed_workspaces()),
@@ -7353,7 +7339,7 @@ impl Session {
         fx
     }
 
-    /// Open the application-settings overlay (`Space ,`). Cheap — no RPC; the values it shows
+    /// Open the application-settings overlay (`Space,`). Cheap — no RPC; the values it shows
     /// already live on the session. Focus lands on the first row.
     pub fn open_app_settings(&mut self) {
         self.app_settings = Some(AppSettingsOverlay { selected: 0 });
@@ -7675,9 +7661,9 @@ impl Session {
         }
         match lookup(KeyContext::Search, code, mods) {
             Some(b) => {
-                // Hint observation (docs/hints.md): search-mode bindings resolve here rather
-                // than through `run_action`, so mirror its pre-dispatch observation — the
-                // option hints (Alt-c/w/e) must follow and rotate when their chord fires.
+                // Hint observation: search-mode bindings resolve here rather than through
+                // `run_action`, so mirror its pre-dispatch observation — the option hints
+                // (Alt-c/w/e) must follow and rotate when their chord fires.
                 let ctx = self.hint_env();
                 let enabled = self.hints_enabled;
                 let evs = self.hints.observe_action(&b.action, ctx, enabled);
@@ -8250,7 +8236,7 @@ impl Session {
         // Global entirely and re-declares what it wants: Global's edit chords are *line*-grain
         // (join, indent, move lines) and the reading view acts on blocks, so it opts in binding by
         // binding — `Ctrl-z`, `Ctrl-a` — rather than inheriting a keymap written for the editor.
-        // (It was once simply read-only; §12 gave it editing, and the opt-in list is what replaced
+        // (It was once simply read-only; block editing came later, and the opt-in list is what
         // that blanket exclusion.)
         let ctx = match self.mode {
             Mode::Normal => KeyContext::Normal,
@@ -8295,15 +8281,14 @@ impl Session {
         extend: bool,
         visible_rows: u32,
     ) -> Effects {
-        // Hint observation (docs/hints.md): every resolved binding passes through here — except
-        // search-mode keys, which resolve in `on_search_key` and observe there. Observed (and
-        // its record requests emitted) *before* dispatch, so the context is the one the hint
-        // displayed in (dispatch may open a picker and move it) — and so a `Quit`'s follow
-        // record hits the wire ahead of `Effect::Exit` tearing the process down, rather than
-        // queuing behind it and being lost.
+        // Hint observation: every resolved binding passes through here — except search-mode keys,
+        // which resolve in `on_search_key` and observe there. Observed (and its record requests
+        // emitted) *before* dispatch, so the context is the one the hint displayed in (dispatch may
+        // open a picker and move it) — and so a `Quit`'s follow record hits the wire ahead of
+        // `Effect::Exit` tearing the process down, rather than queuing behind it and being lost.
         let hint_ctx = self.hint_env();
         let enabled = self.hints_enabled;
-        // `Space h` owns its hint learning inside the engine's `dismiss()` — observing it here
+        // `Space h` owns its hint learning inside the engine's `dismiss` — observing it here
         // would rotate a followed intro hint before the dismissal ran, dismissing its
         // replacement instead.
         let evs = if matches!(action, Action::DismissHint) {
@@ -8583,8 +8568,8 @@ impl Session {
                     Event::AppInfoLoaded(r.map_err(|e| e.to_string()))
                 })
             }
-            // Dismiss the corner hint (docs/hints.md): a deliberate "not now" — down-weight it
-            // (heavier than a lapsed display) and rotate to another. No-op on an empty corner.
+            // Dismiss the corner hint: a deliberate "not now" — down-weight it (heavier than a
+            // lapsed display) and rotate to another. No-op on an empty corner.
             A::DismissHint => {
                 let ctx = self.hint_env();
                 let enabled = self.hints_enabled;
@@ -8790,10 +8775,10 @@ impl Session {
                 self.reload(false)
             }
             A::ToggleKeep => {
-                // Un-keeping the tether *releases* it (docs/tether.md): the buffer demotes to an
-                // ordinary transient AND the client stops exiting when it closes — one-way; a
-                // re-keep is just a plain keep. Atomic with the demotion, so it inherits the
-                // dirty guard — but audibly, since the user asked for a release.
+                // Un-keeping the tether *releases* it: the buffer demotes to an ordinary transient
+                // AND the client stops exiting when it closes — one-way; a re-keep is just a plain
+                // keep. Atomic with the demotion, so it inherits the dirty guard — but audibly,
+                // since the user asked for a release.
                 if self.tethered() {
                     if self.buffer.revision != self.buffer.saved_revision {
                         return Effects::toast(
@@ -9088,7 +9073,7 @@ impl Session {
                 )
             }
 
-            // ---- markdown reading view (docs/markdown-view.md) ----
+            // ---- markdown reading view ----
             A::ToggleReadView => self.toggle_read_view(),
             A::ReadStep(dir) => self.read_step(
                 dir == Direction::Forward,
@@ -9177,12 +9162,11 @@ impl Session {
 
     /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
     /// move the server cursor to the landed element's start: focus is derived from the cursor, so
-    /// the `Goto` *is* the focus change (docs/markdown-view.md §1.3). Quiet no-op at the ends.
-    /// With `extend` (Shift) the step *selects* instead (docs/markdown-view.md §12): the landed
-    /// block's far line becomes the cursor via `cursor/set` + `Granularity::Line` (the server
-    /// snaps to whole-line normal form), the anchor holding at the selection's origin — the
-    /// first extending step plants it at the focused block's near edge, so the selection covers
-    /// origin..=landed as whole blocks.
+    /// the `Goto` *is* the focus change. Quiet no-op at the ends. With `extend` (Shift) the step
+    /// *selects* instead: the landed block's far line becomes the cursor via `cursor/set` +
+    /// `Granularity::Line` (the server snaps to whole-line normal form), the anchor holding at the
+    /// selection's origin — the first extending step plants it at the focused block's near edge, so
+    /// the selection covers origin.=landed as whole blocks.
     fn read_step(
         &mut self,
         forward: bool,
@@ -9252,7 +9236,7 @@ impl Session {
                 }
             } else {
                 // Land outside any leading interactive span, so the step selects the block alone
-                // (the bar) — `l` opts into its links (docs/markdown-view.md §2.3).
+                // (the bar) — `l` opts into its links.
                 Landing::Goto(read.pos_of(crate::markdown::block_rest_byte(&read.elements, idx)))
             }
         };
@@ -9270,17 +9254,16 @@ impl Session {
         }
     }
 
-    /// `x`/`Alt-x` (+Shift): the editor's `cursor/select_line` state machine translated to
-    /// block grain (docs/markdown-view.md §12; see `cursor_select_line_once` server-side).
-    /// Plain presses *walk*: `x` snaps the focused block first, then a press on a whole-block
-    /// selection selects the *next* block alone; `Alt-x` selects the *previous* block even on
-    /// the first press (the editor's first-press asymmetry). Shift *grows* — `Shift-x` the
-    /// bottom, `Alt-Shift-x` the top — but only once a whole-block span exists: a non-whole
-    /// selection first snaps (Shift) or collapses to its edge block (plain), without
-    /// advancing. The cursor stays at whichever end it occupied (fresh selections default it
-    /// to the bottom); edges saturate at the document ends. The editor's
-    /// empty-line-point-is-whole rule has no analog — block walks step block to block and
-    /// can't get stuck on separators. Counts iterate the machine; one `cursor/set` +
+    /// `x`/`Alt-x` (+Shift): the editor's `cursor/select_line` state machine translated to block
+    /// grain (see `cursor_select_line_once` server-side). Plain presses
+    /// *walk*: `x` snaps the focused block first, then a press on a whole-block selection selects
+    /// the *next* block alone; `Alt-x` selects the *previous* block even on the first press (the
+    /// editor's first-press asymmetry). Shift *grows* — `Shift-x` the bottom, `Alt-Shift-x` the top
+    /// — but only once a whole-block span exists: a non-whole selection first snaps (Shift) or
+    /// collapses to its edge block (plain), without advancing. The cursor stays at whichever end it
+    /// occupied (fresh selections default it to the bottom); edges saturate at the document ends.
+    /// The editor's empty-line-point-is-whole rule has no analog — block walks step block to block
+    /// and can't get stuck on separators. Counts iterate the machine; one `cursor/set` +
     /// `Granularity::Line` lands the result in whole-line normal form.
     fn read_select_block(&mut self, forward: bool, count: u32, extend: bool) -> Effects {
         let (position, anchor) = {
@@ -9357,9 +9340,9 @@ impl Session {
         )
     }
 
-    /// Leave the reading view for the editor as an *edit transition* (docs/markdown-view.md
-    /// §12): unlike `Space v`, does NOT record a presentation preference — ducking out to
-    /// type is not "I prefer source". The caller sets the destination mode.
+    /// Leave the reading view for the editor as an *edit transition*: unlike `Space v`, does NOT
+    /// record a presentation preference — ducking out to type is not "I prefer source". The caller
+    /// sets the destination mode.
     fn read_exit_for_edit(&mut self) {
         self.read = None;
         if self.mode == Mode::Read {
@@ -9447,11 +9430,11 @@ impl Session {
         }))
     }
 
-    /// `h`/`l`: step the Enter target among the interactive elements *inside the focused
-    /// block* (docs/markdown-view.md §2.3). `l` with no target selects the block's first
-    /// interactive; `h` from the first steps back *out* — the cursor returns to the block's
-    /// rest byte, so the bar stands alone again. Past the last link, and `h` with nothing
-    /// selected, are quiet no-ops, like `j`/`k` at the document's ends.
+    /// `h`/`l`: step the Enter target among the interactive elements *inside the focused block*.
+    /// `l` with no target selects the block's first interactive; `h` from the first steps back
+    /// *out* — the cursor returns to the block's rest byte, so the bar stands alone again. Past the
+    /// last link, and `h` with nothing selected, are quiet no-ops, like `j`/`k` at the document's
+    /// ends.
     fn read_step_link_in_block(&mut self, forward: bool, count: u32) -> Effects {
         let target = {
             let Some(read) = self.read.as_ref() else {
@@ -9524,10 +9507,10 @@ impl Session {
         }])))
     }
 
-    /// A pointer press on the reading view: the shell hit-tests its own rendering to a source
-    /// byte (an element's span start) and the core moves the server cursor there — focus then
-    /// derives from the cursor exactly like a keyboard step (docs/markdown-view.md §1.3), so
-    /// clicking a block sets the reading selection in every shell through one path.
+    /// A pointer press on the reading view: the shell hit-tests its own rendering to a source byte
+    /// (an element's span start) and the core moves the server cursor there — focus then derives
+    /// from the cursor exactly like a keyboard step, so clicking a block sets the reading selection
+    /// in every shell through one path.
     pub fn read_click(&mut self, byte: u32) -> Effects {
         let target = {
             let Some(read) = self.read.as_ref() else {
@@ -9613,8 +9596,8 @@ impl Session {
 
     /// `Enter`: follow the focused element — open a link (external → system handler, `#anchor` →
     /// the heading, relative path → open in Aether), open an image externally, or jump to a
-    /// footnote's definition. No-op on non-interactive blocks (docs/markdown-view.md §2.3).
-    /// `Ctrl-a`/`Ctrl-Alt-a`: adjust the value under the cursor, up or down.
+    /// footnote's definition. No-op on non-interactive blocks. `Ctrl-a`/`Ctrl-Alt-a`: adjust the
+    /// value under the cursor, up or down.
     ///
     /// Over a number that is increment/decrement. In a markdown buffer it is the task checkbox
     /// instead — up checks, down unchecks — so one pair of keys means the same thing in the
@@ -9693,10 +9676,9 @@ impl Session {
                     };
                     Act::Footnote(read.pos_of(span.start))
                 }
-                // A task item's activation IS toggling its checkbox (docs/markdown-view.md
-                // §12) — the armed-link pill keeps precedence via `focus()`'s innermost-any
-                // resolution, and clicks never route here (`read_click_activate` filters to
-                // links/footnote refs).
+                // A task item's activation IS toggling its checkbox — the armed-link pill keeps
+                // precedence via `focus`'s innermost-any resolution, and clicks never route here
+                // (`read_click_activate` filters to links/footnote refs).
                 crate::markdown::Element::Item {
                     checked: Some(_), ..
                 } => Act::ToggleTask,
@@ -9829,7 +9811,7 @@ impl Session {
         })))
     }
 
-    /// Follow a link target from the reading view (docs/markdown-view.md §2.4).
+    /// Follow a link target from the reading view.
     fn read_follow_link(&mut self, href: &str) -> Effects {
         let lower = href.to_ascii_lowercase();
         if lower.starts_with("http://")
@@ -9897,14 +9879,13 @@ impl Session {
         }
     }
 
-    /// The deferred half of a *cross-file* anchor at content adoption: resolve the slug
-    /// against the freshly-staged parse, send the Goto, and hold the parse back — the
-    /// visible view stays "Loading…" for the one `cursor/move` round-trip, and
-    /// [`Self::install_staged_read`] swaps it in when the cursor lands, so the document
-    /// paints exactly once, already in place (docs/markdown-view.md §2.4 — the editor's
-    /// paint-once property for cross-file goto-def). A slug with no match installs
-    /// immediately with the in-document branch's toast: nothing to place, and the hold must
-    /// never outlive its reason.
+    /// The deferred half of a *cross-file* anchor at content adoption: resolve the slug against the
+    /// freshly-staged parse, send the Goto, and hold the parse back — the visible view stays
+    /// "Loading…" for the one `cursor/move` round-trip, and [`Self::install_staged_read`] swaps it
+    /// in when the cursor lands, so the document paints exactly once, already in place (the
+    /// editor's paint-once property for cross-file goto-def). A slug with no match installs
+    /// immediately with the in-document branch's toast: nothing to place, and the hold must never
+    /// outlive its reason.
     fn stage_read_place(&mut self, staged: ReadView) -> Effects {
         let Some(slug) = self.pending_read_anchor.take() else {
             return Effects::none();
@@ -9969,13 +9950,12 @@ impl Session {
     }
 
     /// Resolve a (possibly relative) link/image target against the buffer. A leading `/` is
-    /// **workspace-root-relative** (GitHub semantics, docs/markdown-view.md §2.4): it joins
-    /// the root containing the buffer (longest match, like every root computation). A buffer
-    /// outside every root has no anchor, so such a target keeps its filesystem-absolute
-    /// reading — the only sensible meaning there. Relative targets join the buffer's
-    /// directory; `None` for a scratch buffer with a relative target. Callers scheme-check
-    /// first — a URL joined onto either base is never meaningful. `pub`: the iced shell
-    /// resolves image sources through this, so links and images can't drift.
+    /// **workspace-root-relative** (GitHub semantics): it joins the root containing the buffer
+    /// (longest match, like every root computation). A buffer outside every root has no anchor, so
+    /// such a target keeps its filesystem-absolute reading — the only sensible meaning there.
+    /// Relative targets join the buffer's directory; `None` for a scratch buffer with a relative
+    /// target. Callers scheme-check first — a URL joined onto either base is never meaningful.
+    /// `pub`: the iced shell resolves image sources through this, so links and images can't drift.
     pub fn read_resolve_path(&self, target: &str) -> Option<String> {
         if target.starts_with('/') {
             let root = self
@@ -10159,8 +10139,7 @@ impl Session {
         )
     }
 
-    /// A counted edit (`3J`, `3>`, …) — the repeat loop lives server-side
-    /// (docs/protocol-composites.md, K).
+    /// A counted edit (`3J`, `3>`, …) — the repeat loop lives server-side.
     fn repeat_edit<M>(&mut self, count: u32) -> Effects
     where
         M: RpcMethod<Params = CountedEditParams, Result = EditResult> + 'static,
@@ -10215,9 +10194,9 @@ impl Session {
         )
     }
 
-    /// `i`/`a`/`Alt-i`/`Alt-a` — collapse to the chosen selection edge. One RPC: the
-    /// server owns the selection, so it resolves the edge (`Motion::SelectionEdge`,
-    /// docs/protocol-composites.md change F — formerly a set-cursor-then-adjust chain).
+    /// `i`/`a`/`Alt-i`/`Alt-a` — collapse to the chosen selection edge. One RPC: the server owns
+    /// the selection, so it resolves the edge (`Motion::SelectionEdge` — formerly a
+    /// set-cursor-then-adjust chain).
     fn enter_insert_at(&mut self, where_: InsertWhere) -> Effects {
         let edge = match where_ {
             InsertWhere::SelectionStart => SelectionEdge::Start,
@@ -10440,9 +10419,9 @@ mod tests {
         assert!(s.read.is_none(), "no anchor → the session choice stands");
     }
 
-    /// Cross-file anchors (docs/markdown-view.md §2.4): following `[x](./other.md#section)`
-    /// opens the file and arms the fragment; the anchor lands as a `cursor/move` Goto once
-    /// the target document's reading view adopts.
+    /// Cross-file anchors: following `[x](./other.md#section)` opens the file and arms the
+    /// fragment; the anchor lands as a `cursor/move` Goto once the target document's reading view
+    /// adopts.
     #[test]
     fn cross_file_anchor_lands_after_target_adopts() {
         let mut s = reading_session();
@@ -10463,7 +10442,7 @@ mod tests {
         })));
         assert_eq!(s.pending_read_anchor, None, "the anchor is consumed");
         // The parse is *staged*, not installed: the visible view stays "Loading…" for the
-        // cursor round-trip, so the document paints exactly once, already in place (§2.4).
+        // cursor round-trip, so the document paints exactly once, already in place.
         let read = s.read.as_ref().unwrap();
         assert!(
             read.loading && read.blocks.is_empty(),
@@ -10541,9 +10520,9 @@ mod tests {
         assert!(!read.loading && !read.blocks.is_empty() && read.staged.is_none());
     }
 
-    /// In-document anchors are *jumps*, not motions (docs/markdown-view.md §2.4): following
-    /// `#section` re-opens the current buffer with `record_nav_from` + `jump_to` — the same
-    /// composite cross-file follows and goto-definition ride — so `Backspace` returns.
+    /// In-document anchors are *jumps*, not motions: following `#section` re-opens the current
+    /// buffer with `record_nav_from` + `jump_to` — the same composite cross-file follows and
+    /// goto-definition ride — so `Backspace` returns.
     #[test]
     fn in_document_anchor_follow_is_nav_recorded() {
         let mut s = reading_session();

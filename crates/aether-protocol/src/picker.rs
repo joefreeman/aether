@@ -28,13 +28,13 @@ pub enum PickerKind {
     /// Open buffers, ordered by most-recently-used. The current buffer sits at position 0 and
     /// selecting it is a no-op switch.
     Buffers,
-    /// Workspace-wide content search. Each candidate is a single match on a single line; the
-    /// query *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes
-    /// throw out the prior candidates and start a fresh scan. Each open starts a *fresh* search:
-    /// query, hits and filter chips all go ([`PickerReset::All`]) — the jobs the old resume did are
-    /// covered better elsewhere (the jumplist keeps a result set you can step with `]`/`[`,
-    /// docs/jumplist.md; `Up` recalls a past query *with its chips*, docs/input-history.md). Hits
-    /// are still preserved *within* one open, across the scroll/re-view cycle.
+    /// Workspace-wide content search. Each candidate is a single match on a single line; the query
+    /// *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes throw
+    /// out the prior candidates and start a fresh scan. Each open starts a *fresh* search: query,
+    /// hits and filter chips all go ([`PickerReset::All`]) — the jobs the old resume did are
+    /// covered better elsewhere (the jumplist keeps a result set you can step with `]`/`[`, and
+    /// `Up` recalls a past query *with its chips*). Hits are still preserved
+    /// *within* one open, across the scroll/re-view cycle.
     Grep,
     /// Filesystem explorer. Entries are the children of one directory. The query is a *path*
     /// relative to the committed *anchor* directory: its part up to the last `/` selects which
@@ -108,9 +108,9 @@ pub enum PickerKind {
     /// (Enter is a no-op — the picker stays open; Esc dismisses it). Like
     /// [`Workspaces`](Self::Workspaces) it's usable before a workspace is active.
     Keybindings,
-    /// **Workspace-wide** symbol search (`Space Alt-o`, docs/workspace-symbols.md) — the modal
+    /// **Workspace-wide** symbol search (`Space Alt-o`) — the modal
     /// sibling of [`DocumentSymbols`](Self::DocumentSymbols). Answered by LSP `workspace/symbol`
-    /// across the servers pinned by the workspace's declared *projects* (docs/projects.md), and
+    /// across the servers pinned by the workspace's declared *projects*, and
     /// deliberately **not** every ready server: a lazily-launched one is reaped when its last
     /// buffer closes, which would make the same query answer differently depending on what happens
     /// to be open.
@@ -120,16 +120,16 @@ pub enum PickerKind {
     /// results stream in per server. Rows are [`PickerItem::Symbol`] carrying a `display_path`
     /// (symbols can come from dependencies outside every root), grouped by file.
     WorkspaceSymbols,
-    /// The client's jumplist (`Space j`, docs/jumplist.md), one row per
-    /// captured entry, fuzzy-matched on the entry's display text, grouped by the entries'
-    /// carried source headers (file or section label; a grouped capture gives every entry one —
-    /// out-of-workspace files get their absolute path as a label). Collapsible when grouped,
-    /// which is a property of the *capture*, not the kind: a centred open expands the
-    /// cursor-nearest entry's group and the rest sit collapsed, but a capture from the
-    /// file-shaped pickers ([`Self::groups_in_jumplist`]) renders flat instead — see
-    /// [`PickerViewResult::collapsible`]. Rebuilt from the live list on every open — nothing to resume, the
-    /// backing list persists regardless. Selecting a row jumps to its entry (via `FileAt`);
-    /// `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in place.
+    /// The client's jumplist (`Space j`), one row per captured entry, fuzzy-matched on the entry's
+    /// display text, grouped by the entries' carried source headers (file or section label; a
+    /// grouped capture gives every entry one — out-of-workspace files get their absolute path as a
+    /// label). Collapsible when grouped, which is a property of the *capture*, not the kind: a
+    /// centred open expands the cursor-nearest entry's group and the rest sit collapsed, but a
+    /// capture from the file-shaped pickers ([`Self::groups_in_jumplist`]) renders flat instead —
+    /// see [`PickerViewResult::collapsible`]. Rebuilt from the live list on every open — nothing to
+    /// resume, the backing list persists regardless. Selecting a row jumps to its entry (via
+    /// `FileAt`); `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in
+    /// place.
     Jumplist,
     /// The local branches **and worktrees** of one repo (`Space g g`), fuzzy-matched on branch
     /// name, checked-out branches first then most-recently-committed. The repo is resolved
@@ -166,10 +166,9 @@ pub enum PickerKind {
     /// Deliberately per-repo rather than grouped across a multi-repo workspace, as every other
     /// `Space g` surface is: it keeps "one row = one repo's binding" true by construction.
     GitBranches,
-    /// One repo's commit history (`Space g l`, docs/git-phase-2.md stage 4), newest first —
-    /// the editor's `git log`. Rows are [`PickerItem::GitCommit`]; `Enter` opens the commit as a
-    /// read-only virtual buffer (`git/show`), so it is not a file jump and has no
-    /// `PickerSelectResult`.
+    /// One repo's commit history (`Space g l`), newest first — the editor's `git log`. Rows are
+    /// [`PickerItem::GitCommit`]; `Enter` opens the commit as a read-only virtual buffer
+    /// (`git/show`), so it is not a file jump and has no `PickerSelectResult`.
     ///
     /// The query **filters what has been loaded** rather than re-running a search: matching is
     /// fuzzy over the composed haystack of subject, author and short hash, and no keystroke
@@ -186,9 +185,9 @@ pub enum PickerKind {
     /// against its parent to know whether the path was touched — which is why the cap counts
     /// commits *examined*, not rows produced.
     GitLogFile,
-    /// The repo's stash entries (`Space g a`, docs/git-phase-2.md stage 5), newest first. Rows are
-    /// [`PickerItem::GitStash`]; `Enter` previews the entry as a read-only virtual buffer, exactly
-    /// as the log picker shows a commit — a stash *is* a commit, so it costs no new read path.
+    /// The repo's stash entries (`Space g a`), newest first. Rows are [`PickerItem::GitStash`];
+    /// `Enter` previews the entry as a read-only virtual buffer, exactly as the log picker shows a
+    /// commit — a stash *is* a commit, so it costs no new read path.
     ///
     /// Not a jump target: the mutations (`Ctrl-p` pop, `Ctrl-Alt-p` apply, `Ctrl-d` drop) are RPCs
     /// the client fires against the highlighted row, so there is no `PickerSelectResult` for it.
@@ -204,12 +203,11 @@ impl PickerKind {
         matches!(self, PickerKind::GitChanges | PickerKind::GitChangesFile)
     }
 
-    /// Which input-history list this picker's query draws on for `Up`/`Down` recall
-    /// (docs/input-history.md), if any. Only Grep, because only Grep's query *is* a search: the
-    /// other kinds fuzzy-filter a live candidate set (the workspace's files, the open buffers, a
-    /// directory listing, the working tree's hunks), where recalling yesterday's string to narrow
-    /// today's set means little. Grep instead re-runs a workspace walk, and the walk is the
-    /// expensive, repeatable thing worth naming.
+    /// Which input-history list this picker's query draws on for `Up`/`Down` recall, if any. Only
+    /// Grep, because only Grep's query *is* a search: the other kinds fuzzy-filter a live candidate
+    /// set (the workspace's files, the open buffers, a directory listing, the working tree's
+    /// hunks), where recalling yesterday's string to narrow today's set means little. Grep instead
+    /// re-runs a workspace walk, and the walk is the expensive, repeatable thing worth naming.
     pub fn history_kind(self) -> Option<HistoryKind> {
         (self == PickerKind::Grep).then_some(HistoryKind::Grep)
     }
@@ -227,15 +225,15 @@ impl PickerKind {
         )
     }
 
-    /// Whether this kind's groups are collapsible (docs/picker-groups.md): group headers are
-    /// pushed as first-class *selectable rows* ([`PickerItem::Group`]) interleaved into the
-    /// window — the whole window/offset/selection space counts rows, not bare items — with
-    /// exactly one group expanded at a time whenever there are groups (accordion): the
-    /// *selected* group. Selection is two-level: moving between groups expands the group
-    /// landed on (`picker/set_group`), descending puts the selection among the expanded run's
-    /// items. The [`Self::groups_by_file`] kinds plus WorkspaceSymbols and Jumplist today, but
-    /// deliberately a separate predicate: the two can diverge. The remaining grouped kinds
-    /// (References, Keybindings) keep derived, non-selectable, always-expanded headers.
+    /// Whether this kind's groups are collapsible: group headers are pushed as first-class
+    /// *selectable rows* ([`PickerItem::Group`]) interleaved into the window — the whole
+    /// window/offset/selection space counts rows, not bare items — with exactly one group expanded
+    /// at a time whenever there are groups (accordion): the *selected* group. Selection is
+    /// two-level: moving between groups expands the group landed on (`picker/set_group`),
+    /// descending puts the selection among the expanded run's items. The [`Self::groups_by_file`]
+    /// kinds plus WorkspaceSymbols and Jumplist today, but deliberately a separate predicate: the
+    /// two can diverge. The remaining grouped kinds (References, Keybindings) keep derived,
+    /// non-selectable, always-expanded headers.
     ///
     /// **This is the default, not the authority.** [`Self::Jumplist`] is collapsible only when
     /// its captured entries carry groups — a capture from Files or Buffers is flat — so the
@@ -297,13 +295,12 @@ impl PickerKind {
         ) || self.is_git_changes()
     }
 
-    /// Whether `jumplist/capture` (picker `Ctrl-j`) applies (docs/jumplist.md) — the
-    /// position-shaped kinds, whose rows are jump targets *into* a file, plus the file-shaped
-    /// [`Self::Files`] and [`Self::Buffers`], whose rows are whole targets with no position (they
-    /// capture as position-less entries and open where the cursor last sat). Excludes the
-    /// non-jump kinds (Explorer, Workspaces, LspServers, Keybindings). Includes
-    /// [`Self::Jumplist`] itself: capturing there replaces the list with the picker's
-    /// currently-filtered subset — iterative narrowing.
+    /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose rows
+    /// are jump targets *into* a file, plus the file-shaped [`Self::Files`] and [`Self::Buffers`],
+    /// whose rows are whole targets with no position (they capture as position-less entries and
+    /// open where the cursor last sat). Excludes the non-jump kinds (Explorer, Workspaces,
+    /// LspServers, Keybindings). Includes [`Self::Jumplist`] itself: capturing there replaces the
+    /// list with the picker's currently-filtered subset — iterative narrowing.
     pub fn captures_to_jumplist(self) -> bool {
         matches!(
             self,
@@ -542,8 +539,8 @@ pub enum PickerItem {
         /// Index into the workspace's root list — pairs with `relative_path` for the absolute path.
         /// Root-addressed like grep hits and workspace diagnostics, because this picker lists the
         /// *workspace's* changes: every row is a changed file under one of the roots, aggregated
-        /// across however many repos those roots span (docs/git-phase-2.md). A change elsewhere in
-        /// a root's repo is a git question, not a workspace one, and isn't listed here.
+        /// across however many repos those roots span. A change elsewhere in a root's repo is a git
+        /// question, not a workspace one, and isn't listed here.
         path_index: u32,
         /// Path relative to root `path_index` (forward-slash separated). The fuzzy haystack + the
         /// group key the client renders a file header for.
@@ -736,7 +733,7 @@ pub enum PickerItem {
         /// runs off the *active buffer*, so a picker opened over repo A would have its checkout
         /// land in repo B if the user switched buffers — or a transient preview closed — while the
         /// list was up. Carrying the id makes each row name what it acts on, which is the rule
-        /// `docs/git-phase-2.md` decision 2 sets for every repo-level operation.
+        /// every repo-level operation follows.
         repo_id: crate::git::RepoId,
         /// Shorthand name (`main`), not `refs/heads/main`.
         name: String,
@@ -795,14 +792,13 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
-    /// A group's header in the collapsible kinds ([`PickerKind::collapsible`],
-    /// docs/picker-groups.md) — a first-class, selectable *row* in the pushed window, not a
-    /// client-derived decoration like the other grouped kinds' headers. Identity is `header`'s
-    /// group key. Exactly one group is expanded whenever groups exist (accordion — the
-    /// *selected* group, docs/picker-groups.md §9); the expanded group's items follow its
-    /// header, every other group renders as a bare header row. `Enter` on a header *is* a
-    /// jump: `picker/select` resolves it server-side to the group's first item. Click selects
-    /// + expands via `picker/set_group`.
+    /// A group's header in the collapsible kinds ([`PickerKind::collapsible`]) — a first-class,
+    /// selectable *row* in the pushed window, not a client-derived decoration like the other
+    /// grouped kinds' headers. Identity is `header`'s group key. Exactly one group is expanded
+    /// whenever groups exist (accordion — the *selected* group); the expanded group's items follow
+    /// its header, every other group renders as a bare header row. `Enter` on a header *is* a jump:
+    /// `picker/select` resolves it server-side to the group's first item. Click selects + expands
+    /// via `picker/set_group`.
     Group {
         header: GroupHeader,
         /// Items in the group's run — rendered on the row (the collapsed row's tell for
@@ -819,7 +815,7 @@ pub enum PickerItem {
     GitCommit {
         /// The repo this commit belongs to, echoed onto `git/show`. Carried per row for the same
         /// reason the branch rows carry it: resolution runs off the active buffer, which can change
-        /// while the list is up (docs/git-phase-2.md decision 2).
+        /// while the list is up.
         repo_id: crate::git::RepoId,
         /// Full 40-char hash — what `git/show` receives.
         hash: String,
@@ -871,11 +867,11 @@ pub enum PickerItem {
         #[serde(default)]
         match_indices: Vec<u32>,
     },
-    /// One captured entry in the Jumplist picker (docs/jumplist.md). Identity is `index` —
-    /// the entry's position in the captured list, stable for the picker's lifetime (the list
-    /// only changes via a re-capture, which resets the picker). Deliberately flat: one
-    /// presentation-neutral line per entry, quickfix-style — the source pickers' richer row
-    /// dressing (severity colours, stage tints, ± counts) doesn't carry over.
+    /// One captured entry in the Jumplist picker. Identity is `index` — the entry's position in the
+    /// captured list, stable for the picker's lifetime (the list only changes via a re-capture,
+    /// which resets the picker). Deliberately flat: one presentation-neutral line per entry,
+    /// quickfix-style — the source pickers' richer row dressing (severity colours, stage tints, ±
+    /// counts) doesn't carry over.
     JumplistEntry {
         /// 0-based position in the captured list.
         index: u32,
@@ -962,8 +958,8 @@ impl CaseMode {
 /// Grep and the changes pickers derive these from their filter chips; buffer search toggles them in
 /// the search prompt (`Alt-c` / `Alt-w` / `Alt-e`). Neither side carries them into the *next*
 /// search: a picker open resets its chips ([`PickerReset::All`]) and a prompt open resets its
-/// options, so the only way a past configuration comes back is recalling the entry that recorded it
-/// (docs/input-history.md §4a).
+/// options, so the only way a past configuration comes back is recalling the entry that recorded
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MatchOptions {
     #[serde(default, skip_serializing_if = "CaseMode::is_smart")]
@@ -1006,20 +1002,21 @@ pub struct ScopedPath {
     pub is_file: bool,
 }
 
-/// Result-narrowing filters, surfaced as chips in the clients (see `docs/picker-filters.md`).
-/// The full set is sent whole on every `picker/query` — filters are small and "replace, don't
-/// diff" keeps the server stateless about chip edits. Defaults mean "no filtering", so an
-/// all-default struct is equivalent to the field being absent on the wire.
+/// Result-narrowing filters, surfaced as chips in the clients. The full set is sent whole on every
+/// `picker/query` — filters are small and "replace, don't diff" keeps the server stateless about
+/// chip edits. Defaults mean "no filtering", so an all-default struct is equivalent to the field
+/// being absent on the wire.
 ///
 /// Which fields apply depends on the picker kind: Grep reads everything (including
-/// `hide_untracked`); Files reads `globs`/`directories`/`changed_only`/`hide_untracked`/`hide_hidden`;
-/// GitChanges reads `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer
-/// reads `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`; Jumplist reads
+/// `hide_untracked`); Files reads
+/// `globs`/`directories`/`changed_only`/`hide_untracked`/`hide_hidden`; GitChanges reads
+/// `globs`/`directories`/`hide_untracked` (it's inherently changed-only); Explorer reads
+/// `hide_ignored`/`hide_hidden`/`changed_only`/`hide_untracked`; Jumplist reads
 /// `globs`/`directories` (against each captured entry's file identity — and only when the capture
 /// spans in-root files at all, see `PickerViewResult::path_filterable`); WorkspaceSymbols reads
 /// `globs`/`directories` (against each symbol's file — `directories` additionally prunes which
-/// projects' servers the query fans out to, see `docs/workspace-symbols.md`). Inapplicable fields
-/// are ignored, not errors — clients only offer the chips that apply.
+/// projects' servers the query fans out to). Inapplicable fields are ignored, not errors — clients
+/// only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.
@@ -1097,8 +1094,7 @@ impl PickerFilters {
     }
 
     /// The inverse: a filter set carrying only match options, no scoping. How the buffer search —
-    /// which has options but nothing to scope — stores its configuration in an input-history entry
-    /// (docs/input-history.md).
+    /// which has options but nothing to scope — stores its configuration in an input-history entry.
     pub fn from_match_options(options: MatchOptions) -> Self {
         PickerFilters {
             case: options.case,
@@ -1118,11 +1114,10 @@ impl PickerFilters {
 /// there is never anything on the far side of a close for `Keep` to resume.
 ///
 /// It used to be a per-kind table (`PickerKind::reset_on_open`), with Grep and the two changes
-/// pickers keeping some or all of their state across opens. That went away in stages
-/// (docs/input-history.md §5): state surviving an open is state the user can't see and didn't ask
-/// for, and it silently changes what the next open shows. Getting back to a previous result set is
-/// the jumplist's job (`Ctrl-j`, docs/jumplist.md) and getting back to a previous query is the
-/// input history's (`Up`) — both explicit acts.
+/// pickers keeping some or all of their state across opens. That went away in stages: state
+/// surviving an open is state the user can't see and didn't ask for, and it silently changes what
+/// the next open shows. Getting back to a previous result set is the jumplist's job (`Ctrl-j`) and
+/// getting back to a previous query is the input history's (`Up`) — both explicit acts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PickerReset {
@@ -1268,13 +1263,13 @@ pub struct PickerViewResult {
     /// match is older than the cap".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// Whether *this view* renders as a collapsible accordion (docs/picker-groups.md): group
-    /// headers as selectable [`PickerItem::Group`] rows, two-level selection, the row space
-    /// counting headers. Normally a per-kind constant ([`PickerKind::collapsible`]) — the second
-    /// data gate after [`Self::path_filterable`], and for the same reason: a Jumplist captured
-    /// from a *file-shaped* picker (Files, Buffers) has one entry per file and nothing to group
-    /// by, so it renders flat, while the same kind captured from Grep renders grouped. Clients
-    /// must read this rather than the kind predicate; the kind is only the pre-response default.
+    /// Whether *this view* renders as a collapsible accordion: group headers as selectable
+    /// [`PickerItem::Group`] rows, two-level selection, the row space counting headers. Normally a
+    /// per-kind constant ([`PickerKind::collapsible`]) — the second data gate after
+    /// [`Self::path_filterable`], and for the same reason: a Jumplist captured from a *file-shaped*
+    /// picker (Files, Buffers) has one entry per file and nothing to group by, so it renders flat,
+    /// while the same kind captured from Grep renders grouped. Clients must read this rather than
+    /// the kind predicate; the kind is only the pre-response default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collapsible: bool,
     /// The initial result window (items at `effective_offset`). Mirrors the `picker/update` push
@@ -1288,11 +1283,10 @@ pub struct PickerViewResult {
 
 // ---- picker/query -------------------------------------------------------------------------------
 
-/// Shortest grep query that actually runs a search. Below this the server installs the query
-/// (so the input shows what you typed) but doesn't walk the workspace — a one-character pattern
-/// matches most of it. Shared so the client can apply the same floor without a round-trip:
-/// it's what decides whether a query is worth recording to the input history
-/// (docs/input-history.md) when the picker closes.
+/// Shortest grep query that actually runs a search. Below this the server installs the query (so
+/// the input shows what you typed) but doesn't walk the workspace — a one-character pattern matches
+/// most of it. Shared so the client can apply the same floor without a round-trip: it's what
+/// decides whether a query is worth recording to the input history when the picker closes.
 pub const MIN_GREP_QUERY_LEN: usize = 2;
 
 /// Update the active query. The client mints `generation` (monotonic per query change); the
@@ -1475,21 +1469,21 @@ pub enum GroupHeader {
 pub struct GroupSpan {
     pub start: u32,
     pub header: GroupHeader,
-    /// Collapsible kinds only (docs/picker-groups.md): the run's item count and whether it is
-    /// the expanded run — the same decoration the run's [`PickerItem::Group`] row carries, so
-    /// a sticky pin standing in for a scrolled-off header renders identically to the row
-    /// itself. `None` for the non-collapsible grouped kinds.
+    /// Collapsible kinds only: the run's item count and whether it is the expanded run — the same
+    /// decoration the run's [`PickerItem::Group`] row carries, so a sticky pin standing in for a
+    /// scrolled-off header renders identically to the row itself. `None` for the non-collapsible
+    /// grouped kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded: Option<bool>,
 }
 
-/// The expanded run's place in a collapsible picker's row space (docs/picker-groups.md §9):
-/// its header's absolute row plus its item count — the run's item rows occupy
-/// `[header_row + 1, header_row + len]`. Rides `picker/update` so the client can do exact,
-/// local two-level navigation math (clamping item-level moves to the run, telling item rows
-/// from header rows by interval) even when the run overflows the fetched window.
+/// The expanded run's place in a collapsible picker's row space: its header's absolute row plus its
+/// item count — the run's item rows occupy `[header_row + 1, header_row + len]`. Rides
+/// `picker/update` so the client can do exact, local two-level navigation math (clamping item-level
+/// moves to the run, telling item rows from header rows by interval) even when the run overflows
+/// the fetched window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpandedRun {
     /// Absolute row (in the collapsible row space) of the expanded run's header.
@@ -1500,17 +1494,16 @@ pub struct ExpandedRun {
 
 // ---- picker/set_group ---------------------------------------------------------------------------
 
-/// Select — and thereby expand — one group in a collapsible picker
-/// ([`PickerKind::collapsible`], docs/picker-groups.md §9). Exactly one group is expanded at a
-/// time (accordion): selecting one implicitly collapses the previous, and there is no
-/// explicit collapse — group-level navigation is what moves the expansion. The group is
-/// addressed either by its `header` (a click, or a gesture on a header row the client holds)
-/// or by `step` (the group-level `Alt-j`/`Alt-k` — the run adjacent to the currently-expanded
-/// one, resolved server-side so it works past the fetched window). Exactly one of the two
-/// must be set. The server recomputes the row space, replies with the selected header's new
-/// absolute row index, and pushes a fresh window through the normal `picker/update` path; the
-/// client adopts `row` as its selection and lets its offset/generation guards + refetch
-/// reconcile the window, so response/push arrival order doesn't matter.
+/// Select — and thereby expand — one group in a collapsible picker ([`PickerKind::collapsible`]).
+/// Exactly one group is expanded at a time (accordion): selecting one implicitly collapses the
+/// previous, and there is no explicit collapse — group-level navigation is what moves the
+/// expansion. The group is addressed either by its `header` (a click, or a gesture on a header row
+/// the client holds) or by `step` (the group-level `Alt-j`/`Alt-k` — the run adjacent to the
+/// currently-expanded one, resolved server-side so it works past the fetched window). Exactly one
+/// of the two must be set. The server recomputes the row space, replies with the selected header's
+/// new absolute row index, and pushes a fresh window through the normal `picker/update` path; the
+/// client adopts `row` as its selection and lets its offset/generation guards + refetch reconcile
+/// the window, so response/push arrival order doesn't matter.
 pub struct PickerSetGroup;
 impl RpcMethod for PickerSetGroup {
     const NAME: &'static str = "picker/set_group";
@@ -1537,14 +1530,13 @@ pub struct PickerSetGroupParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PickerSetGroupResult {
-    /// The selected run's place in the reshaped row space — its header row + item count. The
-    /// client picks its own landing row from it: the header for group-level navigation, the
-    /// run's first/last item for an item-level spill over a run edge (docs/picker-groups.md
-    /// §9 — moving down off a run's last item enters the next group at its first item, and
-    /// up off the first enters the previous at its last, which needs the new run's *length*
-    /// at reply time). `None` when nothing changed: the named group is no longer in the
-    /// result set (it re-ranked away mid-flight), a `step` ran off the ends, or the kind
-    /// doesn't collapse.
+    /// The selected run's place in the reshaped row space — its header row + item count. The client
+    /// picks its own landing row from it: the header for group-level navigation, the run's
+    /// first/last item for an item-level spill over a run edge (moving down off a run's last item
+    /// enters the next group at its first item, and up off the first enters the previous at its
+    /// last, which needs the new run's *length* at reply time). `None` when nothing changed: the
+    /// named group is no longer in the result set (it re-ranked away mid-flight), a `step` ran off
+    /// the ends, or the kind doesn't collapse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<ExpandedRun>,
 }
@@ -1597,10 +1589,10 @@ pub struct PickerUpdateParams {
     /// last group's) is reachable. `None` for the flat kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_display_rows: Option<u32>,
-    /// Collapsible kinds only (docs/picker-groups.md §9): where the expanded run sits in the
-    /// row space (see [`ExpandedRun`]). Describes the same result set as `items`, so like the
-    /// spans it's meaningless on a count-only tick (`items: None`), where the client keeps its
-    /// current value. `None` for the other kinds and while the result set is empty.
+    /// Collapsible kinds only: where the expanded run sits in the row space (see [`ExpandedRun`]).
+    /// Describes the same result set as `items`, so like the spans it's meaningless on a count-only
+    /// tick (`items: None`), where the client keeps its current value. `None` for the other kinds
+    /// and while the result set is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded_run: Option<ExpandedRun>,
     /// A server-resolved highlight to adopt when this push lands — currently the DocumentSymbols

@@ -182,11 +182,10 @@ pub fn shows_workspace_chrome(workspace: &str) -> bool {
 /// the raw id's. Three shells each doing `format!("[{}] ", id)` is how they came to disagree.
 ///
 /// It says nothing about worktrees: a binding is per *repo*, and the status bar's git cluster shows
-/// it at that grain, on the branch of the buffer it actually applies to (`docs/worktrees.md` §9.5).
-/// An `@ <admin name> (<branch>)` suffix was built here and **removed** — it named the first
-/// binding only (a workspace can have several, and collapsing the rest to `+n` names none of them),
-/// and it repeated in workspace-grain form what `⧉ branch` was already saying at the right grain
-/// two clusters away.
+/// it at that grain, on the branch of the buffer it actually applies to. An `@ <admin name>
+/// (<branch>)` suffix was built here and **removed** — it named the first binding only (a workspace
+/// can have several, and collapsing the rest to `+n` names none of them), and it repeated in
+/// workspace-grain form what `⧉ branch` was already saying at the right grain two clusters away.
 pub fn status_workspace_prefix(workspace: &str) -> Option<String> {
     shows_workspace_chrome(workspace).then(|| format!("[{}] ", workspace_display(workspace)))
 }

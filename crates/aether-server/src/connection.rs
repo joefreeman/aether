@@ -327,8 +327,8 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         if pruned_ephemeral {
             pushes.extend(crate::handlers::refresh_workspace_pickers(&mut s));
         }
-        // Last client out of a workspace releases its pinned project servers (`docs/projects.md`).
-        // Runs after `clients.remove` above, so this client no longer counts as holding it active.
+        // Last client out of a workspace releases its pinned project servers. Runs after
+        // `clients.remove` above, so this client no longer counts as holding it active.
         if let Some(workspace_id) = disconnecting_workspace.as_deref() {
             pushes.extend(crate::handlers::unpin_workspace_if_unused(
                 &mut s,

@@ -1,11 +1,10 @@
-//! Input history (docs/input-history.md) — the recall list behind `Up`/`Down` in the overlay
-//! text inputs: the buffer-search prompt, the grep picker's query, and the glob / path filter-chip
-//! editors.
+//! Input history — the recall list behind `Up`/`Down` in the overlay text inputs: the buffer-search
+//! prompt, the grep picker's query, and the glob / path filter-chip editors.
 //!
 //! Scoped per workspace (a grep term or a path scope is workspace vocabulary) and owned by the
 //! server, which persists it to `history.json` and hands each client a snapshot on connect and on
-//! every workspace switch. Like hints (docs/hints.md) the server is a dumb aggregator: clients
-//! append committed values (`history/record`) and do all the *navigation* — cursor, stashed draft,
+//! every workspace switch. Like hints the server is a dumb aggregator: clients append committed
+//! values (`history/record`) and do all the *navigation* — cursor, stashed draft,
 //! restore-on-overshoot — locally, so recall never waits on a round-trip.
 
 use crate::envelope::RpcMethod;

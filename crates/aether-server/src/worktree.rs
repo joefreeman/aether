@@ -1,10 +1,10 @@
 //! Git worktrees: the store, the naming rules, the reads, and the seeding.
 //!
-//! Stage 7 of the git work — `docs/worktrees.md` has the research and the design. The split with
+//! Worktree support. The split with
 //! [`crate::git_cli`] is the house rule sharpened: **libgit2 lists and validates worktrees, the
 //! `git` CLI creates and removes them.** That isn't a preference. Vendored libgit2 1.9.4 can't
 //! produce a detached HEAD, has no `--force`, uses the admin name verbatim as both a directory and
-//! a branch name, and leaves `.git/worktrees/<n>` behind when creation fails halfway (§5).
+//! a branch name, and leaves `.git/worktrees/<n>` behind when creation fails halfway.
 //!
 //! ## The store
 //!
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 /// [`crate::state::ServerState::worktree_store`], which tests point at a tempdir) if set, else the
 /// `worktree_store` app setting, else `$XDG_DATA_HOME/aether/worktrees`.
 ///
-/// Not under `profile_state_dir()`: that subtree is documented as machine state safe to delete, and
+/// Not under `profile_state_dir`: that subtree is documented as machine state safe to delete, and
 /// a worktree may hold hours of uncommitted work. Not under a workspace root either — see the
 /// module docs.
 ///
@@ -51,7 +51,7 @@ pub fn store_root(override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
         return Ok(dir.to_path_buf());
     }
     // A settings file that won't parse is an error, not a reason to quietly use the default. It
-    // used to be `.unwrap_or_default()`, which turned "your `settings.toml` is broken" into a
+    // used to be `.unwrap_or_default`, which turned "your `settings.toml` is broken" into a
     // worktree created on a different filesystem from the one you configured, with nothing said —
     // and a checkout in the wrong place is exactly the kind of thing you find out about much later.
     let configured = crate::config::load_app_settings()
@@ -70,7 +70,7 @@ pub fn store_root(override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
 /// what makes it unique, since two checkouts of the same project have the same basename.
 ///
 /// Keyed by *common dir* rather than workdir on purpose: every worktree of a family must land in
-/// one bucket, and the common dir is the only identifier they share (`docs/worktrees.md` §1).
+/// one bucket, and the common dir is the only identifier they share.
 pub fn repo_key(common_dir: &Path) -> String {
     // The common dir is `<repo>/.git`, so the repo's own name is one level up.
     let basename = common_dir
@@ -177,12 +177,12 @@ pub fn unique_admin_name(existing: &[String], store_dir: &Path, base: &str) -> S
 
 /// Every worktree of the family reachable from `workdir`, main first.
 ///
-/// libgit2 reads throughout — this is the half of the worktree API that is sound (§5). The main
+/// libgit2 reads throughout — this is the half of the worktree API that is sound. The main
 /// worktree is recovered from the common dir (`<main>/.git`, so its parent), because
-/// `worktrees()` lists only the *linked* ones and a caller standing in a linked worktree would
+/// `worktrees` lists only the *linked* ones and a caller standing in a linked worktree would
 /// otherwise never see the main checkout.
 ///
-/// Known fragility, inherited from `branches_checked_out_elsewhere`: `commondir().parent()` is not
+/// Known fragility, inherited from `branches_checked_out_elsewhere`: `commondir.parent` is not
 /// the main worktree for a `--separate-git-dir` or bare repo. Both fail safe here — the main row
 /// is simply omitted rather than wrong.
 pub fn list(workdir: &Path) -> Vec<GitWorktreeRow> {
@@ -298,7 +298,7 @@ pub fn at_risk(workdir: &Path) -> GitWorktreeAtRisk {
 ///
 /// git-worktree(1)'s own BUGS section still advises against multiple checkouts of a superproject,
 /// and the failure mode is silent commit loss. Refusing outright would block a workflow that does
-/// work if you know the hazard, so the result carries the fact and the client says so (§4.9).
+/// work if you know the hazard, so the result carries the fact and the client says so.
 pub fn has_submodules(workdir: &Path) -> bool {
     let Ok(repo) = git2::Repository::open(workdir) else {
         return false;
@@ -449,7 +449,7 @@ fn copy_file(from: &Path, to: &Path) -> bool {
 /// Returns the roots and the bindings that **failed to resolve** — a worktree removed in a terminal
 /// since the binding was written. Those roots fall back to the base path rather than failing the
 /// activation: a variant that can't fully materialise degrades to the base, because refusing to
-/// open would leave the user with no way back in (`docs/worktrees.md` §10.6).
+/// open would leave the user with no way back in.
 ///
 /// ```text
 /// root' = worktree.join(root.strip_prefix(repo_workdir))

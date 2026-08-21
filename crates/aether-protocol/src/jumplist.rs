@@ -1,4 +1,4 @@
-//! The jumplist — a captured, navigable snapshot of picker results (docs/jumplist.md).
+//! The jumplist — a captured, navigable snapshot of picker results.
 //!
 //! Vim-quickfix-shaped (vim's *jumplist* is a different thing — Aether's equivalent of that is
 //! the nav history, [`crate::nav`], which deliberately doesn't use the term). From a supported

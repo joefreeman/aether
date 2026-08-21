@@ -1,5 +1,4 @@
-//! On-disk backups of unsaved buffer contents (the hot-exit mechanism — see
-//! `docs/unsaved-persistence.md`).
+//! On-disk backups of unsaved buffer contents (the hot-exit mechanism).
 //!
 //! A backup file is *exactly* the document's text (LF-normalised, our internal form) — no header,
 //! no sidecar metadata. Identity is encoded in the path. **File backups are document-level**:
@@ -11,7 +10,7 @@
 //! can't collide with the shared directory.
 //!
 //! External-change detection leans on the backup file's own mtime rather than a stored timestamp:
-//! see [`read`] and `docs/unsaved-persistence.md`.
+//! see [`read`].
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};

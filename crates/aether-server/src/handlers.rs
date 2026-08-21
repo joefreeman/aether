@@ -224,10 +224,10 @@ pub async fn settings_set(
 
 // ---- hints/* ------------------------------------------------------------------------------------
 
-/// Apply one hint event (docs/hints.md). App-global like settings — no active workspace
-/// required. The server stamps the wall clock (day attribution and fatigue decay are its call, so
-/// two windows can't disagree) and derives retirement; the write to `hints.json` rides the
-/// periodic dirty-flag flush ([`flush_hints`]), not this request.
+/// Apply one hint event. App-global like settings — no active workspace required. The server stamps
+/// the wall clock (day attribution and fatigue decay are its call, so two windows can't disagree)
+/// and derives retirement; the write to `hints.json` rides the periodic dirty-flag flush
+/// ([`flush_hints`]), not this request.
 pub async fn hints_record(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,
@@ -277,10 +277,10 @@ pub(crate) async fn flush_hints(state: &SharedState) {
 
 // ---- history/* --------------------------------------------------------------------------------
 
-/// The active workspace's input-history lists (docs/input-history.md). Deliberately *not* an
-/// error without an active workspace: the boot chooser fetches this on connect before any
-/// workspace exists, and an ephemeral ("(no workspace)") context has no stable key to file
-/// history under — both get empty lists, which the client treats as "nothing to recall".
+/// The active workspace's input-history lists. Deliberately *not* an error without an active
+/// workspace: the boot chooser fetches this on connect before any workspace exists, and an
+/// ephemeral ("(no workspace)") context has no stable key to file history under — both get empty
+/// lists, which the client treats as "nothing to recall".
 pub async fn history_state(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -345,9 +345,8 @@ pub(crate) async fn flush_history(state: &SharedState) {
 /// active yet (lazy load). If the client already has a different workspace active, tears down the
 /// client's per-buffer state for the prior workspace before switching. Returns the resolved
 /// workspace info (name + canonical paths) so the client can present buffers relative to those
-/// roots.
-/// The client-facing view of a workspace's declared projects (`docs/projects.md`), re-resolved
-/// against its roots on every read.
+/// roots. The client-facing view of a workspace's declared projects, re-resolved against its roots
+/// on every read.
 ///
 /// Deliberately not cached: resolution depends on the filesystem, so a project whose marker was
 /// deleted by a branch switch starts reporting an error, and one that comes back stops — with no
@@ -483,7 +482,7 @@ pub async fn workspace_activate(
 /// Split from [`workspace_activate`] so the callers that compute a binding set themselves — binding
 /// a worktree, which mutates one entry of the current set — can reach it without round-tripping
 /// their families back through `RepoId`s just to have them normalised again. That round trip is not
-/// merely wasteful: recovering a `RepoId` from a family means `common_dir.parent()`, which is not
+/// merely wasteful: recovering a `RepoId` from a family means `common_dir.parent`, which is not
 /// the main worktree for a bare or `--separate-git-dir` repo, so a binding would be silently
 /// dropped in exactly the cases hardest to notice.
 async fn activate_context(
@@ -508,8 +507,8 @@ async fn activate_context(
     // A workspace is its **configured roots** (the TOML, or an in-memory registration) plus its
     // **worktree bindings** (the session file). The two live apart deliberately: a binding that no
     // longer resolves is stale machine state, dropped on load, where a stale root would be a broken
-    // config file to explain (`docs/worktrees.md` §8.2). Which is also why binding can never strand
-    // you — the configured roots are always still there to fall back to.
+    // config file to explain. Which is also why binding can never strand you — the configured roots
+    // are always still there to fall back to.
     //
     // "Is it loaded?" is asked **once**, here. It used to be asked twice under two separate locks —
     // The id derived from the bindings is what makes a second client with the same worktrees
@@ -769,9 +768,9 @@ async fn activate_context(
         ));
     }
 
-    // Composite post-step (docs/protocol-composites.md, C): open the landing buffer — the
-    // workspace's MRU buffer, or a fresh transient scratch on a first visit — in the same
-    // round-trip. Mirrors the convention every client implemented by hand.
+    // Composite post-step: open the landing buffer — the workspace's MRU buffer, or a fresh
+    // transient scratch on a first visit — in the same round-trip. Mirrors the convention every
+    // client implemented by hand.
     let opened = if params.open_last {
         Some(
             buffer_open(
@@ -973,12 +972,12 @@ fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer, doc: &D
 /// one attachment in a *named* workspace, once its content changed since its last backup, and
 /// delete the backup for any document that's gone clean again (e.g. undone back to the saved
 /// state). One write per document regardless of how many workspaces hold it — the backup is a
-/// property of the shared content, not of any workspace's view. This is the single writer of
-/// backup files — deliberately edit-source agnostic, so it captures every kind of edit (typing,
-/// format, revert, surround, …) without hooking each site. Best-effort: a no-op when backups
-/// aren't enabled (`backups_path` unset); logs rather than fails on I/O error. The (potentially
-/// large) rope clones and the file I/O happen off the lock; only the cheap `backed_up_revision`
-/// stamp is taken under it. See `docs/unsaved-persistence.md`.
+/// property of the shared content, not of any workspace's view. This is the single writer of backup
+/// files — deliberately edit-source agnostic, so it captures every kind of edit (typing, format,
+/// revert, surround, …) without hooking each site. Best-effort: a no-op when backups aren't enabled
+/// (`backups_path` unset); logs rather than fails on I/O error. The (potentially large) rope clones
+/// and the file I/O happen off the lock; only the cheap `backed_up_revision` stamp is taken under
+/// it.
 pub(crate) async fn flush_backups(state: &SharedState) {
     enum Action {
         Write(String, aether_protocol::Revision),
@@ -1077,7 +1076,7 @@ pub(crate) async fn flush_backups(state: &SharedState) {
 /// so a workspace actually *called* `ephemeral` would give its variants ids that
 /// [`aether_protocol::is_ephemeral_workspace_id`] reads as throwaway contexts. That misreading is
 /// silent, and it costs a persisted workspace its session, so the collision is refused at the one
-/// place a name is chosen. See `docs/worktrees.md` §10.2.
+/// place a name is chosen.
 fn validate_workspace_name(raw: &str) -> Result<String, RpcError> {
     let name = raw.trim().to_string();
     if name.is_empty() {
@@ -1160,7 +1159,7 @@ pub async fn workspace_create(
     if let Some(prior_id) = &prior {
         if prior_id != &name {
             s.prune_ephemeral_if_empty(prior_id);
-            // ...and, as in `workspace_activate`, releases the old workspace's project pins if this
+            //...and, as in `workspace_activate`, releases the old workspace's project pins if this
             // was the last client there.
             unpin_pushes = unpin_workspace_if_unused(&mut s, prior_id);
         }
@@ -1453,7 +1452,7 @@ pub async fn workspace_add_root(
     })
 }
 
-/// Declare a project (`docs/projects.md`) and pin its language server straight away.
+/// Declare a project and pin its language server straight away.
 ///
 /// Unlike activation — which skips entries that don't resolve so one stale project can't stop a
 /// workspace loading — a *new* declaration fails loudly. The user is looking at the dialog, so
@@ -1541,10 +1540,9 @@ pub async fn workspace_add_project(
     })
 }
 
-/// The add-project row's live inference (`docs/projects.md`): the language a declaration of this
-/// directory would pin, or `None` when the manifests don't single one out. Read-only, and never an
-/// error for a path that doesn't resolve — the client asks as the user types, so half-typed paths
-/// are the normal input.
+/// The add-project row's live inference: the language a declaration of this directory would pin, or
+/// `None` when the manifests don't single one out. Read-only, and never an error for a path that
+/// doesn't resolve — the client asks as the user types, so half-typed paths are the normal input.
 pub async fn workspace_infer_language(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,
@@ -1898,9 +1896,9 @@ pub async fn workspace_rename(
                 tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to rename workspace session");
             }
         }
-        // The input-history lists follow the name too (docs/input-history.md) — they're keyed by
-        // workspace, and a rename shouldn't read as "history lost". In-memory + dirty flag; the
-        // periodic flush writes it, like every other `history.json` mutation.
+        // The input-history lists follow the name too — they're keyed by workspace, and a rename
+        // shouldn't read as "history lost". In-memory + dirty flag; the periodic flush writes it,
+        // like every other `history.json` mutation.
         if let Some(lists) = s.history.workspaces.remove(&old_name) {
             s.history.workspaces.insert(new_name.clone(), lists);
             s.history_dirty = true;
@@ -1938,7 +1936,7 @@ pub async fn workspace_rename(
             )
         })
         .collect();
-    // ...and any open chooser elsewhere should show the new name in its list.
+    //...and any open chooser elsewhere should show the new name in its list.
     pushes.extend(refresh_workspace_pickers(&mut s));
     // Re-keyed above, so the projects come from the *new* name.
     let entry_projects = workspace_project_views_by_id(&s, &new_name);
@@ -2169,8 +2167,8 @@ pub async fn buffer_open(
     ctx: &mut ConnectionCtx,
     params: BufferOpenParams,
 ) -> Result<BufferOpenResult, RpcError> {
-    // Composite pre-step (docs/protocol-composites.md, A): record the jump origin onto this
-    // client's nav history — `nav/record` folded in, so result-style opens are one round-trip.
+    // Composite pre-step: record the jump origin onto this client's nav history — `nav/record`
+    // folded in, so result-style opens are one round-trip.
     if let Some(from) = params.record_nav_from {
         let mut s = state.lock().await;
         if let Some(entry) = nav_entry_for(&s, ctx.client_id, from) {
@@ -2280,8 +2278,8 @@ async fn open_restored_scratch(
     Ok(result)
 }
 
-/// `git/show`: materialise a revision into a read-only virtual buffer (docs/git-phase-2.md
-/// decision 4) — the commit's patch, or one file as of that commit.
+/// `git/show`: materialise a revision into a read-only virtual buffer — the commit's patch, or one
+/// file as of that commit.
 ///
 /// Resolution is against **reachable** repos, not writable ones: this is a read, and decision 2 is
 /// explicit that a repo reachable only through an open buffer stays fully read-eligible. Nothing
@@ -3949,7 +3947,7 @@ async fn workspace_location_of_workspace(
 /// Rebuild an already-loaded workspace around freshly-changed bindings, carrying its open buffers
 /// across. Returns the buffers that stayed behind because they were unsaved.
 ///
-/// This is §9.3 for the in-place case: the roots move, so every buffer under a remapped root has to
+/// The in-place case: the roots move, so every buffer under a remapped root has to
 /// be reopened at the same *relative* path in the new tree. Left alone they would silently keep
 /// editing the other worktree — the `git-worktree.nvim` #88 failure, tractable for us only because
 /// the server owns the buffer↔workspace association and can do the whole switch under one lock.
@@ -4014,7 +4012,7 @@ async fn rebind_loaded_workspace(
             continue; // outside every moved root
         };
         if doc.dirty {
-            // Unsaved work stays where it was edited (§9.3) — but the *view* still moves. Recording
+            // Unsaved work stays where it was edited — but the *view* still moves. Recording
             // the mapping without closing anything means a client that was looking at this buffer
             // lands on the same file in the new tree, with its unsaved copy left open behind it.
             // Without this the landing fell back to the MRU head, which is this very buffer: you
@@ -4070,8 +4068,7 @@ async fn rebind_loaded_workspace(
         // from a restored session but never opened is still in the picker, and replacing the list
         // wholesale silently dropped it. Ones under a moved root follow to the same relative path
         // (keeping their reserved id, since nothing has materialised them); ones outside every
-        // moved root, and scratches, are left exactly as they are. This is `docs/worktrees.md`
-        // §9.3 step 4's "dormant buffers" clause, which the first cut missed.
+        // moved root, and scratches, are left exactly as they are.
         for d in &mut entry.dormant_buffers {
             if let crate::state::DormantSource::File(path) = &d.source {
                 if let Some(mapped) = remap_path(path, &old_roots, &roots) {
@@ -4442,7 +4439,7 @@ fn current_branch_item(
 /// The one thing that is neither: the family lock. `git worktree add` rewrites `.git/config` in the
 /// common dir under git's own lockfile, so two concurrent adds in one family leave one dead with
 /// `could not lock config file`. Waiting is right where refusing would be an error the user has to
-/// understand — two agents asking at once is the expected case (`docs/worktrees.md` §4.4).
+/// understand — two agents asking at once is the expected case.
 pub async fn git_worktree_add(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -4650,7 +4647,7 @@ fn worktree_add_preflight(workdir: &Path, branch: &str, create: bool) -> Worktre
         return ok(GitWorktreeAddStatus::NoSuchBranch);
     }
     // Git allows one checkout of a branch across the whole family. The picker normally keeps this
-    // off the list entirely (§10.5), so reaching it means the list went stale — the client's move
+    // off the list entirely, so reaching it means the list went stale — the client's move
     // is still to *go there* rather than report a failure.
     if let Some(other) = crate::git::branch_checked_out_elsewhere(workdir, branch) {
         return WorktreeAddPreflight {
@@ -4734,7 +4731,7 @@ pub async fn git_worktree_remove(
 
     // Aether's own unsaved work, which git cannot see: a buffer open on a file in this tree with
     // edits that were never written. `--force` would take the file out from under it. Refused
-    // rather than reported, unlike the switch in §9.3 — this really does destroy the context.
+    // rather than reported, unlike the root remap — this really does destroy the context.
     {
         let s = state.lock().await;
         let dirty: Vec<BufferId> = s
@@ -4768,7 +4765,7 @@ pub async fn git_worktree_remove(
 
     // A prunable row's directory is already gone, so `git worktree remove` has nothing to remove
     // and would refuse. Pruning is right *here* and nowhere else: we have just watched `validate`
-    // fail for this specific entry, which is the condition §4.8 says must hold before running a
+    // fail for this specific entry, which is the condition that must hold before running a
     // command that has no grace period.
     //
     // It is worth being honest that `prune` is **family-wide** — git gives no way to prune one
@@ -4893,8 +4890,8 @@ fn main_worktree_dir(rows: &[GitWorktreeRow]) -> Option<std::path::PathBuf> {
 /// Without this, removing the worktree a workspace is standing in leaves that workspace pointing at
 /// a directory that no longer exists — roots, workspace index, watches and open buffers all aimed
 /// at deleted paths, with only a server restart to recover, since nothing re-materialises a
-/// workspace whose bindings changed underneath it. `docs/worktrees.md` §9.4 said to unbind first;
-/// this is that, done for the user rather than demanded of them.
+/// workspace whose bindings changed underneath it. Unbinding first is the fix, done for the user
+/// rather than demanded of them.
 ///
 /// Runs **before** the removal, not after: the point is that no buffer is left open on a file that
 /// is about to be deleted. The cost is that a removal which then fails leaves you unbound — visible,
@@ -6237,8 +6234,8 @@ pub async fn git_blame_line(
         }); // scratch buffer
     }
     let blame = cursor_line_blame(&mut s, params.buffer_id, params.line);
-    // Composite post-step (docs/protocol-composites.md, G): resolve the commit's details in
-    // the same round-trip. Best-effort — an unresolvable hash just yields `None`.
+    // Composite post-step: resolve the commit's details in the same round-trip. Best-effort — an
+    // unresolvable hash just yields `None`.
     let commit_info = match &blame {
         Some(b) if params.include_commit_info && !b.is_uncommitted => s
             .git_baseline
@@ -8216,8 +8213,8 @@ pub async fn search_set(
     let key = (client_id, params.buffer_id);
 
     let mut cursor = s.cursors.get(&key).copied().unwrap_or_default();
-    // Composite pre-step (docs/protocol-composites.md, H): derive the query from the
-    // selection — `Alt-/` searches the selected text literally. Empty selection = no-op.
+    // Composite pre-step: derive the query from the selection — `Alt-/` searches the selected text
+    // literally. Empty selection = no-op.
     let mut effective_query = None;
     if params.from_selection {
         let (start, end) = scope_range(buf, &cursor, CopyScope::Selection);
@@ -8512,9 +8509,9 @@ pub async fn sneak_cancel(
     Ok(())
 }
 
-/// `search/step` — step `count` matches in `params.direction`, handling the composite params
-/// (docs/protocol-composites.md, I): optional query revive first (skipping the step when it
-/// has no matches — same early-out the clients used), then `count` steps.
+/// `search/step` — step `count` matches in `params.direction`, handling the composite params:
+/// optional query revive first (skipping the step when it has no matches — same early-out the
+/// clients used), then `count` steps.
 pub async fn search_step(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -9071,10 +9068,10 @@ fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<Buffer
 /// `(client, buffer)` pairs for every client *other than* `except` affected by closing
 /// `buffer_ids`: clients with a viewport on one (the push hands them a successor to switch to),
 /// plus clients whose active workspace context holds one in its MRU — those may have it as their
-/// *tether* (docs/tether.md), which must exit even while the client is viewing something else.
-/// Capture this BEFORE tearing the buffers down — teardown drops the viewports and MRU entries
-/// this reads. At most one entry per `(client, buffer)` pair; non-matching pushes are ignored
-/// client-side, so the broad audience is safe.
+/// *tether*, which must exit even while the client is viewing something else. Capture this BEFORE
+/// tearing the buffers down — teardown drops the viewports and MRU entries this reads. At most one
+/// entry per `(client, buffer)` pair; non-matching pushes are ignored client-side, so the broad
+/// audience is safe.
 fn clients_affected_by_close(
     s: &ServerState,
     buffer_ids: &[BufferId],
@@ -9339,8 +9336,8 @@ pub async fn buffer_close(
         let _ = sender.send(notif).await;
     }
     tracing::debug!(buffer_id = params.buffer_id, "buffer closed");
-    // Composite post-step (docs/protocol-composites.md, B): attach the client to its next
-    // buffer (or a fresh scratch) in the same round-trip.
+    // Composite post-step: attach the client to its next buffer (or a fresh scratch) in the same
+    // round-trip.
     let opened = if params.open_next {
         Some(
             buffer_open(
@@ -9456,7 +9453,7 @@ async fn navigate_to(
         },
         None => entry.cursor,
     };
-    // Direct insert, *not* via record_motion — a jump-back must not feed `z` (see docs/nav design).
+    // Direct insert, *not* via record_motion — a jump-back must not feed `z`.
     s.cursors
         .insert((ctx.client_id, result.buffer_id), restored);
     result.cursor = restored;
@@ -9568,9 +9565,9 @@ pub async fn buffer_copy(
 }
 
 /// Highlight a standalone snippet with the tree-sitter registry — the markdown reading view's
-/// fenced code blocks (docs/markdown-view.md §2.8). Stateless: a fresh parse per call (snippets
-/// are fence-sized), the fence alias table resolving the language, injections included (a
-/// heredoc inside a snippet still highlights). Unknown language → empty, never an error.
+/// fenced code blocks. Stateless: a fresh parse per call (snippets are fence-sized), the fence
+/// alias table resolving the language, injections included (a heredoc inside a snippet still
+/// highlights). Unknown language → empty, never an error.
 pub async fn syntax_highlight_snippet(
     _state: &SharedState,
     _ctx: &mut ConnectionCtx,
@@ -9601,9 +9598,8 @@ pub async fn syntax_highlight_snippet(
     Ok(aether_protocol::syntax::SyntaxHighlightSnippetResult { highlights })
 }
 
-/// Full buffer text at its current revision — the markdown reading view's content fetch. The
-/// whole rope is materialized; markdown documents are small, and the reading view is the only
-/// caller (docs/markdown-view.md §3).
+/// Full buffer text at its current revision — the markdown reading view's content fetch. The whole
+/// rope is materialized; markdown documents are small, and the reading view is the only caller.
 pub async fn buffer_content(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,
@@ -9687,7 +9683,7 @@ pub async fn buffer_cut(
             )
         {
             // Out-of-window edit: nothing to render for this viewport, but a whole-document
-            // consumer still needs the change signal (docs/markdown-view.md §3).
+            // consumer still needs the change signal.
             push_buffer_changed(&s, vp, params.buffer_id, revision, &mut pushes);
             continue;
         }
@@ -10799,7 +10795,7 @@ fn diff_markers_by_line(
                 if *s == DiffStage::Unstaged && stage == DiffStage::Staged {
                     return;
                 }
-                // ...while Added/Modified outrank a Deleted-above flag (which never downgrades
+                //...while Added/Modified outrank a Deleted-above flag (which never downgrades
                 // them), and an unstaged write takes the stage with it.
                 if marker != DiffMarker::Deleted {
                     *k = marker;
@@ -13107,8 +13103,8 @@ pub async fn input_text(
     params: InputTextParams,
 ) -> Result<EditResult, RpcError> {
     let client_id = ctx.client_id;
-    // Composite pre-step (docs/protocol-composites.md, D): collapse to the requested
-    // selection edge before inserting — the same state changes as a `cursor/set`.
+    // Composite pre-step: collapse to the requested selection edge before inserting — the same
+    // state changes as a `cursor/set`.
     if let Some(edge) = params.at {
         let mut s = state.lock().await;
         let buf = s
@@ -13431,9 +13427,9 @@ pub async fn input_indent(
     Ok(last.expect("count.max(1) iterations"))
 }
 
-/// `input/open_line` — the open-line chains (cursor-park, edit, land) composed server-side
-/// from the same handlers the clients used to call in sequence, so undo grouping, pushes,
-/// and cursor stamping are identical (docs/protocol-composites.md, E).
+/// `input/open_line` — the open-line chains (cursor-park, edit, land) composed server-side from the
+/// same handlers the clients used to call in sequence, so undo grouping, pushes, and cursor
+/// stamping are identical.
 pub async fn input_open_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -13540,7 +13536,7 @@ pub async fn input_newline_and_indent(
 /// count by `INDENT_UNIT`. Otherwise falls back to copying the previous non-empty line's
 /// leading whitespace.
 ///
-/// The engine alone misses the very common "user just typed `fn foo() {` and pressed Enter"
+/// The engine alone misses the very common "user just typed `fn foo {` and pressed Enter"
 /// case: the parser hasn't seen a closing brace yet, so no `block` node exists and no
 /// `@indent` fires. We patch this with a small heuristic floor — `prev_line_levels +
 /// opener_bonus` — taken as `max` with the engine's answer. For complete code the engine
@@ -14521,7 +14517,7 @@ enum IndentKind {
 
 /// Per-buffer-style soft indent. Selection's line range gets the prefix added (or stripped, on
 /// dedent). Cursor and anchor are shifted by the per-line delta — on indent that's always
-/// +unit.len(); on dedent it's 0/-1/-unit.len() depending on what was actually there to strip.
+/// +unit.len; on dedent it's 0/-1/-unit.len depending on what was actually there to strip.
 async fn apply_indent_or_dedent(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -14667,7 +14663,7 @@ pub async fn input_move_lines(
     Ok(last.expect("count.max(1) iterations"))
 }
 
-// ---- block edits (markdown reading view, docs/markdown-view.md §12) -----------------------------
+// ---- block edits (markdown reading view) -----------------------------
 
 /// Resolve a [`BlockOp`] against the buffer's current text: the shared `aether-markdown`
 /// parse turns the selection's byte range into one replacement. `Err` is a refusal (quiet or
@@ -15361,10 +15357,10 @@ fn with_match_bracket(buf: &Document, mut cursor: CursorState) -> CursorState {
 /// counter. Any motion that grows, shrinks, or shifts the selection drops the indicator on the
 /// next response.
 ///
-/// A *whole-target* entry (docs/jumplist.md — captured from the Files or Buffers picker) has no
-/// position to match against, so the weaker rule applies: being in its buffer at all is being on
-/// it. The counter then reads as "file k of N", which is what a captured file list means, and it
-/// survives moving around inside the file rather than blinking out on the first motion.
+/// A *whole-target* entry (captured from the Files or Buffers picker) has no position to match
+/// against, so the weaker rule applies: being in its buffer at all is being on it. The counter then
+/// reads as "file k of N", which is what a captured file list means, and it survives moving around
+/// inside the file rather than blinking out on the first motion.
 fn with_jumplist_position(
     s: &ServerState,
     client_id: ClientId,
@@ -15429,9 +15425,9 @@ fn wrap_for_response(
     with_jumplist_position(s, client_id, buffer_id, with_brackets)
 }
 
-/// A structural block edit (docs/markdown-view.md §12) — resolved inside `apply_edit`'s lock
-/// by `resolve_block_edit`, against the same `aether-markdown` parse the reading view renders
-/// from. Selection-relative: the params carry no positions.
+/// A structural block edit — resolved inside `apply_edit`'s lock by `resolve_block_edit`, against
+/// the same `aether-markdown` parse the reading view renders from. Selection-relative: the params
+/// carry no positions.
 #[derive(Debug, Clone)]
 enum BlockOp {
     Move { down: bool, unit: BlockUnit },
@@ -16087,9 +16083,9 @@ fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) 
 }
 
 /// The edit-push range gate's alternative: queue a revision-only `buffer/changed` for a viewport
-/// the edit didn't intersect, so a whole-document consumer (the markdown reading view) still
-/// hears about every mutation without a window render (docs/markdown-view.md §3). Clients that
-/// draw the pushed window ignore the notification.
+/// the edit didn't intersect, so a whole-document consumer (the markdown reading view) still hears
+/// about every mutation without a window render. Clients that draw the pushed window ignore the
+/// notification.
 fn push_buffer_changed(
     s: &ServerState,
     vp: &Viewport,
@@ -16132,8 +16128,8 @@ fn workspace_candidates(
             crate::config::sort_names_by_recency(&mut names, &sessions);
         }
     }
-    // One row per workspace. There is no second tier: a workspace bound to a worktree is still
-    // that one workspace, on different roots (`docs/worktrees.md` §9.5).
+    // One row per workspace. There is no second tier: a workspace bound to a worktree is still that
+    // one workspace, on different roots.
     let mut out: Vec<picker_state::WorkspaceCandidate> = names
         .iter()
         .map(|name| picker_state::WorkspaceCandidate {
@@ -16168,12 +16164,11 @@ fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
 /// Full-window `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
 /// document — the post-mutation broadcast for whole-document changes (undo/redo, format, revert,
 /// reload), where the rope was swapped wholesale. Decorations (search, hunks, diagnostics, git
-/// status) resolve per *viewport's* buffer, so each workspace's view renders its own overlays
-/// over the shared content.
-/// Range-gated `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
-/// document, after an in-place edit touching logical lines `[edit_first, edit_last_excl)`. A
-/// viewport whose pushed range misses the edit gets a revision-only `buffer/changed` instead —
-/// whole-document consumers still need the change signal (docs/markdown-view.md §3). Decorations
+/// status) resolve per *viewport's* buffer, so each workspace's view renders its own overlays over
+/// the shared content. Range-gated `viewport/lines_changed` pushes for every viewport on any buffer
+/// of `buffer_id`'s document, after an in-place edit touching logical lines `[edit_first,
+/// edit_last_excl)`. A viewport whose pushed range misses the edit gets a revision-only
+/// `buffer/changed` instead — whole-document consumers still need the change signal. Decorations
 /// resolve per *viewport's* buffer, so each workspace's view renders its own overlays.
 fn collect_doc_edit_pushes(
     s: &ServerState,
@@ -16690,7 +16685,7 @@ pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
 }
 
 /// Drop `workspace_id`'s project pins once no client has it active, reaping the servers that only
-/// the pins were keeping alive (`docs/projects.md`).
+/// the pins were keeping alive.
 ///
 /// A pin belongs to the workspace, not to a client, so this fires only when the *last* client
 /// leaves: switching away in one window while another still shows the workspace must not tear its
@@ -17239,7 +17234,7 @@ pub(crate) fn explorer_dirs_in_workdirs(
 }
 
 /// Per-file Git status for the Files picker, aligned to `files` by index. Resolves each workspace
-/// root's repo status once (one `statuses()` per root), then looks each file up by its
+/// root's repo status once (one `statuses` per root), then looks each file up by its
 /// root-relative path — no per-file repo discovery. `None` at an index for a clean file, a file
 /// whose root isn't in a repo, or any libgit2 error.
 fn build_file_git_status(
@@ -17354,7 +17349,7 @@ fn rope_line_trimmed(text: &ropey::Rope, line: u32) -> String {
 /// one and is deliberately absent; the buffer still gets a baseline if you open it
 /// ([`crate::state::WorkspaceEntry::git_eligible`]).
 ///
-/// The walk is **per repo, not per root**: discovery plus a full `statuses()` pass is the expensive
+/// The walk is **per repo, not per root**: discovery plus a full `statuses` pass is the expensive
 /// part, and two roots in one repo used to pay it twice.
 fn build_git_change_candidates(
     roots: &[std::path::PathBuf],
@@ -17516,7 +17511,7 @@ pub async fn picker_view(
             // them again during `rerank`.
             let files = workspace_index.files().await;
             // One Git status pass per workspace root, aligned to the file snapshot by index, computed
-            // off the lock (statuses() walks the worktree). Empty for roots that aren't in a repo.
+            // off the lock (statuses walks the worktree). Empty for roots that aren't in a repo.
             let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
             picker_state::PickerCandidates::Files { files, git_status }
         }
@@ -17607,16 +17602,16 @@ pub async fn picker_view(
         // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
         // the prior snapshot via `preserve_existing`.
         PickerKind::DocumentSymbols => picker_state::PickerCandidates::Symbols(Vec::new()),
-        // Workspace symbols are query-driven (`docs/workspace-symbols.md`): the picker opens empty
-        // and each `picker/query` fans out afresh, exactly as Grep does.
+        // Workspace symbols are query-driven: the picker opens empty and each `picker/query` fans
+        // out afresh, exactly as Grep does.
         PickerKind::WorkspaceSymbols => {
             picker_state::PickerCandidates::WorkspaceSymbols(Vec::new())
         }
-        // Repo-scoped, not root-scoped (docs/git-phase-2.md decision 2): the list is one repo's
-        // working-tree changes, including files outside every workspace root when a root is a
-        // subdirectory of its repo. Resolved as a *writable* repo — the same rule
-        // `git/prepare_commit` and the branch picker use, so a single-repo workspace never sees a
-        // chooser, and the list can't name changes you could never stage or commit.
+        // Repo-scoped, not root-scoped: the list is one repo's working-tree changes, including
+        // files outside every workspace root when a root is a subdirectory of its repo. Resolved as
+        // a *writable* repo — the same rule `git/prepare_commit` and the branch picker use, so a
+        // single-repo workspace never sees a chooser, and the list can't name changes you could
+        // never stage or commit.
         PickerKind::GitChanges if params.reset == PickerReset::All => {
             // Snapshot the roots + every in-root open buffer (live combined hunks + text) under a
             // brief lock, then build off-lock — the repo walks + per-file diffs must not block the
@@ -18192,9 +18187,9 @@ pub async fn picker_view(
         .or_else(|| current_branch_item(picker, params.reset));
     if let Some(item) = effective_center_on.as_ref() {
         // Collapsible kinds: framing an item implies revealing it — expand its group before
-        // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames
-        // a visible row rather than a collapsed header (docs/picker-groups.md). Centering on a
-        // `Group` row just frames the header; it expands nothing.
+        // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames a
+        // visible row rather than a collapsed header. Centering on a `Group` row just frames the
+        // header; it expands nothing.
         if picker.collapsible() && !matches!(item, PickerItem::Group { .. }) {
             if let Some(group_key) = picker.group_key_of_item(item) {
                 picker.expanded = Some(group_key);
@@ -18332,12 +18327,11 @@ pub async fn picker_query(
     };
     // WorkspaceSymbols: resolve the fan-out targets up front (immutable borrows of `s`, like the
     // Explorer roots above) — the initial push below needs them: whether anything will actually be
-    // asked decides `ticking`, and the fan-out size seeds the completion counter. A fan-out of
-    // zero servers settles immediately rather than spinning forever. The scoping rule lives in
-    // `symbol_servers`; a `Dir` filter prunes the fan-out rather than merely filtering results —
-    // a server whose root is disjoint from the scope can't contribute. The query minimum is
-    // grep's: below it a per-keystroke LSP fan-out (uncancellable — see
-    // `docs/workspace-symbols.md`) is pure churn.
+    // asked decides `ticking`, and the fan-out size seeds the completion counter. A fan-out of zero
+    // servers settles immediately rather than spinning forever. The scoping rule lives in
+    // `symbol_servers`; a `Dir` filter prunes the fan-out rather than merely filtering results — a
+    // server whose root is disjoint from the scope can't contribute. The query minimum is grep's:
+    // below it a per-keystroke LSP fan-out (uncancellable) is pure churn.
     let mut symbol_fanout = (matches!(params.kind, PickerKind::WorkspaceSymbols)
         && params.query.len() >= grep::MIN_QUERY_LEN)
         .then(|| {
@@ -18369,8 +18363,8 @@ pub async fn picker_query(
     picker.filters = params.filters;
     picker.generation = params.generation;
     // A query change resets the client's selection to row 0 — drop the expanded key so the
-    // accordion re-coheres with it: the first run of the *new* ranking opens itself
-    // (docs/picker-groups.md §9) and row 0 is its header again.
+    // accordion re-coheres with it: the first run of the *new* ranking opens itself and row 0 is
+    // its header again.
     picker.expanded = None;
     let grep_cache_hit = matches!(params.kind, PickerKind::Grep)
         && picker
@@ -18602,15 +18596,14 @@ pub async fn picker_hide(
     Ok(())
 }
 
-/// Select — and thereby expand — one group in a collapsible picker (docs/picker-groups.md
-/// §9), addressed by `header` (a click, `Alt-l` on a header the client holds) or by `step`
-/// (the group-level `Alt-j`/`Alt-k` — the run adjacent to the expanded one, resolved here so
-/// it works past the fetched window). Accordion semantics: selecting a group implicitly
-/// collapses the previous one; there is no explicit collapse — group navigation is what
-/// moves the expansion. Replies with the selected header's absolute row in the reshaped
-/// space (the client adopts it as its selection) and pushes the reshaped window through the
-/// normal `picker/update` path; the client's offset/generation guards + refetch reconcile,
-/// so response/push arrival order doesn't matter.
+/// Select — and thereby expand — one group in a collapsible picker, addressed by `header` (a click,
+/// `Alt-l` on a header the client holds) or by `step` (the group-level `Alt-j`/`Alt-k` — the run
+/// adjacent to the expanded one, resolved here so it works past the fetched window). Accordion
+/// semantics: selecting a group implicitly collapses the previous one; there is no explicit
+/// collapse — group navigation is what moves the expansion. Replies with the selected header's
+/// absolute row in the reshaped space (the client adopts it as its selection) and pushes the
+/// reshaped window through the normal `picker/update` path; the client's offset/generation guards +
+/// refetch reconcile, so response/push arrival order doesn't matter.
 pub async fn picker_set_group(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -18725,12 +18718,11 @@ fn jumplist_open_params(
     }
 }
 
-/// Snapshot the open picker's filtered results into this client's jumplist (docs/jumplist.md).
-/// Doesn't navigate — the client follows up by opening the Jumplist picker framed on the
-/// returned `index`, and Enter there jumps through the ordinary select path. `None` when the
-/// picker has nothing to capture — the previously captured list survives. Replaces any prior
-/// capture otherwise; capturing from the Jumplist picker itself narrows the list to its current
-/// subset.
+/// Snapshot the open picker's filtered results into this client's jumplist. Doesn't navigate — the
+/// client follows up by opening the Jumplist picker framed on the returned `index`, and Enter there
+/// jumps through the ordinary select path. `None` when the picker has nothing to capture — the
+/// previously captured list survives. Replaces any prior capture otherwise; capturing from the
+/// Jumplist picker itself narrows the list to its current subset.
 pub async fn jumplist_capture(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -18745,9 +18737,9 @@ pub async fn jumplist_capture(
             "no active picker for this client",
         ));
     };
-    // A collapsible picker's selection can sit on a group's header row; anchor the capture on
-    // that run's first item (the capture itself spans the whole filtered set either way —
-    // collapse is view state, not a filter; docs/picker-groups.md).
+    // A collapsible picker's selection can sit on a group's header row; anchor the capture on that
+    // run's first item (the capture itself spans the whole filtered set either way — collapse is
+    // view state, not a filter).
     let ci = match &params.item {
         PickerItem::Group { header, .. } => picker
             .first_candidate_of_group(&picker_state::group_key_of_header(header))
@@ -18810,13 +18802,13 @@ pub async fn jumplist_capture(
     }))
 }
 
-/// Step through the jumplist from the cursor's current location — Normal-mode
-/// `]` / `[` (cross-file) or `Alt-]` / `Alt-[` (`CurrentFile` scope) (docs/jumplist.md).
-/// Cursor-derived, stopping (not wrapping) at the ends; the directional rules live in
-/// [`crate::jumplist::step_index`] (full) / [`crate::jumplist::step_in_file`] (scoped). Returns
-/// [`JumplistStepResult::Empty`] when nothing is captured, [`JumplistStepResult::AtEnd`] at the
-/// boundary in the step direction, and [`JumplistStepResult::NoneInFile`] when a `CurrentFile`
-/// step finds no entries in the buffer's file — each a no-op the client turns into a toast.
+/// Step through the jumplist from the cursor's current location — Normal-mode `]` / `[`
+/// (cross-file) or `Alt-]` / `Alt-[` (`CurrentFile` scope). Cursor-derived, stopping (not wrapping)
+/// at the ends; the directional rules live in [`crate::jumplist::step_index`] (full) /
+/// [`crate::jumplist::step_in_file`] (scoped). Returns [`JumplistStepResult::Empty`] when nothing
+/// is captured, [`JumplistStepResult::AtEnd`] at the boundary in the step direction, and
+/// [`JumplistStepResult::NoneInFile`] when a `CurrentFile` step finds no entries in the buffer's
+/// file — each a no-op the client turns into a toast.
 pub async fn jumplist_step(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -18901,8 +18893,8 @@ pub async fn jumplist_step(
             .then(|| jumplist_open_params(&s, client_id, entry, params.buffer_id));
         (target, open_params)
     };
-    // Composite post-step (docs/protocol-composites.md, J): open the entry — transient, landed
-    // like a picker select, jump origin recorded — in the same round-trip.
+    // Composite post-step: open the entry — transient, landed like a picker select, jump origin
+    // recorded — in the same round-trip.
     if let Some(open_params) = open_params {
         target.opened = Some(buffer_open(state, ctx, open_params).await?);
     }
@@ -19453,7 +19445,7 @@ mod diff_anchor_tests {
     #[test]
     fn change_counts_tally_lines_by_class() {
         // Added/Modified count new-side lines (`new_lines`); Deleted counts removed lines
-        // (`deleted.len()`). A Modified hunk's replaced old lines ride its `modified` count and are
+        // (`deleted.len`). A Modified hunk's replaced old lines ride its `modified` count and are
         // *not* also tallied as deletions.
         let hunks = vec![
             hunk(ChangeKind::Added, 5, 3, &[]),                // +3
@@ -19627,7 +19619,7 @@ mod subscribe_snapshot_tests {
         );
         let pushes = refresh_workspace_diagnostics_pickers(&mut st);
 
-        // ...and the open picker picks it up live, with an update pushed to the viewing client.
+        //...and the open picker picks it up live, with an update pushed to the viewing client.
         assert_eq!(
             pushes.len(),
             1,

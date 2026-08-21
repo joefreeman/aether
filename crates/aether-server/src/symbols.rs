@@ -1,5 +1,5 @@
-//! Workspace-wide symbol search (`docs/workspace-symbols.md`): the LSP `workspace/symbol` fan-out
-//! behind [`aether_protocol::picker::PickerKind::WorkspaceSymbols`].
+//! Workspace-wide symbol search: the LSP `workspace/symbol` fan-out behind
+//! [`aether_protocol::picker::PickerKind::WorkspaceSymbols`].
 //!
 //! Shaped like [`crate::grep`] rather than the snapshot pickers: the query *is* the search, so each
 //! `picker/query` re-asks every eligible server and the results are merged into the picker's
@@ -211,11 +211,10 @@ pub fn scoped_dirs(
 
 /// Whether a language server rooted at `root` can contribute anything under `scopes`.
 ///
-/// This is what makes the `Dir` chip *prune the fan-out* rather than merely filter its results
-/// (`docs/workspace-symbols.md`): a server whose root is disjoint from every scoped directory has
-/// nothing to say, so it isn't asked at all — one fewer round-trip, and one fewer slow project to
-/// wait on. Either containment direction counts: a scope inside the server's root, or a server root
-/// inside the scope.
+/// This is what makes the `Dir` chip *prune the fan-out* rather than merely filter its results: a
+/// server whose root is disjoint from every scoped directory has nothing to say, so it isn't asked
+/// at all — one fewer round-trip, and one fewer slow project to wait on. Either containment
+/// direction counts: a scope inside the server's root, or a server root inside the scope.
 pub fn dir_scope_admits(root: &Path, scopes: &[PathBuf]) -> bool {
     scopes.is_empty()
         || scopes

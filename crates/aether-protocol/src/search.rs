@@ -34,11 +34,10 @@ pub struct SearchSetParams {
     /// `search/next` handles a wrap) or when `anchor` is `None`.
     #[serde(default)]
     pub extend: bool,
-    /// Derive the query from the current selection instead of `query` (which is ignored):
-    /// the server takes the selection's text, regex-escapes it, and searches for it
-    /// literally — `Alt-/` in one round-trip (docs/protocol-composites.md, H). The result's
-    /// `query` echoes what was searched; `None` there means the selection was empty and
-    /// nothing was set.
+    /// Derive the query from the current selection instead of `query` (which is ignored): the
+    /// server takes the selection's text, regex-escapes it, and searches for it literally — `Alt-/`
+    /// in one round-trip. The result's `query` echoes what was searched; `None` there means the
+    /// selection was empty and nothing was set.
     #[serde(default)]
     pub from_selection: bool,
     /// How the pattern matches: case mode, whole-word, and regex-vs-literal. Defaults (regex,
@@ -99,10 +98,9 @@ pub struct SearchStepParams {
     /// Step this many matches (`3n`). `0` is treated as `1`. Default `1`.
     #[serde(default = "default_nav_count", skip_serializing_if = "is_one")]
     pub count: u32,
-    /// Set this query first (`search/set` with no anchor), then step — the history-revive
-    /// chain (`n` after the search was dropped) folded into one round-trip
-    /// (docs/protocol-composites.md, I). When the revived query has no matches, the step is
-    /// skipped and the zero-total summary comes back as-is.
+    /// Set this query first (`search/set` with no anchor), then step — the history-revive chain
+    /// (`n` after the search was dropped) folded into one round-trip. When the revived query has no
+    /// matches, the step is skipped and the zero-total summary comes back as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_query: Option<String>,
     /// Match options for the `set_query` revive (ignored without it) — the options the revived

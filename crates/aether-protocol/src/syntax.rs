@@ -14,9 +14,9 @@ impl RpcMethod for SyntaxHighlightSnippet {
 }
 
 /// Highlight a standalone snippet with the server's tree-sitter registry — the markdown reading
-/// view's fenced code blocks (docs/markdown-view.md §2.8). `language` resolves through the same
-/// alias table fences use (`rs`, `py`, …); an unknown language yields an empty result rather
-/// than an error, so callers can fire-and-adopt.
+/// view's fenced code blocks. `language` resolves through the same alias table fences use (`rs`,
+/// `py`, …); an unknown language yields an empty result rather than an error, so callers can
+/// fire-and-adopt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyntaxHighlightSnippetParams {
     pub language: String,

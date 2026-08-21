@@ -1,7 +1,7 @@
-//! The jumplist (docs/jumplist.md): a per-client snapshot of one picker's
-//! filtered results, stepped from Normal mode with `]` / `[` (`jumplist/step`), stopping (not
-//! wrapping) at the ends. Lives in `ServerState.jumplist` next to the nav history; replaced by
-//! the next `jumplist/capture`, wiped on workspace switch and disconnect.
+//! The jumplist: a per-client snapshot of one picker's filtered results, stepped from Normal mode
+//! with `]` / `[` (`jumplist/step`), stopping (not wrapping) at the ends. Lives in
+//! `ServerState.jumplist` next to the nav history; replaced by the next `jumplist/capture`, wiped
+//! on workspace switch and disconnect.
 //!
 //! Entries are deliberately flat (quickfix-style): one presentation-neutral `display` string, a
 //! jump target mirroring what selecting the row in the source picker would do, and the source
@@ -21,7 +21,7 @@
 //!   captured file list one file at a time; and it carries no group, since a per-file header
 //!   above a row that *is* that file would only repeat it. Grouping is all-or-nothing per
 //!   capture ([`Jumplist::grouped`]), and an ungrouped list renders flat rather than as a
-//!   collapsible accordion (docs/picker-groups.md).
+//!   collapsible accordion.
 
 use crate::picker::{PickerCandidates, PickerState};
 use aether_protocol::cursor::Direction;
@@ -144,12 +144,12 @@ pub struct JumplistEntry {
     /// which opens on the target's last-known cursor instead.
     pub position: Option<LogicalPosition>,
     pub anchor: Option<LogicalPosition>,
-    /// The source picker's group header for this row (file or section label). `None` throughout
-    /// for an ungrouped capture ([`Jumplist::grouped`]); for a grouped one it is `None` only
-    /// while the capture is being assembled — the flat source kinds (buffer diagnostics,
-    /// document symbols, single-file changes) leave it empty and [`assign_file_groups`] fills it
-    /// in, so that every stored entry has one. That totality is what the collapsible row space
-    /// requires of the views it *does* key (docs/picker-groups.md).
+    /// The source picker's group header for this row (file or section label). `None` throughout for
+    /// an ungrouped capture ([`Jumplist::grouped`]); for a grouped one it is `None` only while the
+    /// capture is being assembled — the flat source kinds (buffer diagnostics, document symbols,
+    /// single-file changes) leave it empty and [`assign_file_groups`] fills it in, so that every
+    /// stored entry has one. That totality is what the collapsible row space requires of the views
+    /// it *does* key.
     pub group: Option<GroupHeader>,
     /// The source row's text — the Jumplist picker's row + fuzzy haystack.
     pub display: String,
@@ -351,9 +351,8 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
             entries
         }
         // Unlike DocumentSymbols there's no context-row mask to apply: workspace symbols rank
-        // without filtering (the LSP server did the matching — docs/workspace-symbols.md), so
-        // every ranked row is a real result and the snapshot takes them all, path chips already
-        // honoured by `rerank`.
+        // without filtering (the LSP server did the matching), so every ranked row is a real result
+        // and the snapshot takes them all, path chips already honoured by `rerank`.
         PickerCandidates::WorkspaceSymbols(v) => ranked_entries(picker, |ci| {
             let c = &v[ci];
             JumplistEntry {
@@ -450,7 +449,7 @@ fn relative_parts(path_index: u32, relative_path: &str) -> (Option<u32>, Option<
 ///   already carry a header (grep's `File`, references' `Definition`/`References` labels) keep it.
 ///   Out-of-workspace files (references into dependencies) get their absolute path as a `Label`
 ///   header — the WorkspaceSymbols convention, and what makes grouping *total*: the Jumplist
-///   picker's collapsible row space keys every row (docs/picker-groups.md).
+///   picker's collapsible row space keys every row.
 /// - **Path consistency.** Buffer-scoped candidates arrive with no relative parts (see
 ///   [`relative_parts`]); filling them from `abs_path` makes the open resolve the same file the
 ///   source picker's *select* would (which opens by `abs_path`) instead of erroring.

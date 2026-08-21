@@ -1,11 +1,11 @@
 //! Shell-owned text entry for overlay inputs (save-as, and — as later phases land — search,
 //! picker query, workspace-settings, chip editor).
 //!
-//! The split (docs/client-core.md): the core owns *values* and value-derived semantics; the
-//! shell owns *text-entry mechanics*. For a terminal there's no native input widget, so the shell
-//! drives a [`TextInput`] locally for the focused field — caret, insert, delete — and syncs the
-//! whole value into the core (`*_set_*`). Command keys (commit / cancel / nav / chord) are
-//! forwarded to the core's keycode dispatch unchanged.
+//! The split: the core owns *values* and value-derived semantics; the shell owns *text-entry
+//! mechanics*. For a terminal there's no native input widget, so the shell drives a [`TextInput`]
+//! locally for the focused field — caret, insert, delete — and syncs the whole value into the core
+//! (`*_set_*`). Command keys (commit / cancel / nav / chord) are forwarded to the core's keycode
+//! dispatch unchanged.
 //!
 //! This mirrors what the rich shells already do: iced renders a controlled `text_input` and the
 //! web a native `<input>`, both syncing values to the same core setters. The TUI is the third

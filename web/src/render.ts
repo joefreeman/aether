@@ -2,7 +2,7 @@
 //! with byte-offset highlights, plus per-line diagnostics / search / diff data); we paint it as
 //! rows of <span>s. Each row is styled at code-point granularity then coalesced into spans, so
 //! syntax colour, diagnostic underline, search tint, selection, and the cursor block compose
-//! cleanly even when they overlap. (docs/web-client.md §2.)
+//! cleanly even when they overlap.
 
 import { decodeRow, utf8ByteLen } from "./text";
 import type {

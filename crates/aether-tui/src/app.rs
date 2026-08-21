@@ -48,7 +48,7 @@ pub struct PendingFind {
 /// Client-side mirror of the server's search state. The server owns the match list (and pushes
 /// per-line highlights via viewport line renders); the client just tracks the query, the latest
 /// summary, and the snapshot used to revert from EditorMode::Search via Esc. Query recall lives on
-/// the core session (`InputHistory`, docs/input-history.md), not here — nothing renders it.
+/// the core session (`InputHistory`), not here — nothing renders it.
 #[derive(Debug, Default)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
 pub struct SearchState {
@@ -180,9 +180,9 @@ pub struct AppState {
     /// Active floating toasts, stacked bottom-right (newest at the bottom). Each is expired on a
     /// timer by the shell, keyed by its `id`. Fed from the same stream as `status`.
     pub toasts: Vec<Toast>,
-    /// The hint for the top-right corner (docs/hints.md), as `(before, keys, after)` — the
-    /// display text split around its emphasized key label, mirrored from the core's
-    /// `hint_view().parts()` each sync. `None` = empty corner.
+    /// The hint for the top-right corner, as `(before, keys, after)` — the display text split
+    /// around its emphasized key label, mirrored from the core's `hint_view.parts` each sync.
+    /// `None` = empty corner.
     pub hint: Option<(String, String, String)>,
     /// Connection state, mirrored from the session. The disconnect toast auto-expires, so the
     /// status bar shows a persistent `reconnecting…` / `disconnected` indicator while it's down.
@@ -216,9 +216,9 @@ pub struct AppState {
     /// early-return without touching state in that case; the no-workspace view (workspace picker)
     /// is rendered instead by `ui::draw`.
     pub editor: Option<EditorState>,
-    /// The markdown reading view (docs/markdown-view.md): when `Some`, `ui::draw` paints the
-    /// laid-out document instead of the editor window. Synced from the session each frame; the
-    /// layout itself is cached shell-side by `(buffer, revision, cols)`.
+    /// The markdown reading view: when `Some`, `ui::draw` paints the laid-out document instead of
+    /// the editor window. Synced from the session each frame; the layout itself is cached
+    /// shell-side by `(buffer, revision, cols)`.
     pub read: Option<ReadViewState>,
     /// Active workspace-settings overlay (`Space Alt-,`). When `Some`, draws a centered modal listing
     /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
@@ -241,26 +241,26 @@ pub struct AppState {
     pub symbol_path: Vec<aether_protocol::lsp::SymbolCrumb>,
 }
 
-/// The reading view's render model (docs/markdown-view.md §2.8): rows from the core's
-/// [`aether_client::read_layout`], plus focus/scroll geometry. The shell owns the scroll and the
-/// layout cache; `ui::draw_read_view` just paints.
+/// The reading view's render model: rows from the core's [`aether_client::read_layout`], plus
+/// focus/scroll geometry. The shell owns the scroll and the layout cache; `ui::draw_read_view` just
+/// paints.
 pub struct ReadViewState {
     pub rows: std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
     /// The reading position's bar as an inclusive layout-row range: the focused block's whole
     /// subtree (a parent item's bar covers its nested items, matching the GUI/web wrappers).
     /// `None` only while loading/empty.
     pub bar_rows: Option<(usize, usize)>,
-    /// The extended selection as an inclusive layout-row range (docs/markdown-view.md §12):
-    /// all rows of blocks intersecting the server selection, separators inside riding along.
-    /// `None` while the selection is a point — most of the time.
+    /// The extended selection as an inclusive layout-row range: all rows of blocks intersecting the
+    /// server selection, separators inside riding along. `None` while the selection is a point —
+    /// most of the time.
     pub sel_rows: Option<(usize, usize)>,
     /// The Enter target (interactive-grain): the link/image/footnote-ref span the cursor sits
     /// inside, inverted on top of the block tint. `None` unless the cursor is inside one.
     pub target_focus: Option<usize>,
     /// First visible layout row.
     pub scroll: u16,
-    /// Per-code-block horizontal offsets by element index — code rows are unchunked and the
-    /// painter clips them to this window (docs/markdown-view.md §2.8).
+    /// Per-code-block horizontal offsets by element index — code rows are unchunked and the painter
+    /// clips them to this window.
     pub hscroll: std::collections::HashMap<usize, u16>,
     /// True while the first content fetch is still in flight (an empty page briefly).
     pub loading: bool,
@@ -580,7 +580,7 @@ pub struct EditorState {
     /// first edit, a save, or a reload (`Space r`).
     pub transient: bool,
     /// The buffer is the session's [tether](aether_client::session::Session::tether) — closing it
-    /// exits the client (docs/tether.md). Shown as a dim ` *` after the status-bar file label.
+    /// exits the client. Shown as a dim ` *` after the status-bar file label.
     pub tethered: bool,
 }
 
@@ -842,10 +842,9 @@ fn format_total(s: &SearchSummary) -> String {
 }
 
 /// `Some("(3/12)")` when the server reports the cursor is currently on an entry of the captured
-/// jumplist (docs/jumplist.md), paired with the total entry count. `None` whenever
-/// nothing is captured or the cursor isn't on an entry — the status bar then renders nothing
-/// for the results slot, matching the "hide when not on a match" treatment for the in-buffer
-/// search counter.
+/// jumplist, paired with the total entry count. `None` whenever nothing is captured or the cursor
+/// isn't on an entry — the status bar then renders nothing for the results slot, matching the "hide
+/// when not on a match" treatment for the in-buffer search counter.
 pub fn jumplist_counter_label(state: &AppState) -> Option<String> {
     let rp = state.ed().cursor.jumplist_position?;
     Some(format!("({}/{})", rp.current, rp.total))

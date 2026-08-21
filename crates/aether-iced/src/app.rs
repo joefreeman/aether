@@ -89,9 +89,9 @@ pub struct ConnectingBootstrap {
     /// (`--buffer <id>`). Takes precedence over `file`; the id is daemon-session scoped, so a stale
     /// one falls back to the workspace's MRU/scratch.
     pub buffer_id: Option<BufferId>,
-    /// Tether the client to the buffer `file` opens (docs/tether.md): the quick-edit invocation —
-    /// a file positional without an explicit `--workspace` — where closing that buffer exits the
-    /// window. Windows opened from inside the editor ([`Shell::open_target`]) never tether.
+    /// Tether the client to the buffer `file` opens: the quick-edit invocation — a file positional
+    /// without an explicit `--workspace` — where closing that buffer exits the window. Windows
+    /// opened from inside the editor ([`Shell::open_target`]) never tether.
     pub tether: bool,
     pub client_version: String,
     /// The (profile-resolved) WebSocket address every dial and reconnect targets.
@@ -118,7 +118,7 @@ pub struct SessionBootstrap {
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
     pub explorer_dir: Option<String>,
     /// The session was launched to quick-edit `buffer` (`ae file`): tether the client to it, so
-    /// closing that buffer exits the window (see `Session::tether`, docs/tether.md).
+    /// closing that buffer exits the window (see `Session::tether`).
     pub tethered: bool,
 }
 
@@ -249,7 +249,7 @@ pub enum OverlayField {
 }
 
 impl OverlayField {
-    /// The widget id for this field's `text_input` in `window`, for `.id()` + `operation::focus`.
+    /// The widget id for this field's `text_input` in `window`, for `.id` + `operation::focus`.
     ///
     /// Scoped to the window because iced applies a widget operation to *every* window's UI: two
     /// windows sharing an id means focusing one picker's query input focuses the other's too, and
@@ -374,17 +374,16 @@ pub enum Message {
     /// ready for a D-Bus `org.freedesktop.Application.Open` to feed it.
     #[cfg(target_os = "macos")]
     OpenFromOs(std::path::PathBuf),
-    /// A click on a reading-view block/item: focus it — the source byte is the clicked
-    /// element's span start, and the core turns it into the cursor move focus derives from
-    /// (docs/markdown-view.md §2.3).
+    /// A click on a reading-view block/item: focus it — the source byte is the clicked element's
+    /// span start, and the core turns it into the cursor move focus derives from.
     ReadClick(u32),
     /// A click that landed on a rendered link / footnote-ref / image chip (the
     /// [`READ_ARM_PREFIX`] sentinel): focus it AND follow it like `Enter` — the core keeps
     /// images arm-only. Ctrl-click opens a relative link in a new window (the pointer
     /// sibling of `Ctrl-Enter`, matching the picker rows).
     ReadClickActivate(u32),
-    /// A remote reading-view image download resolved: raw bytes (sniffed raster-vs-SVG on
-    /// receipt) or an error, keyed by URL (docs/markdown-view.md §2.8).
+    /// A remote reading-view image download resolved: raw bytes (sniffed raster-vs-SVG on receipt)
+    /// or an error, keyed by URL.
     RemoteImageFetched(String, Result<Vec<u8>, String>),
     /// The [`ReadRevealProbe`] measured the focused block: `Some(offset)` = scroll the read
     /// view there; `None` = already comfortably visible.
@@ -398,9 +397,8 @@ pub enum Message {
     Noop,
     /// Frame tick while a smooth scroll is in flight.
     AnimTick(std::time::Instant),
-    /// Periodic hint tick (docs/hints.md): stamps the wall clock into the core's hint
-    /// engine, which runs the corner hint's display timer. Subscribed only while a session with
-    /// hints enabled is connected.
+    /// Periodic hint tick: stamps the wall clock into the core's hint engine, which runs the corner
+    /// hint's display timer. Subscribed only while a session with hints enabled is connected.
     HintTick,
     /// Reply errors keep their [`crate::connection::RpcError`] shape so the arms can branch on
     /// server codes (`WindowUpdate` swallows `VIEWPORT_NOT_FOUND` as fetch-races-resubscribe
@@ -408,8 +406,8 @@ pub enum Message {
     Subscribed(Result<ViewportSubscribeResult, crate::connection::RpcError>),
     WindowUpdate(Result<ViewportWindowResult, crate::connection::RpcError>),
 
-    /// A core event (docs/client-core.md): forwarded to `Session::on_event`, whose effects
-    /// the shell executes. Grows a subsystem at a time as update logic migrates into core.
+    /// A core event: forwarded to `Session::on_event`, whose effects the shell executes. Grows a
+    /// subsystem at a time as update logic migrates into core.
     Core(CoreEvent),
     /// Keyboard modifier state changed — stashed in `App::modifiers` for click-time reads (Ctrl-click).
     ModifiersChanged(keyboard::Modifiers),
@@ -420,9 +418,9 @@ pub enum Message {
     /// Pointer entered (`Some(abs)`) or left (`None`-if-still-current, see mapping) a row.
     PickerHovered(Option<u32>),
     PickerUnhovered(u32),
-    /// One message off the ordered inbound stream (a push, or a stream-mode RPC reply);
-    /// `None` = the stream ended (connection lost). Delivered by the single sequential
-    /// `pump`, so wire order survives into iced's message queue (docs/client-core.md).
+    /// One message off the ordered inbound stream (a push, or a stream-mode RPC reply); `None` =
+    /// the stream ended (connection lost). Delivered by the single sequential `pump`, so wire order
+    /// survives into iced's message queue.
     Inbound(Option<Inbound>),
     /// A reconnect attempt resolved (the backoff sleep rides inside the attempt task).
     Reconnected(Result<Box<Reestablished>, ReconnectError>),
@@ -483,8 +481,8 @@ pub struct App {
     /// Live keyboard modifier state, kept current from `ModifiersChanged` in every phase. Read at
     /// click time for Ctrl-click on picker rows — iced's `mouse_area::on_press` carries no modifiers.
     modifiers: keyboard::Modifiers,
-    // Per-session presentation state (geometry + parsed artifacts) — deliberately NOT on
-    // `core` Session (docs/client-core.md: semantics in the core, geometry in the shell).
+    // Per-session presentation state (geometry + parsed artifacts) — deliberately NOT on `core`
+    // Session (semantics in the core, geometry in the shell).
     scroll_px: f32,
     /// Horizontal scroll in px (`wrap: none` only; soft wrap always fits the viewport).
     scroll_x_px: f32,
@@ -507,7 +505,7 @@ pub struct App {
     /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
     /// The reading-view focus last revealed (`(buffer, span.start, span.end)`), so the document
-    /// scrolls only when the focus *changes* (docs/markdown-view.md §2.8).
+    /// scrolls only when the focus *changes*.
     read_last_focus: Option<(u64, u32, u32)>,
     /// The pending reveal is a *placement* — the first into a freshly-appeared document (a
     /// cross-file landing, or the reading view just opening) — so it snaps instead of gliding
@@ -526,8 +524,8 @@ pub struct App {
     /// The offset the read glide last emitted — an `on_scroll` that deviates is user input
     /// (wheel/drag), which snaps the glide off, like the editor.
     read_anim_last: f32,
-    /// Remote (http/https) reading-view images by URL, fetched once per session
-    /// (docs/markdown-view.md §2.8). `Loading`/`Failed` render placeholders.
+    /// Remote (http/https) reading-view images by URL, fetched once per session. `Loading`/`Failed`
+    /// render placeholders.
     remote_images: std::collections::HashMap<String, RemoteImage>,
     /// The `(buffer, revision)` last scanned for remote images, so the fetch fan-out runs once
     /// per parse rather than per frame.
@@ -674,9 +672,9 @@ impl App {
                 let chooser =
                     app.session
                         .open_picker(PickerKind::Workspaces, None, None, false, None);
-                // Fetch the app settings + hint snapshot on the boot connection: the chooser
-                // shows the first hint a fresh install ever sees (docs/hints.md), and the engine
-                // is dormant until the snapshot adopts.
+                // Fetch the app settings + hint snapshot on the boot connection: the chooser shows
+                // the first hint a fresh install ever sees, and the engine is dormant until the
+                // snapshot adopts.
                 let startup = app.session.startup();
                 let fx = app.run_core(chooser.and(startup));
                 (app, Task::batch([pump, fx]))
@@ -963,8 +961,8 @@ impl App {
                 // Fetch the persisted app settings (e.g. the soft-wrap default) on this connection.
                 let startup = startup.and(self.session.startup());
                 // Boot installs the session directly (no `adopt_switch`), so the markdown
-                // reading-view default is applied here (docs/markdown-view.md §1.6); an
-                // `ae file:line` launch is jump-shaped and lands in the editor.
+                // reading-view default is applied here; an `ae file:line` launch is jump-shaped and
+                // lands in the editor.
                 let jumped = jump_boot;
                 let startup = startup.and(self.session.boot_read_presentation(jumped));
                 // A document the desktop handed us during boot wins over the workspace's MRU
@@ -999,8 +997,8 @@ impl App {
                     self.enter_chooser()
                 };
                 let opens = self.drain_os_opens();
-                // Fetch the app settings + hint snapshot on this connection: the chooser shows
-                // the first hint a fresh install ever sees (docs/hints.md).
+                // Fetch the app settings + hint snapshot on this connection: the chooser shows the
+                // first hint a fresh install ever sees.
                 let startup = self.session.startup().and(opens);
                 let startup = self.run_core(startup);
                 Task::batch([pump(b.inbound), chooser, startup])
@@ -1561,7 +1559,7 @@ impl App {
         // Reading-view focus reveal: when the focused element changed (a `j`/`k` step, an
         // outline jump, search `n`), glide the document toward it. Widget layout heights aren't
         // knowable here, so position approximates as the focus span's fraction of the source —
-        // the §2.7 best-effort contract.
+        // the best-effort contract.
         if let Some(read) = self.session.read.as_ref() {
             // Keyed to the Enter target when the cursor sits inside one (a Tab step must
             // reveal the link, not just its paragraph), else the block-grain position.
@@ -1608,10 +1606,9 @@ impl App {
             self.read_scroll_px = 0.0;
             self.read_scroll_max = None;
         }
-        // Remote-image fetch fan-out (docs/markdown-view.md §2.8): once per parse, download any
-        // http(s) display image the document references; results land as `RemoteImageFetched`
-        // and paint in as they arrive. The cache is URL-keyed and session-lived, so revisits and
-        // re-parses are free.
+        // Remote-image fetch fan-out: once per parse, download any http(s) display image the
+        // document references; results land as `RemoteImageFetched` and paint in as they arrive.
+        // The cache is URL-keyed and session-lived, so revisits and re-parses are free.
         let scan_key = self
             .session
             .read
@@ -1839,7 +1836,7 @@ impl App {
         // the chip-row children change under the overlay, and iced drops the focused `text_input`'s
         // focus when its siblings shift in the tree diff. `desired_focus` is unchanged (still the
         // query), so `sync_focus` won't restore it — re-assert it here so the input stays the
-        // keyboard owner instead of leaking keys to the core's character path. (`focus()` snaps the
+        // keyboard owner instead of leaking keys to the core's character path. (`focus` snaps the
         // caret to the end, which is harmless for a chip toggle — not an in-query caret action.)
         if self.picker_chip_count() != chips_before {
             if let Some(field) = self.desired_focus() {
@@ -2251,11 +2248,11 @@ impl App {
 
     /// A typed stream-mode RPC: the request goes out now (`send` is synchronous, keeping wire
     /// order) and the reply — parsed to `M::Result`, errors kept in their
-    /// [`crate::connection::RpcError`] shape so handlers can branch on server codes — builds
-    /// `f`'s message when it arrives on the ordered inbound stream. Returns the request id so a
-    /// caller can supersede the continuation (`inflight.remove`) when a newer request replaces
-    /// it. Replaces the old per-request `Task`, whose completion could be scheduled around a
-    /// push and reorder processing (docs/client-core.md).
+    /// [`crate::connection::RpcError`] shape so handlers can branch on server codes — builds `f`'s
+    /// message when it arrives on the ordered inbound stream. Returns the request id so a caller
+    /// can supersede the continuation (`inflight.remove`) when a newer request replaces it.
+    /// Replaces the old per-request `Task`, whose completion could be scheduled around a push and
+    /// reorder processing.
     fn rpc<M>(
         &mut self,
         params: M::Params,
@@ -2621,8 +2618,8 @@ impl App {
                     })
                     .into()
             } else if self.session.read.is_some() {
-                // The markdown reading view replaces the editor wholesale while active
-                // (docs/markdown-view.md §2.8) — the same status bar and overlays around it.
+                // The markdown reading view replaces the editor wholesale while active — the same
+                // status bar and overlays around it.
                 column![self.read_view(), self.status_bar()].into()
             } else {
                 let editor = editor::editor(
@@ -2698,9 +2695,8 @@ impl App {
         if !self.toasts.is_empty() {
             layers.push(self.toast_overlay());
         }
-        // The hint (docs/hints.md): above the overlays (a picker context's hints must
-        // show over the picker) but below the connection banner. Top-right, so it collides with
-        // nothing else.
+        // The hint: above the overlays (a picker context's hints must show over the picker) but
+        // below the connection banner. Top-right, so it collides with nothing else.
         if let Some(hint) = self.session.hint_view() {
             layers.push(self.hint_corner(hint));
         }
@@ -2715,9 +2711,9 @@ impl App {
         iced::widget::stack(layers).into()
     }
 
-    /// The hint corner (docs/hints.md): a quiet top-right "Hint: …" chip with the key label
-    /// emphasized. Deliberately subtler than a toast: no shadow-heavy card, no animation, no
-    /// icon; it should read as ambient chrome, not a notification.
+    /// The hint corner: a quiet top-right "Hint: …" chip with the key label emphasized.
+    /// Deliberately subtler than a toast: no shadow-heavy card, no animation, no icon; it should
+    /// read as ambient chrome, not a notification.
     fn hint_corner(&self, hint: aether_client::hints::HintView) -> Element<'_, Message> {
         let ui = self.ui();
         let p = self.palette();
@@ -2983,10 +2979,10 @@ impl App {
         ));
         col = col.push(roots_col);
 
-        // The Projects group (docs/projects.md): declared directories whose language servers stay
-        // pinned while the workspace is active. Same shape as Roots — bulleted rows with a delete
-        // button, then an always-present add input — with a trailing tag per row carrying either the
-        // language it pins or, in red, why it can't be used.
+        // The Projects group: declared directories whose language servers stay pinned while the
+        // workspace is active. Same shape as Roots — bulleted rows with a delete button, then an
+        // always-present add input — with a trailing tag per row carrying either the language it
+        // pins or, in red, why it can't be used.
         let mut projects_col = column![label("Projects")].spacing(2);
         for (i, project) in s.projects.iter().enumerate() {
             let highlighted = s.row() == SettingsRow::Project(i);
@@ -3243,7 +3239,7 @@ impl App {
         )
     }
 
-    /// The application-settings overlay (`Space ,`). Grouped checkbox settings: a frost-accent group
+    /// The application-settings overlay (`Space,`). Grouped checkbox settings: a frost-accent group
     /// header, then each setting as a left-aligned label + native checkbox on the right, with its
     /// description grouped on the line directly below. Clicking a checkbox toggles that setting
     /// (`AppSettingToggle`); keys also work (Alt-j/k or Up/Down move, Enter/Space toggles, Esc
@@ -4207,8 +4203,8 @@ impl App {
                 },
             );
         left = left.push(name);
-        // The tether mark (docs/tether.md): a dim ` *` after the file label — closing this buffer
-        // exits the window. Upright even on a slanted transient label, like the terminal client.
+        // The tether mark: a dim ` *` after the file label — closing this buffer exits the window.
+        // Upright even on a slanted transient label, like the terminal client.
         if self.session.tethered() {
             // `fg_muted`: the dim-but-legible rung (dark stays the historic NORD3_BRIGHTER) —
             // see the buffer picker's tether star.
@@ -4854,7 +4850,7 @@ fn md_plain(inlines: &[MdInline]) -> String {
     out
 }
 
-// ---- the markdown reading view (docs/markdown-view.md §2.8, iced) -------------------------------
+// ---- the markdown reading view -------------------------------
 
 /// The reading body size in ems of the buffer font size — one step above the editor: reading
 /// wants larger type than code. Matches the web's `#buffer.md-read-host { font-size: 1.125em }`.
@@ -4887,9 +4883,8 @@ fn read_focus_id(window: window::Id) -> iced::advanced::widget::Id {
     scoped_id(window, "read-focus")
 }
 
-/// The *focused* code panel's horizontal scrollable — Left/Right pan it
-/// (docs/markdown-view.md §2.3); at most one panel carries the id per frame, and the
-/// `scroll_by` no-ops when the focus isn't a code block.
+/// The *focused* code panel's horizontal scrollable — Left/Right pan it; at most one panel carries
+/// the id per frame, and the `scroll_by` no-ops when the focus isn't a code block.
 fn read_code_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
     scoped_id(window, "read-code-scroll")
 }
@@ -4901,14 +4896,13 @@ fn read_code_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
 /// scheme allow-list drops it.
 const READ_ARM_PREFIX: &str = "aether-arm:";
 
-/// Measure-then-reveal for the reading view (docs/markdown-view.md §2.7): captures the read
-/// scrollable's viewport + current offset and the [`read_focus_id`] container's real bounds
-/// (scrollable children operate in untranslated content coordinates), and finishes with the
-/// absolute offset that rests the block ~20% down the viewport — `None` when it's already
-/// comfortably visible. Replaces the source-byte-fraction snap, which drifted off screen as
-/// soon as images and code panels made block heights non-uniform. Safe to run from the reveal
-/// task: the winit runtime executes widget operations *after* rebuilding the view, so the
-/// probe always measures the freshly focused block.
+/// Measure-then-reveal for the reading view: captures the read scrollable's viewport + current
+/// offset and the [`read_focus_id`] container's real bounds (scrollable children operate in
+/// untranslated content coordinates), and finishes with the absolute offset that rests the block
+/// ~20% down the viewport — `None` when it's already comfortably visible. Replaces the
+/// source-byte-fraction snap, which drifted off screen as soon as images and code panels made block
+/// heights non-uniform. Safe to run from the reveal task: the winit runtime executes widget
+/// operations *after* rebuilding the view, so the probe always measures the freshly focused block.
 struct ReadRevealProbe {
     /// The window being measured — the ids it matches are scoped to it.
     window: window::Id,
@@ -5010,10 +5004,10 @@ impl App {
             return iced::widget::Space::new().into();
         };
         let body = self.session.buffer_font_size as f32 * READ_SCALE;
-        // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
-        // always marks the reading position; the target pill inverts the interactive span the
-        // cursor sits inside, on top of it. An extended selection adds the NORD2 tint over its
-        // blocks and suppresses the pill (§12; `display_target`).
+        // Two projections of the one server cursor: the block bar always marks the reading
+        // position; the target pill inverts the interactive span the cursor sits inside, on top of
+        // it. An extended selection adds the NORD2 tint over its blocks and suppresses the pill
+        // (`display_target`).
         let cursor_state = self.session.buffer.cursor;
         let block_span = read
             .display_block_focus(&cursor_state)
@@ -5292,11 +5286,10 @@ impl App {
                         }));
                 }
                 for cb in content {
-                    // A container's children are reading stops in their own right now
-                    // (docs/markdown-view.md §12.6), so each one carries its own bar/tint
-                    // wrapper — the outer loop only wraps top-level blocks, and without this a
-                    // focused paragraph inside a quote painted no bar at all. Lists keep
-                    // wrapping per item inside their own arm.
+                    // A container's children are reading stops in their own right now, so each one
+                    // carries its own bar/tint wrapper — the outer loop only wraps top-level
+                    // blocks, and without this a focused paragraph inside a quote painted no bar at
+                    // all. Lists keep wrapping per item inside their own arm.
                     let child = self.read_block(cb, body, ui, block, target, sel, dim);
                     inner = inner.push(if matches!(cb, MdBlock::List { .. }) {
                         child
@@ -5311,7 +5304,7 @@ impl App {
                     });
                 }
                 // A left bar, no panel shade (Joe's call: quotes read fine as bar + indent).
-                // Same nested-container construction as `read_focus_wrap` — `md_bar()`'s Fill
+                // Same nested-container construction as `read_focus_wrap` — `md_bar`'s Fill
                 // height would blow up under the read scrollable's unbounded limits (the bug
                 // that blanked lists): the outer paints the bar colour, the inner repaints the
                 // canvas over everything but the 3px strip. Square corners, matching the
@@ -5365,9 +5358,8 @@ impl App {
                         }),
                     );
                 }
-                // Tree-sitter runs when the server's snippet highlights have landed for this
-                // fence (docs/markdown-view.md §2.8) — the editor's own token colours; plain
-                // body-coloured monospace until then.
+                // Tree-sitter runs when the server's snippet highlights have landed for this fence —
+                // the editor's own token colours; plain body-coloured monospace until then.
                 let hls = self
                     .session
                     .read
@@ -5456,11 +5448,11 @@ impl App {
             .width(Length::Fill)
             .padding([body * 0.5, 0.0])
             .into(),
-            // Front matter: the dim literal panel (docs/markdown-view.md) — raw YAML in dim
-            // monospace behind a thin selection-shade rule, the web's `.md-front-matter`. The
-            // quote arm's nested-container bar construction, but 2px and the selection shade:
-            // literal metadata, not speech. Must not fall through to `md_block`, whose
-            // hover-scale arm hides front matter entirely (right for popovers, wrong here).
+            // Front matter: the dim literal panel — raw YAML in dim monospace behind a thin
+            // selection-shade rule, the web's `.md-front-matter`. The quote arm's nested-container
+            // bar construction, but 2px and the selection shade: literal metadata, not speech. Must
+            // not fall through to `md_block`, whose hover-scale arm hides front matter entirely
+            // (right for popovers, wrong here).
             MdBlock::FrontMatter { text: raw, .. } => {
                 let panel = container(
                     text(raw.trim_end().to_string())
@@ -5656,10 +5648,9 @@ impl App {
                 }
             } else {
                 // Local sources resolve through the core's link resolution (buffer-dir for
-                // relative, workspace-root for a leading `/` — docs/markdown-view.md §2.4),
-                // so images and links can't drift. `//host` protocol-relative isn't local
-                // (no scheme, but not a path either) — it falls to the placeholder via the
-                // exists() filter after the root-join defangs it.
+                // relative, workspace-root for a leading `/`), so images and links can't drift.
+                // `//host` protocol-relative isn't local (no scheme, but not a path either) — it
+                // falls to the placeholder via the exists filter after the root-join defangs it.
                 let external = src.contains("://");
                 let resolved = (!external)
                     .then(|| {
@@ -5706,8 +5697,7 @@ impl App {
     }
 }
 
-/// A fetched remote reading-view image (docs/markdown-view.md §2.8), keyed by URL in
-/// [`App::remote_images`].
+/// A fetched remote reading-view image, keyed by URL in [`App::remote_images`].
 enum RemoteImage {
     Loading,
     Raster(iced::widget::image::Handle),
@@ -5860,7 +5850,7 @@ fn alert_style(kind: AlertKind, p: &'static theme::Palette) -> (&'static str, ic
 /// (list rows collapsed to nothing). The strip is always reserved, so focus moves shift
 /// nothing.
 /// Whether `span` falls inside the extended selection's inclusive byte range — block-grain
-/// (whole blocks select, §12), so the span must be *contained*, not merely overlapping. A list
+/// (whole blocks select), so the span must be *contained*, not merely overlapping. A list
 /// item's span contains its nested children's, so overlap would tint every ancestor of the
 /// selected item too; containment tints the item alone, and a parent selected whole still tints
 /// its whole subtree because the children are inside it.
@@ -5880,11 +5870,11 @@ fn read_focus_wrap(
 /// Whether a block inside a list item is a reading stop in its own right — and so hosts its own
 /// bar/tint wrapper instead of leaving both to the item's.
 ///
-/// Mirrors `markdown::walk_blocks`' element rule (docs/markdown-view.md §12.6): every child of a
-/// container is an element, *except* a solo one, which describes the same content as the item
-/// itself; headings are listed at any depth. Spans equal to the item's are excluded whatever the
-/// shape, since a bar keyed on span equality would otherwise paint twice on the one stop. Nested
-/// lists are never stops themselves — their items wrap individually in the List arm.
+/// Mirrors `markdown::walk_blocks`' element rule: every child of a container is an element,
+/// *except* a solo one, which describes the same content as the item itself; headings are listed at
+/// any depth. Spans equal to the item's are excluded whatever the shape, since a bar keyed on span
+/// equality would otherwise paint twice on the one stop. Nested lists are never stops themselves —
+/// their items wrap individually in the List arm.
 fn item_child_is_stop(item: &crate::core::markdown::ListItem, child: &MdBlock) -> bool {
     (item.blocks.len() > 1 || matches!(child, MdBlock::Heading { .. }))
         && child.span() != item.span
@@ -5892,7 +5882,7 @@ fn item_child_is_stop(item: &crate::core::markdown::ListItem, child: &MdBlock) -
 }
 
 /// [`read_focus_wrap`] with the gap between the bar strip and the content spelled out. Blocks
-/// *inside* a container (a quote's paragraphs — reading stops of their own since §12.6) take a
+/// *inside* a container (a quote's paragraphs — reading stops of their own since) take a
 /// tighter one: the container already pads its contents away from its own bar, so the full
 /// top-level gap would inset quoted text twice over.
 fn read_focus_wrap_inset(
@@ -5941,9 +5931,8 @@ enum ReadMsg {
     Scrolled(f32, f32),
 }
 
-/// `target` is the reading view's Enter-target span (docs/markdown-view.md §1.3): the link,
-/// inline image or footnote ref whose span matches renders as an inverted pill on top of the
-/// block bar. Hover popovers pass `None`.
+/// `target` is the reading view's Enter-target span: the link, inline image or footnote ref whose
+/// span matches renders as an inverted pill on top of the block bar. Hover popovers pass `None`.
 #[allow(clippy::too_many_arguments)]
 fn md_spans(
     inlines: &[MdInline],
@@ -6251,13 +6240,12 @@ fn reveal_picker_selection(
 /// `scroll-margin-top`): the sticky file header pins over the list's first visible row, so
 /// a hit revealed flush to the top edge would sit hidden underneath it.
 fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) -> Option<f32> {
-    // The group reveal (docs/picker-groups.md §9): frame the freshly-opened run — minimal
-    // scroll to bring its last row into view, capped so the header never leaves the top (at
-    // the cap the header row renders itself at the very top, so nothing hides under the
-    // sticky pin). Applied only when the run matches the selection: a pre-adoption fire
-    // against the *old* run no-ops, and the re-emit after the reshaped push lands (the core's
-    // `reveal_on_update`) runs against fresh geometry. Collapsible row space carries no gap
-    // pixels, so this is pure row arithmetic.
+    // The group reveal: frame the freshly-opened run — minimal scroll to bring its last row into
+    // view, capped so the header never leaves the top (at the cap the header row renders itself at
+    // the very top, so nothing hides under the sticky pin). Applied only when the run matches the
+    // selection: a pre-adoption fire against the *old* run no-ops, and the re-emit after the
+    // reshaped push lands (the core's `reveal_on_update`) runs against fresh geometry. Collapsible
+    // row space carries no gap pixels, so this is pure row arithmetic.
     if let Reveal::Run = reveal {
         let run = p.expanded_run.filter(|r| r.header_row == p.selected)?;
         let run_top = run.header_row as f32 * ui.row_h();
@@ -6732,8 +6720,8 @@ impl Shell {
     /// target the core resolved. It boots exactly like a fresh launch would (dial, then adopt),
     /// which is why the target maps onto a `Connecting` bootstrap rather than a bespoke path.
     ///
-    /// Never tethered: the tether is the CLI's `$EDITOR` contract (docs/tether.md §1), and a window
-    /// opened from inside the editor is not an errand someone is waiting on.
+    /// Never tethered: the tether is the CLI's `$EDITOR` contract, and a window opened from inside
+    /// the editor is not an errand someone is waiting on.
     fn open_target(&mut self, target: WindowTarget) -> Task<ShellMessage> {
         let (file, jump_to, buffer_id) = match target.open {
             WindowOpen::Path { path, at } => (
@@ -6850,9 +6838,9 @@ impl Shell {
                 },
             ));
         }
-        // The hint engine's clock (docs/hints.md): one slow tick for the process, fanned out by
-        // `Shell::update` to each window that wants it. The engine's own idle gate handles
-        // unattended windows, so this needs no focus tracking; with hints off there are no wakeups.
+        // The hint engine's clock: one slow tick for the process, fanned out by `Shell::update` to
+        // each window that wants it. The engine's own idle gate handles unattended windows, so this
+        // needs no focus tracking; with hints off there are no wakeups.
         if self.windows.values().any(App::wants_hint_ticks) {
             subs.push(
                 iced::time::every(std::time::Duration::from_secs(2))
@@ -6911,9 +6899,9 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
             include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf")
                 .as_slice()
                 .into(),
-            // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body
-            // face (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold+Bold so
-            // heading and strong runs resolve inside the family rather than falling back.
+            // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body face.
+            // Regular/Italic for prose, Semibold+Bold so heading and strong runs resolve inside the
+            // family rather than falling back.
             include_bytes!("../fonts/SourceSerif4-Regular.ttf")
                 .as_slice()
                 .into(),
@@ -7053,7 +7041,7 @@ mod tests {
     use crate::picker::GROUP_GAP;
 
     /// The chrome scale at its default `ui_font_size` — the geometry these tests were written
-    /// against (row height, prompt widths). `Ui::row_h()` is the display-row unit the picker's
+    /// against (row height, prompt widths). `Ui::row_h` is the display-row unit the picker's
     /// virtual scroll and the reveal math both count in.
     fn ui() -> theme::Ui {
         theme::Ui::new(aether_protocol::settings::default_ui_font_size())
@@ -7287,9 +7275,9 @@ mod tests {
 
     /// A grep window: rows [0]=hdr a.rs, [1..=3]=hits, [4]=hdr b.rs, [5..=24]=hits.
     fn grep_state() -> PickerState {
-        // The collapsible shape (docs/picker-groups.md): headers are real `Group` window rows
-        // and the selection space is the row space — a.rs collapsed with 3 hidden hits, b.rs
-        // expanded with its 20 hits inline. Rows: [0]=a.rs hdr, [1]=b.rs hdr, [2..=21]=hits.
+        // The collapsible shape: headers are real `Group` window rows and the selection space is
+        // the row space — a.rs collapsed with 3 hidden hits, b.rs expanded with its 20 hits inline.
+        // Rows: [0]=a.rs hdr, [1]=b.rs hdr, [2.=21]=hits.
         let hit = |line: u32| PickerItem::GrepHit {
             path_index: 0,
             relative_path: "b.rs".into(),
@@ -7429,10 +7417,9 @@ mod tests {
         assert_eq!(reveal_target(&s, scroll, Reveal::Minimal, ui()), Some(0.0));
     }
 
-    /// `Reveal::Run` (docs/picker-groups.md §9) frames the freshly-opened run: the minimal
-    /// scroll that shows the run's last row, capped so the header never leaves the top — a
-    /// run taller than the pane puts the header at the very top; a pre-adoption fire (the
-    /// run doesn't match the selection yet) is a no-op.
+    /// `Reveal::Run` frames the freshly-opened run: the minimal scroll that shows the run's last
+    /// row, capped so the header never leaves the top — a run taller than the pane puts the header
+    /// at the very top; a pre-adoption fire (the run doesn't match the selection yet) is a no-op.
     #[test]
     fn run_reveal_frames_the_expanded_run() {
         let mut s = grep_state();
@@ -7510,7 +7497,7 @@ mod tests {
     }
 
     /// Every overlay field maps to a distinct, stable widget id — the focus task and the
-    /// `text_input`'s own `.id()` must agree, or focus would never land.
+    /// `text_input`'s own `.id` must agree, or focus would never land.
     #[test]
     fn overlay_field_ids_are_distinct() {
         use std::collections::HashSet;

@@ -5,7 +5,6 @@
 //! expects git to do: it runs no hooks (`pre-commit`, `commit-msg`), does no commit signing, and
 //! applies no smudge/clean filters, so an LFS checkout would write pointer files into the working
 //! tree. Credential helpers, `core.autocrlf` and sparse-checkout come free with the real binary.
-//! See `docs/git-phase-2.md` decision 1.
 //!
 //! ## Environment
 //! Hooks are the user's own code and are meant to run in the user's own environment — but the
@@ -233,9 +232,8 @@ fn take_progress_lines(pending: &mut Vec<u8>) -> Vec<String> {
 /// The installed git's version string (`git version 2.43.0`), or `None` when git can't be run.
 ///
 /// `cwd` decides which environment the probe resolves — pass the directory git would actually be
-/// run in, so the answer reflects the `PATH` a real operation would see rather than the daemon's.
-/// A `None` here is a genuine diagnostic: every write operation in `docs/git-phase-2.md` depends
-/// on this binary existing.
+/// run in, so the answer reflects the `PATH` a real operation would see rather than the daemon's. A
+/// `None` here is a genuine diagnostic: every git write depends on this binary existing.
 pub async fn version(cwd: &Path) -> Option<String> {
     let out = run(cwd, &["--version"]).await.ok()?;
     out.success().then(|| out.trimmed_stdout().to_string())

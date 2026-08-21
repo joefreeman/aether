@@ -124,17 +124,17 @@ pub enum KeyContext {
     Normal,
     Insert,
     Search,
-    /// The markdown reading view (docs/markdown-view.md §2.3). Read-only by construction: this
-    /// table contains no editing action, and the `Global` edit chords are not consulted in Read
-    /// mode — the read-only invariant is the table itself.
+    /// The markdown reading view. Read-only by construction: this table contains no editing action,
+    /// and the `Global` edit chords are not consulted in Read mode — the read-only invariant is the
+    /// table itself.
     Read,
     Leader,
     /// The `Space g` sub-leader: git verbs and the repo-wide git pickers. A second table rather
     /// than `Alt`-variants on the leader because git is the one area with more operations than a
-    /// single key row can hold (docs/git-phase-2.md). Cursor-local git *navigation* deliberately
-    /// stays out of it — `c`/`Alt-c` (next/prev hunk) in Normal, `Space c`/`Space Alt-c` (the
-    /// changes pickers, mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor,
-    /// the third reveal next to `Tab` and `Space n`).
+    /// single key row can hold. Cursor-local git *navigation* deliberately stays out of it —
+    /// `c`/`Alt-c` (next/prev hunk) in Normal, `Space c`/`Space Alt-c` (the changes pickers,
+    /// mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor, the third reveal next
+    /// to `Tab` and `Space n`).
     LeaderGit,
     Global,
 }
@@ -213,12 +213,12 @@ impl ViewportPlace {
         }
     }
 
-    /// Reading-view placement gap (docs/markdown-view.md §2.3): the space between the view's
-    /// edge and the focused *block's* matching edge — `Upper` leaves this above the block's
-    /// top, `Lower` leaves it below the block's bottom. Edge-matched (unlike the editor's
-    /// top-anchored line placement) so a tall block placed "near the bottom" actually ends
-    /// there instead of hanging mostly off-screen. The gap is the editor's rest fraction, so
-    /// `;` feels identical in both views (a cursor line is its own top *and* bottom edge).
+    /// Reading-view placement gap: the space between the view's edge and the focused *block's*
+    /// matching edge — `Upper` leaves this above the block's top, `Lower` leaves it below the
+    /// block's bottom. Edge-matched (unlike the editor's top-anchored line placement) so a tall
+    /// block placed "near the bottom" actually ends there instead of hanging mostly off-screen. The
+    /// gap is the editor's rest fraction, so `;` feels identical in both views (a cursor line is
+    /// its own top *and* bottom edge).
     pub const READ_GAP: f32 = CURSOR_REST_FRACTION;
 }
 
@@ -365,13 +365,13 @@ pub enum Action {
     SearchToggleWord,
     /// `Alt-e` in the search prompt: toggle literal (fixed-string) vs. regex matching.
     SearchToggleRegex,
-    /// `]` / `[` — step through the jumplist from the cursor, cross-file, stopping
-    /// at the ends (docs/jumplist.md). Populated by `Ctrl-j` in a picker.
+    /// `]` / `[` — step through the jumplist from the cursor, cross-file, stopping at the ends.
+    /// Populated by `Ctrl-j` in a picker.
     JumplistStep(Direction),
-    /// `}` / `{` — like [`Action::JumplistStep`] but restricted to entries in the current
-    /// buffer's file, so you walk one file's hits without jumping away (docs/jumplist.md). Uses
-    /// Shift-bracket, not Alt-bracket, because Alt-bracket collides with terminal escape
-    /// introducers (`ESC [` / `ESC ]`) — see the binding site.
+    /// `}` / `{` — like [`Action::JumplistStep`] but restricted to entries in the current buffer's
+    /// file, so you walk one file's hits without jumping away. Uses Shift-bracket, not Alt-bracket,
+    /// because Alt-bracket collides with terminal escape introducers (`ESC [` / `ESC ]`) — see the
+    /// binding site.
     JumplistStepInFile(Direction),
     /// `Esc` in Normal — drop the active search (clear highlights).
     DropSearch,
@@ -385,9 +385,9 @@ pub enum Action {
     /// doesn't quit. Sequences `Save` then `Quit`.
     SaveAndQuit,
     /// `Space Alt-x` — save the current buffer, then close it if the save succeeds (the close
-    /// analogue of [`Action::SaveAndQuit`], with the same confirm-deferral). On the tethered
-    /// buffer (docs/tether.md) the close also exits the client — the one-chord finish for an
-    /// `ae file` quick edit (write the commit message, `Space Alt-x`, done).
+    /// analogue of [`Action::SaveAndQuit`], with the same confirm-deferral). On the tethered buffer
+    /// the close also exits the client — the one-chord finish for an `ae file` quick edit (write
+    /// the commit message, `Space Alt-x`, done).
     SaveAndClose,
     /// `Space Alt-w` — open a file by typing its absolute path (a leading `~/` is fine),
     /// regardless of the active workspace. Outside any workspace root the file opens as an external
@@ -397,8 +397,8 @@ pub enum Action {
     Reload,
     /// Toggle the active buffer's transient ("keep") state — pin a preview permanent, or release a
     /// permanent buffer back to transient. Refused for unsaved buffers (auto-close would discard).
-    /// On the tethered buffer (docs/tether.md), un-keeping additionally *releases* the tether —
-    /// the client stops exiting when the buffer closes; one-way, a re-keep is just a plain keep.
+    /// On the tethered buffer, un-keeping additionally *releases* the tether — the client stops
+    /// exiting when the buffer closes; one-way, a re-keep is just a plain keep.
     ToggleKeep,
     /// Copy the active buffer's workspace-relative path to the system clipboard.
     CopyRelativePath,
@@ -406,13 +406,13 @@ pub enum Action {
     CopyAbsolutePath,
     NewScratch,
     CloseBuffer,
-    /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached
-    /// `ae --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
-    /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it "duplicates"
-    /// the current view; the two windows are independent thereafter (own cursor/selection/viewport,
-    /// shared buffers server-side). The TUI has no window to spawn, so it ignores the
-    /// [`ShellAction::NewWindow`] it emits. The spawn names the workspace explicitly (`--workspace`),
-    /// so the sibling never tethers to the file it lands on (docs/tether.md).
+    /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached `ae
+    /// --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
+    /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it
+    /// "duplicates" the current view; the two windows are independent thereafter (own
+    /// cursor/selection/viewport, shared buffers server-side). The TUI has no window to spawn, so
+    /// it ignores the [`ShellAction::NewWindow`] it emits. The spawn names the workspace explicitly
+    /// (`--workspace`), so the sibling never tethers to the file it lands on.
     NewWindow,
     /// `Space Alt-z` — the share-link sibling of `Space z`: copy the web client's URL for the
     /// current buffer to the clipboard (`?workspace=&root=&file=` with the cursor as its `#L:C`
@@ -531,13 +531,13 @@ pub enum Action {
 
     // ---- shell-local overlays (dispatched via `Effect::ShellAction`; a shell without the
     // overlay ignores them) ----
-    /// `Space .` — the keyboard-shortcut reference (the Keybindings picker), generated from these
+    /// `Space.` — the keyboard-shortcut reference (the Keybindings picker), generated from these
     /// tables. On `.` rather than `/` because `Space /` is grep, mirroring Normal mode's `/`.
     OpenHelp,
     /// `Space Alt-,` — the workspace-settings overlay (roots + rename). TUI-only today. The Alt
-    /// sibling of the app-wide settings on `Space ,`: same overlay family, narrower scope.
+    /// sibling of the app-wide settings on `Space,`: same overlay family, narrower scope.
     OpenWorkspaceSettings,
-    /// `Space ,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
+    /// `Space,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
     /// `Space ?` — the application-info dialog: build identity, the daemon we're connected to, and
@@ -545,7 +545,7 @@ pub enum Action {
     /// strong enough "what is this thing?" mnemonic to stand on its own.
     ShowAppInfo,
 
-    // ---- hints (docs/hints.md) ----
+    // ---- hints ----
     /// `Space h` — dismiss the corner hint: down-weight it (a deliberate "not now") and show
     /// another. No-op when the corner is empty.
     DismissHint,
@@ -553,7 +553,7 @@ pub enum Action {
     /// persisted app-wide.
     ToggleHints,
 
-    // ---- markdown reading view (docs/markdown-view.md) ----
+    // ---- markdown reading view ----
     /// `Space v` — toggle the markdown reading view on the current buffer (markdown only;
     /// remembered per buffer for the session).
     ToggleReadView,
@@ -582,12 +582,12 @@ pub enum Action {
     /// `Ctrl-c` — copy: an extended selection's source, else the focused element (a link's
     /// URL, otherwise its markdown source).
     ReadCopy,
-    /// `x`/`Alt-x` — the editor's line-select at block grain (docs/markdown-view.md §12):
-    /// plain presses walk block to block (whole-line normal form), Shift grows the selection.
+    /// `x`/`Alt-x` — the editor's line-select at block grain: plain presses walk block to block
+    /// (whole-line normal form), Shift grows the selection.
     ReadSelectBlock(Direction),
-    /// `i`/`a` — to the editor, inserting at the selection's start / end: an extended
-    /// selection uses the editor's own Insert-entry motions; a bare reading position enters
-    /// at the focused block's start / append position (docs/markdown-view.md §12).
+    /// `i`/`a` — to the editor, inserting at the selection's start / end: an extended selection
+    /// uses the editor's own Insert-entry motions; a bare reading position enters at the focused
+    /// block's start / append position.
     ReadInsert {
         at_end: bool,
     },
@@ -601,9 +601,8 @@ pub enum Action {
         above: bool,
     },
     /// Move the selection past a sibling: `Ctrl-j`/`k` in Read (block grain, with `Ctrl-Alt`
-    /// aliases so editor muscle memory lands too), `Ctrl-Alt-j`/`k` in the editor
-    /// (blank-line paragraphs, any file type). One atomic server edit
-    /// (docs/markdown-view.md §12).
+    /// aliases so editor muscle memory lands too), `Ctrl-Alt-j`/`k` in the editor (blank-line
+    /// paragraphs, any file type). One atomic server edit.
     MoveBlock {
         down: bool,
         unit: BlockUnit,
@@ -1053,7 +1052,7 @@ static GLOBAL: &[Binding] = &[
     bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
     bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
     // The paragraph-grain sibling of Ctrl-j/k: swap the blank-line-delimited chunk under the
-    // selection with its neighbour, gap and all — any file type (docs/markdown-view.md §12).
+    // selection with its neighbour, gap and all — any file type.
     bind!(G, ch('j'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: true, unit: BlockUnit::Paragraph }, "Edit", "Move paragraph down"),
     bind!(G, ch('k'), Exact(Mods::CTRL_ALT), A::MoveBlock { down: false, unit: BlockUnit::Paragraph }, "Edit", "Move paragraph up"),
     // Join/un-join are exact mirrors on `g`: join deletes "\n"+indent parking the cursor on the
@@ -1108,10 +1107,10 @@ static INSERT: &[Binding] = &[
 static SEARCH: &[Binding] = &[
     bind!(KeyContext::Search, KeyCode::Esc, Any, A::SearchAbort, "Search", "Abort search"),
     bind!(KeyContext::Search, KeyCode::Enter, Any, A::SearchCommit, "Search", "Commit search"),
-    // Up/Down browse the query history (docs/input-history.md) — the same chord in every overlay
-    // text input (the grep query, the glob/path chip editors). They're safe here and there because
-    // no shell's text input claims a bare arrow-up, and because the *list* keys in the pickers are
-    // Alt-k/j. Alt-k/j stay as an unlisted alias for the muscle memory that predates this.
+    // Up/Down browse the query history — the same chord in every overlay text input (the grep
+    // query, the glob/path chip editors). They're safe here and there because no shell's text input
+    // claims a bare arrow-up, and because the *list* keys in the pickers are Alt-k/j. Alt-k/j stay
+    // as an unlisted alias for the muscle memory that predates this.
     bind!(KeyContext::Search, KeyCode::Up, Exact(Mods::NONE), A::SearchHistoryPrev, "Search", "Previous query in history"),
     bind!(KeyContext::Search, KeyCode::Down, Exact(Mods::NONE), A::SearchHistoryNext, "Search", "Next query in history"),
     bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "", ""),
@@ -1124,12 +1123,11 @@ static SEARCH: &[Binding] = &[
     // syncs the value via `search_set_query`; only the command keys above live in this table.
 ];
 
-/// The markdown reading view's keys (docs/markdown-view.md §2.3). Where the editor already has a
-/// key for the concept, Read reuses it — `o` heading-steps like symbol nav, `g`/`Alt-g` are the
-/// ends pair, `j`/`k` move the (reading) cursor while the arrows scroll, `Ctrl-c` copies (the
-/// editor's clipboard chord — acting on the focused element, since Read has no selection), search
-/// and jumplist keys are verbatim. Deliberately contains no editing action (see
-/// [`KeyContext::Read`]).
+/// The markdown reading view's keys. Where the editor already has a key for the concept, Read
+/// reuses it — `o` heading-steps like symbol nav, `g`/`Alt-g` are the ends pair, `j`/`k` move the
+/// (reading) cursor while the arrows scroll, `Ctrl-c` copies (the editor's clipboard chord — acting
+/// on the focused element, since Read has no selection), search and jumplist keys are verbatim.
+/// Deliberately contains no editing action (see [`KeyContext::Read`]).
 #[rustfmt::skip]
 static READ: &[Binding] = &[
     bind!(R, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
@@ -1137,7 +1135,7 @@ static READ: &[Binding] = &[
     // ---- the reading cursor ----
     bind!(R, ch('j'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Forward), "Read", "Focus next element"),
     bind!(R, ch('k'), IgnoreShift(Mods::NONE), A::ReadStep(Direction::Backward), "Read", "Focus previous element"),
-    // Unlisted muscle-memory aliases (the Ctrl-Alt-j/k pattern, §12.1.7): the editor's other
+    // Unlisted muscle-memory aliases (the Ctrl-Alt-j/k pattern): the editor's other
     // line-step motions — `p`/`Alt-p`'s first-non-blank step, `Alt-j`/`k`'s visual-row step —
     // all collapse into the element step at block grain, so the keys land where the hand
     // expects. IgnoreShift keeps Shift as the extend modifier, exactly as on `j`/`k`.
@@ -1156,9 +1154,8 @@ static READ: &[Binding] = &[
     bind!(R, KeyCode::Enter, Exact(Mods::CTRL), A::ReadActivateNewWindow, "Read", "Open link in a new window/tab"),
     bind!(R, ch('c'), Exact(Mods::CTRL), A::ReadCopy, "Read", "Copy selection, link URL, or element source"),
 
-    // ---- block selection (docs/markdown-view.md §12; the editor's `x` line-select machine
-    // at block grain: plain presses walk, Shift grows — and Shift-j/k extend through
-    // read_step) ----
+    // ---- block selection (the editor's `x` line-select machine at block grain: plain presses
+    // walk, Shift grows — and Shift-j/k extend through read_step) ----
     bind!(R, ch('x'), IgnoreShift(Mods::NONE), A::ReadSelectBlock(Direction::Forward), "Read", "Select block downward (Shift extends)"),
     bind!(R, ch('x'), IgnoreShift(Mods::ALT), A::ReadSelectBlock(Direction::Backward), "Read", "Select block upward (Shift extends)"),
     // The editor's own reverse/orient pair, unchanged: swapping the ends moves the bar to the
@@ -1176,7 +1173,7 @@ static READ: &[Binding] = &[
     bind!(R, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Read", "Collapse selection to the cursor's block"),
 
     // ---- undo/redo (the Global table's chords, whitelisted here — Read still skips Global,
-    // whose other chords are edits; §12's curated-edit discipline) ----
+    // whose other chords are edits; the curated-edit discipline) ----
     bind!(R, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
     bind!(R, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
     // The editor's adjust-the-value pair, re-declared because Read skips Global. Same action, so
@@ -1184,7 +1181,7 @@ static READ: &[Binding] = &[
     bind!(R, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Check task item"),
     bind!(R, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Uncheck task item"),
 
-    // ---- to the editor (§12 transitions; deliberately NOT recording a read-vs-source
+    // ---- to the editor (transitions; deliberately NOT recording a read-vs-source
     // preference — Space v remains the "I prefer source" signal) ----
     bind!(R, ch('i'), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
     bind!(R, ch('a'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
@@ -1192,7 +1189,7 @@ static READ: &[Binding] = &[
     bind!(R, ch('o'), Exact(Mods::CTRL), A::ReadOpenBlock { above: false }, "Edit", "Edit: open block below (list item in a list)"),
     bind!(R, ch('o'), Exact(Mods::CTRL_ALT), A::ReadOpenBlock { above: true }, "Edit", "Edit: open block above (list item in a list)"),
 
-    // ---- structural edits (§12 phase 3: selection-relative server ops, atomic, one undo
+    // ---- structural edits (phase 3: selection-relative server ops, atomic, one undo
     // entry each; the grain-relative reading of the editor's chords — Ctrl-j/k move the
     // block the way they move a line, Ctrl-h/l change depth the way they change indent) ----
     bind!(R, ch('j'), Exact(Mods::CTRL), A::MoveBlock { down: true, unit: BlockUnit::Block }, "Edit", "Move block(s) down"),
@@ -1211,7 +1208,7 @@ static READ: &[Binding] = &[
 
     // ---- coarse reading-position jumps + view placement (the editor's own keys) ----
     // `v` rides the editor's visual-line page motion: the jump distance is measured in the
-    // *editor's* wrap geometry (best-effort in read space — §2.7's contract), but the landing
+    // *editor's* wrap geometry (best-effort in read space), but the landing
     // is always framed by the focus reveal.
     bind!(R, ch('v'), IgnoreShift(Mods::NONE), A::PageMotion { dir: VerticalDirection::Down, half: true }, "Motion", "Reading position down half a page"),
     bind!(R, ch('v'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Reading position up half a page"),
@@ -2025,9 +2022,9 @@ mod tests {
 
     #[test]
     fn read_aliases_cover_editor_muscle_memory() {
-        // `p`/`Alt-p` and `Alt-j`/`Alt-k` alias the element step: the editor's line-step
-        // variants collapse into one motion at block grain (docs/markdown-view.md §2.3).
-        // IgnoreShift keeps Shift as the extend modifier, as on `j`/`k`.
+        // `p`/`Alt-p` and `Alt-j`/`Alt-k` alias the element step: the editor's line-step variants
+        // collapse into one motion at block grain. IgnoreShift keeps Shift as the extend modifier,
+        // as on `j`/`k`.
         let shifted = |base: Mods| Mods {
             shift: true,
             ..base

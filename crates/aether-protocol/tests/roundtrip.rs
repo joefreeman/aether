@@ -2356,7 +2356,7 @@ fn workspace_activate_result_includes_last_buffer_id_when_set() {
 
 #[test]
 fn buffer_open_scratch_form() {
-    // Both path_index and relative_path null => scratch buffer per §6.1.
+    // Both path_index and relative_path null => scratch buffer.
     let v = to_value(BufferOpenParams {
         transient: None,
         buffer_id: None,
@@ -3430,8 +3430,8 @@ fn group_spans_are_tagged_and_skipped_when_empty() {
     assert!(back.groups.is_empty());
 }
 
-/// The collapsible-group additions (docs/picker-groups.md): the `Group` header row item, the
-/// span's count/expanded decoration, and the `picker/set_group` wire shapes.
+/// The collapsible-group additions: the `Group` header row item, the span's count/expanded
+/// decoration, and the `picker/set_group` wire shapes.
 #[test]
 fn collapsible_group_wire_shapes() {
     use aether_protocol::picker::{
@@ -3493,9 +3493,9 @@ fn collapsible_group_wire_shapes() {
     let v = to_value(&span).unwrap();
     assert!(v.get("count").is_none() && v.get("expanded").is_none());
 
-    // `picker/set_group`: the group to select rides as a header OR a step (two-level
-    // navigation, docs/picker-groups.md §9) — the absent half is skipped on the wire; the
-    // selected header's new row (or nothing) comes back.
+    // `picker/set_group`: the group to select rides as a header OR a step (two-level navigation) —
+    // the absent half is skipped on the wire; the selected header's new row (or nothing) comes
+    // back.
     let p = PickerSetGroupParams {
         kind: PickerKind::Grep,
         header: Some(GroupHeader::File {
@@ -4895,8 +4895,8 @@ fn jumplist_wire_shapes() {
             "total": 17,
         })
     );
-    // A whole-target step (a captured file or buffer, docs/jumplist.md): no position on the wire,
-    // and a pathless one identifies by `buffer_id` instead — exactly one of the two is present.
+    // A whole-target step (a captured file or buffer): no position on the wire, and a pathless one
+    // identifies by `buffer_id` instead — exactly one of the two is present.
     let whole_file = JumplistStepTarget {
         path: Some("/proj/src/main.rs".into()),
         buffer_id: None,

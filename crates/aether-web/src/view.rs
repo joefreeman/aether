@@ -1,7 +1,7 @@
-//! The render `View` (docs/web-core.md): a JSON projection of [`Session`] for the TS shell to
-//! paint, built the way `aether-tui/src/shell.rs::sync()`/`editor_view()` build the TUI's
-//! `AppState`. Pure core state — no pixels. The shell layers its own geometry (scroll position,
-//! cell metrics) on top when it renders.
+//! The render `View`: a JSON projection of [`Session`] for the TS shell to paint, built the way
+//! `aether-tui/src/shell.rs::sync`/`editor_view` build the TUI's `AppState`. Pure core state — no
+//! pixels. The shell layers its own geometry (scroll position, cell metrics) on top when it
+//! renders.
 //!
 //! Embedded protocol types (`Window`, `CursorState`, `LspServerStatus`, …) are wire types that
 //! already derive `Serialize`, so they serialise straight in; only the core's own enums (`Mode`,
@@ -79,12 +79,12 @@ pub fn build_view(s: &Session) -> Value {
     })
 }
 
-/// The markdown reading view (docs/markdown-view.md), when active. The shell renders `blocks`
-/// (the shared markdown AST, same shape hover uses) and marks the node whose source span equals
-/// `focus_span` with the position bar and the `target_span` node with the target pill — both
-/// derived core-side from the one server cursor, so the shell carries no focus state of its
-/// own. `focus_span` is block-grain (always present for a non-empty document); `target_span`
-/// is the interactive span the cursor sits inside, absent otherwise.
+/// The markdown reading view, when active. The shell renders `blocks` (the shared markdown AST,
+/// same shape hover uses) and marks the node whose source span equals `focus_span` with the
+/// position bar and the `target_span` node with the target pill — both derived core-side from the
+/// one server cursor, so the shell carries no focus state of its own. `focus_span` is block-grain
+/// (always present for a non-empty document); `target_span` is the interactive span the cursor sits
+/// inside, absent otherwise.
 fn read_view(s: &Session) -> Value {
     let Some(read) = &s.read else {
         return Value::Null;
@@ -94,8 +94,7 @@ fn read_view(s: &Session) -> Value {
     let block = read
         .display_block_focus(&cursor)
         .map(|i| read.elements[i].span());
-    // Suppressed while the selection is extended (docs/markdown-view.md §12) — the
-    // selection tint replaces the pill on screen.
+    // Suppressed while the selection is extended — the selection tint replaces the pill on screen.
     let target = read
         .display_target(&cursor)
         .map(|i| read.elements[i].span());
@@ -162,9 +161,9 @@ fn app_settings(s: &Session) -> Value {
 /// (`on_workspace_settings_key`); the shell renders this projection and routes keys through the
 /// global keydown → `on_key`.
 ///
-/// Selection model: 0 = name field, then the roots, the add-root input, the projects
-/// (`docs/projects.md`), and the add-project input. The two input indices ride along so the shell
-/// can tell which row is focused without re-deriving the arithmetic.
+/// Selection model: 0 = name field, then the roots, the add-root input, the projects, and the
+/// add-project input. The two input indices ride along so the shell can tell which row is focused
+/// without re-deriving the arithmetic.
 fn workspace_settings(s: &Session) -> Value {
     let Some(ps) = &s.workspace_settings else {
         return Value::Null;
@@ -221,10 +220,9 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // the shell renders one header row per span instead of re-deriving boundaries
                 // from item fields.
                 "groups": p.groups.iter().map(jv).collect::<Vec<_>>(),
-                // Whether this view is a collapsible accordion (docs/picker-groups.md §9). A
-                // property of the view, not the kind — a Jumplist captured from the Files or
-                // Buffers picker renders flat (docs/jumplist.md) — so the shell reads this
-                // rather than keeping its own list of collapsible kinds.
+                // Whether this view is a collapsible accordion. A property of the view, not the
+                // kind — a Jumplist captured from the Files or Buffers picker renders flat — so the
+                // shell reads this rather than keeping its own list of collapsible kinds.
                 "collapsible": p.collapsible,
                 "total_matches": p.total_matches,
                 "total_candidates": p.total_candidates,
@@ -239,8 +237,8 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // Display-row index of the loaded window's first rendered row (a grep header sits one
                 // row above the first hit) — where the shell positions the window within the spacer.
                 "window_base": p.window_base(),
-                // Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute rows,
-                // for the `Reveal::Run` scroll math. `null` for the other kinds / empty results.
+                // Collapsible kinds: the expanded run's absolute rows, for the `Reveal::Run` scroll
+                // math. `null` for the other kinds / empty results.
                 "expanded_run": p.expanded_run.map(|r| json!({
                     "header_row": r.header_row,
                     "len": r.len,
@@ -310,7 +308,7 @@ fn save_as(ed: &PathEditor, workspace_paths: &[String]) -> Value {
 /// through the matching `*_set_input` / `*_set_root_filter` pair.
 ///
 /// Shared by the save-as prompt and the settings overlay's add-project row, which use the same
-/// editor (`docs/projects.md`).
+/// editor.
 fn path_editor(ed: &PathEditor, workspace_paths: &[String]) -> Value {
     let labels = aether_client::labels::root_labels(workspace_paths);
     let multi_root = workspace_paths.len() > 1;
@@ -335,7 +333,7 @@ fn path_editor(ed: &PathEditor, workspace_paths: &[String]) -> Value {
 }
 
 /// The modal prompt overlay, when one is open (confirm / save-as / LSP info). Keys flow through the
-/// core's `on_prompt_key` (the shell only renders this); see docs/web-core.md.
+/// core's `on_prompt_key` (the shell only renders this);
 fn prompt(
     p: &Option<Prompt>,
     workspace_paths: &[String],

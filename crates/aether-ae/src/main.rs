@@ -15,10 +15,10 @@
 //! directory. `-w/--workspace` overrides inference, and `ae edit ...` is the explicit form for when a
 //! PATH would otherwise collide with the `server` subcommand name.
 //!
-//! A PATH *without* `-w` also tethers the client to the opened buffer (docs/tether.md): closing
-//! that buffer — `Space x`, or `Space Alt-x` to save-and-close — exits the client, giving
-//! `ae file` the `$EDITOR` contract (e.g. a git commit message: edit, `Space Alt-x`, done, and
-//! the buffer doesn't linger in the workspace's session).
+//! A PATH *without* `-w` also tethers the client to the opened buffer: closing that buffer — `Space
+//! x`, or `Space Alt-x` to save-and-close — exits the client, giving `ae file` the `$EDITOR`
+//! contract (e.g. a git commit message: edit, `Space Alt-x`, done, and the buffer doesn't linger in
+//! the workspace's session).
 //!
 //! Server lifetime: `edit` auto-starts a server if none is listening (see [`ensure_server_running`])
 //! — a detached, idle-reapable daemon that outlives the client and shuts itself down once no client
@@ -187,10 +187,10 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
         None => None,
     };
     let workspace = resolve_workspace(&edit)?;
-    // The quick-edit invocation — a file positional without an explicit `--workspace` — tethers
-    // the client to the opened buffer (docs/tether.md): closing that buffer exits the client,
-    // giving `ae file` the `$EDITOR` contract. Naming the workspace (a deliberate session, and
-    // what window-spawns always do) opts out; the shells skip directories and `--buffer` opens.
+    // The quick-edit invocation — a file positional without an explicit `--workspace` — tethers the
+    // client to the opened buffer: closing that buffer exits the client, giving `ae file` the
+    // `$EDITOR` contract. Naming the workspace (a deliberate session, and what window-spawns always
+    // do) opts out; the shells skip directories and `--buffer` opens.
     let tether = edit.path.is_some() && edit.workspace.is_none();
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
@@ -231,10 +231,10 @@ fn should_detach_gui(edit: &EditArgs) -> bool {
         && std::io::stdout().is_terminal()
 }
 
-/// The CLI shape that tethers (docs/tether.md §1): a file positional without an explicit
-/// `--workspace`. Directory args are sessions, not errands — the shells never tether them, so
-/// they detach like any other session launch. (A missing path is a file to create and tethers;
-/// a `PATH:LINE` jump suffix doesn't exist on disk either and lands in the same arm.)
+/// The CLI shape that tethers: a file positional without an explicit `--workspace`. Directory args
+/// are sessions, not errands — the shells never tether them, so they detach like any other session
+/// launch. (A missing path is a file to create and tethers; a `PATH:LINE` jump suffix doesn't exist
+/// on disk either and lands in the same arm.)
 fn quick_edit_shape(edit: &EditArgs) -> bool {
     match (&edit.path, &edit.workspace) {
         (Some(path), None) => !std::path::Path::new(path).is_dir(),

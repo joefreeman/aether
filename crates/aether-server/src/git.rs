@@ -495,9 +495,9 @@ pub fn discover_repo(path: &Path) -> Option<RepoIdentity> {
 
 /// One local branch, as the branch picker's rows need it.
 ///
-/// Read-only and libgit2-side (`docs/git-phase-2.md` decision 1: reads stay in-process, writes
-/// shell out). Everything here is cheap — a ref walk plus one commit lookup each — so the list is
-/// rebuilt per `picker/view` rather than cached.
+/// Read-only and libgit2-side (reads stay in-process, writes shell out). Everything here is cheap —
+/// a ref walk plus one commit lookup each — so the list is rebuilt per `picker/view` rather than
+/// cached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchRow {
     /// Shorthand name (`main`), not the full `refs/heads/main`.
@@ -761,8 +761,8 @@ pub fn branch_checked_out_elsewhere(workdir: &Path, branch: &str) -> Option<Stri
 /// Whether `branch` is fully merged into HEAD — the check `git branch -d` makes before refusing.
 ///
 /// Done here, from libgit2, rather than by reading git's refusal: the client escalates to a
-/// force-delete confirm on this specific outcome, and `docs/git-phase-2.md` decision 1 rules out
-/// parsing stderr into structured variants. `true` when the answer can't be determined (an unborn
+/// force-delete confirm on this specific outcome, and the house rule rules out parsing stderr
+/// into structured variants. `true` when the answer can't be determined (an unborn
 /// HEAD, an unpeelable tip) so the caller falls through to git, which is authoritative anyway.
 pub fn branch_is_merged(workdir: &Path, branch: &str) -> bool {
     let Ok(repo) = git2::Repository::open(workdir) else {
@@ -2344,7 +2344,7 @@ pub fn has_staged_changes(repo_path: &Path) -> bool {
 /// changed files are diffable. Files with no net change are dropped. Best-effort: empty on any
 /// libgit2 error.
 ///
-/// **Repo-scoped, not root-scoped** (docs/git-phase-2.md decision 2). This used to take a workspace
+/// **Repo-scoped, not root-scoped**. This used to take a workspace
 /// root and drop every change outside that root's subtree, which silently hid a repo's changes
 /// whenever a root was a subdirectory of it — the one place the root/repo ambiguity still lived.
 /// `repo_path` is normally the workdir itself; discovery still runs, so a subdirectory resolves to

@@ -59,8 +59,8 @@ impl LspServerKey {
     /// This is the only way keys should be built outside tests. `typescript`, `javascript` and
     /// `tsx` are one server invocation, so a key built from the raw language would miss the handle
     /// its siblings share — opening `a.ts` and `b.js` in one root would spawn two identical
-    /// `typescript-language-server` processes, and a pinned project server (`docs/projects.md`)
-    /// would go unused by half the buffers it exists to serve.
+    /// `typescript-language-server` processes, and a pinned project server would go unused by half
+    /// the buffers it exists to serve.
     pub fn new(root: PathBuf, language: &str) -> Self {
         LspServerKey {
             root,
@@ -96,7 +96,7 @@ pub struct LspHandle {
     /// Whether the server advertises whole-document formatting (set from the handshake).
     pub document_formatting: bool,
     /// Whether the server advertises `workspace/symbol` (set from the handshake). Gates it out of
-    /// the workspace-symbols fan-out (`docs/workspace-symbols.md`).
+    /// the workspace-symbols fan-out.
     pub workspace_symbol: bool,
     /// The **documents** we've sent `didOpen` for and not yet `didClose`, each with the buffers
     /// currently holding it open.
@@ -114,11 +114,11 @@ pub struct LspHandle {
     /// The buffer set is what makes the close correct: the URI stays open while *any* holder
     /// remains.
     pub open_documents: HashMap<DocumentId, HashSet<BufferId>>,
-    /// The workspaces keeping this server alive by a declared project rather than by an open buffer
-    /// (`docs/projects.md`). A pinned server survives losing its last buffer — indeed it usually
-    /// never has one — because its job is to have the workspace indexed *before* anything is
-    /// opened. A set rather than a flag because two contexts can pin the same root, and one of them
-    /// going away must not release the other's hold.
+    /// The workspaces keeping this server alive by a declared project rather than by an open
+    /// buffer. A pinned server survives losing its last buffer — indeed it usually never has one —
+    /// because its job is to have the workspace indexed *before* anything is opened. A set rather
+    /// than a flag because two contexts can pin the same root, and one of them going away must not
+    /// release the other's hold.
     pub pinned_by: HashSet<String>,
     /// Every buffer attached to this server — registered by [`LspManager::register_doc`] on
     /// `buffer/open` and dropped by [`LspManager::notify_close`]. Buffers that arrive before the
@@ -195,9 +195,8 @@ impl LspManager {
         }
     }
 
-    /// Every server that may answer a workspace-symbol query for `workspace_id`
-    /// (`docs/workspace-symbols.md`): pinned by a declared project, handshaken, and advertising
-    /// `workspace/symbol`.
+    /// Every server that may answer a workspace-symbol query for `workspace_id`: pinned by a
+    /// declared project, handshaken, and advertising `workspace/symbol`.
     ///
     /// The scoping rule lives here, in one place. Deliberately *not* "every ready server": a
     /// lazily-launched one is reaped when its last buffer closes, so including it would make the
@@ -664,8 +663,7 @@ async fn bring_up(
     send_all(pushes).await;
 
     // A pinned server arriving late must not leave an already-typed workspace-symbols query
-    // permanently missing its results (`docs/workspace-symbols.md` § Re-query when a server becomes
-    // ready).
+    // permanently missing its results — hence the re-query once it is ready.
     crate::symbols::requery_ready_server(state, &key).await;
 
     inbound_loop(state.clone(), key, generation, inbound).await;

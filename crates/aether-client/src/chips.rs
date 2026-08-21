@@ -1,5 +1,5 @@
-//! Picker filter chips (docs/picker-filters.md): the ordered chip list that *is* the client's
-//! filter state, plus the valued-chip editor (glob / dir) revealed below the picker input.
+//! Picker filter chips: the ordered chip list that *is* the client's filter state, plus the
+//! valued-chip editor (glob / dir) revealed below the picker input.
 //!
 //! Ported from the terminal client's `picker.rs` chip machinery — same semantics, free of
 //! ratatui/crossterm types so `picker.rs` (rendering) and `app.rs` (keys/RPC) stay thin. The
@@ -135,11 +135,11 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
         // and the git/visibility chips describe live workspace state, which a positional
         // snapshot doesn't have.
         PickerKind::Jumplist => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
-        // Path scoping over where symbols live (docs/workspace-symbols.md): the Dir chip also
-        // prunes which projects' servers are asked, server-side. Pattern chips don't apply —
-        // the *LSP server* ran the match, so case/word/regex here would quietly mean something
-        // different from what they mean in Grep. Ignored/hidden are meaningless (servers don't
-        // report gitignored files); changed/untracked deferred.
+        // Path scoping over where symbols live: the Dir chip also prunes which projects' servers
+        // are asked, server-side. Pattern chips don't apply — the *LSP server* ran the match, so
+        // case/word/regex here would quietly mean something different from what they mean in Grep.
+        // Ignored/hidden are meaningless (servers don't report gitignored files); changed/untracked
+        // deferred.
         PickerKind::WorkspaceSymbols => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
         _ => false,
     }
@@ -799,11 +799,11 @@ impl ChipEditor {
         }
     }
 
-    /// The dir scope a commit would adopt *right now*, or `None` when the editor wouldn't commit
-    /// a scope: an invalid root or path, or an empty path in a single-root workspace (which means
-    /// "no narrowing"). This is the single source of truth shared by the commit path
-    /// ([`crate::session::Session::commit_chip_editor`]) and the live preview, so what the
-    /// results show while you type is exactly what `Enter` would pin (docs/picker-filters.md).
+    /// The dir scope a commit would adopt *right now*, or `None` when the editor wouldn't commit a
+    /// scope: an invalid root or path, or an empty path in a single-root workspace (which means "no
+    /// narrowing"). This is the single source of truth shared by the commit path
+    /// ([`crate::session::Session::commit_chip_editor`]) and the live preview, so what the results
+    /// show while you type is exactly what `Enter` would pin.
     pub fn preview_scope(&self, workspace_paths: &[String]) -> Option<ScopedPath> {
         if !self.is_dir() || !self.path_valid() {
             return None;

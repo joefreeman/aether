@@ -2,9 +2,9 @@
 //! search, picker query, workspace-settings, chip editor). The struct owns the buffer and the
 //! byte-offset cursor; methods keep them in sync and on UTF-8 char boundaries.
 //!
-//! Text editing for overlays lives client-side (docs/client-core.md): the core owns values and
-//! command keys, the shell owns text entry. `crate::overlay_input` drives this type from key
-//! events and syncs the whole value into the core; the renderer reads its caret column.
+//! Text editing for overlays lives client-side: the core owns values and command keys, the shell
+//! owns text entry. `crate::overlay_input` drives this type from key events and syncs the whole
+//! value into the core; the renderer reads its caret column.
 //!
 //! Deref<Target=str> makes read-only string ops (`.is_empty()`, `.width()`, `format!("{}", …)`)
 //! work without unwrapping. Mutating callers go through the methods so the cursor never lands

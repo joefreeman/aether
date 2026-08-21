@@ -1,14 +1,13 @@
-//! Block-edit resolution (docs/markdown-view.md §12, phase 3): each structural command as a
-//! pure function from (source, parse, selection bytes, params) to **one text replacement** —
-//! range, new text, landing selection — or a refusal. The server applies the replacement
-//! through its normal edit pipeline (atomic: one apply, one undo entry, the usual pushes and
-//! LSP sync); resolving here keeps the boundary math testable off-line and guarantees edits
-//! act on the same boundaries the reading view rendered, because both sides run this crate's
-//! parse.
+//! Block-edit resolution (phase 3): each structural command as a pure function from (source, parse,
+//! selection bytes, params) to **one text replacement** — range, new text, landing selection — or a
+//! refusal. The server applies the replacement through its normal edit pipeline (atomic: one apply,
+//! one undo entry, the usual pushes and LSP sync); resolving here keeps the boundary math testable
+//! off-line and guarantees edits act on the same boundaries the reading view rendered, because both
+//! sides run this crate's parse.
 //!
 //! Conventions: byte offsets throughout; `range`/`text` describe the replacement against the
 //! *current* document, `anchor`/`cursor` are offsets into the *resulting* document. Separator
-//! blank lines belong to the *gaps between* blocks, never to the blocks (§12.1): removal takes
+//! blank lines belong to the *gaps between* blocks, never to the blocks: removal takes
 //! a block's lines plus the adjacent blank run, moves carry the gap along, and paste re-creates
 //! whatever separator its new neighbours already use.
 //!
@@ -303,7 +302,7 @@ fn front_matter_span(blocks: &[Block]) -> Option<Span> {
     }
 }
 
-/// Refuse when a structural op would touch the document's front matter (§12.1). Front matter is
+/// Refuse when a structural op would touch the document's front matter. Front matter is
 /// *positional* — it is only front matter while it opens the file — so moving it, replacing it,
 /// or pushing anything above it silently demotes it to a thematic break and a heading. Every op
 /// that relocates or removes block spans runs this.
@@ -573,7 +572,7 @@ pub fn resolve_move_paragraph(text: &str, sel_min: u32, sel_max: u32, down: bool
         let other = para_around(gap.start - 1).ok_or(Refusal::Quiet)?;
         (gap, other)
     };
-    // Front matter is positional (§12.1) — the same rule `guard_front_matter` enforces for the
+    // Front matter is positional — the same rule `guard_front_matter` enforces for the
     // block ops, applied here to the one resolver that runs without a parse. The fence is read
     // straight out of the text for that reason; a non-markdown file that opens `---` pays a
     // refusal it didn't need, which is the safe direction to be wrong in.
@@ -711,7 +710,7 @@ pub fn resolve_paste(
         // No block to anchor against. That is the empty document — where the paste becomes the
         // whole content — but *not only* the empty document: a file the parse yields no blocks
         // for (nothing but link reference definitions, say) reaches here with every byte of its
-        // content intact. Replacing `0..text.len()` on the strength of an empty element list
+        // content intact. Replacing `0..text.len` on the strength of an empty element list
         // would delete a document the reading view merely had nothing to show for, so anything
         // non-blank keeps its text and takes the paste at the end.
         if text.trim().is_empty() {
@@ -856,7 +855,7 @@ fn indent_before(text: &str, byte: u32) -> usize {
 
 /// The whole-line landing over a block edited *in place*: `chunk` is its line extent before the
 /// edit, `grew` how many bytes the replacement added (negative when it shrank). Depth leaves the
-/// block it changed selected, like move and paste (§12.1) — and here that is load-bearing rather
+/// block it changed selected, like move and paste — and here that is load-bearing rather
 /// than cosmetic: a *collapsed* landing on a nested item's line start sits in the indent, which
 /// belongs to the parent's span, so the focus would jump to the parent and the next press would
 /// act on it instead.
@@ -1344,7 +1343,7 @@ pub fn resolve_toggle_task(
     // with nothing on screen marking the box it was about to hit. The newline step-back keeps
     // a whole-line-selected item resolving to itself.
     let at = point_byte(text, byte) as usize;
-    // A blank line is a separator, and separators belong to the gaps between blocks (§12.1) —
+    // A blank line is a separator, and separators belong to the gaps between blocks —
     // but a loose item's *parse* span swallows the blank after it, so without this guard the
     // containing walk would toggle the item above from the gap below it.
     if is_blank_line(&text[line_start(text, at)..line_end_incl(text, at)]) {
@@ -1774,7 +1773,7 @@ mod tests {
 
     #[test]
     fn cut_then_paste_round_trips_inside_a_tight_list() {
-        // §12.1's "cut→paste round-trips by construction" has to hold where the blocks are
+        // The "cut→paste round-trips by construction" rule has to hold where the blocks are
         // newline-adjacent too: a hard-coded blank separator would split the list in two and
         // turn it loose.
         let doc = "- one\n- two\n- three\n";
@@ -1805,7 +1804,7 @@ mod tests {
     #[test]
     fn structural_ops_refuse_front_matter() {
         // Front matter is positional — it is only front matter while it opens the file — so
-        // every op that would relocate it, replace it, or push a block above it refuses (§12.1).
+        // every op that would relocate it, replace it, or push a block above it refuses.
         let doc = "---\nkey: v\n---\n\nBody.\n";
         let (blocks, els) = fixture(doc);
         for op in [
@@ -1933,7 +1932,7 @@ mod tests {
                 .count(),
             1
         );
-        // A selection stays a selection (§12.5), and unwrapping restores the original.
+        // A selection stays a selection, and unwrapping restores the original.
         assert!(e.anchor != e.cursor);
         let (b2, e2) = fixture(&out);
         let back = resolve_depth(&out, &b2, &e2, e.anchor as u32, e.cursor as u32, false).unwrap();
@@ -1979,7 +1978,7 @@ mod tests {
 
     #[test]
     fn ops_reach_inside_containers_now_that_children_are_stops() {
-        // §12.6: a container's children are elements, so the innermost-first focus rule lands on
+        // A container's children are elements, so the innermost-first focus rule lands on
         // them and every op acts on the inner block rather than the whole container.
         let doc = "> Para one.\n>\n> Para two.\n";
         let (blocks, els) = fixture(doc);
@@ -2318,7 +2317,7 @@ mod tests {
             "block after the list"
         );
         // The separator blank lines refuse too — including the one *after* the item, which
-        // the loose item's parse span swallows (separators are gaps, §12.1, so the containing
+        // the loose item's parse span swallows (separators are gaps, so the containing
         // walk must not reach the item from there).
         assert_eq!(resolve_toggle_task(doc, &els, 7, None), Err(Refusal::Quiet));
         assert_eq!(

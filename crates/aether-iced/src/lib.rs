@@ -13,8 +13,8 @@ mod mac_open;
 mod picker;
 mod theme;
 
-// The core crate under the path the shell has always used, plus its modules at their
-// pre-extraction paths so references didn't churn during the seam work (docs/client-core.md).
+// The core crate under the path the shell has always used, plus its modules at their pre-extraction
+// paths so references didn't churn during the seam work.
 pub(crate) use aether_client as core;
 pub(crate) use aether_client::{chips, grid, keymap, labels};
 

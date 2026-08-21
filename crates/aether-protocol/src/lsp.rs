@@ -1,15 +1,14 @@
 //! LSP-related messages.
 //!
 //! Aether-server is itself an LSP *client*: it hosts language-server subprocesses and translates
-//! between them and connected editor clients (see `docs/lsp.md`). The TUI never speaks LSP. These
-//! messages surface language-server *health* to the client — the status of each server in the
-//! active workspace plus live transitions — and let the client request a restart.
+//! between them and connected editor clients. The TUI never speaks LSP. These messages surface
+//! language-server *health* to the client — the status of each server in the active workspace plus
+//! live transitions — and let the client request a restart.
 //!
 //! Defined in Phase 0 ahead of the transport so the wire shape is pinned and the status UI can be
 //! built against it; the server side that emits these lands in Phase 1.
 
-/// Every language Aether can launch a server for — the set a *project* may declare
-/// (`docs/projects.md`).
+/// Every language Aether can launch a server for — the set a *project* may declare.
 ///
 /// Lives in the protocol rather than the server because both ends need it: the server matches it
 /// against its `server_spec` table (a drift test enforces that), and the client validates the

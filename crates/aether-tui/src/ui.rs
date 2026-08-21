@@ -122,8 +122,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .constraints(constraints)
         .split(f.area());
     if state.has_editor() {
-        // The markdown reading view replaces the editor window wholesale while active
-        // (docs/markdown-view.md); all overlays/toasts/status draw over either the same way.
+        // The markdown reading view replaces the editor window wholesale while active; all
+        // overlays/toasts/status draw over either the same way.
         if state.read.is_some() {
             draw_read_view(f, state, chunks[0]);
         } else {
@@ -187,17 +187,17 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         let status_area = chunks.get(1).copied().unwrap_or(Rect::default());
         place_terminal_cursor(f, state, buffer_area, status_area);
     }
-    // The hint (docs/hints.md): a quiet top-right chip. Above overlays (a picker
-    // context's hints must show over the picker box) — it collides with nothing else up there.
+    // The hint: a quiet top-right chip. Above overlays (a picker context's hints must show over the
+    // picker box) — it collides with nothing else up there.
     draw_hint_corner(f, state, chunks[0]);
     // Transient toasts: stacked in the bottom-right of the content area (above the status row) over
     // everything, since they're ephemeral feedback. Drawn last so a modal never hides them.
     draw_toast_overlay(f, state, chunks[0]);
 }
 
-/// The hint corner (docs/hints.md): one quiet "Hint: …" line in the top-right of the content
-/// area — the key label in accent, the sentence dim, on the panel background. Deliberately
-/// subtler than a toast: ambient chrome, not a notification.
+/// The hint corner: one quiet "Hint: …" line in the top-right of the content area — the key label
+/// in accent, the sentence dim, on the panel background. Deliberately subtler than a toast: ambient
+/// chrome, not a notification.
 fn draw_hint_corner(f: &mut Frame, state: &AppState, area: Rect) {
     const MARGIN_X: u16 = 2;
     const PREFIX: &str = "Hint: ";
@@ -1625,9 +1625,9 @@ pub fn picker_window_rows(
     groups: &[GroupSpan],
     collapsible: bool,
 ) -> Vec<PickerRow> {
-    // Collapsible kinds (docs/picker-groups.md): headers arrive as real, selectable
-    // `PickerItem::Group` rows, so the window maps 1:1 — no interleaved headers, no gaps.
-    // The spans only feed the sticky stamp ([`collapsible_pin`]).
+    // Collapsible kinds: headers arrive as real, selectable `PickerItem::Group` rows, so the window
+    // maps 1:1 — no interleaved headers, no gaps. The spans only feed the sticky stamp
+    // ([`collapsible_pin`]).
     if collapsible {
         return (0..items_len).map(PickerRow::Item).collect();
     }
@@ -1728,13 +1728,12 @@ pub fn picker_row_scroll_for_selected(
     top.min(max_top)
 }
 
-/// The §9 group-run reveal (docs/picker-groups.md): the pane-top view row that frames the
-/// freshly-opened run — the minimal move from `top` that brings the run's last row into view,
-/// capped so the run's header never leaves the pane top. A run taller than the pane shows the
-/// header at the very top, where the row renders *itself* (the sticky pin only stamps when the
-/// top row sits inside the run), so capping there keeps the first item visible below it.
-/// `header_rel` is the header's window-relative view row; rows are window view rows
-/// (collapsible kinds map 1:1 to items).
+/// The group-run reveal: the pane-top view row that frames the freshly-opened run — the minimal
+/// move from `top` that brings the run's last row into view, capped so the run's header never
+/// leaves the pane top. A run taller than the pane shows the header at the very top, where the row
+/// renders *itself* (the sticky pin only stamps when the top row sits inside the run), so capping
+/// there keeps the first item visible below it. `header_rel` is the header's window-relative view
+/// row; rows are window view rows (collapsible kinds map 1:1 to items).
 pub fn picker_scroll_for_run(
     top: usize,
     pane_height: usize,
@@ -2173,13 +2172,12 @@ fn pad_horizontal(area: Rect) -> Rect {
     }
 }
 
-/// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query
-/// is empty we render a dim placeholder describing what the picker matches against. For the
-/// Explorer picker, an immutable dim prefix shows the directory the listing is for, sitting
-/// flush with the typed query (cursor lands just after the prefix). Filter chips render
-/// between the prefix and the query (see `docs/picker-filters.md`); while the in-row chip
-/// prompt (glob/dir editor) is open it replaces the whole row. If the row is too narrow to
-/// hold the counts, they get dropped first so the query stays visible.
+/// Query left-aligned, `N/M` (with a trailing `…` while ticking) right-aligned. When the query is
+/// empty we render a dim placeholder describing what the picker matches against. For the Explorer
+/// picker, an immutable dim prefix shows the directory the listing is for, sitting flush with the
+/// typed query (cursor lands just after the prefix). Filter chips render between the prefix and the
+/// query; while the in-row chip prompt (glob/dir editor) is open it replaces the whole row. If the
+/// row is too narrow to hold the counts, they get dropped first so the query stays visible.
 fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
     let base_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
     let placeholder_style = Style::default()
@@ -2684,9 +2682,9 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
             }
         }
         let highlighted = i == state.picker.selected;
-        // Two-level hierarchy (docs/picker-groups.md §9): the collapsible kinds' item rows
-        // indent two cells under their group header, aligning with the header text past its
-        // "▸ "/"▾ " disclosure mark. Header rows (and everything in the flat kinds) start flush.
+        // Two-level hierarchy: the collapsible kinds' item rows indent two cells under their group
+        // header, aligning with the header text past its "▸ "/"▾ " disclosure mark. Header rows
+        // (and everything in the flat kinds) start flush.
         let indent = collapsible && !matches!(item, PickerItem::Group { .. });
         let item_width = (text_width as usize).saturating_sub(if indent { 2 } else { 0 });
         let mut spans = picker_item_spans(
@@ -2833,7 +2831,7 @@ fn picker_item_spans(
         return preview_row_spans(Some(*line), preview, match_indices, highlighted, max_width);
     }
     // A captured entry renders exactly like a grep hit — trimmed preview + right-aligned dim line
-    // number — so the two read alike (docs/jumplist.md §2.2). No dot, no dressing.
+    // number — so the two read alike. No dot, no dressing.
     if let PickerItem::JumplistEntry {
         line,
         display,
@@ -3275,10 +3273,9 @@ fn grep_file_header_spans(
     vec![Span::styled(display, style)]
 }
 
-/// A collapsible group's header row (docs/picker-groups.md) — a real, selectable row, unlike
-/// the derived headers above: `▸/▾` disclosure mark + the header text in the same accent bold
-/// chrome, the run's item count right-aligned dim, and the selection band when
-/// highlighted like any other row.
+/// A collapsible group's header row — a real, selectable row, unlike the derived headers above:
+/// `▸/▾` disclosure mark + the header text in the same accent bold chrome, the run's item count
+/// right-aligned dim, and the selection band when highlighted like any other row.
 fn group_row_spans(
     header: &GroupHeader,
     count: u32,
@@ -3288,9 +3285,9 @@ fn group_row_spans(
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    // The accent alone carries the header chrome — no bold: with the run's items indented under
-    // the header (docs/picker-groups.md §9.2) the hierarchy already reads, and the derived
-    // (non-collapsible) section headers keep their bold as the visual tell for "not a row".
+    // The accent alone carries the header chrome — no bold: with the run's items indented under the
+    // header the hierarchy already reads, and the derived (non-collapsible) section headers keep
+    // their bold as the visual tell for "not a row".
     let style = Style::default().fg(c(th().accent)).bg(bg);
     let count_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
     // The mark reads as part of the header chrome; ambiguous-width glyph, so the budget below
@@ -3401,9 +3398,9 @@ fn file_item_spans(
 
 /// One Buffers-picker row: the buffer's path highlighted by `match_indices`, then (multi-root only)
 /// the disambiguated root label dim after the name — same placement as the Files picker — and a
-/// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the highlight
-/// lands only on the path, never the label. Transient buffers slant; the session's tether gets the
-/// status bar's dim ` *` after the path (docs/tether.md — closing that row exits the client).
+/// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the
+/// highlight lands only on the path, never the label. Transient buffers slant; the session's tether
+/// gets the status bar's dim ` *` after the path (closing that row exits the client).
 #[allow(clippy::too_many_arguments)]
 fn buffer_item_spans(
     path_index: Option<u32>,
@@ -3441,8 +3438,8 @@ fn buffer_item_spans(
         None => String::new(),
     };
 
-    // The tether mark (docs/tether.md): a dim ` *` after the path, before the root label —
-    // matching the status bar. Upright even on a slanted transient row.
+    // The tether mark: a dim ` *` after the path, before the root label — matching the status bar.
+    // Upright even on a slanted transient row.
     let tether_mark = if tethered { " *" } else { "" };
 
     // Reserve the dot region (` • ` = 3 cols) plus the tether mark and the suffix from the
@@ -4697,9 +4694,9 @@ fn truncate_path_with_indices(
     (truncated, new_indices)
 }
 
-/// Paint the markdown reading view (docs/markdown-view.md §2.8): the core's laid-out rows at the
-/// shell's scroll, the content column centered to the reading measure, the focused element
-/// row-tinted (a focused link inverts its own span instead).
+/// Paint the markdown reading view: the core's laid-out rows at the shell's scroll, the content
+/// column centered to the reading measure, the focused element row-tinted (a focused link inverts
+/// its own span instead).
 fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
     use aether_client::read_layout::SpanKind;
     let Some(rv) = state.read.as_ref() else {
@@ -4749,12 +4746,11 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         // link, the link's containing block keeps its bar (two projections of one cursor).
         // `bar_rows` is the focused block's whole subtree (nested items included).
         let row_focused = rv.bar_rows.is_some_and(|(a, b)| idx >= a && idx <= b);
-        // An extended selection tints its blocks' rows with the editor's selection shade
-        // (docs/markdown-view.md §12): page-background cells swap to the selection shade at push time
-        // (`finish_row`); spans with their own background — code panels, chips — keep it,
-        // exactly like the table band. Blank separator rows inside the range stay on the page
-        // background (only their gutter stub would tint) — per-block bands with clean gaps,
-        // matching the GUI/web per-block tint.
+        // An extended selection tints its blocks' rows with the editor's selection shade:
+        // page-background cells swap to the selection shade at push time (`finish_row`); spans with
+        // their own background — code panels, chips — keep it, exactly like the table band. Blank
+        // separator rows inside the range stay on the page background (only their gutter stub would
+        // tint) — per-block bands with clean gaps, matching the GUI/web per-block tint.
         let row_selected =
             rv.sel_rows.is_some_and(|(a, b)| idx >= a && idx <= b) && !row.spans.is_empty();
         let finish_row = move |spans: Vec<Span<'static>>| -> Line<'static> {
@@ -6655,9 +6651,9 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(c(t.bg_panel)).fg(c(fg))
 }
 
-/// The status row's leading label: an optional `[workspace] ` prefix, the file label, whether
-/// the buffer is transient (which italicises the label), and whether it's the session's tether
-/// (which appends a dim ` *` — closing it exits the client, docs/tether.md).
+/// The status row's leading label: an optional `[workspace] ` prefix, the file label, whether the
+/// buffer is transient (which italicises the label), and whether it's the session's tether (which
+/// appends a dim ` *` — closing it exits the client).
 struct StatusLabel<'a> {
     workspace_prefix: &'a str,
     file_label: &'a str,
@@ -6698,8 +6694,8 @@ fn build_editor_status_spans(
     } else {
         base_style
     };
-    // The tether mark (docs/tether.md): a dim ` *` after the file label — upright even on a
-    // slanted transient label (it's chrome, not part of the name). Dropped on narrow rows.
+    // The tether mark: a dim ` *` after the file label — upright even on a slanted transient label
+    // (it's chrome, not part of the name). Dropped on narrow rows.
     let tether_mark = if tethered { " *" } else { "" };
     // The right segment (counters / diagnostics / position / LSP glyph) is pre-built by the caller,
     // already including its internal gaps and the glyph's edge padding.
@@ -7479,8 +7475,8 @@ mod tests {
         (items, spans)
     }
 
-    /// The §9 group-run reveal (docs/picker-groups.md): frame the freshly-opened run — the
-    /// minimal move that shows its last row, capped so the header never leaves the pane top.
+    /// The group-run reveal: frame the freshly-opened run — the minimal move that shows its last
+    /// row, capped so the header never leaves the pane top.
     #[test]
     fn run_reveal_frames_the_expanded_run() {
         // Pane of 6 rows; run header at view row 8 with 3 items (rows 9..=11).
@@ -7947,9 +7943,9 @@ mod tests {
         }
     }
 
-    /// In a collapsible picker (docs/picker-groups.md) the headers are real, selectable
-    /// `Group` window rows: a press on a header selects it (Enter/click then toggles), a press
-    /// on a hit selects that hit, and the window maps 1:1 — no gap rows, no skipped indices.
+    /// In a collapsible picker the headers are real, selectable `Group` window rows: a press on a
+    /// header selects it (Enter/click then toggles), a press on a hit selects that hit, and the
+    /// window maps 1:1 — no gap rows, no skipped indices.
     #[test]
     fn picker_click_selects_group_header_rows() {
         let group = |path: &str, count: u32, expanded: bool| PickerItem::Group {
@@ -8824,9 +8820,9 @@ mod tests {
         assert_eq!(text, spans_text(&grep));
     }
 
-    /// A whole-target entry — a file or buffer captured from the Files/Buffers picker
-    /// (docs/jumplist.md) — has no line to show, so the row renders the path alone with no
-    /// trailing number and no reserved gap for one.
+    /// A whole-target entry — a file or buffer captured from the Files/Buffers picker — has no line
+    /// to show, so the row renders the path alone with no trailing number and no reserved gap for
+    /// one.
     #[test]
     fn jumplist_whole_target_row_renders_without_a_line_number() {
         let item = PickerItem::JumplistEntry {
@@ -8845,8 +8841,8 @@ mod tests {
         assert_eq!(text.width(), 40, "still padded to the full row width");
     }
 
-    /// The Buffers picker marks the session's tether with the status bar's dim ` *` after the
-    /// path (docs/tether.md — closing that row exits the client); other rows are unmarked.
+    /// The Buffers picker marks the session's tether with the status bar's dim ` *` after the path
+    /// (closing that row exits the client); other rows are unmarked.
     #[test]
     fn buffers_picker_marks_the_tethered_row() {
         let item = |id: u64| PickerItem::Buffer {
@@ -9025,8 +9021,8 @@ mod tests {
         assert!(!label.style.add_modifier.contains(Modifier::ITALIC));
     }
 
-    /// The tether (docs/tether.md) appends a dim ` *` after the file label — upright even when the
-    /// transient italic is on the label — and narrow rows drop it rather than cutting the name.
+    /// The tether appends a dim ` *` after the file label — upright even when the transient italic
+    /// is on the label — and narrow rows drop it rather than cutting the name.
     #[test]
     fn editor_status_spans_mark_tethered_buffer() {
         let status = crate::app::StatusMessage::default();

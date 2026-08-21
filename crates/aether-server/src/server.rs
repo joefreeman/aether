@@ -29,9 +29,9 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
     let bind_addr = format!("127.0.0.1:{port}");
 
     // Reject early if the recorded port is already taken: a live server for this profile (the pid
-    // file says so), or some unrelated process squatting it. We fail loudly rather than reallocate
-    // — a recorded port is a stable address (e.g. a bookmarked web URL), so we never move it
-    // silently. See `docs/profiles.md`.
+    // file says so), or some unrelated process squatting it. We fail loudly rather than reallocate —
+    // a recorded port is a stable address (e.g. a bookmarked web URL), so we never move it
+    // silently.
     let runtime_path = config::runtime_info_path()?;
     handle_existing_runtime_file(&runtime_path)?;
 
@@ -56,8 +56,8 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
         // Opt the production daemon into unsaved-buffer backups (left unset elsewhere — see
         // `ServerState::backups_path`). A resolution failure just disables the feature.
         s.backups_path = config::backups_dir().ok();
-        // Hint learning state (docs/hints.md): same opt-in shape as sessions. Loaded
-        // once here; a corrupt file logs and starts fresh rather than refusing to boot.
+        // Hint learning state: same opt-in shape as sessions. Loaded once here; a corrupt file logs
+        // and starts fresh rather than refusing to boot.
         s.hints_path = config::hints_state_path().ok();
         if let Some(path) = s.hints_path.clone() {
             match config::load_hints_at(&path) {
@@ -65,7 +65,7 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
                 Err(e) => tracing::warn!(error = %e, "could not load hint state; starting fresh"),
             }
         }
-        // Input-history lists (docs/input-history.md): same opt-in shape again.
+        // Input-history lists: same opt-in shape again.
         s.history_path = config::history_state_path().ok();
         if let Some(path) = s.history_path.clone() {
             match config::load_history_at(&path) {
@@ -209,9 +209,9 @@ pub async fn run_with_listener(
 /// recall lists, not user content).
 const AGGREGATE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Periodically flush the client-aggregated state files — hint learning (docs/hints.md) and input
-/// history (docs/input-history.md) — until the task is aborted (on server shutdown). See
-/// [`crate::handlers::flush_hints`] and [`crate::handlers::flush_history`].
+/// Periodically flush the client-aggregated state files — hint learning and input history — until
+/// the task is aborted (on server shutdown). See [`crate::handlers::flush_hints`] and
+/// [`crate::handlers::flush_history`].
 async fn aggregate_flush_loop(state: SharedState) {
     loop {
         tokio::time::sleep(AGGREGATE_FLUSH_INTERVAL).await;
@@ -529,8 +529,7 @@ pub async fn spawn_for_test_with_lsp(
     .await
 }
 
-/// **Test seam.** As [`spawn_for_test_with_lsp`], but the workspace also *declares projects*
-/// (`docs/projects.md`), so their language servers come up pinned at registration.
+/// **Test seam.** As [`spawn_for_test_with_lsp`], but the workspace also *declares projects*, so their language servers come up pinned at registration.
 ///
 /// The other seams pre-register workspaces in memory, which means `workspace/activate` takes its
 /// already-loaded path and never runs the cold-load reconcile that starts pinned servers in
@@ -566,10 +565,10 @@ pub async fn spawn_for_test_with_projects(
 }
 
 /// As [`spawn_for_test_multi_with_persistence`], but also points the server at the two
-/// client-aggregated state files — `hints_path` (docs/hints.md) and `history_path`
-/// (docs/input-history.md) — so tests can exercise `hints/record` / `history/record` aggregation
-/// and persistence against throwaway files. With either set the periodic flush runs, so a test
-/// records events then polls the file into existence, like the backup tests do.
+/// client-aggregated state files — `hints_path` and `history_path` — so tests can exercise
+/// `hints/record` / `history/record` aggregation and persistence against throwaway files. With
+/// either set the periodic flush runs, so a test records events then polls the file into existence,
+/// like the backup tests do.
 pub async fn spawn_for_test_full(
     workspaces: Vec<(String, Vec<PathBuf>)>,
     sessions_path: Option<PathBuf>,

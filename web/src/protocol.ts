@@ -530,16 +530,16 @@ export type PickerItem =
       /** 0-based position in the jumplist — the row's identity. */
       index: number;
       /** 0-based landing line — the right-aligned dim line number, like a grep hit. Absent for a
-       *  whole-target entry (a file or buffer captured without a position, docs/jumplist.md),
-       *  which renders with no number at all. */
+       * whole-target entry (a file or buffer captured without a position), which renders with no
+       * number at all. */
       line?: number;
-      /** The captured entry's flat display text (docs/jumplist.md §2.2). */
+      /** The captured entry's flat display text. */
       display: string;
       match_indices?: number[];
     }
   | {
       kind: "group";
-      /** A collapsible group's header row (docs/picker-groups.md §9) — a real, selectable
+      /** A collapsible group's header row — a real, selectable
        *  window row, not a derived decoration. Click selects (and expands) the group; Enter
        *  jumps to its first item — both routed through the core. */
       header: GroupHeader;
@@ -566,7 +566,7 @@ export type GroupHeader =
 export interface GroupSpan {
   start: number;
   header: GroupHeader;
-  /** Collapsible kinds only (docs/picker-groups.md): the run's item count and whether it is
+  /** Collapsible kinds only: the run's item count and whether it is
    *  the expanded run — the same decoration as its `group` row, so a sticky pin standing in
    *  for a scrolled-off header renders identically. Absent for the derived-header kinds. */
   count?: number;

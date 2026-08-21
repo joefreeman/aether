@@ -1,7 +1,7 @@
-//! The browser's seam onto the shared client core (docs/web-core.md). `aether-client` is a pure,
-//! sans-IO state machine that already compiles for `wasm32-unknown-unknown`; this crate is the thin
-//! `wasm-bindgen` shell around it. It owns every `#[wasm_bindgen]` export and every boundary DTO so
-//! `aether-client` itself never grows a wasm dependency.
+//! The browser's seam onto the shared client core. `aether-client` is a pure, sans-IO state machine
+//! that already compiles for `wasm32-unknown-unknown`; this crate is the thin `wasm-bindgen` shell
+//! around it. It owns every `#[wasm_bindgen]` export and every boundary DTO so `aether-client`
+//! itself never grows a wasm dependency.
 //!
 //! The contract mirrors `aether-tui/src/shell.rs`: the TS shell feeds input in (`on_key`,
 //! `on_event`, `on_rpc_result`), gets back an `Effect[]` to execute, and reads a `View` to render.
@@ -59,8 +59,8 @@ impl WasmSession {
         to_js(&effects)
     }
 
-    /// The render view (docs/web-core.md): a JSON projection of the session for the shell to
-    /// paint. Read after every batch of effects, before rendering.
+    /// The render view: a JSON projection of the session for the shell to paint. Read after every
+    /// batch of effects, before rendering.
     pub fn view(&self) -> Result<JsValue, JsValue> {
         to_js(&view::build_view(&self.inner))
     }
@@ -81,11 +81,10 @@ impl WasmSession {
         })
     }
 
-    /// Apply the markdown reading-view boot rules (docs/markdown-view.md §1.6) — call once after
-    /// [`Self::bootstrap`]: boot installs the session directly, never passing through
-    /// `adopt_switch`, so the read-vs-edit decision runs here. `jumped` = the URL carried a
-    /// `#line:col` jump (jump-shaped opens land in the editor). Returns `Effect[]` (the content
-    /// fetch when the buffer opens as a reading view).
+    /// Apply the markdown reading-view boot rules — call once after [`Self::bootstrap`]: boot
+    /// installs the session directly, never passing through `adopt_switch`, so the read-vs-edit
+    /// decision runs here. `jumped` = the URL carried a `#line:col` jump (jump-shaped opens land in
+    /// the editor). Returns `Effect[]` (the content fetch when the buffer opens as a reading view).
     pub fn boot_read_presentation(&mut self, jumped: bool) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.boot_read_presentation(jumped)))
     }
@@ -111,8 +110,8 @@ impl WasmSession {
         to_js(&effects_to_json(self.inner.read_click_activate(byte)))
     }
 
-    /// The periodic hint tick (docs/hints.md): the shell's wall clock in Unix ms,
-    /// stamped into the core's hint engine. Returns `Effect[]` (Shown records, at most).
+    /// The periodic hint tick: the shell's wall clock in Unix ms, stamped into the core's hint
+    /// engine. Returns `Effect[]` (Shown records, at most).
     pub fn on_hint_tick(&mut self, now_ms: f64) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.on_hint_tick(now_ms as u64)))
     }
@@ -169,8 +168,8 @@ impl WasmSession {
         to_js(&self.rpc_result(token, ok, &method, value))
     }
 
-    /// Adopt a `viewport/subscribe` result (a geometry RPC the shell issued — see docs/web-core.md
-    /// §"Two kinds of RPC"). The shell does its pixel positioning afterward, reading `view()`.
+    /// Adopt a `viewport/subscribe` result (a geometry RPC the shell issued).
+    /// The shell does its pixel positioning afterward, reading `view`.
     pub fn adopt_subscribe(&mut self, res: JsValue) -> Result<(), JsValue> {
         let res: ViewportSubscribeResult = from_js(res)?;
         self.inner.adopt_subscribe(res);
@@ -353,7 +352,7 @@ impl WasmSession {
         ))
     }
 
-    /// Replace the add-project row's path segment (`docs/projects.md`). Returns `Effect[]`.
+    /// Replace the add-project row's path segment. Returns `Effect[]`.
     pub fn workspace_settings_set_add_project(&mut self, text: String) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(
             self.inner.workspace_settings_set_add_project(text),
@@ -656,7 +655,7 @@ fn key_text(key: &str, mods: &Mods) -> Option<String> {
     Some(c.to_string())
 }
 
-// ---- effect lowering (Effect -> JSON; see docs/web-core.md for the contract) ------------------
+// ---- effect lowering (Effect -> JSON; for the contract) ------------------
 
 fn effects_to_json(fx: Effects) -> Vec<Value> {
     fx.0.into_iter().map(effect_value).collect()
@@ -752,7 +751,7 @@ fn reveal_value(r: aether_client::picker::Reveal) -> Value {
         match r {
             Reveal::Minimal => "minimal",
             Reveal::Top => "top",
-            // Frame the freshly-opened group run (docs/picker-groups.md §9).
+            // Frame the freshly-opened group run.
             Reveal::Run => "run",
         }
         .into(),

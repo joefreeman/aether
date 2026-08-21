@@ -1,6 +1,6 @@
 //! The save-as prompt's editor (`Alt-s`): a workspace-relative path field with the same
-//! directory-completion UX as the picker's dir-scope chip editor (docs/picker-filters.md § 1.6),
-//! so saving somewhere reuses the muscle memory of scoping a search there.
+//! directory-completion UX as the picker's dir-scope chip editor, so saving somewhere reuses the
+//! muscle memory of scoping a search there.
 //!
 //! It mirrors [`crate::chips::ChipEditor`]'s dir half — a multi-root workspaces' leading root field
 //! (inline smartcase typeahead, `:` separator) ahead of a `directory/list`-backed path field with

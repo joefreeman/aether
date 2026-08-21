@@ -152,11 +152,10 @@ pub struct ServerState {
     /// native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
-    /// Per-client jumplist (docs/jumplist.md): the quickfix-style snapshot
-    /// `jumplist/capture` takes of a picker's filtered results, stepped cursor-relative by
-    /// `jumplist/step` (`]` / `[`). Like `nav_history`, transient: replaced by the next capture,
-    /// cleared on workspace switch (entries reference the prior workspace's files) and on
-    /// disconnect.
+    /// Per-client jumplist: the quickfix-style snapshot `jumplist/capture` takes of a picker's
+    /// filtered results, stepped cursor-relative by `jumplist/step` (`]` / `[`). Like
+    /// `nav_history`, transient: replaced by the next capture, cleared on workspace switch (entries
+    /// reference the prior workspace's files) and on disconnect.
     pub jumplist: HashMap<ClientId, crate::jumplist::Jumplist>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
     /// (`git diff`). Populated on `buffer/open` for file-backed buffers; recomputed as the buffer
@@ -219,10 +218,10 @@ pub struct ServerState {
     /// they never touch the developer's real `~/.config/aether/sessions.json`. When `None`, session
     /// recency/restore is simply disabled (all logic short-circuits).
     pub sessions_path: Option<PathBuf>,
-    /// Root directory for unsaved-buffer backups ([`crate::backup`]). `Some` in the real server (set
-    /// at boot in `server::run`); `None` everywhere else — in-process tests and embeddings leave it
-    /// unset so they never write backups to disk, and the idle reaper keeps its dirty-buffer guard
-    /// (with backups off, reaping a dirty buffer would lose work). See `docs/unsaved-persistence.md`.
+    /// Root directory for unsaved-buffer backups ([`crate::backup`]). `Some` in the real server
+    /// (set at boot in `server::run`); `None` everywhere else — in-process tests and embeddings
+    /// leave it unset so they never write backups to disk, and the idle reaper keeps its
+    /// dirty-buffer guard (with backups off, reaping a dirty buffer would lose work).
     pub backups_path: Option<PathBuf>,
     /// Where app-managed git worktrees are created ([`crate::worktree::store_root`]). Same
     /// convention as [`Self::sessions_path`]: `Some` in the real server, `None` in tests and
@@ -233,10 +232,10 @@ pub struct ServerState {
     /// The alternative — an environment variable set per test — races: `set_var` is process-global
     /// and the suite runs in parallel.
     pub worktree_store: Option<PathBuf>,
-    /// Where to read/write the hint learning state ([`crate::config::HintsState`],
-    /// docs/hints.md). Same convention as [`Self::sessions_path`]: `Some` in the real server (and
-    /// in tests that point it at a tempfile); `None` disables persistence — `hints/record` still
-    /// aggregates in memory so a snapshot within one run stays coherent.
+    /// Where to read/write the hint learning state ([`crate::config::HintsState`]). Same convention
+    /// as [`Self::sessions_path`]: `Some` in the real server (and in tests that point it at a
+    /// tempfile); `None` disables persistence — `hints/record` still aggregates in memory so a
+    /// snapshot within one run stays coherent.
     pub hints_path: Option<PathBuf>,
     /// In-memory hint learning state, loaded from [`Self::hints_path`] at boot and
     /// flushed back by the periodic hints flush (dirty-flag debounced) plus a final flush on
@@ -244,10 +243,10 @@ pub struct ServerState {
     pub hints: crate::config::HintsState,
     /// Set by `hints/record` when [`Self::hints`] mutated; cleared by the flush that writes it.
     pub hints_dirty: bool,
-    /// Where to read/write the input-history lists ([`crate::config::HistoryFile`],
-    /// docs/input-history.md). Same convention as [`Self::hints_path`]: `Some` in the real server
-    /// (and in tests that point it at a tempfile); `None` disables persistence — `history/record`
-    /// still accumulates in memory so recall works within one run.
+    /// Where to read/write the input-history lists ([`crate::config::HistoryFile`]). Same
+    /// convention as [`Self::hints_path`]: `Some` in the real server (and in tests that point it at
+    /// a tempfile); `None` disables persistence — `history/record` still accumulates in memory so
+    /// recall works within one run.
     pub history_path: Option<PathBuf>,
     /// In-memory input-history lists keyed by workspace, loaded from [`Self::history_path`] at
     /// boot and flushed back by the periodic flush (dirty-flag debounced) plus a final flush on
@@ -454,9 +453,9 @@ pub struct WorkspaceEntry {
     /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
     /// live buffer in this workspace — promotion removes it.
     pub dormant_buffers: Vec<DormantBuffer>,
-    /// Projects declared by this workspace's config (`docs/projects.md`), whose language servers are
-    /// pinned open while it's active. Flattened out of the config's nested `[[roots]]` form, so each
-    /// carries the index of the root it was declared under.
+    /// Projects declared by this workspace's config, whose language servers are pinned open while
+    /// it's active. Flattened out of the config's nested `[[roots]]` form, so each carries the
+    /// index of the root it was declared under.
     ///
     /// Held in memory — not re-read from disk when needed — because `workspace/add_root` and
     /// `remove_root` rewrite the config file wholesale from this entry. Anything they don't carry
@@ -737,9 +736,9 @@ impl ServerState {
     ///
     /// `git worktree add` rewrites `.git/config`, which lives in the *common* dir and is guarded by
     /// git's own lockfile: two concurrent adds in one family leave one dead with `could not lock
-    /// config file` (`docs/worktrees.md` §4.4). [`ServerState::git_operations`] is the wrong tool —
-    /// it is a *cancellation registry*, not a lock, and it is keyed by workdir, which every
-    /// worktree of a family has a different one of while sharing the config being written.
+    /// config file`. [`ServerState::git_operations`] is the wrong tool — it is a *cancellation
+    /// registry*, not a lock, and it is keyed by workdir, which every worktree of a family has a
+    /// different one of while sharing the config being written.
     ///
     /// The value is a mutex rather than a busy flag so a second caller **waits** instead of being
     /// refused. Two agents asking for a worktree at the same moment is the expected case, not an
@@ -1003,10 +1002,10 @@ impl ServerState {
     /// Live dirty buffers (`Buffer::dirty`) plus every on-disk backup of the workspace that no live
     /// buffer accounts for. The disk half is what makes the indicator honest for a workspace nobody
     /// has activated since the server started: the daemon idle-reaps, so most unsaved work is
-    /// sitting in `backups/<workspace>/` rather than in memory (`docs/unsaved-persistence.md`), and
-    /// counting only loaded buffers showed every such workspace as clean. Backups belonging to a
-    /// buffer that *is* loaded are excluded rather than added — the live buffer already counted, and
-    /// double-counting it would be worse than the gap it fixes.
+    /// sitting in `backups/<workspace>/` rather than in memory, and counting only loaded buffers
+    /// showed every such workspace as clean. Backups belonging to a buffer that *is* loaded are
+    /// excluded rather than added — the live buffer already counted, and double-counting it would
+    /// be worse than the gap it fixes.
     ///
     /// `0` for a workspace with neither (the common case for a configured-but-unvisited workspace),
     /// and for an ephemeral one with no dirty buffers — those are never backed up.
@@ -1642,10 +1641,9 @@ pub struct Buffer {
 
 /// The shared content of one open file (or scratch): everything derived from *what the text is*
 /// rather than from any workspace's relationship to it. Owned by [`ServerState::documents`] and
-/// referenced by one or more [`Buffer`]s — see `Buffer` for the split.
-/// What a **virtual** document was materialised from (docs/git-phase-2.md decision 4): content
-/// the server produced from an immutable source rather than loading from disk. `git/show` is the
-/// only producer today — a commit's patch, or a file as of a commit.
+/// referenced by one or more [`Buffer`]s — see `Buffer` for the split. What a **virtual** document
+/// was materialised from: content the server produced from an immutable source rather than loading
+/// from disk. `git/show` is the only producer today — a commit's patch, or a file as of a commit.
 ///
 /// Its presence is what makes a document read-only: there is no file to save to and no meaning to
 /// an edit against a revision that has already happened. Deriving read-only from this rather than

@@ -1,9 +1,8 @@
-//! The core-driven shell: the TUI's event loop over `aether_client::Session`
-//! (docs/tui-port.md). Keys translate to the core's `KeyCode`/`Mods` and feed
-//! `Session::on_key`; server pushes feed `on_event(ServerPush)`; RPC outcomes feed
-//! `on_rpc_result`. The shell executes effects in terminal terms (row scrolling, the
-//! status row, the clipboard) and syncs a render view (`AppState`) from `Session` before
-//! every draw, so `ui::draw` renders unchanged.
+//! The core-driven shell: the TUI's event loop over `aether_client::Session`. Keys translate to the
+//! core's `KeyCode`/`Mods` and feed `Session::on_key`; server pushes feed `on_event(ServerPush)`;
+//! RPC outcomes feed `on_rpc_result`. The shell executes effects in terminal terms (row scrolling,
+//! the status row, the clipboard) and syncs a render view (`AppState`) from `Session` before every
+//! draw, so `ui::draw` renders unchanged.
 //!
 //! Geometry mirrors the iced shell with rows for pixels: the scroll position is a visual
 //! row (`top_visual_row`), reveals overscroll by one row, and window fetches go through
@@ -52,10 +51,10 @@ const TAB_WIDTH: u32 = 4;
 /// no click count, so the shell synthesises the streak from press timing.
 const MULTI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// A completed async operation, drained from the shell's `FuturesUnordered`. Only work that is
-/// NOT a server message on the live connection belongs here — dials and timers. RPC replies ride
-/// the ordered [`Inbound`] stream and dispatch through [`Continuation`]s, so a push the server
-/// emits after a response is always processed after it (docs/client-core.md).
+/// A completed async operation, drained from the shell's `FuturesUnordered`. Only work that is NOT
+/// a server message on the live connection belongs here — dials and timers. RPC replies ride the
+/// ordered [`Inbound`] stream and dispatch through [`Continuation`]s, so a push the server emits
+/// after a response is always processed after it.
 enum Done {
     /// A reconnect dial attempt (see `Effect::Reconnect`).
     Reconnected(Box<Result<Reestablished, ReconnectError>>),
@@ -72,7 +71,7 @@ enum Continuation {
     /// An `Effect::Request` outcome — token routes it to the session's parked mapping.
     Core { token: u64 },
     /// `viewport/subscribe` (shell-initiated; geometry). A newer subscribe supersedes it by
-    /// *deregistering* it (`subscribe()` removes the previous entry via `pending_subscribe`),
+    /// *deregistering* it (`subscribe` removes the previous entry via `pending_subscribe`),
     /// so a reply from a burst of subscribes (e.g. `<`/`>` grep jumps) that survives to dispatch
     /// is always the live one — never a since-deleted viewport_id.
     Subscribed,
@@ -136,8 +135,8 @@ struct BootSpec {
     /// A 0-based `(line, col)` to jump to once `file` opens (`ae src/main.rs:42`). `None` for a bare
     /// open. Initial-boot only — reconnects restore the live cursor, not this.
     jump: Option<(u32, u32)>,
-    /// Tether the client to the buffer `file` opens (docs/tether.md): the quick-edit invocation
-    /// — a file positional without an explicit `--workspace` — where closing that buffer exits.
+    /// Tether the client to the buffer `file` opens: the quick-edit invocation — a file positional
+    /// without an explicit `--workspace` — where closing that buffer exits.
     tether: bool,
     version: String,
 }
@@ -186,10 +185,9 @@ pub struct Shell {
     /// `Effect::PickerScrollReset`.
     picker_scroll: crate::ui::PickerScroll,
     /// Armed by `Effect::RevealPickerSelection(Reveal::Run)` — a group select/step wants the
-    /// freshly-opened run framed (docs/picker-groups.md §9). Applied by `sync_picker` once the
-    /// core state is coherent (the selected row IS the expanded run's header — the reshaped
-    /// push may land a batch after the reply); cleared then, on a scroll reset, and when the
-    /// picker closes.
+    /// freshly-opened run framed. Applied by `sync_picker` once the core state is coherent (the
+    /// selected row IS the expanded run's header — the reshaped push may land a batch after the
+    /// reply); cleared then, on a scroll reset, and when the picker closes.
     pending_group_reveal: bool,
     /// The in-flight `viewport/subscribe`'s request id. A newer subscribe removes it from
     /// `inflight` (deregistering the stale continuation) so a superseded reply can't reinstate
@@ -224,7 +222,7 @@ pub struct Shell {
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
     server_url: String,
     /// Reading-view scroll: first visible row of the laid-out document — the reading sibling of
-    /// `top_visual_row` (docs/markdown-view.md: read-mode scroll is shell-owned).
+    /// `top_visual_row` (read-mode scroll is shell-owned).
     read_scroll: u16,
     /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
     /// scrolling doesn't fight the reveal).
@@ -239,9 +237,9 @@ pub struct Shell {
         u16,
         std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
     )>,
-    /// Per-code-block horizontal scroll (docs/markdown-view.md §2.8), keyed by the block's
-    /// element index: code rows are laid out unchunked and the painter clips them to this
-    /// offset. Cleared when the parse changes (element indices shift with the content).
+    /// Per-code-block horizontal scroll, keyed by the block's element index: code rows are laid out
+    /// unchunked and the painter clips them to this offset. Cleared when the parse changes (element
+    /// indices shift with the content).
     read_hscroll: std::collections::HashMap<usize, u16>,
 }
 
@@ -326,9 +324,9 @@ pub async fn run(
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
 
-    // The hint engine's clock (docs/hints.md): a slow tick whose arm is gated below on
-    // "connected + hints on". The engine's own idle gate covers unattended terminals (crossterm
-    // focus events aren't universal, so the TUI ticks whenever the arm is enabled).
+    // The hint engine's clock: a slow tick whose arm is gated below on "connected + hints on". The
+    // engine's own idle gate covers unattended terminals (crossterm focus events aren't universal,
+    // so the TUI ticks whenever the arm is enabled).
     let mut hint_tick = tokio::time::interval(std::time::Duration::from_secs(2));
     hint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -351,7 +349,7 @@ pub async fn run(
                 shell.run_effects(fx);
             }
             // Only poll the inbound stream while connected. Once the socket dies the channel
-            // is closed, so `recv()` returns `None` *immediately* — without this guard the `select!`
+            // is closed, so `recv` returns `None` *immediately* — without this guard the `select!`
             // would spin on that arm (re-dispatching `ConnectionLost` + redrawing) and peg a core
             // during the whole reconnect backoff. The first `None` (handled while still Connected)
             // flips us to Reconnecting, disabling the arm until `Reconnected` installs a fresh one.
@@ -543,8 +541,8 @@ impl Shell {
                 }
                 Effect::RevealPickerSelection(reveal) => {
                     // Plain selection reveals are handled by the sync (`visible_start` follows
-                    // `selected`); the group-run flavour (docs/picker-groups.md §9) arms a
-                    // scroll adjustment `sync_picker` applies once the run is coherent.
+                    // `selected`); the group-run flavour arms a scroll adjustment `sync_picker`
+                    // applies once the run is coherent.
                     if matches!(reveal, aether_client::picker::Reveal::Run) {
                         self.pending_group_reveal = true;
                     }
@@ -566,10 +564,9 @@ impl Shell {
         }
     }
 
-    /// One message off the ordered inbound stream: a push feeds the core; a reply routes to
-    /// the continuation registered under its request id. Processing here, in stream order, IS
-    /// the delivery contract (docs/client-core.md) — a push the server emitted after a reply is
-    /// handled after it.
+    /// One message off the ordered inbound stream: a push feeds the core; a reply routes to the
+    /// continuation registered under its request id. Processing here, in stream order, IS the
+    /// delivery contract — a push the server emitted after a reply is handled after it.
     fn on_inbound(&mut self, msg: Inbound) {
         match msg {
             Inbound::Notification(n) => self.dispatch(CoreEvent::ServerPush(n)),
@@ -728,8 +725,8 @@ impl Shell {
                     self.session = b.session;
                     self.state = b.state;
                     // Boot installs the session directly (no `adopt_switch`), so the markdown
-                    // reading-view default is applied here (docs/markdown-view.md §1.6); an
-                    // `ae file:line` launch is jump-shaped and lands in the editor.
+                    // reading-view default is applied here; an `ae file:line` launch is jump-shaped
+                    // and lands in the editor.
                     let read_fx = self.session.boot_read_presentation(jumped);
                     self.sent_grid = Some(self.grid());
                     self.subscribe();
@@ -1180,9 +1177,9 @@ impl Shell {
                 _ => {}
             }
         }
-        // The reading view owns the mouse while active: the wheel scrolls the document,
-        // horizontal wheel (or shift+wheel) pans the code block under the pointer, a left
-        // press focuses the element under it (docs/markdown-view.md §2.3).
+        // The reading view owns the mouse while active: the wheel scrolls the document, horizontal
+        // wheel (or shift+wheel) pans the code block under the pointer, a left press focuses the
+        // element under it.
         if self.session.read.is_some() {
             match m.kind {
                 MouseEventKind::ScrollLeft => {
@@ -1644,10 +1641,10 @@ impl Shell {
     }
 
     fn place_cursor(&mut self, place: ViewportPlace) {
-        // Reading view: edge-matched placement of the focused *block* (the bar'd subtree —
-        // docs/markdown-view.md §2.3): `;` leaves READ_GAP between the view top and the
-        // block's top, `Alt-;` between the view bottom and the block's bottom. Read scroll is
-        // shell-owned rows (§3.1); the document-end clamp happens in `read_view`.
+        // Reading view: edge-matched placement of the focused *block* (the bar'd subtree): `;`
+        // leaves READ_GAP between the view top and the block's top, `Alt-;` between the view bottom
+        // and the block's bottom. Read scroll is shell-owned rows; the document-end clamp
+        // happens in `read_view`.
         if let Some(read) = self.session.read.as_ref() {
             let cursor = self.session.buffer.cursor.position;
             let Some(focus) = read.block_focus(cursor) else {
@@ -2000,9 +1997,9 @@ impl Shell {
         });
     }
 
-    /// Build the reading-view render model (docs/markdown-view.md §2.8): lay the document out at
-    /// the current width (cached by `(buffer, revision, cols)`), derive the focused element from
-    /// the server cursor, reveal it when the focus changed, and clamp the scroll.
+    /// Build the reading-view render model: lay the document out at the current width (cached by
+    /// `(buffer, revision, cols)`), derive the focused element from the server cursor, reveal it
+    /// when the focus changed, and clamp the scroll.
     fn read_view(&mut self) -> Option<crate::app::ReadViewState> {
         let read = self.session.read.as_ref()?;
         // First fetch still in flight: show the loading page WITHOUT touching the layout cache —
@@ -2048,10 +2045,10 @@ impl Shell {
             self.read_cache = Some((key.0, key.1, key.2, key.3, std::sync::Arc::new(rows)));
         }
         let rows = self.read_cache.as_ref().expect("just filled").4.clone();
-        // Two projections of the one server cursor (docs/markdown-view.md §1.3): the block bar
-        // always marks the reading position; the interactive target inverts on top of it.
-        // An extended selection adds a third (§12): the selection tint over the selected blocks'
-        // rows — and suppresses the pill (display_target), one selection on screen at a time.
+        // Two projections of the one server cursor: the block bar always marks the reading
+        // position; the interactive target inverts on top of it. An extended selection adds a third
+        //: the selection tint over the selected blocks' rows — and suppresses the pill
+        // (display_target), one selection on screen at a time.
         let cursor_state = self.session.buffer.cursor;
         let block_focus = read.display_block_focus(&cursor_state);
         let target_focus = read.display_target(&cursor_state);
@@ -2135,10 +2132,9 @@ impl Shell {
         self.read_scroll = cur.saturating_add(delta).max(0) as u16;
     }
 
-    /// Pan `element`'s horizontal scroll by `delta` columns (docs/markdown-view.md §2.8):
-    /// clamped so the block's widest row just reaches the window's right edge, and a no-op on
-    /// anything without overflowing rows — only unchunked code rows can overflow, so panning a
-    /// paragraph clamps straight to zero.
+    /// Pan `element`'s horizontal scroll by `delta` columns: clamped so the block's widest row just
+    /// reaches the window's right edge, and a no-op on anything without overflowing rows — only
+    /// unchunked code rows can overflow, so panning a paragraph clamps straight to zero.
     fn read_hscroll_by(&mut self, element: Option<usize>, delta: i32) {
         let Some(e) = element else { return };
         let Some(rows) = self.read_cache.as_ref().map(|c| c.4.clone()) else {
@@ -2449,10 +2445,10 @@ impl Shell {
             core.offset,
             self.picker_scroll,
         );
-        // A group select/step armed the run reveal (docs/picker-groups.md §9): once the core
-        // is coherent — the selection IS the expanded run's header, inside the fetched
-        // window — frame the run and disarm. Until then it stays armed: the reshaped push can
-        // land a batch after the reply that moved the selection.
+        // A group select/step armed the run reveal: once the core is coherent — the selection IS
+        // the expanded run's header, inside the fetched window — frame the run and disarm. Until
+        // then it stays armed: the reshaped push can land a batch after the reply that moved the
+        // selection.
         if self.pending_group_reveal {
             if let Some(run) = core.expanded_run {
                 if run.header_row == core.selected && run.header_row >= core.offset {
@@ -2978,7 +2974,7 @@ pub async fn bootstrap(
                     let workspace_name = opened.workspace.name.clone();
                     let mut session = Session::new(opened.workspace, buffer);
                     // Launched to edit this file: tether the client to it, so closing it quits
-                    // (docs/tether.md) rather than dropping to the chooser.
+                    // rather than dropping to the chooser.
                     if tether {
                         session.tether = Some(session.buffer.buffer_id);
                     }
@@ -3062,10 +3058,9 @@ pub async fn bootstrap(
             let workspace_name = activated.workspace.name.clone();
             let mut session = Session::new(activated.workspace, buffer);
             // A quick-edit launch (`ae file`, workspace *inferred* from the path — `tether` is
-            // never set alongside an explicit `--workspace`): tether the client to the opened
-            // file, so closing it exits (docs/tether.md). A missing path is a file to create
-            // and tethers too; directory args land in the explorer over a scratch — nothing to
-            // tether to.
+            // never set alongside an explicit `--workspace`): tether the client to the opened file,
+            // so closing it exits. A missing path is a file to create and tethers too; directory
+            // args land in the explorer over a scratch — nothing to tether to.
             if tether && resolved.as_ref().is_some_and(|p| !p.is_dir()) {
                 session.tether = Some(session.buffer.buffer_id);
             }

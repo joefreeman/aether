@@ -1,17 +1,16 @@
-//! WebSocket connection actor — the one transport implementation shared by the native shells
-//! (TUI and iced). The core stays sans-IO (docs/client-core.md); this crate is the adapter the
-//! native shells plug between it and a real socket. It is never part of the wasm build: the web
-//! shell bridges the page's own socket instead.
+//! WebSocket connection actor — the one transport implementation shared by the native shells (TUI
+//! and iced). The core stays sans-IO; this crate is the adapter the native shells plug between it
+//! and a real socket. It is never part of the wasm build: the web shell bridges the page's own
+//! socket instead.
 //!
-//! The socket lives in a background task that owns request bookkeeping and delivers **every
-//! inbound message on one ordered [`Inbound`] stream** — responses correlated to the id
-//! [`Handle::send`] returned, notifications interleaved exactly as the server wrote them.
-//! Preserving that order end-to-end is load-bearing (docs/client-core.md): a push the server
-//! emits *after* a response (an async picker fill, a query's re-push) must be processed after
-//! it, and some of those pushes are sent exactly once. Each shell keeps the order intact on its
-//! side by consuming the stream from a single place — the TUI's run loop, iced's sequential
-//! pump. Requests ENQUEUE SYNCHRONOUSLY, so callers issuing several get them on the wire in
-//! call order — the core's `Effect::Request` sequencing contract.
+//! The socket lives in a background task that owns request bookkeeping and delivers **every inbound
+//! message on one ordered [`Inbound`] stream** — responses correlated to the id [`Handle::send`]
+//! returned, notifications interleaved exactly as the server wrote them. Preserving that order
+//! end-to-end is load-bearing: a push the server emits *after* a response (an async picker fill, a
+//! query's re-push) must be processed after it, and some of those pushes are sent exactly once.
+//! Each shell keeps the order intact on its side by consuming the stream from a single place — the
+//! TUI's run loop, iced's sequential pump. Requests ENQUEUE SYNCHRONOUSLY, so callers issuing
+//! several get them on the wire in call order — the core's `Effect::Request` sequencing contract.
 //!
 //! [`Handle::rpc`] (await-style, correlated via oneshot) remains for the boot/reconnect dials,
 //! which run before anything is pumping the stream; once a shell's loop covers the connection,
@@ -385,11 +384,11 @@ mod tests {
         }
     }
 
-    /// The load-bearing transport contract (docs/client-core.md): responses and notifications
-    /// are delivered on ONE stream, in the order they came off the socket. A push the server
-    /// emits after a response must be processed after it — some pushes (async picker fills) are
-    /// sent exactly once, so reordering them ahead of the response that establishes their
-    /// generation silently drops them ("Finding symbols…" forever).
+    /// The load-bearing transport contract: responses and notifications are delivered on ONE
+    /// stream, in the order they came off the socket. A push the server emits after a response must
+    /// be processed after it — some pushes (async picker fills) are sent exactly once, so
+    /// reordering them ahead of the response that establishes their generation silently drops them
+    /// ("Finding symbols…" forever).
     #[tokio::test]
     async fn inbound_stream_preserves_wire_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1510,8 +1510,8 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
 
 #[tokio::test]
 async fn buffer_open_composite_records_nav() {
-    // docs/protocol-composites.md, A: `record_nav_from` folds the old nav/record ->
-    // buffer/open client chain into one open.
+    // `record_nav_from` folds the old nav/record -> buffer/open
+    // client chain into one open.
     let (_server, mut ws, origin_id) = setup_with_buffer("alpha beta\n").await;
 
     let opened: BufferOpenResult = send_request::<BufferOpen>(
@@ -1544,8 +1544,8 @@ async fn buffer_open_composite_records_nav() {
 
 #[tokio::test]
 async fn buffer_close_open_next_attaches_in_one_trip() {
-    // docs/protocol-composites.md, B: closing with `open_next` returns the successor fully
-    // opened — the MRU buffer when one exists, a fresh scratch when none remain.
+    // Closing with `open_next` returns the successor fully opened —
+    // the MRU buffer when one exists, a fresh scratch when none remain.
     let (_server, mut ws, first) = setup_with_buffer("one\n").await;
     let second: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
@@ -1593,8 +1593,8 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
 
 #[tokio::test]
 async fn workspace_activate_open_last_lands_in_one_trip() {
-    // docs/protocol-composites.md, C: activate + land (MRU buffer, or a fresh transient
-    // scratch on first visit) in one message.
+    // Activate + land (MRU buffer, or a fresh transient scratch on
+    // first visit) in one message.
     let (_server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
 
     // Re-activating with open_last reattaches to the MRU buffer.
@@ -1643,7 +1643,7 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
 
 #[tokio::test]
 async fn input_text_at_selection_start_inserts_before() {
-    // docs/protocol-composites.md, D: paste-before's collapse rides the edit itself.
+    // Paste-before's collapse rides the edit itself.
     let (_server, mut ws, buffer_id) = setup_with_buffer("abcde\n").await;
     // Select "bcd" (cursor on 'd', anchor on 'b').
     send_request::<CursorSet>(
@@ -1744,8 +1744,8 @@ async fn input_text_replace_selection_replaces_a_multi_char_selection() {
 
 #[tokio::test]
 async fn input_open_line_below_and_above() {
-    // docs/protocol-composites.md, E: vim's o/O as one edit. Below smart-indents; Above
-    // opens an unindented line and lands on it.
+    // Vim's o/O as one edit. Below smart-indents; Above opens an
+    // unindented line and lands on it.
     let (_server, mut ws, buffer_id) = setup_with_buffer("    indented\nplain\n").await;
     // Cursor mid-line-0 (col 6); `o` opens below with the line's indent copied.
     send_request::<CursorSet>(
@@ -1804,7 +1804,7 @@ async fn input_open_line_below_and_above() {
 
 #[tokio::test]
 async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
-    // docs/protocol-composites.md, G: the blame-then-commit-lookup chain in one message.
+    // The blame-then-commit-lookup chain in one message.
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "tracked.rs", "fn main() {}\n");
     let server = spawn_for_test("blame-composite-proj", vec![dir.path().to_path_buf()])
@@ -1883,7 +1883,7 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
 
 #[tokio::test]
 async fn search_set_from_selection_echoes_literal() {
-    // docs/protocol-composites.md, H: Alt-/ in one trip — the server takes the selection's text,
+    // Alt-/ in one trip — the server takes the selection's text,
     // sets a *literal* search of it (regex off), and echoes the raw query.
     let (_server, mut ws, buffer_id) = setup_with_buffer("a.c x\na.c y\nabc z\n").await;
     // Select "a.c" on line 0 (chars 0..=2) — the dot must match literally, not as a regex.
@@ -1948,7 +1948,7 @@ async fn search_set_from_selection_echoes_literal() {
 
 #[tokio::test]
 async fn search_nav_count_and_revive() {
-    // docs/protocol-composites.md, I: `3n` and the history-revive both ride one nav RPC.
+    // `3n` and the history-revive both ride one nav RPC.
     let (_server, mut ws, buffer_id) = setup_with_buffer("x a x b x c\n").await;
     // count: step two matches forward in one trip (cursor starts on the first x, so two
     // steps land on the third; wrapping semantics untouched).
@@ -1991,7 +1991,7 @@ async fn search_nav_count_and_revive() {
 
 #[tokio::test]
 async fn counted_edits_run_server_side() {
-    // docs/protocol-composites.md, K: the count loops live server-side — one trip each.
+    // The count loops live server-side — one trip each.
     let (_server, mut ws, buffer_id) = setup_with_buffer("a\nb\nc\nd\n").await;
 
     // 3J from line 0 joins three times: "abcd" (join inserts no separator).
@@ -11640,9 +11640,9 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     let update = view.update.expect("the view carries its initial window");
     assert_eq!(update.kind, PickerKind::GitChanges);
 
-    // Two hunks across two files: one header row per file (sorted by path), hunk counts on
-    // the rows — and the first group opens itself (docs/picker-groups.md §9), so a.rs's hunk
-    // row sits inline under its header from the start.
+    // Two hunks across two files: one header row per file (sorted by path), hunk counts on the rows
+    // — and the first group opens itself, so a.rs's hunk row sits inline under its header from the
+    // start.
     assert_eq!(update.total_matches, 2, "hunks count; headers don't");
     assert_eq!(
         group_rows(update.items()),
@@ -11986,8 +11986,8 @@ async fn git_changes_file_is_locked_to_its_buffer() {
         send_request::<PickerView>(&mut ws, 5, &view(PickerKind::GitChanges, None)).await;
     let mut p = paths(&workspace);
     p.sort();
-    // The first group opens itself (docs/picker-groups.md §9), so its file appears as both
-    // the header row and its hunk row — identity, not multiplicity, is what's under test.
+    // The first group opens itself, so its file appears as both the header row and its hunk row —
+    // identity, not multiplicity, is what's under test.
     p.dedup();
     assert_eq!(p, vec!["a.rs".to_string(), "b.rs".to_string()]);
 
@@ -12112,9 +12112,8 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
         panic!("expected GitChange, got {centered:?}");
     };
     assert_eq!(*line, 4, "centered on the hunk at the cursor line");
-    // Framing an item implies revealing it (docs/picker-groups.md): the centred open expanded
-    // the cursor's file group, so the resolved hunk is a real window row, not hidden behind a
-    // collapsed header.
+    // Framing an item implies revealing it: the centred open expanded the cursor's file group, so
+    // the resolved hunk is a real window row, not hidden behind a collapsed header.
     let update = view.update.expect("window rides the response");
     assert_eq!(
         group_rows(update.items()),
@@ -12129,9 +12128,9 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
     drop(server);
 }
 
-/// `picker/set_group` end-to-end (docs/picker-groups.md §9): selecting a group is idempotent
-/// and moves the accordion's one expansion, `step` walks neighbouring groups and stops at the
-/// ends, and a vanished group answers `row: None`.
+/// `picker/set_group` end-to-end: selecting a group is idempotent and moves the accordion's one
+/// expansion, `step` walks neighbouring groups and stops at the ends, and a vanished group answers
+/// `row: None`.
 #[tokio::test]
 async fn picker_set_group_holds_the_accordion_invariant() {
     let dir = tempfile::tempdir().unwrap();
@@ -12357,9 +12356,9 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
     drop(server);
 }
 
-/// `Ctrl-j` capture with the selection sitting on a collapsed header: the anchor resolves to
-/// the run's first item, and the captured list spans the *whole* filtered set — collapse is
-/// view state, not a filter (docs/picker-groups.md).
+/// `Ctrl-j` capture with the selection sitting on a collapsed header: the anchor resolves to the
+/// run's first item, and the captured list spans the *whole* filtered set — collapse is view state,
+/// not a filter.
 #[tokio::test]
 async fn jumplist_capture_includes_collapsed_hidden_hits() {
     let (server, mut ws) = setup_grep_workspace().await;
@@ -15302,9 +15301,9 @@ async fn setup_grep_workspace() -> (
     (server, ws)
 }
 
-/// A collapsible picker window's `Group` header rows as `(header text, count, expanded)`
-/// triples — the file's relative path or the label — which is what a collapsed window is made
-/// of by default (docs/picker-groups.md). Non-header rows are skipped.
+/// A collapsible picker window's `Group` header rows as `(header text, count, expanded)` triples —
+/// the file's relative path or the label — which is what a collapsed window is made of by default.
+/// Non-header rows are skipped.
 fn group_rows(items: &[PickerItem]) -> Vec<(String, u32, bool)> {
     items
         .iter()
@@ -15816,8 +15815,8 @@ async fn closing_a_picker_clears_it_and_moves_the_generation() {
 
 /// A fresh grep open (`PickerReset::All`) throws away the query, the hits it produced *and* the
 /// filter chips — grep opens exactly as clean as Files and the Explorer do. Recalling a query along
-/// with the chips it ran under is the input history's job (docs/input-history.md), and stepping the
-/// old *results* is the jumplist's (docs/jumplist.md).
+/// with the chips it ran under is the input history's job, and stepping the old *results* is the
+/// jumplist's.
 #[tokio::test]
 async fn grep_fresh_open_wipes_hits_and_filters() {
     let (server, mut ws) = setup_grep_filter_workspace().await;
@@ -16182,10 +16181,10 @@ async fn step_in_file(
 
 #[tokio::test]
 async fn jumplist_capture_snapshots_and_step_composite_opens() {
-    // docs/jumplist.md: picker Ctrl-j snapshots the filtered results and reports the
-    // highlighted row's position (the client then shows the Jumplist picker framed on it —
-    // capture itself doesn't navigate). Stepping is the composite that opens.
-    // Workspace needle hits: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
+    // Picker Ctrl-j snapshots the filtered results and reports the highlighted
+    // row's position (the client then shows the Jumplist picker framed on it — capture itself
+    // doesn't navigate). Stepping is the composite that opens. Workspace needle hits:
+    // src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4.
     let (_server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
     set_point_cursor(&mut ws, 21, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
@@ -16572,7 +16571,7 @@ async fn cursor_carries_jumplist_position_when_selection_covers_an_entry() {
 
 /// Capture the workspace's *files* into the jumplist (`Ctrl-j` in the Files picker) with
 /// `relative_path` as the highlighted row. The rows are whole targets — no position — so the
-/// captured list is ungrouped and steps one file at a time (docs/jumplist.md).
+/// captured list is ungrouped and steps one file at a time.
 async fn capture_files(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -17021,21 +17020,19 @@ async fn jumplist_capture_from_git_changes_picker() {
     drop(server);
 }
 
-/// The Jumplist picker (`Space j`): a collapsible accordion of the captured entries under
-/// their source group headers (one run always open — the selected group; `picker/set_group`
-/// moves it); a fuzzy query narrows the entries in place (candidate order preserved);
-/// selecting jumps like the source picker's Enter; and `Ctrl-j` re-captures the filtered
-/// subset — iterative narrowing (docs/jumplist.md §2.6).
+/// The Jumplist picker (`Space j`): a collapsible accordion of the captured entries under their
+/// source group headers (one run always open — the selected group; `picker/set_group` moves it); a
+/// fuzzy query narrows the entries in place (candidate order preserved); selecting jumps like the
+/// source picker's Enter; and `Ctrl-j` re-captures the filtered subset — iterative narrowing.
 #[tokio::test]
 async fn jumplist_picker_lists_filters_and_recaptures() {
     let (server, mut ws) = setup_grep_with_needle_query().await;
     let buffer_id = open_test_buffer(&mut ws, 20, "src/main.rs").await;
     let _ = capture_grep_results(&mut ws, 21, "src/lib.rs", 0, 3).await;
 
-    // Open the picker: the Jumplist is collapsible (docs/picker-groups.md §9), so with
-    // nothing centred the accordion opens with one selectable `Group` row per captured file
-    // and the FIRST group's entries inline — the rest hidden behind their headers (but still
-    // counted: collapse is view state).
+    // Open the picker: the Jumplist is collapsible, so with nothing centred the accordion opens
+    // with one selectable `Group` row per captured file and the FIRST group's entries inline — the
+    // rest hidden behind their headers (but still counted: collapse is view state).
     let view = send_request::<PickerView>(
         &mut ws,
         22,
@@ -17216,10 +17213,10 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     drop(server);
 }
 
-/// The Jumplist picker's dir/glob chips (docs/picker-filters.md): path filters narrow the
-/// captured entries by their file identity, re-capture bakes the narrowed set in, and the
-/// `path_filterable` echo tracks whether the (current) capture is worth scoping at all —
-/// true while it spans multiple files, false once narrowed to one.
+/// The Jumplist picker's dir/glob chips: path filters narrow the captured entries by their file
+/// identity, re-capture bakes the narrowed set in, and the `path_filterable` echo tracks whether
+/// the (current) capture is worth scoping at all — true while it spans multiple files, false once
+/// narrowed to one.
 #[tokio::test]
 async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
     // Workspace needle hits: src/lib.rs:0:3, src/main.rs:1:4, src/main.rs:2:4 — two files.
@@ -22773,7 +22770,7 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, id_base: u64,
     panic!("buffer diagnostics present={want} never reached");
 }
 
-// ---- declared projects & pinned language servers (docs/projects.md) -------------------------
+// ---- declared projects & pinned language servers -------------------------
 
 /// A project declared under the workspace's first (and only) root. A project is a *directory*
 /// relative to that root — `"."` being the root itself — with its language inferred from the build
@@ -22838,7 +22835,7 @@ async fn workspace_infer_language_suggests_and_excludes() {
     assert_eq!(r.language, None);
 }
 
-// ---- workspace symbols (docs/workspace-symbols.md) -------------------------------------------
+// ---- workspace symbols -------------------------------------------
 
 /// A dummy symbol at `line`/`character` of `path`.
 fn dummy_symbol(
@@ -22859,7 +22856,7 @@ fn dummy_symbol(
 
 /// Open the workspace-symbols picker and run one query, returning the rows the server settled on.
 /// Polls the `picker/view` response rather than waiting on pushes, because `send_request` eats
-/// notifications (see `docs/projects.md`'s dummy-fixture note).
+/// notifications ('s dummy-fixture note).
 async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
     let _ = send_request::<PickerView>(ws, 90, &view_params(PickerKind::WorkspaceSymbols)).await;
     let _: () = send_request::<PickerQuery>(
@@ -22887,9 +22884,9 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
         .await;
         if let Some(items) = view.update.as_ref().and_then(|u| u.items.clone()) {
             if !items.is_empty() {
-                // The first group opens itself (docs/picker-groups.md §9), but symbols can
-                // span several files: select the first group explicitly and re-view so
-                // callers get its Symbol rows; headers are stripped from the return.
+                // The first group opens itself, but symbols can span several files: select the
+                // first group explicitly and re-view so callers get its Symbol rows; headers are
+                // stripped from the return.
                 let Some(PickerItem::Group { header, .. }) = items.first() else {
                     return items;
                 };
@@ -23197,11 +23194,11 @@ async fn poll_symbol_view(
     panic!("workspace-symbols view never reached the expected state");
 }
 
-/// The `Dir` chip prunes the LSP fan-out (`docs/workspace-symbols.md`): a project whose server
-/// root is disjoint from every scoped directory is not asked at all, not merely filtered out
-/// afterwards. And once a fan-out has settled, a filter-only change whose admitted servers it
-/// covers reuses the accumulated candidates — the servers never see filters, so re-asking would
-/// wipe and refetch the exact answers already held.
+/// The `Dir` chip prunes the LSP fan-out: a project whose server root is disjoint from every scoped
+/// directory is not asked at all, not merely filtered out afterwards. And once a fan-out has
+/// settled, a filter-only change whose admitted servers it covers reuses the accumulated candidates
+/// — the servers never see filters, so re-asking would wipe and refetch the exact answers already
+/// held.
 #[tokio::test]
 async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_it() {
     use aether_server::DummyLspConfig;
@@ -25501,10 +25498,10 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
 }
 
 /// A client that is *not* viewing the closed buffer — it switched to another one — still gets the
-/// `buffer/closed` push when the buffer lives in its active workspace. This is what lets a
-/// tethered client (docs/tether.md) exit when another client closes its tether out from under it,
-/// even mid-browse; clients ignore pushes for buffers that are neither current nor the tether, so
-/// the broad audience is safe.
+/// `buffer/closed` push when the buffer lives in its active workspace. This is what lets a tethered
+/// client exit when another client closes its tether out from under it, even mid-browse; clients
+/// ignore pushes for buffers that are neither current nor the tether, so the broad audience is
+/// safe.
 #[tokio::test]
 async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     let dir = tempfile::tempdir().unwrap();
@@ -25584,11 +25581,10 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     drop(server);
 }
 
-/// The `ae --web` waiter's contract (docs/tether.md §6, `aether-ae/src/web.rs`): a client that
-/// activates a workspace and opens a buffer but never subscribes ANY viewport still receives the
-/// `buffer/closed` push when another client closes that buffer — membership in the active
-/// workspace's MRU alone routes it. This is what lets the headless waiter exit when the browser
-/// tab finishes the edit.
+/// The `ae --web` waiter's contract (`aether-ae/src/web.rs`): a client that activates a workspace
+/// and opens a buffer but never subscribes ANY viewport still receives the `buffer/closed` push
+/// when another client closes that buffer — membership in the active workspace's MRU alone routes
+/// it. This is what lets the headless waiter exit when the browser tab finishes the edit.
 #[tokio::test]
 async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
     let dir = tempfile::tempdir().unwrap();
@@ -25993,9 +25989,8 @@ async fn grep_with_filters(
     }
 }
 
-/// The relative paths hit by an update, in result order — read off the collapsed window's
-/// `Group` header rows, which carry exactly one row per matched file
-/// (docs/picker-groups.md).
+/// The relative paths hit by an update, in result order — read off the collapsed window's `Group`
+/// header rows, which carry exactly one row per matched file.
 fn grep_hit_files(update: &PickerUpdateParams) -> Vec<String> {
     update
         .items()
@@ -27062,7 +27057,7 @@ async fn buffer_content_unknown_buffer_errors() {
 
 /// `syntax/highlight_snippet`: stateless tree-sitter over a snippet — real captures for a known
 /// language, the fence alias table resolving short names, and an empty (not error) result for an
-/// unknown language (docs/markdown-view.md §2.8).
+/// unknown language.
 #[tokio::test]
 async fn highlight_snippet_uses_registry_and_aliases() {
     use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
@@ -27302,9 +27297,9 @@ async fn http_get(ws_url: &str, path: &str) -> (String, String, Vec<u8>) {
     (status, head, buf[header_end..].to_vec())
 }
 
-/// The web reading view's image route: serves files relative to a buffer's directory, confined
-/// to the buffer's workspace root after canonicalization (docs/markdown-view.md §3) — `..` and
-/// symlink escapes 404, as do unknown buffers and non-image extensions.
+/// The web reading view's image route: serves files relative to a buffer's directory, confined to
+/// the buffer's workspace root after canonicalization — `.` and symlink escapes 404, as do unknown
+/// buffers and non-image extensions.
 #[tokio::test]
 async fn buffer_asset_route_serves_and_confines() {
     let dir = tempfile::tempdir().unwrap();
@@ -27371,8 +27366,8 @@ async fn buffer_asset_route_serves_and_confines() {
     );
     assert_eq!(body, b"PNGDATA");
 
-    // A root-relative source (leading `/`, GitHub semantics — docs/markdown-view.md §2.4)
-    // resolves against the buffer's containing root, not the filesystem.
+    // A root-relative source (leading `/`, GitHub semantics) resolves against the buffer's
+    // containing root, not the filesystem.
     let (status, _, body) =
         http_get(&url, &format!("/asset/{}/%2Fimg.png", nested.buffer_id)).await;
     assert!(
@@ -29432,7 +29427,7 @@ async fn keeping_a_transient_buffer_persists_it() {
     drop(server);
 }
 
-// ---- unsaved-buffer persistence (docs/unsaved-persistence.md) -----------------------------------
+// ---- unsaved-buffer persistence -----------------------------------
 
 /// Poll `dir` until it contains at least one (non-tmp) file, or time out. Used to wait for the
 /// periodic backup flush (≈250ms) to land before simulating a restart.
@@ -30015,10 +30010,10 @@ async fn app_info_matches_the_status_endpoint() {
     drop(server);
 }
 
-/// Hint events (docs/hints.md) aggregate server-side across clients — increments
-/// commute, so two windows can't clobber each other — and the state survives a server restart via
-/// the periodically-flushed `hints.json`. Retirement itself needs uses on two distinct calendar
-/// days, which a wall-clock test can't cross; that logic is unit-tested in `config`.
+/// Hint events aggregate server-side across clients — increments commute, so two windows can't
+/// clobber each other — and the state survives a server restart via the periodically-flushed
+/// `hints.json`. Retirement itself needs uses on two distinct calendar days, which a wall-clock
+/// test can't cross; that logic is unit-tested in `config`.
 #[tokio::test]
 async fn hints_aggregate_across_clients_and_persist() {
     use aether_protocol::hints::{
@@ -30148,10 +30143,10 @@ async fn hints_aggregate_across_clients_and_persist() {
     drop(server);
 }
 
-/// Input history (docs/input-history.md) is scoped **per workspace**, shared by every client on
-/// that workspace, and persisted: a grep term recorded in one window is recallable in another, and
-/// survives a daemon restart. The per-kind lists stay independent (a glob is never a query), and
-/// a client with no workspace active — the boot chooser — gets empty lists rather than an error.
+/// Input history is scoped **per workspace**, shared by every client on that workspace, and
+/// persisted: a grep term recorded in one window is recallable in another, and survives a daemon
+/// restart. The per-kind lists stay independent (a glob is never a query), and a client with no
+/// workspace active — the boot chooser — gets empty lists rather than an error.
 #[tokio::test]
 async fn history_records_per_workspace_and_persists() {
     use aether_protocol::history::{
@@ -30350,7 +30345,7 @@ async fn history_records_per_workspace_and_persists() {
     drop(server);
 }
 
-// ---- block edits (markdown reading view, docs/markdown-view.md §12) -----------------------------
+// ---- block edits (markdown reading view) -----------------------------
 
 #[tokio::test]
 async fn move_block_swaps_siblings_selects_the_moved_text_and_undoes_atomically() {
@@ -30591,7 +30586,7 @@ async fn move_block_past_a_list_that_interrupts_it_keeps_the_block_separate() {
 async fn block_edits_refuse_front_matter_with_a_reason() {
     use aether_protocol::input::{InputDeleteBlock, InputPasteBlock, PasteBlockParams};
     // Front matter is only front matter while it opens the file: cutting it, replacing it or
-    // pushing a block above it all refuse with a toastable reason (docs/markdown-view.md §12.1).
+    // pushing a block above it all refuse with a toastable reason.
     let (server, mut ws, buffer_id) = setup_with_buffer("---\nkey: v\n---\n\nBody.\n").await;
     let p = |line: u32, col: u32| LogicalPosition { line, col };
     set_snapped(&mut ws, 10, buffer_id, p(0, 0), p(0, 0), Granularity::Char).await;
@@ -31303,7 +31298,7 @@ async fn git_repos_treats_a_worktree_as_its_own_repo_sharing_a_common_dir() {
     let repo = init_repo_at(&main);
     commit_file(&repo, "a.rs", "one\n");
 
-    // Sibling-of-the-repo layout, per the worktree convention in docs/git-phase-2.md. libgit2
+    // Sibling-of-the-repo layout, per the worktree convention. libgit2
     // creates the leaf but not its parent.
     let wt_path = base.join("main-worktrees/feature");
     std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
@@ -32700,8 +32695,7 @@ async fn checkout_refuses_a_branch_held_by_another_worktree() {
 
 #[tokio::test]
 async fn checkout_surfaces_gits_refusal_verbatim() {
-    // Anything only git knows arrives as `Refused` with its own text — never parsed into a
-    // variant (docs/git-phase-2.md decision 1).
+    // Anything only git knows arrives as `Refused` with its own text — never parsed into a variant.
     let (server, mut ws, repo, root, _buf) = setup_checkout_workspace().await;
 
     let res = checkout(&mut ws, 3, &root, "no-such-branch", false).await;
@@ -34825,8 +34819,7 @@ async fn git_fetch_refuses_a_repo_the_workspace_cannot_reach() {
     // Fetching reaches the network on the user's behalf, so the repo has to be one they actually
     // opened. A repo the active workspace can't see at all is refused outright; the narrower
     // `REPO_NOT_WRITABLE` case (reachable through a buffer but under no root) can't be built here,
-    // because `buffer/open` gives such a buffer no baseline in the first place — see
-    // docs/git-phase-2.md decision 2.
+    // because `buffer/open` gives such a buffer no baseline in the first place —
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -36954,7 +36947,7 @@ async fn binding_remaps_the_repo_root_and_leaves_the_others_alone() {
 
 #[tokio::test]
 async fn a_second_repo_binds_alongside_the_first() {
-    // §9.2: binding a repo that isn't bound yet adds to what this workspace holds. That is the
+    // Binding a repo that isn't bound yet adds to what this workspace holds. That is the
     // whole multi-repo story — run the command once per repo.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
@@ -37363,7 +37356,7 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
 
 #[tokio::test]
 async fn a_workspace_whose_worktree_vanished_degrades_to_its_configured_roots() {
-    // §10.6: a `git worktree remove` in a terminal invalidates a binding at any moment. Refusing to
+    // A `git worktree remove` in a terminal invalidates a binding at any moment. Refusing to
     // open would leave no way back in, so the root falls back to the configured path instead. This
     // is the property that makes bindings safe to keep in machine state.
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
@@ -37762,7 +37755,7 @@ async fn removing_a_worktree_forgets_the_bindings_that_named_it() {
 /// existed — roots, index, watches and open buffers all aimed at deleted paths, recoverable only by
 /// restarting the server, because nothing re-materialises a workspace whose bindings moved
 /// underneath it.
-/// §9.3's first promise: "the active buffer always follows" — *the* active buffer, not whichever
+/// The first promise: "the active buffer always follows" — *the* active buffer, not whichever
 /// one the workspace's MRU happens to head.
 ///
 /// `open_last` alone can't keep that promise: it lands on the MRU head, which is the same file only

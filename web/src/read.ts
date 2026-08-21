@@ -1,8 +1,7 @@
-//! The markdown reading view's DOM renderer (docs/markdown-view.md §2.8, web). Renders the
-//! shared markdown AST (`markdown.ts` types, parsed in the Rust core) as semantic, typographic
-//! HTML — real headings, tables, lists, quotes, code panels, images via the server's confined
-//! `/asset/` route. Everything goes through `textContent` (never `innerHTML`); link
-//! hrefs are scheme-checked.
+//! The markdown reading view's DOM renderer. Renders the shared markdown AST (`markdown.ts` types,
+//! parsed in the Rust core) as semantic, typographic HTML — real headings, tables, lists, quotes,
+//! code panels, images via the server's confined `/asset/` route. Everything goes through
+//! `textContent` (never `innerHTML`); link hrefs are scheme-checked.
 //!
 //! Focus (the reading cursor) is derived core-side from the server cursor and arrives as a
 //! source byte span: the node whose `data-espan` matches gets `.md-focus`. The shell scrolls
@@ -28,7 +27,7 @@ export interface ReadDoc {
    *  inside, rendered as the pill on top of the block bar; null otherwise. Both derive from
    *  the one server cursor. */
   target_span: MdSpan | null;
-  /** The extended block selection's inclusive source byte range (docs/markdown-view.md §12) —
+  /** The extended block selection's inclusive source byte range —
    *  intersecting top-level blocks tint `.md-selected`. Null while the cursor is a point. */
   selection_span?: MdSpan | null;
   buffer_id: number;

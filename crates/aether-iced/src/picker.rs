@@ -268,7 +268,7 @@ pub fn overlay<'a>(
     // leads with a `label: rel/` breadcrumb (workspace-relative, terminal format), flush
     // against the query; the placeholder only shows when there's no breadcrumb.
     let mut input = row![].align_y(iced::Alignment::Center);
-    // Filter chips lead the row, before the explorer breadcrumb (docs/picker-filters.md).
+    // Filter chips lead the row, before the explorer breadcrumb.
     let chip_row = state.chip_row(roots);
     if !chip_row.is_empty() {
         let mut chips_el = row![].spacing(6).align_y(iced::Alignment::Center);
@@ -463,9 +463,9 @@ pub fn overlay<'a>(
             DisplayRow::Item { abs, item } => {
                 let selected = abs == state.selected;
                 let hovered = state.hovered == Some(abs);
-                // Two-level hierarchy (docs/picker-groups.md §9): the collapsible kinds'
-                // item rows indent under their group header, aligning with the header text
-                // past its disclosure-mark cell. Header rows start flush.
+                // Two-level hierarchy: the collapsible kinds' item rows indent under their group
+                // header, aligning with the header text past its disclosure-mark cell. Header rows
+                // start flush.
                 let mut content = render_item(item, roots, tether, hovered, ui, p);
                 if state.collapsible && !matches!(item, PickerItem::Group { .. }) {
                     content = row![
@@ -571,7 +571,7 @@ pub fn overlay<'a>(
             match state.display_rows().get(rel)? {
                 // The governing group of an item row is the last span at-or-before it. A
                 // collapsible kind's own `Group` header row renders itself (chevron + count,
-                // selectable) — no pin on top of it (docs/picker-groups.md).
+                // selectable) — no pin on top of it.
                 DisplayRow::Item { abs, item } => {
                     if matches!(item, PickerItem::Group { .. }) {
                         return None;
@@ -1077,9 +1077,9 @@ fn group_header_label(roots: &[String], header: &GroupHeader) -> String {
     }
 }
 
-/// The sticky-pin stand-in for a collapsible kind's scrolled-off `Group` header row
-/// (docs/picker-groups.md): the same chevron + label + right-aligned count dressing as the row
-/// itself, over the section-header backdrop.
+/// The sticky-pin stand-in for a collapsible kind's scrolled-off `Group` header row: the same
+/// chevron + label + right-aligned count dressing as the row itself, over the section-header
+/// backdrop.
 fn group_pin_header<'a>(
     roots: &[String],
     header: &GroupHeader,
@@ -1091,9 +1091,8 @@ fn group_pin_header<'a>(
     container(
         row![
             disclosure_mark(expanded, ui, p),
-            // Not bold (unlike the derived section headers): the indent under the header
-            // (docs/picker-groups.md §9.2) already carries the hierarchy, and the accent alone
-            // marks the row as chrome.
+            // Not bold (unlike the derived section headers): the indent under the header already
+            // carries the hierarchy, and the accent alone marks the row as chrome.
             text(group_header_label(roots, header))
                 .size(ui.body())
                 .font(SANS)
@@ -1120,9 +1119,9 @@ fn group_pin_header<'a>(
     .into()
 }
 
-/// The group header's disclosure chevron in a fixed-width cell — fixed so the header text
-/// starts at a known x, and the item rows' indent ([`GROUP_ITEM_INDENT`] = this cell + the
-/// row's 6px gap) lines their text up under it (docs/picker-groups.md §9).
+/// The group header's disclosure chevron in a fixed-width cell — fixed so the header text starts at
+/// a known x, and the item rows' indent ([`GROUP_ITEM_INDENT`] = this cell + the row's 6px gap)
+/// lines their text up under it.
 fn disclosure_mark<'a>(
     expanded: bool,
     ui: theme::Ui,
@@ -1141,8 +1140,8 @@ fn disclosure_mark<'a>(
 /// The disclosure-mark cell's tuned width (px at scale 1); see [`disclosure_mark`].
 const MARK_CELL: f32 = 12.0;
 
-/// A collapsible kind's item-row indent: the mark cell plus the header row's 6px gap, so item
-/// text aligns with the header text above it (docs/picker-groups.md §9).
+/// A collapsible kind's item-row indent: the mark cell plus the header row's 6px gap, so item text
+/// aligns with the header text above it.
 pub fn group_item_indent(ui: theme::Ui) -> f32 {
     ui.at(MARK_CELL) + 6.0
 }
@@ -1238,10 +1237,9 @@ fn render_item<'a>(
     p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     match item {
-        // A collapsible group's header row (docs/picker-groups.md) — a real, selectable row
-        // in the same accent chrome as the derived headers, plus a disclosure mark and
-        // the run's right-aligned item count. The selection band comes from the row wrapper,
-        // like any other item.
+        // A collapsible group's header row — a real, selectable row in the same accent chrome as
+        // the derived headers, plus a disclosure mark and the run's right-aligned item count. The
+        // selection band comes from the row wrapper, like any other item.
         PickerItem::Group {
             header,
             count,
@@ -1313,8 +1311,8 @@ fn render_item<'a>(
             )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            // The session's tether: the status bar's dim `*` after the path (docs/tether.md —
-            // closing this row exits the client). Upright even on a slanted transient row.
+            // The session's tether: the status bar's dim `*` after the path (closing this row exits
+            // the client). Upright even on a slanted transient row.
             if tether == Some(*buffer_id) {
                 // `fg_muted`: the dim-but-legible rung between `fg_dim` and `fg` (dark stays
                 // the historic NORD3_BRIGHTER).
@@ -1872,10 +1870,10 @@ fn render_item<'a>(
             ));
             r.into()
         }
-        // A captured entry renders like the kind of thing it points at (docs/jumplist.md §2.2):
-        // trimmed text on the left, right-aligned dim line number on the right — no dot, no
-        // dressing. Leading whitespace strips and the indices shift with it, since most sources
-        // are code lines (grep previews, hunk lines).
+        // A captured entry renders like the kind of thing it points at: trimmed text on the left,
+        // right-aligned dim line number on the right — no dot, no dressing. Leading whitespace
+        // strips and the indices shift with it, since most sources are code lines (grep previews,
+        // hunk lines).
         PickerItem::JumplistEntry {
             line,
             display,

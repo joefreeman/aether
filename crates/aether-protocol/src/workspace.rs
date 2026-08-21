@@ -65,10 +65,9 @@ pub struct WorkspaceActivateParams {
     /// there is no way for a binding to strand you.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees: Option<std::collections::BTreeMap<crate::git::RepoId, String>>,
-    /// Also open the landing buffer — the workspace's `last_buffer_id` when there is one, a
-    /// fresh *transient* scratch otherwise — and return it in `opened`. The bootstrap
-    /// convention (activate, then land somewhere) folded into one round-trip
-    /// (docs/protocol-composites.md, C).
+    /// Also open the landing buffer — the workspace's `last_buffer_id` when there is one, a fresh
+    /// *transient* scratch otherwise — and return it in `opened`. The bootstrap convention
+    /// (activate, then land somewhere) folded into one round-trip.
     #[serde(default)]
     pub open_last: bool,
 }
@@ -135,7 +134,7 @@ pub struct WorkspaceWorktree {
 }
 
 /// One declared project — a marker file whose language server is pinned open while the workspace is
-/// active (`docs/projects.md`).
+/// active.
 ///
 /// Rendered as the canonical `[root]: [path]` buffer-location format (`aether-client/labels.rs`),
 /// like every other in-workspace file reference.
@@ -284,11 +283,11 @@ pub struct WorkspaceRemoveRootResult {
     pub next_buffer_id: Option<crate::BufferId>,
 }
 
-/// Declare a project in a workspace (`docs/projects.md`): a *directory* whose language server is
-/// pinned open while the workspace is active. The server validates it (relative, inside its root,
-/// exists, and its language either inferable from the build manifests inside or given explicitly),
-/// appends it to the TOML under that root, and launches the server straight away rather than waiting
-/// for the next activation.
+/// Declare a project in a workspace: a *directory* whose language server is pinned open while the
+/// workspace is active. The server validates it (relative, inside its root, exists, and its
+/// language either inferable from the build manifests inside or given explicitly), appends it to
+/// the TOML under that root, and launches the server straight away rather than waiting for the next
+/// activation.
 ///
 /// Refuses duplicates and anything that fails to resolve — unlike activation, which skips bad
 /// entries and carries on, a *new* declaration should fail loudly while the user is looking at it.
@@ -456,8 +455,7 @@ pub struct WorkspaceRenamedParams {
 ///
 /// **One rule: this always adjusts the workspace you are in.** It never creates a workspace, never
 /// switches to another, and never asks which one you meant. A workspace is its configured roots plus
-/// a set of worktree bindings; this call edits that set, the roots re-materialise around it
-/// (`docs/worktrees.md` §6.0), and your open buffers follow to the same relative paths (§9.3).
+/// a set of worktree bindings; this call edits that set, the roots re-materialise around it, and your open buffers follow to the same relative paths.
 ///
 /// So there are exactly two outcomes, and the bindings alone decide which:
 ///
@@ -465,7 +463,7 @@ pub struct WorkspaceRenamedParams {
 ///   checkout. Every other binding, the name, and the session are untouched.
 /// - **A binding removed** (empty `worktree`) → that repo goes back to its main checkout. The
 ///   configured roots are the fallback, which is why this can never strand you: the worktree
-///   bindings are machine state, the roots are the workspace's own config (§8.2).
+///   bindings are machine state, the roots are the workspace's own config.
 ///
 /// The rules dropped along the way were all dropped for one reason — they turned invisible state
 /// into a discriminator. "First-bound repo is special" made the same gesture behave differently on
@@ -499,7 +497,7 @@ pub struct WorkspaceBindWorktreeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<crate::git::RepoId>,
     /// The buffer the caller is looking at, so the rebind can land it on the *same file* on the new
-    /// tree (§9.3: "the active buffer always follows"). The server cannot work this out for itself —
+    /// tree ("the active buffer always follows"). The server cannot work this out for itself —
     /// a client may hold several viewports — and without it the landing falls back to the
     /// workspace's MRU head, which is the right file only by coincidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]

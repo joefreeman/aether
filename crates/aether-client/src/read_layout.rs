@@ -1,8 +1,7 @@
-//! Grid layout for the markdown reading view (docs/markdown-view.md §2.8) — the glow-inspired
-//! character-cell rendering the terminal client paints, built in the core so the layout (wrap,
-//! tables, panels, markers) is written once and unit-tested off-screen. The shell maps each
-//! [`SpanStyle`] to its theme and paints rows at a scroll offset; focus painting keys off each
-//! row's element index.
+//! Grid layout for the markdown reading view — the glow-inspired character-cell rendering the
+//! terminal client paints, built in the core so the layout (wrap, tables, panels, markers) is
+//! written once and unit-tested off-screen. The shell maps each [`SpanStyle`] to its theme and
+//! paints rows at a scroll offset; focus painting keys off each row's element index.
 //!
 //! Coordinates are character cells (`unicode-width`), matching the editor grid. The layout is a
 //! pure function of `(blocks, elements, cols)` — shells cache it by `(buffer, revision, cols)`.
@@ -10,8 +9,8 @@
 use crate::markdown::{AlertKind, Block, ColAlign, Element, Inline, ListItem, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Maximum content columns — the reading measure. Wider viewports center the column
-/// (docs/markdown-view.md §2.8); the shell computes the margin via [`measure`].
+/// Maximum content columns — the reading measure. Wider viewports center the column; the shell
+/// computes the margin via [`measure`].
 pub const READ_MEASURE: u16 = 92;
 
 /// Content width and left margin for a viewport `area_cols` wide.
@@ -144,7 +143,7 @@ pub fn layout(
 /// The first row rendering element `idx`, for scroll reveal.
 ///
 /// Matched by span *containment*, not index equality: every block is an element at any depth
-/// (§12.6), so a container's content rows carry the *inner* block's index and the only rows left
+///, so a container's content rows carry the *inner* block's index and the only rows left
 /// bearing the container's own are the blank separators between its children. Equality found one
 /// of those — a row in the middle — and revealed the block from there, leaving its opening rows
 /// off the top of the viewport. Containment is also how the bar rows resolve, so the two agree.
@@ -213,7 +212,7 @@ fn element_index(elements: &[Element], span: Span) -> Option<usize> {
 }
 
 /// `in_item` = laying out a list item's blocks: a nested list then hugs its introducing line
-/// instead of getting the blank separator (§2.8's "tighter inside lists" — the blank read as
+/// instead of getting the blank separator (the "tighter inside lists" rule — the blank read as
 /// the item ending); paragraphs of a loose item keep their separation.
 /// `dim` tones the prose down — a completed task item's content (see [`SpanKind::TaskDone`]).
 /// It stops at a nested list: every item states its own done-ness, so an open item indented under
@@ -1578,7 +1577,7 @@ mod tests {
 
     #[test]
     fn reveal_finds_a_container_through_its_children() {
-        // Every block is an element at any depth now (§12.6), so a container's *content* rows
+        // Every block is an element at any depth now, so a container's *content* rows
         // carry the inner block's index and the only rows left holding the container's own are
         // the blank separators between its children. Index equality therefore found one of those
         // — a row in the middle of the container — and revealed the block from there, leaving its

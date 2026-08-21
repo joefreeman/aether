@@ -140,12 +140,12 @@ async fn serve_http(mut stream: TcpStream, state: SharedState) -> anyhow::Result
     Ok(())
 }
 
-/// Serve a file referenced from a markdown buffer's document — images in the web reading view
-/// (docs/markdown-view.md §3). `rest` is `{buffer_id}/{relative-path}` (URL-encoded); the path
-/// resolves against the buffer's parent directory and is **confined post-canonicalization** to
-/// the workspace root containing the buffer (or, for a buffer outside every root, to its own
-/// directory tree) — so `..` and symlink escapes 404 rather than leaking files. Images only;
-/// unknown extensions are refused rather than octet-streamed.
+/// Serve a file referenced from a markdown buffer's document — images in the web reading view.
+/// `rest` is `{buffer_id}/{relative-path}` (URL-encoded); the path resolves against the buffer's
+/// parent directory and is **confined post-canonicalization** to the workspace root containing the
+/// buffer (or, for a buffer outside every root, to its own directory tree) — so `.` and symlink
+/// escapes 404 rather than leaking files. Images only; unknown extensions are refused rather than
+/// octet-streamed.
 async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
     fn not_found() -> Vec<u8> {
         http_response("404 Not Found", "text/plain; charset=utf-8", b"not found")
@@ -200,10 +200,10 @@ async fn buffer_asset_response(state: &SharedState, rest: &str) -> Vec<u8> {
         .filter(|r| parent.starts_with(r))
         .max_by_key(|r| r.as_os_str().len());
     let confine = root.clone().unwrap_or_else(|| parent.clone());
-    // Root-relative sources (a leading `/`, GitHub semantics — docs/markdown-view.md §2.4)
-    // resolve against the buffer's containing root; that root *is* the confinement root, so
-    // the join can't widen it. A buffer outside every root has no anchor — such sources stay
-    // filesystem-absolute, which the web declines (the natives open them directly).
+    // Root-relative sources (a leading `/`, GitHub semantics) resolve against the buffer's
+    // containing root; that root *is* the confinement root, so the join can't widen it. A buffer
+    // outside every root has no anchor — such sources stay filesystem-absolute, which the web
+    // declines (the natives open them directly).
     let joined = match rel.strip_prefix('/') {
         Some(rest) => match &root {
             Some(root) => root.join(rest.trim_start_matches('/')),
@@ -326,7 +326,7 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
             )),
             "text/css; charset=utf-8",
         ),
-        // The wasm core (docs/web-core.md), loaded by index.js via `new URL(..., import.meta.url)`.
+        // The wasm core, loaded by index.js via `new URL(.., import.meta.url)`.
         "assets/aether_web_bg.wasm" => (
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

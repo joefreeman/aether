@@ -1,4 +1,4 @@
-//! `ae --web` — open the editor in the browser (the deferred half of docs/tether.md §6).
+//! `ae --web` — open the editor in the browser.
 //!
 //! The CLI is a *launcher*: it builds the web client's URL — the same `?workspace=&root=&file=`
 //! (+ `#L:C`) scheme the web shell's own boot and share links use — hands it to the OS opener,
@@ -15,11 +15,10 @@
 //! exits, git proceeds. Ctrl-C closes the buffer (best-effort) and exits non-zero, so an
 //! abandoned edit aborts the caller instead of hanging it.
 //!
-//! Deliberately out of scope for now (each bails with a message rather than half-working):
-//! external files — a path outside every configured workspace needs an ephemeral context, which
-//! the web boot can't address by name; and the native shells' release gesture (`Space k`) has no
-//! web analogue — the waiter only ends on close or Ctrl-C (server-side tether registration,
-//! docs/tether.md §6, is the future fix).
+//! Deliberately out of scope for now (each bails with a message rather than half-working): external
+//! files — a path outside every configured workspace needs an ephemeral context, which the web boot
+//! can't address by name; and the native shells' release gesture (`Space k`) has no web analogue —
+//! the waiter only ends on close or Ctrl-C (server-side tether registration is the future fix).
 
 use aether_connection::{ConnectError, Handle, Inbound};
 use aether_protocol::buffer::{

@@ -1,4 +1,4 @@
-//! Buffer lifecycle messages — §6 of the protocol doc.
+//! Buffer lifecycle messages.
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
@@ -60,10 +60,10 @@ pub struct BufferOpenParams {
     /// promoted by their first edit, a save, or a user-initiated reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
-    /// Record the jump origin (the buffer the client is leaving) onto this client's nav
-    /// history before switching — `nav/record` folded into the open, so result-style
-    /// navigation (picker selections, goto-definition, fresh scratch) is one round-trip
-    /// (docs/protocol-composites.md, A). Ignored if the buffer doesn't exist.
+    /// Record the jump origin (the buffer the client is leaving) onto this client's nav history
+    /// before switching — `nav/record` folded into the open, so result-style navigation (picker
+    /// selections, goto-definition, fresh scratch) is one round-trip. Ignored if the buffer doesn't
+    /// exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_nav_from: Option<BufferId>,
 }
@@ -86,7 +86,7 @@ pub struct BufferOpenResult {
     /// so the numbers stay small and reset as scratches close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch_number: Option<u32>,
-    /// Server-side cursor state for this `(client, buffer)`. `CursorState::default()` for a buffer
+    /// Server-side cursor state for this `(client, buffer)`. `CursorState::default` for a buffer
     /// the client hasn't touched yet; the prior position for a buffer the client is reopening.
     #[serde(default)]
     pub cursor: CursorState,
@@ -166,9 +166,8 @@ impl RpcMethod for BufferClose {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferCloseParams {
     pub buffer_id: BufferId,
-    /// Also open the next buffer (the MRU successor, or a fresh scratch when none remain)
-    /// and return it in `opened` — the close-then-attach client chain folded into one
-    /// round-trip (docs/protocol-composites.md, B).
+    /// Also open the next buffer (the MRU successor, or a fresh scratch when none remain) and
+    /// return it in `opened` — the close-then-attach client chain folded into one round-trip.
     #[serde(default)]
     pub open_next: bool,
 }
@@ -189,13 +188,12 @@ pub struct BufferCloseResult {
 
 /// Pushed to a client when a buffer it currently has open is closed by *another* client (a plain
 /// `buffer/close`, or a path/workspace deletion that tore the buffer down). The receiving client
-/// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when
-/// `None` — the same convention as [`BufferCloseResult`]. Sent to clients with a viewport on the
-/// buffer *and* to clients whose active workspace holds it in its MRU without viewing it — the
-/// latter is what lets a tethered client (docs/tether.md), including the `ae --web` waiter, exit
-/// on a close it didn't witness; non-matching pushes are ignored client-side, so the broad
-/// audience is safe. The client that initiated the close learns the outcome from its RPC result
-/// instead.
+/// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when `None`
+/// — the same convention as [`BufferCloseResult`]. Sent to clients with a viewport on the buffer
+/// *and* to clients whose active workspace holds it in its MRU without viewing it — the latter is
+/// what lets a tethered client, including the `ae --web` waiter, exit on a close it didn't witness;
+/// non-matching pushes are ignored client-side, so the broad audience is safe. The client that
+/// initiated the close learns the outcome from its RPC result instead.
 pub struct BufferClosed;
 impl NotificationMethod for BufferClosed {
     const NAME: &'static str = "buffer/closed";
@@ -343,10 +341,10 @@ pub struct BufferContentParams {
     pub buffer_id: BufferId,
 }
 
-/// The buffer's full text at `revision`. The markdown reading view renders from the whole
-/// document (fences, tables and link reference definitions span arbitrarily, so a windowed view
-/// of the source can't drive the parse — docs/markdown-view.md §1.5); it re-fetches whenever a
-/// change notification carries a revision newer than the one it parsed.
+/// The buffer's full text at `revision`. The markdown reading view renders from the whole document
+/// (fences, tables and link reference definitions span arbitrarily, so a windowed view of the
+/// source can't drive the parse); it re-fetches whenever a change notification carries a revision
+/// newer than the one it parsed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferContentResult {
     pub revision: Revision,

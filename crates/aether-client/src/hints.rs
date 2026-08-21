@@ -1,8 +1,8 @@
-//! Hints (docs/hints.md): a quiet corner suggestion that walks a curated curriculum as
-//! the user demonstrates each binding. This module is the whole engine — curriculum, usage
-//! observation, scoring, temperature sampling, per-context display slots — kept sans-IO like the
-//! rest of the core: the clock arrives stamped on ticks from the shell, randomness is a seeded
-//! generator, and persistence rides `hints/record` / `hints/state` effects.
+//! Hints: a quiet corner suggestion that walks a curated curriculum as the user demonstrates each
+//! binding. This module is the whole engine — curriculum, usage observation, scoring, temperature
+//! sampling, per-context display slots — kept sans-IO like the rest of the core: the clock arrives
+//! stamped on ticks from the shell, randomness is a seeded generator, and persistence rides
+//! `hints/record` / `hints/state` effects.
 //!
 //! Two principles from the design doc shape everything here:
 //!
@@ -37,7 +37,7 @@ const TEMPERATURE: f32 = 0.5;
 const USE_HALFLIFE_HOURS: f32 = 8.0;
 
 /// Fatigue decay half-life in days — must agree with the server's fold-in decay
-/// (`aether-server::config::FATIGUE_HALFLIFE_DAYS`, docs/hints.md §1.11).
+/// (`aether-server::config::FATIGUE_HALFLIFE_DAYS`).
 const FATIGUE_HALFLIFE_DAYS: f32 = 3.0;
 
 /// Shows-without-follow per halving of a hint's score.
@@ -60,9 +60,8 @@ pub enum ContextId {
     Normal,
     Insert,
     Search,
-    /// The markdown reading view (`Mode::Read`, docs/markdown-view.md). Its hints are
-    /// context-local (being in the view is their gate) except the `reader` entry point,
-    /// which displays in Normal.
+    /// The markdown reading view (`Mode::Read`). Its hints are context-local (being in the view is
+    /// their gate) except the `reader` entry point, which displays in Normal.
     Read,
     Picker(PickerKind),
     Settings,
@@ -91,8 +90,7 @@ pub enum PickerCmd {
     CreateWorkspace,
     /// Enter on a workspace row in the Workspaces picker.
     OpenWorkspace,
-    /// `Ctrl-j` in a capturable picker — snapshot its results into the jumplist
-    /// (docs/jumplist.md).
+    /// `Ctrl-j` in a capturable picker — snapshot its results into the jumplist.
     CaptureJumplist,
     /// `Ctrl-o` in the branch picker — create a worktree for the highlighted branch.
     CreateWorktree,
@@ -271,7 +269,7 @@ pub static CURRICULUM: &[HintDef] = &[
         trigger: Trigger::Action(|a| matches!(a, Action::SearchToggleRegex)),
         text: "Use {} to toggle regex matching" },
 
-    // ---- the markdown reading view (docs/markdown-view.md) ----
+    // ---- the markdown reading view ----
     // The entry point displays in Normal (main-track, ladder-gated) and only on markdown
     // buffers; everything else is Read-context-local — being in the view is the gate.
     // `read-source` shares the entry point's trigger but is deliberately a *separate* hint:
@@ -347,8 +345,8 @@ pub static CURRICULUM: &[HintDef] = &[
         ], keys: "Alt-p",
         trigger: Trigger::Picker(PickerCmd::AddPathScope),
         text: "Use {} to scope results to a path" },
-    // The jumplist trio (docs/jumplist.md): capture from a result-shaped picker, step the
-    // captured entries, reopen the list as a picker.
+    // The jumplist trio: capture from a result-shaped picker, step the captured entries, reopen the
+    // list as a picker.
     HintDef { id: "jumplist-capture", tier: 4,
         contexts: &[
             C::Picker(PickerKind::Files),
@@ -943,7 +941,7 @@ fn intro_rank(idx: usize) -> usize {
 }
 
 /// The fatigue counter decayed from its last fold to `now_ms` — the same curve the server applies
-/// when accumulating (`aether-server::config::decayed_shows`); keep in sync via docs/hints.md.
+/// when accumulating (`aether-server::config::decayed_shows`); keep the two in sync.
 fn decayed_shows(shows: f32, last_shown_at: u64, now_ms: u64) -> f32 {
     if shows <= 0.0 || last_shown_at == 0 || now_ms <= last_shown_at {
         return shows;
@@ -1565,10 +1563,10 @@ mod tests {
         }
     }
 
-    /// The keymap cross-check (docs/hints.md §1.10): every action-triggered hint must still match
-    /// a real binding, and that binding's rendered chord must appear in the hint's authored `keys`
-    /// label — so a renamed action or a moved chord can't leave a stale hint behind. (Picker-cmd
-    /// hints have no table to check; their arms are instrumented by hand.)
+    /// The keymap cross-check: every action-triggered hint must still match a real binding, and
+    /// that binding's rendered chord must appear in the hint's authored `keys` label — so a renamed
+    /// action or a moved chord can't leave a stale hint behind. (Picker-cmd hints have no table to
+    /// check; their arms are instrumented by hand.)
     #[test]
     fn curriculum_matches_the_live_keymap() {
         for h in CURRICULUM {

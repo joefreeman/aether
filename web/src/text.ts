@@ -1,6 +1,6 @@
 //! UTF-8 ↔ UTF-16 conversion. The protocol uses UTF-8 byte offsets for highlights, diagnostics,
 //! search matches, and cursor columns; JS strings are UTF-16. Everything that maps a wire byte
-//! offset to a position in a JS string goes through here (docs/web-client.md §2.3).
+//! offset to a position in a JS string goes through here.
 
 const encoder = new TextEncoder();
 

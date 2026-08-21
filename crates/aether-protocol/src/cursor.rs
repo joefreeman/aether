@@ -1,6 +1,6 @@
-//! Cursor & selection messages — §9 of the protocol doc.
+//! Cursor & selection messages.
 //!
-//! `Motion` is shared with `input/delete` (§8.2).
+//! `Motion` is shared with `input/delete`.
 
 use crate::envelope::RpcMethod;
 use crate::{BufferId, LogicalPosition, ViewportId};
@@ -123,10 +123,10 @@ pub enum Motion {
     EndOfNavigationUnit,
     /// Mirror of [`EndOfNavigationUnit`] — jump to the first char of the enclosing unit.
     StartOfNavigationUnit,
-    /// Collapse to an edge of the current selection — the Insert-entry motions (`I`/`A`
-    /// family). Unlike the other motions this reads the whole selection (anchor and
-    /// cursor), which is exactly why it lives server-side: the client would otherwise
-    /// compute selection bounds the server already owns (docs/protocol-composites.md, F).
+    /// Collapse to an edge of the current selection — the Insert-entry motions (`I`/`A` family).
+    /// Unlike the other motions this reads the whole selection (anchor and cursor), which is
+    /// exactly why it lives server-side: the client would otherwise compute selection bounds the
+    /// server already owns.
     SelectionEdge {
         edge: SelectionEdge,
     },
@@ -181,12 +181,11 @@ pub struct CursorState {
     /// client's match-bracket highlight overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_bracket: Option<(LogicalPosition, LogicalPosition)>,
-    /// `Some` when the cursor is currently sitting on an entry of this client's captured
-    /// jumplist (docs/jumplist.md). Carries the 1-based index of the entry (across the
-    /// whole list, not just the current file) and the total entry count, so the status bar can
-    /// render `C/D` alongside the in-buffer search counter. `None` when the cursor isn't on
-    /// any entry or nothing is captured. Derived per-response like `match_bracket`; never
-    /// stored in `state.cursors`.
+    /// `Some` when the cursor is currently sitting on an entry of this client's captured jumplist.
+    /// Carries the 1-based index of the entry (across the whole list, not just the current file)
+    /// and the total entry count, so the status bar can render `C/D` alongside the in-buffer search
+    /// counter. `None` when the cursor isn't on any entry or nothing is captured. Derived
+    /// per-response like `match_bracket`; never stored in `state.cursors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jumplist_position: Option<JumplistPosition>,
 }

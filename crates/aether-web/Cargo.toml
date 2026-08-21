@@ -3,7 +3,7 @@ name = "aether-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "wasm-bindgen binding shell for aether-client: the browser's seam onto the shared client core (docs/web-core.md). Keeps aether-client pure; owns every #[wasm_bindgen] and boundary DTO."
+description = "wasm-bindgen binding shell for aether-client: the browser's seam onto the shared client core. Keeps aether-client pure; owns every #[wasm_bindgen] and boundary DTO."
 
 [lib]
 # cdylib for the wasm artifact; rlib so the boundary logic stays unit-testable on the host target.

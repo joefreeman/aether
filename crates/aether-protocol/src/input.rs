@@ -1,4 +1,4 @@
-//! Input commands — §8 of the protocol doc. Plus undo/redo from §10.
+//! Input commands. Plus undo/redo
 //!
 //! All input commands are cursor-relative; none carry positions on the wire. If a selection
 //! exists, the command's implicit range is that selection.
@@ -38,8 +38,8 @@ pub struct InputTextParams {
     /// Default false: cursor lands just past the inserted text with no anchor.
     #[serde(default)]
     pub select_pasted: bool,
-    /// Collapse the cursor to this selection edge before inserting — the paste-before
-    /// chain's `cursor/set` folded into the edit (docs/protocol-composites.md, D).
+    /// Collapse the cursor to this selection edge before inserting — the paste-before chain's
+    /// `cursor/set` folded into the edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<crate::cursor::SelectionEdge>,
     /// Replace the current selection with `text` rather than inserting at the cursor. A point
@@ -79,8 +79,8 @@ impl RpcMethod for InputChange {
 
 // ---- counted edits --------------------------------------------------------------------------------
 
-/// Params for counted edits (`3J`, `3>`, `3u`, …): the repeat loop lives server-side, so a
-/// counted keypress is one round-trip (docs/protocol-composites.md, K).
+/// Params for counted edits (`3J`, `3>`, `3u`, …): the repeat loop lives server-side, so a counted
+/// keypress is one round-trip.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountedEditParams {
     pub buffer_id: BufferId,
@@ -227,10 +227,9 @@ pub struct InputNewlineAndIndentParams {
 
 // ---- input/open_line ----------------------------------------------------------------------------
 
-/// Vim's `o`/`O` as one server-side edit (docs/protocol-composites.md, E): park the cursor
-/// (end of the cursor line for `Below`, col 0 for `Above`), open the line, land in the
-/// right place. `Below` smart-indents the new line; `Above` opens an unindented one (the
-/// TUI semantics all clients shared).
+/// Vim's `o`/`O` as one server-side edit: park the cursor (end of the cursor line for `Below`, col
+/// 0 for `Above`), open the line, land in the right place. `Below` smart-indents the new line;
+/// `Above` opens an unindented one (the TUI semantics all clients shared).
 pub struct InputOpenLine;
 impl RpcMethod for InputOpenLine {
     const NAME: &'static str = "input/open_line";
@@ -525,7 +524,7 @@ pub struct UndoResult {
     pub cursor: CursorState,
 }
 
-// ---- block edits (markdown reading view, docs/markdown-view.md §12) -----------------------------
+// ---- block edits (markdown reading view) -----------------------------
 //
 // Selection-relative structural edits: the server resolves the block boundaries at edit time
 // with the same `aether-markdown` parse the reading view renders from, applies one atomic

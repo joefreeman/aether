@@ -238,8 +238,7 @@ fn watch_targets(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// **Linked worktree (`.git` is a *file*)**: the interesting state is split in two, and watching
 /// only one half sees nothing. `HEAD` and `index` live in the worktree's own git dir
 /// (`<main>/.git/worktrees/<name>/`), while `refs/**` and `packed-refs` live in the *common* dir
-/// shared with every other worktree of the repo — see the shared/per-worktree table in
-/// `docs/worktrees.md` §4.2. Both get watched. Without this a worktree got **no git-internals
+/// shared with every other worktree of the repo. Both get watched. Without this a worktree got **no git-internals
 /// watch at all**, so a commit or checkout made outside the editor was invisible in it.
 ///
 /// A submodule's `.git` is a file too and takes the same path; its "common dir" is just its own
@@ -282,7 +281,7 @@ fn push_git_dir_targets(git_dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// The path is normally absolute; a relative one is resolved against the `.git` file's own
 /// directory. **Note the `ignore` crate does not do this** — it uses the recorded path verbatim,
-/// which is why `docs/worktrees.md` §4.7 says never to *create* worktrees with `--relative-paths`.
+/// which is why we never *create* worktrees with `--relative-paths`.
 /// Reading one someone else created is still supported.
 fn read_gitdir_pointer(git_file: &Path) -> Option<PathBuf> {
     let content = std::fs::read_to_string(git_file).ok()?;
@@ -551,8 +550,7 @@ enum GitChange {
 /// isn't a meaningful git file: `*.lock` temp files, `logs/`, `objects/`, `COMMIT_EDITMSG`, and
 /// ordinary source files.
 ///
-/// The shared/per-worktree split is git's own, from `common_list[]` in `path.c` — see
-/// `docs/worktrees.md` §4.2.
+/// The shared/per-worktree split is git's own, from `common_list[]` in `path.c` —
 fn classify_git_change(path: &Path) -> Option<GitChange> {
     let comps: Vec<_> = path.components().collect();
     let git_idx = comps.iter().position(|c| c.as_os_str() == ".git")?;
@@ -624,9 +622,8 @@ fn git_change_workdirs(path: &Path) -> Vec<PathBuf> {
 }
 
 /// The working directory of one linked worktree, from its admin entry. `worktrees/<name>/gitdir`
-/// holds the path of the worktree's own `.git` *file*, so the workdir is that path's parent —
-/// the CLI is keyed by path and libgit2 by admin id, and this file is the only bridge between them
-/// (`docs/worktrees.md` §4.8).
+/// holds the path of the worktree's own `.git` *file*, so the workdir is that path's parent — the
+/// CLI is keyed by path and libgit2 by admin id, and this file is the only bridge between them.
 fn worktree_workdir(main_git_dir: &Path, name: &str) -> Option<PathBuf> {
     let admin = main_git_dir.join("worktrees").join(name);
     let content = std::fs::read_to_string(admin.join("gitdir")).ok()?;

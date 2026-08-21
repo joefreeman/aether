@@ -70,8 +70,8 @@ impl LspClient {
     /// Every request is bounded, because we have no way to take one back: LSP's `$/cancelRequest`
     /// isn't implemented here, so a superseded request stays in flight server-side regardless. The
     /// timeout is about *our* bookkeeping — without it a server that never answers leaks its entry
-    /// in `pending` forever, and the workspace-symbols picker fans out one request per pinned server
-    /// per keystroke (`docs/workspace-symbols.md`), so those add up quickly.
+    /// in `pending` forever, and the workspace-symbols picker fans out one request per pinned
+    /// server per keystroke, so those add up quickly.
     pub async fn request_with_timeout(
         &self,
         method: &str,

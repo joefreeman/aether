@@ -3,7 +3,7 @@
 //! there). The actor runs on its own tokio runtime (created in `main`), independent of iced's
 //! `Task` executor — the `Handle` only awaits channels, which are runtime-agnostic. The app's
 //! single sequential pump turns the ordered [`Inbound`] stream into `Message`s, so wire order
-//! survives into iced's queue (docs/client-core.md).
+//! survives into iced's queue.
 
 use tokio::sync::{mpsc, Mutex};
 

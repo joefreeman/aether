@@ -1,14 +1,13 @@
-//! The core-driven web shell (docs/web-core.md, Phase 3 milestone (a)): the editor/buffer read+edit
-//! loop running on the shared `aether-client` core compiled to wasm. The TS side is now a *shell*,
-//! the same shape as `aether-tui/src/shell.rs` and `aether-iced/src/app.rs`:
+//! The core-driven web shell (Phase 3 milestone (a)): the editor/buffer read+edit loop running on
+//! the shared `aether-client` core compiled to wasm. The TS side is now a *shell*, the same shape
+//! as `aether-tui/src/shell.rs` and `aether-iced/src/app.rs`:
 //!
 //!   input → WasmSession.on_key / on_event / on_rpc_result → Effect[] → execute → render(view())
 //!
 //! Semantic RPCs are core-issued (an `Effect.Request` we send over the socket, feeding the result
 //! back through `on_rpc_result`). Geometry RPCs (`viewport/subscribe`/`scroll_to_row`/`scroll`) are
 //! shell-issued — their params need pixels — but their results are adopted by the core
-//! (`adopt_subscribe`/`adopt_window`); the shell then does the pixel positioning. (docs/web-core.md
-//! §"Two kinds of RPC".)
+//! (`adopt_subscribe`/`adopt_window`); the shell then does the pixel positioning.
 //!
 //! Milestone (a) scope: bootstrap, keyboard editing, native virtual scroll, server pushes. Search,
 //! pickers, prompts, hover, mouse, clipboard, and core-driven reconnect are later milestones —
@@ -219,7 +218,7 @@ type EffectTag =
   | "ToChooser"
   | "ShellAction";
 
-/** One effect from the core (docs/web-core.md §"The boundary"). `tag` selects the variant. */
+/** One effect from the core. `tag` selects the variant. */
 interface CoreEffect {
   tag: EffectTag;
   token?: number;
@@ -235,7 +234,7 @@ interface CoreEffect {
   hover?: HoverContent;
   style?: "follow" | "jump";
   /** RevealPickerSelection flavour: minimal keeps the row in view, top aligns it to the top,
-   *  run frames the freshly-opened group run (docs/picker-groups.md §9). */
+   * run frames the freshly-opened group run. */
   reveal?: "minimal" | "top" | "run";
 }
 
@@ -372,10 +371,10 @@ interface PickerView {
    *  ungrouped kinds. The shell opens one section + header row per span instead of re-deriving
    *  boundaries from item fields. */
   groups: GroupSpan[];
-  /** Whether this view renders as a collapsible accordion (docs/picker-groups.md §9): headers
-   *  arrive as real `group` window rows and the row space counts them. Core-owned, and a property
-   *  of the view rather than the kind — a Jumplist captured from the Files or Buffers picker has
-   *  no groups and renders flat (docs/jumplist.md). */
+  /** Whether this view renders as a collapsible accordion: headers
+   * arrive as real `group` window rows and the row space counts them. Core-owned, and a property of
+   * the view rather than the kind — a Jumplist captured from the Files or Buffers picker has no
+   * groups and renders flat. */
   collapsible: boolean;
   total_matches: number;
   total_candidates: number;
@@ -386,7 +385,7 @@ interface PickerView {
   empty_note: string | null;
   total_display_rows: number;
   window_base: number;
-  /** Collapsible kinds (docs/picker-groups.md §9): the expanded run's absolute rows — its
+  /** Collapsible kinds: the expanded run's absolute rows — its
    *  header's row-space index and item count — for the `run` reveal's scroll math. Null for
    *  the other kinds and empty result sets. */
   expanded_run: { header_row: number; len: number } | null;
@@ -517,19 +516,18 @@ interface CoreView {
   picker: PickerView | null;
   workspace_settings: WorkspaceSettingsView | null;
   app_settings: AppSettingsView | null;
-  /** The hint for the top-right corner (docs/hints.md): the display text split around its
+  /** The hint for the top-right corner: the display text split around its
    *  emphasized key label. null = empty corner. */
   hint: { before: string; keys: string; after: string } | null;
-  /** The markdown reading view, when active (docs/markdown-view.md): the parsed document plus
+  /** The markdown reading view, when active: the parsed document plus
    *  the focused element's source span (focus derives from the server cursor core-side). */
   read: ReadDoc | null;
 }
 
 /** The workspace-settings overlay (`Space Alt-,`), when open (view.rs `workspace_settings`). Core-owned
- *  state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys through
- *  the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index` (the
- *  add-root input), the projects (docs/projects.md), and `add_project_index` (the add-project
- *  input). */
+ * state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys
+ * through the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index`
+ * (the add-root input), the projects, and `add_project_index` (the add-project input). */
 interface WorkspaceProjectView {
   path_index: number;
   relative_path: string;
@@ -538,7 +536,7 @@ interface WorkspaceProjectView {
 }
 
 /** The add-project row's two-segment path editor — the same projection the save-as prompt gets,
- *  since they share the component (docs/projects.md). */
+ * since they share the component. */
 interface PathEditorView {
   field: "root" | "path";
   input: string;
@@ -1028,10 +1026,9 @@ function describePickerItem(
       };
     }
     case "jumplist_entry": {
-      // A jumplist entry renders exactly like a grep hit (quickfix-style, docs/jumplist.md §2.2):
-      // the flat display text with the fuzzy highlight and a right-aligned dim line-number meta.
-      // Leading indentation strips like a grep hit (most sources are code lines), shifting the
-      // match indices with it.
+      // A jumplist entry renders exactly like a grep hit (quickfix-style): the flat display text
+      // with the fuzzy highlight and a right-aligned dim line-number meta. Leading indentation
+      // strips like a grep hit (most sources are code lines), shifting the match indices with it.
       const trimmed = item.display.trimStart();
       const lead = [...item.display].length - [...trimmed].length;
       return {
@@ -1042,8 +1039,8 @@ function describePickerItem(
       };
     }
     case "group":
-      // Unreachable from `renderPickerList` — group rows render as sticky section headers
-      // there (docs/picker-groups.md) — but keeps this function total over the item union.
+      // Unreachable from `renderPickerList` — group rows render as sticky section headers there —
+      // but keeps this function total over the item union.
       return {
         primary: item.header.kind === "file" ? item.header.relative_path : item.header.label,
         meta: String(item.count),
@@ -1061,7 +1058,7 @@ export class Shell {
     { el: HTMLElement; fade: number; remove: number }
   >();
   private readonly connBanner: HTMLElement;
-  /** The hint corner (docs/hints.md). */
+  /** The hint corner. */
   private readonly hintEl: HTMLElement;
   private readonly searchBar: HTMLElement;
   private readonly searchInput: HTMLInputElement;
@@ -1144,8 +1141,8 @@ export class Shell {
   /** Pending coalesced-render frame (see `scheduleRender`); null when none is queued. */
   private renderRaf: number | null = null;
   /** Set by the `RevealPickerSelection` effect: the next picker render scrolls the highlighted row
-   *  into view (keyboard nav / refetch reveal) — or, for the `run` flavour, frames the freshly
-   *  opened group run (docs/picker-groups.md §9). Free wheel-scrolling never sets it. */
+   * into view (keyboard nav / refetch reveal) — or, for the `run` flavour, frames the freshly
+   * opened group run. Free wheel-scrolling never sets it. */
   private pickerReveal: "minimal" | "top" | "run" | null = null;
   /** Set by the `PickerScrollReset` effect (a query change): the next picker render jumps to the top. */
   private pickerScrollReset = false;
@@ -1212,7 +1209,7 @@ export class Shell {
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
   private viewportEpoch = 0;
   private fetchInFlight = false;
-  /** True while the markdown reading view owns the buffer element (docs/markdown-view.md). */
+  /** True while the markdown reading view owns the buffer element. */
   private readActive = false;
   /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
   private lastReadFocus: string | null = null;
@@ -1253,8 +1250,8 @@ export class Shell {
     this.connBanner.setAttribute("role", "status");
     this.connBanner.setAttribute("aria-live", "polite");
     this.connBanner.style.display = "none";
-    // The hint corner (docs/hints.md): one quiet top-right chip, rendered from
-    // `view.hint` each paint and clocked by a slow interval (see the constructor's tail).
+    // The hint corner: one quiet top-right chip, rendered from `view.hint` each paint and clocked
+    // by a slow interval (see the constructor's tail).
     this.hintEl = document.createElement("div");
     this.hintEl.id = "hint-corner";
     this.hintEl.style.display = "none";
@@ -1598,8 +1595,8 @@ export class Shell {
     psAddBullet.className = "ps-bullet";
     psAddBullet.textContent = "•";
     psAddRow.append(psAddBullet, this.psAddInput);
-    // The Projects group (docs/projects.md), the same shape as Roots: a rebuilt `<ul>` plus a
-    // persistent add row outside it, so a list rebuild never steals the input's caret mid-type.
+    // The Projects group, the same shape as Roots: a rebuilt `<ul>` plus a persistent add row
+    // outside it, so a list rebuild never steals the input's caret mid-type.
     const psProjectsLabel = document.createElement("div");
     psProjectsLabel.className = "ps-label";
     psProjectsLabel.textContent = "Projects";
@@ -1703,8 +1700,8 @@ export class Shell {
     window.addEventListener("mouseup", () => this.onMouseUp());
     window.addEventListener("resize", () => this.onResize());
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
-    // The hint engine's clock (docs/hints.md): a slow tick while the tab is visible
-    // and the session connected. The engine's own idle gate covers an unattended-but-visible tab.
+    // The hint engine's clock: a slow tick while the tab is visible and the session connected. The
+    // engine's own idle gate covers an unattended-but-visible tab.
     window.setInterval(() => {
       if (!this.session || !this.connected || document.visibilityState !== "visible") return;
       this.hintTick();
@@ -1825,7 +1822,7 @@ export class Shell {
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
       // Boot installs the session directly (no adopt_switch), so the markdown reading-view
-      // decision runs here (docs/markdown-view.md §1.6). A `view=read|source` param is the
+      // decision runs here. A `view=read|source` param is the
       // presentation this URL was captured in (a refresh, a shared reading link) and wins
       // outright; without one, a `#line:col` link is jump-shaped and lands in the editor.
       // (Only honored for a URL-directed open — on a fallback landing the param describes a
@@ -2254,8 +2251,8 @@ export class Shell {
           this.pickerScrollReset = true;
           break;
         case "HintTickNow":
-          // The hints snapshot just adopted: stamp the clock into the engine now, so the first
-          // hint shows immediately instead of waiting out the slow interval (docs/hints.md).
+          // The hints snapshot just adopted: stamp the clock into the engine now, so the first hint
+          // shows immediately instead of waiting out the slow interval.
           this.hintTick();
           break;
         // Deferred to later milestones (browser tab — no process to exit, reconnect handled by a
@@ -2419,8 +2416,8 @@ export class Shell {
         break;
       }
       case "open_url":
-        // Reading-view Enter on an external link (docs/markdown-view.md §2.4). Scheme-checked
-        // like hover links; the browser can't open local file paths, so those no-op here.
+        // Reading-view Enter on an external link. Scheme-checked like hover links; the browser
+        // can't open local file paths, so those no-op here.
         if (a.url && /^(https?|mailto):/i.test(a.url)) {
           window.open(a.url, "_blank", "noopener");
         }
@@ -2610,7 +2607,7 @@ export class Shell {
   }
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
-  /** A click in the reading view: focus the clicked element (docs/markdown-view.md §2.3). The
+  /** A click in the reading view: focus the clicked element. The
    *  shell's whole job is resolving the nearest stamped node to its source-span start; the core
    *  turns that into the cursor move focus derives from. */
   private onReadClick(e: MouseEvent): void {
@@ -2708,10 +2705,10 @@ export class Shell {
   }
 
   private scrollView(dir: string, unit: string): void {
-    // Reading view: instant, pixel-based steps. Smooth scrolling stutters under key repeat —
-    // each press restarts the animation from the current position — and the reading document
-    // has no row grid to align to anyway. Left/Right pan the *focused* code panel
-    // (docs/markdown-view.md §2.3) — a no-op when the focus isn't a code block.
+    // Reading view: instant, pixel-based steps. Smooth scrolling stutters under key repeat — each
+    // press restarts the animation from the current position — and the reading document has no row
+    // grid to align to anyway. Left/Right pan the *focused* code panel — a no-op when the focus
+    // isn't a code block.
     if (this.readActive) {
       if (dir === "left" || dir === "right") {
         const pre = this.bufferEl.querySelector(".md-codeblock.md-focus pre");
@@ -3025,10 +3022,10 @@ export class Shell {
     }
     this.syncUrl(v); // keep the address bar in sync with the current buffer + cursor
     this.renderStatus(v);
-    // The markdown reading view replaces the buffer rendering wholesale while active
-    // (docs/markdown-view.md): the same scrollable hosts a typographic document instead of the
-    // row grid; native browser scrolling applies, and the focused element (derived core-side
-    // from the server cursor) is revealed when it changes.
+    // The markdown reading view replaces the buffer rendering wholesale while active: the same
+    // scrollable hosts a typographic document instead of the row grid; native browser scrolling
+    // applies, and the focused element (derived core-side from the server cursor) is revealed when
+    // it changes.
     const readActive = v.read !== null;
     if (readActive !== this.readActive) {
       this.readActive = readActive;
@@ -3754,7 +3751,7 @@ export class Shell {
    *  setting (`app_settings_toggle`); keyboard nav/toggle routes through the global keydown →
    *  `on_key` (the checkboxes aren't focused), so on open we park focus on `capture`. The flat row
    *  index (across groups) drives both the highlight and the toggle. */
-  /** The hint corner (docs/hints.md): a "Hint: …" line with the key label emphasized, or hidden
+  /** The hint corner: a "Hint: …" line with the key label emphasized, or hidden
    *  when the corner is empty. */
   private renderHint(v: CoreView): void {
     if (!v.hint) {
@@ -4264,13 +4261,13 @@ export class Shell {
   }
 
   /** Keep the address bar reflecting the current buffer + cursor, the way the boot URL reader consumes
-   *  it (`?workspace=&root=&file=#L:C`, or `?workspace=&buffer=<id>` for a scratch), so a reload or a copied
-   *  link reopens where you are. `replaceState`, not `push` — browser back/forward isn't a second nav
-   *  system; in-file/cross-file nav is the core's job (Alt-←/→). A pushState experiment (2026-08-03)
-   *  was reverted: the browser stack and the editor's nav history each turned the other's "back" into
-   *  forward garbage — if revisited, the fix is mirroring one onto the other, not two parallel stacks
-   *  (docs/markdown-view.md). Debounced so a burst of cursor moves is one URL write; skipped when
-   *  unchanged. */
+   * it (`?workspace=&root=&file=#L:C`, or `?workspace=&buffer=<id>` for a scratch), so a reload or
+   * a copied link reopens where you are. `replaceState`, not `push` — browser back/forward isn't a
+   * second nav system; in-file/cross-file nav is the core's job (Alt-←/→). A pushState experiment
+   * (2026-08-03) was reverted: the browser stack and the editor's nav history each turned the
+   * other's "back" into forward garbage — if revisited, the fix is mirroring one onto the other,
+   * not two parallel stacks. Debounced so a burst of cursor moves is one URL write; skipped when
+   * unchanged. */
   private syncUrl(v: CoreView): void {
     const url = this.buildUrl(v);
     if (url === this.lastUrl) return;
@@ -4293,8 +4290,8 @@ export class Shell {
       params.set("buffer", String(v.buffer.buffer_id)); // scratch buffer: key on the session id
     }
     // Record the presentation for markdown buffers, so a refresh restores what's on screen —
-    // without this the `#line:col` cursor restore below reads as a jump-shaped open and a
-    // reading view reloads as source (docs/markdown-view.md §1.6).
+    // without this the `#line:col` cursor restore below reads as a jump-shaped open and a reading
+    // view reloads as source.
     if (v.read) params.set("view", "read");
     else if (v.buffer.language === "markdown") params.set("view", "source");
     const qs = params.toString();
@@ -4511,10 +4508,10 @@ export class Shell {
       return;
     }
     list.classList.add("filled");
-    // Collapsible kinds (docs/picker-groups.md): headers arrive as real, selectable `group`
-    // window rows — the span interleave below is skipped (a span-derived header on top would
-    // double it), inter-section gap pixels are off (headers are uniform rows), and the CSS
-    // modifier restores the flex layout + pointer + selection band on the header rows.
+    // Collapsible kinds: headers arrive as real, selectable `group` window rows — the span
+    // interleave below is skipped (a span-derived header on top would double it), inter-section gap
+    // pixels are off (headers are uniform rows), and the CSS modifier restores the flex layout +
+    // pointer + selection band on the header rows.
     const collapsible = p.collapsible;
     list.classList.toggle("collapsible", collapsible);
     // Path budget for the row (chars), and the disambiguated root labels — both computed once.
@@ -4577,7 +4574,7 @@ export class Shell {
       }
       // A collapsible group's header row: opens its own section (the sticky wrapper) and IS the
       // sticky header — selectable, click-toggled through the core like Enter, dressed with the
-      // disclosure mark and the run's item count (docs/picker-groups.md).
+      // disclosure mark and the run's item count.
       if (item.kind === "group") {
         section = document.createElement("div");
         section.className = "picker-section";
@@ -4711,15 +4708,14 @@ export class Shell {
     // never carries the create row, so add a row for it). Applied before insertion — the window/create
     // are absolute, so without an explicit spacer height the list would collapse and clamp scrollTop.
     const applyGeometry = () => {
-      // Inter-group gaps (grouped kinds): each `.picker-section` except the window's last
-      // carries a CSS margin below it, so the same pixels must enter the virtual geometry or
-      // the spacer under-counts and the window drifts (the row-height-mismatch bug's cousin).
-      // Total gaps = total groups − 1, and groups fall out of the display metrics
-      // (`total_display_rows − total_matches`); gaps above the window = groups that ended
-      // above it = `window_base − offset` (the headers strictly above — every grouped window
-      // leads with its own header). Both zero for the flat kinds.
-      // Collapsible kinds have no gap pixels at all: headers are uniform window rows and the
-      // `.collapsible` CSS modifier removes the section margins (docs/picker-groups.md).
+      // Inter-group gaps (grouped kinds): each `.picker-section` except the window's last carries a
+      // CSS margin below it, so the same pixels must enter the virtual geometry or the spacer
+      // under-counts and the window drifts (the row-height-mismatch bug's cousin). Total gaps =
+      // total groups − 1, and groups fall out of the display metrics (`total_display_rows −
+      // total_matches`); gaps above the window = groups that ended above it = `window_base −
+      // offset` (the headers strictly above — every grouped window leads with its own header). Both
+      // zero for the flat kinds. Collapsible kinds have no gap pixels at all: headers are uniform
+      // window rows and the `.collapsible` CSS modifier removes the section margins.
       const grouped = p.groups.length > 0 && !collapsible;
       const totalGaps = grouped ? Math.max(0, p.total_display_rows - p.total_matches - 1) : 0;
       const gapsAbove = grouped ? Math.max(0, p.window_base - p.offset) : 0;
@@ -4756,12 +4752,12 @@ export class Shell {
       this.pickerScrollReset = false;
       this.pickerReveal = null;
     } else if (this.pickerReveal === "run" && p.expanded_run && p.expanded_run.header_row === p.selected) {
-      // Frame the freshly-opened group run (docs/picker-groups.md §9): scroll the minimum that
-      // brings the run's last row into view, capped so the header never leaves the top — at the
-      // cap the header row itself sits at the very top (its own sticky position), so nothing
-      // hides under it. Applied only once the view reflects the selected run (header_row ===
-      // selected); until then it stays armed, like the selected-row reveal below. Collapsible
-      // row space carries no gap pixels, so this is pure row arithmetic.
+      // Frame the freshly-opened group run: scroll the minimum that brings the run's last row into
+      // view, capped so the header never leaves the top — at the cap the header row itself sits at
+      // the very top (its own sticky position), so nothing hides under it. Applied only once the
+      // view reflects the selected run (header_row === selected); until then it stays armed, like
+      // the selected-row reveal below. Collapsible row space carries no gap pixels, so this is pure
+      // row arithmetic.
       const run = p.expanded_run;
       const top = run.header_row * this.pickerRowH;
       const bottom = (run.header_row + run.len + 1) * this.pickerRowH;

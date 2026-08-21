@@ -51,7 +51,7 @@ pub struct PickerState {
     /// (PageUp/Down delta, edge-of-cache prefetch threshold). Distinct from `limit` since
     /// `limit > pane_rows` under over-fetch.
     pub pane_rows: u32,
-    /// Latest pushed slice. `items.len() <= limit`.
+    /// Latest pushed slice. `items.len <= limit`.
     pub items: Vec<PickerItem>,
     /// The window's group runs, server-pushed alongside `items` (starts index into `items`).
     /// Non-empty exactly for the grouped kinds' non-empty windows — the renderer and the
@@ -61,8 +61,7 @@ pub struct PickerState {
     pub groups: Vec<GroupSpan>,
     /// Whether this view renders as a collapsible accordion — mirrored from the core, which takes
     /// it from `picker/view` rather than the kind (a Jumplist captured from the Files or Buffers
-    /// picker is flat; docs/jumplist.md). Drives the row-space math, the item indent and the
-    /// sticky pin.
+    /// picker is flat). Drives the row-space math, the item indent and the sticky pin.
     pub collapsible: bool,
     /// First *view row* rendered by the picker pane — an index into the window's expanded rows
     /// ([`crate::ui::picker_window_rows`]: header / gap / item rows), not an item index, so the
@@ -137,12 +136,12 @@ pub struct PickerState {
     /// (a drill-down entered with `Enter`) instead of the list; `Esc` clears it back to the list.
     /// A snapshot taken at `Enter` time — it doesn't live-update.
     pub lsp_detail: Option<LspServerDetail>,
-    /// The filter set in effect, stored as the ordered chip list — the client's *single*
-    /// source of truth, in insertion order (see `docs/picker-filters.md`). The wire format
-    /// (the normalized, unordered `PickerFilters`) is derived on demand by
-    /// [`PickerState::wire_filters`] and converted back by [`PickerState::adopt_filters`] on
-    /// open/resume — the order itself never crosses the wire, so a resumed picker comes back
-    /// in canonical order and true insertion order is session-ephemeral, like `chip_selected`.
+    /// The filter set in effect, stored as the ordered chip list — the client's *single* source of
+    /// truth, in insertion order. The wire format (the normalized, unordered `PickerFilters`) is
+    /// derived on demand by [`PickerState::wire_filters`] and converted back by
+    /// [`PickerState::adopt_filters`] on open/resume — the order itself never crosses the wire, so
+    /// a resumed picker comes back in canonical order and true insertion order is
+    /// session-ephemeral, like `chip_selected`.
     pub chips: Vec<ChipValue>,
     /// Index into the chip row — which, the row being the stored list itself, is also an index
     /// into [`PickerState::chips`]. While set, editing keys act on the chip (Enter edits,
@@ -185,7 +184,7 @@ pub enum ChipValue {
     Word,
     Regex,
     /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
-    /// (the Explorer hides, Grep includes — see docs §1.2), so the wire conversion needs no
+    /// (the Explorer hides, Grep includes — see docs), so the wire conversion needs no
     /// kind context.
     Ignored {
         hide: bool,
@@ -745,7 +744,7 @@ impl PickerState {
         }
     }
 
-    /// Remove the chip — it disappears from the row and from the next `wire_filters()` fold.
+    /// Remove the chip — it disappears from the row and from the next `wire_filters` fold.
     /// The caller follows up with a filter-change RPC.
     #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
     pub fn remove_chip(&mut self, id: ChipId) {

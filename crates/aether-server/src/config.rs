@@ -27,8 +27,7 @@ pub use aether_protocol::SERVER_PORT;
 pub const DEFAULT_PROFILE: &str = "default";
 
 /// Band that named profiles allocate their (recorded, reused) port from. Deliberately *below* the
-/// OS ephemeral range so a recorded port doesn't clash with transient outbound sockets later — see
-/// `docs/profiles.md`.
+/// OS ephemeral range so a recorded port doesn't clash with transient outbound sockets later —
 const PORT_BAND: std::ops::RangeInclusive<u16> = 2385..=2484;
 
 /// How long an auto-started server stays up with no clients before idle-reaping, unless the profile
@@ -75,10 +74,10 @@ pub fn profile_config_dir() -> anyhow::Result<PathBuf> {
     Ok(profiles_dir()?.join(active_profile()))
 }
 
-/// The active profile's **state** subtree: `<state>/aether/profiles/<name>/`. Holds machine-managed,
-/// not-user-authored durable state — the session file and unsaved-buffer backups — kept out of the
-/// config dir so dotfile sync/versioning of `~/.config` never drags along churny session data or
-/// (worse) the contents of unsaved buffers. See `docs/unsaved-persistence.md`.
+/// The active profile's **state** subtree: `<state>/aether/profiles/<name>/`. Holds
+/// machine-managed, not-user-authored durable state — the session file and unsaved-buffer backups —
+/// kept out of the config dir so dotfile sync/versioning of `~/.config` never drags along churny
+/// session data or (worse) the contents of unsaved buffers.
 ///
 /// `state_dir()` is `Some` only where `$XDG_STATE_HOME` exists (Linux/BSD); elsewhere (macOS,
 /// Windows) there's no state-home concept, so fall back to the always-present `data_local_dir()`.
@@ -108,7 +107,7 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
 
 /// Root directory for this profile's unsaved-buffer backups
 /// (`<state>/aether/profiles/<name>/backups/`). One subtree per workspace beneath it. See
-/// [`crate::backup`] and `docs/unsaved-persistence.md`.
+/// [`crate::backup`].
 pub fn backups_dir() -> anyhow::Result<PathBuf> {
     Ok(profile_state_dir()?.join("backups"))
 }
@@ -247,7 +246,7 @@ fn list_profiles_at(dir: &Path) -> anyhow::Result<Vec<ProfileEntry>> {
 pub use aether_protocol::settings::AppSettings;
 
 /// A declared project: the **directory** of a buildable unit — a crate, a package, a module — whose
-/// language server is pinned open while the workspace is active (`docs/projects.md`).
+/// language server is pinned open while the workspace is active.
 ///
 /// The path is relative to the root it's declared under ([`RootConfig`]), so relocating a workspace
 /// means editing one `path` line and every project beneath it follows. `"."` is the root itself.
@@ -705,8 +704,8 @@ pub struct WorkspaceSession {
     /// The buffers that were open in this workspace, most-recently-used first. On re-activation
     /// they're restored as *dormant* buffers (listed in the picker, loaded lazily). File buffers
     /// carry their canonical path; dirty scratch buffers carry their per-workspace number (their
-    /// content is restored from the matching backup — see `docs/unsaved-persistence.md`). Clean
-    /// scratches and transient previews are omitted.
+    /// content is restored from the matching backup). Clean scratches and transient previews are
+    /// omitted.
     #[serde(default)]
     pub buffers: Vec<SessionBuffer>,
     /// **Worktree bindings**. Maps a repo **family** — its common dir — to the admin name of the
@@ -903,8 +902,8 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
 ///
 /// Dropped on load rather than migrated into their workspace's bindings: two of them could disagree
 /// about the same repo, so there is no answer to migrate *to* — and this is machine state, where
-/// the rule has always been that what no longer resolves is discarded rather than explained
-/// (`docs/worktrees.md` §8.2). The workspace itself is untouched, as is every worktree.
+/// the rule has always been that what no longer resolves is discarded rather than explained. The
+/// workspace itself is untouched, as is every worktree.
 fn drop_stale_variant_sessions(sessions: &mut WorkspaceSessions) {
     sessions.workspaces.retain(|id, _| {
         // The ephemeral namespace also carries a separator and is not a variant. It is never
@@ -972,11 +971,11 @@ pub fn sort_names_by_recency(names: &mut [String], sessions: &WorkspaceSessions)
     });
 }
 
-/// Hint learning state (docs/hints.md): which hints are retired ("learned") and the
-/// per-hint counters for the still-active frontier. Machine-managed like [`WorkspaceSessions`] —
-/// it lives beside `sessions.json` in the state dir, and the server is a dumb aggregator: clients
-/// send increment events (`hints/record`), this applies them; ranking and display stay client-side
-/// with the keymap. Retired hints collapse to a bare id — no counters survive retirement.
+/// Hint learning state: which hints are retired ("learned") and the per-hint counters for the
+/// still-active frontier. Machine-managed like [`WorkspaceSessions`] — it lives beside
+/// `sessions.json` in the state dir, and the server is a dumb aggregator: clients send increment
+/// events (`hints/record`), this applies them; ranking and display stay client-side with the
+/// keymap. Retired hints collapse to a bare id — no counters survive retirement.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HintsState {
     #[serde(default)]
@@ -998,9 +997,9 @@ impl HintsState {
         let rec = self.active.entry(hint_id.to_string()).or_default();
         match event {
             HintEvent::Shown | HintEvent::Dismissed => {
-                // Fold the decay-to-date into the stored counter, then count this display
-                // period — an explicit dismissal weighs more than a display that merely lapsed.
-                // Scoring applies the same decay read-only (docs/hints.md §1.6).
+                // Fold the decay-to-date into the stored counter, then count this display period —
+                // an explicit dismissal weighs more than a display that merely lapsed. Scoring
+                // applies the same decay read-only.
                 let add = if event == HintEvent::Dismissed {
                     DISMISS_WEIGHT
                 } else {
@@ -1043,8 +1042,8 @@ impl HintsState {
 }
 
 /// Half-life, in days, of the shows-without-follow fatigue counter — "not interested" fades so a
-/// hint ignored early can come back when it's relevant (docs/hints.md §1.6). Must agree with the
-/// client core's scoring decay (`aether-client`'s hints module), pinned by docs/hints.md §1.11.
+/// hint ignored early can come back when it's relevant. Must agree with the client core's scoring
+/// decay (`aether-client`'s hints module).
 pub const FATIGUE_HALFLIFE_DAYS: f32 = 3.0;
 
 /// The fatigue counter's value at `now_ms`, decayed from its last fold at `last_shown_at`. Pure;
@@ -1086,12 +1085,11 @@ pub fn write_hints_at(path: &Path, hints: &HintsState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Input-history state (docs/input-history.md): the `Up`/`Down` recall lists for the overlay text
-/// inputs, keyed by workspace name. Machine-managed like [`WorkspaceSessions`] and [`HintsState`],
-/// and — like them — the server is a dumb aggregator: clients append committed values and own the
-/// navigation. A `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral
-/// workspaces are never recorded here (no stable identity to file the history under), matching
-/// [`WorkspaceSessions`].
+/// Input-history state: the `Up`/`Down` recall lists for the overlay text inputs, keyed by
+/// workspace name. Machine-managed like [`WorkspaceSessions`] and [`HintsState`], and — like them —
+/// the server is a dumb aggregator: clients append committed values and own the navigation. A
+/// `BTreeMap` keeps the on-disk JSON deterministically ordered. Ephemeral workspaces are never
+/// recorded here (no stable identity to file the history under), matching [`WorkspaceSessions`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryFile {
     #[serde(default)]
