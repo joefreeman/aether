@@ -1308,12 +1308,11 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPush, "Git", "Push commits to remote"),
     bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch, push or pull in progress"),
     bind!(LG, ch('x'), Exact(Mods::ALT), A::GitAbortOperation, "Git", "Abandon the stopped merge/rebase"),
-    bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches"),
+    bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches and worktrees"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
     bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
     bind!(LG, ch('z'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
-    bind!(LG, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Worktrees), "Git", "Worktrees"),
     bind!(LG, ch('z'), Exact(Mods::ALT), A::GitStashPush, "Git", "Stash working tree"),
 ];
 

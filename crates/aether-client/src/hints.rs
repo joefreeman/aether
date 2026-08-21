@@ -94,6 +94,8 @@ pub enum PickerCmd {
     /// `Ctrl-j` in a capturable picker — snapshot its results into the jumplist
     /// (docs/jumplist.md).
     CaptureJumplist,
+    /// `Ctrl-o` in the branch picker — create a worktree for the highlighted branch.
+    CreateWorktree,
 }
 
 /// Session facts that condition a hint's display eligibility beyond the context id — the engine
@@ -327,6 +329,14 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "picker-close", tier: 4, contexts: &[C::Picker(PickerKind::Buffers)], keys: "Ctrl-d",
         trigger: Trigger::Picker(PickerCmd::CloseBuffer),
         text: "Use {} to close the selected buffer" },
+    // The branch picker's least guessable key, and the one the merge made necessary. `Enter` on a
+    // branch with no tree checks it out — which is what the *worktree* picker's Enter used to
+    // create a tree for — so anyone carrying that muscle memory needs pointing here. The text says
+    // "worktree" outright rather than leaning on the letter: `o` means "make a new one" inside
+    // Aether (open line below, open block below) but reads as "open" to everyone else.
+    HintDef { id: "worktree-create", tier: 4, contexts: &[C::Picker(PickerKind::GitBranches)], keys: "Ctrl-o",
+        trigger: Trigger::Picker(PickerCmd::CreateWorktree),
+        text: "Use {} to create a worktree for the selected branch" },
     // (Not the Jumplist, whose path chips are data-gated — the hint could name a chord that
     // isn't available for the current capture.)
     HintDef { id: "picker-scope", tier: 4,

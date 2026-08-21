@@ -75,6 +75,10 @@ impl std::fmt::Debug for Bootstrap {
 #[derive(Clone)]
 pub struct ConnectingBootstrap {
     pub workspace: Option<String>,
+    /// Which **context** of that workspace to enter: repo id → worktree admin name, empty for the
+    /// base. Passed as a struct field because `Space z` opens another window *in this process* —
+    /// there is no command line for it to survive, and so no user-facing flag to explain.
+    pub worktrees: Vec<(String, String)>,
     pub file: Option<String>,
     /// A location (0-based line/col) to jump to once the CLI `file` opens (`ae src/main.rs:42:10`,
     /// and the grep-hit "open in new window"). Applies only to a file *inside* a workspace root —
@@ -2152,6 +2156,10 @@ impl App {
                 }
                 let activated = match handle
                     .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+                        // Unset, not empty: reconnects and boot land in whichever context this
+                        // workspace was last used in. Windows have no identity across a restart, so
+                        // this is the whole of "come back where I was".
+                        worktrees: None,
                         name: workspace,
                         open_last: false,
                     })
@@ -6486,6 +6494,12 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
 
     let activated = handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+            // A window spawned from inside the editor names the context it should open in
+            // (`Space z`, `Ctrl-Enter` on a branch row). A fresh launch names none, and unset —
+            // not empty — means "wherever this workspace was last used", which is the whole of
+            // "come back where I was" given windows have no identity across a restart.
+            worktrees: (!args.worktrees.is_empty())
+                .then(|| args.worktrees.iter().cloned().collect()),
             name: workspace,
             open_last: false,
         })
@@ -6728,6 +6742,7 @@ impl Shell {
         };
         self.open(Bootstrap::Connecting(ConnectingBootstrap {
             workspace: target.workspace,
+            worktrees: target.worktrees,
             file,
             jump_to,
             buffer_id,
@@ -7552,6 +7567,7 @@ mod tests {
 
     fn connecting_bootstrap() -> Bootstrap {
         Bootstrap::Connecting(ConnectingBootstrap {
+            worktrees: Vec::new(),
             workspace: None,
             file: None,
             jump_to: None,
@@ -7571,6 +7587,7 @@ mod tests {
         assert_eq!(shell.windows.len(), 1, "the launch opens one window");
 
         let _ = shell.open_target(WindowTarget {
+            worktrees: Vec::new(),
             workspace: Some("aether".into()),
             open: WindowOpen::Path {
                 path: "/proj/src/main.rs".into(),
@@ -7606,6 +7623,7 @@ mod tests {
         let _ = shell.update(ShellMessage::Window(
             id,
             Message::OpenWindow(WindowTarget {
+                worktrees: Vec::new(),
                 workspace: Some("aether".into()),
                 open: WindowOpen::Workspace,
             }),
@@ -7624,6 +7642,7 @@ mod tests {
     fn closing_windows_drops_them_and_empties_on_the_last() {
         let (mut shell, _boot) = Shell::new(connecting_bootstrap());
         let _ = shell.open_target(WindowTarget {
+            worktrees: Vec::new(),
             workspace: None,
             open: WindowOpen::Workspace,
         });
@@ -7661,6 +7680,7 @@ mod tests {
         let (mut app, _dial) = App::new(
             window::Id::unique(),
             Bootstrap::Connecting(ConnectingBootstrap {
+                worktrees: Vec::new(),
                 workspace: None,
                 file: None,
                 jump_to: None,

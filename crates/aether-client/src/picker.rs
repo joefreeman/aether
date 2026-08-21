@@ -399,7 +399,6 @@ impl PickerState {
             PickerKind::Explorer => self.explorer_pending_create(),
             PickerKind::Workspaces => self.workspace_pending_create(),
             PickerKind::GitBranches => self.branch_pending_create(),
-            PickerKind::Worktrees => self.worktree_pending_create(),
             _ => None,
         }
     }
@@ -543,37 +542,6 @@ impl PickerState {
         })
     }
 
-    /// The worktree picker's create row: a branch name that neither a worktree nor a local branch
-    /// already carries. Selecting it creates the branch *and* a worktree for it.
-    ///
-    /// Matched against branch names, not admin names: the query is a branch, and the directory is
-    /// derived from it server-side. A worktree row whose *admin name* happens to equal the query
-    /// therefore doesn't suppress the row — its branch may well be something else, and offering to
-    /// create that branch is right.
-    fn worktree_pending_create(&self) -> Option<PendingCreate> {
-        let name = self.query.trim();
-        if name.is_empty() {
-            return None;
-        }
-        // Same reasoning as `branch_pending_create`: git's ref-name rules are not worth
-        // reimplementing client-side, and the server's refusal surfaces verbatim.
-        let exact = self.items.iter().any(|it| {
-            matches!(
-                it,
-                PickerItem::Worktree { row, label, branch, .. }
-                    if (*row == aether_protocol::picker::WorktreeRowKind::Branch && label == name)
-                        || branch == name
-            )
-        });
-        if exact {
-            return None;
-        }
-        Some(PendingCreate {
-            name: name.to_string(),
-            is_dir: false,
-        })
-    }
-
     /// The full text of the synthetic "+ Create …" row, or `None` when there is no such row.
     ///
     /// Lives in the core, next to the [`Self::pending_create`] decision it labels, because the
@@ -584,10 +552,10 @@ impl PickerState {
         let pc = self.pending_create()?;
         Some(match self.kind {
             PickerKind::Workspaces => format!("+ Create workspace {}", pc.name),
-            // Both name a *branch*: `Space g b` creates and checks one out; the worktree picker
-            // creates one and a worktree for it. Neither creates a file.
+            // Names a *branch*, not a file. `Enter` creates it and checks it out here; `Ctrl-o`
+            // creates it and a worktree for it — the same two verbs every other row in this picker
+            // carries, which is why one label covers both.
             PickerKind::GitBranches => format!("+ Create branch {}", pc.name),
-            PickerKind::Worktrees => format!("+ Create worktree for new branch {}", pc.name),
             _ if pc.is_dir => format!("+ Create directory {}/", pc.name),
             _ => format!("+ Create file {}", pc.name),
         })
@@ -1025,9 +993,6 @@ pub enum ItemKey<'a> {
     GitCommit(&'a str),
     /// A stash entry's hash — stable where its `stash@{n}` position isn't.
     GitStash(&'a str),
-    /// `(row kind, label)` — an admin name is unique within a family and a branch name within a
-    /// repo, but the two namespaces overlap, so the kind is part of the identity.
-    Worktree(aether_protocol::picker::WorktreeRowKind, &'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1129,7 +1094,6 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::GitBranch { repo_id, name, .. } => ItemKey::GitBranch(repo_id, name),
         PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit(hash),
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash(oid),
-        PickerItem::Worktree { row, label, .. } => ItemKey::Worktree(*row, label),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,
@@ -2116,11 +2080,7 @@ mod tests {
             s.create_row_reserves_status_cell()
         };
         assert!(reserves(PickerKind::Explorer));
-        for kind in [
-            PickerKind::Workspaces,
-            PickerKind::GitBranches,
-            PickerKind::Worktrees,
-        ] {
+        for kind in [PickerKind::Workspaces, PickerKind::GitBranches] {
             assert!(!reserves(kind), "{kind:?} rows start at the text");
         }
     }
@@ -2137,10 +2097,6 @@ mod tests {
         assert_eq!(
             labelled(PickerKind::GitBranches, "feature").as_deref(),
             Some("+ Create branch feature")
-        );
-        assert_eq!(
-            labelled(PickerKind::Worktrees, "feature").as_deref(),
-            Some("+ Create worktree for new branch feature")
         );
         assert_eq!(
             labelled(PickerKind::Workspaces, "notes").as_deref(),
@@ -2161,7 +2117,7 @@ mod tests {
         );
 
         // No query, no row — and so no label.
-        assert_eq!(labelled(PickerKind::Worktrees, ""), None);
+        assert_eq!(labelled(PickerKind::GitBranches, ""), None);
     }
 
     #[test]

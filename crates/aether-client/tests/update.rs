@@ -3983,14 +3983,13 @@ fn a_request_on_a_buffer_the_server_closed_is_dropped_silently() {
     use aether_protocol::error::ErrorCode;
     let mut s = session();
     let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
-    let token = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            Effect::Request { token, .. } => Some(*token),
-            _ => None,
-        })
-        .expect("an edit went out");
+    let token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("an edit went out");
 
     let fx = s.on_rpc_result(
         token,
@@ -4009,14 +4008,13 @@ fn a_request_on_a_buffer_the_server_closed_is_dropped_silently() {
     // Any *other* failure still surfaces — this is a narrow rule about a vanished buffer, not a
     // blanket swallow.
     let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
-    let token = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            Effect::Request { token, .. } => Some(*token),
-            _ => None,
-        })
-        .expect("an edit went out");
+    let token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("an edit went out");
     let fx = s.on_rpc_result(
         token,
         Err(RpcError {
@@ -4206,13 +4204,19 @@ fn space_g_b_opens_the_branch_picker() {
     );
 }
 
-/// Open the branch picker on a fixed two-branch listing: `main` (current) and `feature`.
-fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session::Session {
+use aether_protocol::picker::BranchCheckout;
+
+/// Open the merged branch picker on a fixed two-branch listing: `main` (current) and `feature`.
+///
+/// `held` is the tree holding `feature`, if any — which is what turns its row from a branch row
+/// into a worktree row.
+fn branch_picker_session(held: Option<BranchCheckout>) -> aether_client::session::Session {
     use aether_protocol::picker::{PickerItem, PickerKind};
     let mut s = session();
+    s.workspace = "p".into();
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::GitBranches, None, None, false, None);
-    let row = |name: &str, is_head: bool, held: Option<&str>| PickerItem::GitBranch {
+    let row = |name: &str, is_head: bool, checkout: Option<BranchCheckout>| PickerItem::GitBranch {
         repo_id: "/p".into(),
         name: name.into(),
         is_head,
@@ -4221,15 +4225,28 @@ fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session
         upstream: None,
         ahead: 0,
         behind: 0,
-        checked_out_in: held.map(str::to_string),
-        checked_out_in_main: false,
+        checkout,
+        detached_at: None,
         match_indices: vec![],
     };
     {
         let p = s.picker.as_mut().expect("picker open");
         p.items = vec![
-            row("main", true, None),
-            row("feature", false, checked_out_in),
+            // `main` carries the checkout holding it, as the server sends it: `checkouts_by_branch`
+            // records the tree you are standing in like any other.
+            row(
+                "main",
+                true,
+                Some(BranchCheckout {
+                    path: "/p".into(),
+                    is_main: true,
+                    worktree: String::new(),
+                    is_current: true,
+                    locked: false,
+                    prunable: false,
+                }),
+            ),
+            row("feature", false, held),
         ];
         p.total_matches = 2;
         p.selected = 1; // "feature"
@@ -4237,46 +4254,149 @@ fn branch_picker_session(checked_out_in: Option<&str>) -> aether_client::session
     s
 }
 
-/// A worktree picker holding the three row kinds, highlighting the linked tree `feature`.
-fn worktree_picker_session() -> aether_client::session::Session {
-    use aether_protocol::picker::{PickerItem, PickerKind, WorktreeRowKind};
-    let mut s = session();
-    s.workspace_paths = vec!["/p".into()];
-    let _ = s.open_picker(PickerKind::Worktrees, None, None, false, None);
-    let row = |row: WorktreeRowKind, label: &str| PickerItem::Worktree {
-        repo_id: "/p".into(),
-        row,
-        label: label.into(),
-        branch: label.into(),
-        path: format!("/store/{label}"),
+/// A tree holding a branch: the linked-worktree case unless overridden.
+fn linked(worktree: &str) -> BranchCheckout {
+    BranchCheckout {
+        path: format!("/store/{worktree}"),
+        is_main: false,
+        worktree: worktree.into(),
         is_current: false,
-        prunable: false,
         locked: false,
-        match_indices: vec![],
-    };
-    {
-        let p = s.picker.as_mut().expect("picker open");
-        p.items = vec![
-            row(WorktreeRowKind::Main, "main"),
-            row(WorktreeRowKind::Existing, "feature"),
-            row(WorktreeRowKind::Branch, "spare"),
-        ];
-        p.total_matches = 3;
-        p.selected = 1; // the linked tree
+        prunable: false,
     }
-    s
 }
 
-/// Removal is on `Ctrl-d` like every other picker's "remove the highlighted thing" (it was `Alt-x`
-/// until 2026-08-20), and it does *not* stage a confirm: the refusal is the confirmation.
+fn request_token(fx: &Effects, method: &str) -> Option<u64> {
+    fx.0.iter().find_map(|e| match e {
+        Effect::Request {
+            method: m, token, ..
+        } if *m == method => Some(*token),
+        _ => None,
+    })
+}
+
+/// A `BUFFER_NOT_FOUND` error is stripped of its toast but must still run its callback. Dropping
+/// the callback too — as this once did — quietly took every state-clearing continuation with it.
 #[test]
-fn worktree_picker_ctrl_d_removes_without_a_confirm() {
-    let mut s = worktree_picker_session();
+fn a_stale_buffer_error_still_runs_its_callback() {
+    use aether_client::transport::RpcError;
+    use aether_protocol::error::ErrorCode;
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+    let token = request_token(&fx, "git/worktree_add").expect("Ctrl-o creates");
+
+    let fx = s.on_rpc_result(
+        token,
+        Err(RpcError {
+            method: "git/worktree_add",
+            code: ErrorCode::BUFFER_NOT_FOUND.0,
+            message: "unknown buffer_id: 7".into(),
+        }),
+    );
+    assert!(
+        !fx.0.iter().any(|e| matches!(
+            e,
+            Effect::Toast {
+                kind: ToastKind::Error,
+                ..
+            }
+        )),
+        "a buffer the server already closed is still not worth a toast"
+    );
+}
+
+/// `Ctrl-Enter` on a branch a tree holds targets **that tree**, in a new window. This is the verb
+/// the whole context keying exists for: two windows, two trees of one repo, at once.
+#[test]
+fn ctrl_enter_on_a_held_branch_targets_its_tree() {
+    let mut s = branch_picker_session(Some(linked("feature-auth")));
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    let target =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::ShellAction(aether_client::effect::ShellAction::NewWindow(t)) => {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .expect("Ctrl-Enter asks the shell for a new window");
+    assert_eq!(target.workspace.as_deref(), Some("p"));
+    assert_eq!(
+        target.worktrees,
+        vec![("/p".to_string(), "feature-auth".to_string())],
+        "the target names the tree to open, not the internal context id"
+    );
+}
+
+/// A branch **no** tree holds can't be opened in a second window — git permits one checkout per
+/// branch. It refuses with the way forward rather than falling through to an ordinary accept, which
+/// would check the branch out *here*: something else entirely from what was asked for, and silently.
+#[test]
+fn ctrl_enter_on_a_treeless_branch_refuses_with_guidance() {
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    assert!(
+        find_request(&fx, "git/checkout").is_none(),
+        "it must not quietly do what plain Enter does"
+    );
+    let toast = toast_messages(&fx).join(" ");
+    assert!(
+        toast.contains("feature") && toast.contains("no worktree"),
+        "names the branch and the missing thing: {toast}"
+    );
+}
+
+/// `Ctrl-o` creates a worktree for the highlighted branch and **stays put**. Its own key rather
+/// than a side effect of Enter: creation is a long, cancellable checkout, and bundling it into a
+/// navigation key leaves "where am I?" unanswerable when it's cancelled mid-flight.
+#[test]
+fn ctrl_o_creates_a_worktree_without_moving() {
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+
+    let req = find_request(&fx, "git/worktree_add").expect("Ctrl-o creates");
+    assert_eq!(req["branch"], json!("feature"));
+    assert_eq!(
+        req["repo_id"],
+        json!("/p"),
+        "the row's repo, not a re-resolve"
+    );
+    assert!(
+        req.get("create_branch").is_none_or(|c| c == &json!(false)),
+        "the branch already exists — only the tree is new"
+    );
+    assert!(
+        find_request(&fx, "workspace/bind_worktree").is_none(),
+        "creating never moves you: that is the whole point of the split from Enter"
+    );
+    assert!(s.picker.is_some(), "and the picker stays open on the row");
+}
+
+/// A branch that already has a tree has nothing to create. It says which tree, because admin names
+/// drift from branch names — "feature already has a worktree" would be the wrong sentence for a
+/// row whose tree is called something else.
+#[test]
+fn ctrl_o_refuses_a_branch_that_already_has_a_tree() {
+    let mut s = branch_picker_session(Some(linked("feature-auth")));
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+    assert!(find_request(&fx, "git/worktree_add").is_none());
+    let toast = toast_messages(&fx).join(" ");
+    assert!(toast.contains("feature-auth"), "names the tree: {toast}");
+}
+
+/// `Ctrl-d` takes the **outermost** thing off: a row with a tree loses the tree, a row without one
+/// loses the branch. The exact inverse of `Ctrl-o` building the tree onto the branch.
+#[test]
+fn ctrl_d_removes_the_tree_when_there_is_one() {
+    let mut s = branch_picker_session(Some(linked("feature-auth")));
     let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
 
-    let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-d removes");
-    assert_eq!(req["name"], json!("feature"));
-    assert_eq!(req["repo_id"], json!("/p"), "the row's repo, not a re-resolve");
+    let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-d removes the tree");
+    assert_eq!(
+        req["name"],
+        json!("feature-auth"),
+        "keyed on the admin name, not the branch"
+    );
     assert!(
         req.get("force").is_none_or(|f| f == &json!(false)),
         "the first press is never forced — its refusal is what itemises the risk"
@@ -4285,30 +4405,62 @@ fn worktree_picker_ctrl_d_removes_without_a_confirm() {
         s.prompt.is_none(),
         "no modal: a confirm carrying no facts would only train people to confirm"
     );
+    assert!(
+        find_request(&fx, "git/delete_branch").is_none(),
+        "the branch survives its worktree"
+    );
 }
 
-/// `Ctrl-Alt-d` is the escalation from having read that refusal. Alt rather than Shift, because a
-/// terminal reports Ctrl-Shift-D indistinguishably from Ctrl-d.
+/// The same key on a row with no tree falls through to deleting the branch — behind a confirm,
+/// because unlike a worktree removal there is no refusal to read first.
 #[test]
-fn worktree_picker_ctrl_alt_d_forces() {
-    let mut s = worktree_picker_session();
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL_ALT, None, ROWS);
+fn ctrl_d_deletes_the_branch_when_there_is_no_tree() {
+    let mut s = branch_picker_session(None);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    assert!(find_request(&fx, "git/worktree_remove").is_none());
+    assert!(s.prompt.is_some(), "branch deletion stages a confirm");
+}
 
+/// `Ctrl-Alt-d` is the escalation from having read the removal's refusal. Alt rather than Shift,
+/// because a terminal reports Ctrl-Shift-D indistinguishably from Ctrl-d.
+#[test]
+fn ctrl_alt_d_forces_the_removal() {
+    let mut s = branch_picker_session(Some(linked("feature-auth")));
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL_ALT, None, ROWS);
     let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-Alt-d removes");
-    assert_eq!(req["name"], json!("feature"));
     assert_eq!(req["force"], json!(true));
 }
 
-/// The rows that have no tree to remove say so client-side rather than failing at the server.
+/// The main checkout is the repository, and the tree you are standing in can't be pulled out from
+/// under you. Both say so client-side rather than failing at the server.
 #[test]
-fn worktree_picker_ctrl_d_refuses_the_rows_without_a_tree() {
-    for (index, row) in [(0, "main"), (2, "spare")] {
-        let mut s = worktree_picker_session();
-        s.picker.as_mut().unwrap().selected = index;
+fn ctrl_d_refuses_the_trees_that_cannot_be_removed() {
+    for (label, checkout) in [
+        (
+            "main checkout",
+            BranchCheckout {
+                is_main: true,
+                worktree: String::new(),
+                ..linked("")
+            },
+        ),
+        (
+            "the tree you're in",
+            BranchCheckout {
+                is_current: true,
+                ..linked("feature-auth")
+            },
+        ),
+    ] {
+        let mut s = branch_picker_session(Some(checkout));
         let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
         assert!(
             find_request(&fx, "git/worktree_remove").is_none(),
-            "{row} has no worktree to remove"
+            "{label} cannot be removed"
+        );
+        assert!(
+            s.prompt.is_none(),
+            "{label} does not fall through to a branch delete"
         );
     }
 }
@@ -4346,43 +4498,36 @@ fn branch_picker_alt_l_checks_out_like_enter() {
     assert_eq!(req["branch"], json!("feature"));
 }
 
+/// **The merge, in one test.** A branch another tree holds used to dead-end here: git refuses a
+/// second checkout, so the branch picker could only toast "checked out in another worktree" and
+/// stop — with the way forward under a different key, in a list you were not looking at.
+///
+/// Now the row *is* the worktree row, and Enter goes there. One intent — get me to this branch —
+/// with git's state picking the mechanism.
 #[test]
-fn branch_picker_refuses_a_branch_held_by_another_worktree() {
-    // The row already says it's taken, so the round trip would only come back refused. The server
-    // checks too (a race is possible); this is about not sending a request that can't succeed.
-    let mut s = branch_picker_session(Some("/p-worktrees/feature"));
+fn enter_on_a_held_branch_opens_its_worktree() {
+    let mut s = branch_picker_session(Some(linked("feature-auth")));
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
 
     assert!(
         find_request(&fx, "git/checkout").is_none(),
-        "no checkout is attempted"
+        "git can't check out a branch another tree holds"
     );
-    assert!(
-        s.picker.is_some(),
-        "and the picker stays open to pick another"
+    let req = find_request(&fx, "workspace/bind_worktree").expect("Enter goes to the tree");
+    assert_eq!(
+        req["worktree"],
+        json!("feature-auth"),
+        "bound by admin name, which drifts from the branch"
     );
-    // The refusal must not name the worktree: admin names are derived from branch names, so the
-    // basename is normally the branch itself and the message read "feature is checked out in
-    // feature". The row's `⧉ <name>` already says which tree; the toast points at the way forward.
-    let toast = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            aether_client::effect::Effect::Toast { message, .. } => Some(message.clone()),
-            _ => None,
-        })
-        .expect("a refusal says why");
-    assert!(
-        !toast.contains("in feature"),
-        "must not read as \"feature is checked out in feature\": {toast}"
+    assert_eq!(
+        req["repo_id"],
+        json!("/p"),
+        "the row's repo, not a re-resolve"
     );
+    let toast = toast_messages(&fx).join(" ");
     assert!(
-        toast.contains("another worktree"),
-        "a linked worktree holds it: {toast}"
-    );
-    assert!(
-        !toast.contains("Space"),
-        "and names no keybinding — those go stale, and the hint system owns key discovery: {toast}"
+        !toast.contains("checked out in"),
+        "the refusal this replaced is gone: {toast}"
     );
 }
 
@@ -4457,44 +4602,47 @@ fn branch_picker_ctrl_d_confirms_then_deletes() {
     );
 }
 
-/// The *main* checkout can be the holder — from inside a worktree that is the ordinary case for
-/// `main` — and calling it "a worktree" was simply wrong. Both refuse identically; they are
-/// different places to be sent.
+/// A branch the *main* checkout holds is reached by **unbinding** — sending this repo back to its
+/// main tree. An empty admin name is exactly what `workspace/bind_worktree` reads as that, so the
+/// main row needs no case of its own.
 #[test]
-fn a_branch_held_by_the_main_checkout_says_so() {
-    use aether_protocol::picker::PickerItem;
-    let mut s = branch_picker_session(Some("/src/aether"));
-    if let Some(PickerItem::GitBranch {
-        checked_out_in_main,
-        ..
-    }) = s.picker.as_mut().unwrap().items.get_mut(1)
-    {
-        *checked_out_in_main = true;
-    }
+fn a_branch_held_by_the_main_checkout_unbinds() {
+    let mut s = branch_picker_session(Some(BranchCheckout {
+        path: "/p".into(),
+        is_main: true,
+        worktree: String::new(),
+        is_current: false,
+        locked: false,
+        prunable: false,
+    }));
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
 
-    assert!(find_request(&fx, "git/checkout").is_none());
-    let toast = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            aether_client::effect::Effect::Toast { message, .. } => Some(message.clone()),
-            _ => None,
-        })
-        .expect("a refusal says why");
     assert!(
-        toast.contains("the main checkout"),
-        "the main tree is not \"a worktree\": {toast}"
+        find_request(&fx, "git/checkout").is_none(),
+        "git can't check out a branch another tree holds — you go there instead"
+    );
+    let req = find_request(&fx, "workspace/bind_worktree").expect("Enter goes to the holder");
+    assert!(
+        req.get("worktree").is_none_or(|w| w == &json!("")),
+        "an empty admin name is the unbind"
     );
 }
 
+/// Git refuses to delete the branch you are on, so don't stage a doomed confirm — and don't try to
+/// remove the tree you are standing in either.
 #[test]
 fn branch_picker_ctrl_d_refuses_the_current_branch() {
     let mut s = branch_picker_session(None);
-    s.picker.as_mut().unwrap().selected = 0; // "main", the HEAD row
+    s.picker.as_mut().unwrap().selected = 0; // "main", the row you are standing on
     let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
     assert!(s.prompt.is_none(), "no confirm for a doomed delete");
     assert!(find_request(&fx, "git/delete_branch").is_none());
+    assert!(find_request(&fx, "git/worktree_remove").is_none());
+    let toast = toast_messages(&fx).join(" ");
+    assert!(
+        toast.contains("You're on main"),
+        "says you are standing on it, not that it is \"the repository\": {toast}"
+    );
 }
 
 /// A `NotMerged` refusal escalates into a second confirm rather than dead-ending, and accepting
@@ -6436,6 +6584,7 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
     // A fresh workspace comes back with no roots and no landing buffer.
     let fx = s.on_event(Event::WorkspaceCreated(Ok(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "fresh".into(),
             paths: vec![],
             projects: Vec::new(),
@@ -6514,6 +6663,7 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     assert_eq!(add["path"], json!("/b"));
     // The result updates the session roots + the overlay's roots and clears the input.
     let _ = s.on_event(Event::WorkspaceRootAdded(Ok(WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether".into(),
         paths: vec!["/a".into(), "/b".into()],
         projects: Vec::new(),
@@ -6589,6 +6739,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
 
     let mut s = Session::new(
         WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec!["/a".into()],
             projects: vec![WorkspaceProject {
@@ -7100,6 +7251,7 @@ fn settings_add_project_emits_request_and_its_result_updates_state() {
     );
 
     let _ = s.on_event(Event::WorkspaceProjectAdded(Ok(WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether".into(),
         paths: vec!["/a".into()],
         projects: vec![WorkspaceProject {
@@ -7178,6 +7330,7 @@ fn settings_rename_emits_request_and_its_result_updates_the_name() {
     assert_eq!(rename["new_name"], json!("oldx"));
     // The result reconciles the committed name in both the session and the overlay.
     let _ = s.on_event(Event::WorkspaceRenamed(Ok(WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "oldx".into(),
         paths: vec!["/a".into()],
         projects: Vec::new(),
@@ -7228,6 +7381,7 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
     // The result refreshes the roots.
     let _ = s.on_event(Event::WorkspaceRootRemoved(Ok(WorkspaceRemoveRootResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec!["/b".into()],
             projects: Vec::new(),
@@ -7747,6 +7901,7 @@ fn daemon_restart_remaps_the_tether_on_the_same_file_and_drops_it_otherwise() {
         .unwrap()
     };
     let workspace = || WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "proj".into(),
         paths: vec!["/p".into()],
         projects: vec![],
@@ -7839,6 +7994,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
     };
     let result = serde_json::to_value(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "proj".into(),
             paths: vec![],
             projects: Vec::new(),
@@ -8021,6 +8177,7 @@ fn hint_session() -> Session {
     use aether_client::session::BufferInfo;
     Session::new(
         aether_protocol::workspace::WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "w".into(),
             paths: vec!["/tmp/w".into()],
             projects: Vec::new(),

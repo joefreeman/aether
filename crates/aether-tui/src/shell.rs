@@ -2827,6 +2827,10 @@ async fn dial(
     }
     let activated = match handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+            // Unset, not empty: reconnects and boot land in whichever context this
+            // workspace was last used in. Windows have no identity across a restart, so
+            // this is the whole of "come back where I was".
+            worktrees: None,
             name: workspace,
             open_last: false,
         })
@@ -2985,6 +2989,10 @@ pub async fn bootstrap(
         Some(workspace) => {
             let activated = handle
                 .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+                    // Unset, not empty: reconnects and boot land in whichever context this
+                    // workspace was last used in. Windows have no identity across a restart, so
+                    // this is the whole of "come back where I was".
+                    worktrees: None,
                     name: workspace.to_string(),
                     open_last: file.is_none(),
                 })

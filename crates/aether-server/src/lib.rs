@@ -87,7 +87,7 @@ pub fn lsp_view(s: &state::ServerState) -> LspManagerView {
             language: h.language.clone(),
             ready: matches!(h.status, aether_protocol::lsp::LspStatus::Ready),
             pinned: !h.pinned_by.is_empty(),
-            open_buffers: h.open_buffers.len(),
+            open_buffers: h.open_documents.values().map(|holders| holders.len()).sum(),
         })
         .collect()
 }

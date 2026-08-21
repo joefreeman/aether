@@ -514,20 +514,56 @@ pub struct BranchRow {
     /// upstream. Computed locally, so they're only as fresh as the last fetch — stage 3's job.
     pub ahead: u32,
     pub behind: u32,
-    /// Workdir of *another* checkout in this family that has this branch. Git refuses the same
-    /// branch in two checkouts, so the picker must show this before the user tries.
-    pub checked_out_in: Option<String>,
-    /// True when that other checkout is the repo's **main** working tree rather than a linked
-    /// worktree. Both refuse the checkout identically, but they are not the same place to be sent:
-    /// "it's in the main tree" and "it's in a worktree" are different sentences, and without this
-    /// the client can only guess from a path.
-    pub checked_out_in_main: bool,
+    /// The checkout in this family holding this branch, when one does. Git permits a branch in only
+    /// one checkout at a time, so this is at most one — and its presence is what makes a branch row
+    /// a *worktree* row in the merged picker.
+    pub checkout: Option<BranchCheckout>,
+    /// This row is a **detached** worktree rather than a branch: `name` is the tree's admin name
+    /// (the only thing about it worth typing — a commit id isn't) and this is its short commit id.
+    ///
+    /// Such a row has no branch, so it supports neither checkout nor branch deletion; Enter opens
+    /// the tree and `Ctrl-d` removes it. It exists because a branch-keyed list otherwise has
+    /// nowhere to put a tree that is on no branch, and silently omitting one would make it
+    /// unreachable — including for removal.
+    pub detached_at: Option<String>,
 }
 
-/// Every local branch of the repo at `workdir`, HEAD first and then most-recently-committed first.
+/// The checkout holding a branch: which tree it is, and what can be done to it.
+///
+/// One type rather than the flat `checked_out_in` / `checked_out_in_main` pair it replaces, because
+/// the merged branch picker needs more than "somewhere else has it" — it needs the admin name (to
+/// bind, and to remove) and the lock/prune state (to know what `Ctrl-d` may do). Those only ever
+/// make sense together, and a row either has a checkout or doesn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCheckout {
+    /// Working directory of the checkout.
+    pub path: String,
+    /// It is the repo's **main** working tree rather than a linked worktree. Different sentence for
+    /// the user, and different consequences: the main tree has no admin name and can't be removed.
+    pub is_main: bool,
+    /// Admin name of the linked worktree. **Empty for the main tree**, which has none — the same
+    /// convention `GitWorktreeRow::name` uses, and what `workspace/bind_worktree` reads as "unbind".
+    pub worktree: String,
+    /// This is the checkout the caller is standing in. Not a refusal: the row for the branch you
+    /// are on is the ordinary "already here" case, distinct from a branch held by another tree.
+    pub is_current: bool,
+    /// `git worktree lock` is holding it — never removed, not even with force.
+    pub locked: bool,
+    /// The admin entry outlived its directory (`rm -rf` rather than `git worktree remove`). The
+    /// only condition under which pruning is offered.
+    pub prunable: bool,
+}
+
+/// Every local branch of the repo at `workdir`, checked-out ones first (see [`checkout_rank`]) and
+/// then most-recently-committed first.
 ///
 /// That ordering is the useful default for a fuzzy picker: with no query you want the branch you're
 /// on and the ones you've touched lately, not an alphabetical list where `main` sits under `feat/…`.
+///
+/// Each row carries the checkout holding it, when one does — which is what makes this list the
+/// *whole* merged picker rather than half of it. A branch in a worktree is not a separate kind of
+/// row; it is a branch row that knows where it lives. The one thing this list can't produce is a
+/// **detached** worktree, which holds no branch: see [`detached_worktrees`].
 ///
 /// Best-effort throughout — a branch whose tip can't be peeled still lists, with an empty subject.
 /// An unborn HEAD (fresh repo, no commits) has no branches at all and correctly returns empty.
@@ -539,7 +575,7 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
         Some(GitHead::Branch { name, .. }) => Some(name),
         _ => None,
     };
-    let elsewhere = branches_checked_out_elsewhere(&repo, workdir);
+    let mut checkouts = checkouts_by_branch(workdir);
 
     let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) else {
         return Vec::new();
@@ -569,66 +605,141 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
             upstream: upstream.and_then(|u| u.name().ok().flatten().map(String::from)),
             ahead: ahead as u32,
             behind: behind as u32,
-            checked_out_in: elsewhere.get(&name).map(|(p, _)| p.clone()),
-            checked_out_in_main: elsewhere.get(&name).is_some_and(|(_, main)| *main),
+            checkout: checkouts.remove(&name),
+            detached_at: None,
             name,
         });
     }
-    // HEAD pinned to the top; the rest newest-tip first, name as the tiebreak so the order is
-    // stable when several branches share a commit (a just-created branch and its base).
+    // Checked-out branches pinned above the rest, then newest-tip first with the name as tiebreak
+    // so the order is stable when several branches share a commit (a just-created branch and its
+    // base).
     out.sort_by(|a, b| {
-        b.is_head
-            .cmp(&a.is_head)
+        checkout_rank(a)
+            .cmp(&checkout_rank(b))
             .then(b.timestamp.cmp(&a.timestamp))
             .then(a.name.cmp(&b.name))
     });
     out
 }
 
-/// Which branches are checked out in a checkout *other than* `workdir`, mapped to that checkout's
-/// path and whether it is the **main** working tree.
+/// Sort bucket for [`list_branches`]: where you are, the main checkout, the family's other
+/// worktrees, then branches no tree holds.
 ///
-/// Both directions have to be covered: `worktrees()` lists only the *linked* worktrees, so a linked
-/// worktree asking this question would never see the main checkout. The main working tree is
-/// recovered from the common dir instead — it is `<main>/.git`, so its parent is the main worktree
-/// (absent for a bare main repo, which has no working tree and so checks nothing out).
-fn branches_checked_out_elsewhere(
-    repo: &git2::Repository,
-    workdir: &Path,
-) -> HashMap<String, (String, bool)> {
-    // `(path, is_main)` — the main working tree first, then the linked ones. Which kind holds a
-    // branch is carried through rather than re-derived: from a path alone the caller cannot tell.
-    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
-    if let Some(main) = repo.commondir().parent() {
-        candidates.push((main.to_path_buf(), true));
+/// Current-first is how Buffers and Workspaces already land their selection — the default highlight
+/// is index 0, so "where you are" being first makes Enter-on-open a no-op without any extra
+/// mechanism. Pinning rather than sectioning is deliberate: splitting the list into "has a tree" and
+/// "doesn't" scatters the branches you are looking for across two places, where pinning keeps them
+/// in one familiar recency order underneath a short block of trees.
+fn checkout_rank(row: &BranchRow) -> u8 {
+    match &row.checkout {
+        Some(c) if c.is_current => 0,
+        Some(c) if c.is_main => 1,
+        Some(_) => 2,
+        None => 3,
     }
-    if let Ok(names) = repo.worktrees() {
-        for name in names.iter() {
-            let Ok(Some(name)) = name else { continue };
-            if let Ok(worktree) = repo.find_worktree(name) {
-                candidates.push((worktree.path().to_path_buf(), false));
-            }
-        }
-    }
+}
 
-    let here = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
+/// Every row of the merged branch picker: [`list_branches`] plus the trees a branch cannot
+/// represent ([`detached_worktrees`]), in one ordering.
+///
+/// Sorted as a whole rather than appended, so "where you are" stays at index 0 even when where you
+/// are is a detached tree — the default highlight is index 0, which is how Buffers and Workspaces
+/// already land their selection, and it makes Enter-on-open a no-op.
+///
+/// Kept separate from `list_branches` so that function stays what its name says. Callers that want
+/// branches (the checkout pre-flight, tests) want branches; only the picker wants both.
+pub fn branch_picker_rows(workdir: &Path) -> Vec<BranchRow> {
+    let mut rows = list_branches(workdir);
+    rows.extend(detached_worktrees(workdir));
+    rows.sort_by(|a, b| {
+        checkout_rank(a)
+            .cmp(&checkout_rank(b))
+            .then(b.timestamp.cmp(&a.timestamp))
+            .then(a.name.cmp(&b.name))
+    });
+    rows
+}
+
+/// Rows for the worktrees that hold no branch, which [`list_branches`] therefore cannot produce: a
+/// tree on a **detached** HEAD, and a **prunable** one whose directory is gone (for which
+/// [`crate::worktree::list`] reports no head at all).
+///
+/// Both have to appear or they are unreachable — including for the `Ctrl-d` that removes them,
+/// which in the prunable case is the only thing left to do with the entry.
+///
+/// The main checkout is never among these. Detached or not, it cannot be removed and has no admin
+/// name to identify a row by, so a row for it could carry no verb.
+pub fn detached_worktrees(workdir: &Path) -> Vec<BranchRow> {
+    crate::worktree::list(workdir)
+        .into_iter()
+        .filter(|row| {
+            !row.is_main
+                && !matches!(
+                    row.head,
+                    Some(GitHead::Branch { .. }) | Some(GitHead::Unborn { .. })
+                )
+        })
+        .map(|row| BranchRow {
+            // Empty for a prunable tree, which has no head to read at all — the row still needs to
+            // exist, and the client renders it on `prunable` rather than on this.
+            detached_at: Some(match &row.head {
+                Some(GitHead::Detached { oid }) => oid.clone(),
+                _ => String::new(),
+            }),
+            checkout: Some(BranchCheckout {
+                path: row.path,
+                is_main: false,
+                worktree: row.name.clone(),
+                is_current: row.is_current,
+                locked: row.locked,
+                prunable: row.prunable,
+            }),
+            // The admin name *is* the row's name here: a commit id is not something anyone types to
+            // find a tree, and a prunable entry has not even got one of those.
+            name: row.name,
+            // `is_head` is a statement about a branch, and this row has none. "You are here" is
+            // carried by `checkout.is_current`, which is what the ordering reads.
+            is_head: false,
+            subject: String::new(),
+            timestamp: 0,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        })
+        .collect()
+}
+
+/// Every checkout in this family, keyed by the branch it holds.
+///
+/// Built from [`crate::worktree::list`] rather than re-walking `worktrees()` here: that function
+/// already covers both directions (a linked worktree asking this question must still see the main
+/// checkout, which `worktrees()` never lists) and already carries the admin name and lock/prune
+/// state the merged picker needs. Two walks producing subtly different views of one family is
+/// exactly the drift the merge is meant to remove.
+///
+/// Includes the **current** checkout, unlike the `branches_checked_out_elsewhere` it replaces. The
+/// merged picker needs the branch you're on to be a worktree row like any other; callers who
+/// specifically want *another* tree filter on [`BranchCheckout::is_current`].
+///
+/// `Unborn` counts as holding its branch — git refuses a second checkout of one just the same —
+/// even though such a branch has no ref yet and so no row in [`list_branches`].
+fn checkouts_by_branch(workdir: &Path) -> HashMap<String, BranchCheckout> {
     let mut map = HashMap::new();
-    for (path, is_main) in candidates {
-        let Ok(canonical) = path.canonicalize() else {
-            continue; // a pruned worktree whose directory is gone
+    for row in crate::worktree::list(workdir) {
+        let name = match &row.head {
+            Some(GitHead::Branch { name, .. }) | Some(GitHead::Unborn { name }) => name.clone(),
+            // A detached tree holds no branch. It still gets a picker row, built separately —
+            // there is no branch for it to hang off.
+            Some(GitHead::Detached { .. }) | None => continue,
         };
-        if canonical == here {
-            continue;
-        }
-        let Ok(other) = git2::Repository::open(&canonical) else {
-            continue;
-        };
-        if let Some(GitHead::Branch { name, .. }) = head_state(&other) {
-            map.entry(name)
-                .or_insert_with(|| (canonical.to_string_lossy().into_owned(), is_main));
-        }
+        map.entry(name).or_insert_with(|| BranchCheckout {
+            path: row.path.clone(),
+            is_main: row.is_main,
+            worktree: row.name.clone(),
+            is_current: row.is_current,
+            locked: row.locked,
+            prunable: row.prunable,
+        });
     }
     map
 }
@@ -637,12 +748,14 @@ fn branches_checked_out_elsewhere(
 /// question, asked without listing every branch.
 ///
 /// Git permits a branch in only one worktree at a time, so this is a refusal the server can make
-/// (and explain, naming the worktree) before spawning a `git checkout` that could only fail.
+/// (and explain, naming the worktree) before spawning a `git checkout` that could only fail. The
+/// tree you are standing in is excluded: it holding the branch means you are already on it, which
+/// is not a refusal.
 pub fn branch_checked_out_elsewhere(workdir: &Path, branch: &str) -> Option<String> {
-    let repo = git2::Repository::open(workdir).ok()?;
-    branches_checked_out_elsewhere(&repo, workdir)
+    checkouts_by_branch(workdir)
         .remove(branch)
-        .map(|(path, _)| path)
+        .filter(|c| !c.is_current)
+        .map(|c| c.path)
 }
 
 /// Whether `branch` is fully merged into HEAD — the check `git branch -d` makes before refusing.
@@ -3643,8 +3756,8 @@ mod tests {
             "a never-pushed branch has no upstream"
         );
         assert_eq!((feature.ahead, feature.behind), (0, 0));
-        assert_eq!(
-            feature.checked_out_in, None,
+        assert!(
+            feature.checkout.is_none(),
             "no linked worktrees in this fixture"
         );
     }
@@ -3702,13 +3815,20 @@ mod tests {
         let rows = list_branches(dir.path());
         let feature = rows.iter().find(|r| r.name == "feature").unwrap();
         let held = feature
-            .checked_out_in
-            .as_deref()
+            .checkout
+            .as_ref()
             .expect("feature is checked out in the linked worktree");
         assert!(
-            held.ends_with("wt-feature"),
-            "names the worktree holding it, got {held}"
+            held.path.ends_with("wt-feature"),
+            "names the worktree holding it, got {}",
+            held.path
         );
+        assert_eq!(
+            held.worktree, "feature",
+            "carries the admin name, which is what binding and removal are keyed on"
+        );
+        assert!(!held.is_main);
+        assert!(!held.is_current, "we are standing in the main checkout");
 
         // ...and the reverse direction: from inside the linked worktree, the *main* checkout's
         // branch must show as taken. `worktrees()` lists only linked ones, so this is the case
@@ -3719,10 +3839,28 @@ mod tests {
             .iter()
             .find(|r| r.name == main_row.name)
             .unwrap();
+        let seen_checkout = seen
+            .checkout
+            .as_ref()
+            .expect("the main worktree's branch reads as taken from the linked worktree");
+        assert!(seen_checkout.is_main);
         assert!(
-            seen.checked_out_in.is_some(),
-            "the main worktree's branch reads as taken from the linked worktree"
+            seen_checkout.worktree.is_empty(),
+            "the main checkout has no admin name — which is what `bind_worktree` reads as unbind"
         );
+
+        // And the tree we are standing in reports itself, which the old
+        // `branches_checked_out_elsewhere` deliberately skipped. A branch-keyed picker needs the
+        // branch you are on to be a worktree row like any other, so "already here" and "another
+        // tree has it" can be different sentences.
+        let here = from_worktree
+            .iter()
+            .find(|r| r.name == "feature")
+            .unwrap()
+            .checkout
+            .as_ref()
+            .expect("the tree we are in holds `feature`");
+        assert!(here.is_current);
     }
 
     // ---- branch_is_merged (delete pre-flight) ---------------------------------------------------

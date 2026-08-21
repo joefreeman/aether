@@ -226,6 +226,7 @@ async fn hello_then_open_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -306,6 +307,7 @@ async fn workspace_delete_refuses_the_active_workspace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p1".into(),
             open_last: false,
         },
@@ -348,6 +350,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -467,6 +470,7 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "scroll-row-proj".into(),
             open_last: false,
         },
@@ -569,6 +573,7 @@ async fn buffer_open_jump_drops_saved_scroll() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -677,6 +682,7 @@ async fn buffer_open_isolates_scroll_per_client() {
             &mut ws,
             1,
             &WorkspaceActivateParams {
+                worktrees: None,
                 name: "test-proj".into(),
                 open_last: false,
             },
@@ -894,6 +900,7 @@ async fn rejects_path_outside_workspace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -948,6 +955,7 @@ async fn viewport_subscribe_renders_window() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1020,6 +1028,7 @@ async fn viewport_subscribe_wraps_long_line() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1106,6 +1115,7 @@ async fn viewport_scroll_returns_new_window() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1189,6 +1199,7 @@ async fn setup_with_buffer(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -1591,6 +1602,7 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
         &mut ws,
         10,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: true,
         },
@@ -1614,6 +1626,7 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
         &mut ws,
         12,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: true,
         },
@@ -1804,6 +1817,7 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "blame-composite-proj".into(),
             open_last: false,
         },
@@ -3043,6 +3057,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3133,6 +3148,7 @@ async fn setup_deferred_parse_buffer() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3318,6 +3334,7 @@ async fn setup_deferred_git_buffer(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3447,6 +3464,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3524,6 +3542,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3589,6 +3608,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3653,6 +3673,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3733,6 +3754,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3797,6 +3819,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3868,6 +3891,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -3941,6 +3965,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -4069,6 +4094,7 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -4087,6 +4113,7 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -4142,6 +4169,7 @@ async fn save_preserves_crlf_endings() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -4201,6 +4229,7 @@ async fn save_scratch_returns_buffer_has_no_path() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7856,6 +7885,7 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -7925,6 +7955,7 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8010,6 +8041,7 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8076,6 +8108,7 @@ async fn newline_and_indent_engine_python_def() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8143,6 +8176,7 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8208,6 +8242,7 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8310,6 +8345,7 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8374,6 +8410,7 @@ async fn toggle_comment_strips_when_already_commented() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8439,6 +8476,7 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8506,6 +8544,7 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8571,6 +8610,7 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8636,6 +8676,7 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8703,6 +8744,7 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8771,6 +8813,7 @@ async fn toggle_comment_block_wrap_reselects_the_wrapped_content() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8840,6 +8883,7 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8930,6 +8974,7 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -8998,6 +9043,7 @@ async fn toggle_comment_block_style_wraps_multi_line_partial_selection() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9066,6 +9112,7 @@ async fn toggle_comment_round_trip_partial_selection() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9147,6 +9194,7 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9216,6 +9264,7 @@ async fn toggle_comment_block_unwrap_collapses_in_insert_mode() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9287,6 +9336,7 @@ async fn toggle_comment_insert_round_trips_in_markdown() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9362,6 +9412,7 @@ async fn toggle_comment_insert_keeps_caret_on_its_character() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9434,6 +9485,7 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9502,6 +9554,7 @@ async fn toggle_comment_block_wrap_collapses_in_insert_mode() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9570,6 +9623,7 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9624,6 +9678,7 @@ async fn toggle_comment_is_noop_for_json() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -9685,6 +9740,7 @@ async fn setup_with_named_file(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -10017,6 +10073,7 @@ async fn toggle_comment_block_style_wraps_single_char_selection() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -10087,6 +10144,7 @@ async fn toggle_comment_block_style_is_noop_without_block_tokens() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -10141,6 +10199,7 @@ async fn toggle_comment_line_style_comments_lines_of_partial_selection() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11149,6 +11208,7 @@ async fn setup_picker_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -11449,6 +11509,7 @@ async fn git_changes_picker_aggregates_across_the_workspaces_repos() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "two-repos-proj".into(),
             open_last: false,
         },
@@ -11508,6 +11569,7 @@ async fn git_changes_picker_omits_changes_outside_the_roots() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "subdir-root-proj".into(),
             open_last: false,
         },
@@ -11559,6 +11621,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "changes-proj".into(),
             open_last: false,
         },
@@ -11679,6 +11742,7 @@ async fn git_changes_picker_collapses_untracked_directories() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "collapse-proj".into(),
             open_last: false,
         },
@@ -11729,6 +11793,7 @@ async fn git_changes_picker_hide_untracked() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hide-untracked-proj".into(),
             open_last: false,
         },
@@ -12085,6 +12150,7 @@ async fn picker_set_group_holds_the_accordion_invariant() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "accordion-proj".into(),
             open_last: false,
         },
@@ -12205,6 +12271,7 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "midspan-proj".into(),
             open_last: false,
         },
@@ -12365,6 +12432,7 @@ async fn git_changes_picker_query_greps_diff_content() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "grep-proj".into(),
             open_last: false,
         },
@@ -12444,6 +12512,7 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "jump-proj".into(),
             open_last: false,
         },
@@ -12545,6 +12614,7 @@ async fn git_changes_keep_view_preserves_query_within_one_open() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "persist-proj".into(),
             open_last: false,
         },
@@ -12604,6 +12674,7 @@ async fn git_changes_picker_query_is_a_regex() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "regex-proj".into(),
             open_last: false,
         },
@@ -12681,6 +12752,7 @@ async fn git_changes_picker_filters_by_directory() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "filter-proj".into(),
             open_last: false,
         },
@@ -12752,6 +12824,7 @@ async fn git_changes_picker_filters_by_exact_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "file-filter-proj".into(),
             open_last: false,
         },
@@ -13030,6 +13103,7 @@ async fn setup_buffer_picker_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -13737,6 +13811,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         &mut ws_b,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -13789,6 +13864,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -13904,6 +13980,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14009,6 +14086,7 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14091,6 +14169,7 @@ async fn save_as_creates_missing_parent_directories() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14169,6 +14248,7 @@ async fn save_as_does_not_create_dirs_outside_workspace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14230,6 +14310,7 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14307,6 +14388,7 @@ async fn save_as_to_same_path_is_in_place_save() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14393,6 +14475,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14506,6 +14589,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14601,6 +14685,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14711,6 +14796,7 @@ async fn buffer_close_drops_buffer() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14796,6 +14882,7 @@ async fn buffer_close_last_buffer_returns_none() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -14845,6 +14932,7 @@ async fn buffer_close_drops_viewports() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15083,6 +15171,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15144,6 +15233,7 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -15203,6 +15293,7 @@ async fn setup_grep_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -16850,6 +16941,7 @@ async fn jumplist_capture_from_git_changes_picker() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "changes-proj".into(),
             open_last: false,
         },
@@ -17379,6 +17471,7 @@ async fn workspace_switch_wipes_the_captured_results() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p1".into(),
             open_last: false,
         },
@@ -17423,6 +17516,7 @@ async fn workspace_switch_wipes_the_captured_results() {
         &mut ws,
         15,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p2".into(),
             open_last: true,
         },
@@ -17468,6 +17562,7 @@ async fn setup_explorer_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -17671,6 +17766,7 @@ async fn setup_peek_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -18284,6 +18380,7 @@ async fn directory_create_refuses_outside_workspace_boundary() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -18402,6 +18499,7 @@ async fn setup_explorer_git_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -18587,6 +18685,7 @@ async fn setup_watched_buffer(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -18930,6 +19029,7 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -18992,6 +19092,7 @@ async fn connect_and_open_watched(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: workspace.into(),
             open_last: false,
         },
@@ -19515,6 +19616,7 @@ async fn ephemeral_file_edits_survive_restart_via_path_keyed_backup() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -19659,6 +19761,7 @@ async fn workspace_activate_returns_info_and_unlocks_buffer_ops() {
         &mut ws,
         2,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19702,6 +19805,7 @@ async fn workspace_activate_rejects_unknown_name() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "no-such-workspace-12345".into(),
             open_last: false,
         },
@@ -19731,6 +19835,7 @@ async fn workspace_activate_same_workspace_is_idempotent() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -19757,6 +19862,7 @@ async fn workspace_activate_same_workspace_is_idempotent() {
         &mut ws,
         3,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -20343,6 +20449,7 @@ async fn git_blame_line_reports_committed_author() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "blame-proj".into(),
             open_last: false,
         },
@@ -20397,6 +20504,7 @@ async fn git_blame_line_is_none_without_repo() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "norepo-proj".into(),
             open_last: false,
         },
@@ -20448,6 +20556,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "diff-proj".into(),
             open_last: false,
         },
@@ -20578,6 +20687,7 @@ async fn blame_follow_pushes_on_enable_and_cursor_moves() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "blame-follow-proj".into(),
             open_last: false,
         },
@@ -20676,6 +20786,7 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "intraline-proj".into(),
             open_last: false,
         },
@@ -20765,6 +20876,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "diff-sub-proj".into(),
             open_last: false,
         },
@@ -20873,6 +20985,7 @@ async fn git_status_counts_ride_the_window() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "counts-proj".into(),
             open_last: false,
         },
@@ -20984,6 +21097,7 @@ async fn git_status_splits_staged_and_unstaged() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "status-proj".into(),
             open_last: false,
         },
@@ -21067,6 +21181,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "base-proj".into(),
             open_last: false,
         },
@@ -21152,6 +21267,7 @@ async fn setup_git_apply(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: proj.into(),
             open_last: false,
         },
@@ -21273,6 +21389,7 @@ async fn a_file_outside_the_roots_but_inside_the_repo_gets_a_baseline_and_stages
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "repo-scope-proj".into(),
             open_last: false,
         },
@@ -21326,6 +21443,7 @@ async fn a_file_in_an_unreachable_repo_stays_a_guest() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "guest-repo-proj".into(),
             open_last: false,
         },
@@ -21828,6 +21946,7 @@ async fn git_gutter_marker_present_without_diff_view() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "gutter-proj".into(),
             open_last: false,
         },
@@ -21910,6 +22029,7 @@ async fn git_navigate_hunk_jumps_between_changes() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "nav-proj".into(),
             open_last: false,
         },
@@ -22052,6 +22172,7 @@ async fn git_navigate_hunk_honours_count() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "nav-count-proj".into(),
             open_last: false,
         },
@@ -22198,6 +22319,7 @@ async fn open_and_subscribe_with_lsp(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: workspace.into(),
             open_last: false,
         },
@@ -22835,6 +22957,7 @@ async fn workspace_symbols_come_from_the_pinned_project_server() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms".into(),
             open_last: false,
         },
@@ -22892,6 +23015,7 @@ async fn workspace_symbols_need_a_declared_project() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "no-projects".into(),
             open_last: false,
         },
@@ -22951,6 +23075,7 @@ async fn workspace_symbol_select_resolves_to_a_jump() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-select".into(),
             open_last: false,
         },
@@ -23011,6 +23136,7 @@ async fn workspace_symbols_outside_a_root_show_an_absolute_path() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-dep".into(),
             open_last: false,
         },
@@ -23143,6 +23269,7 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-scope".into(),
             open_last: false,
         },
@@ -23315,6 +23442,7 @@ async fn ready_server_requery_respects_the_dir_scope() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-ready-scope".into(),
             open_last: false,
         },
@@ -23414,6 +23542,7 @@ async fn workspace_symbols_capture_to_the_jumplist() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-capture".into(),
             open_last: false,
         },
@@ -23511,6 +23640,7 @@ async fn workspace_symbols_keep_server_matches_our_matcher_would_reject() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-loose".into(),
             open_last: false,
         },
@@ -23581,6 +23711,7 @@ async fn workspace_symbol_groups_stay_contiguous_and_step_to_every_file() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-groups".into(),
             open_last: false,
         },
@@ -23734,6 +23865,7 @@ async fn workspace_symbols_settle_when_no_server_matches() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-empty".into(),
             open_last: false,
         },
@@ -23800,6 +23932,7 @@ async fn workspace_symbols_with_no_capable_server_settle_immediately() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "syms-none".into(),
             open_last: false,
         },
@@ -23909,6 +24042,7 @@ async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "pinned-open".into(),
             open_last: false,
         },
@@ -23977,6 +24111,7 @@ async fn reactivating_after_the_last_client_leaves_restores_the_pins() {
             &mut ws,
             1,
             &WorkspaceActivateParams {
+                worktrees: None,
                 name: "restart".into(),
                 open_last: false,
             },
@@ -24002,6 +24137,7 @@ async fn reactivating_after_the_last_client_leaves_restores_the_pins() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "restart".into(),
             open_last: false,
         },
@@ -24044,6 +24180,7 @@ async fn sibling_language_buffers_share_one_server() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "ts-js".into(),
             open_last: false,
         },
@@ -25315,6 +25452,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     }
 
     let activate = WorkspaceActivateParams {
+        worktrees: None,
         name: "test-proj".into(),
         open_last: false,
     };
@@ -25376,6 +25514,7 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
         .await
         .unwrap();
     let activate = WorkspaceActivateParams {
+        worktrees: None,
         name: "test-proj".into(),
         open_last: false,
     };
@@ -25458,6 +25597,7 @@ async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
         .await
         .unwrap();
     let activate = WorkspaceActivateParams {
+        worktrees: None,
         name: "test-proj".into(),
         open_last: false,
     };
@@ -25573,6 +25713,7 @@ async fn nav_back_and_forward_across_files() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -25659,6 +25800,7 @@ async fn nav_back_empty_is_noop() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -25695,6 +25837,7 @@ async fn nav_goto_reopens_by_path() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -25807,6 +25950,7 @@ async fn setup_grep_filter_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -26032,6 +26176,7 @@ async fn grep_skips_binary_files_and_caps_long_line_previews() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -26097,6 +26242,7 @@ async fn grep_flood_does_not_deadlock_request_dispatch() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -26262,6 +26408,7 @@ async fn grep_default_excludes_whitelisted_dotfile() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "wl-proj".into(),
             open_last: false,
         },
@@ -26409,6 +26556,7 @@ async fn grep_filter_root_scope() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -26665,6 +26813,7 @@ async fn files_picker_shows_hidden_dirs() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hidden-proj".into(),
             open_last: false,
         },
@@ -26856,6 +27005,7 @@ async fn setup_transient_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27023,6 +27173,7 @@ async fn out_of_window_edit_pushes_buffer_changed() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27040,6 +27191,7 @@ async fn out_of_window_edit_pushes_buffer_changed() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27179,6 +27331,7 @@ async fn buffer_asset_route_serves_and_confines() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27351,6 +27504,7 @@ async fn transient_buffer_closes_on_disconnect() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27620,6 +27774,7 @@ async fn transient_buffer_survives_while_another_client_views_it() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27927,6 +28082,7 @@ async fn open_path_rejects_a_relative_path() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -27956,6 +28112,7 @@ async fn open_path_external_within_active_workspace_keeps_workspace() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -28011,6 +28168,7 @@ async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
         &mut ws,
         3,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -28059,6 +28217,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
         &mut ws_b,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: ephemeral_id.clone(),
             open_last: true,
         },
@@ -28427,6 +28586,7 @@ async fn a_temporary_workspace_gets_no_language_server() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "test-proj".into(),
             open_last: false,
         },
@@ -29114,6 +29274,7 @@ async fn workspace_session_persisted_on_activate_and_open() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -29206,6 +29367,7 @@ async fn keeping_a_transient_buffer_persists_it() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -29318,6 +29480,7 @@ async fn unsaved_file_edits_restored_across_restart() {
             &mut ws,
             1,
             &WorkspaceActivateParams {
+                worktrees: None,
                 name: "p".into(),
                 open_last: false,
             },
@@ -29371,6 +29534,7 @@ async fn unsaved_file_edits_restored_across_restart() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -29425,6 +29589,7 @@ async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
             &mut ws,
             1,
             &WorkspaceActivateParams {
+                worktrees: None,
                 name: "p".into(),
                 open_last: false,
             },
@@ -29483,6 +29648,7 @@ async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -29544,6 +29710,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             &mut ws,
             1,
             &WorkspaceActivateParams {
+                worktrees: None,
                 name: "p".into(),
                 open_last: false,
             },
@@ -29595,6 +29762,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -29662,6 +29830,7 @@ async fn saving_clears_the_backup() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -30023,6 +30192,7 @@ async fn history_records_per_workspace_and_persists() {
         &mut ws1,
         2,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hist-a".into(),
             open_last: false,
         },
@@ -30082,6 +30252,7 @@ async fn history_records_per_workspace_and_persists() {
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hist-a".into(),
             open_last: false,
         },
@@ -30105,6 +30276,7 @@ async fn history_records_per_workspace_and_persists() {
         &mut ws2,
         3,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hist-b".into(),
             open_last: false,
         },
@@ -30157,6 +30329,7 @@ async fn history_records_per_workspace_and_persists() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "hist-a".into(),
             open_last: false,
         },
@@ -30912,6 +31085,7 @@ async fn setup_repos_workspace(
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "repos-proj".into(),
             open_last: false,
         },
@@ -31186,9 +31360,13 @@ fn branch_rows(items: &[PickerItem]) -> Vec<(String, bool, Option<String>)> {
             PickerItem::GitBranch {
                 name,
                 is_head,
-                checked_out_in,
+                checkout,
                 ..
-            } => (name.clone(), *is_head, checked_out_in.clone()),
+            } => (
+                name.clone(),
+                *is_head,
+                checkout.as_ref().map(|k| k.path.clone()),
+            ),
             other => panic!("expected a branch row, got {other:?}"),
         })
         .collect()
@@ -31212,10 +31390,17 @@ async fn branch_picker_lists_local_branches_with_head_first() {
     assert_eq!(
         branch_rows(update.items()),
         vec![
-            ("main".to_string(), true, None),
+            // The branch you are on carries the checkout holding it, like any other. The row for
+            // where you are is a worktree row too — that is what lets "already here" and "another
+            // tree has it" be different sentences rather than one refusal.
+            (
+                "main".to_string(),
+                true,
+                Some(root.to_string_lossy().into_owned())
+            ),
             ("feature".to_string(), false, None),
         ],
-        "HEAD sorts first; neither branch is held by another worktree"
+        "the checked-out branch sorts first; `feature` is held by no tree"
     );
     // Every row names the repo it belongs to, so the checkout the client fires can't re-resolve
     // to a different one if the active buffer moves while the picker is up.
@@ -31324,8 +31509,9 @@ async fn branch_picker_is_empty_on_an_unborn_head() {
 
 #[tokio::test]
 async fn branch_picker_marks_a_branch_held_by_another_worktree() {
-    // Git refuses the same branch in two worktrees, so the picker must surface it *before* the
-    // user presses Enter — a checkout that can only fail is worse than a disabled row.
+    // Git permits a branch in only one worktree, so a branch another tree holds cannot be checked
+    // out here. Since the merge that is not a refusal to surface but a **destination** to name:
+    // the row carries the tree, and Enter opens it.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let main = base.join("main");
@@ -31353,34 +31539,129 @@ async fn branch_picker_marks_a_branch_held_by_another_worktree() {
     );
     let main_row = rows.iter().find(|(n, _, _)| n == "main").unwrap();
     assert!(main_row.1, "the main checkout's branch is still HEAD here");
-    assert_eq!(main_row.2, None, "and is not held elsewhere");
+    assert_eq!(
+        main_row.2.as_deref(),
+        Some(main.to_string_lossy().as_ref()),
+        "and names the tree holding it — which here is the one we are standing in"
+    );
 
     // Asked from *inside* the worktree, the answer inverts — and `main`'s holder is the **main
-    // checkout**, not a worktree. Both refuse a checkout, but only one of them is a worktree, and
-    // the row has to say which or the client can only guess from a path.
+    // checkout**, which has no admin name. That empty name is exactly what `bind_worktree` reads
+    // as "unbind", so selecting the row sends this repo back to main with no case of its own.
     let (server2, mut ws2) = setup_repos_workspace(vec![wt_path.clone()]).await;
-    let view2 = send_request::<PickerView>(&mut ws2, 2, &view_params(PickerKind::GitBranches)).await;
+    let view2 =
+        send_request::<PickerView>(&mut ws2, 2, &view_params(PickerKind::GitBranches)).await;
     let items = view2.update.expect("initial window");
     let main_here = items
         .items()
         .iter()
         .find_map(|i| match i {
-            PickerItem::GitBranch {
-                name,
-                checked_out_in,
-                checked_out_in_main,
-                ..
-            } if name == "main" => Some((checked_out_in.clone(), *checked_out_in_main)),
+            PickerItem::GitBranch { name, checkout, .. } if name == "main" => {
+                checkout.as_ref().map(|k| (Some(k.path.clone()), k.is_main))
+            }
             _ => None,
         })
         .expect("main is listed from inside the worktree");
-    assert_eq!(main_here.0.as_deref(), Some(main.to_string_lossy().as_ref()));
+    assert_eq!(
+        main_here.0.as_deref(),
+        Some(main.to_string_lossy().as_ref())
+    );
     assert!(
         main_here.1,
         "held by the main working tree, so the client must not call it a worktree"
     );
 
     drop(server2);
+    drop(server);
+}
+
+#[tokio::test]
+async fn branch_picker_matches_a_drifted_worktree_on_its_branch_not_its_admin_name() {
+    // A tree is admin-named once, at `git worktree add`; a checkout *inside* it later moves HEAD
+    // without renaming anything, and `git worktree move` relocates the directory without renaming
+    // it either (git has no rename verb at all). So a tree called `feature` can end up sitting on
+    // `hotfix`, and its admin name is machinery the user never chose and cannot rely on.
+    //
+    // The picker keys on the branch and renders a bare `⧉`, so the admin name is invisible — and
+    // therefore must not be matched: a row appearing for a query with no visible cause is the
+    // failure this pins against. The tree stays reachable the way the merged picker teaches you to
+    // reach it, by naming the branch it holds today.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    let repo = init_repo_at(&main);
+    commit_file(&repo, "a.rs", "one\n");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+
+    let wt_path = base.join("main-worktrees/feature");
+    std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+    repo.worktree("feature", &wt_path, None).unwrap();
+
+    // Move the tree off its namesake and drop the branch behind it, so "feature" now names the
+    // *tree* and nothing else in the repo — the query has no branch to reach it through.
+    repo.branch("hotfix", &head, false).unwrap();
+    let wt_repo = git2::Repository::open(&wt_path).unwrap();
+    wt_repo.set_head("refs/heads/hotfix").unwrap();
+    repo.find_branch("feature", git2::BranchType::Local)
+        .unwrap()
+        .delete()
+        .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![main.clone()]).await;
+    let view = send_request::<PickerView>(&mut ws, 2, &view_params(PickerKind::GitBranches)).await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the view's own push
+
+    // Unfiltered, the tree is listed — under `hotfix`, carrying `feature` as the admin name the
+    // client binds and removes by. Carried on the wire, just never rendered.
+    let held = view
+        .update
+        .expect("the view carries its initial window")
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitBranch {
+                name,
+                checkout: Some(k),
+                ..
+            } if name == "hotfix" => Some(k.worktree.clone()),
+            _ => None,
+        })
+        .expect("the tree is listed under the branch it holds");
+    assert_eq!(
+        held, "feature",
+        "carrying the admin name the client binds and removes by"
+    );
+
+    // Querying the admin name finds nothing: it is not on screen, so it is not matched.
+    let query = |q: &str| PickerQueryParams {
+        filters: Default::default(),
+        kind: PickerKind::GitBranches,
+        query: q.into(),
+        generation: 1,
+    };
+    let _: () = send_request::<PickerQuery>(&mut ws, 3, &query("feature")).await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        branch_rows(update.items()),
+        vec![],
+        "the admin name is invisible, so it must not put a row in the list"
+    );
+
+    // Querying the branch it actually holds finds it — the way the merged picker teaches you to
+    // reach a tree.
+    let _: () = send_request::<PickerQuery>(&mut ws, 4, &query("hotfix")).await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    let rows = branch_rows(update.items());
+    assert_eq!(
+        rows.iter().map(|(n, _, _)| n.clone()).collect::<Vec<_>>(),
+        vec!["hotfix".to_string()]
+    );
+    assert_eq!(
+        rows[0].2.as_deref(),
+        Some(wt_path.to_string_lossy().as_ref()),
+        "and it is the worktree row, so Enter opens the tree"
+    );
     drop(server);
 }
 
@@ -36321,11 +36602,27 @@ async fn worktree_remove_force_discards_and_refuses_the_main_worktree() {
     drop(server);
 }
 
+/// The merged branch picker's rows as `(name, admin name of the tree holding it)`, in window order.
+/// `None` means no tree has that branch; `Some("")` is the main checkout, which has no admin name.
+fn merged_rows(items: &[PickerItem]) -> Vec<(String, Option<String>)> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitBranch { name, checkout, .. } => {
+                Some((name.clone(), checkout.as_ref().map(|k| k.worktree.clone())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn worktree_picker_lists_trees_then_branches_without_the_ones_checked_out() {
-    use aether_protocol::picker::WorktreeRowKind;
+async fn the_branch_picker_lists_worktrees_and_branches_as_one_list() {
+    // The merge: one branch-keyed list where a checked-out branch is a branch row carrying a
+    // `checkout`, not a row in a second picker. `feature` appears exactly once — as itself, with
+    // its tree named — which is how the one-checkout-per-family rule stops being a refusal and
+    // becomes a destination.
     let (server, mut ws, repo, root, _dir) = setup_worktree_workspace().await;
-    // Two extra branches: one gets a worktree, one doesn't.
     repo.branch(
         "spare",
         &repo.head().unwrap().peel_to_commit().unwrap(),
@@ -36335,32 +36632,33 @@ async fn worktree_picker_lists_trees_then_branches_without_the_ones_checked_out(
     let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
     assert_eq!(created.status, GitWorktreeAddStatus::Created);
 
-    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::GitBranches)).await;
     let update = view.update.expect("the view carries its initial window");
-    let rows: Vec<(WorktreeRowKind, String)> = update
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            PickerItem::Worktree { row, label, .. } => Some((*row, label.clone())),
-            _ => None,
-        })
-        .collect();
+    let rows = merged_rows(update.items());
 
-    // Main first (labelled by its branch, since it has no admin name), then the linked tree, then
-    // branches with no tree. `feature` is deliberately absent as a *branch* row: it is already a
-    // worktree row, which is how the one-checkout-per-family rule is avoided rather than reported.
-    assert_eq!(rows[0], (WorktreeRowKind::Main, "main".to_string()));
+    // Checked-out branches pinned above the rest: where you are, then the family's other trees,
+    // then branches no tree holds. Pinning rather than sectioning — two sections scattered the
+    // branches you were looking for across two places.
+    assert_eq!(
+        rows[0],
+        ("main".to_string(), Some(String::new())),
+        "the main checkout is where we are standing, and has no admin name"
+    );
     assert_eq!(
         rows[1],
-        (WorktreeRowKind::Existing, "feature".to_string()),
-        "the linked worktree is keyed by its admin name"
+        ("feature".to_string(), Some("feature".to_string())),
+        "the branch row names the tree holding it"
     );
-    assert!(rows.contains(&(WorktreeRowKind::Branch, "spare".to_string())));
-    assert!(
-        !rows.contains(&(WorktreeRowKind::Branch, "feature".to_string())),
-        "a branch with a worktree must not also appear as a branch row"
+    assert_eq!(
+        rows.iter().filter(|(n, _)| n == "feature").count(),
+        1,
+        "exactly one row per branch — it is not both a branch row and a worktree row"
     );
-    assert!(!rows.contains(&(WorktreeRowKind::Branch, "main".to_string())));
+    assert_eq!(
+        rows.iter().find(|(n, _)| n == "spare"),
+        Some(&("spare".to_string(), None)),
+        "a branch with no tree is an ordinary row, and Enter checks it out"
+    );
 
     drop(server);
 }
@@ -36406,6 +36704,7 @@ async fn setup_variant_workspace() -> (
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -36428,6 +36727,9 @@ async fn bind(
         &WorkspaceBindWorktreeParams {
             repo_id: Some(repo_id.to_string_lossy().into()),
             worktree: worktree.into(),
+            // What the real client sends: land somewhere on arrival rather than leaving the window
+            // showing a buffer from the context we just left.
+            open_last: true,
             ..Default::default()
         },
     )
@@ -36484,6 +36786,7 @@ async fn a_second_repo_binds_alongside_the_first() {
         &mut ws,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -36518,7 +36821,12 @@ async fn a_second_repo_binds_alongside_the_first() {
 async fn rebinding_updates_in_place_and_keeps_the_other_bindings() {
     // Rebinding must not silently drop what else the workspace holds, and must not spawn a second
     // workspace — the reason the "first-bound repo is special" rule was deleted.
-    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    //
+    // The second bind here is issued with the *worktree's* path as the repo id, which is the state
+    // you are actually in after the first one. Keyed by workdir that wrote a second binding for the
+    // same repo and left the two to fight; keyed by common dir — which every worktree of a family
+    // shares — there is one key by construction, which is what the count below pins.
+    let (server, mut ws, repo_root, _notes, dir) = setup_variant_workspace().await;
     let oauth = worktree_add(&mut ws, 10, &repo_root, "oauth", true)
         .await
         .worktree
@@ -36537,6 +36845,34 @@ async fn rebinding_updates_in_place_and_keeps_the_other_bindings() {
         "still the workspace you were standing in"
     );
     assert_eq!(second.workspace.paths[0], hotfix.path);
+    // Both contexts survive, one per binding set — that is the model, not a leak. You can go back
+    // to `oauth` and find the buffers you left there.
+    let contexts = sessions_json(&dir)["workspaces"]["p"]["contexts"]
+        .as_array()
+        .expect("the workspace recorded its bound contexts")
+        .clone();
+    assert_eq!(
+        contexts.len(),
+        2,
+        "one context per binding set, both remembered: {contexts:?}"
+    );
+    // What must *not* accumulate is keys within a context. The second bind was issued with the
+    // worktree's own path as the repo id, which is the state you are actually in after the first;
+    // keyed by workdir that wrote a second binding for the same repo and left the two to fight.
+    for ctx in &contexts {
+        let bindings = ctx["worktrees"]
+            .as_object()
+            .expect("a context records what it is bound to");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "one key per repo family, however you reach it: {bindings:?}"
+        );
+        assert!(
+            bindings.keys().all(|k| k.ends_with("/.git")),
+            "keyed by common dir, not by any checkout's workdir: {bindings:?}"
+        );
+    }
 
     drop(server);
 }
@@ -36558,6 +36894,113 @@ async fn unbinding_the_last_repo_returns_to_the_configured_roots() {
     let back = bind(&mut ws, 12, std::path::Path::new(&wt.path), "").await;
     assert_eq!(back.workspace.name, "p");
     assert_eq!(back.workspace.paths[0], repo_root.to_string_lossy());
+
+    drop(server);
+}
+
+/// Editing the roots of a **bound** workspace edits its *configured* roots, not the materialised
+/// ones it is currently standing on.
+///
+/// A bound workspace's `paths` point into the app-managed worktree store. Those are machine state:
+/// `git worktree remove` can delete them, and they are not what the workspace *is*. Writing them
+/// back as the workspace's own roots — which every `from_parts` call site did — replaced its
+/// definition with a checkout, so unbinding had nothing to return to. The two lists also have to
+/// stay positionally identical, or the added root falls off the next materialisation entirely.
+#[tokio::test]
+async fn adding_a_root_while_bound_edits_the_configured_roots_not_the_worktree_ones() {
+    let (server, mut ws, repo_root, notes, dir) = setup_variant_workspace().await;
+    let extra = dir.path().canonicalize().unwrap().join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    let added: aether_protocol::workspace::WorkspaceInfo =
+        send_request::<aether_protocol::workspace::WorkspaceAddRoot>(
+            &mut ws,
+            12,
+            &aether_protocol::workspace::WorkspaceAddRootParams {
+                workspace: "p".into(),
+                path: extra.to_string_lossy().into(),
+            },
+        )
+        .await;
+    assert_eq!(added.paths.len(), 3);
+    assert_eq!(
+        added.paths[0], wt.path,
+        "the bound root stays materialised — adding a root is not an unbind"
+    );
+
+    // The proof: unbinding returns to the configured roots, and the root added while bound is
+    // among them. With the addition recorded only against the materialised list, the configured
+    // list still held two entries and the third silently vanished on the next materialisation.
+    let back = bind(&mut ws, 13, std::path::Path::new(&wt.path), "").await;
+    assert_eq!(
+        back.workspace.paths,
+        vec![
+            repo_root.to_string_lossy().into_owned(),
+            notes.to_string_lossy().into_owned(),
+            extra.to_string_lossy().into_owned(),
+        ],
+        "back on the main checkout, with the added root still there and in order"
+    );
+
+    drop(server);
+}
+
+/// The mirror of the above: removing a root while bound drops the same index from both halves.
+///
+/// The client sends back a path it was *shown*, which for a bound repo is the worktree path — so
+/// the lookup has to find it in the materialised list and then remove the corresponding
+/// **configured** root, not retain-by-value on one list and leave the other a slot longer.
+#[tokio::test]
+async fn removing_a_root_while_bound_drops_it_from_both_halves() {
+    let (server, mut ws, repo_root, notes, _dir) = setup_variant_workspace().await;
+    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
+        .await
+        .worktree
+        .unwrap();
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+
+    // Remove the bound repo's root, naming it the way the client sees it: the worktree path.
+    let after: aether_protocol::workspace::WorkspaceRemoveRootResult =
+        send_request::<aether_protocol::workspace::WorkspaceRemoveRoot>(
+            &mut ws,
+            12,
+            &aether_protocol::workspace::WorkspaceRemoveRootParams {
+                workspace: "p".into(),
+                path: wt.path.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        after.workspace.paths,
+        vec![notes.to_string_lossy().into_owned()],
+        "the worktree root is gone and the untouched one stays"
+    );
+
+    // And the configured half went with it. Re-activating re-materialises from the configured
+    // roots, so a stale entry there resurrects the root we just removed.
+    let again: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        13,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        again.workspace.paths,
+        vec![notes.to_string_lossy().into_owned()],
+        "the removed root must not come back on the next activation"
+    );
 
     drop(server);
 }
@@ -36769,6 +37212,7 @@ async fn a_workspace_whose_worktree_vanished_degrades_to_its_configured_roots() 
         &mut ws2,
         14,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -36784,13 +37228,12 @@ async fn a_workspace_whose_worktree_vanished_degrades_to_its_configured_roots() 
 }
 
 #[tokio::test]
-async fn the_worktree_you_are_in_is_highlighted_not_hoisted() {
-    // The picker opens *on* the current worktree, like the buffer picker opens on the current
-    // buffer — but by centring, not by reordering. Hoisting it would land the selection too, and
-    // reshuffle the `Worktrees` section on every switch, so the list you scan is never the same
-    // list twice. In the base the main checkout is already current, so the case worth testing is
-    // standing in a variant.
-    use aether_protocol::picker::{PickerItem, WorktreeRowKind};
+async fn the_tree_you_are_in_is_the_pickers_opening_selection() {
+    // The picker opens *on* where you are, like the buffer picker opens on the current buffer.
+    // Since the merge that row is a branch row carrying a current checkout — and the ordering pins
+    // it to index 0, which is the default highlight, so Enter-on-open is a no-op with no extra
+    // mechanism. In the base the main checkout is already current, so the case worth testing is
+    // standing in a worktree.
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
@@ -36799,93 +37242,102 @@ async fn the_worktree_you_are_in_is_highlighted_not_hoisted() {
     let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
     assert_eq!(bound.workspace.paths[0], wt.path);
 
-    let view = send_request::<PickerView>(&mut ws, 12, &view_params(PickerKind::Worktrees)).await;
-    // The server names the row to highlight; the client adopts it as its selection.
+    let view = send_request::<PickerView>(&mut ws, 12, &view_params(PickerKind::GitBranches)).await;
     let centred = view
         .effective_center_on
-        .expect("a fresh open centres on the current worktree");
+        .expect("a fresh open centres on where you are");
     assert!(
-        matches!(&centred, PickerItem::Worktree { label, is_current, .. }
-            if label == &wt.name && *is_current),
-        "centred on the worktree we're standing in: {centred:?}"
+        matches!(&centred, PickerItem::GitBranch { checkout: Some(k), .. }
+            if k.worktree == wt.name && k.is_current),
+        "centred on the tree we're standing in: {centred:?}"
     );
 
-    // ...and the rows kept their stable order — main still leads the section.
     let update = view.update.expect("the view carries its initial window");
-    let kinds: Vec<WorktreeRowKind> = update
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            PickerItem::Worktree { row, .. } => Some(*row),
-            _ => None,
-        })
-        .collect();
+    let rows = merged_rows(update.items());
     assert_eq!(
-        kinds[0],
-        WorktreeRowKind::Main,
-        "the current worktree is highlighted, not moved: {kinds:?}"
+        rows[0].1.as_deref(),
+        Some(wt.name.as_str()),
+        "and it leads the list: {rows:?}"
     );
 
     drop(server);
 }
 
+/// **Creating** refreshes the open picker too, which only became necessary when the verbs split.
+///
+/// `Ctrl-o` deliberately stays put — it is a lifecycle verb, not a navigation one — so the row
+/// gaining its worktree marker *is* the feedback that it worked. Without this the list still says
+/// the branch has no tree, and the next press tries to make a second one. Caught by driving the
+/// real TUI, not by any unit test: the create path had never needed a refresh, because it used to
+/// be followed by a bind that closed and reopened everything.
 #[tokio::test]
-async fn worktree_rows_group_into_worktrees_then_branches() {
-    // Two sections, split on the one distinction a row has to make: does a tree exist yet.
-    // Non-collapsible like References, so the headers are client-side decorations that don't take
-    // selection indices — which is what lets the current worktree stay at index 0.
-    use aether_protocol::picker::{GroupHeader, PickerItem, WorktreeRowKind};
-    let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
-    let repo = git2::Repository::open(&root).unwrap();
+async fn creating_a_worktree_refreshes_the_open_picker() {
+    use aether_protocol::picker::PickerItem;
+    let (server, mut ws, repo, root, _dir) = setup_worktree_workspace().await;
     repo.branch(
         "spare",
         &repo.head().unwrap().peel_to_commit().unwrap(),
         false,
     )
     .unwrap();
-    let created = worktree_add(&mut ws, 10, &root, "feature", true).await;
-    assert_eq!(created.status, GitWorktreeAddStatus::Created);
 
-    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
-    let update = view.update.expect("the view carries its initial window");
-
-    let labels: Vec<(u32, String)> = update
-        .groups
-        .iter()
-        .map(|g| match &g.header {
-            GroupHeader::Label { label } => (g.start, label.clone()),
-            other => panic!("worktree groups are label sections, got {other:?}"),
+    // Open *and* subscribe — a refresh only reaches a picker with a window.
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::GitBranches)).await;
+    let holds_a_tree = |update: &PickerUpdateParams, branch: &str| {
+        update.items().iter().any(|i| {
+            matches!(i, PickerItem::GitBranch { name, checkout: Some(_), .. }
+                if name.as_str() == branch)
         })
-        .collect();
-    assert_eq!(
-        labels,
-        vec![(0, "Worktrees".to_string()), (2, "Branches".to_string())],
-        "existing trees first, then branches with none: {labels:?}"
+    };
+    assert!(
+        !holds_a_tree(&view.update.expect("initial window"), "spare"),
+        "`spare` has no tree before we make one"
     );
 
-    // And the runs hold what their headers claim.
-    let kinds: Vec<WorktreeRowKind> = update
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            PickerItem::Worktree { row, .. } => Some(*row),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(kinds[0], WorktreeRowKind::Main);
-    assert_eq!(kinds[1], WorktreeRowKind::Existing);
-    assert_eq!(kinds[2], WorktreeRowKind::Branch);
+    let (created, mut updates) = send_request_collecting_updates::<GitWorktreeAdd>(
+        &mut ws,
+        12,
+        &GitWorktreeAddParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            branch: "spare".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(created.status, GitWorktreeAddStatus::Created);
+
+    // Which window arrives when is not fixed — the writer prefers replies to pushes, and the open's
+    // own push may still be in flight. Read on until one reflects the create.
+    let mut update = updates.pop();
+    for _ in 0..4 {
+        match &update {
+            Some(u) if holds_a_tree(u, "spare") => break,
+            _ => {
+                update = Some(
+                    expect_notification_within::<PickerUpdate>(
+                        &mut ws,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await,
+                )
+            }
+        }
+    }
+    assert!(
+        holds_a_tree(&update.expect("a window after the create"), "spare"),
+        "the row must gain its worktree marker in place — that is the whole feedback"
+    );
 
     drop(server);
 }
 
 #[tokio::test]
 async fn removing_a_worktree_refreshes_the_open_picker() {
-    // Removal is the only worktree row action that leaves the picker *up* — create and bind both
-    // end in a switch that closes it, and removal has no confirm dialog either. So the list has to
-    // be corrected underneath the user, or the tree they just removed stays on screen and the next
-    // press acts on a row that isn't there.
-    use aether_protocol::picker::{PickerItem, WorktreeRowKind};
+    // Removal leaves the picker *up* — it has no confirm dialog and no switch to follow. So the
+    // list has to be corrected underneath the user, or the tree they just removed stays on screen
+    // and the next press acts on a row that isn't there. `Ctrl-o` is the same in reverse: it stays
+    // put deliberately, and the marker appearing on the row is the feedback that it worked.
+    use aether_protocol::picker::PickerItem;
     let (server, mut ws, _repo, root, _dir) = setup_worktree_workspace().await;
     let wt = worktree_add(&mut ws, 10, &root, "feature", true)
         .await
@@ -36893,13 +37345,14 @@ async fn removing_a_worktree_refreshes_the_open_picker() {
         .unwrap();
 
     // Open *and* subscribe — a refresh only reaches a picker with a window.
-    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
-    // Keyed on the row *kind*, not the label: the branch keeps its name after the tree goes, so
-    // "is `feature` listed" stays true either way and would answer the wrong question.
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::GitBranches)).await;
+    // Keyed on the row's *checkout*, not its name: since the merge the branch keeps its row after
+    // the tree goes, so "is `feature` listed" stays true either way and would answer the wrong
+    // question. What changes is that the row stops naming a tree.
     let lists_tree = |update: &PickerUpdateParams, want: &str| {
         update.items().iter().any(|i| {
-            matches!(i, PickerItem::Worktree { row: WorktreeRowKind::Existing, label, .. }
-                if label.as_str() == want)
+            matches!(i, PickerItem::GitBranch { checkout: Some(k), .. }
+                if k.worktree.as_str() == want)
         })
     };
     assert!(
@@ -36942,12 +37395,13 @@ async fn removing_a_worktree_refreshes_the_open_picker() {
         "the removed tree must not still be listed: {:?}",
         update.items()
     );
-    // And it comes back as a *branch* row — nothing checks `feature` out now, which is the same
-    // rebuild the next fresh open would do rather than a row simply deleted from the window.
+    // And the branch survives, now holding no tree — the same rebuild the next fresh open would
+    // do, rather than a row simply deleted from the window. This is `Ctrl-d`'s progression made
+    // visible: the first press takes the tree off, and only then is there a branch to delete.
     assert!(
         update.items().iter().any(|i| matches!(
             i,
-            PickerItem::Worktree { row: WorktreeRowKind::Branch, label, .. } if label == "feature"
+            PickerItem::GitBranch { name, checkout: None, .. } if name == "feature"
         )),
         "the branch survives the worktree: {:?}",
         update.items()
@@ -36957,44 +37411,43 @@ async fn removing_a_worktree_refreshes_the_open_picker() {
 }
 
 #[tokio::test]
-async fn selecting_a_worktree_row_resolves_it_and_binds() {
-    // The listing test covered what the picker *shows*; this covers pressing Enter, which is a
-    // separate server path (`position_of` → `select_result`). Without an identity arm for the kind,
-    // every selection failed with "not in the picker's candidate set".
-    use aether_protocol::picker::{PickerItem, PickerSelect, PickerSelectParams, WorktreeRowKind};
+async fn a_branch_row_carries_everything_its_actions_need() {
+    // The merged picker is not a jump target: `picker/select` never fires for it, and the client
+    // acts on the highlighted row directly — `workspace/bind_worktree` for a row with a tree,
+    // `git/checkout` for one without, `git/worktree_add` on `Ctrl-o`, `git/worktree_remove` on
+    // `Ctrl-d`. So every one of those has to be answerable from the row alone, without a second
+    // round trip: the repo (resolution runs off the active buffer, which may have moved) and the
+    // admin name (which drifts from the branch, so it can't be re-derived).
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
         .worktree
         .unwrap();
 
-    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::Worktrees)).await;
+    let view = send_request::<PickerView>(&mut ws, 11, &view_params(PickerKind::GitBranches)).await;
     let update = view.update.expect("the view carries its initial window");
-    let branch_row = update
+    let row = update
         .items()
         .iter()
-        .find(
-            |i| matches!(i, PickerItem::Worktree { row, .. } if *row == WorktreeRowKind::Existing),
-        )
-        .expect("the linked worktree is listed")
+        .find(|i| matches!(i, PickerItem::GitBranch { checkout: Some(k), .. } if !k.is_main))
+        .expect("the linked worktree's branch is listed")
         .clone();
 
-    let selected: aether_protocol::picker::PickerSelectResult = send_request::<PickerSelect>(
-        &mut ws,
-        12,
-        &PickerSelectParams {
-            kind: PickerKind::Worktrees,
-            item: branch_row,
-        },
-    )
-    .await;
-    match selected {
-        aether_protocol::picker::PickerSelectResult::Worktree { name, create, .. } => {
-            assert_eq!(name, wt.name, "an existing row selects by admin name");
-            assert!(create.is_none(), "it already exists — nothing to create");
-        }
-        other => panic!("expected a worktree selection, got {other:?}"),
-    }
+    let PickerItem::GitBranch {
+        repo_id, checkout, ..
+    } = row
+    else {
+        unreachable!("filtered above")
+    };
+    let checkout = checkout.expect("filtered above");
+    assert_eq!(checkout.worktree, wt.name, "the admin name to bind by");
+    assert_eq!(checkout.path, wt.path);
+    assert_eq!(
+        repo_id,
+        repo_root.to_string_lossy(),
+        "the repo the row belongs to, echoed onto every action it triggers"
+    );
+    assert!(!checkout.is_current, "we are still in the main checkout");
 
     drop(server);
 }
@@ -37007,9 +37460,10 @@ fn sessions_json(dir: &tempfile::TempDir) -> serde_json::Value {
 
 #[tokio::test]
 async fn deleting_a_bound_workspace_takes_its_bindings_and_leaves_the_worktree() {
-    // Bindings live on the workspace's own session entry, so deleting it takes them along with no
-    // cascade to forget — a binding stranded in the file would resurrect against an unrelated
-    // workspace that later took the same name. The worktree is not the workspace's to delete.
+    // A workspace's bound contexts are nested under its own session entry, so deleting it takes
+    // them along with no cascade to forget — a context stranded in the file would resurrect against
+    // an unrelated workspace that later took the same name. The worktree is not the workspace's to
+    // delete.
     let (server, mut ws, repo_root, _notes, dir) = setup_variant_workspace().await;
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
@@ -37018,10 +37472,10 @@ async fn deleting_a_bound_workspace_takes_its_bindings_and_leaves_the_worktree()
     let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
     assert_eq!(bound.workspace.paths[0], wt.path);
     assert!(
-        !sessions_json(&dir)["workspaces"]["p"]["worktrees"]
-            .as_object()
-            .is_none_or(|m| m.is_empty()),
-        "the binding is recorded on the workspace's own entry"
+        sessions_json(&dir)["workspaces"]["p"]["contexts"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "the bound context is nested under the workspace's own entry"
     );
 
     // Switch away — deletion refuses on an active workspace.
@@ -37029,6 +37483,7 @@ async fn deleting_a_bound_workspace_takes_its_bindings_and_leaves_the_worktree()
         &mut ws,
         12,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
@@ -37038,6 +37493,7 @@ async fn deleting_a_bound_workspace_takes_its_bindings_and_leaves_the_worktree()
         &mut ws,
         13,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "q".into(),
             open_last: false,
         },
@@ -37196,32 +37652,29 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
     drop(server);
 }
 
-/// The one case the promise can't keep: a file that **isn't on the target branch** has nothing to
-/// follow to. The buffer closes and the landing falls back to the workspace's usual choice — which,
-/// with nothing else open, is a scratch. Pinned so the fallback is a decision rather than a
-/// surprise. (§9.3 step 3 wants this *reported* too; it isn't yet.)
+/// A file the target tree doesn't have can't be landed on, so the switch lands somewhere valid
+/// instead of on a path that isn't there.
 #[tokio::test]
 async fn a_file_absent_from_the_target_branch_cannot_follow() {
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
+    // A worktree on a *new* branch created at HEAD, then a file that exists only in the main
+    // checkout — so the tree genuinely lacks it.
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
         .worktree
         .unwrap();
-    // Committed *after* the worktree was created, so it exists on `main` and not on `feature`.
-    let repo = git2::Repository::open(&repo_root).unwrap();
-    commit_file(&repo, "only-on-main.rs", "one\n");
-
+    std::fs::write(repo_root.join("only-here.rs"), "fn main() {}\n").unwrap();
     let open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         11,
         &BufferOpenParams {
             path_index: Some(0),
-            relative_path: Some("only-on-main.rs".into()),
-            transient: Some(false),
+            relative_path: Some("only-here.rs".into()),
             ..Default::default()
         },
     )
     .await;
+    assert!(open.path.is_some());
 
     let bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
         &mut ws,
@@ -37230,244 +37683,171 @@ async fn a_file_absent_from_the_target_branch_cannot_follow() {
             repo_id: Some(repo_root.to_string_lossy().into()),
             worktree: wt.name.clone(),
             open_last: true,
-            buffer_id: Some(open.buffer_id),
             ..Default::default()
         },
     )
     .await;
-    let landed = bound.opened.expect("a bind with open_last lands somewhere");
-    assert!(
-        landed.path.is_none(),
-        "nothing to follow to and nothing else open, so the fallback is a scratch: {:?}",
-        landed.path
-    );
+    assert_eq!(bound.workspace.paths[0], wt.path, "we did move");
+    // Whatever it landed on, it is not a path outside the tree we just entered. Landing on the old
+    // checkout's copy would be the worst outcome: the same-looking file, edited in the tree you
+    // just left.
+    if let Some(path) = bound.opened.and_then(|o| o.path) {
+        assert!(
+            path.starts_with(&wt.path),
+            "landed outside the tree we switched into: {path}"
+        );
+    }
 
     drop(server);
 }
 
-/// Switching back and forth must not accumulate rows. The dormant list gains entries from two
-/// places during a rebind — the paths it remaps, and the buffers it just closed — and either can
-/// land on a path the other already has, or on one a second client has since opened live. Each
-/// shows up as a duplicated row in the buffers picker.
+/// **The point of keying contexts by their bindings.** Binding moves *only the client that asked*.
+///
+/// This used to be the opposite, and deliberately so: a workspace had one binding set, so binding
+/// re-rooted it under everyone standing in it and they were pushed the new shape to follow. That is
+/// what made "two trees of one repo at once" impossible. Now a context is `(workspace, bindings)`,
+/// the base is the empty set, and the two are separate entries — so the client that binds moves and
+/// nobody else does.
 #[tokio::test]
-async fn switching_back_and_forth_does_not_duplicate_buffers() {
+async fn binding_moves_only_the_client_that_asked() {
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
-    // Two committed files, so both exist on the branch the worktree checks out.
-    let repo = git2::Repository::open(&repo_root).unwrap();
-    commit_file(&repo, "b.rs", "two\n");
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
         .worktree
         .unwrap();
 
-    // Two kept buffers, viewing a.rs. b.rs stays dormant across every switch, which is the entry
-    // that gets *remapped* each time — the one that can collide with a freshly followed buffer.
-    let mut viewing = 0;
-    for (id, rel) in [(11u64, "b.rs"), (13, "a.rs")] {
-        let open: BufferOpenResult = send_request::<BufferOpen>(
-            &mut ws,
-            id,
-            &BufferOpenParams {
-                path_index: Some(0),
-                relative_path: Some(rel.into()),
-                transient: Some(false),
-                ..Default::default()
-            },
-        )
-        .await;
-        viewing = open.buffer_id;
-    }
-
-    // A second client on the same workspace and the same file, following each switch by path.
+    // A second client in the same workspace, viewing a file in the repo.
     let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
         .await
         .unwrap();
-    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+    let act2: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
         &mut ws2,
         1,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },
     )
     .await;
-    let _o2: BufferOpenResult = send_request::<BufferOpen>(
+    let base_root = act2.workspace.paths[0].clone();
+    assert_eq!(
+        base_root,
+        repo_root.to_string_lossy(),
+        "client 2 is in the base"
+    );
+    let open2: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws2,
         2,
         &BufferOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
-            transient: Some(false),
             ..Default::default()
         },
     )
     .await;
 
-    let mut current_repo = repo_root.to_string_lossy().to_string();
-    for (n, name) in [wt.name.clone(), String::new(), wt.name.clone(), String::new()]
-        .into_iter()
-        .enumerate()
-    {
-        let r: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
-            &mut ws,
-            20 + n as u64,
-            &WorkspaceBindWorktreeParams {
-                repo_id: Some(current_repo.clone()),
-                worktree: name.clone(),
-                open_last: true,
-                buffer_id: Some(viewing),
-                ..Default::default()
+    // Client 1 binds.
+    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path, "client 1 moved");
+    assert_eq!(
+        bound.workspace.worktrees.len(),
+        1,
+        "and its info says which tree it is in"
+    );
+
+    // Client 2 is told nothing and moved nowhere. Asked again, it still reports the base — and its
+    // buffer is still the base's copy, not closed out from under it.
+    let act2_again: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        3,
+        &WorkspaceActivateParams {
+            worktrees: Some(Default::default()),
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        act2_again.workspace.paths[0], base_root,
+        "client 2 stayed on the configured roots"
+    );
+    assert!(
+        act2_again.workspace.worktrees.is_empty(),
+        "…and is bound to nothing"
+    );
+    let content: aether_protocol::buffer::BufferContentResult =
+        send_request::<aether_protocol::buffer::BufferContent>(
+            &mut ws2,
+            4,
+            &aether_protocol::buffer::BufferContentParams {
+                buffer_id: open2.buffer_id,
             },
         )
         .await;
-        current_repo = if name.is_empty() {
-            repo_root.to_string_lossy().to_string()
-        } else {
-            wt.path.clone()
-        };
-        viewing = r.opened.as_ref().map(|o| o.buffer_id).unwrap_or(viewing);
-
-        // Client 2 follows, as the real client does.
-        let closed: aether_protocol::buffer::BufferClosedParams =
-            expect_notification_within::<aether_protocol::buffer::BufferClosed>(
-                &mut ws2,
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-        if let Some(loc) = closed.next_path {
-            let _o: BufferOpenResult = send_request::<BufferOpen>(
-                &mut ws2,
-                60 + n as u64,
-                &BufferOpenParams {
-                    path_index: Some(loc.path_index),
-                    relative_path: Some(loc.relative_path),
-                    ..Default::default()
-                },
-            )
-            .await;
-        }
-
-        let view =
-            send_request::<PickerView>(&mut ws, 40 + n as u64, &view_params(PickerKind::Buffers))
-                .await;
-        let mut rows: Vec<String> = view
-            .update
-            .expect("window")
-            .items()
-            .iter()
-            .filter_map(|i| match i {
-                aether_protocol::picker::PickerItem::Buffer { display, .. } => {
-                    Some(display.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        rows.sort();
-        let mut unique = rows.clone();
-        unique.dedup();
-        assert_eq!(rows, unique, "switch {n} duplicated a row: {rows:?}");
-        assert_eq!(rows.len(), 2, "both files stay listed, once each: {rows:?}");
-    }
+    assert!(
+        !content.text.is_empty(),
+        "client 2's buffer survived a bind it had nothing to do with"
+    );
 
     drop(server);
 }
 
-/// Unsaved work stays where it was edited (§9.3) — but the **view still moves**. Otherwise the
-/// landing falls back to the workspace's MRU head, which is that very buffer: you ask to switch
-/// trees and stay on the old tree's file, now displayed as an absolute path because it sits outside
-/// every root. That is `git-worktree.nvim` #88 wearing a different hat.
+/// Each context keeps its **own** buffer list, and going back and forth restores rather than
+/// accumulates.
 ///
-/// The cost, which is the design's and not this test's: the unsaved copy stays listed at its own
-/// path, so the picker shows two rows with the same file name.
+/// The old model moved buffers with the workspace, so there was one list and the risk was
+/// duplicating it. Contexts keep separate lists — which is the point — so what has to hold now is
+/// that returning to one finds what you left there.
 #[tokio::test]
-async fn the_view_moves_even_when_unsaved_work_stays_behind() {
+async fn each_context_keeps_its_own_buffers() {
     let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
     let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
         .await
         .worktree
         .unwrap();
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+
+    let base_open: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
         11,
         &BufferOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
-            transient: Some(false),
             ..Default::default()
         },
     )
     .await;
+    let base_path = base_open.path.clone().expect("a file buffer");
+    assert!(base_path.starts_with(repo_root.to_string_lossy().as_ref()));
 
-    // Bind: the clean buffer follows onto the worktree.
-    let r: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
-        &mut ws,
-        12,
-        &WorkspaceBindWorktreeParams {
-            repo_id: Some(repo_root.to_string_lossy().into()),
-            worktree: wt.name.clone(),
-            open_last: true,
-            buffer_id: Some(open.buffer_id),
-            ..Default::default()
-        },
-    )
-    .await;
-    let on_tree = r.opened.expect("landed").buffer_id;
-
-    // Type into it, so it is unsaved when we switch back.
-    let _e: EditResult = send_request::<InputText>(
-        &mut ws,
-        13,
-        &InputTextParams {
-            buffer_id: on_tree,
-            text: "X".into(),
-            select_pasted: false,
-            replace_selection: false,
-            at: None,
-        },
-    )
-    .await;
-
-    // Unbind: a dirty buffer stays behind, on the worktree's path.
-    let back: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
-        &mut ws,
-        14,
-        &WorkspaceBindWorktreeParams {
-            repo_id: Some(wt.path.clone()),
-            worktree: String::new(),
-            open_last: true,
-            buffer_id: Some(on_tree),
-            ..Default::default()
-        },
-    )
-    .await;
-    let landed = back
+    // Into the tree: the file follows, but as the *tree's* copy.
+    let bound = bind(&mut ws, 12, &repo_root, &wt.name).await;
+    assert_eq!(bound.workspace.paths[0], wt.path);
+    let in_tree = bound
         .opened
-        .expect("landed somewhere")
-        .path
-        .expect("on a file");
+        .and_then(|o| o.path)
+        .expect("the file you were on follows you in");
     assert!(
-        landed.starts_with(&repo_root.to_string_lossy().to_string()),
-        "the view followed the unbind onto the configured root, got {landed}"
+        in_tree.starts_with(&wt.path),
+        "the tree's copy, not the checkout's: {in_tree}"
     );
+    assert_ne!(in_tree, base_path);
 
-    let view = send_request::<PickerView>(&mut ws, 15, &view_params(PickerKind::Buffers)).await;
-    let rows: Vec<String> = view
-        .update
-        .expect("window")
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            aether_protocol::picker::PickerItem::Buffer { display, .. } => Some(display.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        rows.iter().any(|r| r == "a.rs"),
-        "the file you are now on is listed relative to its root: {rows:?}"
+    // ...and back out to the base, which still has its own copy open.
+    let back = bind(&mut ws, 13, std::path::Path::new(&wt.path), "").await;
+    assert_eq!(
+        back.workspace.paths[0],
+        repo_root.to_string_lossy(),
+        "an empty admin name unbinds"
     );
     assert!(
-        rows.iter().any(|r| r.starts_with(&wt.path)),
-        "and the unsaved copy is still there, at the path it was edited at: {rows:?}"
+        back.workspace.worktrees.is_empty(),
+        "and the context is the base again"
+    );
+    let landed = back.opened.and_then(|o| o.path).expect("landed on a file");
+    assert!(
+        landed.starts_with(repo_root.to_string_lossy().as_ref()),
+        "back on the checkout's copy: {landed}"
     );
 
     drop(server);
@@ -37517,341 +37897,6 @@ async fn the_rebinding_client_lands_on_the_same_file_on_the_new_tree() {
     drop(server);
 }
 
-/// The failure the debug log caught: **rebind, then rebind back.** The second time, the initiating
-/// client's `open_last` landing buffer materialises the followed file first — consuming the dormant
-/// entry and giving it a *different* id — so a successor named by id was already dead when the
-/// other client asked for it (`unknown buffer_id: 6`). It then sat on the old tree's buffer, which
-/// is why the terminal client kept showing `test1` after the switch back to main.
-#[tokio::test]
-async fn the_other_client_follows_a_rebind_back_to_the_configured_roots() {
-    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
-    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
-        .await
-        .worktree
-        .unwrap();
-
-    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
-        .await
-        .unwrap();
-    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
-        &mut ws2,
-        1,
-        &WorkspaceActivateParams {
-            name: "p".into(),
-            open_last: false,
-        },
-    )
-    .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws2,
-        2,
-        &BufferOpenParams {
-            path_index: Some(0),
-            relative_path: Some("a.rs".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    // Client 2 follows a rebind, exactly as the real client does.
-    async fn follow(
-        ws2: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        id: u64,
-    ) -> String {
-        let closed: aether_protocol::buffer::BufferClosedParams =
-            expect_notification_within::<aether_protocol::buffer::BufferClosed>(
-                ws2,
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-        let loc = closed
-            .next_path
-            .expect("the successor is a path, which no activation can invalidate");
-        let opened: BufferOpenResult = send_request::<BufferOpen>(
-            ws2,
-            id,
-            &BufferOpenParams {
-                path_index: Some(loc.path_index),
-                relative_path: Some(loc.relative_path),
-                ..Default::default()
-            },
-        )
-        .await;
-        opened.path.expect("a file-backed buffer has a path")
-    }
-
-    // Bind, with `open_last` — the initiator lands on a buffer, which is what consumes the dormant
-    // entry and made an id-based successor stale.
-    let _bound: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
-        &mut ws,
-        11,
-        &WorkspaceBindWorktreeParams {
-            repo_id: Some(repo_root.to_string_lossy().into()),
-            worktree: wt.name.clone(),
-            open_last: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let on_tree = follow(&mut ws2, 12).await;
-    assert!(on_tree.starts_with(&wt.path), "followed onto the worktree: {on_tree}");
-
-    // …and back. This is the direction that was broken.
-    let _back: WorkspaceActivateResult = send_request::<WorkspaceBindWorktree>(
-        &mut ws,
-        13,
-        &WorkspaceBindWorktreeParams {
-            repo_id: Some(wt.path.clone()),
-            worktree: String::new(),
-            open_last: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let on_main = follow(&mut ws2, 14).await;
-    assert!(
-        on_main.starts_with(&repo_root.to_string_lossy().to_string()),
-        "and back onto the configured root: {on_main}"
-    );
-    let _ = open;
-
-    drop(server);
-}
-
-/// A workspace is one thing however many clients are in it: rebinding moves its roots for all of
-/// them. The *other* clients therefore have to be told what closed and what replaced it — without
-/// that they keep buffer ids the server has just dropped, and every request on one comes back
-/// `unknown buffer_id`.
-/// Every handler that edits a workspace's shape owes the other clients in it a `workspace/changed`
-/// — not just the worktree rebind that made the gap visible. A second client that keeps a stale
-/// root list resolves every path it renders against a shape the workspace no longer has.
-#[tokio::test]
-async fn editing_a_workspaces_roots_tells_the_other_clients() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().canonicalize().unwrap();
-    let first = base.join("one");
-    let second = base.join("two");
-    std::fs::create_dir_all(&first).unwrap();
-    std::fs::create_dir_all(&second).unwrap();
-
-    let (server, mut ws) = setup_repos_workspace(vec![first.clone()]).await;
-    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
-        .await
-        .unwrap();
-    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
-        &mut ws2,
-        1,
-        &WorkspaceActivateParams {
-            name: "repos-proj".into(),
-            open_last: false,
-        },
-    )
-    .await;
-
-    let added: aether_protocol::workspace::WorkspaceInfo = send_request::<aether_protocol::workspace::WorkspaceAddRoot>(
-        &mut ws,
-        2,
-        &aether_protocol::workspace::WorkspaceAddRootParams {
-            workspace: "repos-proj".into(),
-            path: second.to_string_lossy().into(),
-        },
-    )
-    .await;
-    assert_eq!(added.paths.len(), 2, "the caller sees it in its own result");
-
-    let info: aether_protocol::workspace::WorkspaceInfo =
-        expect_notification_within::<aether_protocol::workspace::WorkspaceChanged>(
-            &mut ws2,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-    assert_eq!(info.name, "repos-proj");
-    assert_eq!(
-        info.paths.len(),
-        2,
-        "and so does everyone else standing in it"
-    );
-    assert!(info.paths.iter().any(|p| p == &second.to_string_lossy()));
-
-    drop(server);
-}
-
-/// A rebind must **remap** the dormant list, not replace it.
-///
-/// The followed set of one rebind *is* the dormant list of the next, so assigning over the top of
-/// it — as the first cut did — made a second rebind drop everything the first had carried across.
-/// (`docs/worktrees.md` §9.3 step 4.)
-#[tokio::test]
-async fn a_second_rebind_keeps_what_the_first_carried_across() {
-    use aether_protocol::picker::PickerItem;
-    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
-    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
-        .await
-        .worktree
-        .unwrap();
-
-    // One open buffer in the repo. The first bind closes it and lists it dormant on the new tree.
-    let _open: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws,
-        11,
-        &BufferOpenParams {
-            path_index: Some(0),
-            relative_path: Some("a.rs".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let bound = bind(&mut ws, 12, &repo_root, &wt.name).await;
-    assert_eq!(bound.workspace.paths[0], wt.path);
-
-    let listed = |update: &PickerUpdateParams| -> Vec<String> {
-        update
-            .items()
-            .iter()
-            .filter_map(|i| match i {
-                PickerItem::Buffer { display, .. } => Some(display.clone()),
-                _ => None,
-            })
-            .collect()
-    };
-    let view = send_request::<PickerView>(&mut ws, 13, &view_params(PickerKind::Buffers)).await;
-    let after_first = listed(&view.update.expect("initial window"));
-    assert!(
-        after_first.iter().any(|d| d.contains("a.rs")),
-        "the first rebind carried it across: {after_first:?}"
-    );
-
-    // Unbind. Nothing is open under a moved root now, so the second rebind contributes no followed
-    // buffers of its own — everything in the list is what the first one left.
-    let back = bind(&mut ws, 14, std::path::Path::new(&wt.path), "").await;
-    assert_eq!(back.workspace.paths[0], repo_root.to_string_lossy());
-
-    let view = send_request::<PickerView>(&mut ws, 15, &view_params(PickerKind::Buffers)).await;
-    let after_second = listed(&view.update.expect("initial window"));
-    assert!(
-        after_second.iter().any(|d| d.contains("a.rs")),
-        "and the second must not drop it: {after_second:?}"
-    );
-
-    drop(server);
-}
-
-#[tokio::test]
-async fn rebinding_tells_the_other_clients_on_the_workspace() {
-    let (server, mut ws, repo_root, _notes, _dir) = setup_variant_workspace().await;
-    let wt = worktree_add(&mut ws, 10, &repo_root, "feature", true)
-        .await
-        .worktree
-        .unwrap();
-
-    // A second client in the same workspace, viewing a file in the repo.
-    let (mut ws2, _) = tokio_tungstenite::connect_async(server.ws_url())
-        .await
-        .unwrap();
-    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
-        &mut ws2,
-        1,
-        &WorkspaceActivateParams {
-            name: "p".into(),
-            open_last: false,
-        },
-    )
-    .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws2,
-        2,
-        &BufferOpenParams {
-            path_index: Some(0),
-            relative_path: Some("a.rs".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws2,
-        3,
-        &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
-            cols: 80,
-            rows: 24,
-            overscan_rows: 0,
-            scroll: ScrollPosition {
-                logical_line: 0,
-                sub_row: 0.0,
-            },
-            wrap: WrapMode::None,
-            continuation_marker_width: 0,
-            tab_width: 4,
-            diff_view: false,
-        },
-    )
-    .await;
-
-    // The first client rebinds. The second is not the initiator, so it must hear about it.
-    let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
-    assert_eq!(bound.workspace.paths[0], wt.path);
-
-    // The new shape must arrive *before* the close, or the client resolves the successor's path
-    // against roots the workspace no longer has and mislabels everything it renders.
-    let mut saw_changed = false;
-    let closed: aether_protocol::buffer::BufferClosedParams = loop {
-        let text = tokio::time::timeout(std::time::Duration::from_secs(5), next_text(&mut ws2))
-            .await
-            .expect("the other client is told what happened");
-        match serde_json::from_str::<ClientInbound>(&text).expect("parseable") {
-            ClientInbound::Notification(n)
-                if n.method == aether_protocol::workspace::WorkspaceChanged::NAME =>
-            {
-                let info: aether_protocol::workspace::WorkspaceInfo =
-                    serde_json::from_value(n.params).expect("typed");
-                assert_eq!(info.name, "p");
-                assert_eq!(
-                    info.paths[0], wt.path,
-                    "carrying the roots it now has, not the ones it had"
-                );
-                saw_changed = true;
-            }
-            ClientInbound::Notification(n)
-                if n.method == aether_protocol::buffer::BufferClosed::NAME =>
-            {
-                assert!(saw_changed, "the shape change has to land first");
-                break serde_json::from_value(n.params).expect("typed");
-            }
-            _ => {}
-        }
-    };
-    assert_eq!(
-        closed.buffer_id, open.buffer_id,
-        "the buffer it was viewing is the one that closed"
-    );
-
-    // The successor is the *same file on the new tree*, named as a **path**: the id the server
-    // could offer is a dormant placeholder, and the initiator's own landing buffer may already have
-    // materialised it under a different id (this is the race the debug log caught — the second
-    // rebind's `unknown buffer_id`). A path opens the same file whichever client gets there first.
-    let loc = closed.next_path.clone().expect("handed a path, not an id");
-    let reopened: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws2,
-        4,
-        &BufferOpenParams {
-            path_index: Some(loc.path_index),
-            relative_path: Some(loc.relative_path),
-            ..Default::default()
-        },
-    )
-    .await;
-    let path = reopened.path.expect("a file-backed buffer has a path");
-    assert!(
-        path.starts_with(&wt.path),
-        "landed on the worktree's copy: {path}"
-    );
-    assert!(path.ends_with("a.rs"), "same file: {path}");
-
-    drop(server);
-}
-
 #[tokio::test]
 async fn removing_the_worktree_you_are_in_returns_you_to_the_configured_roots() {
     let (server, mut ws, repo_root, _notes, dir) = setup_variant_workspace().await;
@@ -37860,7 +37905,10 @@ async fn removing_the_worktree_you_are_in_returns_you_to_the_configured_roots() 
         .worktree
         .unwrap();
     let bound = bind(&mut ws, 11, &repo_root, &wt.name).await;
-    assert_eq!(bound.workspace.paths[0], wt.path, "standing in the worktree");
+    assert_eq!(
+        bound.workspace.paths[0], wt.path,
+        "standing in the worktree"
+    );
 
     // A clean buffer in the tree, so the removal has something open to rescue.
     let _open: BufferOpenResult = send_request::<BufferOpen>(
@@ -37896,6 +37944,7 @@ async fn removing_the_worktree_you_are_in_returns_you_to_the_configured_roots() 
         &mut ws,
         14,
         &WorkspaceActivateParams {
+            worktrees: None,
             name: "p".into(),
             open_last: false,
         },

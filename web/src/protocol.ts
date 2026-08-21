@@ -353,8 +353,7 @@ export type PickerKind =
   | "git_branches"
   | "git_log"
   | "git_log_file"
-  | "git_stash"
-  | "worktrees";
+  | "git_stash";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -412,27 +411,28 @@ export type PickerItem =
       upstream?: string | null;
       ahead?: number;
       behind?: number;
-      /** Workdir of another worktree holding this branch — the row is not checkout-able. */
-      checked_out_in?: string | null;
-      match_indices?: number[];
-    }
-  | {
-      kind: "worktree";
-      /** Which repo the row belongs to — echoed onto every action it triggers. */
-      repo_id: string;
-      /** What the row is: the main checkout, an existing linked worktree, a branch with no
-       *  worktree, or the synthetic create row. Drives the glyph and what selecting it does. */
-      row: "main" | "existing" | "branch" | "create";
-      /** The row text and match target: an admin name, or a branch name for a branch row. */
-      label: string;
-      /** Branch checked out in this worktree, when it is on one. */
-      branch?: string;
-      /** Absolute working directory; empty for a branch or create row. */
-      path?: string;
-      is_current?: boolean;
-      /** The admin entry outlived its directory — prunable, and rendered as such. */
-      prunable?: boolean;
-      locked?: boolean;
+      /** The checkout in this family holding this branch, when one does — including the tree you
+       *  are standing in. Its presence is what makes this a worktree row: Enter opens that tree
+       *  rather than moving HEAD, and Ctrl-d removes it rather than deleting the branch. */
+      checkout?: {
+        /** Working directory of the checkout. */
+        path: string;
+        /** It is the repo's main working tree: no admin name, and not removable. */
+        is_main?: boolean;
+        /** Admin name of the linked worktree — empty for the main tree, which is also what
+         *  `workspace/bind_worktree` reads as "unbind". Drifts from the branch: a tree made for
+         *  `feature/auth` is called `feature-auth`, and a checkout inside it later moves HEAD
+         *  without renaming anything. */
+        worktree?: string;
+        /** This is the checkout you are standing in. */
+        is_current?: boolean;
+        locked?: boolean;
+        /** The admin entry outlived its directory — prunable, and rendered as such. */
+        prunable?: boolean;
+      } | null;
+      /** Set when the row is a detached worktree rather than a branch: `name` is the tree's admin
+       *  name and this is its short commit id (empty for a prunable entry). */
+      detached_at?: string | null;
       match_indices?: number[];
     }
   | {

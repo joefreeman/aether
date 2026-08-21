@@ -871,12 +871,6 @@ pub enum ItemKey<'a> {
     GitStash {
         oid: &'a str,
     },
-    /// `(row kind, label)` — admin names and branch names are separate namespaces that can
-    /// coincide, so the kind is part of the identity.
-    Worktree {
-        row: aether_protocol::picker::WorktreeRowKind,
-        label: &'a str,
-    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -959,10 +953,6 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             hash: hash.as_str(),
         },
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash { oid: oid.as_str() },
-        PickerItem::Worktree { row, label, .. } => ItemKey::Worktree {
-            row: *row,
-            label: label.as_str(),
-        },
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {
                 path_index,

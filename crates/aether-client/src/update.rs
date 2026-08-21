@@ -1180,61 +1180,57 @@ impl Session {
             // Creating a worktree is a checkout into a directory nothing is looking at, so the
             // report is the whole feedback: where it went, and the two facts that decide whether
             // it will actually work — what was seeded, and whether submodules are in play.
-            Event::WorktreeAdded { branch, result } => match result {
-                Err(e) => {
-                    self.pending_worktree_bind = None;
-                    Effects::error(e)
-                }
-                Ok(res) => match res.status {
-                    GitWorktreeAddStatus::Created => {
-                        // Selecting a branch row means "work on that branch here", so the create is
-                        // only half of it — the bind is what actually moves you. Chained off the
-                        // result rather than fired blind, because the admin name is derived
-                        // server-side and this is where it first exists.
-                        if let (Some(repo_id), Some(wt)) =
-                            (self.pending_worktree_bind.take(), res.worktree.as_ref())
-                        {
-                            return self.bind_worktree(repo_id, wt.name.clone());
+            Event::WorktreeAdded { branch, result } => {
+                match result {
+                    Err(e) => Effects::error(e),
+                    Ok(res) => match res.status {
+                        GitWorktreeAddStatus::Created => {
+                            // Creating never moves you. `Ctrl-o` is a lifecycle verb and the picker
+                            // stays open on the row, which now renders its worktree marker — that
+                            // change *is* the feedback. This used to chain a bind off the result,
+                            // back when selecting a branch row meant "create a tree and go there";
+                            // splitting the two is what stopped a cancelled or refused create from
+                            // leaving a half-applied gesture behind.
+                            let mut note = format!("Created worktree for {branch}");
+                            if res.seeded_files > 0 {
+                                note.push_str(&format!(" — seeded {} file(s)", res.seeded_files));
+                            }
+                            if res.has_submodules {
+                                // git's own BUGS section advises against this and the failure mode is
+                                // silent commit loss, so it is said out loud rather than logged.
+                                note.push_str("; repo has submodules — see git-worktree(1) BUGS");
+                            }
+                            Effects::toast(note, ToastKind::Success)
                         }
-                        let mut note = format!("Created worktree for {branch}");
-                        if res.seeded_files > 0 {
-                            note.push_str(&format!(" — seeded {} file(s)", res.seeded_files));
-                        }
-                        if res.has_submodules {
-                            // git's own BUGS section advises against this and the failure mode is
-                            // silent commit loss, so it is said out loud rather than logged.
-                            note.push_str("; repo has submodules — see git-worktree(1) BUGS");
-                        }
-                        Effects::toast(note, ToastKind::Success)
-                    }
-                    // The refusal with a concrete next step: the branch is already open somewhere,
-                    // and going there is what the user wanted anyway.
-                    GitWorktreeAddStatus::AlreadyCheckedOut => Effects::toast(
-                        format!(
-                            "{branch} is already checked out in {}",
-                            res.checked_out_in.unwrap_or_default()
+                        // The refusal with a concrete next step: the branch is already open somewhere,
+                        // and going there is what the user wanted anyway.
+                        GitWorktreeAddStatus::AlreadyCheckedOut => Effects::toast(
+                            format!(
+                                "{branch} is already checked out in {}",
+                                res.checked_out_in.unwrap_or_default()
+                            ),
+                            ToastKind::Warning,
                         ),
-                        ToastKind::Warning,
-                    ),
-                    GitWorktreeAddStatus::NoSuchBranch => {
-                        Effects::toast(format!("No branch {branch}"), ToastKind::Warning)
-                    }
-                    GitWorktreeAddStatus::InvalidBranchName => Effects::toast(
-                        format!("{branch} isn't a usable branch name"),
-                        ToastKind::Warning,
-                    ),
-                    GitWorktreeAddStatus::Unborn => Effects::toast(
-                        "No commits yet — commit before creating a worktree",
-                        ToastKind::Warning,
-                    ),
-                    GitWorktreeAddStatus::Cancelled => {
-                        Effects::toast("Worktree creation stopped", ToastKind::Info)
-                    }
-                    GitWorktreeAddStatus::Refused => {
-                        Effects::toast(res.message, ToastKind::Warning)
-                    }
-                },
-            },
+                        GitWorktreeAddStatus::NoSuchBranch => {
+                            Effects::toast(format!("No branch {branch}"), ToastKind::Warning)
+                        }
+                        GitWorktreeAddStatus::InvalidBranchName => Effects::toast(
+                            format!("{branch} isn't a usable branch name"),
+                            ToastKind::Warning,
+                        ),
+                        GitWorktreeAddStatus::Unborn => Effects::toast(
+                            "No commits yet — commit before creating a worktree",
+                            ToastKind::Warning,
+                        ),
+                        GitWorktreeAddStatus::Cancelled => {
+                            Effects::toast("Worktree creation stopped", ToastKind::Info)
+                        }
+                        GitWorktreeAddStatus::Refused => {
+                            Effects::toast(res.message, ToastKind::Warning)
+                        }
+                    },
+                }
+            }
 
             Event::WorktreeRemoved { name, result } => match result {
                 Err(e) => Effects::error(e),
@@ -1729,31 +1725,18 @@ impl Session {
                         Event::Switched,
                     )
                 }
-                // A worktree row. Phase 1 of docs/worktrees.md: a row that names a tree which
-                // doesn't exist yet creates it; an existing one is reported. Binding it to the
-                // workspace's roots is Phase 2 — the row already carries what that needs.
-                // A worktree row. A row naming a tree that doesn't exist yet creates it first —
-                // and the create's result carries the admin name to bind, so the two steps chain
-                // without the client having to re-derive anything. An existing row binds directly.
-                PickerSelectResult::Worktree {
-                    repo_id,
-                    name,
-                    create,
-                } => match create {
-                    Some(c) => {
-                        self.pending_worktree_bind = Some(repo_id.clone());
-                        self.git_worktree_add(repo_id, c.branch, c.create_branch)
-                    }
-                    // The `main` row: send this repo back to its main checkout in this context,
-                    // which an empty worktree name is exactly what means on the wire.
-                    None => self.bind_worktree(repo_id, name),
-                },
+
                 PickerSelectResult::Workspace { name } => {
                     // Activate and land on the workspace's last buffer (or a fresh transient
                     // scratch) — the bootstrap convention, now one server-side composite.
                     self.request_str::<WorkspaceActivate>(
                         WorkspaceActivateParams {
                             name,
+                            // Unset, not empty: "wherever I was". The server enters this
+                            // workspace's most recently activated context, so picking it from the
+                            // switcher lands you back in the worktree you were working in rather
+                            // than always on the main checkout.
+                            worktrees: None,
                             open_last: true,
                         },
                         |r| {
@@ -1774,6 +1757,7 @@ impl Session {
             Event::WorkspaceActivated(Ok((workspace, open))) => {
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
+                self.workspace_worktrees = workspace.worktrees;
                 self.workspace_projects = workspace.projects;
                 // A deliberate switch means we're no longer in the launch context — release the
                 // tether, so closing the launched buffer later behaves like any other close (and
@@ -1790,6 +1774,7 @@ impl Session {
                 };
                 self.workspace = activate.workspace.name;
                 self.workspace_paths = activate.workspace.paths;
+                self.workspace_worktrees = activate.workspace.worktrees;
                 self.workspace_projects = activate.workspace.projects;
                 self.tether = None;
                 // Deliberately no toast for buffers that stayed behind. They are not lost — they
@@ -1810,6 +1795,7 @@ impl Session {
                 } = activate;
                 self.workspace = workspace.name.clone();
                 self.workspace_paths = workspace.paths;
+                self.workspace_worktrees = workspace.worktrees;
                 self.workspace_projects = workspace.projects;
                 self.tether = None;
                 // Workspace-scoped recall lists — empty for a brand-new workspace, but the fetch
@@ -2280,6 +2266,7 @@ impl Session {
                 let old_buffer_id = self.buffer.buffer_id;
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
+                self.workspace_worktrees = workspace.worktrees;
                 self.workspace_projects = workspace.projects;
                 let same_file = open.path == self.buffer.path;
                 self.buffer = buffer_info(open, &self.workspace_paths);
@@ -2553,17 +2540,32 @@ impl Session {
         // Another client rebinding a worktree is what makes this ordinary rather than exotic: the
         // clean file-backed buffers under the roots that moved all close at once, under a client
         // that may be typing into one of them, and each in-flight request came back as its own
-        // error toast. Dropped silently, callback and all — running it would only feed a stale id
-        // into whatever it does next.
-        if result
+        // error toast.
+        //
+        // **Only the toast is noise; the callback still runs.** Dropping the callback too — as this
+        // did — quietly took every state-clearing continuation with it. A `git/worktree_add` whose
+        // `buffer_id` had just been closed never reached its result arm; a dropped `Event::Switched`
+        // left the client rendering a buffer id the server had already closed; a `buffer/save` did
+        // nothing at all, silently. So the error is delivered normally and only the resulting error
+        // toast is stripped.
+        let stale_buffer = result
             .as_ref()
             .err()
-            .is_some_and(|e| e.code == ErrorCode::BUFFER_NOT_FOUND.0)
-        {
-            return Effects::none();
-        }
+            .is_some_and(|e| e.code == ErrorCode::BUFFER_NOT_FOUND.0);
         let event = f(result);
-        self.on_event(event)
+        let mut effects = self.on_event(event);
+        if stale_buffer {
+            effects.0.retain(|e| {
+                !matches!(
+                    e,
+                    Effect::Toast {
+                        kind: ToastKind::Error,
+                        ..
+                    }
+                )
+            });
+        }
+        effects
     }
 
     /// Send an edit RPC — the single client-side funnel for every buffer mutation, mirroring the
@@ -4494,7 +4496,21 @@ impl Session {
                 at: None,
             },
         };
-        WindowTarget { workspace, open }
+        WindowTarget {
+            workspace,
+            // The same context, not just the same workspace: duplicating a window on a worktree and
+            // landing on the main checkout would be a surprising `Space z`.
+            worktrees: self.window_worktrees(),
+            open,
+        }
+    }
+
+    /// This session's bindings in [`WindowTarget`] form.
+    fn window_worktrees(&self) -> Vec<(String, String)> {
+        self.workspace_worktrees
+            .iter()
+            .map(|w| (w.repo_id.clone(), w.worktree.clone()))
+            .collect()
     }
 
     /// The spawn descriptor for opening the highlighted picker item in a *new* window (`Ctrl-Enter`),
@@ -4517,6 +4533,9 @@ impl Session {
             let root = self.workspace_paths.get(path_index as usize)?;
             Some(format!("{}/{}", root.trim_end_matches('/'), relative))
         };
+        // Rows that open something *here* carry this context, so a new window on a file you are
+        // reading in a worktree opens in that worktree rather than on the main checkout.
+        let mine = self.window_worktrees();
         match p.selected_item()? {
             PickerItem::File {
                 path_index,
@@ -4524,6 +4543,7 @@ impl Session {
                 ..
             } => Some(WindowTarget {
                 workspace: here,
+                worktrees: mine,
                 open: WindowOpen::Path {
                     path: abs(*path_index, relative_path)?,
                     at: None,
@@ -4537,6 +4557,7 @@ impl Session {
                 ..
             } => Some(WindowTarget {
                 workspace: here,
+                worktrees: mine,
                 open: WindowOpen::Path {
                     path: abs(*path_index, relative_path)?,
                     at: Some((*line, *col)),
@@ -4549,6 +4570,7 @@ impl Session {
                 ..
             } => Some(WindowTarget {
                 workspace: here,
+                worktrees: mine,
                 open: WindowOpen::Path {
                     path: abs(*pi, rel)?,
                     at: None,
@@ -4558,6 +4580,7 @@ impl Session {
             // workspace is CLI-addressable (the new `ae` must activate it before `buffer/open`-by-id).
             PickerItem::Buffer { buffer_id, .. } => here.map(|ws| WindowTarget {
                 workspace: Some(ws),
+                worktrees: mine,
                 open: WindowOpen::Buffer(*buffer_id),
             }),
             // An explorer *file* (a directory navigates within the picker instead). The listing dir
@@ -4570,6 +4593,7 @@ impl Session {
                 let dir = p.explorer_listing_dir()?;
                 Some(WindowTarget {
                     workspace: here,
+                    worktrees: mine,
                     open: WindowOpen::Path {
                         path: format!("{}/{name}", dir.trim_end_matches('/')),
                         at: None,
@@ -4577,10 +4601,42 @@ impl Session {
                 })
             }
             // Open a *different* workspace in a new window — lands on its MRU buffer.
+            // A *different* workspace opens in whichever context it was last used in — ours says
+            // nothing about it, and its repos may not even be the same ones.
             PickerItem::Workspace { name, .. } => Some(WindowTarget {
                 workspace: Some(name.clone()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Workspace,
             }),
+            // A branch row: open the tree that holds it, in a new window. This is the verb the whole
+            // context keying exists for — two windows, two trees of one repo, at once.
+            //
+            // A branch **no tree holds** has nothing to open in another window: git permits one
+            // checkout per branch, so a second window on it would need a tree that does not exist.
+            // Refused with the way forward rather than silently falling through to an ordinary
+            // accept, which would check the branch out *here* — something else entirely from what
+            // was asked for.
+            PickerItem::GitBranch {
+                repo_id, checkout, ..
+            } => {
+                let checkout = checkout.as_ref()?;
+                let mut worktrees: Vec<(String, String)> = self
+                    .workspace_worktrees
+                    .iter()
+                    .filter(|w| &w.repo_id != repo_id)
+                    .map(|w| (w.repo_id.clone(), w.worktree.clone()))
+                    .collect();
+                // An empty admin name is the main checkout, which is the *absence* of a binding —
+                // the same thing `workspace/bind_worktree` reads it as.
+                if !checkout.worktree.is_empty() {
+                    worktrees.push((repo_id.clone(), checkout.worktree.clone()));
+                }
+                Some(WindowTarget {
+                    workspace: here,
+                    worktrees,
+                    open: WindowOpen::Workspace,
+                })
+            }
             _ => None,
         }
     }
@@ -4619,7 +4675,6 @@ impl Session {
             return match p.kind {
                 PickerKind::Workspaces => self.workspace_create_from_query(),
                 PickerKind::GitBranches => self.branch_create_from_query(),
-                PickerKind::Worktrees => self.worktree_create_from_query(),
                 _ => self.explorer_create_from_query(),
             };
         }
@@ -4671,41 +4726,38 @@ impl Session {
                 repo_id,
                 name,
                 is_head,
-                checked_out_in,
-                checked_out_in_main,
+                checkout,
+                detached_at,
                 ..
             } => {
+                // One intent — *get me to this branch* — and git's state picks the mechanism. A
+                // branch a tree already holds cannot be checked out again, so going there means
+                // moving this window to that tree; a branch no tree holds is reached by moving
+                // HEAD here. Either way what the user sees is "I am now looking at this branch, in
+                // this window", which is what makes the two mechanisms one gesture rather than an
+                // overload.
+                if let Some(checkout) = checkout {
+                    if checkout.is_current {
+                        // Already here. A detached row has no branch to name, so it says where you
+                        // are instead of what you are on.
+                        return Effects::toast(
+                            if detached_at.is_some() {
+                                format!("Already in {name}")
+                            } else {
+                                format!("Already on {name}")
+                            },
+                            ToastKind::Info,
+                        );
+                    }
+                    // An empty admin name is the main checkout, which is exactly what
+                    // `workspace/bind_worktree` reads as "unbind" — so selecting the branch main
+                    // holds sends this repo back to it, with no case of its own.
+                    let (repo_id, worktree) = (repo_id.clone(), checkout.worktree.clone());
+                    return self.bind_worktree(repo_id, worktree);
+                }
                 // Already here: say so rather than spawning a git that would do nothing.
                 if *is_head {
                     return Effects::toast(format!("Already on {name}"), ToastKind::Info);
-                }
-                // Refuse client-side — git refuses it too, and the row already carries the fact,
-                // so the round trip would only confirm what is on screen. (The server checks
-                // again: another client can create a worktree between the open and the Enter.)
-                //
-                // Deliberately doesn't name the worktree. It used to, from the basename of
-                // `checked_out_in` — but admin names are *derived from the branch*
-                // (`admin_name_for_branch`), so the common case read "test1 is checked out in
-                // test1". The `⧉ <name>` on the row already says which tree; what the toast has to
-                // add is the way forward, since binding this workspace to that tree is how you get
-                // to the branch you were reaching for.
-                if checked_out_in.is_some() {
-                    // Says *which kind* of checkout holds it, because they are different places to
-                    // be sent even though both refuse identically. Saying "a worktree" for the main
-                    // tree was simply wrong — and it is the common case from inside a worktree,
-                    // where `main` is held by the repo itself.
-                    //
-                    // No chord in the text: a toast that names a key goes stale the moment the
-                    // keymap moves, and the hint system is where key discovery lives.
-                    let where_ = if *checked_out_in_main {
-                        "the main checkout"
-                    } else {
-                        "another worktree"
-                    };
-                    return Effects::toast(
-                        format!("{name} is checked out in {where_}"),
-                        ToastKind::Warning,
-                    );
                 }
                 let (repo_id, name) = (repo_id.clone(), name.clone());
                 // Close first: a checkout is a terminal action, and the list it was showing is
@@ -4917,6 +4969,20 @@ impl Session {
             // new-window target (directories, LSP servers, keybindings, …) fall through to an
             // ordinary accept — the same fall-through the web shell does when the row has no URL.
             KeyCode::Enter if mods.ctrl => {
+                // A branch no tree holds cannot be opened in a second window: git permits one
+                // checkout per branch. Refused *with the way forward* rather than falling through
+                // to an ordinary accept, which would check the branch out here — something else
+                // entirely from what was asked for, and silently.
+                if p.kind == PickerKind::GitBranches {
+                    if let Some(PickerItem::GitBranch { name, checkout, .. }) = p.selected_item() {
+                        if checkout.is_none() {
+                            return Effects::toast(
+                                format!("{name} has no worktree yet"),
+                                ToastKind::Warning,
+                            );
+                        }
+                    }
+                }
                 if let Some(target) = self.picker_item_target() {
                     return self.close_picker().and(Effects::one(Effect::ShellAction(
                         ShellAction::NewWindow(target),
@@ -4951,58 +5017,123 @@ impl Session {
             // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
             // GitBranches: Ctrl-d deletes the highlighted branch behind a confirm — the same
             // gesture Explorer/Files/Workspaces and Buffers use for "remove the highlighted thing".
-            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::GitBranches => {
-                let Some(PickerItem::GitBranch { name, is_head, .. }) = p.selected_item() else {
-                    return Effects::none();
-                };
-                // Git refuses this outright, so don't stage a doomed confirm — say why.
-                if *is_head {
-                    return Effects::error(format!(
-                        "{name} is checked out here — switch away first"
-                    ));
-                }
-                let name = name.clone();
-                self.prompt = Some(Prompt::Confirm {
-                    kind: ConfirmKind::DeleteBranch { name: name.clone() },
-                    action: ConfirmAction::DeleteBranch { name, force: false },
-                });
-                return Effects::none();
-            }
-            // Worktree removal on `Ctrl-d`, the same key every other picker uses for "remove the
-            // highlighted thing" (it was `Alt-x` until 2026-08-20).
-            //
-            // Unlike those, it stages no confirm dialog, because here the *refusal* is the
-            // confirmation: a first press either removes a clean tree or comes back itemising what
-            // a forced removal would destroy, and `Ctrl-Alt-d` is the escalation from having read
-            // that. A modal "are you sure?" carrying no facts would only train people to confirm.
-            // The escalation rides Alt rather than Shift — the plain/Alt sibling convention the
-            // stash picker's `Ctrl-p`/`Ctrl-Alt-p` pair already uses, and the one that survives a
-            // terminal, where Ctrl-Shift-D arrives indistinguishable from Ctrl-d.
-            KeyCode::Char('d') if mods.ctrl && p.kind == PickerKind::Worktrees => {
-                let Some(PickerItem::Worktree {
+            KeyCode::Char('d') if mods.ctrl && p.kind == PickerKind::GitBranches => {
+                let Some(PickerItem::GitBranch {
                     repo_id,
-                    row,
-                    label,
+                    name,
+                    checkout,
+                    detached_at,
                     ..
                 }) = p.selected_item()
                 else {
                     return Effects::none();
                 };
-                use aether_protocol::picker::WorktreeRowKind;
-                // Only an existing linked tree can be removed. The main worktree is the repo, and
-                // a branch row has no tree yet — both say so rather than failing at the server.
-                match row {
-                    WorktreeRowKind::Main => {
-                        return Effects::error("That's the repository itself, not a worktree")
+                // One key, taking the **outermost** thing off: a row with a worktree loses the
+                // worktree, a row without one loses the branch. The exact inverse of `Ctrl-o`
+                // building the tree onto the branch, and pressing it twice walks the row back down
+                // — with the row visibly changing in between, which is what keeps it honest.
+                let Some(checkout) = checkout else {
+                    if mods.alt {
+                        // Force is the escalation from a `NotMerged` refusal the user has read, and
+                        // that path runs through the confirm below. Nothing to escalate from yet.
+                        return Effects::none();
                     }
-                    WorktreeRowKind::Branch | WorktreeRowKind::Create => {
-                        return Effects::error(format!("{label} has no worktree to remove"))
-                    }
-                    WorktreeRowKind::Existing => {}
+                    let name = name.clone();
+                    self.prompt = Some(Prompt::Confirm {
+                        kind: ConfirmKind::DeleteBranch { name: name.clone() },
+                        action: ConfirmAction::DeleteBranch { name, force: false },
+                    });
+                    return Effects::none();
+                };
+                // Two things this row can't be asked to do, checked in the order the user would
+                // hit them. Standing in it comes first: it is true of the main checkout *and* of a
+                // worktree, and "you are here" is the more useful sentence either way.
+                if checkout.is_current {
+                    return Effects::error(if detached_at.is_some() {
+                        format!("You're in {name} — switch away first")
+                    } else {
+                        format!("You're on {name} — switch away first")
+                    });
                 }
-                let (repo_id, name) = (repo_id.clone(), label.clone());
+                // The main checkout is the repository: there is no tree to remove, and git refuses
+                // to delete a branch it holds, so neither half of `Ctrl-d` applies.
+                if checkout.is_main {
+                    return Effects::error(format!("{name} is in the main checkout"));
+                }
+                // No confirm dialog, unlike the branch half: here the *refusal* is the
+                // confirmation. A first press either removes a clean tree or comes back itemising
+                // what a forced removal would destroy, and `Ctrl-Alt-d` is the escalation from
+                // having read that. A modal "are you sure?" carrying no facts would only train
+                // people to confirm. The escalation rides Alt rather than Shift — the plain/Alt
+                // sibling convention the stash picker's `Ctrl-p`/`Ctrl-Alt-p` pair already uses,
+                // and the one that survives a terminal, where Ctrl-Shift-D arrives
+                // indistinguishable from Ctrl-d.
+                let (repo_id, worktree) = (repo_id.clone(), checkout.worktree.clone());
                 let force = mods.alt;
-                return self.git_worktree_remove(repo_id, name, force);
+                return self.git_worktree_remove(repo_id, worktree, force);
+            }
+            // `Ctrl-o` — create a worktree for the highlighted branch and **stay put**.
+            //
+            // Its own key rather than a side effect of Enter, because creating one is a full
+            // checkout: a registered, cancellable operation (`GitOperationKind::WorktreeAdd`) that
+            // may seed `node_modules` from `.worktreeinclude` and can warn about submodules.
+            // Bundled into a navigation key, cancelling it mid-flight leaves "where am I?" with no
+            // good answer; separated, the answer is "where you were, with no worktree".
+            //
+            // `o` because it already means *make a new one* here — `Ctrl-o` opens a line below in
+            // Normal mode and a block below in read mode. The hint says "Create worktree" outright
+            // rather than leaning on the letter, since `o` reads as "open" to everyone else.
+            KeyCode::Char('o') if mods.ctrl && !mods.alt && p.kind == PickerKind::GitBranches => {
+                // Everything the create needs, read off the row before the picker borrow is
+                // released — `observe_picker_cmd` and `git_worktree_add` both want `&mut self`.
+                let create_from_query = p.selected_is_create().then(|| p.query.trim().to_string());
+                let row = match p.selected_item() {
+                    Some(PickerItem::GitBranch {
+                        repo_id,
+                        name,
+                        checkout,
+                        detached_at,
+                        ..
+                    }) => Some((
+                        repo_id.clone(),
+                        name.clone(),
+                        checkout.clone(),
+                        detached_at.is_some(),
+                    )),
+                    _ => None,
+                };
+                let observed = self.observe_picker_cmd(PickerCmd::CreateWorktree);
+
+                // The `+ Create` row: the branch doesn't exist either, so make both.
+                if let Some(branch) = create_from_query {
+                    let Some(repo_id) = self.branch_picker_repo_id() else {
+                        return observed;
+                    };
+                    if branch.is_empty() {
+                        return observed.and(Effects::error("Type a branch name to create"));
+                    }
+                    return observed.and(self.git_worktree_add(repo_id, branch, true));
+                }
+                let Some((repo_id, name, checkout, detached)) = row else {
+                    return observed;
+                };
+                if let Some(checkout) = checkout {
+                    // Already has one. Naming *which* matters: the tree's admin name drifts from
+                    // the branch, so "main already has a worktree" would be the wrong sentence for
+                    // a row whose tree is called something else entirely.
+                    return observed.and(Effects::error(if checkout.is_main {
+                        format!("{name} is in the main checkout")
+                    } else {
+                        format!("{name} is already in worktree {}", checkout.worktree)
+                    }));
+                }
+                // A detached row always carries a checkout, so this is unreachable through it —
+                // but a row with no branch has no branch to make a tree for, and saying so beats
+                // sending the server a commit id where it expects a ref.
+                if detached {
+                    return observed;
+                }
+                return observed.and(self.git_worktree_add(repo_id, name, false));
             }
             // Stash chords, in the Ctrl family the other pickers' row actions use. `Ctrl-p` pops
             // (the gesture you stashed *for*) and `Ctrl-Alt-p` applies — the plain/Alt sibling
@@ -7684,44 +7815,6 @@ impl Session {
         )
     }
 
-    /// The repo the worktree picker is listing, read off its own rows for the same reason the
-    /// branch picker does it: the active buffer may have moved since the list was built.
-    fn worktree_picker_repo_id(&self) -> Option<String> {
-        let p = self.picker.as_ref()?;
-        if p.kind != PickerKind::Worktrees {
-            return None;
-        }
-        p.items.iter().find_map(|it| match it {
-            PickerItem::Worktree { repo_id, .. } => Some(repo_id.clone()),
-            _ => None,
-        })
-    }
-
-    /// The `+ Create` row in the worktree picker: create the typed **branch** and a worktree for
-    /// it. The query is a branch name throughout — the directory is derived server-side and is
-    /// never something the user types or sees as editable.
-    pub fn worktree_create_from_query(&mut self) -> Effects {
-        let (branch, repo_id) = {
-            let Some(p) = &self.picker else {
-                return Effects::none();
-            };
-            if p.kind != PickerKind::Worktrees {
-                return Effects::none();
-            }
-            (p.query.trim().to_string(), self.worktree_picker_repo_id())
-        };
-        if branch.is_empty() {
-            return Effects::error("Type a branch name to create");
-        }
-        // The picker always lists at least the main worktree, so a missing id means the list never
-        // arrived — there is nothing sensible to create against.
-        let Some(repo_id) = repo_id else {
-            return Effects::none();
-        };
-        let hide = self.close_picker();
-        hide.and(self.git_worktree_add(repo_id, branch, true))
-    }
-
     /// Fire `workspace/bind_worktree`: point this repo at `worktree` in the current context and
     /// activate the result. An empty `worktree` unbinds — the `main` row.
     ///
@@ -9658,6 +9751,9 @@ impl Session {
             .then(|| self.workspace.clone());
         Effects::one(Effect::ShellAction(ShellAction::NewWindow(WindowTarget {
             workspace,
+            // A relative link resolves against the tree you are reading in, so the window that
+            // opens it belongs in the same context.
+            worktrees: self.window_worktrees(),
             open: WindowOpen::Path { path, at: None },
         })))
     }
@@ -10543,6 +10639,7 @@ mod tests {
             ),
             Some(WindowTarget {
                 workspace: Some("proj".into()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Path {
                     path: "/proj/src/main.rs".into(),
                     at: None,
@@ -10565,6 +10662,7 @@ mod tests {
             ),
             Some(WindowTarget {
                 workspace: Some("proj".into()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Path {
                     path: "/proj/src/main.rs".into(),
                     at: Some((41, 9)),
@@ -10591,6 +10689,7 @@ mod tests {
             ),
             Some(WindowTarget {
                 workspace: Some("proj".into()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Buffer(7),
             })
         );
@@ -10610,6 +10709,7 @@ mod tests {
             ),
             Some(WindowTarget {
                 workspace: Some("other".into()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Workspace,
             })
         );
@@ -10691,6 +10791,7 @@ mod tests {
             target,
             Some(WindowTarget {
                 workspace: Some("proj".into()),
+                worktrees: Vec::new(),
                 open: WindowOpen::Path {
                     path: "/proj/b.rs".into(),
                     at: None,

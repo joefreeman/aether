@@ -95,6 +95,8 @@ async fn open_in_workspace(
     let (handle, mut inbound) = connect_with_retry(port, &version).await?;
     let activated = handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
+            // Unset: land in whichever context this workspace was last used in.
+            worktrees: None,
             name: workspace.clone(),
             open_last: false,
         })

@@ -1,9 +1,10 @@
 //! The stateful LSP layer: one language server per `(workspace_root, language)`, the buffers open
 //! against each, and the lifecycle that ties them to editor state.
 //!
-//! One server can back **several workspaces** — each handle carries the set it serves. That matters
-//! for worktree variants (`docs/worktrees.md`), which share every root outside their bound repos: a
-//! key that included the workspace would spawn one rust-analyzer per variant per shared root.
+//! One server can back **several workspaces**: the key is `(root, language)`, so two workspaces over
+//! the same root share one process rather than getting a rust-analyzer each. Which workspaces a
+//! server serves is derived on demand ([`owners_of`]) rather than stored, and document sync is keyed
+//! by [`DocumentId`] so one URI is opened once per server however many buffers hold it.
 //!
 //! Document sync ([`LspClient::notify`]) is synchronous — a channel send — so `didOpen`/`didChange`/
 //! `didClose` are fired straight from the locked handler sections (see the `notify_*` methods). Only
@@ -29,23 +30,21 @@ use super::client::{LspClient, LspInbound};
 use super::config::{self, LspServerSpec, WorkspaceMarker};
 use super::position::PositionEncoding;
 use super::{lifecycle, process, shell_env, uri};
-use crate::state::{ServerState, SharedState};
+use crate::state::{DocumentId, ServerState, SharedState};
 
 /// Identifies a server instance: one per workspace root per language.
 ///
-/// **Deliberately not keyed by workspace.** It was, once, so that "one buffer per URI per server"
-/// held by construction — within a workspace a file is always exactly one buffer, so document sync
-/// could never be ambiguous. Its own doc admitted the cost: a redundant server whenever two
-/// workspaces share a root, which it called uncommon.
+/// **Deliberately not keyed by workspace.** A language server process is identified by the root it
+/// indexes and the language it speaks; which workspace happened to want it is not part of what makes
+/// two of them different. Two workspaces over the same root want the same process, and giving them
+/// one each costs a second rust-analyzer for nothing.
 ///
-/// Worktree variants made it the common case. A variant shares every root outside its bound repos
-/// with its base, so N variants × M shared roots meant N×M servers — and with rust-analyzer's
-/// footprint that is the expensive direction (`docs/worktrees.md` §6.3).
-///
-/// What the workspace component actually bought is now [`LspHandle::workspaces`]: membership, not
-/// identity. Sync stays unambiguous because a server addresses *files*, and the handful of places
-/// that genuinely need per-workspace scoping — status views, diagnostics routing, status pushes —
-/// filter on that set instead.
+/// The workspace component was there to enforce an invariant rather than to identify anything:
+/// within one workspace a file is exactly one buffer, so "one buffer per URI per server" held by
+/// construction and document sync could never be ambiguous. That invariant still matters — it is
+/// now held at the layer it belongs to, by keying sync on [`LspHandle::open_documents`], since LSP
+/// addresses files by URI and Aether's `DocumentId` is one-per-canonical-path. The scoping the
+/// workspace component also provided (status views, routing, pushes) is derived by [`owners_of`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LspServerKey {
     pub root: PathBuf,
@@ -99,24 +98,35 @@ pub struct LspHandle {
     /// Whether the server advertises `workspace/symbol` (set from the handshake). Gates it out of
     /// the workspace-symbols fan-out (`docs/workspace-symbols.md`).
     pub workspace_symbol: bool,
-    /// Buffers we've sent `didOpen` for (and not yet `didClose`).
-    pub open_buffers: HashSet<BufferId>,
-    /// The workspaces this server serves. A server is keyed by `(root, language)` alone, so one
-    /// process can back several contexts at once — most obviously a base workspace and its worktree
-    /// variants, which share every root outside the bound repos.
+    /// The **documents** we've sent `didOpen` for and not yet `didClose`, each with the buffers
+    /// currently holding it open.
     ///
-    /// **This is what the workspace component of the key used to buy**, without the cost: status
-    /// views, diagnostics routing and status pushes all scope by membership here instead, so N
-    /// variants sharing M roots need M servers rather than N×M (`docs/worktrees.md` §6.3).
-    pub workspaces: HashSet<String>,
+    /// Keyed by document, not by buffer, because that is the grain LSP works at: a server addresses
+    /// files by URI and has no notion of a buffer. Aether's [`DocumentId`] is one-per-canonical-path
+    /// ([`ServerState::document_for_path`]), so this makes "one `didOpen` per URI per server" hold
+    /// by construction.
+    ///
+    /// It used to be a `HashSet<BufferId>`, which was equivalent only while the server key carried a
+    /// workspace — within one workspace a file is exactly one buffer. Once the key became
+    /// `(root, language)` alone, two workspaces sharing a root shared a process, the same URI got
+    /// two `didOpen`s, and the first close pulled the document out from under the second buffer.
+    ///
+    /// The buffer set is what makes the close correct: the URI stays open while *any* holder
+    /// remains.
+    pub open_documents: HashMap<DocumentId, HashSet<BufferId>>,
     /// The workspaces keeping this server alive by a declared project rather than by an open buffer
     /// (`docs/projects.md`). A pinned server survives losing its last buffer — indeed it usually
     /// never has one — because its job is to have the workspace indexed *before* anything is
     /// opened. A set rather than a flag because two contexts can pin the same root, and one of them
     /// going away must not release the other's hold.
     pub pinned_by: HashSet<String>,
-    /// Buffers that want this server but were registered before it became `Ready`; opened in bulk
-    /// once the handshake lands.
+    /// Every buffer attached to this server — registered by [`LspManager::register_doc`] on
+    /// `buffer/open` and dropped by [`LspManager::notify_close`]. Buffers that arrive before the
+    /// handshake are opened in bulk once it lands; the set is not pruned after that, so it stays the
+    /// full attachment list rather than only the waiting ones.
+    ///
+    /// Load-bearing twice over: it is half of the idle test (a server with no attachments and no
+    /// pins is reaped), and it is what [`owners_of`] derives workspace membership from.
     pub registered_buffers: HashSet<BufferId>,
     /// Active `$/progress` work-done operations, keyed by the (stringified) progress token. A
     /// server runs several at once (indexing, `cargo check`, …); non-empty means "busy". Drives the
@@ -145,16 +155,8 @@ pub struct LspManager {
 impl LspManager {
     /// Ensure a handle exists for `key`. Returns `Some(generation)` if a fresh one was created (the
     /// caller should spawn its [`launch`] task), or `None` if one already existed.
-    pub fn ensure(
-        &mut self,
-        key: &LspServerKey,
-        server_name: &str,
-        workspace: &str,
-    ) -> Option<u64> {
-        if let Some(handle) = self.servers.get_mut(key) {
-            // Already running, possibly for a different context. Record that this one wants it too:
-            // membership is what scopes status and routing now that the key doesn't.
-            handle.workspaces.insert(workspace.to_string());
+    pub fn ensure(&mut self, key: &LspServerKey, server_name: &str) -> Option<u64> {
+        if self.servers.contains_key(key) {
             return None;
         }
         let generation = self.next_generation;
@@ -171,9 +173,8 @@ impl LspManager {
                 position_encoding: PositionEncoding::Utf16,
                 document_formatting: false,
                 workspace_symbol: false,
-                open_buffers: HashSet::new(),
+                open_documents: HashMap::new(),
                 registered_buffers: HashSet::new(),
-                workspaces: HashSet::from([workspace.to_string()]),
                 pinned_by: HashSet::new(),
                 progress: HashMap::new(),
                 last_progress_push: None,
@@ -191,7 +192,6 @@ impl LspManager {
     pub fn pin(&mut self, key: &LspServerKey, workspace: &str) {
         if let Some(h) = self.servers.get_mut(key) {
             h.pinned_by.insert(workspace.to_string());
-            h.workspaces.insert(workspace.to_string());
         }
     }
 
@@ -206,8 +206,10 @@ impl LspManager {
         self.servers
             .iter()
             .filter(|(_, h)| {
-                h.workspaces.contains(workspace_id)
-                    && !h.pinned_by.is_empty()
+                // Pinned *by this workspace*, which is both the membership test and the pinned test
+                // in one: a workspace's symbol results come from the servers its own declared
+                // projects keep alive.
+                h.pinned_by.contains(workspace_id)
                     && h.workspace_symbol
                     && matches!(h.status, LspStatus::Ready)
             })
@@ -239,8 +241,7 @@ impl LspManager {
             if !h.pinned_by.is_empty() {
                 return true;
             }
-            h.workspaces.remove(workspace_id);
-            if h.open_buffers.is_empty() && h.registered_buffers.is_empty() {
+            if h.open_documents.is_empty() && h.registered_buffers.is_empty() {
                 removed.push(key.clone());
                 false // dropping the handle kills the process (`kill_on_drop`)
             } else {
@@ -258,11 +259,20 @@ impl LspManager {
         }
     }
 
-    /// Send `didOpen` for a buffer if its server is ready (idempotent). A no-op while the server is
-    /// still starting — [`launch`] opens all registered buffers once it reaches `Ready`.
+    /// Send `didOpen` for a document if its server is ready (idempotent). A no-op while the server
+    /// is still starting — [`launch`] opens all registered buffers once it reaches `Ready`.
+    ///
+    /// `buffer_id` is recorded as a holder, not as the thing being opened: a second buffer on the
+    /// same document (the same file open in another workspace) adds itself and sends nothing. LSP
+    /// addresses documents by URI, so a second `didOpen` for one URI is a protocol error rather
+    /// than a second document.
+    // Every parameter is a distinct field of the `didOpen` notification plus the two ids that route
+    // it; bundling them would only move the list somewhere else.
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_open(
         &mut self,
         buffer_id: BufferId,
+        document: DocumentId,
         key: &LspServerKey,
         uri: &str,
         language: &str,
@@ -272,25 +282,35 @@ impl LspManager {
         let Some(h) = self.servers.get_mut(key) else {
             return;
         };
-        if h.open_buffers.contains(&buffer_id) {
+        if let Some(holders) = h.open_documents.get_mut(&document) {
+            holders.insert(buffer_id);
             return;
         }
         if let (LspStatus::Ready, Some(client)) = (&h.status, &h.client) {
             if lifecycle::did_open(client, uri, language, version, text).is_ok() {
-                h.open_buffers.insert(buffer_id);
+                h.open_documents
+                    .insert(document, HashSet::from([buffer_id]));
             }
         }
     }
 
-    /// Send `didChange` (full document) for a buffer that's open against a ready server.
-    pub fn notify_change(&mut self, buffer_id: BufferId, uri: &str, version: i64, text: &str) {
-        let Some(key) = self.doc_server.get(&buffer_id) else {
-            return;
-        };
+    /// Send `didChange` (full document) for a document open against a ready server.
+    ///
+    /// Takes the server key rather than looking it up: one document can be open against *several*
+    /// servers (two workspaces holding the same file at different roots), and the caller is the one
+    /// that knows which of them it is notifying — see `handlers::notify_lsp_change`.
+    pub fn notify_change(
+        &mut self,
+        document: DocumentId,
+        key: &LspServerKey,
+        uri: &str,
+        version: i64,
+        text: &str,
+    ) {
         let Some(h) = self.servers.get(key) else {
             return;
         };
-        if !h.open_buffers.contains(&buffer_id) {
+        if !h.open_documents.contains_key(&document) {
             return;
         }
         if let Some(client) = &h.client {
@@ -298,25 +318,38 @@ impl LspManager {
         }
     }
 
-    /// Send `didClose` and forget the buffer. If that was the server's last buffer *and* nothing
-    /// else is holding it open, tear the server down — drop its handle (killing the process via
-    /// `kill_on_drop`) — and return its key so the caller can refresh any open status views.
-    /// Returns `None` when the server stays up.
+    /// Drop `buffer_id`'s hold on its server, sending `didClose` if it was the document's last
+    /// holder. If that leaves the server with nothing at all, tear it down — drop its handle
+    /// (killing the process via `kill_on_drop`) — and return its key so the caller can refresh any
+    /// open status views. Returns `None` when the server stays up.
+    ///
+    /// **`didClose` follows the document, not the buffer.** The URI stays open on the server while
+    /// any workspace still holds the file; closing it on the first buffer to go left a sibling's
+    /// later `didChange` addressing a document the server had already dropped.
     ///
     /// A project-pinned server never reaps here: it's kept alive by the workspace, not by buffers
-    /// (see [`LspHandle::pinned`]), and closing the file you happened to open in it must not undo
+    /// (see [`LspHandle::pinned_by`]), and closing the file you happened to open in it must not undo
     /// the indexing the pin exists to guarantee.
-    pub fn notify_close(&mut self, buffer_id: BufferId, uri: &str) -> Option<LspServerKey> {
+    pub fn notify_close(
+        &mut self,
+        buffer_id: BufferId,
+        document: DocumentId,
+        uri: &str,
+    ) -> Option<LspServerKey> {
         let key = self.doc_server.remove(&buffer_id)?;
         let idle = {
             let h = self.servers.get_mut(&key)?;
             h.registered_buffers.remove(&buffer_id);
-            if h.open_buffers.remove(&buffer_id) {
-                if let Some(client) = &h.client {
-                    let _ = lifecycle::did_close(client, uri);
+            if let Some(holders) = h.open_documents.get_mut(&document) {
+                holders.remove(&buffer_id);
+                if holders.is_empty() {
+                    h.open_documents.remove(&document);
+                    if let Some(client) = &h.client {
+                        let _ = lifecycle::did_close(client, uri);
+                    }
                 }
             }
-            h.pinned_by.is_empty() && h.open_buffers.is_empty() && h.registered_buffers.is_empty()
+            h.pinned_by.is_empty() && h.open_documents.is_empty() && h.registered_buffers.is_empty()
         };
         if idle {
             // Last buffer gone → shut the server down. Dropping the handle drops its `Child`
@@ -336,19 +369,44 @@ impl LspManager {
         let key = self.doc_server.get(&buffer_id)?;
         self.servers.get(key).map(handle_status)
     }
+}
 
-    /// Snapshot of every server serving `workspace_id` — drives the LSP servers picker.
-    ///
-    /// Scoped by membership rather than by key, so a context sees the servers actually working for
-    /// it. A server shared with a sibling workspace (or with this workspace's base) appears in
-    /// both, which is the truth: it is one process.
-    pub fn status_for_workspace(&self, workspace_id: &str) -> Vec<LspServerStatus> {
-        self.servers
+/// Snapshot of every server serving `workspace_id` — drives the LSP servers picker.
+///
+/// Scoped by membership rather than by key, so a context sees the servers actually working for it.
+/// A server shared with another workspace over the same root appears in both, which is the truth:
+/// it is one process.
+pub fn status_for_workspace(s: &ServerState, workspace_id: &str) -> Vec<LspServerStatus> {
+    s.lsp
+        .servers
+        .keys()
+        .filter(|key| owners_of(s, key).contains(workspace_id))
+        .filter_map(|key| s.lsp.servers.get(key).map(handle_status))
+        .collect()
+}
+
+/// The workspaces a server serves: the ones pinning it, plus the ones with a buffer attached to it.
+///
+/// **Derived, never stored.** It was a `HashSet<String>` on the handle for one commit, and a set
+/// that has to be kept in step with `pinned_by` and the attachment registry is a set that drifts out
+/// of step with them — it did, in both directions at once. Releasing a pin erased a workspace that
+/// still had buffers open (so its diagnostics routed nowhere and its servers vanished from the
+/// picker), while a workspace that only ever *opened* a buffer was never removed at all, so
+/// ephemeral ids accumulated for the life of the process.
+///
+/// Recomputing walks one server's attachments, on status and routing paths that are already doing
+/// far more work than that.
+pub fn owners_of(s: &ServerState, key: &LspServerKey) -> HashSet<String> {
+    let Some(h) = s.lsp.servers.get(key) else {
+        return HashSet::new();
+    };
+    let mut owners = h.pinned_by.clone();
+    owners.extend(
+        h.registered_buffers
             .iter()
-            .filter(|(_, h)| h.workspaces.contains(workspace_id))
-            .map(|(_, h)| handle_status(h))
-            .collect()
-    }
+            .filter_map(|b| s.buffer_workspaces.get(b).cloned()),
+    );
+    owners
 }
 
 fn handle_status(h: &LspHandle) -> LspServerStatus {
@@ -544,7 +602,18 @@ async fn bring_up(
             .copied()
             .collect();
         for bid in registered {
-            if s.lsp.servers[&key].open_buffers.contains(&bid) {
+            let Some(document) = s.buffers.get(&bid).map(|b| b.document) else {
+                continue;
+            };
+            // Another buffer of the same document already opened this URI — record the second
+            // holder and move on, exactly as `notify_open` would.
+            if let Some(holders) = s
+                .lsp
+                .servers
+                .get_mut(&key)
+                .and_then(|h| h.open_documents.get_mut(&document))
+            {
+                holders.insert(bid);
                 continue;
             }
             let Some(doc) = s.try_doc_of(bid) else {
@@ -567,8 +636,8 @@ async fn bring_up(
                     .servers
                     .get_mut(&key)
                     .expect("present")
-                    .open_buffers
-                    .insert(bid);
+                    .open_documents
+                    .insert(document, HashSet::from([bid]));
             }
         }
 
@@ -577,8 +646,14 @@ async fn bring_up(
         // server with nothing to report on a clean file never sends one — marksman on markdown
         // is exactly that — so `o`/`Alt-o` and `Space o` stayed empty for the whole session.
         // (The buffer-open warm runs before the server is ready and finds nothing to ask.)
-        for bid in &s.lsp.servers[&key].open_buffers {
-            crate::handlers::spawn_document_symbol_refresh(state.clone(), *bid);
+        let opened: Vec<BufferId> = s.lsp.servers[&key]
+            .open_documents
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        for bid in opened {
+            crate::handlers::spawn_document_symbol_refresh(state.clone(), bid);
         }
 
         tracing::info!(server = caps.name.as_deref().unwrap_or(&key.language), language = %key.language, root = %key.root.display(), "language server ready");
@@ -799,7 +874,7 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
     };
     let diags_json = params.get("diagnostics").cloned().unwrap_or(Value::Null);
 
-    let (pushes, buffer_id) = {
+    let (pushes, buffer_ids) = {
         let mut guard = state.lock().await;
         let s = &mut *guard;
 
@@ -816,36 +891,39 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
         // and it fires for closed files too — that's how a never-opened file's diagnostics appear.
         let mut pushes = crate::handlers::refresh_workspace_diagnostics_pickers(s);
 
-        // Route to the buffer in *this server's* workspace: a file open in two workspaces has a buffer
-        // in each, and each workspace's server publishes for its own buffer (with per-workspace keying
-        // there's exactly one such buffer per server).
-        let owners: HashSet<String> = s
-            .lsp
-            .servers
-            .get(key)
-            .map(|h| h.workspaces.clone())
-            .unwrap_or_default();
-        let buffer_id = s.buffers.iter().find_map(|(id, b)| {
-            (s.documents
-                .get(&b.document)
-                .and_then(|d| d.canonical_path.as_deref())
-                == Some(path.as_path())
-                && s.buffer_workspaces
-                    .get(id)
-                    .is_some_and(|w| owners.contains(w)))
-            .then_some(*id)
-        });
-        match buffer_id {
-            // No open buffer: the path-keyed store + workspace-picker refresh above are all there is —
-            // no squiggles to render and no symbol outline to refresh for a file we don't have open.
-            None => (pushes, None),
-            Some(buffer_id) => {
-                let encoding = s
-                    .lsp
-                    .servers
-                    .get(key)
-                    .map(|h| h.position_encoding)
-                    .unwrap_or(PositionEncoding::Utf16);
+        // Route to **every** buffer this server holds the file open for. A file open in two
+        // workspaces has a buffer in each, and with the key carrying no workspace those two can be
+        // the same process — so "the buffer for this path" is no longer a single answer. Diagnostics
+        // are a property of the document, so every buffer on it gets them; picking one (as this did,
+        // via `find_map`) left the other silently un-squiggled, with hash order deciding which.
+        //
+        // Filtered by `doc_server` so we only touch buffers *this* server owns: a buffer served by a
+        // different root's process gets its own publish from that process.
+        let buffer_ids: Vec<BufferId> = s
+            .buffers
+            .iter()
+            .filter(|(id, b)| {
+                s.documents
+                    .get(&b.document)
+                    .and_then(|d| d.canonical_path.as_deref())
+                    == Some(path.as_path())
+                    && s.lsp.doc_server.get(id) == Some(key)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if buffer_ids.is_empty() {
+            // No open buffer: the path-keyed store + workspace-picker refresh above are all there is
+            // — no squiggles to render and no symbol outline to refresh for a file we don't have
+            // open.
+            (pushes, Vec::new())
+        } else {
+            let encoding = s
+                .lsp
+                .servers
+                .get(key)
+                .map(|h| h.position_encoding)
+                .unwrap_or(PositionEncoding::Utf16);
+            for &buffer_id in &buffer_ids {
                 let diags = {
                     let doc = s.doc_of(buffer_id);
                     super::diagnostics::from_lsp(&diags_json, &doc.text, encoding)
@@ -853,14 +931,14 @@ async fn handle_publish_diagnostics(state: &SharedState, key: &LspServerKey, par
                 pushes.extend(crate::handlers::set_diagnostics_and_refresh(
                     s, buffer_id, diags,
                 ));
-                (pushes, Some(buffer_id))
             }
+            (pushes, buffer_ids)
         }
     };
     // A fresh diagnostics publish for an OPEN buffer means the server just re-analyzed it, so its
     // symbol outline may have changed too — re-fetch it (naturally debounced by the analysis cycle).
     // This keeps the `o` symbol-navigation motion and the `Space o` outline in sync with edits.
-    if let Some(buffer_id) = buffer_id {
+    for buffer_id in buffer_ids {
         crate::handlers::spawn_document_symbol_refresh(state.clone(), buffer_id);
     }
     send_all(pushes).await;
@@ -881,13 +959,7 @@ pub async fn restart(state: &SharedState, language: &str, workspace_id: &str) {
             .servers
             .keys()
             .filter(|k| k.language == language)
-            .filter(|k| {
-                guard
-                    .lsp
-                    .servers
-                    .get(k)
-                    .is_some_and(|h| h.workspaces.contains(workspace_id))
-            })
+            .filter(|k| owners_of(&guard, k).contains(workspace_id))
             .cloned()
             .collect()
     };
@@ -900,21 +972,18 @@ pub async fn restart(state: &SharedState, language: &str, workspace_id: &str) {
             let mut guard = state.lock().await;
             let s = &mut *guard;
             // Drop the old handle (kills its process); its inbound loop's terminal update is keyed
-            // by the old generation and so won't touch the new handle.
-            // Carry the membership across the restart: the same contexts still want this server,
-            // and rebuilding it as nobody's would hide it from every status view.
-            let owners = s
+            // by the old generation and so won't touch the new handle. The pins come across with it
+            // — a restart is not an unpin — and membership needs no carrying at all now that it is
+            // derived from the pins and the buffers re-registered just below.
+            let pinned_by = s
                 .lsp
                 .servers
                 .remove(&key)
-                .map(|h| h.workspaces)
+                .map(|h| h.pinned_by)
                 .unwrap_or_default();
-            let generation = s
-                .lsp
-                .ensure(&key, spec.command, workspace_id)
-                .expect("just removed");
+            let generation = s.lsp.ensure(&key, spec.command).expect("just removed");
             if let Some(h) = s.lsp.servers.get_mut(&key) {
-                h.workspaces.extend(owners);
+                h.pinned_by = pinned_by;
             }
             let docs: Vec<BufferId> = s
                 .lsp
@@ -975,7 +1044,7 @@ fn collect_status_pushes(
         return Vec::new();
     };
     let params = serde_json::to_value(handle_status(handle)).expect("infallible");
-    let owners = &handle.workspaces;
+    let owners = owners_of(s, key);
     s.clients
         .values()
         .filter(|c| {
@@ -1193,9 +1262,8 @@ mod tests {
             position_encoding: PositionEncoding::Utf8,
             document_formatting: true,
             workspace_symbol: true,
-            open_buffers: HashSet::new(),
+            open_documents: HashMap::new(),
             registered_buffers: HashSet::new(),
-            workspaces: HashSet::from(["proj".to_string()]),
             pinned_by: HashSet::new(),
             progress: HashMap::new(),
             last_progress_push: None,
@@ -1224,9 +1292,8 @@ mod tests {
             position_encoding: PositionEncoding::Utf8,
             document_formatting: false,
             workspace_symbol: true,
-            open_buffers: HashSet::new(),
+            open_documents: HashMap::new(),
             registered_buffers: HashSet::new(),
-            workspaces: HashSet::from(["proj".to_string()]),
             pinned_by: HashSet::new(),
             progress: HashMap::new(),
             last_progress_push: None,
@@ -1361,25 +1428,25 @@ mod tests {
         mgr.register_doc(7, &key);
 
         let uri = "file:///proj/src/main.rs";
-        mgr.notify_open(7, &key, uri, "rust", 1, "fn main() {}");
+        mgr.notify_open(7, DocumentId(1), &key, uri, "rust", 1, "fn main() {}");
         let (m, p) = recv(&mut ev).await;
         assert_eq!(m, "textDocument/didOpen");
         assert_eq!(p["textDocument"]["uri"], uri);
         assert_eq!(p["textDocument"]["version"], 1);
 
-        mgr.notify_change(7, uri, 2, "fn main() { todo!() }");
+        mgr.notify_change(DocumentId(1), &key, uri, 2, "fn main() { todo!() }");
         let (m, p) = recv(&mut ev).await;
         assert_eq!(m, "textDocument/didChange");
         assert_eq!(p["textDocument"]["version"], 2);
         assert_eq!(p["contentChanges"][0]["text"], "fn main() { todo!() }");
 
-        mgr.notify_close(7, uri);
+        mgr.notify_close(7, DocumentId(1), uri);
         let (m, p) = recv(&mut ev).await;
         assert_eq!(m, "textDocument/didClose");
         assert_eq!(p["textDocument"]["uri"], uri);
 
         // After close the doc is forgotten: a further change is a no-op (no message).
-        mgr.notify_change(7, uri, 3, "x");
+        mgr.notify_change(DocumentId(1), &key, uri, 3, "x");
         assert!(
             tokio::time::timeout(Duration::from_millis(150), ev.recv())
                 .await
@@ -1399,11 +1466,11 @@ mod tests {
         mgr.servers.insert(key.clone(), handle);
         mgr.register_doc(7, &key);
         let uri = "file:///proj/src/main.rs";
-        mgr.notify_open(7, &key, uri, "rust", 1, "fn main() {}");
+        mgr.notify_open(7, DocumentId(1), &key, uri, "rust", 1, "fn main() {}");
         let _ = recv(&mut ev).await; // didOpen
 
         // Closing the only buffer tears the server down and hands back its key.
-        let stopped = mgr.notify_close(7, uri);
+        let stopped = mgr.notify_close(7, DocumentId(1), uri);
         assert_eq!(stopped.as_ref(), Some(&key));
         assert!(!mgr.servers.contains_key(&key), "idle server removed");
         let (m, _) = recv(&mut ev).await; // didClose still sent before teardown
@@ -1421,13 +1488,16 @@ mod tests {
         mgr.servers.insert(key.clone(), handle);
         mgr.register_doc(7, &key);
         mgr.register_doc(8, &key);
-        mgr.notify_open(7, &key, "file:///proj/a.rs", "rust", 1, "");
-        mgr.notify_open(8, &key, "file:///proj/b.rs", "rust", 1, "");
+        mgr.notify_open(7, DocumentId(1), &key, "file:///proj/a.rs", "rust", 1, "");
+        mgr.notify_open(8, DocumentId(2), &key, "file:///proj/b.rs", "rust", 1, "");
         let _ = recv(&mut ev).await;
         let _ = recv(&mut ev).await;
 
         // One of two buffers closing leaves the server up.
-        assert_eq!(mgr.notify_close(7, "file:///proj/a.rs"), None);
+        assert_eq!(
+            mgr.notify_close(7, DocumentId(1), "file:///proj/a.rs"),
+            None
+        );
         assert!(mgr.servers.contains_key(&key));
     }
 
@@ -1443,7 +1513,7 @@ mod tests {
         mgr.register_doc(7, &key);
 
         // No didOpen yet → didChange must not be sent (the server doesn't know the doc).
-        mgr.notify_change(7, "file:///proj/x.rs", 2, "x");
+        mgr.notify_change(DocumentId(1), &key, "file:///proj/x.rs", 2, "x");
         assert!(
             tokio::time::timeout(Duration::from_millis(150), ev.recv())
                 .await
@@ -1463,50 +1533,123 @@ mod tests {
             root: PathBuf::from("/b"),
             language: "go".into(),
         };
-        let g0 = mgr.ensure(&a, "rust-analyzer", "proj").expect("created");
+        let g0 = mgr.ensure(&a, "rust-analyzer").expect("created");
         assert!(
-            mgr.ensure(&a, "rust-analyzer", "proj").is_none(),
+            mgr.ensure(&a, "rust-analyzer").is_none(),
             "second ensure is a no-op"
         );
-        let g1 = mgr.ensure(&b, "gopls", "proj").expect("created");
+        let g1 = mgr.ensure(&b, "gopls").expect("created");
         assert_ne!(g0, g1, "distinct handles get distinct generations");
     }
 
     #[test]
     fn same_root_in_two_workspaces_is_one_shared_server() {
-        // The inverse of what this used to assert. Keying by workspace gave a server per workspace
-        // at a shared root; worktree variants share every root outside their bound repos, which
-        // turned "uncommon" into N×M rust-analyzers. One process now backs both, and the set of
-        // workspaces it serves is what scopes the views that need scoping.
-        let mut mgr = LspManager::default();
+        // Keying by workspace gave a server per workspace at a shared root. One process now backs
+        // both, and who it serves is *derived* from the pins and the attached buffers rather than
+        // tracked in a third set that has to be kept in step with them.
+        let mut s = ServerState::new();
         let key = LspServerKey::new(PathBuf::from("/shared"), "rust");
-        assert!(mgr.ensure(&key, "rust-analyzer", "proj").is_some());
+        assert!(s.lsp.ensure(&key, "rust-analyzer").is_some());
         assert!(
-            mgr.ensure(&key, "rust-analyzer", "proj/feature").is_none(),
+            s.lsp.ensure(&key, "rust-analyzer").is_none(),
             "a second workspace at the same root joins the running server"
         );
-        assert_eq!(mgr.servers.len(), 1);
-        assert_eq!(mgr.servers[&key].workspaces.len(), 2);
+        assert_eq!(s.lsp.servers.len(), 1);
+
+        s.lsp.register_doc(1, &key);
+        s.buffer_workspaces.insert(1, "a".into());
+        s.lsp.register_doc(2, &key);
+        s.buffer_workspaces.insert(2, "b".into());
+        assert_eq!(
+            owners_of(&s, &key),
+            HashSet::from(["a".to_string(), "b".to_string()]),
+            "both workspaces own the shared process"
+        );
+
+        // A pin is the other half of ownership, and survives the buffer closing.
+        s.lsp.pin(&key, "c");
+        s.lsp.notify_close(1, DocumentId(1), "file:///shared/a.rs");
+        assert_eq!(
+            owners_of(&s, &key),
+            HashSet::from(["b".to_string(), "c".to_string()]),
+            "the closed buffer's workspace drops out; the pinning one does not"
+        );
     }
 
     #[test]
     fn status_snapshot_filters_by_membership_not_by_key() {
-        let mut mgr = LspManager::default();
+        let mut s = ServerState::new();
         let mine = LspServerKey::new(PathBuf::from("/proj/a"), "rust");
         // Same root, a language only another workspace opened — it must not show in `proj`'s
         // snapshot. Since the key no longer carries a workspace, this is exactly the case that
         // membership has to answer.
         let other = LspServerKey::new(PathBuf::from("/proj/a"), "go");
-        mgr.ensure(&mine, "rust-analyzer", "proj");
-        mgr.ensure(&other, "gopls", "other");
+        s.lsp.ensure(&mine, "rust-analyzer");
+        s.lsp.ensure(&other, "gopls");
+        s.lsp.register_doc(1, &mine);
+        s.buffer_workspaces.insert(1, "proj".into());
+        s.lsp.register_doc(2, &other);
+        s.buffer_workspaces.insert(2, "other".into());
 
-        let snap = mgr.status_for_workspace("proj");
+        let snap = status_for_workspace(&s, "proj");
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].language, "rust");
         assert!(matches!(snap[0].status, LspStatus::Starting));
         // And a workspace that later opens the same root sees it too — one process, two views.
-        mgr.ensure(&mine, "rust-analyzer", "proj/feature");
-        assert_eq!(mgr.status_for_workspace("proj/feature").len(), 1);
+        s.lsp.register_doc(3, &mine);
+        s.buffer_workspaces.insert(3, "second".into());
+        assert_eq!(status_for_workspace(&s, "second").len(), 1);
+    }
+
+    /// Two buffers on one document — the same file open in two workspaces — share a single
+    /// `didOpen`, and the `didClose` waits for the second of them to let go.
+    ///
+    /// This is the invariant the workspace component of the server key used to provide by
+    /// construction. Without it the server saw one URI opened twice and dropped on the *first*
+    /// close, after which the surviving buffer's `didChange` addressed a document the server had
+    /// already forgotten.
+    #[tokio::test]
+    async fn one_document_in_two_workspaces_opens_and_closes_once() {
+        let key = LspServerKey {
+            root: PathBuf::from("/proj"),
+            language: "rust".into(),
+        };
+        let (handle, mut ev) = ready_handle_to_mock(&key);
+        let mut mgr = LspManager::default();
+        mgr.servers.insert(key.clone(), handle);
+        let uri = "file:///proj/src/main.rs";
+        let doc = DocumentId(1);
+
+        mgr.register_doc(7, &key);
+        mgr.register_doc(8, &key);
+        mgr.notify_open(7, doc, &key, uri, "rust", 1, "one");
+        mgr.notify_open(8, doc, &key, uri, "rust", 1, "one");
+        let (m, _) = recv(&mut ev).await;
+        assert_eq!(m, "textDocument/didOpen");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), ev.recv())
+                .await
+                .is_err(),
+            "the second buffer on the same document must not re-open the URI"
+        );
+
+        // First close: no `didClose` — the other workspace still holds the file.
+        assert_eq!(mgr.notify_close(7, doc, uri), None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), ev.recv())
+                .await
+                .is_err(),
+            "didClose must wait for the last holder"
+        );
+        // …and the survivor can still edit it.
+        mgr.notify_change(doc, &key, uri, 2, "two");
+        let (m, _) = recv(&mut ev).await;
+        assert_eq!(m, "textDocument/didChange");
+
+        // Second close: now the URI goes.
+        mgr.notify_close(8, doc, uri);
+        let (m, _) = recv(&mut ev).await;
+        assert_eq!(m, "textDocument/didClose");
     }
 
     #[test]
@@ -1542,20 +1685,18 @@ mod tests {
         assert_eq!(ts, tsx);
 
         assert!(
-            mgr.ensure(&ts, "typescript-language-server", "proj")
-                .is_some(),
+            mgr.ensure(&ts, "typescript-language-server").is_some(),
             "first ensure creates the handle"
         );
         assert!(
-            mgr.ensure(&js, "typescript-language-server", "proj")
-                .is_none(),
+            mgr.ensure(&js, "typescript-language-server").is_none(),
             "sibling language must reuse it, not spawn a second process"
         );
         assert_eq!(mgr.servers.len(), 1);
 
         // A genuinely different language in the same root is still its own server.
         let rust = LspServerKey::new(root, "rust");
-        assert!(mgr.ensure(&rust, "rust-analyzer", "proj").is_some());
+        assert!(mgr.ensure(&rust, "rust-analyzer").is_some());
         assert_eq!(mgr.servers.len(), 2);
     }
 
@@ -1563,7 +1704,7 @@ mod tests {
     fn mgr_with_server(pinned: bool) -> (LspManager, LspServerKey) {
         let mut mgr = LspManager::default();
         let key = LspServerKey::new(PathBuf::from("/proj"), "rust");
-        mgr.ensure(&key, "rust-analyzer", "proj");
+        mgr.ensure(&key, "rust-analyzer");
         if pinned {
             mgr.pin(&key, "proj");
         }
@@ -1578,7 +1719,7 @@ mod tests {
             let (mut mgr, key) = mgr_with_server(pinned);
             mgr.register_doc(7, &key);
 
-            let reaped = mgr.notify_close(7, "file:///proj/src/main.rs");
+            let reaped = mgr.notify_close(7, DocumentId(1), "file:///proj/src/main.rs");
             assert_eq!(
                 reaped.is_none(),
                 pinned,
@@ -1595,7 +1736,7 @@ mod tests {
 
         // A server pinned by a *different* workspace is untouched.
         let other = LspServerKey::new(PathBuf::from("/other"), "rust");
-        mgr.ensure(&other, "rust-analyzer", "sibling");
+        mgr.ensure(&other, "rust-analyzer");
         mgr.pin(&other, "sibling");
 
         let removed = mgr.unpin_workspace("proj");
@@ -1607,27 +1748,26 @@ mod tests {
         );
     }
 
-    /// Two contexts pinning the same root share one process — that is the whole point of dropping
+    /// Two workspaces pinning the same root share one process — that is the whole point of dropping
     /// the workspace from the key — so one of them going away must not reap it.
     #[test]
     fn unpin_leaves_a_server_a_second_workspace_still_pins() {
         let mut mgr = LspManager::default();
         let key = LspServerKey::new(PathBuf::from("/proj"), "rust");
-        mgr.ensure(&key, "rust-analyzer", "proj");
+        mgr.ensure(&key, "rust-analyzer");
         mgr.pin(&key, "proj");
-        // The base workspace's variant, sharing this root because it isn't in a bound repo.
-        mgr.ensure(&key, "rust-analyzer", "proj/feature");
-        mgr.pin(&key, "proj/feature");
+        // A second workspace over the same root — one process, two holds on it.
+        mgr.ensure(&key, "rust-analyzer");
+        mgr.pin(&key, "second");
         assert_eq!(mgr.servers.len(), 1, "one root, one process");
 
         assert!(
             mgr.unpin_workspace("proj").is_empty(),
-            "the variant still wants it"
+            "the other workspace still wants it"
         );
         assert!(mgr.servers.contains_key(&key));
-        // Both see it while both hold it; only the last release reaps.
-        assert_eq!(mgr.status_for_workspace("proj/feature").len(), 1);
-        assert_eq!(mgr.unpin_workspace("proj/feature"), vec![key]);
+        // Only the last release reaps.
+        assert_eq!(mgr.unpin_workspace("second"), vec![key]);
     }
 
     /// A pinned server that also has buffers open reverts to the ordinary lifetime rather than
@@ -1642,6 +1782,9 @@ mod tests {
         assert!(mgr.servers[&key].pinned_by.is_empty());
 
         // ...and now that the pin is gone, closing its last buffer reaps it as usual.
-        assert_eq!(mgr.notify_close(7, "file:///proj/src/main.rs"), Some(key));
+        assert_eq!(
+            mgr.notify_close(7, DocumentId(1), "file:///proj/src/main.rs"),
+            Some(key)
+        );
     }
 }

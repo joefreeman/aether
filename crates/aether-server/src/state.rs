@@ -402,10 +402,15 @@ impl NavHistory {
 /// config on disk, and is auto-removed once its last buffer closes. So `name.is_some()` *is* the
 /// persistence signal: there's no separate "ephemeral" flag that could fall out of sync.
 pub struct WorkspaceEntry {
-    /// Stable identity and `workspaces` map key. For a persisted workspace this equals its `name`; for
-    /// an ephemeral workspace it's a generated token (see [`ServerState::ephemeral_workspace_id`]) that
-    /// can never collide with a valid workspace name — it contains a path separator, which
-    /// `validate_workspace_name` forbids.
+    /// Stable identity and `workspaces` map key: [`crate::worktree::context_id`] of this entry's
+    /// name and bindings. For an *unbound* persisted workspace that is simply its name; for a bound
+    /// one it is `<name>/<bindings>`; for an ephemeral workspace it's a generated token (see
+    /// [`ServerState::ephemeral_workspace_id`]). None of the three can collide, because every form
+    /// but the first contains a path separator, which `validate_workspace_name` forbids.
+    ///
+    /// Deriving identity from the bindings is what makes two clients with the same worktrees *join*
+    /// one entry instead of racing to create two — and what makes "does this worktree already belong
+    /// to another context?" a lookup rather than a case to handle.
     pub id: String,
     /// The persisted workspace name, or `None` for an ephemeral workspace. `Some` ⇔ a `<name>.toml`
     /// exists on disk ⇔ this workspace survives losing its last buffer.
@@ -418,6 +423,13 @@ pub struct WorkspaceEntry {
     /// (tests, embeddings) has no TOML to read at all. It is also the only copy of the pre-remap
     /// shape once `paths` has been materialised.
     pub base_paths: Option<Vec<PathBuf>>,
+    /// The worktree bindings this context is resolved against: repo family (common dir) → admin
+    /// name. Empty for the base, which is not a different kind of thing — just the empty set.
+    ///
+    /// Held on the entry because it is what [`Self::paths`] was materialised *from*, and because the
+    /// entry's own id is derived from it. Persisted separately, per context, under the workspace's
+    /// session entry.
+    pub worktrees: std::collections::BTreeMap<PathBuf, String>,
     /// Canonicalized workspace paths. Each is either a file or a directory. Read from the config for
     /// a persisted workspace; for an ephemeral one they're synthesized from the files it hosts (one
     /// per directory — see [`ServerState::adopt_ephemeral_root`]), which is bookkeeping for the
@@ -519,6 +531,22 @@ impl WorkspaceEntry {
     /// Ephemeral ⇔ not persisted ⇔ no on-disk config. The single source of truth is `name.is_none()`.
     pub fn is_ephemeral(&self) -> bool {
         self.name.is_none()
+    }
+
+    /// The workspace's **configured** roots: [`Self::base_paths`] when a worktree binding has
+    /// remapped [`Self::paths`], else `paths` themselves.
+    ///
+    /// **This — never `paths` — is what gets written to the workspace TOML.** `paths` is a
+    /// materialisation: for a bound workspace it holds paths inside the app-managed worktree store,
+    /// which are machine state and must never reach the hand-editable config. Writing them there
+    /// replaces the workspace's own definition with a checkout that `git worktree remove` can
+    /// delete, and unbinding then has nothing to fall back to.
+    ///
+    /// The two lists are positionally identical by construction — materialisation preserves root
+    /// count and order (`crate::worktree::materialise_roots`) — so an index into one indexes the
+    /// other, which is what lets `ProjectRef::root_index` survive a binding.
+    pub fn configured_paths(&self) -> &[PathBuf] {
+        self.base_paths.as_deref().unwrap_or(&self.paths)
     }
 }
 
@@ -705,9 +733,6 @@ impl ServerState {
         self.buffer_workspaces.get(&buffer_id).map(|s| s.as_str())
     }
 
-    /// The display number for a *new* ephemeral workspace: the lowest positive integer not in use by
-    /// another live ephemeral workspace. Mirrors [`Self::next_scratch_number`] — numbers stay small
-    /// and a freed one is reused once its workspace is pruned — so the picker shows `(workspace 1)`,
     /// The mutual-exclusion lock for worktree creation and removal in one repo **family**.
     ///
     /// `git worktree add` rewrites `.git/config`, which lives in the *common* dir and is guarded by
@@ -775,10 +800,14 @@ impl ServerState {
         self.workspaces.insert(
             id.clone(),
             WorkspaceEntry {
+                worktrees: Default::default(),
                 id: id.clone(),
                 name: None,
-                    base_paths: None,
+                base_paths: None,
                 paths: Vec::new(),
+                // No config file, so no configured roots to remap — an ephemeral context can bind
+                // nothing, which `workspace/bind_worktree` refuses outright rather than silently
+                // recording something that could never resolve.
                 workspace_index,
                 mru_buffers: VecDeque::new(),
                 dormant_buffers: Vec::new(),
@@ -1117,8 +1146,13 @@ impl ServerState {
             .try_doc_of(id)
             .and_then(|d| d.canonical_path.as_deref())
             .map(crate::lsp::uri::path_to_uri);
-        let stopped_server = lsp_uri.and_then(|uri| self.lsp.notify_close(id, &uri));
         let doc_id = self.buffers.get(&id).map(|b| b.document);
+        // The document goes with the uri: `didClose` fires only when this was its last holder on
+        // that server, since another workspace may still have the same file open against it.
+        let stopped_server = match (lsp_uri, doc_id) {
+            (Some(uri), Some(doc)) => self.lsp.notify_close(id, doc, &uri),
+            _ => None,
+        };
         self.buffers.remove(&id);
         // Drop the document once its last buffer is gone — content lives exactly as long as some
         // workspace still holds it open.
@@ -2352,7 +2386,10 @@ mod workspace_state_tests {
         assert_eq!(moved.name.as_deref(), Some("renamed"));
         // The remapped shape rides on the entry, so a rename can't strand it on the old key —
         // which is the whole reason bindings no longer need a cascade of their own.
-        assert_eq!(moved.base_paths.as_deref(), Some(&[PathBuf::from("/p")][..]));
+        assert_eq!(
+            moved.base_paths.as_deref(),
+            Some(&[PathBuf::from("/p")][..])
+        );
         assert!(!s.workspaces.contains_key("p"));
         assert_eq!(
             s.buffer_workspaces.get(&7).map(String::as_str),
@@ -2362,6 +2399,7 @@ mod workspace_state_tests {
 
     fn workspace_entry(name: &str, paths: Vec<PathBuf>) -> WorkspaceEntry {
         WorkspaceEntry {
+            worktrees: Default::default(),
             id: name.to_string(),
             name: Some(name.to_string()),
             base_paths: None,
@@ -2807,7 +2845,7 @@ mod workspace_state_tests {
         sessions.workspaces.insert(
             "p".into(),
             crate::config::WorkspaceSession {
-                worktrees: Default::default(),
+                contexts: Vec::new(),
                 last_activated_at: 1,
                 buffers: vec![crate::config::SessionBuffer::File {
                     path: PathBuf::from("/p/a.rs"),

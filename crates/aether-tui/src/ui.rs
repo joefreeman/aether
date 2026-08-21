@@ -2556,11 +2556,10 @@ fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'st
         Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
         Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
         Some(aether_protocol::picker::PickerKind::Jumplist) => "Filter the jumplist…",
-        Some(aether_protocol::picker::PickerKind::GitBranches) => "Switch branch…",
+        Some(aether_protocol::picker::PickerKind::GitBranches) => "Branches & worktrees…",
         Some(aether_protocol::picker::PickerKind::GitLog) => "Search history…",
         Some(aether_protocol::picker::PickerKind::GitLogFile) => "Search this file's history…",
         Some(aether_protocol::picker::PickerKind::GitStash) => "Find stash…",
-        Some(aether_protocol::picker::PickerKind::Worktrees) => "Switch worktree…",
         None => "Search…",
     }
 }
@@ -2990,7 +2989,8 @@ fn picker_item_spans(
         timestamp,
         ahead,
         behind,
-        checked_out_in,
+        checkout,
+        detached_at,
         match_indices,
         ..
     } = item
@@ -3002,27 +3002,17 @@ fn picker_item_spans(
                 timestamp: *timestamp,
                 ahead: *ahead,
                 behind: *behind,
-                checked_out_in: checked_out_in.as_deref(),
+                held: checkout.as_ref().map(|k| {
+                    if k.is_main {
+                        HeldBy::Main
+                    } else {
+                        HeldBy::Worktree
+                    }
+                }),
+                locked: checkout.as_ref().is_some_and(|k| k.locked),
+                prunable: checkout.as_ref().is_some_and(|k| k.prunable),
+                detached_at: detached_at.as_deref(),
             },
-            match_indices,
-            highlighted,
-            max_width,
-        );
-    }
-    if let PickerItem::Worktree {
-        label,
-        branch,
-        prunable,
-        locked,
-        match_indices,
-        ..
-    } = item
-    {
-        return worktree_item_spans(
-            label,
-            branch,
-            *prunable,
-            *locked,
             match_indices,
             highlighted,
             max_width,
@@ -3181,7 +3171,6 @@ fn picker_item_spans(
         | PickerItem::GitBranch { .. }
         | PickerItem::GitCommit { .. }
         | PickerItem::GitStash { .. }
-        | PickerItem::Worktree { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -4123,11 +4112,12 @@ fn lsp_server_item_spans(
     };
     // Live progress hint (e.g. "  cargo check 28% +1"), rendered in the activity color after the tail.
     let hint = lsp_progress_hint(progress);
-    // Status-dot cell (two cols, like the git bullets), then the name fills the budget left
-    // after the tail and hint.
-    // No leading cell to reserve: "which one am I on" is the initial selection, as in every other
-    // picker (`current_branch_item`), not a `●` in a column every row pays for.
+    // Status-dot cell (two cols, like the git bullets), then the name fills what's left after the
+    // tail and hint. **This picker keeps its dot** — a server's health is a live property of the
+    // row, not "which one am I on" — so unlike `git_branch_item_spans`, which dropped its dot, the
+    // two columns still have to come off the budget here.
     let name_budget = max_width
+        .saturating_sub(2)
         .saturating_sub(tail.width())
         .saturating_sub(hint.width());
 
@@ -4234,11 +4224,14 @@ fn match_highlighted_spans(
     spans
 }
 
-/// One branch row: `● name   subject · 3d ago  ↑2 ↓1  ⧉ worktree`.
+/// One branch row: `name  ⧉  subject · 3d ago                                    ↑2 ↓1`.
 ///
-/// The HEAD dot reuses the LSP/buffer rows' two-column glyph cell so the pickers line up. The
-/// worktree marker is the load-bearing part: git refuses the same branch in two worktrees, so a
-/// row you cannot check out has to say so before you press Enter on it.
+/// The marker is the load-bearing part: it says a checkout holds this branch, which since the merge
+/// makes the row a *destination* rather than a refusal (Enter goes there instead of moving HEAD).
+/// Which glyph says which kind, borrowing the status bar's pair — `⎇` accent for the main checkout,
+/// `⧉` warning for a linked worktree ([`aether_client::labels::BRANCH_MARK`] /
+/// [`aether_client::labels::WORKTREE_HELD_MARK`]). The glyph alone: the holding tree's admin name is
+/// machinery, not something the row spells out.
 fn git_branch_item_spans(
     branch: GitBranchRow<'_>,
     match_indices: &[u32],
@@ -4251,7 +4244,10 @@ fn git_branch_item_spans(
         timestamp,
         ahead,
         behind,
-        checked_out_in,
+        held,
+        locked,
+        prunable,
+        detached_at,
     } = branch;
     let bg = picker_row_bg(highlighted);
     let base = Style::default().fg(c(th().fg)).bg(bg);
@@ -4283,17 +4279,46 @@ fn git_branch_item_spans(
         }
         arrows.push_str(&format!("↓{behind}"));
     }
-    // The `⧉` mark rides directly after the name: it is a property *of the branch*, not of the
-    // commit line it would otherwise be lost in. Glyph only — see `labels::WORKTREE_HELD_MARK`.
-    let held =
-        checked_out_in.map(|_| format!("  {}", aether_client::labels::WORKTREE_HELD_MARK));
+    // The mark rides directly after the name: it is a property *of the branch*, not of the commit
+    // line it would otherwise be lost in. The glyph alone — see `labels::WORKTREE_HELD_MARK` for
+    // why the holding tree's admin name isn't spelled out here.
+    //
+    // Same two glyphs as the status bar's git cluster, same two colours: `⎇` accent for the
+    // ordinary main checkout, `⧉` warning for a linked worktree. A branch nothing holds gets
+    // neither — it isn't anywhere, and Enter checks it out here rather than going somewhere.
+    // One trailing space after `⎇`, none after `⧉` (the commit line supplies its own two-space
+    // lead): same cell width, but `⧉` is filled and reads as touching the text a space sooner.
+    let held = held.map(|by| match by {
+        HeldBy::Main => (
+            format!("  {} ", aether_client::labels::BRANCH_MARK),
+            c(th().accent_alt),
+        ),
+        HeldBy::Worktree => (
+            format!("  {}", aether_client::labels::WORKTREE_HELD_MARK),
+            c(th().warning),
+        ),
+    });
+    // Both of these change what the row can *do*, so they are stated rather than decorated. The
+    // commit id of a detached tree sits with them: it is what the tree is *on*, in the slot a
+    // branch row uses for the same fact.
+    let mut flags = String::new();
+    if let Some(oid) = detached_at.filter(|o| !o.is_empty()) {
+        flags.push_str(&format!("  detached at {oid}"));
+    }
+    if locked {
+        flags.push_str("  locked");
+    }
+    if prunable {
+        flags.push_str("  missing");
+    }
 
     // No leading cell to reserve: "which one am I on" is the initial selection, as in every other
     // picker (`current_branch_item`), not a `●` in a column every row pays for.
     let name_budget = max_width
         .saturating_sub(tail.width())
         .saturating_sub(arrows.width())
-        .saturating_sub(held.as_deref().map(|h| h.width()).unwrap_or(0));
+        .saturating_sub(flags.width())
+        .saturating_sub(held.as_ref().map(|(h, _)| h.width()).unwrap_or(0));
 
     let truncated: String = name
         .chars()
@@ -4322,12 +4347,17 @@ fn git_branch_item_spans(
         base,
         match_style,
     ));
-    if let Some(held) = held {
-        // Warning-coloured, not dim: this is the row's *disabled* tell, not decoration.
+    if let Some((held, colour)) = held {
+        // Both glyph and colour match the status bar's git cluster, so the pair reads the same
+        // wherever it appears.
         used += held.width();
+        spans.push(Span::styled(held, Style::default().fg(colour).bg(bg)));
+    }
+    if !flags.is_empty() {
+        used += flags.width();
         spans.push(Span::styled(
-            held,
-            Style::default().fg(c(th().warning)).bg(bg),
+            flags.clone(),
+            Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
         ));
     }
     used += tail.width();
@@ -4345,87 +4375,6 @@ fn git_branch_item_spans(
         spans.push(Span::styled(
             arrows,
             Style::default().fg(c(th().accent_alt)).bg(bg),
-        ));
-    }
-    spans
-}
-
-/// One worktree row: `feature-auth   feature/auth`, with the branch trailing dim.
-///
-/// The admin name leads because it is the row's identity and what removal is keyed on; the branch
-/// trails because "the same tree on a different branch" is the thing you are usually choosing
-/// between. A branch row has no admin name yet, so it renders the branch alone.
-///
-/// Rows carry no marker of their own: the `Worktrees` / `Branches` group headers already say which
-/// kind a row is, and the current worktree is the one highlighted on open. Both distinctions are
-/// made once, where they read as structure rather than as decoration on every line.
-#[allow(clippy::too_many_arguments)]
-fn worktree_item_spans(
-    label: &str,
-    branch: &str,
-    prunable: bool,
-    locked: bool,
-    match_indices: &[u32],
-    highlighted: bool,
-    max_width: usize,
-) -> Vec<Span<'static>> {
-    let bg = picker_row_bg(highlighted);
-    let base = Style::default().fg(c(th().fg)).bg(bg);
-    let match_style = base
-        .fg(c(th().match_highlight))
-        .add_modifier(Modifier::BOLD);
-
-    let mut tail = String::new();
-    if !branch.is_empty() && branch != label {
-        tail.push_str("  ");
-        tail.push_str(branch);
-    }
-    // Both of these change what the row can *do*, so they are stated rather than decorated.
-    let mut flags = String::new();
-    if locked {
-        flags.push_str("  locked");
-    }
-    if prunable {
-        flags.push_str("  missing");
-    }
-
-    let name_budget = max_width
-        .saturating_sub(tail.width())
-        .saturating_sub(flags.width());
-    let truncated: String = label
-        .chars()
-        .scan(0usize, |w, ch| {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if *w + cw > name_budget {
-                None
-            } else {
-                *w += cw;
-                Some(ch)
-            }
-        })
-        .collect();
-    let kept = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices
-        .iter()
-        .copied()
-        .filter(|&i| i < kept)
-        .collect();
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.extend(match_highlighted_spans(
-        truncated,
-        &kept_indices,
-        base,
-        match_style,
-    ));
-    spans.push(Span::styled(
-        tail,
-        Style::default().fg(picker_dim_fg(highlighted)).bg(bg),
-    ));
-    if !flags.is_empty() {
-        spans.push(Span::styled(
-            flags,
-            Style::default().fg(c(th().warning)).bg(bg),
         ));
     }
     spans
@@ -4517,6 +4466,15 @@ fn git_commit_item_spans(
     spans
 }
 
+/// Which checkout holds a branch, at the grain the row renders it: one glyph, one colour. The
+/// distinction is the status bar's — an ordinary main checkout versus a linked worktree — not
+/// "which tree", which the row deliberately doesn't say.
+#[derive(Clone, Copy)]
+enum HeldBy {
+    Main,
+    Worktree,
+}
+
 /// The fields of [`PickerItem::GitBranch`] a row needs, borrowed for rendering.
 struct GitBranchRow<'a> {
     name: &'a str,
@@ -4524,7 +4482,16 @@ struct GitBranchRow<'a> {
     timestamp: i64,
     ahead: u32,
     behind: u32,
-    checked_out_in: Option<&'a str>,
+    /// Which checkout in the family holds this branch, at the only grain the row renders: the
+    /// glyph. `None` when no tree has it. Deliberately *not* the tree's admin name — the row
+    /// doesn't render that (see [`aether_client::labels::WORKTREE_HELD_MARK`]), and passing it here
+    /// is how it would creep back.
+    held: Option<HeldBy>,
+    locked: bool,
+    prunable: bool,
+    /// Short commit id when the row *is* a detached tree rather than a branch — `name` is then the
+    /// tree's admin name. Empty for a prunable entry, which has no head left to read.
+    detached_at: Option<&'a str>,
 }
 
 /// A compact one-line summary of a server's active `$/progress` work for a picker row: the
@@ -6883,8 +6850,10 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
         return parts;
     }
     if let Some(branch) = &status.branch {
-        // `⧉` for a linked worktree, in the same warning colour the branch picker marks a
-        // worktree-held branch with — one glyph, one colour, one meaning across the app. It
+        // `⧉` for a linked worktree — the glyph the branch picker also marks a worktree-held
+        // branch with. The *colours* diverged with the merge: there the mark is an accent, because
+        // the row is now a destination Enter opens rather than a refusal. Here it stays
+        // warning-coloured because it is telling you where you are, which is worth noticing. It
         // replaces `⎇` rather than adding to it: it is the same fact (which checkout you are in)
         // at a finer grain, and the cluster has no width to spend on a second mark. Warning rather
         // than the metadata colour deliberately: a binding is persistent state you can forget you

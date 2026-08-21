@@ -105,11 +105,10 @@ const PLACEHOLDER: Record<PickerKind, string> = {
   workspace_symbols: "Go to symbol in workspace…",
   keybindings: "Search keybindings…",
   jumplist: "Filter the jumplist…",
-  git_branches: "Switch branch…",
+  git_branches: "Branches & worktrees…",
   git_log: "Search history…",
   git_log_file: "Search this file\u2019s history…",
   git_stash: "Find stash…",
-  worktrees: "Switch worktree…",
 };
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
@@ -186,6 +185,9 @@ interface ShellActionDesc {
    *  duplicate-this-tab form. */
   path?: string;
   workspace?: string;
+  /** new_window only: which context of that workspace — `[repo id, worktree admin name]` pairs,
+   *  absent in the base. */
+  worktrees?: [string, string][];
   line?: number;
   col?: number;
   /** copy_web_url only: the `?workspace=…` query (+ `#L:C` fragment) to append to our own
@@ -435,8 +437,9 @@ interface RowDesc {
   /** Coloured right-aligned meta (e.g. a git change's `+A -R` summary), rendered as separate spans
    *  in place of the plain `meta` text. Mutually exclusive with `meta`. */
   metaParts?: { text: string; cls: string }[];
-  /** A small coloured mark between the primary and the suffix — branch rows' `⧉`, which is the
-   *  row's "you can't check this out" tell and must not read as dim metadata. */
+  /** A small coloured mark between the primary and the suffix — branch rows' `⧉`, which says a
+   *  checkout holds this branch (a destination since the merge, not a refusal) and must not read
+   *  as dim metadata. */
   mark?: { text: string; cls: string };
   prefix?: string;
   prefixClass?: string;
@@ -496,6 +499,8 @@ interface CoreView {
   sneak_active: boolean;
   workspace: string;
   workspace_paths: string[];
+  /** The worktree bindings this window's context is resolved against — empty in the base. */
+  workspace_worktrees: { repo_id: string; worktree: string; branch?: string }[];
   externally_modified: boolean;
   externally_deleted: boolean;
   /** The long-running git operation in flight, or null. Only user-initiated ones appear. */
@@ -661,10 +666,19 @@ function showsWorkspaceChrome(workspace: string): boolean {
   return workspace.length > 0 && !workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
 }
 
-/** The mark a branch row carries when another checkout in the family already has this branch —
- *  mirrors `labels::WORKTREE_HELD_MARK`. Glyph only: which checkout it is belongs in the refusal,
- *  which has room for a sentence. */
+/** The mark a branch row carries when a checkout in the family already holds this branch — since
+ *  the branch/worktree merge, a destination Enter opens rather than a refusal. Mirrors
+ *  `labels::WORKTREE_HELD_MARK`, which carries the full rationale: glyph only, because the holding
+ *  tree's admin name is machinery the user never chose and git lets go stale. It shows where it is
+ *  a row's *identity* (a detached tree, whose row name it is) or in a sentence with room to say
+ *  which tree — never as an annotation on a branch row, and never in the match haystack. */
 const WORKTREE_HELD_MARK = "⧉";
+
+/** The mark for a branch checked out in the repo's *main* working tree — the ordinary place a
+ *  branch lives. Mirrors `labels::BRANCH_MARK`. Paired with `WORKTREE_HELD_MARK` exactly as the
+ *  status bar's git cluster pairs them: this glyph in the secondary accent for an ordinary
+ *  checkout, `⧉` in the warning colour for a linked worktree. */
+const BRANCH_MARK = "⎇";
 
 /** A workspace id as a human reads it. Mirrors the native clients' `labels::workspace_display`:
  *  an ephemeral context is `(workspace N)`, anything else is its own name. */
@@ -889,32 +903,31 @@ function describePickerItem(
       if (item.ahead) arrows.push(`↑${item.ahead}`);
       if (item.behind) arrows.push(`↓${item.behind}`);
       const parts: { text: string; cls: string }[] = [];
+      // Stated, not decorated: each changes what the row can do. A detached tree's commit id sits
+      // with them — it is what the tree is *on*, in the slot a branch row uses for the same fact.
+      if (item.detached_at) parts.push({ text: `detached at ${item.detached_at}`, cls: "picker-meta-dim" });
+      if (item.checkout?.locked) parts.push({ text: "locked", cls: "picker-meta-warn" });
+      if (item.checkout?.prunable) parts.push({ text: "missing", cls: "picker-meta-warn" });
       if (arrows.length) parts.push({ text: arrows.join(" "), cls: "picker-meta-accent" });
+      // The status bar's two glyphs and two colours, so the pair reads the same wherever it
+      // appears: `⎇` in the secondary accent for the ordinary main checkout, `⧉` in the warning
+      // colour for a linked worktree. A branch nothing holds gets neither — it isn't anywhere, and
+      // Enter checks it out here instead of going somewhere. The glyph alone: the holding tree's
+      // admin name is machinery the user never chose and git lets go stale, so it isn't spelled
+      // out here (mirrors `labels::WORKTREE_HELD_MARK`).
+      const held = item.checkout
+        ? item.checkout.is_main
+          ? { text: BRANCH_MARK, cls: "picker-meta-accent" }
+          : { text: WORKTREE_HELD_MARK, cls: "picker-meta-warn" }
+        : undefined;
       return {
         primary: item.name,
         matches: item.match_indices,
-        mark: item.checked_out_in
-          ? { text: WORKTREE_HELD_MARK, cls: "picker-meta-warn" }
-          : undefined,
+        mark: held,
         suffix: dim.join(" · "),
         metaParts: parts,
-        // No bullet cell: "which one am I on" is the initial selection, as in the worktree,
-        // workspace and buffer pickers, not a column every row pays for.
-      };
-    }
-    case "worktree": {
-      // `feature-auth   feature/auth`. The admin name leads (it is what removal is keyed on), the
-      // branch trails dim. No per-row marker: the `Worktrees` / `Branches` headers say which kind a
-      // row is, and the current worktree is the one highlighted on open.
-      const parts: { text: string; cls: string }[] = [];
-      const branch = item.branch ?? "";
-      if (branch && branch !== item.label) parts.push({ text: branch, cls: "picker-meta-dim" });
-      if (item.locked) parts.push({ text: "locked", cls: "picker-meta-warn" });
-      if (item.prunable) parts.push({ text: "missing", cls: "picker-meta-warn" });
-      return {
-        primary: item.label,
-        matches: item.match_indices,
-        metaParts: parts,
+        // No bullet cell: "which one am I on" is the initial selection, as in the workspace and
+        // buffer pickers, not a column every row pays for.
       };
     }
     case "git_stash": {
@@ -1731,6 +1744,16 @@ export class Shell {
       const urlBufferRaw = sp.get("buffer");
       const urlBuffer =
         urlBufferRaw != null && Number.isInteger(Number(urlBufferRaw)) ? Number(urlBufferRaw) : null;
+      // Which *context* of the workspace: repeated `worktree=<repo id>=<admin name>`. The repo id
+      // is a path, which is heavier in a URL than an index would be — but a root index can't be
+      // mapped back from a *bound* context, whose roots point into the worktree rather than at the
+      // checkout the repo id names. Exactness wins over prettiness for something a shared link has
+      // to reproduce.
+      const urlWorktrees: Record<string, string> = {};
+      for (const raw of sp.getAll("worktree")) {
+        const at = raw.lastIndexOf("=");
+        if (at > 0) urlWorktrees[raw.slice(0, at)] = raw.slice(at + 1);
+      }
       const known = list.workspaces.some((pr) => pr.name === urlWorkspace);
       const specified = (known ? urlWorkspace : null) ?? cfg.workspace ?? null;
       // A URL-directed open (file/buffer link) opens separately; otherwise `open_last` folds the
@@ -1753,6 +1776,9 @@ export class Shell {
       }
       const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
         name,
+        // Omitted, not empty, when the URL names none: the server enters whichever context this
+        // workspace was last used in.
+        worktrees: Object.keys(urlWorktrees).length ? urlWorktrees : undefined,
         open_last: !directed,
       });
       const lastOrScratch = (): Promise<BufferOpenResult> =>
@@ -2375,6 +2401,7 @@ export class Shell {
             const params = new URLSearchParams();
             const ws = a.workspace ?? v.workspace;
             if (ws) params.set("workspace", ws);
+            for (const [repo, tree] of a.worktrees ?? []) params.append("worktree", `${repo}=${tree}`);
             if (r.path_index) params.set("root", String(r.path_index));
             params.set("file", r.relative_path);
             const frag =
@@ -4161,9 +4188,20 @@ export class Shell {
    *  (directories, diagnostics, references, LSP servers, items outside any root). */
   private pickerItemUrl(item: PickerItem, v: CoreView): string | null {
     const workspace = v.workspace;
+    // Rows that open something *here* stay in this context, so a link opened from a worktree lands
+    // in that worktree rather than on the main checkout.
+    const here: [string, string][] = (v.workspace_worktrees ?? []).map((w) => [
+      w.repo_id,
+      w.worktree,
+    ]);
+    const withContext = (params: URLSearchParams, trees: [string, string][]): URLSearchParams => {
+      for (const [repo, tree] of trees) params.append("worktree", `${repo}=${tree}`);
+      return params;
+    };
     const fileQuery = (pathIndex: number, relativePath: string): string => {
       const params = new URLSearchParams();
       if (workspace) params.set("workspace", workspace);
+      withContext(params, here);
       if (pathIndex) params.set("root", String(pathIndex));
       params.set("file", relativePath);
       return params.toString();
@@ -4181,6 +4219,7 @@ export class Shell {
         }
         const params = new URLSearchParams();
         if (workspace) params.set("workspace", workspace);
+        withContext(params, here);
         params.set("buffer", String(item.buffer_id));
         return `${location.pathname}?${params.toString()}`;
       }
@@ -4197,7 +4236,23 @@ export class Shell {
         return r ? fromPath(r.path_index, r.relative_path) : null;
       }
       case "workspace":
+        // A *different* workspace opens in whichever context it was last used in — ours says
+        // nothing about it, and its repos may not even be the same ones.
         return `${location.pathname}?${new URLSearchParams({ workspace: item.name }).toString()}`;
+      case "git_branch": {
+        // The branch picker's Ctrl-Enter: open the tree holding this branch in a new tab. A branch
+        // *no* tree holds has nothing to open — git permits one checkout per branch, so a second
+        // tab on it would need a tree that doesn't exist. Returning null makes the row a non-link,
+        // which is what stops Ctrl-Enter quietly doing something else instead.
+        if (!item.checkout) return null;
+        const params = new URLSearchParams();
+        if (workspace) params.set("workspace", workspace);
+        const trees: [string, string][] = here.filter(([repo]) => repo !== item.repo_id);
+        // An empty admin name is the main checkout, which is the *absence* of a binding.
+        if (item.checkout.worktree) trees.push([item.repo_id, item.checkout.worktree]);
+        withContext(params, trees);
+        return `${location.pathname}?${params.toString()}`;
+      }
       default:
         return null;
     }
@@ -4784,8 +4839,10 @@ export class Shell {
         // Upstream divergence rides the branch label in the same colour: it annotates the branch
         // rather than the file, unlike the change counts. Level (or no upstream at all) renders
         // nothing, matching `git status`'s own silence in both cases.
-        // `⧉` for a linked worktree, in the same warning colour the branch picker marks a
-        // worktree-held branch with — one glyph, one colour, one meaning. It replaces `⎇` rather
+        // `⧉` for a linked worktree — the glyph the branch picker also marks a worktree-held branch
+        // with. The *colours* diverged with the merge: there the mark is an accent, because the row
+        // is now a destination Enter opens rather than a refusal. Here it stays warning-coloured
+        // because it is telling you where you are, which is worth noticing. It replaces `⎇` rather
         // than adding a mark, and takes the warning colour rather than the metadata one because a
         // binding is persistent state you can forget you are in.
         // One space after `⧉`, two after `⎇` — same cell width, different ink weight.

@@ -36,7 +36,7 @@ use aether_protocol::lsp::{
     LspLocation, LspNavigateDiagnostic, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult,
     LspReadiness, LspRestartServer, LspServerStatus, LspStatus, LspStatusChanged,
 };
-use aether_protocol::picker::{CaseMode, MatchOptions};
+use aether_protocol::picker::{BranchCheckout, CaseMode, MatchOptions};
 use aether_protocol::search::{SearchSet, SearchSetParams};
 use aether_protocol::sneak::{
     SneakCancel, SneakSelect, SneakSelectParams, SneakTarget, SneakUpdate, SneakUpdateParams,
@@ -68,6 +68,7 @@ fn request_roundtrip() {
         method: WorkspaceActivate::NAME.into(),
         params: Some(
             to_value(WorkspaceActivateParams {
+                worktrees: None,
                 name: "aether".into(),
                 open_last: false,
             })
@@ -1964,6 +1965,7 @@ fn workspace_changed_is_a_workspace_info() {
     use aether_protocol::workspace::{WorkspaceChanged, WorkspaceInfo};
     assert_eq!(WorkspaceChanged::NAME, "workspace/changed");
     let info = WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether".into(),
         paths: vec!["/store/aether-3f9c/feature".into()],
         projects: Vec::new(),
@@ -1976,6 +1978,7 @@ fn workspace_changed_is_a_workspace_info() {
 #[test]
 fn workspace_info_shape() {
     let p = WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether".into(),
         paths: vec!["/home/joe/x".into()],
         projects: Vec::new(),
@@ -1990,6 +1993,7 @@ fn workspace_info_shape() {
 fn workspace_info_carries_projects() {
     use aether_protocol::workspace::WorkspaceProject;
     let p = WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether".into(),
         paths: vec!["/src/aether".into()],
         projects: vec![
@@ -2121,6 +2125,7 @@ fn workspace_activate_result_wraps_info() {
     use aether_protocol::workspace::WorkspaceActivateResult;
     let r = WorkspaceActivateResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec!["/p".into()],
             projects: Vec::new(),
@@ -2173,6 +2178,7 @@ fn workspace_rename_params_round_trip() {
     assert_eq!(v, json!({"workspace": "aether", "new_name": "aether-next"}));
     // Result is a plain WorkspaceInfo (new name + paths).
     let info = WorkspaceInfo {
+        worktrees: Vec::new(),
         name: "aether-next".into(),
         paths: vec!["/p".into()],
         projects: Vec::new(),
@@ -2237,6 +2243,7 @@ fn workspace_remove_root_result_shape() {
     assert_eq!(WorkspaceRemoveRoot::NAME, "workspace/remove_root");
     let r = WorkspaceRemoveRootResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec!["/p".into()],
             projects: Vec::new(),
@@ -2255,6 +2262,7 @@ fn workspace_remove_root_result_skips_none_next_buffer() {
     use aether_protocol::workspace::WorkspaceRemoveRootResult;
     let r = WorkspaceRemoveRootResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec![],
             projects: Vec::new(),
@@ -2271,6 +2279,7 @@ fn workspace_activate_result_includes_last_buffer_id_when_set() {
     use aether_protocol::workspace::WorkspaceActivateResult;
     let r = WorkspaceActivateResult {
         workspace: WorkspaceInfo {
+            worktrees: Vec::new(),
             name: "aether".into(),
             paths: vec!["/p".into()],
             projects: Vec::new(),
@@ -2867,8 +2876,8 @@ fn picker_item_git_branch_is_tagged() {
         upstream: None,
         ahead: 0,
         behind: 0,
-        checked_out_in: None,
-        checked_out_in_main: false,
+        checkout: None,
+        detached_at: None,
         match_indices: vec![0, 1],
     };
     let v = to_value(&plain).unwrap();
@@ -2882,14 +2891,14 @@ fn picker_item_git_branch_is_tagged() {
             "timestamp": 1_700_000_000i64,
             "match_indices": [0, 1],
         }),
-        "is_head/upstream/ahead/behind/checked_out_in* all omitted at their defaults"
+        "is_head/upstream/ahead/behind/checkout/detached_at all omitted at their defaults"
     );
     assert_eq!(from_value::<PickerItem>(v).unwrap(), plain);
 
-    // The decorated row: current branch, tracking an upstream it has diverged from, and held by
-    // another checkout. `checked_out_in` is what stops the client offering a doomed checkout, and
-    // `checked_out_in_main` is what lets it say *where* — "the main checkout" and "another
-    // worktree" are different sentences, and a path alone can't tell them apart.
+    // The decorated row: current branch, tracking an upstream it has diverged from, and held by a
+    // linked worktree. `checkout` is what turns this from a branch row into a worktree row —
+    // `Enter` opens that tree instead of moving HEAD, and `Ctrl-d` removes it rather than deleting
+    // the branch — and `worktree` is the admin name both of those are keyed on.
     let decorated = PickerItem::GitBranch {
         repo_id: "/home/u/proj".into(),
         name: "main".into(),
@@ -2899,8 +2908,15 @@ fn picker_item_git_branch_is_tagged() {
         upstream: Some("origin/main".into()),
         ahead: 2,
         behind: 1,
-        checked_out_in: Some("/home/u/proj".into()),
-        checked_out_in_main: true,
+        checkout: Some(BranchCheckout {
+            path: "/home/u/trees/feature-auth".into(),
+            is_main: false,
+            worktree: "feature-auth".into(),
+            is_current: true,
+            locked: false,
+            prunable: false,
+        }),
+        detached_at: None,
         match_indices: vec![],
     };
     let v = to_value(&decorated).unwrap();
@@ -2908,9 +2924,43 @@ fn picker_item_git_branch_is_tagged() {
     assert_eq!(v["upstream"], "origin/main");
     assert_eq!(v["ahead"], 2);
     assert_eq!(v["behind"], 1);
-    assert_eq!(v["checked_out_in"], "/home/u/proj");
-    assert_eq!(v["checked_out_in_main"], true);
+    assert_eq!(v["checkout"]["path"], "/home/u/trees/feature-auth");
+    assert_eq!(v["checkout"]["worktree"], "feature-auth");
+    assert_eq!(v["checkout"]["is_current"], true);
+    // The main checkout's admin name is empty and its flags are false, so a row held by it carries
+    // `is_main` and nothing else — the same "common case stays small" rule as the plain row.
+    assert_eq!(v["checkout"].get("is_main"), None);
+    assert_eq!(v["checkout"].get("locked"), None);
+    assert_eq!(v["checkout"].get("prunable"), None);
     assert_eq!(from_value::<PickerItem>(v).unwrap(), decorated);
+
+    // A detached worktree: no branch, so `name` is the tree's admin name and `detached_at` carries
+    // what it is sitting on. Without such a row the tree would be unreachable in a branch-keyed
+    // list — including for the removal that is the only thing left to do with a prunable one.
+    let detached = PickerItem::GitBranch {
+        repo_id: "/home/u/proj".into(),
+        name: "spike".into(),
+        is_head: false,
+        subject: String::new(),
+        timestamp: 0,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        checkout: Some(BranchCheckout {
+            path: "/home/u/trees/spike".into(),
+            is_main: false,
+            worktree: "spike".into(),
+            is_current: false,
+            locked: false,
+            prunable: true,
+        }),
+        detached_at: Some("abc1234".into()),
+        match_indices: vec![],
+    };
+    let v = to_value(&detached).unwrap();
+    assert_eq!(v["detached_at"], "abc1234");
+    assert_eq!(v["checkout"]["prunable"], true);
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), detached);
 }
 
 #[test]
@@ -3457,7 +3507,6 @@ fn collapsible_kinds_are_pinned() {
     for kind in [
         PickerKind::References,
         PickerKind::Keybindings,
-        PickerKind::Worktrees,
         PickerKind::GitChangesFile,
         PickerKind::Files,
         PickerKind::Diagnostics,
@@ -3465,11 +3514,12 @@ fn collapsible_kinds_are_pinned() {
     ] {
         assert!(!kind.collapsible(), "{kind:?}");
     }
-    // Worktrees groups but does not collapse — the same shape as References. That combination is
-    // what keeps its headers out of the selection indices, so the current worktree stays at index 0
-    // and Enter-on-open remains a no-op.
-    assert!(PickerKind::Worktrees.renders_group_headers());
-    assert!(!PickerKind::Worktrees.groups_by_file());
+    // The merged branch picker groups not at all. It used to be two pickers, one of which split its
+    // rows into `Worktrees` and `Branches` sections; pinning the checked-out ones to the top of one
+    // recency-ordered list replaced that, because sectioning scattered the branches you were
+    // actually looking for across two places.
+    assert!(!PickerKind::GitBranches.renders_group_headers());
+    assert!(!PickerKind::GitBranches.collapsible());
 }
 
 #[test]
@@ -5057,59 +5107,6 @@ fn worktree_remove_itemises_what_is_at_risk() {
     })
     .unwrap();
     assert_eq!(v, json!({ "status": "removed" }));
-}
-
-#[test]
-fn worktree_picker_row_and_select_shapes() {
-    use aether_protocol::picker::{
-        PickerItem, PickerSelectResult, WorktreeCreate, WorktreeRowKind,
-    };
-    let v = to_value(PickerItem::Worktree {
-        repo_id: "/src/aether".into(),
-        row: WorktreeRowKind::Branch,
-        label: "feature".into(),
-        branch: String::new(),
-        path: String::new(),
-        is_current: false,
-        prunable: false,
-        locked: false,
-        match_indices: vec![0],
-    })
-    .unwrap();
-    assert_eq!(
-        v,
-        json!({
-            "kind": "worktree",
-            "repo_id": "/src/aether",
-            "row": "branch",
-            "label": "feature",
-            "match_indices": [0],
-        })
-    );
-    // Selecting an existing tree carries its admin name and no create half; selecting a branch row
-    // carries the branch to make it from. The two never both appear.
-    let v = to_value(PickerSelectResult::Worktree {
-        repo_id: "/src/aether".into(),
-        name: "feature-auth".into(),
-        create: None,
-    })
-    .unwrap();
-    assert_eq!(v["name"], json!("feature-auth"));
-    assert!(v.get("create").is_none());
-    let v = to_value(PickerSelectResult::Worktree {
-        repo_id: "/src/aether".into(),
-        name: String::new(),
-        create: Some(WorktreeCreate {
-            branch: "wip".into(),
-            create_branch: true,
-        }),
-    })
-    .unwrap();
-    assert!(v.get("name").is_none());
-    assert_eq!(
-        v["create"],
-        json!({ "branch": "wip", "create_branch": true })
-    );
 }
 
 #[test]

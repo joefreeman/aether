@@ -56,6 +56,9 @@ pub fn run(
     // front, so the client can start before the daemon and wait for it immersively. The app dials
     // `server_url` from within, on iced's own runtime, and installs the session once the socket lands.
     app::run(app::Bootstrap::Connecting(app::ConnectingBootstrap {
+        // A fresh launch has no context to inherit; the server enters whichever this workspace was
+        // last used in. Deliberately not a CLI flag — see `WindowTarget::worktrees`.
+        worktrees: Vec::new(),
         workspace,
         file,
         jump_to: jump.map(|(line, col)| aether_protocol::LogicalPosition { line, col }),

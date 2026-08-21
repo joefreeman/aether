@@ -63,6 +63,15 @@ pub struct WindowTarget {
     /// no-workspace open, used for a file outside every workspace (an ephemeral workspace id isn't
     /// CLI-addressable).
     pub workspace: Option<String>,
+    /// Which **context** of that workspace to open: repo id → worktree admin name, empty for the
+    /// base. Carried as the binding *set* rather than the server's internal context id, because the
+    /// id is internal — activation takes the set and derives it.
+    ///
+    /// Deliberately not a CLI flag. `Space z` opens a window in-process (the GUI) or a tab (the
+    /// web), so this never has to survive a command line; and a user-facing `--worktree` beside a
+    /// path positional would raise "is that path relative to the checkout or the tree?", which has
+    /// no non-arbitrary answer. Reaching a context by hand is what the branch picker is for.
+    pub worktrees: Vec<(String, String)>,
     /// What the new window lands on.
     pub open: WindowOpen,
 }

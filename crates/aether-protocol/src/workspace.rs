@@ -45,6 +45,26 @@ impl RpcMethod for WorkspaceActivate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceActivateParams {
     pub name: String,
+    /// Which **context** of the workspace to enter: repo → the admin name of the worktree to
+    /// resolve its roots against. A workspace is `(configured roots, bindings)`, and the **base is
+    /// the empty map** — not a different kind of thing, which is what removes every base-versus-
+    /// bound case from this call.
+    ///
+    /// Keys are [`crate::git::RepoId`]s — the workdirs picker rows already carry, echoed back
+    /// opaquely. The server normalises each to its repo *family* (common dir) on the way in, so a
+    /// binding sent from inside a worktree lands on the same key as one sent from the main
+    /// checkout instead of writing a second entry for the same repo.
+    ///
+    /// Omitted means **"wherever I was"**: the server enters the workspace's most recently
+    /// activated context. That is how a cold-started window returns to the worktree it was in
+    /// without windows needing durable identity across restarts — they have none. Send an explicit
+    /// empty map to mean the base regardless of history.
+    ///
+    /// A binding whose worktree no longer resolves does not fail the activation: those roots fall
+    /// back to their configured paths. The configured roots are the workspace's own definition, so
+    /// there is no way for a binding to strand you.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<std::collections::BTreeMap<crate::git::RepoId, String>>,
     /// Also open the landing buffer — the workspace's `last_buffer_id` when there is one, a
     /// fresh *transient* scratch otherwise — and return it in `opened`. The bootstrap
     /// convention (activate, then land somewhere) folded into one round-trip
@@ -81,10 +101,37 @@ pub struct WorkspaceActivateResult {
 pub struct WorkspaceInfo {
     pub name: String,
     pub paths: Vec<String>,
+    /// The worktree bindings this context is resolved against — empty in the base. Carried so a
+    /// client can hand the same context to a **new window** without asking the server what it is
+    /// standing in. It also drove an `aether @ feature-auth` label in the status bar and title;
+    /// that was removed — a binding is per *repo*, so where you are is said on the git cluster's
+    /// `⧉ branch`, at the grain it actually applies to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<WorkspaceWorktree>,
     /// Projects declared by this workspace, resolved for display. Absent on the wire when empty, so
     /// a workspace that declares none costs nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<WorkspaceProject>,
+}
+
+/// One repo of a workspace bound to a worktree.
+///
+/// Carries the branch as well as the admin name because the two **drift**: `git worktree add` names
+/// a tree once, and a checkout inside it later moves HEAD without renaming anything, so a tree
+/// admin-named `feature-auth` can be sitting on `main`. A label wants both — admin name primary,
+/// branch secondary — for the same reason the picker's rows show both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceWorktree {
+    /// The repo this binds, as the [`crate::git::RepoId`] of its **main** checkout — the form
+    /// clients already speak, and the one to echo back to `workspace/activate`.
+    pub repo_id: crate::git::RepoId,
+    /// Admin name of the bound worktree. Never empty here: an empty name is an unbind, which is the
+    /// absence of an entry rather than an entry saying nothing.
+    pub worktree: String,
+    /// Branch currently checked out in that tree, when it is on one. Empty for a detached HEAD, or
+    /// when the tree no longer resolves.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branch: String,
 }
 
 /// One declared project — a marker file whose language server is pinned open while the workspace is

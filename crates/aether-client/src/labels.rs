@@ -134,13 +134,37 @@ pub fn workspace_display(workspace: &str) -> String {
     }
 }
 
-/// The mark a branch row carries when **another checkout in the family already has this branch**:
-/// git allows one checkout per branch, so the row is telling you it can't be checked out here.
+/// The mark for a branch checked out in the repo's **main** working tree — the ordinary,
+/// unremarkable place a branch lives. Rendered in the secondary accent, exactly as the status bar's
+/// git cluster renders `⎇ branch`, so the two surfaces share one vocabulary: this glyph means "an
+/// ordinary checkout", [`WORKTREE_HELD_MARK`] means "a linked worktree".
 ///
-/// The glyph alone. It used to trail the holding checkout's directory name, which was noise in the
-/// ordinary case — admin names are derived from branch names, so it read `feature ⧉ feature` — and
-/// ambiguous in the rest: the name is the *repo's* directory when the main checkout holds it. Which
-/// checkout it is belongs in the refusal, which has room for a sentence.
+/// The pairing is why a main-checkout row can't just reuse `⧉`: warning colour on the most ordinary
+/// row on the list reads as something needing attention, and it is not.
+pub const BRANCH_MARK: &str = "⎇";
+
+/// The mark a branch row carries when **a linked worktree already holds this branch**. Since
+/// the branch/worktree merge that is a destination rather than a refusal: git allows one checkout
+/// per branch, so Enter on such a row opens that tree instead of moving HEAD here.
+///
+/// **The glyph alone — the holding tree's admin name is never rendered beside it, and is not in the
+/// row's match haystack either.** It reads as a name and behaves like machinery: the user never
+/// chose it (git derives it from the path basename at `git worktree add`, sanitised and
+/// uniquified), git lets it go stale (`git worktree move` relocates the directory without renaming
+/// the entry, and there is no `git worktree rename` at all), and it names nothing else on screen.
+/// In the ordinary case it simply repeats the branch. Matching on it while hiding it would be worse
+/// still — rows would appear with no visible cause, the same reason a Keybindings row's group stays
+/// out of [`aether_protocol::picker::KeybindingEntry::haystack`].
+///
+/// **The rule: the admin name shows where it is a row's *identity*, and hides where it is an
+/// annotation on a branch row.** So it is still displayed and matched for a detached or prunable
+/// tree — those have no branch, so the admin name *is* their row name — and still named in
+/// sentences that have room to say which tree (`{branch} is already in worktree {name}`, the
+/// removal toasts). A glyph on a branch row has no such room, and the branch is what you were
+/// reaching for.
+///
+/// Warning-coloured in every shell, matching the status bar's `⧉ branch`: same glyph, same colour,
+/// one vocabulary for "a worktree is involved" wherever it appears.
 pub const WORKTREE_HELD_MARK: &str = "⧉";
 
 /// Whether a workspace id should be wrapped in the `[workspace]` chrome shown in the status bar and
@@ -159,6 +183,10 @@ pub fn shows_workspace_chrome(workspace: &str) -> bool {
 ///
 /// It says nothing about worktrees: a binding is per *repo*, and the status bar's git cluster shows
 /// it at that grain, on the branch of the buffer it actually applies to (`docs/worktrees.md` §9.5).
+/// An `@ <admin name> (<branch>)` suffix was built here and **removed** — it named the first
+/// binding only (a workspace can have several, and collapsing the rest to `+n` names none of them),
+/// and it repeated in workspace-grain form what `⧉ branch` was already saying at the right grain
+/// two clusters away.
 pub fn status_workspace_prefix(workspace: &str) -> Option<String> {
     shows_workspace_chrome(workspace).then(|| format!("[{}] ", workspace_display(workspace)))
 }
@@ -323,6 +351,11 @@ pub fn split_symbol_path(rendered: &str) -> (&str, &str) {
 /// stray `[]`) *and* an ephemeral "(no workspace)" context, which shows just the buffer label.
 /// Long paths are segment-elided (see [`truncate_path`]) so an external file's absolute path doesn't
 /// overflow the title bar. The TUI prepends a dirty dot; no shell appends the app name.
+///
+/// **Two windows on two worktrees of one workspace therefore share a `[workspace]`** — the `@ …`
+/// context suffix that told them apart was removed with the status bar's (user's call). The buffer
+/// label still differs whenever they're on different files, which is the ordinary case; when it
+/// doesn't, the window list is ambiguous and that is the accepted cost.
 pub fn title_body(workspace: &str, label: &str) -> Option<String> {
     if workspace.is_empty() {
         // Boot / connecting / chooser: no workspace *and* no buffer — the title is just the app name.
@@ -334,7 +367,7 @@ pub fn title_body(workspace: &str, label: &str) -> Option<String> {
         // editing), with no `[workspace]` bracket — or nothing when there's no label.
         return (!label.is_empty()).then_some(label);
     }
-    // Display form, not the raw id.
+    // Display form, never the raw id.
     let workspace = workspace_display(workspace);
     Some(if label.is_empty() {
         format!("[{workspace}]")
@@ -597,4 +630,3 @@ mod tests {
         assert!(shows_workspace_chrome("demo"));
     }
 }
-

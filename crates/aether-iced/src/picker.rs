@@ -233,11 +233,10 @@ fn placeholder(kind: PickerKind) -> &'static str {
         PickerKind::GitChangesFile => "Changes in current file…",
         PickerKind::GitChanges => "Changes in workspace…",
         PickerKind::Keybindings => "Search keybindings…",
-        PickerKind::GitBranches => "Switch branch…",
+        PickerKind::GitBranches => "Branches & worktrees…",
         PickerKind::GitLog => "Search history…",
         PickerKind::GitLogFile => "Search this file's history…",
         PickerKind::GitStash => "Find stash…",
-        PickerKind::Worktrees => "Switch worktree…",
         PickerKind::Jumplist => "Filter the jumplist…",
     }
 }
@@ -515,14 +514,14 @@ pub fn overlay<'a>(
                     text_el.into()
                 };
                 let row_el = container(inner)
-                .width(Length::Fill)
-                .height(ui.row_h())
-                .padding([3, 12])
-                .align_y(iced::alignment::Vertical::Center)
-                .style(move |_| container::Style {
-                    background: selected.then(|| p.bg_selection.into()),
-                    ..container::Style::default()
-                });
+                    .width(Length::Fill)
+                    .height(ui.row_h())
+                    .padding([3, 12])
+                    .align_y(iced::alignment::Vertical::Center)
+                    .style(move |_| container::Style {
+                        background: selected.then(|| p.bg_selection.into()),
+                        ..container::Style::default()
+                    });
                 list = list.push(
                     iced::widget::mouse_area(row_el)
                         .interaction(iced::mouse::Interaction::Pointer)
@@ -1600,44 +1599,6 @@ fn render_item<'a>(
             .align_y(iced::Alignment::Center)
             .into()
         }
-        PickerItem::Worktree {
-            label,
-            branch,
-            prunable,
-            locked,
-            match_indices,
-            ..
-        } => {
-            // `feature-auth   feature/auth`. The admin name leads because it is what removal is
-            // keyed on; the branch trails because "the same tree on another branch" is what you are
-            // usually choosing between. No per-row marker: the `Worktrees` / `Branches` headers say
-            // which kind a row is, and the current worktree is the one highlighted on open.
-            let mut m = String::new();
-            if !branch.is_empty() && branch != label {
-                m.push_str(branch);
-            }
-            // Stated, not decorated: both change what the row can do.
-            let mut flags = String::new();
-            if *locked {
-                flags.push_str("locked");
-            }
-            if *prunable {
-                flags.push_str(if flags.is_empty() { "missing" } else { "  missing" });
-            }
-            row![
-                highlighted(label, match_indices, p.fg_bright, SANS, hovered, ui, p),
-                iced::widget::Space::new().width(Length::Fill),
-                meta(m, ui, p),
-                text(flags)
-                    .size(ui.body())
-                    .font(SANS)
-                    .color(p.warning)
-                    .wrapping(iced::widget::text::Wrapping::None),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .into()
-        }
         PickerItem::GitStash {
             index,
             message,
@@ -1710,12 +1671,14 @@ fn render_item<'a>(
             timestamp,
             ahead,
             behind,
-            checked_out_in,
+            checkout,
+            detached_at,
             match_indices,
             ..
         } => {
-            // Name, the `⧉` mark if another checkout holds it, then dim metadata (tip subject,
-            // relative date) filling the middle, and the divergence counts last at the right edge.
+            // Name, the `⧉` mark and admin name when a tree holds it, then dim metadata (tip
+            // subject, relative date) filling the middle, and the divergence counts last at the
+            // right edge.
             let mut m = subject.clone();
             if *timestamp > 0 {
                 if !m.is_empty() {
@@ -1747,15 +1710,58 @@ fn render_item<'a>(
             )]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            // Directly after the name, because it is a property of the *branch*. Not decoration:
-            // git refuses the same branch in two checkouts, so this is the row's "you cannot check
-            // this out" tell, and it gets the warning colour rather than the dim one.
-            if checked_out_in.is_some() {
+            // Directly after the name, because it is a property of the *branch*. The warning colour
+            // the status bar gives `⧉ branch`: same glyph, same colour, one vocabulary for "a
+            // worktree is involved" wherever it appears. It briefly went accent on the argument that
+            // the row is a destination rather than a refusal — true, but the glyph's job is to be
+            // *noticed*, and splitting its colour across two surfaces cost more than the distinction
+            // was worth.
+            //
+            // The glyph alone: the holding tree's admin name is machinery the user never chose and
+            // git lets go stale, so it isn't spelled out here (`labels::WORKTREE_HELD_MARK`).
+            //
+            // Same two glyphs and colours as the status bar's git cluster: `⎇` accent for the
+            // ordinary main checkout, `⧉` warning for a linked worktree. A branch nothing holds
+            // gets neither — it isn't anywhere, and Enter checks it out here instead of going.
+            if let Some(checkout) = checkout {
+                let (glyph, colour) = if checkout.is_main {
+                    (aether_client::labels::BRANCH_MARK, p.accent_alt)
+                } else {
+                    (aether_client::labels::WORKTREE_HELD_MARK, p.warning)
+                };
                 r = r.push(
-                    text(aether_client::labels::WORKTREE_HELD_MARK)
+                    text(glyph)
                         .size(ui.small())
                         .font(SANS)
-                        .color(p.warning),
+                        .color(colour)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                );
+            }
+            // Stated, not decorated: each changes what the row can do. A detached tree's commit id
+            // sits with them — it is what the tree is *on*, in the slot a branch row uses for the
+            // same fact.
+            let mut flags = String::new();
+            if let Some(oid) = detached_at.as_deref().filter(|o| !o.is_empty()) {
+                flags.push_str(&format!("detached at {oid}"));
+            }
+            for (on, word) in [
+                (checkout.as_ref().is_some_and(|k| k.locked), "locked"),
+                (checkout.as_ref().is_some_and(|k| k.prunable), "missing"),
+            ] {
+                if on {
+                    if !flags.is_empty() {
+                        flags.push_str("  ");
+                    }
+                    flags.push_str(word);
+                }
+            }
+            if !flags.is_empty() {
+                r = r.push(
+                    text(flags)
+                        .size(ui.small())
+                        .font(SANS)
+                        .color(p.fg_dim)
+                        .wrapping(iced::widget::text::Wrapping::None),
                 );
             }
             // The commit line sits directly after the name, left-aligned — it reads as a

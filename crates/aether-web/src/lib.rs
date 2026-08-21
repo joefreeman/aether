@@ -789,6 +789,11 @@ fn action_value(a: &ShellAction) -> Value {
             if let Some(ws) = &target.workspace {
                 v["workspace"] = json!(ws);
             }
+            // Which context of that workspace, as `[[repo id, admin name], …]`. Empty in the base,
+            // where the field is simply absent.
+            if !target.worktrees.is_empty() {
+                v["worktrees"] = json!(target.worktrees);
+            }
             v
         }
         // The reading view's Enter on an external link/image: the shell opens a new tab

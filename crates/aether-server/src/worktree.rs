@@ -50,9 +50,13 @@ pub fn store_root(override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(dir) = override_dir {
         return Ok(dir.to_path_buf());
     }
+    // A settings file that won't parse is an error, not a reason to quietly use the default. It
+    // used to be `.unwrap_or_default()`, which turned "your `settings.toml` is broken" into a
+    // worktree created on a different filesystem from the one you configured, with nothing said —
+    // and a checkout in the wrong place is exactly the kind of thing you find out about much later.
     let configured = crate::config::load_app_settings()
-        .map(|s| s.worktree_store)
-        .unwrap_or_default();
+        .map_err(|e| anyhow::anyhow!("reading app settings for the worktree store: {e}"))?
+        .worktree_store;
     if !configured.is_empty() {
         return Ok(PathBuf::from(configured));
     }
@@ -244,9 +248,10 @@ fn head_of(workdir: &Path) -> Option<aether_protocol::git::GitHead> {
 
 /// Resolve a worktree admin name to its working directory, from any member of the family.
 ///
-/// This is the resolution step the whole variant model rests on: bindings store the **admin
+/// This is the resolution step the whole binding model rests on: bindings store the **admin
 /// name**, never a path, so the store can move, `git worktree repair` can relocate things, and a
-/// worktree created in a terminal needs no import (`docs/worktrees.md` §7.2).
+/// worktree created in a terminal needs no import. Nothing here assumes a worktree lives in the
+/// app-managed store — [`store_root`] only says where new ones are *made*.
 pub fn path_for_name(family_member: &Path, name: &str) -> Option<PathBuf> {
     let repo = git2::Repository::open(family_member).ok()?;
     let worktree = repo.find_worktree(name).ok()?;
@@ -317,7 +322,12 @@ pub fn has_submodules(workdir: &Path) -> bool {
 /// - an ignored directory that does **not** match is skipped entirely, so a pattern has to name
 ///   the ignored directory itself (`node_modules/`) rather than something buried inside one;
 /// - symlinks are skipped rather than followed — copying through one writes into the target.
-pub fn seed_from_include_file(source: &Path, dest: &Path) -> u32 {
+///
+/// `cancelled` is checked between entries. Copying a `node_modules` is easily the slowest part of
+/// creating a worktree, and it used to run after the operation had been deregistered — no status
+/// bar, no `Space g x`, just an editor that looked wedged. Between entries rather than mid-file:
+/// a half-written file is worse than a whole one, and they are small next to the walk.
+pub fn seed_from_include_file(source: &Path, dest: &Path, cancelled: &dyn Fn() -> bool) -> u32 {
     let include_file = source.join(".worktreeinclude");
     let Ok(contents) = std::fs::read_to_string(&include_file) else {
         return 0;
@@ -337,7 +347,15 @@ pub fn seed_from_include_file(source: &Path, dest: &Path) -> u32 {
         return 0;
     };
     let mut copied = 0u32;
-    seed_dir(&repo, &matcher, source, dest, Path::new(""), &mut copied);
+    seed_dir(
+        &repo,
+        &matcher,
+        source,
+        dest,
+        Path::new(""),
+        &mut copied,
+        cancelled,
+    );
     copied
 }
 
@@ -348,11 +366,15 @@ fn seed_dir(
     dest: &Path,
     rel: &Path,
     copied: &mut u32,
+    cancelled: &dyn Fn() -> bool,
 ) {
     let Ok(entries) = std::fs::read_dir(source.join(rel)) else {
         return;
     };
     for entry in entries.flatten() {
+        if cancelled() {
+            return;
+        }
         let name = entry.file_name();
         if name == ".git" {
             continue;
@@ -374,7 +396,7 @@ fn seed_dir(
         if matched && ignored {
             let to = dest.join(&rel_child);
             if is_dir {
-                copy_tree(&from, &to, copied);
+                copy_tree(&from, &to, copied, cancelled);
             } else if copy_file(&from, &to) {
                 *copied += 1;
             }
@@ -383,16 +405,19 @@ fn seed_dir(
         // Descend into ordinary directories looking for deeper matches; never into an ignored one
         // we didn't want, which is what stops this walking `node_modules` for nothing.
         if is_dir && !ignored {
-            seed_dir(repo, matcher, source, dest, &rel_child, copied);
+            seed_dir(repo, matcher, source, dest, &rel_child, copied, cancelled);
         }
     }
 }
 
-fn copy_tree(from: &Path, to: &Path, copied: &mut u32) {
+fn copy_tree(from: &Path, to: &Path, copied: &mut u32, cancelled: &dyn Fn() -> bool) {
     let Ok(entries) = std::fs::read_dir(from) else {
         return;
     };
     for entry in entries.flatten() {
+        if cancelled() {
+            return;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -402,7 +427,7 @@ fn copy_tree(from: &Path, to: &Path, copied: &mut u32) {
         let child_from = entry.path();
         let child_to = to.join(entry.file_name());
         if file_type.is_dir() {
-            copy_tree(&child_from, &child_to, copied);
+            copy_tree(&child_from, &child_to, copied, cancelled);
         } else if copy_file(&child_from, &child_to) {
             *copied += 1;
         }
@@ -418,7 +443,7 @@ fn copy_file(from: &Path, to: &Path) -> bool {
     std::fs::copy(from, to).is_ok()
 }
 
-/// Resolve a variant's roots: the base workspace's roots, with every root belonging to a bound repo
+/// Resolve a workspace's roots: its configured roots, with every root belonging to a bound repo
 /// remapped into that repo's worktree.
 ///
 /// Returns the roots and the bindings that **failed to resolve** — a worktree removed in a terminal
@@ -449,7 +474,7 @@ pub fn materialise_roots(
             roots.push(root.clone());
             continue;
         };
-        let Some(name) = bindings.get(&identity.workdir) else {
+        let Some(name) = bindings.get(&identity.common_dir) else {
             roots.push(root.clone());
             continue;
         };
@@ -478,21 +503,73 @@ pub fn materialise_roots(
     (roots, unresolved)
 }
 
-/// Drop bindings whose repo is no longer reachable from any of the base workspace's roots.
+/// The **context id** for a workspace resolved against `bindings` — the key
+/// [`crate::state::ServerState::workspaces`] holds the entry under.
 ///
-/// Structural cleanup, run at load: removing a root removes the binding for the repo it reached,
-/// and a variant left with no bindings is no longer a variant at all. This is the machine-state
-/// counterpart of the config file nesting `projects` inside their root so a dangling reference is
-/// unrepresentable — here it *is* representable, so it is pruned instead.
+/// A context is `(workspace, bindings)`, and the **base is the empty binding set**, so an unbound
+/// workspace's id is simply its name and nothing anywhere needs a base-versus-bound case. Two
+/// clients that compute the same bindings compute the same id and therefore *join* the same entry —
+/// sharing its index, its MRU and its buffers — which is what turns "is this worktree already open
+/// somewhere?" from a question into a map lookup.
+///
+/// **Internal only.** It is never persisted (the session file nests contexts under their workspace)
+/// and never sent (`workspace/activate` carries the binding map itself). So the separator can be
+/// `/`, which workspace names already forbid, making a collision with a real name impossible
+/// without reserving anything new.
+///
+/// Pairs are `<repo key>=<admin name>`, sorted — a `BTreeMap` iterates in key order, so the same
+/// bindings always produce the same string. [`repo_key`] identifies the repo rather than its path:
+/// it is already the stable, legible per-family key this crate uses for store directories.
+pub fn context_id(name: &str, bindings: &std::collections::BTreeMap<PathBuf, String>) -> String {
+    if bindings.is_empty() {
+        return name.to_string();
+    }
+    let pairs: Vec<String> = bindings
+        .iter()
+        .map(|(common_dir, admin)| format!("{}={admin}", repo_key(common_dir)))
+        .collect();
+    format!("{name}/{}", pairs.join("+"))
+}
+
+/// The workspace name a [`context_id`] belongs to — everything before the first `/`.
+///
+/// The inverse only needs to recover the *name*, never the bindings: whoever holds an id also holds
+/// the entry, which carries the bindings directly. Deriving them back out of the string would be
+/// the one-way-derivation mistake this module already refuses to make with branch names.
+pub fn context_workspace_name(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(name, _)| name)
+}
+
+/// The repo **families** a workspace's configured roots reach, identified by common dir.
+///
+/// The common dir is what every worktree of a repo shares — a linked tree's is the main
+/// checkout's — so it is the only identifier under which "this repo" means the family rather than
+/// one checkout of it. That is exactly what a binding is about, which is why it is the binding key
+/// and why this is the set both the refusal and the prune below are phrased against.
+pub fn reachable_families(base_roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    base_roots
+        .iter()
+        .filter_map(|root| crate::git::discover_repo(root).map(|i| i.common_dir))
+        .collect()
+}
+
+/// Drop bindings whose repo is no longer reachable from any of the workspace's configured roots.
+///
+/// Structural cleanup, run at load: removing a root removes the binding for the repo it reached.
+/// This is the machine-state counterpart of the config file nesting `projects` inside their root so
+/// a dangling reference is unrepresentable — here it *is* representable, so it is pruned instead.
+///
+/// It also carries the one-way migration off the old **workdir** keys, at no cost: a workdir is
+/// never a common dir (`/src/aether` vs `/src/aether/.git`), so a stale key matches nothing and is
+/// dropped on the next load. Machine state that no longer resolves is discarded rather than
+/// explained — the same rule a dormant buffer whose file vanished already follows — so the price is
+/// re-binding once, not a migration path that has to live forever.
 pub fn prune_unreachable_bindings(
     base_roots: &[PathBuf],
     bindings: &mut std::collections::BTreeMap<PathBuf, String>,
 ) {
-    let reachable: std::collections::HashSet<PathBuf> = base_roots
-        .iter()
-        .filter_map(|root| crate::git::discover_repo(root).map(|i| i.workdir))
-        .collect();
-    bindings.retain(|workdir, _| reachable.contains(workdir));
+    let reachable = reachable_families(base_roots);
+    bindings.retain(|common_dir, _| reachable.contains(common_dir));
 }
 
 #[cfg(test)]

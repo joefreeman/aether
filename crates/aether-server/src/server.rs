@@ -619,6 +619,7 @@ pub async fn spawn_for_test_full(
             s.workspaces.insert(
                 name.clone(),
                 WorkspaceEntry {
+                    worktrees: Default::default(),
                     id: name.clone(),
                     name: Some(name.clone()),
                     base_paths: None,
@@ -794,9 +795,10 @@ mod tests {
                 s.workspaces.insert(
                     "p".into(),
                     crate::state::WorkspaceEntry {
+                        worktrees: Default::default(),
                         id: "p".into(),
                         name: Some("p".into()),
-                            base_paths: None,
+                        base_paths: None,
                         paths: Vec::new(),
                         workspace_index: Arc::new(crate::workspace_index::WorkspaceIndex::new(
                             Vec::new(),

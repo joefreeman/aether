@@ -709,9 +709,17 @@ pub struct WorkspaceSession {
     /// scratches and transient previews are omitted.
     #[serde(default)]
     pub buffers: Vec<SessionBuffer>,
-    /// **Worktree bindings**, present only on a *variant* (`docs/worktrees.md` §8.3). Maps a repo's
-    /// workdir to the admin name of the worktree this context uses for it; a repo with no entry
-    /// uses its main checkout, which is why the base workspace's own entry never carries this.
+    /// **Worktree bindings**. Maps a repo **family** — its common dir — to the admin name of the
+    /// worktree this workspace uses for it; a repo with no entry uses its main checkout, so an
+    /// unbound workspace carries none at all.
+    ///
+    /// Keyed by common dir, never by workdir: a linked worktree's common dir is the main
+    /// checkout's, so there is exactly one key per repo however you reach it. Keyed by a workdir —
+    /// as this once was — binding from *inside* a worktree wrote a second entry for the same repo
+    /// and left the two to fight, which then needed a normalisation step at every call site to undo.
+    ///
+    /// The value is an admin **name**, never a path: the store can move, `git worktree repair` can
+    /// relocate a tree, and one created in a terminal anywhere on disk resolves with no import.
     ///
     /// It lives here rather than in the workspace's TOML deliberately. A binding is not something
     /// the user types — it names an app-managed object and can be invalidated at any moment by a
@@ -720,10 +728,122 @@ pub struct WorkspaceSession {
     /// file to surface and explain. It also keeps generated entries out of the hand-editable TOML,
     /// which `workspace/add_root` and `remove_root` rewrite wholesale.
     ///
-    /// Keyed by **repo**, never by root or root index: a root added later in an already-bound repo
-    /// then follows automatically, and reordering roots can't silently re-point a binding.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Never keyed by root or root index either: a root added later in an already-bound repo then
+    /// follows automatically, and reordering roots can't silently re-point a binding.
+    ///
+    /// **Only the bound contexts carry this.** The entry you are reading is the workspace's
+    /// *unbound* context — the empty binding set — so it has none, and [`Self::contexts`] holds one
+    /// entry per bound shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<WorkspaceContextSession>,
+}
+
+/// One *bound* context of a workspace: the same configured roots resolved against a set of worktree
+/// bindings, with its own open buffers and its own recency.
+///
+/// A context is `(workspace, bindings)` and **the base is the empty binding set** — not a different
+/// kind of thing. That is the whole trick: "am I in the base or a variant?" and "does this worktree
+/// already belong to another context?" stop being questions with answers and become a lookup, which
+/// is what collapsed the four-case tangle that binding used to be.
+///
+/// Nested here rather than kept under a composite key like `aether/feature-auth`. Those existed
+/// once and were removed for being unresolvable — no `aether/feature-auth.toml` ever existed — and
+/// nesting means there is no encoding to invent, no separator to reserve in workspace names, and no
+/// migration: an existing session file loads unchanged, because an unbound workspace simply has no
+/// `contexts`.
+///
+/// Its buffers are absolute paths *into the worktrees*. When a tree is removed they stop resolving
+/// and are dropped, which needs no new handling — it is the standing rule for machine state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceContextSession {
+    /// The binding set that identifies this context. Never empty — an empty one *is* the base, and
+    /// would shadow the entry this is nested in.
+    #[serde(default)]
     pub worktrees: BTreeMap<PathBuf, String>,
+    /// Wall-clock time (Unix ms) this context was last activated. A cold-started window enters the
+    /// workspace's most-recent context, which is what makes "come back where I was" work without
+    /// windows needing durable identity — they have none, and inventing it for this would be real
+    /// new state for a thin payoff.
+    #[serde(default)]
+    pub last_activated_at: u64,
+    /// Buffers open in *this* context, most-recently-used first — same shape and same restore path
+    /// as [`WorkspaceSession::buffers`].
+    #[serde(default)]
+    pub buffers: Vec<SessionBuffer>,
+}
+
+impl WorkspaceSession {
+    /// The buffers recorded for `bindings` — the base's own when empty, else the matching context's
+    /// (empty when it has never been visited).
+    pub fn buffers_for(&self, bindings: &BTreeMap<PathBuf, String>) -> &[SessionBuffer] {
+        if bindings.is_empty() {
+            return &self.buffers;
+        }
+        self.contexts
+            .iter()
+            .find(|c| &c.worktrees == bindings)
+            .map_or(&[][..], |c| &c.buffers)
+    }
+
+    /// Record `buffers` and a fresh activation stamp against `bindings`, creating the context if
+    /// this is the first visit.
+    pub fn record(
+        &mut self,
+        bindings: &BTreeMap<PathBuf, String>,
+        buffers: Vec<SessionBuffer>,
+        at: u64,
+    ) {
+        if bindings.is_empty() {
+            self.buffers = buffers;
+            self.last_activated_at = at;
+            return;
+        }
+        // Deliberately *not* touching `self.last_activated_at`: it is the **base** context's own
+        // stamp, and the two have to stay comparable or [`Self::most_recent_bindings`] can't tell
+        // which context was last. The switcher's "when was this workspace last used" is
+        // [`Self::activated_at`], the max over all of them.
+        match self.contexts.iter_mut().find(|c| &c.worktrees == bindings) {
+            Some(ctx) => {
+                ctx.buffers = buffers;
+                ctx.last_activated_at = at;
+            }
+            None => self.contexts.push(WorkspaceContextSession {
+                worktrees: bindings.clone(),
+                last_activated_at: at,
+                buffers,
+            }),
+        }
+    }
+
+    /// The binding set to enter on a cold start: the most recently activated context, or the base
+    /// when it is the most recent (or nothing has been recorded).
+    ///
+    /// Windows have no durable identity — a fresh invocation gets a fresh `ClientId` — so "this
+    /// window returns to its context" is not answerable. This is: one window, restarted, lands back
+    /// where it was. Two windows in two contexts both land in the more recent one, which is one
+    /// keystroke to correct.
+    pub fn most_recent_bindings(&self) -> BTreeMap<PathBuf, String> {
+        self.contexts
+            .iter()
+            .filter(|c| c.last_activated_at > self.last_activated_at)
+            .max_by_key(|c| c.last_activated_at)
+            .map(|c| c.worktrees.clone())
+            .unwrap_or_default()
+    }
+
+    /// When this **workspace** was last used, across every context — what the switcher sorts on.
+    ///
+    /// Not [`Self::last_activated_at`], which is the base context's own stamp. Being in a worktree
+    /// of a workspace is being in the workspace, so a workspace worked in all day through a bound
+    /// context would otherwise sink to the bottom of the list.
+    pub fn activated_at(&self) -> u64 {
+        self.contexts
+            .iter()
+            .map(|c| c.last_activated_at)
+            .chain(std::iter::once(self.last_activated_at))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// One entry in a workspace's persisted buffer list. A scratch buffer has no path, so the list is a
@@ -843,7 +963,10 @@ pub fn sort_names_by_recency(names: &mut [String], sessions: &WorkspaceSessions)
             sessions
                 .workspaces
                 .get(name)
-                .map(|s| s.last_activated_at)
+                // Across every context, not just the base: being in a worktree of a workspace is
+                // being in the workspace, so one worked in all day through a bound context must not
+                // sink to the bottom of the switcher.
+                .map(|s| s.activated_at())
                 .unwrap_or(0),
         )
     });
@@ -1531,7 +1654,7 @@ mod tests {
         sessions.workspaces.insert(
             "work".into(),
             WorkspaceSession {
-                worktrees: Default::default(),
+                contexts: Vec::new(),
                 last_activated_at: 1000,
                 buffers: vec![
                     SessionBuffer::File {
@@ -1547,7 +1670,7 @@ mod tests {
         sessions.workspaces.insert(
             "dots".into(),
             WorkspaceSession {
-                worktrees: Default::default(),
+                contexts: Vec::new(),
                 last_activated_at: 2000,
                 buffers: vec![],
             },
@@ -1562,7 +1685,7 @@ mod tests {
         sessions.workspaces.insert(
             "beta".into(),
             WorkspaceSession {
-                worktrees: Default::default(),
+                contexts: Vec::new(),
                 last_activated_at: 100,
                 buffers: vec![],
             },
@@ -1570,7 +1693,7 @@ mod tests {
         sessions.workspaces.insert(
             "alpha".into(),
             WorkspaceSession {
-                worktrees: Default::default(),
+                contexts: Vec::new(),
                 last_activated_at: 200,
                 buffers: vec![],
             },
@@ -2029,9 +2152,12 @@ mod tests {
         sessions.workspaces.insert(
             "p".into(),
             WorkspaceSession {
-                worktrees: [(PathBuf::from("/src/p"), "feature".to_string())]
-                    .into_iter()
-                    .collect(),
+                contexts: vec![WorkspaceContextSession {
+                    worktrees: [(PathBuf::from("/src/p/.git"), "feature".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..WorkspaceContextSession::default()
+                }],
                 ..WorkspaceSession::default()
             },
         );
@@ -2079,7 +2205,15 @@ mod tests {
         let after = load_workspace_sessions_at(&path).unwrap();
         let moved = after.workspaces.get("renamed").expect("the entry moved");
         assert_eq!(
-            moved.worktrees.get(Path::new("/src/p")).map(String::as_str),
+            moved.contexts.len(),
+            1,
+            "the workspace's bound contexts came with it"
+        );
+        assert_eq!(
+            moved.contexts[0]
+                .worktrees
+                .get(Path::new("/src/p/.git"))
+                .map(String::as_str),
             Some("feature"),
             "a rename must not put the workspace back on its main checkout"
         );

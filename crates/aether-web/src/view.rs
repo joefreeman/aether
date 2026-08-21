@@ -34,6 +34,9 @@ pub fn build_view(s: &Session) -> Value {
         "conn": conn(&s.conn),
         "workspace": s.workspace,
         "workspace_paths": s.workspace_paths,
+        // Which context this window is in — the label reads it, and the picker's open-in-new-tab
+        // links carry it so a link opened from a worktree lands in that worktree.
+        "workspace_worktrees": s.workspace_worktrees,
         "buffer": buffer(s),
         "viewport_id": s.viewport_id,
         "window": s.window.as_ref().map(jv),
