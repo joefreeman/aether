@@ -79,9 +79,26 @@ enum Continuation {
     Window,
 }
 
-/// How long a floating toast (bottom-right) stays before it auto-dismisses — matching the web/native
-/// clients' transient toasts.
-const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+/// The core's toast kind for one of ours — the pair the shell keeps in sync so the lifetime policy
+/// ([`ToastKind::pinned`] / [`ToastKind::ttl`]) is read from the core rather than restated here.
+fn toast_kind(kind: StatusKind) -> ToastKind {
+    match kind {
+        StatusKind::Info => ToastKind::Info,
+        StatusKind::Success => ToastKind::Success,
+        StatusKind::Warning => ToastKind::Warning,
+        StatusKind::Error => ToastKind::Error,
+    }
+}
+
+/// The inverse of [`toast_kind`].
+fn status_kind(kind: ToastKind) -> StatusKind {
+    match kind {
+        ToastKind::Info => StatusKind::Info,
+        ToastKind::Success => StatusKind::Success,
+        ToastKind::Warning => StatusKind::Warning,
+        ToastKind::Error => StatusKind::Error,
+    }
+}
 
 struct Reestablished {
     handle: Handle,
@@ -407,15 +424,30 @@ impl Shell {
     }
 
     fn status(&mut self, msg: StatusMessage) {
-        self.push_toast(msg, None);
+        self.push_toast(msg.text, None, msg.kind, None);
     }
 
-    /// Push a transient toast onto the bottom-right stack and arm its expiry timer. Empty messages
-    /// are dropped. A `group` replaces any existing toast with the same key (so an evolving status
-    /// updates one toast in place); otherwise the stack is capped so a burst can't grow it without
-    /// bound (oldest fall off).
-    fn push_toast(&mut self, msg: StatusMessage, group: Option<String>) {
-        if msg.is_empty() {
+    /// An error toast whose detail — the failure's own words — reads on its own muted line under a
+    /// short title. The shell-side twin of `Effects::error_detail`.
+    fn error_detail(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.push_toast(title.into(), Some(body.into()), StatusKind::Error, None);
+    }
+
+    /// Push a transient toast onto the bottom-right stack and arm its expiry timer. Empty titles are
+    /// dropped, as are blank bodies (they'd render as a dangling line). A `group` replaces any
+    /// existing toast with the same key (so an evolving status updates one toast in place);
+    /// otherwise the stack is capped so a burst can't grow it without bound (oldest fall off).
+    ///
+    /// Every toast gets a timer, pinned ones included: for them it's the backstop that stops a
+    /// forgotten error sitting in the corner forever (`Esc` is the real way out).
+    fn push_toast(
+        &mut self,
+        title: String,
+        body: Option<String>,
+        kind: StatusKind,
+        group: Option<String>,
+    ) {
+        if title.is_empty() {
             return;
         }
         const MAX_TOASTS: usize = 5;
@@ -426,19 +458,31 @@ impl Shell {
         }
         let id = self.next_toast_id;
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
+        let kind_for_policy = toast_kind(kind);
         self.state.toasts.push(crate::app::Toast {
             id,
-            text: msg.text,
-            kind: msg.kind,
+            title,
+            body: body.filter(|b| !b.trim().is_empty()),
+            kind,
             group,
+            pinned: kind_for_policy.pinned(),
         });
         if self.state.toasts.len() > MAX_TOASTS {
             self.state.toasts.remove(0);
         }
+        let ttl = kind_for_policy.ttl();
         self.pending.push(Box::pin(async move {
-            tokio::time::sleep(TOAST_TTL).await;
+            tokio::time::sleep(ttl).await;
             Done::ToastExpired(id)
         }));
+    }
+
+    /// Clear every pinned toast (see [`crate::app::Toast::pinned`]). Called on `Esc` *before* the
+    /// key is dispatched and without consuming it: Esc keeps doing its usual job (leaving insert,
+    /// closing an overlay) and takes the held errors with it, so there's never a mode where the key
+    /// silently means only "dismiss".
+    fn dismiss_pinned_toasts(&mut self) {
+        self.state.toasts.retain(|t| !t.pinned);
     }
 
     // ---- core dispatch -----------------------------------------------------------------
@@ -463,27 +507,17 @@ impl Shell {
                     self.inflight.insert(id, Continuation::Core { token });
                 }
                 Effect::Toast {
-                    message,
+                    title,
+                    body,
                     kind,
                     group,
-                } => self.push_toast(
-                    StatusMessage {
-                        text: message,
-                        kind: match kind {
-                            ToastKind::Info => StatusKind::Info,
-                            ToastKind::Success => StatusKind::Success,
-                            ToastKind::Warning => StatusKind::Warning,
-                            ToastKind::Error => StatusKind::Error,
-                        },
-                    },
-                    group,
-                ),
+                } => self.push_toast(title, body, status_kind(kind), group),
                 Effect::WriteClipboard(text) => {
                     // The core already emits a "copied N bytes" success toast alongside
                     // this effect (see update.rs CopyDone handler), so only report failures
                     // here to avoid a duplicate success message.
                     if let Err(e) = clipboard::copy(&mut self.state.clipboard, text) {
-                        self.status(StatusMessage::error(format!("Copy failed: {e}")));
+                        self.error_detail("Copy failed", e.to_string());
                     }
                 }
                 Effect::ReadClipboard(kind) => {
@@ -646,7 +680,7 @@ impl Shell {
                         }
                         // Diff view rides the subscribe params; nothing to re-apply here.
                     }
-                    Err(e) => self.status(StatusMessage::error(format!("Subscribe failed: {e}"))),
+                    Err(e) => self.error_detail("Subscribe failed", e.message),
                 }
             }
             Continuation::Window => {
@@ -673,9 +707,7 @@ impl Shell {
                         // the call landed. The pending newer subscribe reveals the cursor afresh, so
                         // this is expected churn, not a failure worth surfacing.
                         if e.code != aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND.code() {
-                            self.status(StatusMessage::error(format!(
-                                "Viewport update failed: {e}"
-                            )));
+                            self.error_detail("Viewport update failed", e.message);
                         }
                     }
                 }
@@ -800,6 +832,12 @@ impl Shell {
     }
 
     async fn on_key(&mut self, k: KeyEvent) {
+        // Esc clears any pinned (error) toast, then goes on to do whatever it normally does. First
+        // in the function so it applies from every state — including the ones below that return
+        // early — and non-consuming so Esc never silently means *only* "dismiss".
+        if k.code == crossterm::event::KeyCode::Esc {
+            self.dismiss_pinned_toasts();
+        }
         // Hover: the popover reuses the editor's own Copy / Scroll bindings (resolved by
         // `keymap::hover_action`, so the chords never drift) — Ctrl-c copies its content, the scroll
         // keys pan it and keep it open; any other key dismisses it.
@@ -814,9 +852,7 @@ impl Shell {
                             match clipboard::copy(&mut self.state.clipboard, text) {
                                 Ok(()) => self
                                     .status(StatusMessage::success("Copied popover".to_string())),
-                                Err(e) => {
-                                    self.status(StatusMessage::error(format!("Copy failed: {e}")))
-                                }
+                                Err(e) => self.error_detail("Copy failed", e.to_string()),
                             }
                         }
                         return;
@@ -1426,7 +1462,7 @@ impl Shell {
                     aether_client::web_link::http_base(&self.server_url)
                 );
                 if let Err(e) = clipboard::copy(&mut self.state.clipboard, url) {
-                    self.status(StatusMessage::error(format!("Copy failed: {e}")));
+                    self.error_detail("Copy failed", e.to_string());
                 }
             }
         }
@@ -1734,11 +1770,11 @@ impl Shell {
     fn reconnect_to_chooser(&mut self) {
         let was_choosing = self.session.is_placeholder();
         self.enter_chooser();
-        self.status(if was_choosing {
-            StatusMessage::success("Reconnected".to_string())
+        if was_choosing {
+            self.status(StatusMessage::success("Reconnected".to_string()));
         } else {
-            StatusMessage::error("workspace no longer exists — pick another".to_string())
-        });
+            self.error_detail("That workspace no longer exists", "Pick another");
+        }
     }
 
     /// Drop to the workspace chooser over the live connection: swap in a fresh placeholder session

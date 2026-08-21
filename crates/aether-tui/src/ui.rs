@@ -6468,58 +6468,113 @@ fn toast_accent_color(kind: crate::app::StatusKind) -> Color {
     })
 }
 
+/// A toast's text width in columns: half the available width, held between a floor and a ceiling.
+/// Half so a toast never dominates the view, the ceiling so a long error doesn't run the width of an
+/// ultrawide terminal (long lines are hard to read back), the floor so a narrow split still gets
+/// something readable — even if that means most of the width. Mirrors the GUI/web clamps.
+fn toast_text_width(available: usize) -> usize {
+    const MIN: usize = 28;
+    const MAX: usize = 64;
+    available.min((available / 2).clamp(MIN, MAX))
+}
+
 /// Floating toasts stacked in the bottom-right of `area`: each is a fat status-coloured left bar
-/// followed by its message on a tinted background — deliberately subtle (no full outline), mirroring
-/// the web/native transient toasts. The newest sits at the bottom; older ones stack upward with a
-/// blank gap row between them (until they run out of vertical room). The shell expires each on a TTL
-/// timer, so they auto-dismiss.
+/// running down its height, then the title in the kind's colour with any detail muted beneath it, on
+/// a tinted background — deliberately subtle (no full outline), mirroring the web/native transient
+/// toasts. Both lines wrap within [`toast_text_width`].
+///
+/// The newest sits at the bottom; older ones stack upward with a blank gap row between them (until
+/// they run out of vertical room). The shell expires each on a TTL timer, so they auto-dismiss —
+/// except pinned ones, which carry a dim `Esc` marker naming the key that clears them.
 fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     const BAR_W: u16 = 1; // a solid accent-coloured cell — the "fat" left bar
     const PAD: u16 = 1; // one space between the bar and the text, and after the text
     const MARGIN_X: u16 = 2;
     const MARGIN_Y: u16 = 1;
     const GAP: u16 = 1; // blank row between stacked toasts
+    const DISMISS: &str = "Esc";
     if state.toasts.is_empty() || area.height <= MARGIN_Y {
         return;
     }
-    let max_text = (area.width as usize).saturating_sub((BAR_W + PAD * 2 + MARGIN_X * 2) as usize);
-    if max_text == 0 {
+    let available = (area.width as usize).saturating_sub((BAR_W + PAD * 2 + MARGIN_X * 2) as usize);
+    if available == 0 {
         return;
     }
-    // Newest toast hugs the bottom; older ones march upward a row + gap at a time.
-    let mut y = area.y + area.height.saturating_sub(1 + MARGIN_Y);
+    let max_text = toast_text_width(available);
+    // Newest toast hugs the bottom; older ones march upward past whatever height each one took.
+    let mut bottom = area.y + area.height.saturating_sub(1 + MARGIN_Y);
+    let tint = Style::default().bg(c(th().bg_selection));
     for toast in state.toasts.iter().rev() {
-        let text = if toast.text.width() <= max_text {
-            toast.text.clone()
+        // The dismiss marker rides the end of the title, so it costs no extra height; the title
+        // wraps in what's left of the row.
+        let marker_w = if toast.pinned {
+            DISMISS.width() + 2 // a two-space gap keeps it off the title
         } else {
-            truncate_to_width(&toast.text, max_text)
+            0
         };
-        let box_w = BAR_W + PAD + text.width() as u16 + PAD;
-        let rect = Rect {
-            x: area.x + area.width.saturating_sub(box_w + MARGIN_X),
-            y,
-            width: box_w,
-            height: 1,
-        };
-        f.render_widget(Clear, rect);
-        let tint = Style::default()
-            .bg(c(th().bg_selection))
-            .fg(c(th().fg_bright));
-        let spans = vec![
-            Span::styled(
-                " ".to_string(),
-                Style::default().bg(toast_accent_color(toast.kind)),
-            ),
-            Span::styled(" ".to_string(), tint),
-            Span::styled(text, tint),
-            Span::styled(" ".to_string(), tint),
-        ];
-        f.render_widget(Paragraph::new(Line::from(spans)).style(tint), rect);
-        // Step up for the next (older) toast; stop once there's no room left in the area.
-        if y < area.y + 1 + GAP {
+        let title_w = max_text.saturating_sub(marker_w).max(1);
+        let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+        let title_lines = wrap_words(&toast.title, title_w);
+        let last_title = title_lines.len().saturating_sub(1);
+        for (i, line) in title_lines.iter().enumerate() {
+            let mut spans = vec![Span::styled(
+                line.clone(),
+                tint.fg(toast_accent_color(toast.kind))
+                    .add_modifier(Modifier::BOLD),
+            )];
+            // One marker per toast, trailing the title — repeating it down a wrapped title would
+            // read as three separate toasts.
+            if marker_w > 0 && i == last_title {
+                spans.push(Span::styled("  ".to_string(), tint));
+                spans.push(Span::styled(DISMISS, tint.fg(c(th().fg_faint))));
+            }
+            rows.push(spans);
+        }
+        if let Some(body) = &toast.body {
+            for line in wrap_words(body, max_text) {
+                rows.push(vec![Span::styled(line, tint.fg(c(th().fg_dim)))]);
+            }
+        }
+        // Sized to the widest row, so a short toast stays short.
+        let text_w = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.content.width()).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        let height = (rows.len() as u16).min(bottom.saturating_sub(area.y) + 1);
+        if height == 0 {
             break;
         }
-        y -= 1 + GAP;
+        let box_w = BAR_W + PAD + text_w as u16 + PAD;
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(box_w + MARGIN_X),
+            y: bottom + 1 - height,
+            width: box_w,
+            height,
+        };
+        f.render_widget(Clear, rect);
+        let lines: Vec<Line<'static>> = rows
+            .into_iter()
+            .take(height as usize)
+            .map(|spans| {
+                let mut row = vec![
+                    // The bar runs the toast's full height — one accent cell per row.
+                    Span::styled(
+                        " ".to_string(),
+                        Style::default().bg(toast_accent_color(toast.kind)),
+                    ),
+                    Span::styled(" ".to_string(), tint),
+                ];
+                row.extend(spans);
+                Line::from(row)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines).style(tint), rect);
+        // Step up past this toast for the next (older) one; stop once there's no room left.
+        if rect.y < area.y + 1 + GAP {
+            break;
+        }
+        bottom = rect.y - 1 - GAP;
     }
 }
 
@@ -9711,5 +9766,159 @@ mod tests {
             "attributes ride the mode flip"
         );
         set_theme_mode(ThemeMode::Dark);
+    }
+
+    // ---- toasts ----
+
+    /// A toast on the bottom-right stack, built the way the shell builds one.
+    fn toast_app(toasts: Vec<crate::app::Toast>) -> AppState {
+        let mut st = picker_app(crate::picker::PickerState::default());
+        st.picker = crate::picker::PickerState::default();
+        st.toasts = toasts;
+        st
+    }
+
+    fn toast(title: &str, body: Option<&str>, kind: crate::app::StatusKind) -> crate::app::Toast {
+        crate::app::Toast {
+            id: 1,
+            title: title.into(),
+            body: body.map(Into::into),
+            kind,
+            group: None,
+            pinned: matches!(kind, crate::app::StatusKind::Error),
+        }
+    }
+
+    /// Half the width, floored and capped: a toast never spans the terminal, never runs the width
+    /// of an ultrawide one, and still gets a readable line in a narrow split (where "half" would be
+    /// too little, so it takes what's there).
+    #[test]
+    fn toast_width_is_half_the_terminal_within_bounds() {
+        assert_eq!(toast_text_width(200), 64, "capped on a wide terminal");
+        assert_eq!(toast_text_width(100), 50, "half in between");
+        assert_eq!(toast_text_width(40), 28, "floored on a narrow one");
+        assert_eq!(toast_text_width(20), 20, "never wider than what exists");
+        assert_eq!(toast_text_width(0), 0);
+    }
+
+    /// The split reaches the screen: the title on its own row, the detail on the next — and the
+    /// detail wraps within the clamp instead of running the terminal's width.
+    #[test]
+    fn a_toast_draws_its_body_under_its_title() {
+        let long = "remote: permission denied to this repository, ask an owner for write access";
+        let rows = render_rows(&toast_app(vec![toast(
+            "Push failed",
+            Some(long),
+            crate::app::StatusKind::Error,
+        )]));
+        let title_row = rows
+            .iter()
+            .position(|r| r.contains("Push failed"))
+            .expect("the title is drawn");
+        assert!(
+            rows[title_row + 1].contains("remote: permission"),
+            "the body starts on the row under the title, got {:?}",
+            rows[title_row + 1]
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("write access")),
+            "the whole body is drawn, wrapped: {rows:?}"
+        );
+        for row in &rows {
+            assert!(
+                row.trim_end().len() <= TEST_COLS as usize,
+                "no row overflows the terminal"
+            );
+        }
+        // Wrapped, not one long line: the body needed more rows than the title.
+        assert!(
+            rows.iter().filter(|r| r.contains("remote:")).count() == 1
+                && rows.iter().any(|r| r.contains("owner")),
+            "the body wrapped across rows: {rows:?}"
+        );
+    }
+
+    /// The title takes the kind's colour and the body is muted — the whole point of the split is
+    /// that the headline tells you which way it went before you read the detail.
+    #[test]
+    fn a_toasts_title_is_coloured_by_kind_and_its_body_muted() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let st = toast_app(vec![toast(
+            "Push failed",
+            Some("remote rejected"),
+            crate::app::StatusKind::Error,
+        )]);
+        let mut terminal = Terminal::new(TestBackend::new(TEST_COLS, TEST_ROWS)).unwrap();
+        terminal.draw(|f| draw(f, &st)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let cell_fg = |needle: &str| {
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect();
+                if let Some(col) = row.find(needle) {
+                    return buf.cell((col as u16, y)).unwrap().fg;
+                }
+            }
+            panic!("{needle:?} not drawn");
+        };
+        assert_eq!(cell_fg("Push failed"), c(th().error));
+        assert_eq!(cell_fg("remote rejected"), c(th().fg_dim));
+    }
+
+    /// A pinned toast advertises the key that clears it; a fading one doesn't (nothing to press).
+    #[test]
+    fn only_a_pinned_toast_names_its_dismiss_key() {
+        let rows = render_rows(&toast_app(vec![toast(
+            "Push failed",
+            None,
+            crate::app::StatusKind::Error,
+        )]));
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Push failed"))
+            .expect("drawn");
+        assert!(title.contains("Esc"), "pinned toast names Esc: {title:?}");
+
+        let rows = render_rows(&toast_app(vec![toast(
+            "Saved",
+            None,
+            crate::app::StatusKind::Success,
+        )]));
+        let title = rows.iter().find(|r| r.contains("Saved")).expect("drawn");
+        assert!(
+            !title.contains("Esc"),
+            "a self-dismissing toast has no key to name: {title:?}"
+        );
+    }
+
+    /// Two toasts stack upward from the bottom without overlapping, however tall each one is.
+    #[test]
+    fn stacked_toasts_clear_each_other() {
+        let rows = render_rows(&toast_app(vec![
+            toast(
+                "Older",
+                Some("with a detail line"),
+                crate::app::StatusKind::Info,
+            ),
+            toast("Newest", None, crate::app::StatusKind::Success),
+        ]));
+        let older = rows
+            .iter()
+            .position(|r| r.contains("Older"))
+            .expect("drawn");
+        let detail = rows
+            .iter()
+            .position(|r| r.contains("with a detail line"))
+            .expect("drawn");
+        let newest = rows
+            .iter()
+            .position(|r| r.contains("Newest"))
+            .expect("drawn");
+        assert_eq!(detail, older + 1, "the older toast keeps its own two rows");
+        assert!(
+            newest > detail + 1,
+            "the newest sits below it with a gap: {rows:?}"
+        );
     }
 }

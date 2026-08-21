@@ -114,6 +114,10 @@ impl StatusMessage {
             kind: StatusKind::Success,
         }
     }
+    /// Test-only: every runtime error now goes out as a toast with its detail on its own line
+    /// (`Shell::error_detail`), so nothing in the shell constructs an error status any more — but
+    /// the status row still styles one, and its layout tests need one to style.
+    #[cfg(test)]
     pub fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -137,11 +141,18 @@ impl std::fmt::Display for StatusMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub id: u64,
-    pub text: String,
+    /// The headline, drawn in the kind's colour.
+    pub title: String,
+    /// The optional detail line(s) under it, drawn muted and wrapped.
+    pub body: Option<String>,
     pub kind: StatusKind,
     /// Replacement key (see [`aether_client::effect::Effect::Toast`]). A new grouped toast evicts
     /// any existing toast sharing this key instead of stacking. `None` toasts always stack.
     pub group: Option<String>,
+    /// Stays up until dismissed (Esc) rather than fading on its own — see
+    /// [`aether_client::effect::ToastKind::pinned`]. Its expiry timer is only a backstop, so the
+    /// renderer marks it with a dim `Esc` to advertise the way out.
+    pub pinned: bool,
 }
 
 /// Top-level UI state. Anything that exists regardless of whether a buffer is open lives on
@@ -897,7 +908,10 @@ mod tests {
         let file_path = dir.path().join("hello.txt");
         std::fs::write(&file_path, "hi").unwrap();
 
-        assert!(lands_on_last_buffer(None), "no path: land on the last buffer");
+        assert!(
+            lands_on_last_buffer(None),
+            "no path: land on the last buffer"
+        );
         assert!(
             lands_on_last_buffer(Some(dir.path())),
             "a directory browses over what you were last in"

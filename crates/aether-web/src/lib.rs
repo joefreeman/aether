@@ -670,13 +670,22 @@ fn effect_value(e: Effect) -> Value {
             method,
             params,
         } => json!({ "tag": "Request", "token": token, "method": method, "params": params }),
+        // The lifetime policy (`pinned`, `ttlMs`) rides along rather than being re-derived in TS, so
+        // the browser shell can't drift from the native ones on how long a toast lives.
         Effect::Toast {
-            message,
+            title,
+            body,
             kind,
             group,
-        } => {
-            json!({ "tag": "Toast", "message": message, "level": toast_level(kind), "group": group })
-        }
+        } => json!({
+            "tag": "Toast",
+            "title": title,
+            "body": body,
+            "level": toast_level(kind),
+            "group": group,
+            "pinned": kind.pinned(),
+            "ttlMs": kind.ttl().as_millis() as u64,
+        }),
         Effect::WriteClipboard(text) => json!({ "tag": "WriteClipboard", "text": text }),
         Effect::ReadClipboard(paste) => {
             json!({ "tag": "ReadClipboard", "paste": paste_value(&paste) })
@@ -981,13 +990,27 @@ mod tests {
         assert_eq!(reveal["tag"], "RevealCursor");
         assert_eq!(reveal["style"], "jump");
         let toast = effect_value(Effect::Toast {
-            message: "hi".into(),
+            title: "hi".into(),
+            body: Some("the detail".into()),
             kind: ToastKind::Error,
             group: Some("connection".into()),
         });
         assert_eq!(toast["tag"], "Toast");
+        assert_eq!(toast["title"], "hi");
+        assert_eq!(toast["body"], "the detail");
         assert_eq!(toast["level"], "error");
         assert_eq!(toast["group"], "connection");
+        // Errors pin; the TS shell reads the policy off the effect rather than re-deriving it.
+        assert_eq!(toast["pinned"], true);
+        assert_eq!(toast["ttlMs"], 20_000);
+        let info = effect_value(Effect::Toast {
+            title: "hi".into(),
+            body: None,
+            kind: ToastKind::Info,
+            group: None,
+        });
+        assert_eq!(info["body"], Value::Null);
+        assert_eq!(info["pinned"], false);
         let req = effect_value(Effect::Request {
             token: 7,
             method: "cursor/move",

@@ -71,12 +71,25 @@ fn quits(fx: &Effects) -> bool {
     fx.0.iter().any(|e| matches!(e, Effect::Exit))
 }
 
-/// The messages of every toast an update produced, for asserting on wording that carries a
-/// concrete next step ("save first", "switch away first").
+/// The full text of every toast an update produced — title, then body if it has one — for asserting
+/// on wording that carries a concrete next step ("save first", "switch away first"). Flattened
+/// because most assertions care that the words reached the user, not which line they landed on; use
+/// [`toast_parts`] when the split itself is the point.
 fn toast_messages(fx: &Effects) -> Vec<String> {
+    toast_parts(fx)
+        .into_iter()
+        .map(|(title, body)| match body {
+            Some(b) => format!("{title} — {b}"),
+            None => title,
+        })
+        .collect()
+}
+
+/// Every toast's `(title, body)`, unflattened.
+fn toast_parts(fx: &Effects) -> Vec<(String, Option<String>)> {
     fx.0.iter()
         .filter_map(|e| match e {
-            Effect::Toast { message, .. } => Some(message.clone()),
+            Effect::Toast { title, body, .. } => Some((title.clone(), body.clone())),
             _ => None,
         })
         .collect()
@@ -92,6 +105,48 @@ fn has_error_toast(fx: &Effects) -> bool {
             }
         )
     })
+}
+
+/// The lifetime policy lives on the kind so all three shells read it from one place. Errors are the
+/// ones that pin — they carry detail worth reading and are rare enough to hold the corner — and a
+/// pinned toast still expires eventually so a forgotten one can't sit there forever.
+#[test]
+fn only_errors_pin_and_every_kind_outlives_a_glance() {
+    assert!(ToastKind::Error.pinned());
+    for kind in [ToastKind::Info, ToastKind::Success, ToastKind::Warning] {
+        assert!(!kind.pinned(), "{kind:?} must not pin");
+    }
+    assert!(
+        ToastKind::Error.ttl() > ToastKind::Warning.ttl(),
+        "a pinned error's backstop outlasts a warning"
+    );
+    assert!(
+        ToastKind::Warning.ttl() > ToastKind::Info.ttl(),
+        "a warning is a sentence to finish; an info is read at a glance"
+    );
+    assert_eq!(ToastKind::Info.ttl(), ToastKind::Success.ttl());
+}
+
+/// A body built from a formatted error can come back blank (a server that failed with nothing to
+/// say). Rendering that would leave a dangling empty line under the title, so it degrades to a
+/// title-only toast.
+#[test]
+fn a_blank_toast_body_degrades_to_a_plain_toast() {
+    assert_eq!(
+        toast_parts(&Effects::error_detail("Save failed", "")),
+        vec![("Save failed".to_string(), None)]
+    );
+    assert_eq!(
+        toast_parts(&Effects::error_detail("Save failed", "   ")),
+        vec![("Save failed".to_string(), None)]
+    );
+    assert_eq!(
+        toast_parts(&Effects::error_detail("Save failed", "permission denied")),
+        vec![(
+            "Save failed".to_string(),
+            Some("permission denied".to_string())
+        )]
+    );
 }
 
 #[test]
@@ -2229,10 +2284,14 @@ fn app_info_failure_toasts_rather_than_opening() {
     let mut s = session();
     let fx = s.on_event(Event::AppInfoLoaded(Err("server gone".into())));
     assert!(s.prompt.is_none());
-    assert!(fx.0.iter().any(|e| matches!(
-        e,
-        aether_client::effect::Effect::Toast { message, .. } if message.contains("server gone")
-    )));
+    // Titled by what failed, with the server's own words as the detail line.
+    assert_eq!(
+        toast_parts(&fx),
+        vec![(
+            "App info failed".to_string(),
+            Some("server gone".to_string())
+        )]
+    );
 }
 
 fn app_info() -> aether_protocol::app::AppInfo {
@@ -2331,7 +2390,7 @@ fn lsp_info_restart_is_ctrl_r_not_plain_r() {
 /// The `(message, group)` of the first toast in `fx`, if any.
 fn first_toast(fx: &Effects) -> Option<(String, Option<String>)> {
     fx.0.iter().find_map(|e| match e {
-        Effect::Toast { message, group, .. } => Some((message.clone(), group.clone())),
+        Effect::Toast { title, group, .. } => Some((title.clone(), group.clone())),
         _ => None,
     })
 }
@@ -2472,7 +2531,7 @@ fn repeat_prone_toasts_carry_a_group_so_they_coalesce_on_every_shell() {
     assert_eq!(
         first_toast(&fx),
         Some((
-            "No jumplist entries in this file — ] steps across files".into(),
+            "No jumplist entries in this file".into(),
             Some("jumplist".into())
         )),
     );
@@ -4703,8 +4762,12 @@ fn blocked_checkout_tells_the_user_to_save() {
     });
     let toasted = toast_messages(&fx).join(" | ");
     assert!(
-        toasted.contains("2 unsaved") && toasted.contains("Space s"),
+        toasted.contains("2 unsaved") && toasted.to_lowercase().contains("save first"),
         "names the count and the way out, got: {toasted}"
+    );
+    assert!(
+        !toasted.contains("Space"),
+        "…as an act, not a chord that goes stale when the keymap moves: {toasted}"
     );
 }
 
@@ -4844,19 +4907,10 @@ fn workspaces_delete_confirms_then_deletes_and_guards_active() {
                 .into(),
         }),
     );
-    let msg =
-        fx.0.iter()
-            .find_map(|e| match e {
-                Effect::Toast {
-                    message: m,
-                    kind: ToastKind::Error,
-                    ..
-                } => Some(m.clone()),
-                _ => None,
-            })
-            .expect("an error toast");
+    // Titled by the act that failed, with the tailored sentence as the detail line under it.
+    let msg = toast_messages(&fx).join(" ");
     assert!(
-        msg.contains("another window"),
+        msg.contains("delete") && msg.contains("another window"),
         "tailored message, got {msg:?}"
     );
     assert!(!msg.contains("RPC"), "no raw RpcError prefix, got {msg:?}");
@@ -5266,7 +5320,7 @@ fn tab_triggers_hover() {
 fn info_toast(fx: &Effects) -> Option<String> {
     fx.0.iter().find_map(|e| match e {
         Effect::Toast {
-            message: m,
+            title: m,
             kind: ToastKind::Info,
             ..
         } => Some(m.clone()),
@@ -5575,7 +5629,10 @@ fn a_finished_fetch_reports_what_it_found() {
         behind: 0,
     })));
     assert!(
-        toast_messages(&fx).join(" ").contains("up to date"),
+        toast_messages(&fx)
+            .join(" ")
+            .to_lowercase()
+            .contains("up to date"),
         "level with upstream is its own message"
     );
 
@@ -5838,12 +5895,22 @@ fn push_outcomes_name_their_next_step() {
     })));
     let msg = toast_messages(&fx).join(" ");
     assert!(
-        msg.contains('3') && msg.contains("fetch"),
+        msg.contains('3') && msg.to_lowercase().contains("fetch"),
         "behind should name the gap and the next step, got {msg:?}"
     );
     assert!(!has_error_toast(&fx), "this is actionable, not an error");
+    // …and the split puts the gap in the title with the next step under it, rather than running
+    // both together on one line.
+    assert_eq!(
+        toast_parts(&fx),
+        vec![(
+            "3 behind origin/main".to_string(),
+            Some("Fetch and merge first".to_string())
+        )]
+    );
 
-    // Anything git refused for a reason we didn't classify keeps its own words.
+    // Anything git refused for a reason we didn't classify keeps its own words — as the detail
+    // line, under a title naming what was refused.
     let fx = s.on_event(Event::PushDone(Ok(GitPushResult {
         status: GitPushStatus::Refused,
         message: "remote: protected branch".into(),
@@ -5851,7 +5918,13 @@ fn push_outcomes_name_their_next_step() {
         set_upstream: false,
     })));
     assert!(has_error_toast(&fx));
-    assert!(toast_messages(&fx).join(" ").contains("protected branch"));
+    assert_eq!(
+        toast_parts(&fx),
+        vec![(
+            "Push refused".to_string(),
+            Some("remote: protected branch".to_string())
+        )]
+    );
 }
 
 /// `Alt-f` is pull, and it must not collide with plain `f` (fetch) — the two differ only by the
@@ -5977,7 +6050,10 @@ fn pull_outcomes_name_what_happened_to_local_history() {
         ..Default::default()
     })));
     let msg = toast_messages(&fx).join(" ");
-    assert!(msg.contains("push"), "points at the fix: {msg}");
+    assert!(
+        msg.to_lowercase().contains("push"),
+        "points at the fix: {msg}"
+    );
     assert!(!msg.contains("Space"), "without naming a key: {msg}");
 
     // The pre-flight refusal points at saving, exactly as checkout's does.
@@ -5986,7 +6062,10 @@ fn pull_outcomes_name_what_happened_to_local_history() {
         blocked: vec![4],
         ..Default::default()
     })));
-    assert!(toast_messages(&fx).join(" ").contains("save first"));
+    assert!(toast_messages(&fx)
+        .join(" ")
+        .to_lowercase()
+        .contains("save first"));
 
     // Anything we didn't classify keeps git's own words.
     let fx = s.on_event(Event::PullDone(Ok(GitPullResult {
@@ -6055,7 +6134,7 @@ fn pull_reports_a_repo_left_mid_operation() {
     })));
     let msg = toast_messages(&fx).join(" ");
     assert!(
-        msg.contains("merging") && msg.contains("abort"),
+        msg.contains("merging") && msg.to_lowercase().contains("abandon"),
         "got {msg:?}"
     );
 
@@ -6099,7 +6178,7 @@ fn staging_a_conflicted_file_explains_the_refusal() {
 
     let msg = toast(&mut s, ApplyHunkStatus::Conflicted);
     assert!(
-        msg.contains("Conflicted") && msg.contains("resolve"),
+        msg.contains("Conflicted") && msg.to_lowercase().contains("resolve"),
         "got {msg:?}"
     );
     // The two outcomes of the whole-file key on a conflicted path.
@@ -6133,7 +6212,7 @@ fn resolving_a_conflict_names_the_side_and_what_remains() {
     // Positional wording, matching the keys: "theirs" is exactly the word that would be wrong
     // mid-rebase, where the bottom section holds the user's own commit.
     assert!(
-        msg.contains("bottom section") && msg.contains("2 left"),
+        msg.contains("bottom section") && msg.contains("2 conflicts left"),
         "got {msg:?}"
     );
     assert!(
@@ -6148,7 +6227,9 @@ fn resolving_a_conflict_names_the_side_and_what_remains() {
     }))
     .join(" ");
     assert!(
-        msg.contains("both sections") && msg.contains("2 conflicts") && msg.contains("none left"),
+        msg.contains("both sections")
+            && msg.contains("2 conflicts")
+            && msg.contains("No conflicts left"),
         "got {msg:?}"
     );
 
@@ -8555,9 +8636,8 @@ fn hints_intro_teaches_dismiss_then_toggle() {
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0]["hints"], json!(false));
     assert!(
-        fx.0.iter().any(
-            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints disabled"))
-        ),
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast { title, .. } if title.contains("Hints disabled"))),
         "turning hints off is confirmed with a toast"
     );
 }
@@ -8613,9 +8693,8 @@ fn hints_space_alt_h_toggles_and_persists() {
         "the flip persists"
     );
     assert!(
-        fx.0.iter().any(
-            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints disabled"))
-        ),
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast { title, .. } if title.contains("Hints disabled"))),
         "turning hints off is confirmed with a toast"
     );
 
@@ -8627,9 +8706,8 @@ fn hints_space_alt_h_toggles_and_persists() {
     assert_eq!(method, "settings/set");
     assert_eq!(params["hints"], json!(true));
     assert!(
-        fx.0.iter().any(
-            |e| matches!(e, Effect::Toast { message, .. } if message.contains("Hints enabled"))
-        ),
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Toast { title, .. } if title.contains("Hints enabled"))),
         "turning hints back on is confirmed too"
     );
 }
@@ -8751,8 +8829,8 @@ fn hints_state_fetch_failure_is_loud() {
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
-            Effect::Toast { message, kind: ToastKind::Warning, .. }
-                if message.contains("restart the Aether server")
+            Effect::Toast { title, body: Some(body), kind: ToastKind::Warning, .. }
+                if title.contains("Hints unavailable") && body.contains("Restart the Aether server")
         )),
         "a failed hints snapshot fetch must say so"
     );
@@ -10069,7 +10147,7 @@ fn read_ctrl_h_l_change_depth_and_refusals_toast_only_with_reason() {
     assert!(fx
         .0
         .iter()
-        .any(|e| matches!(e, Effect::Toast { message, .. } if message.contains("Depth"))),);
+        .any(|e| matches!(e, Effect::Toast { title, .. } if title.contains("Depth"))),);
     // …a quiet boundary no-op doesn't.
     let fx = s.on_event(refusal(None));
     assert!(!fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
@@ -10904,13 +10982,10 @@ fn space_g_c_prepares_a_commit_and_alt_x_commits_it() {
         })),
     );
     assert!(s.pending_commit.is_none(), "the commit is done");
-    let toast =
-        fx.0.iter()
-            .find_map(|e| match e {
-                Effect::Toast { message, .. } => Some(message.clone()),
-                _ => None,
-            })
-            .expect("a toast reports the commit");
+    let toast = toast_messages(&fx)
+        .first()
+        .cloned()
+        .expect("a toast reports the commit");
     assert!(toast.contains("a1b2c3d"), "short hash: {toast}");
     assert!(toast.contains("Add a line"), "subject only: {toast}");
     assert!(!toast.contains("Body."), "not the whole message: {toast}");
@@ -10933,7 +11008,7 @@ fn preparing_a_commit_with_nothing_staged_opens_no_buffer() {
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
-            Effect::Toast { message, .. } if message.contains("Nothing staged")
+            Effect::Toast { title, .. } if title.contains("Nothing staged")
         )),
         "the user is told why nothing happened"
     );
@@ -10982,9 +11057,10 @@ fn a_refused_commit_keeps_the_message_buffer_open() {
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
-            Effect::Toast { message, .. } if message.contains("lint failed: tabs everywhere")
+            Effect::Toast { title, body: Some(body), .. }
+                if title == "Commit refused" && body.contains("lint failed: tabs everywhere")
         )),
-        "git's own words, unedited"
+        "git's own words, unedited — as the detail under a title naming the refusal"
     );
 }
 
@@ -11070,7 +11146,7 @@ fn space_g_c_again_resumes_the_message_instead_of_overwriting_it() {
     assert!(no_request(&fx), "no second prepare");
     assert!(fx.0.iter().any(|e| matches!(
         e,
-        Effect::Toast { message, .. } if message.contains("Already writing")
+        Effect::Toast { title, .. } if title.contains("Already writing")
     )));
 
     // From another buffer: switch back to it by id, still without re-preparing.
@@ -11212,13 +11288,10 @@ fn space_g_z_uncommits_and_names_what_came_back() {
             }],
         })),
     );
-    let toast =
-        fx.0.iter()
-            .find_map(|e| match e {
-                Effect::Toast { message, .. } => Some(message.clone()),
-                _ => None,
-            })
-            .expect("a toast reports the uncommit");
+    let toast = toast_messages(&fx)
+        .first()
+        .cloned()
+        .expect("a toast reports the uncommit");
     assert!(toast.contains("Add a line"), "names the commit: {toast}");
     assert!(
         toast.contains("staged"),
@@ -11239,7 +11312,7 @@ fn uncommitting_with_no_parent_shows_gits_refusal() {
     );
     assert!(fx.0.iter().any(|e| matches!(
         e,
-        Effect::Toast { message, kind, .. }
-            if message.contains("ambiguous argument") && *kind == ToastKind::Warning
+        Effect::Toast { body: Some(body), kind, .. }
+            if body.contains("ambiguous argument") && *kind == ToastKind::Warning
     )));
 }

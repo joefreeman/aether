@@ -224,10 +224,17 @@ interface CoreEffect {
   token?: number;
   method?: string;
   params?: unknown;
-  message?: string;
+  /** Toast headline, shown in the level's colour. */
+  title?: string;
+  /** Toast detail line, shown muted under the title. */
+  body?: string | null;
   level?: ToastLevel;
   /** Toast replacement key: a grouped toast replaces any existing toast with the same key. */
   group?: string | null;
+  /** Toast lifetime policy, decided by the core (`ToastKind::pinned` / `::ttl`) so all three
+   *  shells agree: a pinned toast stays until dismissed and `ttlMs` is only its backstop. */
+  pinned?: boolean;
+  ttlMs?: number;
   text?: string;
   paste?: unknown;
   action?: ShellActionDesc;
@@ -1057,6 +1064,12 @@ export class Shell {
     string,
     { el: HTMLElement; fade: number; remove: number }
   >();
+  /** Toasts that stay up until dismissed (errors) → the node and its backstop timers. Esc clears
+   *  every one of them; a click clears just the one. */
+  private readonly pinnedToasts = new Map<
+    HTMLElement,
+    { fade: number; remove: number }
+  >();
   private readonly connBanner: HTMLElement;
   /** The hint corner. */
   private readonly hintEl: HTMLElement;
@@ -1699,6 +1712,16 @@ export class Shell {
     window.addEventListener("mousemove", (e) => this.onMouseMove(e));
     window.addEventListener("mouseup", () => this.onMouseUp());
     window.addEventListener("resize", () => this.onResize());
+    // Esc clears any pinned (error) toast from anywhere. Capture phase, so it fires even when an
+    // overlay input handles the key and stops it propagating; non-consuming, so Esc goes on to do
+    // its usual job (leaving insert, closing an overlay) rather than silently meaning "dismiss".
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.key === "Escape") this.dismissPinnedToasts();
+      },
+      true,
+    );
     window.addEventListener("keydown", (e) => this.onKeyDown(e));
     // The hint engine's clock: a slow tick while the tab is visible and the session connected. The
     // engine's own idle gate covers an unattended-but-visible tab.
@@ -1773,7 +1796,9 @@ export class Shell {
       }
       const name = specified ?? list.workspaces[0]?.name;
       if (!name) {
-        this.toast("No workspaces configured on the server.", "error");
+        this.toast("No workspaces configured", "error", {
+          body: "The server has none to open",
+        });
         return;
       }
       const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
@@ -1800,7 +1825,7 @@ export class Shell {
             ...(jump ? { jump_to: jump } : {}),
           });
         } catch {
-          this.toast(`Could not open ${urlFile}`, "warning");
+          this.toast(`Couldn't open ${urlFile}`, "warning");
           open = await lastOrScratch();
         }
       } else if (urlBuffer != null) {
@@ -1837,7 +1862,7 @@ export class Shell {
       }
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
-      this.toast(`Bootstrap failed: ${String(e)}`, "error");
+      this.toast("Startup failed", "error", { body: String(e) });
     }
   }
 
@@ -2173,7 +2198,7 @@ export class Shell {
       this.runEffects(this.session.startup() as CoreEffect[]);
       this.capture.focus();
     } catch (e) {
-      this.toast(`Reconnect failed: ${String(e)}`, "error");
+      this.toast("Reconnect failed", "error", { body: String(e) });
     }
   }
 
@@ -2194,7 +2219,12 @@ export class Shell {
           this.sendRequest(e.token!, e.method!, e.params);
           break;
         case "Toast":
-          this.toast(e.message ?? "", e.level ?? "info", e.group ?? undefined);
+          this.toast(e.title ?? "", e.level ?? "info", {
+            body: e.body ?? undefined,
+            group: e.group ?? undefined,
+            pinned: e.pinned,
+            ttlMs: e.ttlMs,
+          });
           break;
         case "RevealCursor":
           void this.ensureCursorVisible(e.style === "jump" ? "jump" : "follow");
@@ -5023,7 +5053,19 @@ export class Shell {
 
   // ---- toasts ---------------------------------------------------------------------------------
 
-  private toast(message: string, kind: ToastLevel = "info", group?: string): void {
+  /** Raise a toast: `title` in the level's colour, an optional muted `body` under it.
+   *
+   *  Lifetime comes from the core (`opts.pinned` / `opts.ttlMs`), so the three shells can't drift:
+   *  an ordinary toast fades out over its TTL, a pinned one (errors) stays until it's dismissed —
+   *  Esc clears every pinned toast, a click clears the one clicked — with the TTL as a backstop so
+   *  a forgotten error can't sit in the corner forever. */
+  private toast(
+    title: string,
+    kind: ToastLevel = "info",
+    opts: { body?: string; group?: string; pinned?: boolean; ttlMs?: number } = {},
+  ): void {
+    const { body, group, pinned = false } = opts;
+    const ttl = opts.ttlMs ?? 3600;
     // A grouped toast replaces any live toast with the same key (cancelling its timers and removing
     // its node), so an evolving status — LSP restart → ready, the diff toggle — updates one toast in
     // place rather than stacking. Mirrors the native shells' group replacement.
@@ -5032,19 +5074,65 @@ export class Shell {
       if (prev) {
         window.clearTimeout(prev.fade);
         window.clearTimeout(prev.remove);
-        prev.el.remove();
+        this.removeToast(prev.el);
       }
     }
     const t = document.createElement("div");
-    t.className = `toast ${kind}`;
-    t.textContent = message;
+    t.className = `toast ${kind}${pinned ? " pinned" : ""}`;
+    const titleEl = document.createElement("div");
+    titleEl.className = "toast-title";
+    titleEl.textContent = title;
+    if (pinned) {
+      // Names the way out, quietly — the toast holds the corner until it's pressed.
+      const key = document.createElement("span");
+      key.className = "toast-dismiss";
+      key.textContent = "Esc";
+      titleEl.append(key);
+    }
+    t.append(titleEl);
+    if (body) {
+      const bodyEl = document.createElement("div");
+      bodyEl.className = "toast-body";
+      bodyEl.textContent = body;
+      t.append(bodyEl);
+    }
+    if (pinned) {
+      // Clicking a held toast is the pointer twin of Esc. `.pinned` re-enables pointer events,
+      // which the stack turns off so ordinary toasts never eat a click meant for the editor.
+      t.addEventListener("click", () => this.removeToast(t));
+    }
     this.toastsEl.append(t);
-    const fade = window.setTimeout(() => t.classList.add("fade"), 3000);
+    // The fade is the last 600ms of the toast's life, so a longer TTL holds it solid for longer
+    // rather than fading it earlier.
+    const fade = window.setTimeout(() => t.classList.add("fade"), Math.max(0, ttl - 600));
     const remove = window.setTimeout(() => {
-      t.remove();
+      this.removeToast(t);
       if (group && this.toastGroups.get(group)?.el === t) this.toastGroups.delete(group);
-    }, 3600);
+    }, ttl);
     if (group) this.toastGroups.set(group, { el: t, fade, remove });
+    if (pinned) this.pinnedToasts.set(t, { fade, remove });
+  }
+
+  /** Take a toast off the screen, cancelling its pending timers and forgetting its bookkeeping. */
+  private removeToast(t: HTMLElement): void {
+    const timers = this.pinnedToasts.get(t);
+    if (timers) {
+      window.clearTimeout(timers.fade);
+      window.clearTimeout(timers.remove);
+      this.pinnedToasts.delete(t);
+    }
+    // A dismissed toast must not stay in the group map: the next toast on that key would otherwise
+    // "replace" a node that is already gone (and, for a pinned one, whose timers were cancelled).
+    for (const [key, live] of this.toastGroups) {
+      if (live.el === t) this.toastGroups.delete(key);
+    }
+    t.remove();
+  }
+
+  /** Clear every pinned toast — the Esc path. Non-consuming: Esc goes on to do its usual job
+   *  (leaving insert, closing an overlay), so the key never silently means only "dismiss". */
+  private dismissPinnedToasts(): void {
+    for (const t of [...this.pinnedToasts.keys()]) this.removeToast(t);
   }
 }
 

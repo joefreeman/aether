@@ -434,17 +434,49 @@ html, body, #app {
   border-left-width: 3px;
   border-radius: 4px;
   padding: 6px 12px;
-  max-width: calc(var(--ui-font-size) * 420 / 13);
+  /* Half the viewport, floored and capped (and font-scaled): a toast never dominates the window,
+     a long error never runs the width of an ultrawide display, and a narrow window still gets a
+     readable line. The TUI's `toast_text_width` and the GUI's `toast_max_width` mirror this. */
+  max-width: clamp(
+    min(90vw, calc(var(--ui-font-size) * 260 / 13)),
+    50vw,
+    calc(var(--ui-font-size) * 560 / 13)
+  );
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   transition: opacity 0.4s ease;
   /* Sans-serif like the rest of the chrome (popovers, status), not the editor's monospace. */
   font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow-wrap: anywhere; /* a long unbroken path/URL wraps instead of widening the card */
 }
 .toast.fade { opacity: 0; }
+/* The title carries the intent (colour + weight); the detail under it reads as secondary. */
+.toast-title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-weight: 600;
+}
+.toast-body {
+  color: var(--fg-dim);
+  margin-top: 2px;
+}
+/* The dismiss key on a pinned toast: present, not loud. */
+.toast-dismiss {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-size: var(--ui-small);
+  font-weight: 400;
+}
+/* Pinned toasts are clickable (the pointer twin of Esc); the stack itself stays click-through. */
+.toast.pinned { pointer-events: auto; cursor: pointer; }
 .toast.error { border-left-color: var(--error); }
+.toast.error .toast-title { color: var(--error); }
 .toast.warning { border-left-color: var(--warning); }
+.toast.warning .toast-title { color: var(--warning); }
 .toast.success { border-left-color: var(--ok); }
+.toast.success .toast-title { color: var(--ok); }
 .toast.info { border-left-color: var(--info); }
+.toast.info .toast-title { color: var(--info); }
 
 /* Connection banner — top-center, above everything; amber while reconnecting, red when given up. */
 #conn-banner {

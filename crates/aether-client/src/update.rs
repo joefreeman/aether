@@ -514,18 +514,20 @@ impl Session {
                 self.install_staged_read()
                     .and(Effects::one(Effect::RevealCursor(RevealStyle::Follow)))
             }
-            Event::CursorMsg(Err(e)) => self.install_staged_read().and(Effects::error(e)),
+            Event::CursorMsg(Err(e)) => self
+                .install_staged_read()
+                .and(Effects::error_detail("Move failed", e)),
 
             // Go-to-line and other targeted motions reveal as a jump (rest a quarter down).
             Event::CursorJump(Ok(cursor)) => self.jump_to_cursor(cursor),
-            Event::CursorJump(Err(e)) => Effects::error(e),
+            Event::CursorJump(Err(e)) => Effects::error_detail("Jump failed", e),
 
             Event::EditDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
                 self.buffer.cursor = r.cursor;
                 Effects::one(Effect::RevealCursor(RevealStyle::Follow))
             }
-            Event::EditDone(Err(e)) => Effects::error(e),
+            Event::EditDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
             Event::UndoRedoDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
@@ -544,7 +546,7 @@ impl Session {
                 // push arrives too).
                 fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
             }
-            Event::UndoRedoDone(Err(e)) => Effects::error(e),
+            Event::UndoRedoDone(Err(e)) => Effects::error_detail("Undo/redo failed", e),
 
             Event::BlockEditDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
@@ -567,7 +569,7 @@ impl Session {
                 // own response, exactly like undo (revisions identify states, `!=` guard).
                 fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
             }
-            Event::BlockEditDone(Err(e)) => Effects::error(e),
+            Event::BlockEditDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
             Event::OpenBlockDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
@@ -590,7 +592,7 @@ impl Session {
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
-            Event::OpenBlockDone(Err(e)) => Effects::error(e),
+            Event::OpenBlockDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
             // Opening replaces whatever prompt was up: `Space ?` is only reachable from Normal mode
             // via the leader, so nothing that owns the keyboard can be underneath it.
@@ -598,7 +600,7 @@ impl Session {
                 self.prompt = Some(Prompt::AppInfo(Some(Box::new(info))));
                 Effects::none()
             }
-            Event::AppInfoLoaded(Err(e)) => Effects::error(format!("App info failed: {e}")),
+            Event::AppInfoLoaded(Err(e)) => Effects::error_detail("App info failed", e),
 
             Event::CopyDone(Ok(r)) => {
                 let mut fx =
@@ -606,7 +608,7 @@ impl Session {
                 fx.push(Effect::WriteClipboard(r.text));
                 fx
             }
-            Event::CopyDone(Err(e)) => Effects::error(format!("Copy failed: {e}")),
+            Event::CopyDone(Err(e)) => Effects::error_detail("Copy failed", e),
 
             Event::CutDone(Ok(r)) => {
                 self.buffer.revision = r.revision;
@@ -617,7 +619,7 @@ impl Session {
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
-            Event::CutDone(Err(e)) => Effects::error(format!("Cut failed: {e}")),
+            Event::CutDone(Err(e)) => Effects::error_detail("Cut failed", e),
 
             Event::ClipboardRead(kind, text) => {
                 let Some(text) = text.filter(|t| !t.is_empty()) else {
@@ -641,7 +643,7 @@ impl Session {
                 // A failed jump-shaped open must not leave its flag armed for the next
                 // (unrelated) switch — it would wrongly land a markdown file in the editor.
                 self.open_route_jumped = false;
-                Effects::error(e)
+                Effects::error_detail("Open failed", e)
             }
 
             Event::ReadContent(Ok(c)) => {
@@ -683,7 +685,7 @@ impl Session {
                 if self.read.take().is_some() && self.mode == Mode::Read {
                     self.mode = Mode::Normal;
                 }
-                Effects::error(format!("Reading view failed to load: {e}"))
+                Effects::error_detail("Reading view failed to load", e)
             }
 
             Event::ReadHighlights {
@@ -722,17 +724,17 @@ impl Session {
                 )
             }
             Event::EphemeralClosed(Ok(None)) => self.leave_ephemeral_workspace(),
-            Event::EphemeralClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
+            Event::EphemeralClosed(Err(e)) => Effects::error_detail("Close failed", e),
 
             // The tether closed cleanly — the quick edit this client was launched for is over.
             Event::TetherClosed(Ok(())) => Effects::one(Effect::Exit),
-            Event::TetherClosed(Err(e)) => Effects::error(format!("Close failed: {e}")),
+            Event::TetherClosed(Err(e)) => Effects::error_detail("Close failed", e),
             Event::TetherReleased(Ok(_)) => {
                 self.tether = None;
                 // Same toast group as the plain keep toggle, so repeated presses update in place.
                 Effects::toast_grouped("Tether released", ToastKind::Success, "transient")
             }
-            Event::TetherReleased(Err(e)) => Effects::error(format!("Keep toggle failed: {e}")),
+            Event::TetherReleased(Err(e)) => Effects::error_detail("Release failed", e),
 
             // Captured: swap the source picker for the Jumplist picker, framed on the row that
             // was highlighted at capture time (its `index` in the new list) — Enter from here jumps
@@ -767,7 +769,7 @@ impl Session {
             Event::JumplistCaptured(Ok(None), _) => {
                 Effects::toast_grouped("Nothing to capture", ToastKind::Info, "jumplist")
             }
-            Event::JumplistCaptured(Err(e), _) => Effects::error(format!("Capture failed: {e}")),
+            Event::JumplistCaptured(Err(e), _) => Effects::error_detail("Capture failed", e),
 
             Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
                 Some(open) => {
@@ -800,7 +802,7 @@ impl Session {
             // instead cross into another file.
             Event::JumplistStepped(Ok(JumplistStepResult::NoneInFile), _, _) => {
                 Effects::toast_grouped(
-                    "No jumplist entries in this file — ] steps across files",
+                    "No jumplist entries in this file",
                     ToastKind::Info,
                     "jumplist",
                 )
@@ -809,7 +811,7 @@ impl Session {
             Event::JumplistStepped(Ok(JumplistStepResult::Empty), _, _) => {
                 Effects::toast_grouped("Jumplist is empty", ToastKind::Info, "jumplist")
             }
-            Event::JumplistStepped(Err(e), _, _) => Effects::error(e),
+            Event::JumplistStepped(Err(e), _, _) => Effects::error_detail("Jump failed", e),
 
             Event::PromptAccept => self.accept_prompt(),
             Event::PromptCancel => self.decline_prompt(),
@@ -845,13 +847,13 @@ impl Session {
                 self.search.summary = Some(r.summary);
                 Effects::none()
             }
-            Event::SearchRestored(Err(e)) => Effects::error(e),
+            Event::SearchRestored(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::SearchNav(Ok(r)) => {
                 self.search.summary = Some(r.summary);
                 self.jump_to_cursor(r.cursor)
             }
-            Event::SearchNav(Err(e)) => Effects::error(e),
+            Event::SearchNav(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::SneakUpdated(Ok(result)) => {
                 // The session may have ended (label pressed, Esc) before this result landed; only
@@ -861,7 +863,7 @@ impl Session {
                 }
                 Effects::none()
             }
-            Event::SneakUpdated(Err(e)) => Effects::error(e),
+            Event::SneakUpdated(Err(e)) => Effects::error_detail("Sneak failed", e),
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
                 self.search.query = query.clone();
@@ -874,7 +876,7 @@ impl Session {
                 self.record_history(HistoryKind::Search, entry)
             }
             Event::SearchFromSel(Ok(None)) => Effects::none(), // empty selection
-            Event::SearchFromSel(Err(e)) => Effects::error(e),
+            Event::SearchFromSel(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::NavDone { forward, result } => match result {
                 // Same-buffer step glides, cross-buffer step switches — see `adopt_navigation`.
@@ -889,11 +891,11 @@ impl Session {
                     ToastKind::Info,
                     "nav-history",
                 ),
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Navigation failed", e),
             },
 
             Event::Definition(Ok(r)) => match lsp_readiness_message(r.readiness) {
-                Some(msg) => Effects::toast(msg, ToastKind::Info),
+                Some((msg, why)) => Effects::toast_detail(msg, why, ToastKind::Info),
                 None => match r.location {
                     Some(location) => {
                         // Land the identifier selected (anchor at its start, cursor on its last
@@ -906,10 +908,10 @@ impl Session {
                     None => Effects::toast("No definition found", ToastKind::Info),
                 },
             },
-            Event::Definition(Err(e)) => Effects::error(e),
+            Event::Definition(Err(e)) => Effects::error_detail("Go to definition failed", e),
 
             Event::DiagNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more diagnostics"),
-            Event::DiagNav(Err(e)) => Effects::error(e),
+            Event::DiagNav(Err(e)) => Effects::error_detail("Diagnostic navigation failed", e),
 
             Event::HoverInfo(Ok(r)) => match r.contents {
                 // Render per the server-reported kind: Markdown as Markdown, plaintext literally
@@ -926,17 +928,19 @@ impl Session {
                 // No content: say *why* — a server still starting / crashed isn't the same as a
                 // ready server that simply has nothing here ("No hover info").
                 None => {
-                    let msg = lsp_readiness_message(r.readiness).unwrap_or("No hover info");
+                    let (msg, why) =
+                        lsp_readiness_message(r.readiness).unwrap_or(("No hover info", ""));
                     let mut fx = Effects::one(Effect::DismissHover);
                     fx.push(Effect::Toast {
-                        message: msg.into(),
+                        title: msg.into(),
+                        body: (!why.is_empty()).then(|| why.to_string()),
                         kind: ToastKind::Info,
                         group: None,
                     });
                     fx
                 }
             },
-            Event::HoverInfo(Err(e)) => Effects::error(format!("Hover failed: {e}")),
+            Event::HoverInfo(Err(e)) => Effects::error_detail("Hover failed", e),
 
             Event::FormatDone(Ok(r)) => {
                 self.buffer.cursor = r.cursor;
@@ -958,7 +962,7 @@ impl Session {
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 fx
             }
-            Event::FormatDone(Err(e)) => Effects::error(format!("Format failed: {e}")),
+            Event::FormatDone(Err(e)) => Effects::error_detail("Format failed", e),
 
             Event::CommitLookup(Ok(CommitDetails::Info(info))) => {
                 // Mirror `git show`'s header: commit / Author / Date, blank line, message.
@@ -974,21 +978,19 @@ impl Session {
             Event::CommitLookup(Ok(CommitDetails::Note(note))) => {
                 Effects::toast(note, ToastKind::Info)
             }
-            Event::CommitLookup(Err(e)) => Effects::error(format!("Commit info failed: {e}")),
+            Event::CommitLookup(Err(e)) => Effects::error_detail("Commit info failed", e),
 
             Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more changes"),
-            Event::HunkNav(Err(e)) => Effects::error(e),
+            Event::HunkNav(Err(e)) => Effects::error_detail("Change navigation failed", e),
 
             Event::CommitPrepared { amend, result } => match result {
                 Ok(prepared) => {
                     // Conflicts outstanding: git would refuse this commit, so nothing was prepared.
                     // Named files, because "resolve them" is only actionable if you know which.
                     if !prepared.blocked_by_conflicts.is_empty() {
-                        return Effects::toast(
-                            format!(
-                                "Still conflicted: {}",
-                                name_a_few(&prepared.blocked_by_conflicts)
-                            ),
+                        return Effects::toast_detail(
+                            "Still conflicted",
+                            name_a_few(&prepared.blocked_by_conflicts),
                             ToastKind::Warning,
                         );
                     }
@@ -999,10 +1001,10 @@ impl Session {
                         return Effects::toast("Nothing staged to commit", ToastKind::Info);
                     }
                     let summary = if amend {
-                        "Amending — write the message, then close this buffer".to_string()
+                        "Amending".to_string()
                     } else {
                         format!(
-                            "Committing {} file{} — write the message, then close this buffer",
+                            "Committing {} file{}",
                             prepared.staged.len(),
                             if prepared.staged.len() == 1 { "" } else { "s" }
                         )
@@ -1027,13 +1029,14 @@ impl Session {
                         amend,
                     });
                     fx.push(Effect::Toast {
-                        message: summary,
+                        title: summary,
+                        body: Some("Write the message, then close this buffer".into()),
                         kind: ToastKind::Info,
                         group: None,
                     });
                     fx
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Commit failed", e),
             },
 
             Event::Committed(result) => match result {
@@ -1065,19 +1068,18 @@ impl Session {
                             // What the commit *concluded*, when it was part of something bigger.
                             // A rebase that stopped again is the case worth spelling out: the
                             // commit worked, and there is more to resolve before it's over.
-                            let message = match (&res.operation, res.conflicts.is_empty()) {
+                            let detail = match (&res.operation, res.conflicts.is_empty()) {
                                 (Some(op), false) => format!(
-                                    "Committed {short} — {} stopped at {}",
+                                    "{} stopped at {}",
                                     op.noun(),
                                     name_a_few(&res.conflicts)
                                 ),
-                                (Some(op), true) => {
-                                    format!("Committed {short} — finished the {}", op.noun())
-                                }
-                                (None, _) => format!("Committed {short} — {subject}"),
+                                (Some(op), true) => format!("finished the {}", op.noun()),
+                                (None, _) => subject,
                             };
                             fx.push(Effect::Toast {
-                                message,
+                                title: format!("Committed {short}"),
+                                body: Some(detail),
                                 kind: if res.conflicts.is_empty() {
                                     ToastKind::Success
                                 } else {
@@ -1089,11 +1091,14 @@ impl Session {
                         }
                         // A refusal keeps the buffer open with the message intact: a failing
                         // `pre-commit` hook is something you fix and retry, not something that
-                        // should cost you what you wrote. git's own words, unedited.
-                        None => Effects::toast(res.message, ToastKind::Warning),
+                        // should cost you what you wrote. git's own words, unedited — in the
+                        // detail line, where every other git refusal puts them.
+                        None => {
+                            Effects::toast_detail("Commit refused", res.message, ToastKind::Warning)
+                        }
                     }
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Commit failed", e),
             },
 
             Event::OperationAborted(result) => match result {
@@ -1109,41 +1114,52 @@ impl Session {
                     GitAbortStatus::NothingInProgress => {
                         Effects::toast("Nothing in progress to abandon", ToastKind::Info)
                     }
-                    GitAbortStatus::BlockedByDirtyBuffers => Effects::toast(
-                        format!(
-                            "{} unsaved buffer(s) — save first (Space s), then retry",
-                            res.blocked.len()
-                        ),
+                    GitAbortStatus::BlockedByDirtyBuffers => Effects::toast_detail(
+                        format!("{} unsaved buffer(s)", res.blocked.len()),
+                        "Save first, then retry",
                         ToastKind::Warning,
                     ),
-                    GitAbortStatus::Refused => Effects::error(res.message),
+                    GitAbortStatus::Refused => Effects::error_detail("Abandon failed", res.message),
                 },
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Abandon failed", e),
             },
 
             Event::Uncommitted(result) => match result {
                 Ok(res) if res.head.is_some() => {
                     // Name what came back rather than reporting a hash movement: "Uncommitted:
                     // Add a line" is the sentence the user can check against their intent.
-                    let note = match res.undone.first() {
-                        Some(c) => format!(
-                            "Uncommitted: {} — changes are staged",
-                            c.message.lines().next().unwrap_or_default()
+                    // Shaped like the commit toast it undoes: the hash names *which*, the
+                    // subject in the detail line is what you check against your intent.
+                    let (title, detail) = match res.undone.first() {
+                        Some(c) => {
+                            let short: String = c.commit.chars().take(7).collect();
+                            (
+                                format!("Uncommitted {short}"),
+                                format!(
+                                    "{} — its changes are staged",
+                                    c.message.lines().next().unwrap_or_default()
+                                ),
+                            )
+                        }
+                        None => (
+                            "Uncommitted".to_string(),
+                            "Its changes are staged".to_string(),
                         ),
-                        None => "Uncommitted — changes are staged".to_string(),
                     };
-                    Effects::toast(note, ToastKind::Success)
+                    Effects::toast_detail(title, detail, ToastKind::Success)
                 }
                 // Refused: no parent commit (the initial commit has nothing behind it), or a
                 // repo-level objection. git's own words.
-                Ok(res) => Effects::toast(res.message, ToastKind::Warning),
-                Err(e) => Effects::error(e),
+                Ok(res) => {
+                    Effects::toast_detail("Uncommit failed", res.message, ToastKind::Warning)
+                }
+                Err(e) => Effects::error_detail("Uncommit failed", e),
             },
 
             // One `match` on the status, because that's what the status enum is for: every arm
             // has a different message and a different thing for the user to do next.
             Event::CheckedOut { branch, result } => match result {
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail(format!("Couldn't switch to {branch}"), e),
                 Ok(res) => match res.status {
                     GitCheckoutStatus::Switched | GitCheckoutStatus::Created => {
                         let verb = if res.status == GitCheckoutStatus::Created {
@@ -1153,33 +1169,47 @@ impl Session {
                         };
                         // Name the buffers the switch disturbed. A checkout that quietly left
                         // three buffers pointing at content from another branch is exactly the
-                        // surprise the reconciliation pass exists to prevent, so say so.
-                        let mut note = format!("{verb} {branch}");
+                        // surprise the reconciliation pass exists to prevent, so say so — as the
+                        // detail line, since the switch itself is the headline.
+                        let mut detail = String::new();
                         let moved = res.refreshed.reloaded.len();
                         if moved > 0 {
-                            note.push_str(&format!(" — reloaded {moved} buffer(s)"));
+                            detail.push_str(&format!("Reloaded {moved} buffer(s)"));
                         }
                         if !res.refreshed.missing.is_empty() {
-                            note.push_str(&format!(
-                                ", {} not on this branch",
-                                res.refreshed.missing.len()
-                            ));
+                            if detail.is_empty() {
+                                detail.push_str(&format!(
+                                    "{} buffer(s) not on this branch",
+                                    res.refreshed.missing.len()
+                                ));
+                            } else {
+                                detail.push_str(&format!(
+                                    ", {} not on this branch",
+                                    res.refreshed.missing.len()
+                                ));
+                            }
                         }
-                        Effects::toast(note, ToastKind::Success)
+                        Effects::toast_detail(
+                            format!("{verb} {branch}"),
+                            detail,
+                            ToastKind::Success,
+                        )
                     }
                     // The one refusal with a concrete next step, so it gets one.
-                    GitCheckoutStatus::BlockedByDirtyBuffers => Effects::toast(
-                        format!(
-                            "{} unsaved buffer(s) — save first (Space s), then retry",
-                            res.blocked.len()
-                        ),
+                    GitCheckoutStatus::BlockedByDirtyBuffers => Effects::toast_detail(
+                        format!("{} unsaved buffer(s)", res.blocked.len()),
+                        "Save first, then retry",
                         ToastKind::Warning,
                     ),
                     GitCheckoutStatus::AlreadyCheckedOut => Effects::toast(
                         format!("{branch} is checked out in {}", res.message),
                         ToastKind::Warning,
                     ),
-                    GitCheckoutStatus::Refused => Effects::toast(res.message, ToastKind::Warning),
+                    GitCheckoutStatus::Refused => Effects::toast_detail(
+                        format!("Couldn't switch to {branch}"),
+                        res.message,
+                        ToastKind::Warning,
+                    ),
                 },
             },
 
@@ -1188,7 +1218,9 @@ impl Session {
             // it will actually work — what was seeded, and whether submodules are in play.
             Event::WorktreeAdded { branch, result } => {
                 match result {
-                    Err(e) => Effects::error(e),
+                    Err(e) => {
+                        Effects::error_detail(format!("Couldn't create a worktree for {branch}"), e)
+                    }
                     Ok(res) => match res.status {
                         GitWorktreeAddStatus::Created => {
                             // Creating never moves you. `Ctrl-o` is a lifecycle verb and the picker
@@ -1197,16 +1229,23 @@ impl Session {
                             // back when selecting a branch row meant "create a tree and go there";
                             // splitting the two is what stopped a cancelled or refused create from
                             // leaving a half-applied gesture behind.
-                            let mut note = format!("Created worktree for {branch}");
+                            let mut detail = String::new();
                             if res.seeded_files > 0 {
-                                note.push_str(&format!(" — seeded {} file(s)", res.seeded_files));
+                                detail.push_str(&format!("Seeded {} file(s)", res.seeded_files));
                             }
                             if res.has_submodules {
                                 // git's own BUGS section advises against this and the failure mode is
                                 // silent commit loss, so it is said out loud rather than logged.
-                                note.push_str("; repo has submodules — see git-worktree(1) BUGS");
+                                if !detail.is_empty() {
+                                    detail.push_str("; ");
+                                }
+                                detail.push_str("repo has submodules — see git-worktree(1) BUGS");
                             }
-                            Effects::toast(note, ToastKind::Success)
+                            Effects::toast_detail(
+                                format!("Created worktree for {branch}"),
+                                detail,
+                                ToastKind::Success,
+                            )
                         }
                         // The refusal with a concrete next step: the branch is already open somewhere,
                         // and going there is what the user wanted anyway.
@@ -1224,25 +1263,29 @@ impl Session {
                             format!("{branch} isn't a usable branch name"),
                             ToastKind::Warning,
                         ),
-                        GitWorktreeAddStatus::Unborn => Effects::toast(
-                            "No commits yet — commit before creating a worktree",
+                        GitWorktreeAddStatus::Unborn => Effects::toast_detail(
+                            "No commits yet",
+                            "Commit before creating a worktree",
                             ToastKind::Warning,
                         ),
                         GitWorktreeAddStatus::Cancelled => {
-                            Effects::toast("Worktree creation stopped", ToastKind::Info)
+                            Effects::toast("Worktree creation cancelled", ToastKind::Info)
                         }
-                        GitWorktreeAddStatus::Refused => {
-                            Effects::toast(res.message, ToastKind::Warning)
-                        }
+                        GitWorktreeAddStatus::Refused => Effects::toast_detail(
+                            format!("Couldn't create a worktree for {branch}"),
+                            res.message,
+                            ToastKind::Warning,
+                        ),
                     },
                 }
             }
 
             Event::WorktreeRemoved { name, result } => match result {
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail(format!("Couldn't remove {name}"), e),
                 Ok(res) => match res.status {
-                    GitWorktreeRemoveStatus::Removed => Effects::toast(
-                        format!("Removed worktree {name} — branch kept"),
+                    GitWorktreeRemoveStatus::Removed => Effects::toast_detail(
+                        format!("Removed worktree {name}"),
+                        "Its branch was kept",
                         ToastKind::Success,
                     ),
                     // Itemise rather than ask again: the point of the refusal is that the user can
@@ -1259,25 +1302,30 @@ impl Session {
                         if at.operation_in_progress {
                             parts.push("an operation in progress".to_string());
                         }
-                        Effects::toast(
-                            format!("{name} has {} — force removal to discard", parts.join(", ")),
+                        Effects::toast_detail(
+                            format!("{name} has {}", parts.join(", ")),
+                            "Force the removal to discard it",
                             ToastKind::Warning,
                         )
                     }
-                    GitWorktreeRemoveStatus::IsMain => Effects::toast(
-                        "That's the repository itself, not a worktree",
+                    GitWorktreeRemoveStatus::IsMain => Effects::toast_detail(
+                        "Not a worktree",
+                        "That's the repository itself",
                         ToastKind::Warning,
                     ),
-                    GitWorktreeRemoveStatus::Locked => Effects::toast(
-                        format!("{name} is locked — unlock it first"),
+                    GitWorktreeRemoveStatus::Locked => Effects::toast_detail(
+                        format!("{name} is locked"),
+                        "Unlock it first",
                         ToastKind::Warning,
                     ),
                     GitWorktreeRemoveStatus::NotFound => {
                         Effects::toast(format!("No worktree {name}"), ToastKind::Warning)
                     }
-                    GitWorktreeRemoveStatus::Refused => {
-                        Effects::toast(res.message, ToastKind::Warning)
-                    }
+                    GitWorktreeRemoveStatus::Refused => Effects::toast_detail(
+                        format!("Couldn't remove {name}"),
+                        res.message,
+                        ToastKind::Warning,
+                    ),
                 },
             },
 
@@ -1286,7 +1334,7 @@ impl Session {
                 forced,
                 result,
             } => match result {
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail(format!("Couldn't delete {branch}"), e),
                 Ok(res) => match res.status {
                     GitDeleteBranchStatus::Deleted => {
                         Effects::toast(format!("Deleted {branch}"), ToastKind::Success)
@@ -1309,49 +1357,58 @@ impl Session {
                     GitDeleteBranchStatus::NotMerged => {
                         Effects::toast(format!("{branch} isn't merged"), ToastKind::Warning)
                     }
-                    GitDeleteBranchStatus::IsCurrentBranch => Effects::toast(
-                        format!("{branch} is checked out here — switch away first"),
+                    GitDeleteBranchStatus::IsCurrentBranch => Effects::toast_detail(
+                        format!("{branch} is checked out here"),
+                        "Switch away first",
                         ToastKind::Warning,
                     ),
-                    GitDeleteBranchStatus::Refused => {
-                        Effects::toast(res.message, ToastKind::Warning)
-                    }
+                    GitDeleteBranchStatus::Refused => Effects::toast_detail(
+                        format!("Couldn't delete {branch}"),
+                        res.message,
+                        ToastKind::Warning,
+                    ),
                 },
             },
 
             Event::StashDone { staged, result } => match result {
                 Ok(r) => {
-                    let (msg, kind) = match r.status {
+                    // `(title, body, kind)` — an empty body is no body, as in `HunkApplied`.
+                    let (msg, detail, kind) = match r.status {
                         GitStashStatus::Pushed if staged => {
-                            ("Stashed staged changes", ToastKind::Success)
+                            ("Stashed staged changes", "", ToastKind::Success)
                         }
-                        GitStashStatus::Pushed => ("Stashed working tree", ToastKind::Success),
+                        GitStashStatus::Pushed => ("Stashed working tree", "", ToastKind::Success),
                         GitStashStatus::NothingToStash if staged => {
-                            ("Nothing staged to stash", ToastKind::Info)
+                            ("Nothing staged to stash", "", ToastKind::Info)
                         }
-                        GitStashStatus::NothingToStash => ("Nothing to stash", ToastKind::Info),
-                        GitStashStatus::Applied => ("Applied stash", ToastKind::Success),
-                        GitStashStatus::Popped => ("Popped stash", ToastKind::Success),
-                        GitStashStatus::Dropped => ("Dropped stash", ToastKind::Success),
-                        GitStashStatus::BlockedByDirtyBuffers => {
-                            ("Unsaved changes — save first", ToastKind::Warning)
-                        }
-                        // The picker was showing a snapshot; something removed the entry since.
-                        GitStashStatus::Gone => ("That stash is gone", ToastKind::Warning),
-                        GitStashStatus::Refused => ("", ToastKind::Error),
-                        // Names the version, because the fix is entirely outside the editor and
-                        // "unsupported" alone would send them looking for a setting.
-                        GitStashStatus::StagedUnsupported => (
-                            "Stashing only staged changes needs git 2.35 or newer",
+                        GitStashStatus::NothingToStash => ("Nothing to stash", "", ToastKind::Info),
+                        GitStashStatus::Applied => ("Applied stash", "", ToastKind::Success),
+                        GitStashStatus::Popped => ("Popped stash", "", ToastKind::Success),
+                        GitStashStatus::Dropped => ("Dropped stash", "", ToastKind::Success),
+                        GitStashStatus::BlockedByDirtyBuffers => (
+                            "Unsaved changes",
+                            "Save first, then retry",
                             ToastKind::Warning,
                         ),
+                        // The picker was showing a snapshot; something removed the entry since.
+                        GitStashStatus::Gone => ("That stash is gone", "", ToastKind::Warning),
+                        GitStashStatus::Refused => ("", "", ToastKind::Error),
+                        // Names the version, because the fix is entirely outside the editor and
+                        // "unsupported" alone would send them looking for a setting.
+                        GitStashStatus::StagedUnsupported => {
+                            return Effects::toast_detail(
+                                "Can't stash only the staged changes",
+                                "That needs git 2.35 or newer",
+                                ToastKind::Warning,
+                            );
+                        }
                     };
                     if r.status == GitStashStatus::Refused {
-                        return Effects::error(r.message);
+                        return Effects::error_detail("Stash refused", r.message);
                     }
-                    Effects::toast(msg, kind)
+                    Effects::toast_detail(msg, detail, kind)
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Stash failed", e),
             },
 
             Event::FetchDone(result) => match result {
@@ -1359,49 +1416,55 @@ impl Session {
                     // Report the divergence, not the transfer: "fetched" alone leaves the user
                     // looking for what changed, and the counts are the whole reason to fetch.
                     GitFetchStatus::Fetched => {
-                        Effects::toast(fetch_summary(r.upstream.as_ref()), ToastKind::Success)
+                        let (title, detail) = fetch_summary(r.upstream.as_ref());
+                        Effects::toast_detail(title, detail, ToastKind::Success)
                     }
                     GitFetchStatus::NoRemote => {
                         Effects::toast("No remote configured", ToastKind::Info)
                     }
                     // Acknowledged, not celebrated or mourned: the user asked for this.
                     GitFetchStatus::Cancelled => Effects::toast("Fetch cancelled", ToastKind::Info),
-                    GitFetchStatus::Refused => Effects::error(r.message),
+                    GitFetchStatus::Refused => Effects::error_detail("Fetch refused", r.message),
                 },
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Fetch failed", e),
             },
 
             Event::PushDone(result) => match result {
                 Ok(r) => match r.status {
-                    GitPushStatus::Pushed => Effects::toast(push_summary(&r), ToastKind::Success),
+                    GitPushStatus::Pushed => {
+                        let (title, detail) = push_summary(&r);
+                        Effects::toast_detail(title, detail, ToastKind::Success)
+                    }
                     GitPushStatus::NothingToPush => {
                         Effects::toast("Nothing to push", ToastKind::Info)
                     }
                     // The one refusal with a next step worth naming. Git's own wording here is
                     // several lines of hint text; what the user needs is the number and the verb.
-                    GitPushStatus::Behind => Effects::toast(
+                    GitPushStatus::Behind => Effects::toast_detail(
                         match r.upstream.as_ref() {
-                            Some(u) => {
-                                format!("{} behind {} — fetch and merge first", u.behind, u.name)
-                            }
-                            None => "Behind the remote — fetch and merge first".to_string(),
+                            Some(u) => format!("{} behind {}", u.behind, u.name),
+                            None => "Behind the remote".to_string(),
                         },
+                        "Fetch and merge first",
                         ToastKind::Warning,
                     ),
-                    GitPushStatus::DetachedHead => {
-                        Effects::toast("Not on a branch — nothing to push", ToastKind::Warning)
-                    }
+                    GitPushStatus::DetachedHead => Effects::toast_detail(
+                        "Not on a branch",
+                        "Nothing to push",
+                        ToastKind::Warning,
+                    ),
                     GitPushStatus::NoRemote => {
                         Effects::toast("No remote configured", ToastKind::Info)
                     }
-                    GitPushStatus::AmbiguousRemote => Effects::toast(
-                        "Several remotes and no upstream — set one with git push -u",
+                    GitPushStatus::AmbiguousRemote => Effects::toast_detail(
+                        "Several remotes and no upstream",
+                        "Set one with git push -u",
                         ToastKind::Warning,
                     ),
                     GitPushStatus::Cancelled => Effects::toast("Push cancelled", ToastKind::Info),
-                    GitPushStatus::Refused => Effects::error(r.message),
+                    GitPushStatus::Refused => Effects::error_detail("Push refused", r.message),
                 },
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Push failed", e),
             },
 
             Event::PullDone(result) => match result {
@@ -1419,14 +1482,15 @@ impl Session {
                     GitPullStatus::FastForwarded
                     | GitPullStatus::Merged
                     | GitPullStatus::Rebased => {
-                        Effects::toast(pull_summary(&r), ToastKind::Success)
+                        let (title, detail) = pull_summary(&r);
+                        Effects::toast_detail(title, detail, ToastKind::Success)
                     }
                     // Not an error toast: the files are on disk with markers in them and the next
                     // step is to open one, so name them rather than relaying git's stderr.
-                    GitPullStatus::Conflicted => Effects::toast(
+                    GitPullStatus::Conflicted => Effects::toast_detail(
+                        format!("Conflicts in {}", name_a_few(&r.conflicts)),
                         format!(
-                            "Conflicts in {} — resolve them, then {}",
-                            name_a_few(&r.conflicts),
+                            "Resolve them, then {}",
                             // The follow-up differs by operation and guessing costs the user a
                             // wrong command: a merge is finished by committing, a rebase by
                             // `--continue`. The server read which one stopped, so say it.
@@ -1440,66 +1504,62 @@ impl Session {
                     ),
                     // The mirror of push's `Behind`, and like it the number and the verb are what
                     // the user needs — git's own answer here is a paragraph of hint text.
-                    GitPullStatus::Diverged => Effects::toast(
+                    GitPullStatus::Diverged => Effects::toast_detail(
                         match r.upstream.as_ref() {
                             Some(u) => format!(
-                                "Diverged from {} ({} ahead, {} behind) — merge or rebase to reconcile",
+                                "Diverged from {} ({} ahead, {} behind)",
                                 u.name, u.ahead, u.behind
                             ),
-                            None => {
-                                "Diverged from the remote — merge or rebase to reconcile".to_string()
-                            }
+                            None => "Diverged from the remote".to_string(),
                         },
+                        "Merge or rebase to reconcile",
                         ToastKind::Warning,
                     ),
                     // The one refusal whose fix is another action in this same sub-leader.
-                    GitPullStatus::NoUpstream => Effects::toast(
-                        "No upstream — push this branch first to set one",
+                    GitPullStatus::NoUpstream => Effects::toast_detail(
+                        "No upstream",
+                        "Push this branch first to set one",
                         ToastKind::Warning,
                     ),
-                    GitPullStatus::DetachedHead => {
-                        Effects::toast("Not on a branch — nothing to pull", ToastKind::Warning)
-                    }
+                    GitPullStatus::DetachedHead => Effects::toast_detail(
+                        "Not on a branch",
+                        "Nothing to pull",
+                        ToastKind::Warning,
+                    ),
                     GitPullStatus::NoRemote => {
                         Effects::toast("No remote configured", ToastKind::Info)
                     }
-                    GitPullStatus::BlockedByDirtyBuffers => Effects::toast(
-                        format!(
-                            "{} unsaved buffer(s) — save first (Space s), then retry",
-                            r.blocked.len()
-                        ),
+                    GitPullStatus::BlockedByDirtyBuffers => Effects::toast_detail(
+                        format!("{} unsaved buffer(s)", r.blocked.len()),
+                        "Save first, then retry",
                         ToastKind::Warning,
                     ),
                     // Already stopped part-way through something. Names the operation and the
                     // conflicts still outstanding — the state the user has forgotten they're in,
                     // which is precisely why the pull they just asked for made no sense.
-                    GitPullStatus::OperationInProgress => Effects::toast(
-                        {
-                            let what = r
-                                .operation
-                                .map(|op| op.label().to_string())
-                                .unwrap_or_else(|| "an operation".to_string());
-                            if r.conflicts.is_empty() {
-                                format!("Still {what} — finish or abort it first")
-                            } else {
-                                format!(
-                                    "Still {what} — resolve {} first",
-                                    name_a_few(&r.conflicts)
-                                )
-                            }
-                        },
-                        ToastKind::Warning,
-                    ),
+                    GitPullStatus::OperationInProgress => {
+                        let what = r
+                            .operation
+                            .map(|op| op.label().to_string())
+                            .unwrap_or_else(|| "an operation".to_string());
+                        let next = if r.conflicts.is_empty() {
+                            "Finish or abandon it first".to_string()
+                        } else {
+                            format!("Resolve {} first", name_a_few(&r.conflicts))
+                        };
+                        Effects::toast_detail(format!("Still {what}"), next, ToastKind::Warning)
+                    }
                     // A stranded lock isn't an aside: until it's gone, every git operation in this
                     // repo fails. Say where it is, since removing it is the user's call.
-                    GitPullStatus::Cancelled if r.index_locked => Effects::toast(
-                        "Pull cancelled — .git/index.lock was left behind; remove it before running git again",
+                    GitPullStatus::Cancelled if r.index_locked => Effects::toast_detail(
+                        "Pull cancelled",
+                        "Remove .git/index.lock before running git again",
                         ToastKind::Warning,
                     ),
                     GitPullStatus::Cancelled => Effects::toast("Pull cancelled", ToastKind::Info),
-                    GitPullStatus::Refused => Effects::error(r.message),
+                    GitPullStatus::Refused => Effects::error_detail("Pull refused", r.message),
                 },
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Pull failed", e),
             },
 
             Event::CancelDone(result) => match result {
@@ -1507,7 +1567,7 @@ impl Session {
                 // operation's own `Cancelled` result, and "nothing was running" means it beat the
                 // keystroke, which is not a failure the user needs telling about.
                 Ok(_) => Effects::none(),
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Cancel failed", e),
             },
 
             Event::HunkApplied {
@@ -1521,19 +1581,21 @@ impl Session {
                     // and "Staged change" after `Space g s` — because at a glance the toast is the
                     // only confirmation of *how much* just moved into the index.
                     let whole_file = scope == ApplyScope::File;
-                    let (msg, kind) = match r.status {
+                    // `(title, body, kind)`: an empty body is no body — most of these outcomes are
+                    // a single scannable phrase, and only the refusals have a next step to add.
+                    let (msg, detail, kind) = match r.status {
                         ApplyHunkStatus::Staged if whole_file => {
-                            ("Staged file", ToastKind::Success)
+                            ("Staged file", "", ToastKind::Success)
                         }
                         ApplyHunkStatus::Unstaged if whole_file => {
-                            ("Unstaged file", ToastKind::Success)
+                            ("Unstaged file", "", ToastKind::Success)
                         }
                         ApplyHunkStatus::Reverted if whole_file => {
-                            ("Reverted file", ToastKind::Success)
+                            ("Reverted file", "", ToastKind::Success)
                         }
-                        ApplyHunkStatus::Staged => ("Staged change", ToastKind::Success),
-                        ApplyHunkStatus::Unstaged => ("Unstaged change", ToastKind::Success),
-                        ApplyHunkStatus::Reverted => ("Reverted change", ToastKind::Success),
+                        ApplyHunkStatus::Staged => ("Staged change", "", ToastKind::Success),
+                        ApplyHunkStatus::Unstaged => ("Unstaged change", "", ToastKind::Success),
+                        ApplyHunkStatus::Reverted => ("Reverted change", "", ToastKind::Success),
                         // Worded from the action *sent*, which is the only thing that knows which
                         // question was asked: with explicit directions, "no change here" on a
                         // hunk that's sitting there staged would read as a bug.
@@ -1546,35 +1608,47 @@ impl Session {
                                 (HunkAction::Unstage, true) => "Nothing to unstage in this file",
                                 (HunkAction::Revert, true) => "Nothing to revert in this file",
                             },
+                            "",
                             ToastKind::Info,
                         ),
-                        ApplyHunkStatus::DirtyBuffer => {
-                            ("Unsaved changes — save first", ToastKind::Warning)
-                        }
+                        ApplyHunkStatus::DirtyBuffer => (
+                            "Unsaved changes",
+                            "Save first, then retry",
+                            ToastKind::Warning,
+                        ),
                         ApplyHunkStatus::Unavailable => {
-                            ("Not in a git repository", ToastKind::Info)
+                            ("Not in a git repository", "", ToastKind::Info)
                         }
                         // Names the cause, not just the refusal: the user set this baseline, and
                         // the way out is to unset it.
                         ApplyHunkStatus::NotAgainstHead => (
-                            "Diffing against a revision — restore the HEAD baseline to stage",
+                            "Diffing against a revision",
+                            "Restore the HEAD baseline to stage",
                             ToastKind::Warning,
                         ),
                         // Deliberately no "do it anyway" escape: marking a conflict resolved is a
                         // decision, and this key is not where it's made.
                         ApplyHunkStatus::Conflicted => {
-                            ("Conflicted file — resolve it first", ToastKind::Warning)
+                            ("Conflicted file", "Resolve it first", ToastKind::Warning)
                         }
-                        ApplyHunkStatus::Resolved => ("Marked resolved", ToastKind::Success),
+                        ApplyHunkStatus::Resolved => ("Marked resolved", "", ToastKind::Success),
                         // The classic way to break a merge, and silent — nothing else would say so.
                         ApplyHunkStatus::MarkersRemain => (
                             "Conflict markers still in this file",
+                            "Remove them, then mark it resolved",
                             ToastKind::Warning,
                         ),
                     };
-                    Effects::toast(msg, kind)
+                    Effects::toast_detail(msg, detail, kind)
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail(
+                    match action {
+                        HunkAction::Stage => "Staging failed",
+                        HunkAction::Unstage => "Unstaging failed",
+                        HunkAction::Revert => "Revert failed",
+                    },
+                    e,
+                ),
             },
 
             Event::ConflictResolved { side, result } => match result {
@@ -1600,10 +1674,11 @@ impl Session {
                                 format!("Kept {kept} in {} conflicts", r.resolved)
                             };
                             let left = match r.remaining {
-                                0 => "none left".to_string(),
-                                n => format!("{n} left"),
+                                0 => "No conflicts left in this file".to_string(),
+                                1 => "1 conflict left".to_string(),
+                                n => format!("{n} conflicts left"),
                             };
-                            Effects::toast(format!("{took} — {left}"), ToastKind::Success)
+                            Effects::toast_detail(took, left, ToastKind::Success)
                         }
                         // Includes the "this file has no conflicts at all" case: one sentence
                         // answers both.
@@ -1612,7 +1687,7 @@ impl Session {
                         }
                     }
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Resolve failed", e),
             },
 
             Event::DiffViewSet { enabled, result } => match result {
@@ -1622,13 +1697,14 @@ impl Session {
                     let mut fx = Effects::one(Effect::WindowAdopted);
                     // Grouped so repeated toggling updates one toast in place rather than stacking.
                     fx.push(Effect::Toast {
-                        message: format!("Diff {}", if enabled { "on" } else { "off" }),
+                        title: format!("Diff {}", if enabled { "on" } else { "off" }),
+                        body: None,
                         kind: ToastKind::Info,
                         group: Some("diff".into()),
                     });
                     fx
                 }
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Diff toggle failed", e),
             },
 
             Event::PickerViewed { initial, result } => match result {
@@ -1725,7 +1801,7 @@ impl Session {
                 }
                 Err(e) => {
                     self.picker = None;
-                    Effects::error(format!("Picker failed: {e}"))
+                    Effects::error_detail("Picker failed", e)
                 }
             },
 
@@ -1778,7 +1854,7 @@ impl Session {
                 }
             },
             Event::PickerSelected { result: Err(e), .. } => {
-                Effects::error(format!("Select failed: {e}"))
+                Effects::error_detail("Select failed", e)
             }
 
             Event::WorkspaceActivated(Ok((workspace, open))) => {
@@ -1797,7 +1873,10 @@ impl Session {
             }
             Event::WorktreeBound(Ok(activate)) => {
                 let Some(open) = activate.opened else {
-                    return Effects::error("Bind returned no landing buffer");
+                    return Effects::error_detail(
+                        "Worktree switch failed",
+                        "The server didn't say where to land",
+                    );
                 };
                 self.workspace = activate.workspace.name;
                 self.workspace_paths = activate.workspace.paths;
@@ -1810,10 +1889,10 @@ impl Session {
                 // ask rather than once, in passing, while you are looking at something else.
                 self.fetch_history().and(self.adopt_switch(open))
             }
-            Event::WorktreeBound(Err(e)) => Effects::error(format!("Worktree switch failed: {e}")),
+            Event::WorktreeBound(Err(e)) => Effects::error_detail("Worktree switch failed", e),
 
             Event::WorkspaceActivated(Err(e)) => {
-                Effects::error(format!("Workspace switch failed: {e}"))
+                Effects::error_detail("Workspace switch failed", e)
             }
 
             Event::WorkspaceCreated(Ok(activate)) => {
@@ -1835,11 +1914,12 @@ impl Session {
                     // user lands in *some* editor (and the previous workspace's buffer doesn't linger
                     // behind the new workspace). `adopt_switch` leaves the settings overlay open.
                     None => self.request::<BufferOpen>(BufferOpenParams::default(), move |__r| {
-                        Event::Switched(__r.map_err(|e| e.to_string()))
+                        Event::Switched(__r.map_err(|e| e.message))
                     }),
                 });
                 fx.push(Effect::Toast {
-                    message: format!("Created workspace {}", workspace.name),
+                    title: format!("Created workspace {}", workspace.name),
+                    body: None,
                     kind: ToastKind::Success,
                     group: None,
                 });
@@ -1852,9 +1932,7 @@ impl Session {
                 }
                 fx
             }
-            Event::WorkspaceCreated(Err(e)) => {
-                Effects::error(format!("Create workspace failed: {e}"))
-            }
+            Event::WorkspaceCreated(Err(e)) => Effects::error_detail("Create workspace failed", e),
 
             Event::WorkspaceRenamed(result) => {
                 let Some(s) = self.workspace_settings.as_mut() else {
@@ -1946,14 +2024,12 @@ impl Session {
                         // Keep the selection in range (the removed row is gone).
                         s.selected = s.selected.min(s.input_index());
                     }
-                    let mut fx = Effects::toast(
+                    let mut fx = Effects::toast_detail(
+                        format!("Removed root from {name}"),
                         if closed.is_empty() {
-                            format!("Removed root from {name}")
+                            String::new()
                         } else {
-                            format!(
-                                "Removed root from {name}; closed {} buffer(s)",
-                                closed.len()
-                            )
+                            format!("Closed {} buffer(s)", closed.len())
                         },
                         ToastKind::Success,
                     );
@@ -1965,7 +2041,7 @@ impl Session {
                                 buffer_id: r.next_buffer_id,
                                 ..Default::default()
                             },
-                            move |__r| Event::Switched(__r.map_err(|e| e.to_string())),
+                            move |__r| Event::Switched(__r.map_err(|e| e.message)),
                         ));
                     }
                     fx
@@ -1975,7 +2051,7 @@ impl Session {
                         s.error = Some(e);
                         Effects::none()
                     } else {
-                        Effects::error(format!("Remove root failed: {e}"))
+                        Effects::error_detail("Remove root failed", e)
                     }
                 }
             },
@@ -1985,7 +2061,7 @@ impl Session {
                 Ok(()) => Effects::toast("Deleted workspace", ToastKind::Success),
                 // Covers the active-workspace and dirty-buffer refusals — the server messages are
                 // already user-facing.
-                Err(e) => Effects::error(e),
+                Err(e) => Effects::error_detail("Workspace delete failed", e),
             },
 
             Event::PickerClicked(abs) => {
@@ -2043,8 +2119,9 @@ impl Session {
                 // is undebuggable. The one realistic cause is a stale daemon from a dev rebuild
                 // (identical version string, so the connect gate lets it through) that predates
                 // the hints RPCs — say so, and say the fix.
-                Err(_) if self.hints_enabled => Effects::toast_grouped(
-                    "Hints unavailable — restart the Aether server (ae server stop)",
+                Err(_) if self.hints_enabled => Effects::toast_grouped_detail(
+                    "Hints unavailable",
+                    "Restart the Aether server (ae server stop)",
                     ToastKind::Warning,
                     "hints",
                 ),
@@ -2053,7 +2130,7 @@ impl Session {
 
             Event::AppSettingsSaved(result) => match result {
                 Ok(_) => Effects::none(),
-                Err(e) => Effects::error(format!("Couldn't save settings: {e}")),
+                Err(e) => Effects::error_detail("Settings save failed", e),
             },
 
             Event::PickerChipListing { abs, result } => {
@@ -2139,7 +2216,7 @@ impl Session {
                     Err(e) => {
                         // No reshaping push follows a failed gesture — release repeats here.
                         p.group_gesture_in_flight = false;
-                        return Effects::error(format!("Group select failed: {e}"));
+                        return Effects::error_detail("Group select failed", e);
                     }
                     // `None`: the group re-ranked away under the gesture, or a `step` ran
                     // off the ends (a stop) — nothing to adopt, and no push follows, so
@@ -2180,7 +2257,7 @@ impl Session {
                 })
             }
             Event::PathDeleted { noun, result } => match result {
-                Err(e) => Effects::error(format!("Delete failed: {e}")),
+                Err(e) => Effects::error_detail("Delete failed", e),
                 Ok(_) => {
                     // Any close of *our* buffer rides the `buffer/closed` push (it switches us
                     // to the server's successor). Here we just confirm and re-list the picker.
@@ -2211,7 +2288,7 @@ impl Session {
                 }
             },
             Event::KeepToggled(result) => match result {
-                Err(e) => Effects::error(format!("Keep toggle failed: {e}")),
+                Err(e) => Effects::error_detail("Keep failed", e),
                 // Grouped: toggling keep/release updates one toast rather than stacking a pair.
                 Ok(transient) => Effects::toast_grouped(
                     if transient {
@@ -2223,7 +2300,7 @@ impl Session {
                     "transient",
                 ),
             },
-            Event::DirCreated(Err(e)) => Effects::error(format!("Create directory failed: {e}")),
+            Event::DirCreated(Err(e)) => Effects::error_detail("Create directory failed", e),
             Event::DirCreated(Ok(r)) => {
                 let mut fx = Effects::toast(format!("Created {}", r.path), ToastKind::Success);
                 // Step into the new directory so the user can keep creating inside it.
@@ -2252,8 +2329,9 @@ impl Session {
                 self.mode = self.search_return_mode();
                 tracing::warn!(buffer = %self.buffer.label, "connection lost; reconnecting");
                 // Grouped "connection": the matching "Reconnected" toast replaces this one in place.
-                let mut fx = Effects::toast_grouped(
-                    "Server disconnected — reconnecting…",
+                let mut fx = Effects::toast_grouped_detail(
+                    "Server disconnected",
+                    "Reconnecting…",
                     ToastKind::Warning,
                     "connection",
                 );
@@ -2270,11 +2348,7 @@ impl Session {
             }
             Event::ReconnectFatal(e) => {
                 self.conn = ConnState::Failed;
-                Effects::toast_grouped(
-                    format!("Reconnect failed: {e}"),
-                    ToastKind::Error,
-                    "connection",
-                )
+                Effects::toast_grouped_detail("Reconnect failed", e, ToastKind::Error, "connection")
             }
             Event::Reestablished {
                 workspace,
@@ -2345,19 +2419,20 @@ impl Session {
                             from_selection: false,
                             options: self.search.options,
                         },
-                        move |__r| Event::SearchRestored(__r.map_err(|e| e.to_string())),
+                        move |__r| Event::SearchRestored(__r.map_err(|e| e.message)),
                     ));
                 }
                 fx.push(if restarted && had_unsaved {
                     Effect::Toast {
-                        message: "Reconnected — the server restarted, unsaved changes were lost"
-                            .into(),
+                        title: "Reconnected".into(),
+                        body: Some("The server restarted, so unsaved changes were lost".into()),
                         kind: ToastKind::Warning,
                         group: Some("connection".into()),
                     }
                 } else {
                     Effect::Toast {
-                        message: "Reconnected".into(),
+                        title: "Reconnected".into(),
+                        body: None,
                         kind: ToastKind::Success,
                         group: Some("connection".into()),
                     }
@@ -2420,7 +2495,7 @@ impl Session {
                 self.prompt = Some(Prompt::Confirm { kind, action });
                 Effects::none()
             }
-            Event::SaveTried(Err(e)) => Effects::error(format!("Save failed: {e}")),
+            Event::SaveTried(Err(e)) => Effects::error_detail("Save failed", e),
 
             Event::ReloadTried(Ok(ReloadTry::Reloaded(r))) => {
                 self.buffer.revision = r.revision;
@@ -2437,7 +2512,7 @@ impl Session {
                 });
                 Effects::none()
             }
-            Event::ReloadTried(Err(e)) => Effects::error(format!("Reload failed: {e}")),
+            Event::ReloadTried(Err(e)) => Effects::error_detail("Reload failed", e),
         }
     }
 
@@ -2489,7 +2564,7 @@ impl Session {
                             action: ConfirmAction::Save { target, after },
                         })
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e.message),
                 })
             },
         )
@@ -2543,7 +2618,10 @@ impl Session {
     where
         M: RpcMethod + 'static,
     {
-        self.request::<M>(params, move |r| f(r.map_err(|e| e.to_string())))
+        // The server's *message*, not the stringified `RpcError` — its Display carries an "RPC
+        // {method} returned error {code}: " prefix that reads as machine noise in the toast body
+        // this string usually lands in. The method and code stay on the error itself for logging.
+        self.request::<M>(params, move |r| f(r.map_err(|e| e.message)))
     }
 
     /// An RPC outcome arriving from the shell: run the parked mapping and process the
@@ -3090,7 +3168,11 @@ impl Session {
         use crate::web_link::{web_link, WebLinkTarget};
         if self.workspace.is_empty() || aether_protocol::is_ephemeral_workspace_id(&self.workspace)
         {
-            return Effects::toast("No web URL without a workspace", ToastKind::Warning);
+            return Effects::toast_detail(
+                "No web URL",
+                "This buffer isn't in a workspace",
+                ToastKind::Warning,
+            );
         }
         let path_query = match self.buffer.path.as_deref() {
             Some(path) => match strip_longest_root(path, &self.workspace_paths) {
@@ -3106,8 +3188,9 @@ impl Session {
                     )
                 }
                 None => {
-                    return Effects::toast(
-                        "No web URL for a file outside the workspace",
+                    return Effects::toast_detail(
+                        "No web URL",
+                        "This file is outside the workspace's roots",
                         ToastKind::Warning,
                     )
                 }
@@ -3210,7 +3293,8 @@ impl Session {
         let group = crate::session::lsp_toast_group(language, workspace_root);
         self.lsp_restart_pending.insert(group.clone());
         Effect::Toast {
-            message: format!("Restarting {name}"),
+            title: format!("Restarting {name}"),
+            body: None,
             kind: ToastKind::Info,
             group: Some(group),
         }
@@ -3338,7 +3422,8 @@ impl Session {
         if diags.is_empty() {
             let mut fx = Effects::one(Effect::DismissHover);
             fx.push(Effect::Toast {
-                message: "No diagnostics on this line".into(),
+                title: "No diagnostics on this line".into(),
+                body: None,
                 kind: ToastKind::Info,
                 group: None,
             });
@@ -3389,7 +3474,7 @@ impl Session {
             |r| {
                 Event::CommitLookup(r.map(|r| match r.blame {
                     Some(b) if b.is_uncommitted => {
-                        CommitDetails::Note("Uncommitted line — no commit details")
+                        CommitDetails::Note("This line isn't committed yet")
                     }
                     None => CommitDetails::Note("No commit details for this line"),
                     Some(_) => match r.commit_info {
@@ -3529,7 +3614,7 @@ impl Session {
             },
             move |__r| Event::PickerViewed {
                 initial: true,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             },
         );
         // Every open starts the list at the top. A kind that wants to land somewhere else centres
@@ -3670,7 +3755,7 @@ impl Session {
             },
             move |__r| Event::PickerViewed {
                 initial: false,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             },
         ));
         fx
@@ -3771,7 +3856,7 @@ impl Session {
             },
             move |__r| Event::PickerViewed {
                 initial: false,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             },
         )
     }
@@ -4016,7 +4101,7 @@ impl Session {
         self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
             Event::AddProjectListing {
                 abs,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             }
         })
     }
@@ -4223,7 +4308,7 @@ impl Session {
                     },
                     move |__r| Event::PickerViewed {
                         initial: false,
-                        result: __r.map_err(|e| e.to_string()),
+                        result: __r.map_err(|e| e.message),
                     },
                 ))
             }
@@ -4376,7 +4461,7 @@ impl Session {
         self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
             Event::PickerChipListing {
                 abs,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             }
         })
     }
@@ -4864,7 +4949,7 @@ impl Session {
         // jump. Closing second also reads right: the row is resolved, then the list goes away.
         let select = self.request::<PickerSelect>(PickerSelectParams { kind, item }, move |__r| {
             Event::PickerSelected {
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             }
         });
 
@@ -5091,16 +5176,22 @@ impl Session {
                 // hit them. Standing in it comes first: it is true of the main checkout *and* of a
                 // worktree, and "you are here" is the more useful sentence either way.
                 if checkout.is_current {
-                    return Effects::error(if detached_at.is_some() {
-                        format!("You're in {name} — switch away first")
-                    } else {
-                        format!("You're on {name} — switch away first")
-                    });
+                    return Effects::error_detail(
+                        if detached_at.is_some() {
+                            format!("You're in {name}")
+                        } else {
+                            format!("You're on {name}")
+                        },
+                        "Switch away first",
+                    );
                 }
                 // The main checkout is the repository: there is no tree to remove, and git refuses
                 // to delete a branch it holds, so neither half of `Ctrl-d` applies.
                 if checkout.is_main {
-                    return Effects::error(format!("{name} is in the main checkout"));
+                    return Effects::error_detail(
+                        format!("{name} is in the main checkout"),
+                        "There's no worktree to remove, and git won't delete a branch it holds",
+                    );
                 }
                 // No confirm dialog, unlike the branch half: here the *refusal* is the
                 // confirmation. A first press either removes a clean tree or comes back itemising
@@ -5610,7 +5701,7 @@ impl Session {
         self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
             Event::SaveAsListing {
                 abs,
-                result: __r.map_err(|e| e.to_string()),
+                result: __r.map_err(|e| e.message),
             }
         })
     }
@@ -5633,7 +5724,10 @@ impl Session {
                 Some(target) => target,
                 None => {
                     self.prompt = None;
-                    return Effects::error(format!("{raw} is outside the workspace's roots"));
+                    return Effects::error_detail(
+                        "Outside the workspace",
+                        format!("{raw} isn't under any of this workspace's roots"),
+                    );
                 }
             }
         } else {
@@ -5714,7 +5808,7 @@ impl Session {
             },
             move |__r| {
                 Event::GroupSet(
-                    __r.map(|r| r.run).map_err(|e| e.to_string()),
+                    __r.map(|r| r.run).map_err(|e| e.message),
                     GroupLanding::Header,
                 )
             },
@@ -5738,7 +5832,7 @@ impl Session {
                 header: None,
                 step: Some(direction),
             },
-            move |__r| Event::GroupSet(__r.map(|r| r.run).map_err(|e| e.to_string()), landing),
+            move |__r| Event::GroupSet(__r.map(|r| r.run).map_err(|e| e.message), landing),
         )
     }
 
@@ -5907,14 +6001,16 @@ impl Session {
                 // one external-change toast rather than stacking.
                 let group = format!("external-change:{}", self.buffer.buffer_id);
                 if !was_external && p.externally_deleted {
-                    Effects::toast_grouped(
-                        "File removed on disk — save to recreate, or close",
+                    Effects::toast_grouped_detail(
+                        "File removed on disk",
+                        "Save to recreate it, or close the buffer",
                         ToastKind::Warning,
                         group,
                     )
                 } else if !was_external && p.externally_modified {
-                    Effects::toast_grouped(
-                        "File changed on disk — save to overwrite, or reload",
+                    Effects::toast_grouped_detail(
+                        "File changed on disk",
+                        "Save to overwrite it, or reload",
                         ToastKind::Warning,
                         group,
                     )
@@ -6004,7 +6100,8 @@ impl Session {
                         LspStatus::Ready => {
                             self.lsp_restart_pending.remove(&group);
                             Some(Effect::Toast {
-                                message: format!("{} restarted", s.name),
+                                title: format!("{} restarted", s.name),
+                                body: None,
                                 kind: ToastKind::Success,
                                 group: Some(group.clone()),
                             })
@@ -6012,7 +6109,8 @@ impl Session {
                         LspStatus::Crashed { .. } | LspStatus::Stopped => {
                             self.lsp_restart_pending.remove(&group);
                             Some(Effect::Toast {
-                                message: format!("{} failed to restart", s.name),
+                                title: format!("{} failed to restart", s.name),
+                                body: None,
                                 kind: ToastKind::Error,
                                 group: Some(group.clone()),
                             })
@@ -6079,7 +6177,7 @@ impl Session {
                         relative_path,
                         ..Default::default()
                     },
-                    move |__r| Event::Switched(__r.map_err(|e| e.to_string())),
+                    move |__r| Event::Switched(__r.map_err(|e| e.message)),
                 ))
             }
             aether_protocol::workspace::WorkspaceChanged::NAME => {
@@ -6132,7 +6230,8 @@ impl Session {
                 };
                 let mut fx = self.apply_app_settings(settings);
                 fx.push(Effect::Toast {
-                    message: "Settings updated".to_string(),
+                    title: "Settings updated".to_string(),
+                    body: None,
                     kind: ToastKind::Info,
                     group: None,
                 });
@@ -6210,7 +6309,7 @@ impl Session {
                 from_selection: false,
                 options: self.search.options,
             },
-            move |__r| Event::SearchApplied(__r.map_err(|e| e.to_string())),
+            move |__r| Event::SearchApplied(__r.map_err(|e| e.message)),
         )
     }
 
@@ -6233,7 +6332,7 @@ impl Session {
                 anchor: snap.cursor.anchor,
                 granularity: Granularity::Char,
             },
-            move |__r| Event::CursorMsg(__r.map_err(|e| e.to_string())),
+            move |__r| Event::CursorMsg(__r.map_err(|e| e.message)),
         )
     }
 
@@ -6331,7 +6430,7 @@ impl Session {
                     from_selection: false,
                     options: snap.options,
                 },
-                move |__r| Event::SearchRestored(__r.map_err(|e| e.to_string())),
+                move |__r| Event::SearchRestored(__r.map_err(|e| e.message)),
             )
         } else {
             self.search.summary = None;
@@ -6352,7 +6451,7 @@ impl Session {
                 anchor: snap.cursor.anchor,
                 granularity: Granularity::Char,
             },
-            move |__r| Event::CursorMsg(__r.map_err(|e| e.to_string())),
+            move |__r| Event::CursorMsg(__r.map_err(|e| e.message)),
         ));
         fx.push(Effect::RestoreScrollAnchor);
         fx
@@ -6509,7 +6608,7 @@ impl Session {
         // nothing was captured and the source picker survives untouched.
         observed.and(
             self.request::<JumplistCapture>(JumplistCaptureParams { kind, item }, move |__r| {
-                Event::JumplistCaptured(__r.map_err(|e| e.to_string()), kind)
+                Event::JumplistCaptured(__r.map_err(|e| e.message), kind)
             }),
         )
     }
@@ -6530,7 +6629,10 @@ impl Session {
                     return Effects::none();
                 };
                 if name == &self.workspace {
-                    return Effects::error("Can't delete the active workspace — switch away first");
+                    return Effects::error_detail(
+                        "Can't delete the active workspace",
+                        "Switch away first",
+                    );
                 }
                 let name = name.clone();
                 self.prompt = Some(Prompt::Confirm {
@@ -6699,7 +6801,10 @@ impl Session {
         // outside-roots refusal above keeps the explorer up so the name can be fixed.
         let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.workspace_paths)
         else {
-            return Effects::error("Path is outside the workspace's roots");
+            return Effects::error_detail(
+                "Outside the workspace",
+                "That path isn't under any of this workspace's roots",
+            );
         };
         let from = self.buffer.buffer_id;
         let hide = self.close_picker();
@@ -6731,7 +6836,10 @@ impl Session {
             return Effects::error("Type a name to create");
         }
         if name.contains('/') || name.contains('\\') {
-            return Effects::error("Workspace name can't contain path separators");
+            return Effects::error_detail(
+                "Invalid workspace name",
+                "It can't contain path separators",
+            );
         }
         // Hint observation before the picker closes (the chooser's create hint lives in this
         // context — a successful create is its follow).
@@ -8071,7 +8179,7 @@ impl Session {
                     Err(e) if e.code == ErrorCode::WOULD_DISCARD_CHANGES.code() => {
                         Ok(ReloadTry::NeedsConfirm)
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(e.message),
                 })
             },
         )
@@ -8335,8 +8443,9 @@ impl Session {
             )
         {
             // Grouped: each blocked keystroke while disconnected refreshes one hint, not a stack.
-            return Effects::toast_grouped(
-                "Not connected — editing unavailable",
+            return Effects::toast_grouped_detail(
+                "Not connected",
+                "Editing is unavailable until the server is back",
                 ToastKind::Info,
                 "edit-blocked",
             );
@@ -8565,7 +8674,7 @@ impl Session {
                     return Effects::none();
                 }
                 self.request::<AppInfoGet>(AppInfoParams {}, |r| {
-                    Event::AppInfoLoaded(r.map_err(|e| e.to_string()))
+                    Event::AppInfoLoaded(r.map_err(|e| e.message))
                 })
             }
             // Dismiss the corner hint: a deliberate "not now" — down-weight it (heavier than a
@@ -8582,7 +8691,7 @@ impl Session {
                 let forward = matches!(action, A::NavForward);
                 let f = move |res: Result<NavStepResult, RpcError>| Event::NavDone {
                     forward,
-                    result: res.map_err(|e| e.to_string()),
+                    result: res.map_err(|e| e.message),
                 };
                 let direction = if forward {
                     Direction::Forward
@@ -8767,8 +8876,9 @@ impl Session {
             }
             A::Reload => {
                 if self.buffer.path.is_none() {
-                    return Effects::toast(
-                        "Scratch buffer has no path to reload",
+                    return Effects::toast_detail(
+                        "Scratch buffer has no path",
+                        "There's nothing on disk to reload",
                         ToastKind::Warning,
                     );
                 }
@@ -8781,8 +8891,9 @@ impl Session {
                 // since the user asked for a release.
                 if self.tethered() {
                     if self.buffer.revision != self.buffer.saved_revision {
-                        return Effects::toast(
-                            "Unsaved changes — save before releasing",
+                        return Effects::toast_detail(
+                            "Unsaved changes",
+                            "Save before releasing the tether",
                             ToastKind::Warning,
                         );
                     }
@@ -8944,8 +9055,9 @@ impl Session {
             // multi-repo workspace (an operation in one repo blocks starting one in another), which
             // is the same simplification the single indicator already makes.
             A::GitFetch | A::GitPush | A::GitPull if self.git_operation.is_some() => {
-                Effects::toast(
-                    "A git operation is already running — stop it first",
+                Effects::toast_detail(
+                    "A git operation is already running",
+                    "Stop it first",
                     ToastKind::Info,
                 )
             }
@@ -9006,8 +9118,9 @@ impl Session {
                 // then *refuse* — losing the message to a keystroke meant to resume it.
                 if let Some(pending) = self.pending_commit.clone() {
                     if pending.buffer_id == self.buffer.buffer_id {
-                        return Effects::toast(
-                            "Already writing this commit — close the buffer to commit",
+                        return Effects::toast_detail(
+                            "Already writing this commit",
+                            "Close the buffer to commit",
                             ToastKind::Info,
                         );
                     }
@@ -9020,7 +9133,8 @@ impl Session {
                         Event::Switched,
                     );
                     fx.push(Effect::Toast {
-                        message: "Commit message already open".to_string(),
+                        title: "Commit message already open".to_string(),
+                        body: None,
                         kind: ToastKind::Info,
                         group: None,
                     });
@@ -10285,12 +10399,15 @@ fn has_url_scheme(s: &str) -> bool {
 /// at all (nothing to be ahead or behind *of*), level with it, and diverged. Naming the upstream
 /// matters in the last case — in a fork workflow "5 behind" is a very different sentence about
 /// `origin/main` than about `upstream/main`.
-fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> String {
+fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> (String, String) {
     let Some(up) = upstream else {
-        return "Fetched".to_string();
+        return ("Fetched".to_string(), String::new());
     };
     if up.is_level() {
-        return format!("Fetched — up to date with {}", up.name);
+        return (
+            "Fetched".to_string(),
+            format!("Up to date with {}", up.name),
+        );
     }
     let mut parts: Vec<String> = Vec::new();
     if up.ahead > 0 {
@@ -10299,7 +10416,10 @@ fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> String {
     if up.behind > 0 {
         parts.push(format!("{} behind", up.behind));
     }
-    format!("Fetched — {} {}", parts.join(", "), up.name)
+    (
+        "Fetched".to_string(),
+        format!("{} {}", parts.join(", "), up.name),
+    )
 }
 
 /// What a successful push accomplished. Names the upstream, because that's the fact the user is
@@ -10308,16 +10428,19 @@ fn fetch_summary(upstream: Option<&GitUpstreamStatus>) -> String {
 /// A first push says so explicitly: it's the one that *created* the tracking relationship, which is
 /// also the moment the status bar's arrows start working for that branch, so it's worth a different
 /// sentence rather than a silent success.
-fn push_summary(result: &GitPushResult) -> String {
+fn push_summary(result: &GitPushResult) -> (String, String) {
     let target = result
         .upstream
         .as_ref()
         .map(|u| u.name.clone())
         .unwrap_or_else(|| "the remote".to_string());
     if result.set_upstream {
-        format!("Pushed — now tracking {target}")
+        (
+            format!("Pushed to {target}"),
+            format!("Now tracking {target}"),
+        )
     } else {
-        format!("Pushed to {target}")
+        (format!("Pushed to {target}"), String::new())
     }
 }
 
@@ -10328,7 +10451,7 @@ fn push_summary(result: &GitPushResult) -> String {
 /// and a rebase rewrote them. The buffer counts are checkout's sentence for the same reason — a
 /// pull that quietly left three buffers showing pre-merge content is the surprise the
 /// reconciliation pass exists to prevent.
-fn pull_summary(result: &GitPullResult) -> String {
+fn pull_summary(result: &GitPullResult) -> (String, String) {
     let verb = match result.status {
         GitPullStatus::Merged => "Merged",
         GitPullStatus::Rebased => "Rebased onto",
@@ -10339,15 +10462,20 @@ fn pull_summary(result: &GitPullResult) -> String {
         .as_ref()
         .map(|u| u.name.clone())
         .unwrap_or_else(|| "the remote".to_string());
-    let mut note = format!("{verb} {target}");
+    let mut detail = String::new();
     let moved = result.refreshed.reloaded.len();
     if moved > 0 {
-        note.push_str(&format!(" — reloaded {moved} buffer(s)"));
+        detail.push_str(&format!("Reloaded {moved} buffer(s)"));
     }
     if !result.refreshed.missing.is_empty() {
-        note.push_str(&format!(", {} now gone", result.refreshed.missing.len()));
+        let gone = result.refreshed.missing.len();
+        if detail.is_empty() {
+            detail.push_str(&format!("{gone} buffer(s) now gone"));
+        } else {
+            detail.push_str(&format!(", {gone} now gone"));
+        }
     }
-    note
+    (format!("{verb} {target}"), detail)
 }
 
 /// Name a short list in a toast: every entry up to three, then a count. Long enough to be
@@ -10365,12 +10493,23 @@ fn name_a_few(paths: &[String]) -> String {
 /// The toast to show when a cursor-relative LSP request (hover / goto-definition) couldn't run
 /// because the server wasn't ready — `None` once a ready server has answered, so the caller falls
 /// back to its own "nothing here" message ("No hover info" / "No definition found").
-fn lsp_readiness_message(readiness: LspReadiness) -> Option<&'static str> {
+fn lsp_readiness_message(readiness: LspReadiness) -> Option<(&'static str, &'static str)> {
     match readiness {
         LspReadiness::Ready => None,
-        LspReadiness::NoServer => Some("No language server for this buffer"),
-        LspReadiness::Starting => Some("Language server still starting"),
-        LspReadiness::Unavailable => Some("Language server unavailable"),
+        // The body is the part that saves a trip: each of these has a different cause, and only
+        // one of them is worth waiting out.
+        LspReadiness::NoServer => Some((
+            "No language server for this buffer",
+            "Aether has no server configured for this language",
+        )),
+        LspReadiness::Starting => Some((
+            "Language server still starting",
+            "Try again in a moment — the servers picker shows its progress",
+        )),
+        LspReadiness::Unavailable => Some((
+            "Language server unavailable",
+            "It isn't installed, isn't on PATH, or it failed to start — the servers picker says which",
+        )),
     }
 }
 
@@ -10912,8 +11051,8 @@ mod tests {
         );
         assert!(
             fx.0.iter().any(
-                |e| matches!(e, Effect::Toast { message, kind: ToastKind::Success, .. }
-                if message == "Copied web URL")
+                |e| matches!(e, Effect::Toast { title, kind: ToastKind::Success, .. }
+                if title == "Copied web URL")
             ),
             "a concise confirmation toast rides alongside"
         );

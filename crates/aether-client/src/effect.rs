@@ -7,6 +7,7 @@
 use super::keymap::{ScrollDir, ScrollUnit, ViewportPlace};
 use super::session::{HoverText, PasteKind};
 use aether_protocol::BufferId;
+use std::time::Duration;
 
 /// An action whose execution is irreducibly shell-side — geometry (pixel scroll, cell metrics,
 /// cursor placement), viewport wrap plumbing, or the help overlay. The keymap and dispatch stay in
@@ -93,13 +94,35 @@ pub enum WindowOpen {
     Workspace,
 }
 
-/// Web-client toast kinds; the colour of the toast's accent bar.
+/// A toast's intent: the colour of its accent bar and title, and (via [`ToastKind::pinned`] /
+/// [`ToastKind::ttl`]) how long it stays up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
     Error,
     Warning,
     Success,
+}
+
+impl ToastKind {
+    /// Whether a toast of this kind stays up until it's *dismissed* (Esc, or a click in the GUI/web
+    /// shells) rather than fading on its own. Only errors pin: they're the ones carrying detail
+    /// worth reading, and they're rare enough that holding the corner isn't noise. Pinned toasts
+    /// still expire on [`ToastKind::ttl`] as a backstop, so a forgotten one can't linger forever.
+    pub fn pinned(self) -> bool {
+        matches!(self, ToastKind::Error)
+    }
+
+    /// How long a toast of this kind stays before it auto-dismisses. Confirmations (a save, a copy)
+    /// are read at a glance; a warning is a sentence worth finishing; an error is pinned and this is
+    /// only its backstop. Shared by all three shells so their timings can't drift.
+    pub fn ttl(self) -> Duration {
+        match self {
+            ToastKind::Info | ToastKind::Success => Duration::from_millis(3600),
+            ToastKind::Warning => Duration::from_millis(6000),
+            ToastKind::Error => Duration::from_millis(20_000),
+        }
+    }
 }
 
 /// How a cursor reveal should reposition the viewport.
@@ -125,14 +148,20 @@ pub enum Effect {
         method: &'static str,
         params: serde_json::Value,
     },
-    /// Show a transient message (display duration and styling are the shell's). When `group` is
-    /// set, the shell replaces any existing toast carrying the same key — refreshing its lifetime —
-    /// instead of stacking a new one, so a status that evolves (an LSP server's "Restarting" →
-    /// "ready", the diff toggle, the reconnect lifecycle) updates a single toast in place. `None`
-    /// (the default, via [`Effects::toast`]/[`Effects::error`]) always stacks a fresh toast — the
-    /// right behaviour for discrete confirmations (saves, copies, deletes).
+    /// Show a transient message (styling is the shell's; lifetime comes from the `kind`, see
+    /// [`ToastKind::ttl`]). `title` is the headline, shown in the kind's colour — keep it short and
+    /// scannable ("Push failed", not "Push failed: remote rejected…"). The optional `body` carries
+    /// the detail or the suggested next step, rendered muted underneath; it's what the reader turns
+    /// to *after* the title has told them which way it went.
+    ///
+    /// When `group` is set, the shell replaces any existing toast carrying the same key — refreshing
+    /// its lifetime — instead of stacking a new one, so a status that evolves (an LSP server's
+    /// "Restarting" → "ready", the diff toggle, the reconnect lifecycle) updates a single toast in
+    /// place. `None` (the default, via [`Effects::toast`]/[`Effects::error`]) always stacks a fresh
+    /// toast — the right behaviour for discrete confirmations (saves, copies, deletes).
     Toast {
-        message: String,
+        title: String,
+        body: Option<String>,
         kind: ToastKind,
         group: Option<String>,
     },
@@ -213,9 +242,27 @@ impl Effects {
         Effects(vec![e])
     }
 
-    pub fn toast(message: impl Into<String>, kind: ToastKind) -> Self {
+    pub fn toast(title: impl Into<String>, kind: ToastKind) -> Self {
         Effects::one(Effect::Toast {
-            message: message.into(),
+            title: title.into(),
+            body: None,
+            kind,
+            group: None,
+        })
+    }
+
+    /// A toast with a muted detail line under its title (see [`Effect::Toast`]). Use it instead of
+    /// folding the detail into the title with a `: ` — the title stays scannable and the detail gets
+    /// room to wrap. An empty `body` degrades to a plain [`Effects::toast`], so a formatted error
+    /// string that happens to come back blank doesn't leave a dangling line.
+    pub fn toast_detail(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        kind: ToastKind,
+    ) -> Self {
+        Effects::one(Effect::Toast {
+            title: title.into(),
+            body: non_empty(body),
             kind,
             group: None,
         })
@@ -225,19 +272,41 @@ impl Effects {
     /// status that should update one toast in place rather than stack — keyed so distinct subjects
     /// (e.g. two LSP servers) still get their own toast.
     pub fn toast_grouped(
-        message: impl Into<String>,
+        title: impl Into<String>,
         kind: ToastKind,
         group: impl Into<String>,
     ) -> Self {
         Effects::one(Effect::Toast {
-            message: message.into(),
+            title: title.into(),
+            body: None,
             kind,
             group: Some(group.into()),
         })
     }
 
-    pub fn error(message: impl Into<String>) -> Self {
-        Effects::toast(message, ToastKind::Error)
+    /// [`Effects::toast_grouped`] with a detail line ([`Effects::toast_detail`]).
+    pub fn toast_grouped_detail(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        kind: ToastKind,
+        group: impl Into<String>,
+    ) -> Self {
+        Effects::one(Effect::Toast {
+            title: title.into(),
+            body: non_empty(body),
+            kind,
+            group: Some(group.into()),
+        })
+    }
+
+    pub fn error(title: impl Into<String>) -> Self {
+        Effects::toast(title, ToastKind::Error)
+    }
+
+    /// An error toast whose detail — the failure's own message, or the suggested fix — reads on its
+    /// own muted line. The shape to reach for when the alternative is `format!("{what}: {e}")`.
+    pub fn error_detail(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Effects::toast_detail(title, body, ToastKind::Error)
     }
 
     pub fn push(&mut self, e: Effect) {
@@ -249,4 +318,10 @@ impl Effects {
         self.0.extend(other.0);
         self
     }
+}
+
+/// A toast body, dropped when it's blank — see [`Effects::toast_detail`].
+fn non_empty(body: impl Into<String>) -> Option<String> {
+    let body = body.into();
+    (!body.trim().is_empty()).then_some(body)
 }

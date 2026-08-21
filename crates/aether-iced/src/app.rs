@@ -328,11 +328,18 @@ const SCROLL_ANIM_MS: f32 = 180.0;
 #[derive(Debug)]
 struct Toast {
     id: u64,
-    message: String,
+    /// The headline, drawn in the kind's colour.
+    title: String,
+    /// The optional detail line under it, drawn muted and wrapped.
+    body: Option<String>,
     kind: ToastKind,
     /// Replacement key (see [`aether_client::effect::Effect::Toast`]). A new grouped toast evicts
     /// any existing toast sharing this key instead of stacking. `None` toasts always stack.
     group: Option<String>,
+    /// Stays up until dismissed (Esc, or a click on it) rather than fading on its own — see
+    /// [`ToastKind::pinned`]. Its expiry timer is only a backstop, so it carries a dim `Esc` marker
+    /// naming the way out.
+    pinned: bool,
 }
 
 #[derive(Debug)]
@@ -351,6 +358,8 @@ pub enum Message {
     /// via the matching `*_set_*` method (web parity). Carries the field and its new value.
     OverlayInput(OverlayField, String),
     ToastExpired(u64),
+    /// A pinned toast was clicked — dismiss that one (the mouse twin of Esc).
+    ToastDismissed(u64),
     /// Fire-and-forget RPC completed (e.g. `search/clear`); result ignored.
     /// An RPC outcome for a core-issued `Effect::Request` (the token routes it back to
     /// the parked mapping in the session).
@@ -1085,7 +1094,7 @@ impl App {
                 // Connected) — disconnect fallout, not worth a toast next to the reconnect
                 // banner. The fresh subscribe after reconnect re-establishes the viewport.
                 if self.session.conn == ConnState::Connected {
-                    self.error(format!("Subscribe failed: {e}"))
+                    self.error_detail("Subscribe failed", e.message)
                 } else {
                     Task::none()
                 }
@@ -1131,7 +1140,7 @@ impl App {
                 if e.code != aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND.code()
                     && self.session.conn == ConnState::Connected
                 {
-                    self.error(format!("Viewport update failed: {e}"))
+                    self.error_detail("Viewport update failed", e.message)
                 } else {
                     Task::none()
                 }
@@ -1190,6 +1199,10 @@ impl App {
             }
 
             Message::ToastExpired(id) => {
+                self.toasts.retain(|t| t.id != id);
+                Task::none()
+            }
+            Message::ToastDismissed(id) => {
                 self.toasts.retain(|t| t.id != id);
                 Task::none()
             }
@@ -1387,10 +1400,16 @@ impl App {
                         let toast = if self.session.is_placeholder() {
                             // Grouped "connection", replacing the "reconnecting…" toast in
                             // place — the same evolution the restore path gets from the core.
-                            self.toast("Reconnected", ToastKind::Success, Some("connection".into()))
+                            self.toast(
+                                "Reconnected",
+                                None,
+                                ToastKind::Success,
+                                Some("connection".into()),
+                            )
                         } else {
                             self.toast(
-                                "Workspace no longer exists — pick another",
+                                "That workspace no longer exists",
+                                Some("Pick another".into()),
                                 ToastKind::Warning,
                                 None,
                             )
@@ -1416,11 +1435,12 @@ impl App {
 
     fn toast(
         &mut self,
-        message: impl Into<String>,
+        title: impl Into<String>,
+        body: Option<String>,
         kind: ToastKind,
         group: Option<String>,
     ) -> Task<Message> {
-        let message = message.into();
+        let title = title.into();
         // A grouped toast replaces any existing toast with the same key, so an evolving status
         // (LSP restart → ready, the diff toggle) updates one toast in place. Ungrouped toasts
         // stack; repeat-prone messages (search errors, nav boundaries) carry a group in the core,
@@ -1433,21 +1453,35 @@ impl App {
         self.next_toast += 1;
         self.toasts.push(Toast {
             id,
-            message,
+            title,
+            body: body.filter(|b| !b.trim().is_empty()),
             kind,
             group,
+            pinned: kind.pinned(),
         });
+        // Every toast gets a timer, pinned ones included: for them it's the backstop that stops a
+        // forgotten error sitting in the corner forever (Esc, or a click, is the real way out).
+        let ttl = kind.ttl();
         Task::perform(
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(3600)).await;
+                tokio::time::sleep(ttl).await;
                 id
             },
             Message::ToastExpired,
         )
     }
 
-    fn error(&mut self, message: String) -> Task<Message> {
-        self.toast(message, ToastKind::Error, None)
+    /// An error toast whose detail — the failure's own words — reads on its own muted line under a
+    /// short title. The shell-side twin of `Effects::error_detail`.
+    fn error_detail(&mut self, title: impl Into<String>, body: impl Into<String>) -> Task<Message> {
+        self.toast(title, Some(body.into()), ToastKind::Error, None)
+    }
+
+    /// Clear every pinned toast (see [`Toast::pinned`]). Called on Esc *before* the key is
+    /// dispatched and without consuming it: Esc keeps doing its usual job (leaving insert, closing
+    /// an overlay) and takes the held errors with it.
+    fn dismiss_pinned_toasts(&mut self) {
+        self.toasts.retain(|t| !t.pinned);
     }
 
     /// Execute a batch of core effects: futures spawn onto iced's executor with their events
@@ -1457,10 +1491,11 @@ impl App {
         for e in fx.0 {
             match e {
                 Effect::Toast {
-                    message,
+                    title,
+                    body,
                     kind,
                     group,
-                } => tasks.push(self.toast(message, kind, group)),
+                } => tasks.push(self.toast(title, body, kind, group)),
                 Effect::WriteClipboard(text) => tasks.push(iced::clipboard::write(text)),
                 Effect::RevealCursor(style) => tasks.push(self.ensure_cursor_visible(style)),
                 Effect::Resubscribe => {
@@ -1758,6 +1793,12 @@ impl App {
     /// Key events: the shell's edge — dismiss the hover popover (its parse cache lives
     /// here), then hand the key to the core with the viewport height it may need.
     fn on_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Task<Message> {
+        // Esc clears any pinned (error) toast, then goes on to do whatever it normally does. First
+        // in the function so it applies from every state — including the ones below that return
+        // early — and non-consuming so Esc never silently means *only* "dismiss".
+        if code == KeyCode::Esc {
+            self.dismiss_pinned_toasts();
+        }
         // While a hover popover is open, scroll keys pan it (and keep it open); any other key
         // dismisses it — Esc is then consumed, everything else still acts.
         if self.hover.is_some() {
@@ -1769,7 +1810,7 @@ impl App {
                 // normal copy.
                 Some(HoverAction::Copy) => {
                     let text = self.hover.as_ref().unwrap().to_plain_text();
-                    let note = self.toast("Copied popover", ToastKind::Success, None);
+                    let note = self.toast("Copied popover", None, ToastKind::Success, None);
                     return Task::batch([iced::clipboard::write(text), note]);
                 }
                 Some(HoverAction::Scroll { dir, unit }) => {
@@ -4388,10 +4429,13 @@ impl App {
     }
 
     /// Bottom-right toast stack, above the status bar — layout and accent colours mirror the
-    /// web client's `#toasts` (a `▌` glyph stands in for its 3px left border).
+    /// web client's `#toasts` (a `▌` glyph stands in for its 3px left border). The title takes the
+    /// kind's colour, any detail reads muted beneath it, and both wrap within
+    /// [`toast_max_width`]. Pinned toasts carry a dim `Esc` and dismiss on a click.
     fn toast_overlay(&self) -> Element<'_, Message> {
         let ui = self.ui();
         let p = self.palette();
+        let max_w = toast_max_width(self.window_size.width);
         let mut stack_col = column![].spacing(8).align_x(iced::Alignment::End);
         for toast in &self.toasts {
             let accent = match toast.kind {
@@ -4400,41 +4444,57 @@ impl App {
                 ToastKind::Warning => p.warning,
                 ToastKind::Success => p.ok,
             };
+            let mut title_row = row![text(toast.title.clone())
+                .size(ui.body())
+                .font(SANS_BOLD_UI)
+                .color(accent)]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
+            if toast.pinned {
+                // Names the way out, quietly — the toast holds the corner until it's pressed.
+                title_row =
+                    title_row.push(text("Esc").size(ui.small()).font(SANS).color(p.fg_faint));
+            }
+            let mut lines = column![title_row].spacing(2);
+            if let Some(body) = &toast.body {
+                lines = lines.push(
+                    text(body.clone())
+                        .size(ui.small())
+                        .font(SANS)
+                        .color(p.fg_dim),
+                );
+            }
             // The accent left strip is rendered the way the web does a rounded `border-left`: an
             // accent-coloured rounded base (outer) showing through a 3px left inset, with the NORD1
             // content layer (inner) covering everything else. So the strip's left corners ARE the
             // base's rounded corners — matching the rounded right corners — and the height is just
             // the content's (no `Fill` to bound).
-            stack_col = stack_col.push(
+            let card =
                 container(
-                    container(
-                        text(toast.message.clone())
-                            .size(ui.body())
-                            .font(SANS)
-                            .color(p.fg),
-                    )
-                    .padding([6, 12])
-                    .style(move |_| container::Style {
-                        background: Some(p.bg_panel.into()),
-                        // Square against the accent strip on the left; rounded on the right (just
-                        // inside the 1px border, so ~3) to sit within the base's rounded corners.
-                        border: iced::Border {
-                            radius: iced::border::Radius {
-                                top_left: 0.0,
-                                bottom_left: 0.0,
-                                top_right: 3.0,
-                                bottom_right: 3.0,
+                    container(lines)
+                        .padding([6, 12])
+                        .style(move |_| container::Style {
+                            background: Some(p.bg_panel.into()),
+                            // Square against the accent strip on the left; rounded on the right (just
+                            // inside the 1px border, so ~3) to sit within the base's rounded corners.
+                            border: iced::Border {
+                                radius: iced::border::Radius {
+                                    top_left: 0.0,
+                                    bottom_left: 0.0,
+                                    top_right: 3.0,
+                                    bottom_right: 3.0,
+                                },
+                                ..iced::Border::default()
                             },
-                            ..iced::Border::default()
-                        },
-                        ..container::Style::default()
-                    }),
+                            ..container::Style::default()
+                        }),
                 )
                 // Reveal a 3px accent strip down the left; the content is flush on the other sides.
                 .padding(iced::Padding {
                     left: 3.0,
                     ..iced::Padding::ZERO
                 })
+                .max_width(max_w)
                 .style(move |_| container::Style {
                     background: Some(accent.into()),
                     border: iced::Border {
@@ -4448,8 +4508,22 @@ impl App {
                         blur_radius: 16.0,
                     },
                     ..container::Style::default()
-                }),
-            );
+                });
+            // A pinned toast is dismissible by pointer as well as by Esc; a fading one isn't worth
+            // a hit box (it's gone before the pointer arrives).
+            // Built over a tiny `Clone` message (the toast's id) and mapped up, the way every other
+            // clickable in this view is — `Message` itself isn't `Clone`, which `mouse_area` needs.
+            let card = Element::<'_, u64>::from(card);
+            let card = if toast.pinned {
+                Element::from(
+                    iced::widget::mouse_area(card)
+                        .on_press(toast.id)
+                        .interaction(iced::mouse::Interaction::Pointer),
+                )
+            } else {
+                card
+            };
+            stack_col = stack_col.push(card.map(Message::ToastDismissed));
         }
         container(stack_col)
             .width(Length::Fill)
@@ -4464,6 +4538,20 @@ impl App {
             })
             .into()
     }
+}
+
+/// A toast's maximum width in pixels: half the window, held between a floor and a ceiling. Half so a
+/// toast never dominates the view, the ceiling so a long error doesn't run the width of an ultrawide
+/// display (long lines are hard to read back), the floor so a narrow window still gets something
+/// readable — even if that means most of the width. The TUI and web clamps mirror these.
+fn toast_max_width(window_width: f32) -> f32 {
+    const MIN: f32 = 260.0;
+    const MAX: f32 = 560.0;
+    // Before the first resize event the window size is zero; the ceiling is the sane default.
+    if window_width <= 0.0 {
+        return MAX;
+    }
+    window_width.min((window_width / 2.0).clamp(MIN, MAX))
 }
 
 /// A filter chip for the search bar's match options — same look as the grep picker's chips
@@ -7704,6 +7792,22 @@ mod tests {
         assert!(
             app.pending_os_opens.is_empty(),
             "the queue drains, so a later boot event can't reopen them"
+        );
+    }
+
+    /// Half the window, floored and capped: a toast never dominates the view, never runs the width
+    /// of an ultrawide display, and still gets a readable line in a narrow window (where "half"
+    /// would be too little, so it takes what's there). The TUI's `toast_text_width` mirrors this.
+    #[test]
+    fn toast_width_is_half_the_window_within_bounds() {
+        assert_eq!(toast_max_width(2400.0), 560.0, "capped on a wide display");
+        assert_eq!(toast_max_width(800.0), 400.0, "half in between");
+        assert_eq!(toast_max_width(400.0), 260.0, "floored on a narrow window");
+        assert_eq!(toast_max_width(200.0), 200.0, "never wider than the window");
+        assert_eq!(
+            toast_max_width(0.0),
+            560.0,
+            "before the first resize event, the ceiling stands in"
         );
     }
 }
