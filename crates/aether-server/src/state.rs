@@ -438,9 +438,10 @@ pub struct WorkspaceEntry {
     /// survives picker hide/show.
     pub workspace_index: Arc<WorkspaceIndex>,
     /// Most-recently-used buffers in this workspace, front = most-recent. Bumped on every
-    /// `buffer/open` (fresh open, reopen, or attach-by-id). Drives the buffer picker's empty-
-    /// query ordering, and the `last_buffer_id` returned by `workspace/activate` (so re-attaching
-    /// to a workspace drops the user on the buffer they last had).
+    /// `buffer/open` (fresh open, reopen, or attach-by-id) — so this is *focus* recency, not edit
+    /// recency. Drives the buffer picker's empty-query ordering, and the `last_buffer_id` returned
+    /// by `workspace/activate` (so re-attaching to a workspace drops the user on the buffer they
+    /// last had, scratch or file alike).
     ///
     /// Lives on the workspace — not on the client — so it persists across client disconnects.
     /// A new TUI invocation gets a fresh `ClientId` but inherits the workspace's MRU.
@@ -2606,6 +2607,34 @@ mod workspace_state_tests {
             s.first_dormant_id("p"),
             None,
             "promotion empties the registry"
+        );
+    }
+
+    /// A restored *scratch* is a landing target like any other dormant buffer: it sits at the front
+    /// of the session's buffer list when it's what you were last editing, and that's what a restart
+    /// lands you on.
+    #[test]
+    fn first_dormant_id_includes_restored_scratches() {
+        let mut s = ServerState::new();
+        s.workspaces
+            .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
+        let scratch = s.allocate_buffer_id();
+        let file = s.allocate_buffer_id();
+        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
+            DormantBuffer {
+                id: scratch,
+                source: DormantSource::Scratch { number: 1 },
+            },
+            DormantBuffer {
+                id: file,
+                source: DormantSource::File(PathBuf::from("/p/a.rs")),
+            },
+        ];
+
+        assert_eq!(
+            s.first_dormant_id("p"),
+            Some(scratch),
+            "the scratch you were last editing lands, not the file behind it"
         );
     }
 

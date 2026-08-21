@@ -2989,6 +2989,16 @@ pub async fn bootstrap(
             }
         }
         Some(workspace) => {
+            // Resolve the CLI path once, before activating: whether it's a directory decides
+            // whether the activation should also land us somewhere.
+            let resolved = match file {
+                Some(f) => Some(crate::app::resolve_cli_path(f)?),
+                None => None,
+            };
+            // A directory browses over the workspace's last buffer, with the explorer opening on
+            // top (the `startup` effects below); only a workspace with nothing to return to falls
+            // through to the transient scratch `open_last` mints. A file lands on itself.
+            let land_on_last = crate::app::lands_on_last_buffer(resolved.as_deref());
             let activated = handle
                 .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
                     // Unset, not empty: reconnects and boot land in whichever context this
@@ -2996,29 +3006,13 @@ pub async fn bootstrap(
                     // this is the whole of "come back where I was".
                     worktrees: None,
                     name: workspace.to_string(),
-                    open_last: file.is_none(),
+                    open_last: land_on_last,
                 })
                 .await?;
             let workspace_paths = activated.workspace.paths.clone();
 
-            // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
-            // transient scratch and opens the file explorer over it (the `startup` effects below);
-            // a file opens normally.
-            let resolved = match file {
-                Some(f) => Some(crate::app::resolve_cli_path(f)?),
-                None => None,
-            };
-
             let open = match &resolved {
-                Some(abs) if abs.is_dir() => {
-                    handle
-                        .rpc::<BufferOpen>(BufferOpenParams {
-                            transient: Some(true),
-                            ..Default::default()
-                        })
-                        .await?
-                }
-                Some(abs) => {
+                Some(abs) if !abs.is_dir() => {
                     let abs = abs.display().to_string();
                     match aether_client::session::strip_longest_root(&abs, &workspace_paths) {
                         // Inside a workspace root: ordinary workspace-relative open. A `path:line:col`
@@ -3049,7 +3043,8 @@ pub async fn bootstrap(
                             })?,
                     }
                 }
-                None => activated.opened.ok_or_else(|| {
+                // No path, or a directory: the composite already landed us.
+                _ => activated.opened.ok_or_else(|| {
                     anyhow::anyhow!("workspace/activate returned no landing buffer")
                 })?,
             };
@@ -3059,8 +3054,8 @@ pub async fn bootstrap(
             let mut session = Session::new(activated.workspace, buffer);
             // A quick-edit launch (`ae file`, workspace *inferred* from the path — `tether` is
             // never set alongside an explicit `--workspace`): tether the client to the opened file,
-            // so closing it exits. A missing path is a file to create and tethers too; directory
-            // args land in the explorer over a scratch — nothing to tether to.
+            // so closing it exits. A missing path is a file to create and tethers too; a directory
+            // opens the explorer over whatever buffer we landed on — nothing to tether to.
             if tether && resolved.as_ref().is_some_and(|p| !p.is_dir()) {
                 session.tether = Some(session.buffer.buffer_id);
             }

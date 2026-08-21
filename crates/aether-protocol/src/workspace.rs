@@ -75,11 +75,11 @@ pub struct WorkspaceActivateParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceActivateResult {
     pub workspace: WorkspaceInfo,
-    /// The most-recently-used buffer in this workspace for the calling client, if any. Populated
-    /// from the server's per-client MRU. `None` means the client has no history in this workspace
-    /// (first visit, or every prior buffer has been closed). The client should attach to this
-    /// buffer rather than spawn a fresh scratch, so switching back to a workspace lands you on the
-    /// buffer you last had open.
+    /// The most-recently-used buffer in this workspace, if any — scratch or file alike, since the
+    /// point is to put you back where you left off. Resolved from the workspace's MRU (shared by
+    /// every client, so it outlives disconnects), falling back to the most recent session-restored
+    /// dormant buffer. `None` means the workspace holds nothing at all (first visit, or every prior
+    /// buffer closed), and only then should the client spawn a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_buffer_id: Option<BufferId>,
     /// With `open_last`: the landing buffer, fully opened.

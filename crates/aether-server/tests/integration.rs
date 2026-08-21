@@ -1642,6 +1642,73 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
 }
 
 #[tokio::test]
+async fn workspace_activate_lands_back_on_a_scratch_you_were_editing() {
+    // Landing is kind-blind: you come back to whatever you left off in. A scratch at the front of
+    // the MRU is where you were, so that is where re-activation puts you — a file behind it in the
+    // MRU does *not* take precedence. (A fresh scratch is only ever minted when there is nothing to
+    // return to at all, which is a state with no file to prefer either.)
+    let (_server, mut ws, file_id) = setup_with_buffer("hello\n").await;
+
+    // Open a scratch *after* the file, putting it at the front of the MRU.
+    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        10,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(scratch.path.is_none(), "opened a scratch");
+    assert_ne!(scratch.buffer_id, file_id);
+
+    let r: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        11,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        r.last_buffer_id,
+        Some(scratch.buffer_id),
+        "the scratch you were last in wins over the file behind it"
+    );
+    let opened = r.opened.expect("open_last returns the landing buffer");
+    assert_eq!(opened.buffer_id, scratch.buffer_id);
+
+    // Closing it falls back to the file rather than minting a second scratch.
+    send_request::<BufferClose>(
+        &mut ws,
+        12,
+        &BufferCloseParams {
+            buffer_id: scratch.buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+    let r: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        13,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        r.last_buffer_id,
+        Some(file_id),
+        "with the scratch gone, the file is the landing target"
+    );
+}
+
+#[tokio::test]
 async fn input_text_at_selection_start_inserts_before() {
     // Paste-before's collapse rides the edit itself.
     let (_server, mut ws, buffer_id) = setup_with_buffer("abcde\n").await;

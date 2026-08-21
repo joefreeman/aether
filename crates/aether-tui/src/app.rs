@@ -746,6 +746,17 @@ pub fn apply_cursor_style(state: &AppState) {
 /// exception is a trailing `/`: that declares directory intent, which create-on-open can't
 /// satisfy, so the original error surfaces (e.g. "No such file or directory") with the arg for
 /// context.
+/// Whether a launch should land on the workspace's last buffer rather than on its path argument.
+///
+/// True with no path at all, and true for a **directory**: a directory is a place to browse, not a
+/// file to open, so the explorer opens *over* whatever you were last in rather than over a blank
+/// scratch. (A workspace with nothing to return to still gets one — that's `open_last`'s own
+/// fallback.) A file argument is the thing you asked for, so it lands on itself; so does a path
+/// that doesn't exist yet, which is a file to create.
+pub fn lands_on_last_buffer(resolved: Option<&std::path::Path>) -> bool {
+    resolved.is_none_or(|p| p.is_dir())
+}
+
 pub fn resolve_cli_path(arg: &str) -> Result<std::path::PathBuf> {
     let raw = std::path::Path::new(arg);
     let joined = if raw.is_absolute() {
@@ -876,6 +887,30 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ae DIR` opens the explorer over the workspace's last buffer, not over a fresh scratch —
+    /// so a directory arg lands on the last buffer just like a bare `ae -w NAME`. A file arg (and
+    /// a not-yet-existing path, which is a file to create) lands on itself instead.
+    #[test]
+    fn lands_on_last_buffer_for_directories_and_bare_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("hello.txt");
+        std::fs::write(&file_path, "hi").unwrap();
+
+        assert!(lands_on_last_buffer(None), "no path: land on the last buffer");
+        assert!(
+            lands_on_last_buffer(Some(dir.path())),
+            "a directory browses over what you were last in"
+        );
+        assert!(
+            !lands_on_last_buffer(Some(&file_path)),
+            "a file is the thing you asked for"
+        );
+        assert!(
+            !lands_on_last_buffer(Some(&dir.path().join("not-yet.txt"))),
+            "a path that doesn't exist yet is a file to create, not a directory"
+        );
+    }
 
     /// `resolve_cli_path` resolves a relative arg against CWD, not against an arbitrary base.
     /// Tested here because the old (buggy) behaviour joined relative args with `workspace_paths[0]`

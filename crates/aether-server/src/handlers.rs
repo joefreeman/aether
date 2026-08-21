@@ -729,6 +729,10 @@ async fn activate_context(
     // Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
     // loaded yet — land on the most-recently-used *dormant* buffer, which `buffer_open` materializes
     // by id. `None` only when the workspace is genuinely empty (first ever visit), giving a scratch.
+    //
+    // Deliberately kind-blind: a scratch you were editing is where you left off, and coming back to
+    // it is the point. A fresh scratch is only ever minted when there is no buffer of any kind to
+    // return to — a state with no file to prefer — so this never opens a blank scratch over a file.
     let last_buffer_id = s
         .workspaces
         .get(&context)

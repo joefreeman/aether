@@ -6500,9 +6500,9 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
     let server_started_at = activated.server_started_at;
     let workspace_paths = activated.workspace.paths.clone();
 
-    // Resolve the CLI path once, then branch on file vs directory. A directory lands in a
-    // transient scratch and opens the file explorer over it (`explorer_dir`, run once the session
-    // installs); a file opens normally.
+    // Resolve the CLI path once, then branch on file vs directory. A directory opens the file
+    // explorer (`explorer_dir`, run once the session installs) over the workspace's last buffer;
+    // a file opens normally.
     let resolved = match &args.file {
         Some(f) => Some(resolve_cli_path(f)?),
         None => None,
@@ -6531,14 +6531,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         }
     } else {
         match &resolved {
-            Some(abs) if abs.is_dir() => handle
-                .rpc::<BufferOpen>(BufferOpenParams {
-                    transient: Some(true),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| e.to_string())?,
-            Some(abs) => {
+            Some(abs) if !abs.is_dir() => {
                 let abs_str = abs.display().to_string();
                 match strip_longest_root(&abs_str, &workspace_paths) {
                     // Inside a workspace root: ordinary workspace-relative open (creating a
@@ -6569,8 +6562,11 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                         .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?,
                 }
             }
-            // No file: attach to the most recent buffer, or a transient scratch placeholder.
-            None => handle
+            // No file, or a *directory* — a place to browse, not a file to open, so it lands like
+            // a no-path launch with the explorer opening over it (`explorer_dir` below). Attach to
+            // the most recent buffer; only a workspace with nothing to return to gets the transient
+            // scratch placeholder.
+            _ => handle
                 .rpc::<BufferOpen>(BufferOpenParams {
                     buffer_id: activated.last_buffer_id,
                     transient: activated.last_buffer_id.is_none().then_some(true),
