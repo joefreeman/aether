@@ -5903,7 +5903,7 @@ fn md_rich_in<M: 'static>(
     md_spans(
         inlines, bold, false, None, base_color, size, family, target, p, &mut spans,
     );
-    iced::widget::rich_text(spans)
+    iced::widget::rich_text(shape_split(spans))
         .size(size)
         .line_height(iced::widget::text::LineHeight::Relative(line_height))
         .on_link_click(on_link)
@@ -6215,6 +6215,51 @@ fn md_span(
         Some(href) => s.link(href.to_string()).underline(true),
         None => s.link_maybe(None::<String>),
     }
+}
+
+/// The zero-width character [`shape_split`] wedges between two faces: U+2060 WORD JOINER.
+const SHAPE_SPLITTER: &str = "\u{2060}";
+
+/// Wedge a zero-width joiner wherever the face changes mid-word, so each span is shaped in its
+/// own font.
+///
+/// cosmic-text 0.15 — the version iced 0.14 pins — shapes a whole line-break "word" with the
+/// attributes of its *first* byte whenever the word is plain ASCII, a fast path that ignores every
+/// attribute change inside the word. Only a run flanked by spaces came out right: `` (`code`) ``
+/// drew the chip in the body serif, and `` `code`. `` dragged the full stop into the mono face.
+/// A non-ASCII character in the word sends it down cosmic-text's per-attribute path instead, where
+/// each span is matched and shaped on its own. Upstream guards the fast path as of cosmic-text
+/// 0.19; this can go once iced pins a version that has it.
+///
+/// U+2060 rather than U+200B: it adds no break opportunity, so wrapping is untouched, and
+/// harfbuzz hides default-ignorables, so it takes no advance and can never draw a box. It *does*
+/// forbid a break at its own position, so it's only wedged between two non-blank characters —
+/// the case the bug needs, and never one that carries the line's wrap point.
+fn shape_split(
+    spans: Vec<iced::advanced::text::Span<'static, String>>,
+) -> Vec<iced::advanced::text::Span<'static, String>> {
+    let mut out = Vec::with_capacity(spans.len());
+    // The trailing character and face of the last span that contributed any text: empty spans
+    // carry no attribute range of their own, so they can't be the boundary.
+    let mut prev: Option<(char, Option<iced::Font>)> = None;
+    for span in spans {
+        let Some(first) = span.text.chars().next() else {
+            out.push(span);
+            continue;
+        };
+        if let Some((last, font)) = prev {
+            if font != span.font && !last.is_whitespace() && !first.is_whitespace() {
+                out.push(
+                    iced::widget::span(SHAPE_SPLITTER.to_string())
+                        .font_maybe(span.font)
+                        .link_maybe(None::<String>),
+                );
+            }
+        }
+        prev = Some((span.text.chars().next_back().unwrap_or(first), span.font));
+        out.push(span);
+    }
+    out
 }
 
 /// Estimate the rendered height (wrapped rows) of the AST, for the place-above-or-below decision.
@@ -7135,6 +7180,79 @@ mod tests {
         ui().row_h()
     }
     use aether_protocol::picker::{PickerItem, PickerUpdateParams};
+
+    /// The rendered spans for one line of inline Markdown, as `(text, font)` pairs.
+    fn read_spans(inlines: &[MdInline]) -> Vec<(String, Option<iced::Font>)> {
+        let p = theme::palette(aether_protocol::settings::ThemeMode::Dark);
+        let mut spans = Vec::new();
+        md_spans(
+            inlines,
+            false,
+            false,
+            None,
+            p.fg,
+            MD_TEXT,
+            READ_FONT_FAMILY,
+            None,
+            p,
+            &mut spans,
+        );
+        shape_split(spans)
+            .into_iter()
+            .map(|s| (s.text.into_owned(), s.font))
+            .collect()
+    }
+
+    fn text(s: &str) -> MdInline {
+        MdInline::Text {
+            text: s.to_string(),
+        }
+    }
+
+    fn code(s: &str) -> MdInline {
+        MdInline::Code {
+            text: s.to_string(),
+        }
+    }
+
+    /// Regression: cosmic-text 0.15 shapes an all-ASCII line-break "word" in the face of its first
+    /// byte, so an inline code span glued to punctuation — `(`this`)` — came out in the reading
+    /// view's serif rather than the mono chip face, and a code span followed by a full stop pulled
+    /// the stop into mono. A zero-width joiner at each glued face change is what breaks the word
+    /// out of that fast path, so it has to land on exactly those boundaries.
+    #[test]
+    fn glued_code_spans_get_a_shaping_joiner() {
+        let spans = read_spans(&[text("e.g. ("), code("this"), text(").")]);
+        assert_eq!(
+            spans.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["e.g. (", SHAPE_SPLITTER, "this", SHAPE_SPLITTER, ")."],
+        );
+        // Each joiner opens the run it precedes, so the face change lands on the joiner itself.
+        assert_eq!(spans[1].1, spans[2].1);
+        assert_eq!(spans[1].1, Some(iced::Font::MONOSPACE));
+        assert_eq!(spans[3].1, spans[4].1);
+    }
+
+    /// The flip side: a boundary that already falls on a blank is shaped correctly as-is, and a
+    /// joiner there would forbid the line break the wrap point needs.
+    #[test]
+    fn spaced_code_spans_keep_their_break_opportunities() {
+        assert_eq!(
+            read_spans(&[text("e.g. "), code("this"), text(" here")])
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["e.g. ", "this", " here"],
+        );
+        // Only the glued side is wedged: a leading space, a trailing stop.
+        assert_eq!(
+            read_spans(&[text("e.g. "), code("this"), text(".")])
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["e.g. ", "this", SHAPE_SPLITTER, "."],
+        );
+    }
 
     /// Regression: a three-level chain on a bar with a workspace prefix, a path and a Git cluster
     /// used to be handed a budget it couldn't actually render, and the row silently wrapped to two
