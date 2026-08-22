@@ -5500,3 +5500,53 @@ fn app_settings_carry_a_path_and_stay_backward_compatible() {
         json!("/mnt/fast/worktrees")
     );
 }
+
+/// `MUTATES_TEXT` is what the client's request funnel refuses a read-only buffer on, so the two
+/// deliberate answers are worth pinning: the flag means "changes the text of the buffer it
+/// *names*", not "writes text somewhere".
+///
+/// `git/apply_hunk` is the exception that makes the distinction load-bearing. Invoked on a patch
+/// view it stages into a *different* buffer, so marking it — as a sweep over "everything that
+/// writes text" would — silently breaks staging from the working-changes view, the one thing a
+/// read-only buffer is legitimately the subject of.
+///
+/// Asserted in `const` blocks: the flags are compile-time facts, so getting one wrong should fail
+/// the build rather than one test run. Nothing here executes.
+#[test]
+fn mutates_text_marks_the_buffer_a_method_names() {
+    use aether_protocol::buffer::{BufferContent, BufferCut};
+    use aether_protocol::cursor::CursorMove;
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::git::{GitApplyHunk, GitResolveConflict};
+    use aether_protocol::input::{EditUndo, InputMoveLines, InputText};
+
+    const { assert!(InputText::MUTATES_TEXT) };
+    const { assert!(InputMoveLines::MUTATES_TEXT, "the whole point") };
+    const { assert!(EditUndo::MUTATES_TEXT) };
+    const {
+        assert!(
+            BufferCut::MUTATES_TEXT,
+            "not every mutator returns EditResult"
+        )
+    };
+    const {
+        assert!(
+            GitResolveConflict::MUTATES_TEXT,
+            "rewrites the buffer it names"
+        )
+    };
+
+    const {
+        assert!(
+            !GitApplyHunk::MUTATES_TEXT,
+            "staging from a patch view writes a different buffer than the one it names"
+        )
+    };
+    const {
+        assert!(
+            !CursorMove::MUTATES_TEXT,
+            "reading a revision must still work"
+        )
+    };
+    const { assert!(!BufferContent::MUTATES_TEXT) };
+}

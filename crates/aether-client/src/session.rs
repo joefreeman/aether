@@ -2,6 +2,7 @@
 //! buffer identity, modal state, search, prompts. The shell keeps the presentation companions
 //! (pixel scroll, animation, parsed hover markdown) on its own struct.
 
+use super::effect::{Effects, ToastKind};
 use super::keymap::Action;
 use super::picker::PickerState;
 use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
@@ -1335,6 +1336,17 @@ impl ReadView {
 /// separate (restarting two servers shows two toasts, each updating in place).
 pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
     format!("lsp:{language}:{workspace_root}")
+}
+
+/// The refusal every read-only buffer answers an edit with.
+///
+/// Grouped, and deliberately on one key for the whole reason rather than per buffer or per
+/// gesture: the message is the same whichever edit asked, so holding `Ctrl-j` down — or trying
+/// `i`, then a delete, then a line move — refreshes one warning in place instead of stacking a
+/// column of identical ones. Built here so the sites that refuse can't drift apart on either the
+/// wording or the key.
+pub fn read_only_toast() -> Effects {
+    Effects::toast_grouped("Buffer is read-only", ToastKind::Warning, "read-only")
 }
 
 /// Tab stop width used for all cell math (mirrors the value the shells pass to the server on

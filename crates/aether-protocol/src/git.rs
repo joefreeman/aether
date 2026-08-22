@@ -376,6 +376,7 @@ pub enum ApplyHunkStatus {
 pub struct GitResolveConflict;
 impl RpcMethod for GitResolveConflict {
     const NAME: &'static str = "git/resolve_conflict";
+    const MUTATES_TEXT: bool = true;
     type Params = GitResolveConflictParams;
     type Result = GitResolveConflictResult;
 }

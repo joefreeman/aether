@@ -1,5 +1,6 @@
 //! Authoritative in-memory state owned by the server.
 
+use crate::error::RpcError;
 use crate::indent::{self, IndentStyle};
 use crate::picker::{self as picker_state, PickerState};
 use crate::syntax::{self, InjectionLayer, LanguageConfig};
@@ -659,6 +660,20 @@ impl ServerState {
     pub fn try_doc_of_mut(&mut self, buffer_id: BufferId) -> Option<&mut Document> {
         let doc_id = self.buffers.get(&buffer_id)?.document;
         self.documents.get_mut(&doc_id)
+    }
+
+    /// The document a buffer views, as something that may be **mutated** — the only way to reach
+    /// [`Editable`], and so the only way to change a document's text. Refuses a buffer that isn't
+    /// there and a document that doesn't accept edits, which folds the two checks every edit
+    /// handler opens with into one call.
+    pub fn editable_doc(&mut self, buffer_id: BufferId) -> Result<Editable<'_>, RpcError> {
+        let doc = self
+            .try_doc_of_mut(buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        if doc.read_only() {
+            return Err(RpcError::read_only_buffer(buffer_id));
+        }
+        Ok(Editable(doc))
     }
 
     /// The live document loaded from `canonical`, if any — the cross-workspace sharing lookup.
@@ -2098,7 +2113,10 @@ impl Document {
     /// `cursors_before_edit` is the `(client, buffer)` cursor map captured before this edit —
     /// across every buffer attached to this document; it's stored in the undo entry when a new
     /// group opens, so `Document::undo` can restore cursors.
-    pub fn apply_edit(
+    ///
+    /// Private: reached only through [`Editable::apply_edit`], which is what makes the read-only
+    /// check unskippable.
+    fn apply_edit(
         &mut self,
         start_char: usize,
         end_char: usize,
@@ -2197,6 +2215,9 @@ impl Document {
     /// was loaded with CRLF endings. Updates `canonical_path`, `dirty`, `last_modified_unix_ms`.
     ///
     /// Returns the post-save mtime in unix milliseconds.
+    ///
+    /// Not behind [`Editable`]: this doesn't touch the text, and a read-only document has to be
+    /// refused by `buffer/save` before it resolves a save-as path, not here at the end of it.
     pub fn save_to_disk(&mut self, target: PathBuf) -> std::io::Result<u64> {
         use std::io::Write;
 
@@ -2262,7 +2283,9 @@ impl Document {
     /// (saved_revision == revision). Indent style is preserved (stable for buffer lifetime).
     ///
     /// Errors if the buffer has no path or the file is unreadable.
-    pub fn reload_from_disk(&mut self) -> std::io::Result<u64> {
+    ///
+    /// Private: reached only through [`Editable::reload_from_disk`].
+    fn reload_from_disk(&mut self) -> std::io::Result<u64> {
         let path = self.canonical_path.clone().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "buffer has no path")
         })?;
@@ -2308,6 +2331,10 @@ impl Document {
     /// becomes the live text at a fresh revision, so the buffer comes back **dirty** with exactly the
     /// unsaved edits that were in flight. Undo history isn't reconstructed (hot-exit restores content
     /// and dirty state only). Re-parses syntax from scratch since the whole rope is replaced.
+    ///
+    /// Not behind [`Editable`]: this hydrates a document still under construction, before it's
+    /// inserted into [`ServerState`] and before any buffer views it, so there's no `BufferId` to
+    /// gate on — and the callers built it from a file or a scratch, never from a revision.
     pub fn restore_unsaved(&mut self, content: &str) {
         self.text = ropey::Rope::from_str(content);
         self.revision = self.next_revision_id;
@@ -2317,7 +2344,8 @@ impl Document {
         self.reparse_full();
     }
 
-    pub fn undo(
+    /// Private: reached only through [`Editable::undo`].
+    fn undo(
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
@@ -2338,7 +2366,8 @@ impl Document {
         })
     }
 
-    pub fn redo(
+    /// Private: reached only through [`Editable::redo`].
+    fn redo(
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
@@ -2393,6 +2422,64 @@ impl Document {
                     syntax::compute_injections(syntax.config, &syntax.tree, &source);
             }
         }
+    }
+}
+
+/// A document that has been checked to accept mutation — the only handle through which a
+/// document's text can change.
+///
+/// Every text-changing operation lives here rather than on [`Document`], and the only constructor
+/// is [`ServerState::editable_doc`], which refuses a read-only document. That makes the refusal a
+/// property of the type rather than a rule each handler has to remember: a new edit handler
+/// inherits it by construction (there is nothing else to call), and a new *source* of
+/// read-only-ness — see [`Document::read_only`] — applies to the whole edit surface at once.
+///
+/// Reads go through `Deref`, so the usual "edit, then measure the result" call sites keep working
+/// off the same binding. Field-level bookkeeping that isn't an edit (`dirty`, `backed_up_revision`,
+/// the external-change flags) still goes through [`ServerState::doc_of_mut`].
+pub struct Editable<'a>(&'a mut Document);
+
+impl std::ops::Deref for Editable<'_> {
+    type Target = Document;
+
+    fn deref(&self) -> &Document {
+        self.0
+    }
+}
+
+impl Editable<'_> {
+    /// See [`Document::apply_edit`] — the one text replacement primitive.
+    pub fn apply_edit(
+        &mut self,
+        start_char: usize,
+        end_char: usize,
+        insert_text: &str,
+        kind: EditKindTag,
+        cursors_before_edit: std::collections::HashMap<(ClientId, BufferId), CursorState>,
+    ) -> Revision {
+        self.0
+            .apply_edit(start_char, end_char, insert_text, kind, cursors_before_edit)
+    }
+
+    /// See [`Document::undo`].
+    pub fn undo(
+        &mut self,
+        current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
+    ) -> Option<UndoOutcome> {
+        self.0.undo(current_cursors)
+    }
+
+    /// See [`Document::redo`].
+    pub fn redo(
+        &mut self,
+        current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
+    ) -> Option<UndoOutcome> {
+        self.0.redo(current_cursors)
+    }
+
+    /// See [`Document::reload_from_disk`].
+    pub fn reload_from_disk(&mut self) -> std::io::Result<u64> {
+        self.0.reload_from_disk()
     }
 }
 

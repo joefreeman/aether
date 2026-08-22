@@ -26,6 +26,7 @@ pub struct BufferOnlyParams {
 pub struct InputText;
 impl RpcMethod for InputText {
     const NAME: &'static str = "input/text";
+    const MUTATES_TEXT: bool = true;
     type Params = InputTextParams;
     type Result = EditResult;
 }
@@ -59,6 +60,7 @@ pub struct InputTextParams {
 pub struct InputDelete;
 impl RpcMethod for InputDelete {
     const NAME: &'static str = "input/delete";
+    const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -73,6 +75,7 @@ impl RpcMethod for InputDelete {
 pub struct InputChange;
 impl RpcMethod for InputChange {
     const NAME: &'static str = "input/change";
+    const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -101,6 +104,7 @@ pub struct CountedEditParams {
 pub struct InputBackspace;
 impl RpcMethod for InputBackspace {
     const NAME: &'static str = "input/backspace";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -118,6 +122,7 @@ impl RpcMethod for InputBackspace {
 pub struct InputDeleteWord;
 impl RpcMethod for InputDeleteWord {
     const NAME: &'static str = "input/delete_word";
+    const MUTATES_TEXT: bool = true;
     type Params = InputDeleteWordParams;
     type Result = EditResult;
 }
@@ -149,6 +154,7 @@ pub struct InputDeleteWordParams {
 pub struct InputTab;
 impl RpcMethod for InputTab {
     const NAME: &'static str = "input/tab";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -161,6 +167,7 @@ impl RpcMethod for InputTab {
 pub struct InputDeleteLine;
 impl RpcMethod for InputDeleteLine {
     const NAME: &'static str = "input/delete_line";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -170,6 +177,7 @@ impl RpcMethod for InputDeleteLine {
 pub struct InputChangeLine;
 impl RpcMethod for InputChangeLine {
     const NAME: &'static str = "input/change_line";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -180,6 +188,7 @@ impl RpcMethod for InputChangeLine {
 pub struct InputReplaceLine;
 impl RpcMethod for InputReplaceLine {
     const NAME: &'static str = "input/replace_line";
+    const MUTATES_TEXT: bool = true;
     type Params = InputReplaceLineParams;
     type Result = EditResult;
 }
@@ -195,6 +204,7 @@ pub struct InputReplaceLineParams {
 pub struct InputIndent;
 impl RpcMethod for InputIndent {
     const NAME: &'static str = "input/indent";
+    const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -202,6 +212,7 @@ impl RpcMethod for InputIndent {
 pub struct InputDedent;
 impl RpcMethod for InputDedent {
     const NAME: &'static str = "input/dedent";
+    const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -218,6 +229,7 @@ impl RpcMethod for InputDedent {
 pub struct InputAdjustNumber;
 impl RpcMethod for InputAdjustNumber {
     const NAME: &'static str = "input/adjust_number";
+    const MUTATES_TEXT: bool = true;
     type Params = InputAdjustNumberParams;
     type Result = EditResult;
 }
@@ -241,6 +253,7 @@ pub struct InputAdjustNumberParams {
 pub struct InputNewlineAndIndent;
 impl RpcMethod for InputNewlineAndIndent {
     const NAME: &'static str = "input/newline_and_indent";
+    const MUTATES_TEXT: bool = true;
     type Params = InputNewlineAndIndentParams;
     type Result = EditResult;
 }
@@ -264,6 +277,7 @@ pub struct InputNewlineAndIndentParams {
 pub struct InputOpenLine;
 impl RpcMethod for InputOpenLine {
     const NAME: &'static str = "input/open_line";
+    const MUTATES_TEXT: bool = true;
     type Params = InputOpenLineParams;
     type Result = EditResult;
 }
@@ -307,6 +321,7 @@ pub enum CommentStyle {
 pub struct InputToggleComment;
 impl RpcMethod for InputToggleComment {
     const NAME: &'static str = "input/toggle_comment";
+    const MUTATES_TEXT: bool = true;
     type Params = ToggleCommentParams;
     type Result = EditResult;
 }
@@ -332,6 +347,7 @@ pub struct ToggleCommentParams {
 pub struct InputMoveLines;
 impl RpcMethod for InputMoveLines {
     const NAME: &'static str = "input/move_lines";
+    const MUTATES_TEXT: bool = true;
     type Params = InputMoveLinesParams;
     type Result = EditResult;
 }
@@ -372,6 +388,7 @@ pub enum SurroundTarget {
 pub struct InputSurround;
 impl RpcMethod for InputSurround {
     const NAME: &'static str = "input/surround";
+    const MUTATES_TEXT: bool = true;
     type Params = InputSurroundParams;
     type Result = EditResult;
 }
@@ -392,6 +409,7 @@ pub struct InputSurroundParams {
 pub struct InputUnsurround;
 impl RpcMethod for InputUnsurround {
     const NAME: &'static str = "input/unsurround";
+    const MUTATES_TEXT: bool = true;
     type Params = InputUnsurroundParams;
     type Result = EditResult;
 }
@@ -482,6 +500,7 @@ impl CaseKind {
 pub struct InputTransformCase;
 impl RpcMethod for InputTransformCase {
     const NAME: &'static str = "input/transform_case";
+    const MUTATES_TEXT: bool = true;
     type Params = InputTransformCaseParams;
     type Result = EditResult;
 }
@@ -506,6 +525,7 @@ pub struct InputTransformCaseParams {
 pub struct EditUndo;
 impl RpcMethod for EditUndo {
     const NAME: &'static str = "edit/undo";
+    const MUTATES_TEXT: bool = true;
     type Params = UndoRedoParams;
     type Result = UndoResult;
 }
@@ -513,6 +533,7 @@ impl RpcMethod for EditUndo {
 pub struct EditRedo;
 impl RpcMethod for EditRedo {
     const NAME: &'static str = "edit/redo";
+    const MUTATES_TEXT: bool = true;
     type Params = UndoRedoParams;
     type Result = UndoResult;
 }
@@ -542,6 +563,7 @@ pub struct UndoRedoParams {
 pub struct InputJoinLines;
 impl RpcMethod for InputJoinLines {
     const NAME: &'static str = "input/join_lines";
+    const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -591,6 +613,7 @@ pub enum BlockUnit {
 pub struct InputMoveBlock;
 impl RpcMethod for InputMoveBlock {
     const NAME: &'static str = "input/move_block";
+    const MUTATES_TEXT: bool = true;
     type Params = MoveBlockParams;
     type Result = BlockEditResult;
 }
@@ -607,6 +630,7 @@ pub struct MoveBlockParams {
 pub struct InputDeleteBlock;
 impl RpcMethod for InputDeleteBlock {
     const NAME: &'static str = "input/delete_block";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = BlockEditResult;
 }
@@ -616,6 +640,7 @@ impl RpcMethod for InputDeleteBlock {
 pub struct InputPasteBlock;
 impl RpcMethod for InputPasteBlock {
     const NAME: &'static str = "input/paste_block";
+    const MUTATES_TEXT: bool = true;
     type Params = PasteBlockParams;
     type Result = BlockEditResult;
 }
@@ -633,6 +658,7 @@ pub struct PasteBlockParams {
 pub struct InputOpenBlock;
 impl RpcMethod for InputOpenBlock {
     const NAME: &'static str = "input/open_block";
+    const MUTATES_TEXT: bool = true;
     type Params = OpenBlockParams;
     type Result = BlockEditResult;
 }
@@ -648,6 +674,7 @@ pub struct OpenBlockParams {
 pub struct InputBlockDepth;
 impl RpcMethod for InputBlockDepth {
     const NAME: &'static str = "input/block_depth";
+    const MUTATES_TEXT: bool = true;
     type Params = BlockDepthParams;
     type Result = BlockEditResult;
 }
@@ -663,6 +690,7 @@ pub struct BlockDepthParams {
 pub struct InputToggleTask;
 impl RpcMethod for InputToggleTask {
     const NAME: &'static str = "input/toggle_task";
+    const MUTATES_TEXT: bool = true;
     type Params = ToggleTaskParams;
     type Result = BlockEditResult;
 }

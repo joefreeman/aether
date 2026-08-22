@@ -2896,14 +2896,48 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
         "navigation is unaffected"
     );
 
-    // Edits are dropped with a warning rather than sent.
+    // Edits are dropped with a warning rather than sent. The warning is grouped, so holding a key
+    // down refreshes one toast in place instead of stacking a column of identical ones.
     let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
     assert!(no_request(&fx), "no edit RPC leaves the client");
+    assert_eq!(
+        first_toast(&fx),
+        Some((
+            "Buffer is read-only".to_string(),
+            Some("read-only".to_string())
+        ))
+    );
 
     //...and `i` doesn't even change mode, so the next keystroke isn't text either.
     let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
     assert!(no_request(&fx));
     assert!(matches!(s.mode, aether_client::session::Mode::Normal));
+    // ...on the same key as the edit refusal: `i` then a delete is one toast, not two.
+    assert_eq!(
+        first_toast(&fx).and_then(|(_, group)| group),
+        Some("read-only".to_string())
+    );
+
+    // The gestures that don't reach the wire through `Session::edit` are covered too, because the
+    // refusal keys off `RpcMethod::MUTATES_TEXT` in the request funnel rather than off the edit
+    // helper's signature. `Ctrl-j`/`Ctrl-k` send `input/move_lines` directly and used to sail
+    // straight past; `Ctrl-x` sends `buffer/cut`, whose result type the helper can't even name.
+    for (key, mods, what) in [
+        (KeyCode::Char('j'), Mods::CTRL, "input/move_lines down"),
+        (KeyCode::Char('k'), Mods::CTRL, "input/move_lines up"),
+        (KeyCode::Char('x'), Mods::CTRL, "buffer/cut"),
+    ] {
+        let fx = s.on_key(key, mods, None, ROWS);
+        assert!(no_request(&fx), "{what} left the client");
+    }
+
+    // The same gestures on a writable buffer do reach the wire — what's being asserted above is
+    // the refusal, not three inert bindings.
+    s.buffer.read_only = false;
+    let fx = s.on_key(KeyCode::Char('j'), Mods::CTRL, None, ROWS);
+    assert!(find_request(&fx, "input/move_lines").is_some());
+    let fx = s.on_key(KeyCode::Char('x'), Mods::CTRL, None, ROWS);
+    assert!(find_request(&fx, "buffer/cut").is_some());
 }
 
 /// Enter on a commit row opens it as a read-only virtual buffer: the row already carries the repo

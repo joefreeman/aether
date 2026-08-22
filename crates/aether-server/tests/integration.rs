@@ -40,13 +40,15 @@ use aether_protocol::git::{
     HunkDirection, ResolveConflictStatus, ShowTarget,
 };
 use aether_protocol::input::{
-    BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
-    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
-    InputDelete, InputDeleteWord, InputDeleteWordParams, InputIndent, InputJoinLines,
-    InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams,
-    InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams, InputTab, InputText,
-    InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
-    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
+    BlockDepthParams, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams,
+    EditRedo, EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
+    InputBlockDepth, InputChange, InputDedent, InputDelete, InputDeleteBlock, InputDeleteWord,
+    InputDeleteWordParams, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
+    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
+    InputOpenLine, InputOpenLineParams, InputPasteBlock, InputSurround, InputSurroundParams,
+    InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask, InputTransformCase,
+    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, MoveBlockParams,
+    OpenBlockParams, PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams,
     UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
@@ -34464,6 +34466,323 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
     )
     .await;
     assert!(err.contains("read-only"), "save refused: {err}");
+
+    drop(server);
+}
+
+/// The refusal covers the *whole* mutating surface, not just the handlers that happen to share
+/// the `input/*` funnel. Every method below reaches its edit through `ServerState::editable_doc`,
+/// which is what makes that true by construction rather than by each handler remembering to
+/// check: `input/move_lines`, `input/join_lines`, the indent pair, `input/toggle_comment` and
+/// `buffer/cut` all compute their own char ranges and used to walk straight past the funnel's
+/// guard and mutate a commit's content.
+///
+/// Deliberately absent: `lsp/format` (a pathless buffer has no language server, so it reports
+/// `Unavailable` before reaching an edit) and `git/apply_hunk` / `git/resolve_conflict` (they
+/// resolve a repo path first, and staging *from* a patch view is meant to edit a different
+/// buffer). Both still hit the same gate underneath — they just can't demonstrate it from here.
+#[tokio::test]
+async fn a_read_only_buffer_refuses_every_mutating_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // A file at a revision rather than a commit's patch: it carries a grammar, so the commands
+    // that need one (`input/toggle_comment`) have real work to do rather than no-opping on a
+    // language-less buffer and never reaching an edit at all.
+    // Two blank-line-separated paragraphs, so the block-grain commands have somewhere to move to,
+    // and a trailing checkbox line for `input/toggle_task`. The content only has to be text at a
+    // revision — nothing here has to be valid Rust.
+    commit_file(
+        &repo,
+        "a.rs",
+        "fn main() {\n    let x = \"1\";\n    let y = (2);\n}\n\nfn other() {\n    let z = 3;\n}\n\n- [ ] a task\n",
+    );
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: head,
+                path: "a.rs".into(),
+            },
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(opened.read_only);
+    let buffer_id = opened.buffer_id;
+
+    let before: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 3, &BufferContentParams { buffer_id }).await;
+
+    let counted = || CountedEditParams {
+        buffer_id,
+        count: 1,
+    };
+    let only = || BufferOnlyParams { buffer_id };
+    let sel = |al: u32, ac: u32, pl: u32, pc: u32| {
+        (
+            LogicalPosition { line: al, col: ac },
+            LogicalPosition { line: pl, col: pc },
+        )
+    };
+    let mut id = 100;
+    // Each row re-selects the two indented body lines first, so every command is judged from the
+    // same state and has something real to do: a refusal that only held because the range was
+    // empty, the buffer had no line to move onto, or the lines had no leading whitespace to strip
+    // would prove nothing. Re-selecting per row also keeps the table order from mattering — a
+    // refused `input/open_line` still parks the cursor on its way to being refused, since a
+    // cursor move isn't a mutation and doesn't pass through the gate.
+    macro_rules! refuses {
+        // The two indented body lines — what the line-oriented commands want.
+        ($m:ty, $p:expr) => {
+            refuses!(@at sel(1, 0, 2, 0), $m, $p)
+        };
+        // An explicit selection, for the commands that need something narrower under the cursor.
+        (@at $sel:expr, $m:ty, $p:expr) => {{
+            let (anchor, position) = $sel;
+            id += 1;
+            let _: CursorState = send_request::<CursorSet>(
+                &mut ws,
+                id,
+                &CursorSetParams {
+                    buffer_id,
+                    position,
+                    anchor,
+                    granularity: Granularity::Char,
+                },
+            )
+            .await;
+            id += 1;
+            let err = send_request_expect_err::<$m>(&mut ws, id, &$p).await;
+            assert!(
+                err.contains("read-only"),
+                "{} was not refused: {err}",
+                <$m as RpcMethod>::NAME
+            );
+        }};
+    }
+
+    // Text in, text out.
+    refuses!(
+        InputText,
+        InputTextParams {
+            buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        }
+    );
+    refuses!(InputDelete, counted());
+    refuses!(InputChange, counted());
+    refuses!(InputBackspace, only());
+    refuses!(
+        InputDeleteWord,
+        InputDeleteWordParams {
+            buffer_id,
+            direction: Direction::Backward,
+            boundary: WordBoundary::Word,
+            count: 1,
+        }
+    );
+    refuses!(InputTab, only());
+
+    // Line-grained commands — the ones that resolve their own ranges.
+    refuses!(InputDeleteLine, only());
+    refuses!(InputChangeLine, only());
+    refuses!(
+        InputReplaceLine,
+        InputReplaceLineParams {
+            buffer_id,
+            text: "replaced".into(),
+        }
+    );
+    refuses!(InputIndent, counted());
+    refuses!(InputDedent, counted());
+    refuses!(InputJoinLines, counted());
+    refuses!(
+        InputMoveLines,
+        InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+        }
+    );
+    refuses!(
+        InputMoveLines,
+        InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Up,
+            count: 1,
+        }
+    );
+    refuses!(
+        InputToggleComment,
+        ToggleCommentParams {
+            buffer_id,
+            style: CommentStyle::Line,
+            target: SurroundTarget::Line,
+        }
+    );
+    refuses!(
+        InputOpenLine,
+        InputOpenLineParams {
+            buffer_id,
+            side: LineSide::Below,
+        }
+    );
+    refuses!(
+        InputNewlineAndIndent,
+        InputNewlineAndIndentParams {
+            buffer_id,
+            park_before: false,
+        }
+    );
+
+    // Selection transforms.
+    refuses!(
+        InputSurround,
+        InputSurroundParams {
+            buffer_id,
+            delimiter: '(',
+            target: SurroundTarget::Selection,
+        }
+    );
+    // On the `1` inside the quotes: there has to be a pair around the selection to strip.
+    refuses!(
+        @at sel(1, 13, 1, 13),
+        InputUnsurround,
+        InputUnsurroundParams {
+            buffer_id,
+            target: SurroundTarget::Selection,
+        }
+    );
+    refuses!(
+        InputTransformCase,
+        InputTransformCaseParams {
+            buffer_id,
+            kind: CaseKind::Upper,
+            scan_at_cursor: false,
+        }
+    );
+    // On the `2`: without a number under the cursor there is no edit to resolve.
+    refuses!(
+        @at sel(2, 13, 2, 13),
+        InputAdjustNumber,
+        InputAdjustNumberParams {
+            buffer_id,
+            delta: 1,
+            scan_at_cursor: false,
+        }
+    );
+
+    // Block grain (markdown reading view).
+    refuses!(
+        InputMoveBlock,
+        MoveBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Paragraph,
+        }
+    );
+    refuses!(InputDeleteBlock, only());
+    refuses!(
+        InputPasteBlock,
+        PasteBlockParams {
+            buffer_id,
+            text: "pasted\n".into(),
+            replace: false,
+        }
+    );
+    refuses!(
+        InputBlockDepth,
+        BlockDepthParams {
+            buffer_id,
+            deeper: true,
+        }
+    );
+    refuses!(
+        InputOpenBlock,
+        OpenBlockParams {
+            buffer_id,
+            above: false,
+        }
+    );
+    // On the checkbox line: there has to be a task to toggle.
+    refuses!(
+        @at sel(9, 0, 9, 0),
+        InputToggleTask,
+        ToggleTaskParams {
+            buffer_id,
+            set: Some(true),
+        }
+    );
+
+    // Whole-rope swaps and the file-backed operations.
+    refuses!(
+        EditUndo,
+        UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        }
+    );
+    refuses!(
+        EditRedo,
+        UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        }
+    );
+    refuses!(
+        BufferCut,
+        BufferCopyParams {
+            buffer_id,
+            scope: CopyScope::Selection,
+        }
+    );
+    refuses!(
+        BufferSave,
+        BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        }
+    );
+    refuses!(
+        BufferReload,
+        BufferReloadParams {
+            buffer_id,
+            force: true,
+        }
+    );
+
+    // The invariant the refusals exist to protect: byte-for-byte what it was, with no partial
+    // edit landed before any of the failures.
+    let after: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 900, &BufferContentParams { buffer_id }).await;
+    assert_eq!(
+        after.text, before.text,
+        "a refused edit still changed the buffer"
+    );
+    assert_eq!(
+        after.revision, before.revision,
+        "revision moved without an edit"
+    );
 
     drop(server);
 }

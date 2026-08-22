@@ -7321,7 +7321,7 @@ pub async fn git_apply_hunk(
             let was_dirty = buf.dirty;
             let old_len = buf.text.len_chars();
             let cursors_before = document_cursor_snapshot(&s, buffer_id);
-            let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+            let mut buf_mut = s.editable_doc(buffer_id)?;
             let revision =
                 buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Revert, cursors_before);
 
@@ -7425,7 +7425,7 @@ pub async fn git_resolve_conflict(
     let was_dirty = doc.dirty;
     let old_len = doc.text.len_chars();
     let cursors_before = document_cursor_snapshot(&s, buffer_id);
-    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+    let mut buf_mut = s.editable_doc(buffer_id)?;
     let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Resolve, cursors_before);
 
     clamp_doc_cursors(&mut s, buffer_id);
@@ -8091,7 +8091,7 @@ pub async fn lsp_format(
     let was_dirty = buf.dirty;
     let old_len = buf.text.len_chars();
     let cursors_before = document_cursor_snapshot(&s, buffer_id);
-    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+    let mut buf_mut = s.editable_doc(buffer_id)?;
     let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Format, cursors_before);
 
     // Clamp every cursor on the buffer into the reformatted rope.
@@ -10194,7 +10194,7 @@ pub async fn buffer_cut(
 
     let cursors_before = document_cursor_snapshot(&s, params.buffer_id);
 
-    let buf_mut = s.try_doc_of_mut(params.buffer_id).expect("just checked");
+    let mut buf_mut = s.editable_doc(params.buffer_id)?;
     let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(
         start_char,
@@ -10203,7 +10203,7 @@ pub async fn buffer_cut(
         EditKindTag::Delete,
         cursors_before,
     );
-    let new_pos = motion::char_to_pos(buf_mut, start_char);
+    let new_pos = motion::char_to_pos(&buf_mut, start_char);
     let new_cursor = CursorState {
         position: new_pos,
         anchor: new_pos,
@@ -10642,9 +10642,7 @@ pub(crate) fn reload_buffer_locked(
     let was_dirty = s.try_doc_of(buffer_id).map(|b| b.dirty).unwrap_or(false);
 
     let saved_at_unix_ms = {
-        let buf = s
-            .try_doc_of_mut(buffer_id)
-            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        let mut buf = s.editable_doc(buffer_id)?;
         if buf.canonical_path.is_none() {
             return Err(RpcError::buffer_has_no_path());
         }
@@ -14721,7 +14719,7 @@ async fn apply_toggle_comment(
 
     let was_dirty = s.doc_of(buffer_id).dirty;
     let revision = {
-        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+        let mut buf_mut = s.editable_doc(buffer_id)?;
         buf_mut.apply_edit(
             start_char,
             end_char,
@@ -15241,7 +15239,7 @@ async fn apply_indent_or_dedent(
 
     let was_dirty = s.doc_of(buffer_id).dirty;
     let (revision, new_cursor) = {
-        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+        let mut buf_mut = s.editable_doc(buffer_id)?;
         let revision = buf_mut.apply_edit(
             start_char,
             end_char,
@@ -15260,8 +15258,8 @@ async fn apply_indent_or_dedent(
             aether_protocol::LogicalPosition { line: p.line, col }
         };
         let new_cursor = CursorState {
-            position: motion::clamp_position(buf_mut, shift_pos(cursor.position)),
-            anchor: motion::clamp_position(buf_mut, shift_pos(cursor.anchor)),
+            position: motion::clamp_position(&buf_mut, shift_pos(cursor.position)),
+            anchor: motion::clamp_position(&buf_mut, shift_pos(cursor.anchor)),
             match_bracket: None,
             jumplist_position: None,
         };
@@ -15583,7 +15581,7 @@ async fn input_move_lines_once(
 
     let was_dirty = s.doc_of(buffer_id).dirty;
     let (revision, new_cursor) = {
-        let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+        let mut buf_mut = s.editable_doc(buffer_id)?;
         let revision = buf_mut.apply_edit(
             edit_start,
             edit_end,
@@ -15599,8 +15597,8 @@ async fn input_move_lines_once(
             col: p.col,
         };
         let new_cursor = CursorState {
-            position: motion::clamp_position(buf_mut, shift(cursor.position)),
-            anchor: motion::clamp_position(buf_mut, shift(cursor.anchor)),
+            position: motion::clamp_position(&buf_mut, shift(cursor.position)),
+            anchor: motion::clamp_position(&buf_mut, shift(cursor.anchor)),
             match_bracket: None,
             jumplist_position: None,
         };
@@ -15775,7 +15773,7 @@ async fn input_join_lines_once(
     let (revision, new_cursor, was_dirty) = {
         let mut s = state.lock().await;
         let was_dirty = s.doc_of(buffer_id).dirty;
-        let buf = s.try_doc_of_mut(buffer_id).expect("just checked");
+        let mut buf = s.editable_doc(buffer_id)?;
         let revision = buf.apply_edit(
             first_char,
             last_line_end_char,
@@ -15787,7 +15785,7 @@ async fn input_join_lines_once(
         // joined text: `Ctrl-Alt-g` (newline before the cursor) is then the exact inverse, and a
         // separator can be typed straight in.
         let new_cursor_char = first_char + last_seam;
-        let new_pos = motion::char_to_pos(buf, new_cursor_char);
+        let new_pos = motion::char_to_pos(&buf, new_cursor_char);
         let new_cursor = CursorState {
             position: new_pos,
             anchor: new_pos,
@@ -15870,9 +15868,7 @@ async fn apply_undo_or_redo(
 
     let was_dirty = s.try_doc_of(buffer_id).map(|b| b.dirty).unwrap_or(false);
     let outcome = {
-        let buf = s
-            .try_doc_of_mut(buffer_id)
-            .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+        let mut buf = s.editable_doc(buffer_id)?;
         match direction {
             UndoDirection::Undo => buf.undo(current_cursors),
             UndoDirection::Redo => buf.redo(current_cursors),
@@ -16209,8 +16205,10 @@ async fn apply_edit_reporting(
     let buf = s
         .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    // Every `input/*` funnels through here, so one guard covers the whole edit surface: a virtual
-    // buffer holds a revision's content and there is nothing an edit against it could mean.
+    // Refuse before resolving the edit rather than after: a virtual buffer holds a revision's
+    // content and there is nothing an edit against it could mean. This is the early-out, not the
+    // guarantee — `ServerState::editable_doc` is what makes the refusal unskippable, here and in
+    // the handlers that compute their own ranges instead of coming through this one.
     if buf.read_only() {
         return Err(RpcError::read_only_buffer(buffer_id));
     }
@@ -16661,7 +16659,7 @@ async fn apply_edit_reporting(
     let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
     // Mutate the buffer (rope edit + incremental reparse + undo-group bookkeeping).
-    let buf_mut = s.try_doc_of_mut(buffer_id).expect("just checked");
+    let mut buf_mut = s.editable_doc(buffer_id)?;
     let was_dirty = buf_mut.dirty;
     let revision = buf_mut.apply_edit(start_char, end_char, &insert_text, kind_tag, cursors_before);
 
@@ -16679,8 +16677,8 @@ async fn apply_edit_reporting(
         // The block edits' landing: absolute bytes of the post-edit document, converted on
         // the new rope (they were computed against the resulting text).
         let clamp = |b: usize| buf_mut.text.byte_to_char(b.min(buf_mut.text.len_bytes()));
-        let anchor_pos = motion::char_to_pos(buf_mut, clamp(anchor));
-        let position_pos = motion::char_to_pos(buf_mut, clamp(cursor));
+        let anchor_pos = motion::char_to_pos(&buf_mut, clamp(anchor));
+        let position_pos = motion::char_to_pos(&buf_mut, clamp(cursor));
         CursorState {
             position: position_pos,
             anchor: anchor_pos,
@@ -16691,8 +16689,8 @@ async fn apply_edit_reporting(
         // Select the inserted span. Block cursor on its last char.
         let anchor_char = start_char + lead;
         let last_char = start_char + inserted_char_count - 1 - trail;
-        let anchor_pos = motion::char_to_pos(buf_mut, anchor_char);
-        let position_pos = motion::char_to_pos(buf_mut, last_char);
+        let anchor_pos = motion::char_to_pos(&buf_mut, anchor_char);
+        let position_pos = motion::char_to_pos(&buf_mut, last_char);
         CursorState {
             position: position_pos,
             anchor: anchor_pos,
@@ -16706,7 +16704,7 @@ async fn apply_edit_reporting(
             PostEdit::PointAt(c) => c.clamp(start_char, buf_mut.text.len_chars()),
             _ => start_char + inserted_char_count,
         };
-        let post_pos = motion::char_to_pos(buf_mut, point_char);
+        let post_pos = motion::char_to_pos(&buf_mut, point_char);
         CursorState {
             position: post_pos,
             anchor: post_pos,

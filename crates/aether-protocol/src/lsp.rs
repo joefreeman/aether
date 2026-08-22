@@ -173,6 +173,7 @@ pub struct LspServerRef {
 pub struct LspFormat;
 impl RpcMethod for LspFormat {
     const NAME: &'static str = "lsp/format";
+    const MUTATES_TEXT: bool = true;
     type Params = LspBufferParams;
     type Result = LspFormatResult;
 }

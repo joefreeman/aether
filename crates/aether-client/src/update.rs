@@ -2653,6 +2653,15 @@ impl Session {
     where
         M: RpcMethod + 'static,
     {
+        // A read-only buffer declines every text-changing method here rather than paying a round
+        // trip to be refused — that's what keeps a held key quiet instead of streaming errors.
+        // The property is declared on the method (`RpcMethod::MUTATES_TEXT`), not remembered at
+        // each call site, so a method added later is covered by the funnel it already goes
+        // through. The server is still the authority: `ServerState::editable_doc` refuses these
+        // for real, whatever a client believes.
+        if M::MUTATES_TEXT && self.buffer.read_only {
+            return crate::session::read_only_toast();
+        }
         // The socket is down: drop the request rather than parking a mapping that can never
         // resolve (and would fire stale on reconnect). The reconnect path re-subscribes from
         // scratch, so nothing is lost by not queuing here. This is the single place the
@@ -2744,17 +2753,15 @@ impl Session {
         effects
     }
 
-    /// Send an edit RPC — the single client-side funnel for every buffer mutation, mirroring the
-    /// server's `apply_edit`. A read-only buffer (a revision materialised by `git/show`) declines
-    /// here with a toast rather than paying a round trip to be refused: the server is still the
-    /// authority, this just makes holding a key down quiet instead of a stream of errors.
+    /// Send an edit RPC: `request_str` with the shared `EditDone` continuation. The read-only
+    /// refusal is *not* here — it lives in `request`, keyed off `RpcMethod::MUTATES_TEXT`, so it
+    /// also covers the mutating methods this signature can't express (`buffer/cut` and
+    /// `lsp/format` return their own result types) and the ones that reach the wire by another
+    /// route.
     pub fn edit<M>(&mut self, params: M::Params) -> Effects
     where
         M: RpcMethod<Result = EditResult> + 'static,
     {
-        if self.buffer.read_only {
-            return Effects::toast("Buffer is read-only", ToastKind::Warning);
-        }
         self.request_str::<M>(params, Event::EditDone)
     }
 
@@ -8875,7 +8882,7 @@ impl Session {
                 // Refused up front rather than letting the mode change and toasting per keystroke:
                 // a read-only buffer has nothing Insert mode could do.
                 if self.buffer.read_only {
-                    return Effects::toast("Buffer is read-only", ToastKind::Warning);
+                    return crate::session::read_only_toast();
                 }
                 self.mode = Mode::Insert;
                 self.enter_insert_at(where_)

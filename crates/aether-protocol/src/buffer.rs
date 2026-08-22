@@ -133,6 +133,7 @@ pub struct BufferOpenResult {
 pub struct BufferSave;
 impl RpcMethod for BufferSave {
     const NAME: &'static str = "buffer/save";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferSaveParams;
     type Result = BufferSaveResult;
 }
@@ -242,6 +243,7 @@ pub struct BufferLocation {
 pub struct BufferReload;
 impl RpcMethod for BufferReload {
     const NAME: &'static str = "buffer/reload";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferReloadParams;
     type Result = BufferReloadResult;
 }
@@ -303,6 +305,7 @@ impl RpcMethod for BufferCopy {
 pub struct BufferCut;
 impl RpcMethod for BufferCut {
     const NAME: &'static str = "buffer/cut";
+    const MUTATES_TEXT: bool = true;
     type Params = BufferCopyParams;
     type Result = BufferCutResult;
 }

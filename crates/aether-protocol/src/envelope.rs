@@ -87,6 +87,19 @@ pub trait RpcMethod {
     const NAME: &'static str;
     type Params: Serialize + DeserializeOwned;
     type Result: Serialize + DeserializeOwned;
+
+    /// Whether this method changes the text of the buffer it names.
+    ///
+    /// Declared here, beside the method's name, because it's a property of the method rather than
+    /// of any one call site: the client checks it in its single request funnel and declines
+    /// against a read-only buffer without paying a round trip to be refused, so holding a key
+    /// down stays quiet instead of streaming errors back. The server refuses these for real —
+    /// see `ServerState::editable_doc` — and remains the authority.
+    ///
+    /// "The buffer it names" is the load-bearing part. `git/apply_hunk` is `false` despite
+    /// writing text: invoked on a patch view it stages *into a different buffer*, which is the
+    /// one thing a read-only buffer is legitimately the subject of.
+    const MUTATES_TEXT: bool = false;
 }
 
 /// One-way server→client notifications. No response.
