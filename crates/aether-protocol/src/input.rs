@@ -3,7 +3,7 @@
 //! All input commands are cursor-relative; none carry positions on the wire. If a selection
 //! exists, the command's implicit range is that selection.
 
-use crate::cursor::{CursorState, VerticalDirection};
+use crate::cursor::{CursorState, Direction, VerticalDirection, WordBoundary};
 use crate::envelope::RpcMethod;
 use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,37 @@ impl RpcMethod for InputBackspace {
     const NAME: &'static str = "input/backspace";
     type Params = BufferOnlyParams;
     type Result = EditResult;
+}
+
+// ---- input/delete_word --------------------------------------------------------------------------
+
+/// Delete the span between the cursor and where the equivalent word *motion* would land —
+/// Insert-mode `Alt-Backspace` (backward) and `Alt-Delete` (forward). The cursor ends at the
+/// span's start either way, so a backward delete walks left and a forward delete stays put.
+///
+/// Distinct from both siblings rather than a flag on either. `input/backspace` resolves a
+/// tab-stop-aware *char* span that deliberately never leaves the line; `input/delete` removes the
+/// current selection, which in Insert mode is the point char. This resolves a word motion and is
+/// free to cross the line boundary, exactly as `b` does in Normal mode.
+pub struct InputDeleteWord;
+impl RpcMethod for InputDeleteWord {
+    const NAME: &'static str = "input/delete_word";
+    type Params = InputDeleteWordParams;
+    type Result = EditResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InputDeleteWordParams {
+    pub buffer_id: BufferId,
+    pub direction: Direction,
+    pub boundary: WordBoundary,
+    /// Delete this many words in one edit (`0` = `1`) — the count rides the motion, so a counted
+    /// press stays a single round-trip and a single undo step.
+    #[serde(
+        default = "crate::count_one",
+        skip_serializing_if = "crate::count_is_one"
+    )]
+    pub count: u32,
 }
 
 // ---- input/tab ------------------------------------------------------------------------------

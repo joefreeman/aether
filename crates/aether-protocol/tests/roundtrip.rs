@@ -1455,6 +1455,46 @@ fn input_tab_method() {
     assert_eq!(parsed.buffer_id, 7);
 }
 
+/// `input/delete_word` — the Insert-mode `Alt-Backspace` / `Alt-Delete` edit. Direction and
+/// boundary are always on the wire (there is no sensible default for either); `count` follows the
+/// counted-edit convention and is omitted at 1.
+#[test]
+fn input_delete_word_method() {
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::input::{InputDeleteWord, InputDeleteWordParams};
+    assert_eq!(InputDeleteWord::NAME, "input/delete_word");
+
+    let back = to_value(InputDeleteWordParams {
+        buffer_id: 5,
+        direction: Direction::Backward,
+        boundary: WordBoundary::Word,
+        count: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        back,
+        json!({"buffer_id": 5, "direction": "backward", "boundary": "word"})
+    );
+
+    let fwd = to_value(InputDeleteWordParams {
+        buffer_id: 5,
+        direction: Direction::Forward,
+        boundary: WordBoundary::BigWord,
+        count: 3,
+    })
+    .unwrap();
+    assert_eq!(
+        fwd,
+        json!({"buffer_id": 5, "direction": "forward", "boundary": "WORD", "count": 3})
+    );
+
+    let parsed: InputDeleteWordParams =
+        from_value(json!({"buffer_id": 5, "direction": "backward", "boundary": "word"})).unwrap();
+    assert_eq!(parsed.count, 1);
+    assert_eq!(parsed.direction, Direction::Backward);
+    assert_eq!(parsed.boundary, WordBoundary::Word);
+}
+
 #[test]
 fn input_adjust_number_methods() {
     use aether_protocol::envelope::RpcMethod;

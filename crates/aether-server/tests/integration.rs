@@ -41,11 +41,12 @@ use aether_protocol::git::{
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
     InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputChange, InputDedent,
-    InputDelete, InputIndent, InputJoinLines, InputMoveLines, InputMoveLinesParams,
-    InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenLine, InputOpenLineParams,
-    InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
-    InputTransformCase, InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide,
-    SurroundTarget, ToggleCommentParams, UndoRedoParams, UndoResult,
+    InputDelete, InputDeleteWord, InputDeleteWordParams, InputIndent, InputJoinLines,
+    InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams,
+    InputOpenLine, InputOpenLineParams, InputSurround, InputSurroundParams, InputTab, InputText,
+    InputTextParams, InputToggleComment, InputTransformCase, InputTransformCaseParams,
+    InputUnsurround, InputUnsurroundParams, LineSide, SurroundTarget, ToggleCommentParams,
+    UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistClear,
@@ -3105,6 +3106,184 @@ async fn input_backspace_steps_back_through_indent() {
     let _: EditResult =
         send_request::<InputBackspace>(&mut ws, 27, &BufferOnlyParams { buffer_id }).await;
     assert_eq!(buffer_text(&mut ws, 28, buffer_id).await, "    fn () {}\n");
+
+    drop(server);
+}
+
+/// Move the cursor to `(line, col)`, delete one word in `direction`, and return
+/// `(buffer text, resulting cursor)`.
+async fn delete_word_at(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    buffer_id: u64,
+    line: u32,
+    col: u32,
+    direction: Direction,
+) -> (String, LogicalPosition) {
+    let pos = LogicalPosition { line, col };
+    send_request::<CursorSet>(
+        ws,
+        80,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputDeleteWord>(
+        ws,
+        81,
+        &InputDeleteWordParams {
+            buffer_id,
+            direction,
+            boundary: WordBoundary::Word,
+            count: 1,
+        },
+    )
+    .await;
+    (buffer_text(ws, 82, buffer_id).await, r.cursor.position)
+}
+
+/// `input/delete_word` backward — Insert-mode `Alt-Backspace`. The span is exactly what the `b`
+/// motion would traverse, so the delete and the motion always agree on where a word starts.
+#[tokio::test]
+async fn input_delete_word_backward() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world\nfoo bar\n").await;
+
+    // From the end of a word: that word goes, its leading space stays.
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 0, 11, Direction::Backward).await;
+    assert_eq!(text, "hello \nfoo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 0, col: 6 });
+
+    // Repeated presses make progress: the next one takes the space *and* the word before it.
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 0, 6, Direction::Backward).await;
+    assert_eq!(text, "\nfoo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 0, col: 0 });
+
+    // At the buffer start there's nothing left to take — a clean no-op, not an error.
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 0, 0, Direction::Backward).await;
+    assert_eq!(text, "\nfoo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+/// Backward from a line start crosses the boundary, taking the newline *and* the word before it —
+/// the `b` motion's span, and the same choice Emacs makes. (Some editors stop at the join; this
+/// one follows its own motion, so `Alt-Backspace` never removes a different span than `b` skips.)
+#[tokio::test]
+async fn input_delete_word_backward_crosses_the_line_boundary() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world\nfoo bar\n").await;
+
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 1, 0, Direction::Backward).await;
+    assert_eq!(text, "hello foo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 0, col: 6 });
+
+    drop(server);
+}
+
+/// `input/delete_word` forward — Insert-mode `Alt-Delete`. Mirror image: the cursor stays put and
+/// the text ahead of it goes, up to the next word start.
+#[tokio::test]
+async fn input_delete_word_forward() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello world\nfoo bar\n").await;
+
+    // The word *and* the whitespace after it, so the next word slides up to the caret.
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 0, 0, Direction::Forward).await;
+    assert_eq!(text, "world\nfoo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 0, col: 0 });
+
+    // Repeated presses make progress, crossing the line boundary as the motion does.
+    let (text, _) = delete_word_at(&mut ws, buffer_id, 0, 0, Direction::Forward).await;
+    assert_eq!(text, "foo bar\n");
+
+    // At the buffer end there's nothing ahead — a no-op.
+    let (text, cursor) = delete_word_at(&mut ws, buffer_id, 1, 0, Direction::Forward).await;
+    assert_eq!(text, "foo bar\n");
+    assert_eq!(cursor, LogicalPosition { line: 1, col: 0 });
+
+    drop(server);
+}
+
+/// The count rides the motion, so `count: n` is one edit (and one undo step), not `n` of them.
+#[tokio::test]
+async fn input_delete_word_honours_count() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("one two three\n").await;
+    let pos = LogicalPosition { line: 0, col: 13 };
+    send_request::<CursorSet>(
+        &mut ws,
+        30,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    let r: EditResult = send_request::<InputDeleteWord>(
+        &mut ws,
+        31,
+        &InputDeleteWordParams {
+            buffer_id,
+            direction: Direction::Backward,
+            boundary: WordBoundary::Word,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 32, buffer_id).await, "one \n");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 4 });
+
+    // One undo step, not two.
+    let _: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        33,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 34, buffer_id).await, "one two three\n");
+
+    drop(server);
+}
+
+/// `WordBoundary::BigWord` widens the unit to whitespace-delimited runs — the `Alt-b` grain,
+/// available on the wire even though the keymap only binds the small-word tier today.
+#[tokio::test]
+async fn input_delete_word_big_word_boundary() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("call foo.bar()\n").await;
+    let pos = LogicalPosition { line: 0, col: 14 };
+    send_request::<CursorSet>(
+        &mut ws,
+        40,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: pos,
+            anchor: pos,
+        },
+    )
+    .await;
+    // Small-word would stop at the `)`; BIGword takes the whole `foo.bar()` run.
+    let _: EditResult = send_request::<InputDeleteWord>(
+        &mut ws,
+        41,
+        &InputDeleteWordParams {
+            buffer_id,
+            direction: Direction::Backward,
+            boundary: WordBoundary::BigWord,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, 42, buffer_id).await, "call \n");
 
     drop(server);
 }

@@ -1829,13 +1829,14 @@ impl App {
                 return Task::none();
             }
         }
-        // Snapshot the chip editor's active-field text before the core sees the key. The chip
-        // inputs are controlled `text_input`s, so when the core rewrites the text in response to a
-        // key (Tab-complete, suggestion cycle, switching root↔path) iced leaves the widget's own
-        // caret where it was — mid-string. Detect that out-of-band change and jump the caret to the
-        // end. Scoped to the key path: plain typing flows through `OverlayInput`, so this never
-        // fights a click-to-position-then-type.
-        let chip_before = self.chip_field_snapshot();
+        // Snapshot the focused overlay field's text before the core sees the key. Every overlay
+        // input is a controlled `text_input`, so when the core rewrites the text in response to a
+        // key (Tab-complete, suggestion cycle, switching root↔path, Alt-Backspace's word/segment
+        // delete, search-history recall) iced leaves the widget's own caret where it was —
+        // mid-string. Detect that out-of-band change and jump the caret to the end. Scoped to the
+        // key path: plain typing flows through `OverlayInput`, so this never fights a
+        // click-to-position-then-type.
+        let field_before = self.overlay_field_snapshot();
         let chips_before = self.picker_chip_count();
         // The picker query is a controlled `text_input` too: a command key can rewrite it
         // out-of-band (Tab-complete extends it, Alt-Backspace clears it), and iced would leave the
@@ -1851,11 +1852,11 @@ impl App {
         }
         let fx = self.session.on_key(code, mods, text, visible_rows);
         let mut task = self.run_core(fx);
-        let chip_after = self.chip_field_snapshot();
-        if let Some((field, _)) = &chip_after {
+        let field_after = self.overlay_field_snapshot();
+        if let Some((field, _)) = &field_after {
             // The active field or its text changed out-of-band (the core rewrote it) — snap the
             // controlled `text_input`'s caret to the end of the new value.
-            if chip_after != chip_before {
+            if field_after != field_before {
                 task = Task::batch([
                     task,
                     iced::widget::operation::move_cursor_to_end(field.id(self.window)),
@@ -1893,42 +1894,65 @@ impl App {
         self.session.picker.as_ref().map(|p| p.chips.len())
     }
 
-    /// The active chip-editor / save-as field (the one with a focused `text_input`) and its current
-    /// text, or `None` when neither is open. Used to spot core-driven text changes that need the
-    /// `text_input` caret moved to the end (see `on_key`). The save-as prompt's root/path segments
-    /// are the same controlled-input-over-ghost shape as the chip editor, so they get the same
-    /// caret-to-end treatment when the core rewrites them (Tab-complete, cycle, root↔path switch).
-    fn chip_field_snapshot(&self) -> Option<(OverlayField, String)> {
-        // The workspace-settings add-project row is the same path editor, so it needs the same
-        // caret snap: `Alt-l` rewrites the value under the controlled `text_input`, which otherwise
-        // leaves its caret at the old index — mid-string, right after an accept.
+    /// The focused overlay text field (the one with a focused `text_input`) and its current text,
+    /// or `None` when no overlay owns a field. Used to spot core-driven text changes that need the
+    /// `text_input` caret moved to the end (see `on_key`) — Tab-complete, suggestion cycle,
+    /// root↔path switch, `Alt-Backspace`'s word/segment delete, search-history recall.
+    ///
+    /// The picker *query* is snapshotted separately by the caller, which distinguishes "the picker
+    /// stayed open and its query changed" from "a picker opened or closed".
+    fn overlay_field_snapshot(&self) -> Option<(OverlayField, String)> {
+        // The workspace-settings add-project row is the same path editor as the chip editor, so it
+        // needs the same caret snap: `Alt-l` rewrites the value under the controlled `text_input`,
+        // which otherwise leaves its caret at the old index — mid-string, right after an accept.
         if let Some(ps) = &self.session.workspace_settings {
-            if ps.row() == SettingsRow::AddProject {
+            let multi_root = self.session.workspace_paths.len() > 1;
+            match ps.row() {
+                SettingsRow::AddProject => {
+                    return Some(
+                        if multi_root && ps.add_project.field == crate::chips::ChipEditorField::Root
+                        {
+                            (
+                                OverlayField::WorkspaceAddProjectRoot,
+                                ps.add_project.root_filter.text.clone(),
+                            )
+                        } else {
+                            (
+                                OverlayField::WorkspaceAddProject,
+                                ps.add_project.input.text.clone(),
+                            )
+                        },
+                    );
+                }
+                SettingsRow::Name => {
+                    return Some((OverlayField::WorkspaceName, ps.name.text.clone()));
+                }
+                SettingsRow::AddRoot => {
+                    return Some((OverlayField::WorkspaceAddRoot, ps.add.text.clone()));
+                }
+                // The root/project list rows hold no editable field.
+                _ => {}
+            }
+        }
+        match &self.session.prompt {
+            Some(Prompt::SaveAs(ed)) => {
                 let multi_root = self.session.workspace_paths.len() > 1;
                 return Some(
-                    if multi_root && ps.add_project.field == crate::chips::ChipEditorField::Root {
-                        (
-                            OverlayField::WorkspaceAddProjectRoot,
-                            ps.add_project.root_filter.text.clone(),
-                        )
+                    if multi_root && ed.field == crate::chips::ChipEditorField::Root {
+                        (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
                     } else {
-                        (
-                            OverlayField::WorkspaceAddProject,
-                            ps.add_project.input.text.clone(),
-                        )
+                        (OverlayField::SaveAs, ed.input.text.clone())
                     },
                 );
             }
+            Some(Prompt::OpenPath(field)) => {
+                return Some((OverlayField::OpenPath, field.text.clone()));
+            }
+            _ => {}
         }
-        if let Some(Prompt::SaveAs(ed)) = &self.session.prompt {
-            let multi_root = self.session.workspace_paths.len() > 1;
-            return Some(
-                if multi_root && ed.field == crate::chips::ChipEditorField::Root {
-                    (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
-                } else {
-                    (OverlayField::SaveAs, ed.input.text.clone())
-                },
-            );
+        // A selected option chip parks focus off the search input, so there's no caret to keep.
+        if self.session.mode == Mode::Search && self.session.search.chip_selected.is_none() {
+            return Some((OverlayField::Search, self.session.search.query.clone()));
         }
         let ed = self.session.picker.as_ref()?.chip_editor.as_ref()?;
         Some(if ed.field == crate::chips::ChipEditorField::Root {

@@ -228,9 +228,11 @@ impl ViewportPlace {
 pub enum Action {
     // ---- motions (extend = Shift) ----
     MoveChar(Direction),
-    /// `b` / `Alt-b` — move to the previous word start. (`w` selects words via
-    /// [`Action::SelectWord`], so this is backward-only.)
-    MoveWordBack {
+    /// Move to the next/previous word start. Normal mode binds only the backward direction
+    /// (`b` / `Alt-b`) because `w` there selects words via [`Action::SelectWord`]; Insert mode,
+    /// which has no selection, binds both on `Alt-←` / `Alt-→`.
+    MoveWord {
+        dir: Direction,
         boundary: WordBoundary,
     },
     MoveWordEnd {
@@ -306,6 +308,13 @@ pub enum Action {
 
     // ---- edits ----
     Backspace,
+    /// `Alt-Backspace` / `Alt-Delete` in Insert mode — delete the word to one side of the caret.
+    /// The span is the matching [`Action::MoveWord`] motion's, resolved server-side, so the delete
+    /// and the motion can never disagree about where a word starts.
+    DeleteWord {
+        dir: Direction,
+        boundary: WordBoundary,
+    },
     NewlineIndent,
     /// Join's dual: insert a line break at the cursor, cursor staying *before* it (so a
     /// following join re-joins the same pair). Distinct from [`Action::NewlineIndent`], whose
@@ -363,6 +372,10 @@ pub enum Action {
     SearchToggleCase,
     /// `Alt-w` in the search prompt: toggle whole-word matching.
     SearchToggleWord,
+    /// `Alt-Backspace` in the search bar — drop the query's last word and re-run the incremental
+    /// search. The search bar has no unwind ladder behind it (its option chips have their own
+    /// toggle chords), so this rung is all there is.
+    SearchDeleteWord,
     /// `Alt-e` in the search prompt: toggle literal (fixed-string) vs. regex matching.
     SearchToggleRegex,
     /// `]` / `[` — step through the jumplist from the cursor, cross-file, stopping at the ends.
@@ -653,7 +666,7 @@ impl Action {
         matches!(
             self,
             Action::MoveChar(_)
-                | Action::MoveWordBack { .. }
+                | Action::MoveWord { .. }
                 | Action::MoveWordEnd { .. }
                 | Action::MoveVisualLine(_)
                 | Action::MoveLogicalLine(_)
@@ -954,8 +967,8 @@ static NORMAL: &[Binding] = &[
     // ---- motions: words ----
     bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::SelectWord { boundary: WordBoundary::BigWord }, "Selection", "Select big word"),
     bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::SelectWord { boundary: WordBoundary::Word }, "Selection", "Select word"),
-    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWordBack { boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
-    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWordBack { boundary: WordBoundary::Word }, "Motion", "Small word backward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
     bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
     bind!(N, ch('e'), IgnoreShift(Mods::NONE), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 
@@ -1086,14 +1099,30 @@ static GLOBAL: &[Binding] = &[
 #[rustfmt::skip]
 static INSERT: &[Binding] = &[
     bind!(I, KeyCode::Esc, Any, A::LeaveInsert, "Mode", "Leave insert mode"),
+    // The Alt tier of the editing keys deletes/moves by word — the one modifier every terminal
+    // delivers intact (legacy encoding sends ESC + the key, which reads back as Alt). Each must be
+    // declared *before* its `Any` sibling below: lookup takes the first matching row, so an `Any`
+    // seen first would swallow the chord. `IgnoreShift` because Shift means "extend" and Insert has
+    // no selection to extend — holding it must not silently drop the chord back to char grain.
+    bind!(I, KeyCode::Backspace, IgnoreShift(Mods::ALT), A::DeleteWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Edit", "Delete word before cursor"),
     bind!(I, KeyCode::Backspace, Any, A::Backspace, "Edit", "Delete character before cursor"),
+    bind!(I, KeyCode::Delete, IgnoreShift(Mods::ALT), A::DeleteWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Edit", "Delete word after cursor"),
     bind!(I, KeyCode::Delete, Any, A::DeletePoint, "Edit", "Delete character at cursor"),
     bind!(I, KeyCode::Enter, Any, A::NewlineIndent, "Edit", "Newline and indent"),
     bind!(I, KeyCode::Tab, Any, A::InsertTab, "Edit", "Indent to next tab stop"),
+    // Insert has no selection, so it can't borrow Normal's `w`-selects-a-word trick: both word
+    // directions are plain motions here.
+    bind!(I, KeyCode::Left, IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Word left"),
     bind!(I, KeyCode::Left, Any, A::MoveChar(Direction::Backward), "Motion", "Cursor left"),
+    bind!(I, KeyCode::Right, IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Word right"),
     bind!(I, KeyCode::Right, Any, A::MoveChar(Direction::Forward), "Motion", "Cursor right"),
     bind!(I, KeyCode::Up, Any, A::MoveVisualLine(VerticalDirection::Up), "Motion", "Cursor up"),
     bind!(I, KeyCode::Down, Any, A::MoveVisualLine(VerticalDirection::Down), "Motion", "Cursor down"),
+    // Normal binds these too — the line ends are the same place in either mode, and typing is
+    // exactly when you reach for them. Insert doesn't fall through to Normal's table, so they have
+    // to be declared here to exist at all.
+    bind!(I, KeyCode::Home, Any, A::MoveLineStart, "Motion", "Logical line start"),
+    bind!(I, KeyCode::End, Any, A::MoveLineEnd, "Motion", "Logical line end"),
     // Line-scoped editing mirrors Normal's selection-scoped Ctrl column on the same keys (Insert
     // has no selection to act on); the mode-agnostic Ctrl-f comes from GLOBAL.
     bind!(I, ch('e'), Exact(Mods::CTRL), A::ChangeLine, "Edit", "Change line"),
@@ -1121,6 +1150,10 @@ static SEARCH: &[Binding] = &[
     bind!(KeyContext::Search, KeyCode::Down, Exact(Mods::NONE), A::SearchHistoryNext, "Search", "Next query in history"),
     bind!(KeyContext::Search, ch('k'), Exact(Mods::ALT), A::SearchHistoryPrev, "", ""),
     bind!(KeyContext::Search, ch('j'), Exact(Mods::ALT), A::SearchHistoryNext, "", ""),
+    // The one editing key the core owns here: word-grain delete, as in a buffer and in the pickers.
+    // Plain Backspace stays with the shell's input (and, at the query start, steps into the chip
+    // row) — see the note below.
+    bind!(KeyContext::Search, KeyCode::Backspace, Exact(Mods::ALT), A::SearchDeleteWord, "Search", "Delete word in query"),
     // Match-option toggles, mirroring the grep picker's chip chords (Alt-c / Alt-w / Alt-e).
     bind!(KeyContext::Search, ch('c'), Exact(Mods::ALT), A::SearchToggleCase, "Search", "Cycle case sensitivity"),
     bind!(KeyContext::Search, ch('w'), Exact(Mods::ALT), A::SearchToggleWord, "Search", "Toggle whole-word match"),
@@ -1944,6 +1977,107 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Insert mode's Alt tier: word-grain versions of the char-grain editing keys. Each `Exact(ALT)`
+    /// row must beat its `Any` sibling, which only holds while it's declared first — hence the
+    /// paired assertions.
+    #[test]
+    fn insert_alt_tier_is_word_grain() {
+        let alt_shift = Mods {
+            alt: true,
+            shift: true,
+            ..Mods::NONE
+        };
+        for (mods, expected_word) in [(Mods::ALT, true), (alt_shift, true), (Mods::NONE, false)] {
+            let back = lookup(KeyContext::Insert, KeyCode::Backspace, mods).map(|b| b.action);
+            assert_eq!(
+                matches!(
+                    back,
+                    Some(Action::DeleteWord {
+                        dir: Direction::Backward,
+                        ..
+                    })
+                ),
+                expected_word,
+                "Backspace with {mods:?}"
+            );
+            let del = lookup(KeyContext::Insert, KeyCode::Delete, mods).map(|b| b.action);
+            assert_eq!(
+                matches!(
+                    del,
+                    Some(Action::DeleteWord {
+                        dir: Direction::Forward,
+                        ..
+                    })
+                ),
+                expected_word,
+                "Delete with {mods:?}"
+            );
+            let left = lookup(KeyContext::Insert, KeyCode::Left, mods).map(|b| b.action);
+            assert_eq!(
+                matches!(
+                    left,
+                    Some(Action::MoveWord {
+                        dir: Direction::Backward,
+                        ..
+                    })
+                ),
+                expected_word,
+                "Left with {mods:?}"
+            );
+            let right = lookup(KeyContext::Insert, KeyCode::Right, mods).map(|b| b.action);
+            assert_eq!(
+                matches!(
+                    right,
+                    Some(Action::MoveWord {
+                        dir: Direction::Forward,
+                        ..
+                    })
+                ),
+                expected_word,
+                "Right with {mods:?}"
+            );
+        }
+        // Unmodified, the same keys keep their char-grain meaning.
+        assert!(matches!(
+            lookup(KeyContext::Insert, KeyCode::Backspace, Mods::NONE).map(|b| b.action),
+            Some(Action::Backspace)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Insert, KeyCode::Delete, Mods::NONE).map(|b| b.action),
+            Some(Action::DeletePoint)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Insert, KeyCode::Left, Mods::NONE).map(|b| b.action),
+            Some(Action::MoveChar(Direction::Backward))
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Insert, KeyCode::Right, Mods::NONE).map(|b| b.action),
+            Some(Action::MoveChar(Direction::Forward))
+        ));
+    }
+
+    /// Insert doesn't fall through to Normal's table, so the line ends have to be declared in both
+    /// to mean the same thing in both.
+    #[test]
+    fn line_ends_are_bound_in_normal_and_insert() {
+        for ctx in [KeyContext::Normal, KeyContext::Insert] {
+            assert!(
+                matches!(
+                    lookup(ctx, KeyCode::Home, Mods::NONE).map(|b| b.action),
+                    Some(Action::MoveLineStart)
+                ),
+                "Home in {ctx:?}"
+            );
+            assert!(
+                matches!(
+                    lookup(ctx, KeyCode::End, Mods::NONE).map(|b| b.action),
+                    Some(Action::MoveLineEnd)
+                ),
+                "End in {ctx:?}"
+            );
+        }
     }
 
     #[test]

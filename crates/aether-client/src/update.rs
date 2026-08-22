@@ -74,13 +74,14 @@ use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BufferOnlyParams, CaseKind, CountedEditParams, EditRedo,
     EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
     InputBlockDepth, InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock,
-    InputDeleteLine, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
-    InputOpenLine, InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams,
-    InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
-    InputToggleTask, InputTransformCase, InputTransformCaseParams, InputUnsurround,
-    InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams, PasteBlockParams,
-    ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
+    InputDeleteLine, InputDeleteWord, InputDeleteWordParams, InputIndent, InputJoinLines,
+    InputMoveBlock, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
+    InputNewlineAndIndentParams, InputOpenBlock, InputOpenLine, InputOpenLineParams,
+    InputPasteBlock, InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams,
+    InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask, InputTransformCase,
+    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, MoveBlockParams,
+    OpenBlockParams, PasteBlockParams, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistChanged, JumplistClear,
@@ -3406,11 +3407,20 @@ impl Session {
                 self.prompt = Some(Prompt::SaveAs(editor));
                 self.on_save_as_key(code, mods, text)
             }
-            Prompt::OpenPath(field) => {
+            Prompt::OpenPath(mut field) => {
                 // Plain single-line path field — text entry is shell-owned (synced via
-                // `open_path_set_input`); only Enter (open) and Esc (cancel) are command keys.
+                // `open_path_set_input`); only Enter (open), Esc (cancel) and the segment delete
+                // are command keys.
                 let no_chord = !mods.ctrl && !mods.alt;
                 match code {
+                    // Alt-Backspace pops one path segment, fish-style — the same grain the save-as
+                    // prompt's path field uses, since this is the same kind of value.
+                    KeyCode::Backspace if mods.alt && !mods.ctrl => {
+                        let shortened = chips::pop_segment(&field.text);
+                        field.set(shortened);
+                        self.prompt = Some(Prompt::OpenPath(field));
+                        Effects::none()
+                    }
                     KeyCode::Enter if no_chord => {
                         let path = field.text.trim().to_string();
                         if path.is_empty() {
@@ -4588,19 +4598,25 @@ impl Session {
         Effects::none()
     }
 
-    /// Alt-Backspace: progressively unwind — clear the query, then (explorer) pop one directory
-    /// segment per press — landing the highlight on the directory just left — into roots mode in
-    /// multi-root workspaces, and only then pop the rightmost filter chip. The breadcrumb sits
+    /// Alt-Backspace: progressively unwind — one query word per press, then (explorer) one
+    /// directory segment per press — landing the highlight on the directory just left — into roots
+    /// mode in multi-root workspaces, and only then the rightmost filter chip. The breadcrumb sits
     /// closest to the cursor and unwinds first; chips have their own toggle bindings. Deliberately
     /// *not* bound to Alt-h: clearing input is Alt-Backspace's job alone — Alt-h only ever goes
     /// structurally shallower (ascend to the group header, explorer ascend) and never touches the
     /// query.
+    ///
+    /// The query rung is word-grained rather than a wipe, which makes this key mean the same thing
+    /// here as in a buffer and in the path editors next door: remove the last unit of input, and
+    /// once there is none left, unwind what encloses it. A single-word query — most of them —
+    /// still clears in one press; a multi-word one drops one matcher atom at a time, and repeated
+    /// presses still walk the whole ladder.
     fn picker_back(&mut self) -> Effects {
         let Some(p) = &mut self.picker else {
             return Effects::none();
         };
         if !p.query.is_empty() {
-            p.query.clear();
+            p.query = chips::pop_word(&p.query);
             return self.picker_query_changed();
         }
         // Explorer: unwind the breadcrumb one directory segment per press before touching chips.
@@ -7122,6 +7138,26 @@ impl Session {
             }
         }
 
+        // Alt-Backspace deletes the last unit of the focused field, at the field's own grain: a
+        // word in the workspace name, a `/` segment in the add-root path — the same split the
+        // add-project row already gets from the path editor above.
+        if code == KeyCode::Backspace && mods.alt && !mods.ctrl {
+            if let Some(s) = self.workspace_settings.as_mut() {
+                match row {
+                    SettingsRow::Name => {
+                        let shortened = chips::pop_word(&s.name.text);
+                        s.name.set(shortened);
+                    }
+                    SettingsRow::AddRoot => {
+                        let shortened = chips::pop_segment(&s.add.text);
+                        s.add.set(shortened);
+                    }
+                    _ => {}
+                }
+            }
+            return Effects::none();
+        }
+
         // Text editing for the focused field (name / add-root / add-project) is owned by each
         // shell's input, which syncs the value via `workspace_settings_set_name` / `_set_add` /
         // `_set_add_project`. The core handles only the command keys above; any other key here is a
@@ -7925,6 +7961,12 @@ impl Session {
             Action::SearchAbort => self.abort_search(),
             Action::SearchHistoryPrev => self.search_history_step(VerticalDirection::Up),
             Action::SearchHistoryNext => self.search_history_step(VerticalDirection::Down),
+            Action::SearchDeleteWord => {
+                let shortened = chips::pop_word(&self.search.query);
+                // Goes through the setter so the history walk is abandoned and the search re-runs,
+                // exactly as typing into the field would.
+                self.search_set_query(shortened)
+            }
             // The Alt-chord toggles deselect any chip — they're the "chord" interaction, distinct
             // from chip-row editing.
             Action::SearchToggleCase => {
@@ -8531,11 +8573,11 @@ impl Session {
         match action {
             // ---- motions ----
             A::MoveChar(direction) => self.move_motion(Motion::Char { direction, count }, extend),
-            // `b` / `Alt-b` — `w` now selects words (`CursorSelectWord`), so the only word *motion*
-            // left in the keymap is the backward one.
-            A::MoveWordBack { boundary } => self.move_motion(
+            // `b` / `Alt-b` in Normal (backward only — `w` there selects words via
+            // `CursorSelectWord`), `Alt-←` / `Alt-→` in Insert (both directions).
+            A::MoveWord { dir, boundary } => self.move_motion(
                 Motion::Word {
-                    direction: Direction::Backward,
+                    direction: dir,
                     count,
                     boundary,
                 },
@@ -8810,6 +8852,14 @@ impl Session {
 
             // ---- edits ----
             A::Backspace => self.edit::<InputBackspace>(BufferOnlyParams { buffer_id }),
+            A::DeleteWord { dir, boundary } => {
+                self.edit::<InputDeleteWord>(InputDeleteWordParams {
+                    buffer_id,
+                    direction: dir,
+                    boundary,
+                    count,
+                })
+            }
             A::NewlineIndent => self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
                 buffer_id,
                 park_before: false,
@@ -8914,7 +8964,8 @@ impl Session {
             | A::SearchHistoryNext
             | A::SearchToggleCase
             | A::SearchToggleWord
-            | A::SearchToggleRegex => self.search_action(action),
+            | A::SearchToggleRegex
+            | A::SearchDeleteWord => self.search_action(action),
             A::SearchCycle(direction) => self.search_cycle(direction, count, extend),
             A::SearchFromSelection => self.search_from_selection(),
             A::JumplistStep(direction) => {

@@ -3106,6 +3106,31 @@ fn search_query_is_value_synced_not_keycode_edited() {
     assert_eq!(s.mode, Mode::Normal, "Esc aborts search");
 }
 
+/// Alt-Backspace is the one editing key the core owns in the search bar: word-grain delete, the
+/// same unit the pickers and the buffer use. It goes through the query setter, so the search
+/// re-runs against the shortened pattern.
+#[test]
+fn search_alt_backspace_drops_one_query_word() {
+    use aether_client::keymap::Mods;
+    let mut s = session();
+    let _ = key(&mut s, '/');
+    let _ = s.search_set_query("fn parse".into());
+
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert_eq!(s.search.query, "fn ");
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "search/set");
+    assert_eq!(params["query"], json!("fn "));
+
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert_eq!(s.search.query, "");
+    // Nothing left to take, and no ladder behind the search bar — its option chips have their own
+    // toggle chords.
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(no_request(&fx));
+    assert_eq!(s.search.query, "");
+}
+
 #[test]
 fn search_option_toggles_cycle_and_ride_the_request() {
     use aether_client::keymap::Mods;
@@ -4480,6 +4505,56 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
     );
 }
 
+/// Alt-Backspace's first rung is word-grained, matching the key's meaning in a buffer and in the
+/// path editors: one matcher atom per press, then the rungs below. A single-word query — most of
+/// them — still clears in one press, which is why this is a refinement of the old wipe rather than
+/// a different gesture.
+#[test]
+fn picker_alt_backspace_drops_one_query_word_per_press() {
+    use aether_client::chips::ChipValue;
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.chips = vec![ChipValue::Changed];
+        p.query = "src update".into();
+    }
+
+    // One atom, separator kept — the query narrows rather than vanishing.
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/query").is_some());
+    assert_eq!(s.picker.as_ref().unwrap().query, "src ");
+    assert_eq!(
+        s.picker.as_ref().unwrap().chips.len(),
+        1,
+        "the query rung runs to exhaustion before any chip is touched"
+    );
+
+    // The next press takes the last atom and its trailing space together.
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert_eq!(s.picker.as_ref().unwrap().query, "");
+    assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
+
+    // Only now does the ladder move on to the chips (Files has no breadcrumb rung).
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(s.picker.as_ref().unwrap().chips.is_empty());
+}
+
+/// The single-word case, spelled out: unchanged from the wipe it replaces.
+#[test]
+fn picker_alt_backspace_still_clears_a_one_word_query_in_one_press() {
+    use aether_protocol::picker::PickerKind;
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    s.picker.as_mut().unwrap().query = "needle".into();
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert!(find_request(&fx, "picker/query").is_some());
+    assert_eq!(s.picker.as_ref().unwrap().query, "");
+}
+
 /// The changes pickers open fresh like everything else — their query and chips don't outlive an
 /// open — and land on the cursor's hunk instead of a saved highlight. `Space Alt-c` also re-points
 /// at the active buffer on every open, so it carries `buffer_id` too.
@@ -5567,6 +5642,62 @@ fn insert_tab_requests_an_indent_step() {
     assert_eq!(method, "input/tab");
     // No text on the wire: the payload is just the buffer.
     assert_eq!(params.get("text"), None);
+}
+
+/// Insert mode's Alt tier goes out as word-grain RPCs — the boundary rules live server-side, so
+/// the client only names the direction.
+#[test]
+fn insert_alt_tier_sends_word_grain_requests() {
+    use aether_client::keymap::Mods;
+    let mut s = session();
+    key(&mut s, 'i');
+    assert_eq!(s.mode, aether_client::session::Mode::Insert);
+
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/delete_word");
+    assert_eq!(params["direction"], json!("backward"));
+    assert_eq!(params["boundary"], json!("word"));
+
+    let fx = s.on_key(KeyCode::Delete, Mods::ALT, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "input/delete_word");
+    assert_eq!(params["direction"], json!("forward"));
+
+    let fx = s.on_key(KeyCode::Left, Mods::ALT, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(
+        params["motion"],
+        json!({"kind": "word", "direction": "backward", "count": 1, "boundary": "word"})
+    );
+
+    let fx = s.on_key(KeyCode::Right, Mods::ALT, None, ROWS);
+    let (_t, _method, params) = the_request(&fx);
+    assert_eq!(params["motion"]["direction"], json!("forward"));
+
+    // Unmodified, the same keys stay char-grain.
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let (_t, method, _params) = the_request(&fx);
+    assert_eq!(method, "input/backspace");
+}
+
+/// Home / End are bound in Insert as well as Normal — Insert has no fallthrough to Normal's table,
+/// so before this they did nothing at all while typing.
+#[test]
+fn insert_home_end_move_to_the_line_ends() {
+    let mut s = session();
+    key(&mut s, 'i');
+
+    let fx = s.on_key(KeyCode::Home, Mods::NONE, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"], json!({"kind": "line_start"}));
+
+    let fx = s.on_key(KeyCode::End, Mods::NONE, None, ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(params["motion"], json!({"kind": "line_end"}));
 }
 
 #[test]
@@ -8570,6 +8701,62 @@ fn open_path_empty_submit_keeps_overlay_open() {
         "an empty submit leaves the overlay open"
     );
     assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+}
+
+/// Alt-Backspace in the open-from-path overlay pops one path segment, fish-style — the grain the
+/// save-as prompt's path field already uses, because it holds the same kind of value.
+#[test]
+fn open_path_alt_backspace_pops_a_path_segment() {
+    use aether_client::session::{Prompt, TextField};
+    let mut s = session();
+    s.workspace = "proj".into();
+    s.prompt = Some(Prompt::OpenPath(TextField::new("/etc/nginx/conf.d".into())));
+
+    let text = |s: &Session| match s.prompt.as_ref() {
+        Some(Prompt::OpenPath(f)) => f.text.clone(),
+        _ => panic!("the overlay should still be open"),
+    };
+
+    let fx = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
+    assert_eq!(text(&s), "/etc/nginx/");
+    let _ = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
+    assert_eq!(text(&s), "/etc/");
+    // Down to nothing, then a clean no-op — never a close.
+    let _ = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
+    assert_eq!(text(&s), "/");
+    let _ = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
+    assert_eq!(text(&s), "");
+    let _ = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
+    assert_eq!(text(&s), "");
+}
+
+/// The workspace-settings overlay's two plain fields take Alt-Backspace at their own grain: a word
+/// in the name, a `/` segment in the add-root path.
+#[test]
+fn settings_alt_backspace_matches_each_fields_grain() {
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    s.open_workspace_settings();
+
+    // The name field (focused on open).
+    assert!(s.workspace_settings.as_ref().unwrap().on_name());
+    let _ = s.workspace_settings_set_name("my old project".into());
+    s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert_eq!(s.workspace_settings.as_ref().unwrap().name.text, "my old ");
+
+    // Tab down to the add-root input (past the single root).
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert!(s.workspace_settings.as_ref().unwrap().on_input());
+    let _ = s.workspace_settings_set_add("/home/me/code".into());
+    s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().add.text,
+        "/home/me/",
+        "a path field pops a segment, not a word"
+    );
 }
 
 // ---- sneak (s / S word-jump) --------------------------------------------------------------------

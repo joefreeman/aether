@@ -495,6 +495,29 @@ pub fn pop_segment(input: &str) -> String {
     }
 }
 
+/// Word delete for the overlay text fields that aren't paths: drop any trailing whitespace, then
+/// the run of non-whitespace before it. `"src foo"` → `"src "`, `"src "` → `""`, `"foo"` → `""`.
+///
+/// Whitespace is the only separator on purpose. These fields hold fuzzy queries, and whitespace is
+/// exactly what the matcher splits a pattern into atoms on — so one press drops one atom, which is
+/// a narrowing step rather than a text edit. Path-shaped fields use [`pop_segment`] instead, whose
+/// unit is the `/` segment.
+///
+/// Operates on the value's tail, not at a caret: the core stores overlay field *values* and the
+/// shells own the caret (see [`Input`]). Every field this is used on is a single short line where
+/// the caret is at the end in practice, and the shells snap it there after a core-driven rewrite.
+pub fn pop_word(input: &str) -> String {
+    let trimmed = input.trim_end();
+    match trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+    {
+        Some((i, c)) => input[..i + c.len_utf8()].to_string(),
+        None => String::new(),
+    }
+}
+
 /// Resolve `dir_part` (root-relative, possibly with trailing `/`) under the chosen root.
 pub fn join_root_relative(workspace_paths: &[String], path_index: u32, dir_part: &str) -> String {
     let Some(root) = workspace_paths.get(path_index as usize) else {
@@ -1121,6 +1144,23 @@ mod tests {
         assert_eq!(pop_segment("src/foo"), "src/");
         assert_eq!(pop_segment("src"), "");
         assert_eq!(pop_segment(""), "");
+    }
+
+    #[test]
+    fn pop_word_examples() {
+        // One atom per press, separator kept — so the *next* press starts from a clean tail.
+        assert_eq!(pop_word("src foo"), "src ");
+        assert_eq!(pop_word("src "), "");
+        assert_eq!(pop_word("src"), "");
+        assert_eq!(pop_word(""), "");
+        // Runs of whitespace go with the word they trail, so two presses clear "a  b".
+        assert_eq!(pop_word("a  b"), "a  ");
+        assert_eq!(pop_word("a  "), "");
+        // `/` is not a boundary here — a query is not a path (that's `pop_segment`'s job).
+        assert_eq!(pop_word("src/foo bar"), "src/foo ");
+        assert_eq!(pop_word("src/foo"), "");
+        // A multi-byte separator must not be sliced mid-char.
+        assert_eq!(pop_word("a\u{a0}b"), "a\u{a0}");
     }
 
     #[test]

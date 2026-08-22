@@ -24,7 +24,7 @@ use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
     CursorSetParams, CursorState, CursorSwapAnchorParams, CursorTreeSelectParams, CursorUndoParams,
     CursorUndoResult, Direction, Granularity, JumplistPosition, Motion, TreeSelectDirection,
-    VerticalDirection,
+    VerticalDirection, WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -58,11 +58,11 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle,
-    CountedEditParams, EditResult, InputAdjustNumberParams, InputMoveLinesParams,
-    InputNewlineAndIndentParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
-    InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams,
-    PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
-    UndoResult,
+    CountedEditParams, EditResult, InputAdjustNumberParams, InputDeleteWordParams,
+    InputMoveLinesParams, InputNewlineAndIndentParams, InputOpenLineParams, InputSurroundParams,
+    InputTextParams, InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams,
+    OpenBlockParams, PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams,
+    UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCaptureParams, JumplistCaptureResult, JumplistClearParams, JumplistClearResult,
@@ -13196,6 +13196,31 @@ pub async fn input_backspace(
     apply_edit(state, client_id, params.buffer_id, EditKind::Backspace).await
 }
 
+/// `input/delete_word` — delete one word either side of the cursor (Insert-mode `Alt-Backspace`
+/// / `Alt-Delete`).
+///
+/// The span is exactly what the matching word *motion* would traverse, so what `Alt-Backspace`
+/// removes is what `b` would have skipped over — one rule for both, and no way for the delete and
+/// the motion to disagree about where a word starts.
+pub async fn input_delete_word(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: InputDeleteWordParams,
+) -> Result<EditResult, RpcError> {
+    let client_id = ctx.client_id;
+    apply_edit(
+        state,
+        client_id,
+        params.buffer_id,
+        EditKind::DeleteWord {
+            direction: params.direction,
+            boundary: params.boundary,
+            count: params.count,
+        },
+    )
+    .await
+}
+
 /// `input/tab` — insert one indent step at the cursor (Insert-mode `Tab`).
 ///
 /// The step comes from the buffer's `indent_style`, the same source `Enter`'s smart indent and
@@ -15482,6 +15507,15 @@ enum EditKind {
     /// by Insert-mode `Backspace` — there's no meaningful selection in Insert mode and "delete
     /// the previous char" is its own gesture.
     Backspace,
+    /// Delete from `cursor.position` to where a `count`-word motion in `direction` would land,
+    /// leaving the cursor at the span's start. Insert-mode `Alt-Backspace` / `Alt-Delete`.
+    /// Unlike [`EditKind::Backspace`] this is a plain motion span: no tab-stop snapping, and it
+    /// crosses the line boundary when the motion does.
+    DeleteWord {
+        direction: Direction,
+        boundary: WordBoundary,
+        count: u32,
+    },
     /// Delete the cursor's whole line — content and trailing newline. Insert-mode `Ctrl-d`.
     DeleteLine,
     /// Blank the cursor's line — content only, newline preserved. Insert-mode `Ctrl-e`.
@@ -15745,6 +15779,28 @@ async fn apply_edit_reporting(
                 last_line: hi.line,
             }
         }
+        EditKind::DeleteWord {
+            direction,
+            boundary,
+            count,
+        } => {
+            let target = motion::resolve_motion(
+                buf,
+                cursor.position,
+                &Motion::Word {
+                    direction: *direction,
+                    count: (*count).max(1),
+                    boundary: *boundary,
+                },
+            );
+            let (lo, hi) = motion::ordered(cursor.position, target);
+            EditRange {
+                start_char: motion::pos_to_char(buf, lo),
+                end_char: motion::pos_to_char(buf, hi),
+                first_line: lo.line,
+                last_line: hi.line,
+            }
+        }
         EditKind::DeleteLine | EditKind::ReplaceLine { .. } => {
             let line = cursor.position.line as usize;
             let total_lines = buf.text.len_lines();
@@ -15886,6 +15942,7 @@ async fn apply_edit_reporting(
         EditKind::DeleteSelection
         | EditKind::ChangeSelection
         | EditKind::Backspace
+        | EditKind::DeleteWord { .. }
         | EditKind::DeleteLine
         | EditKind::ChangeLine => (Cow::Borrowed(""), PostEdit::PointAfter),
         EditKind::Surround { open, close, line } => {
@@ -15973,6 +16030,7 @@ async fn apply_edit_reporting(
         EditKind::DeleteSelection
         | EditKind::ChangeSelection
         | EditKind::Backspace
+        | EditKind::DeleteWord { .. }
         | EditKind::DeleteLine
         | EditKind::ChangeLine => EditKindTag::Delete,
         EditKind::Surround { .. } | EditKind::Unsurround { .. } => EditKindTag::Surround,

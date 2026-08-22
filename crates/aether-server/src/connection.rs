@@ -34,10 +34,10 @@ use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
     EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputBlockDepth, InputChange,
-    InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputIndent,
-    InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent, InputOpenBlock,
-    InputOpenLine, InputPasteBlock, InputReplaceLine, InputSurround, InputTab, InputText,
-    InputToggleComment, InputToggleTask, InputTransformCase, InputUnsurround,
+    InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputDeleteWord,
+    InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent,
+    InputOpenBlock, InputOpenLine, InputPasteBlock, InputReplaceLine, InputSurround, InputTab,
+    InputText, InputToggleComment, InputToggleTask, InputTransformCase, InputUnsurround,
 };
 use aether_protocol::jumplist::{JumplistCapture, JumplistClear, JumplistStep};
 use aether_protocol::lsp::{
@@ -511,6 +511,7 @@ async fn dispatch(
         InputDelete::NAME => run!(InputDelete, handlers::input_delete),
         InputChange::NAME => run!(InputChange, handlers::input_change),
         InputBackspace::NAME => run!(InputBackspace, handlers::input_backspace),
+        InputDeleteWord::NAME => run!(InputDeleteWord, handlers::input_delete_word),
         InputTab::NAME => run!(InputTab, handlers::input_tab),
         InputDeleteLine::NAME => run!(InputDeleteLine, handlers::input_delete_line),
         InputChangeLine::NAME => run!(InputChangeLine, handlers::input_change_line),
