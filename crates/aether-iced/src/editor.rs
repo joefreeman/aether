@@ -12,7 +12,8 @@ use crate::grid;
 use crate::theme;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::viewport::{
-    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, Window,
+    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, PatchLine,
+    VirtualRowKind, Window,
 };
 use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
@@ -417,12 +418,120 @@ where
 
         let mut abs_row = window.first_visual_row;
         for line in &window.lines {
-            // Phantom deleted rows (inline diff view): the baseline content a hunk removed,
-            // rendered above the line, never holding the cursor.
-            for v in &line.virtual_rows_above {
+            // Rows that hold no cursor position: the inline diff view's phantom deleted lines, and
+            // a generated patch's file and hunk separators.
+            for (chrome_idx, v) in line.virtual_rows_above.iter().enumerate() {
                 let y = bounds.y + PAD + abs_row as f32 * cell.height - scroll;
                 abs_row += 1;
                 if y + cell.height < bounds.y || y > bounds.y + bounds.height {
+                    continue;
+                }
+                // A generated patch's chrome. It carries a band — starting in the gutter, since
+                // the gutter belongs to the rows the cursor can reach — so that "unreachable"
+                // reads as a band rather than as text the cursor mysteriously skips.
+                if v.kind != VirtualRowKind::Deleted {
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: bounds.width,
+                            height: cell.height,
+                        },
+                        p.patch_chrome_bg,
+                    );
+                    // A left rail down the file's chrome, in the gutter column, cornering into
+                    // the rule that opens the block — so the heading rows read as belonging to the
+                    // file above them rather than floating in the diff.
+                    let rail_x = bounds.x + cell.width * 0.25;
+                    let rule_y = y + (cell.height * 0.5).floor();
+                    // A file's rule tees off the rail when one runs into it from above (the blank
+                    // closing the previous file's last section) and corners when nothing does —
+                    // the first file in the patch, where a stub above the corner would read as a
+                    // line to nowhere.
+                    let corners = v.kind == VirtualRowKind::Rule && chrome_idx == 0;
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: rail_x,
+                            y: if corners { rule_y } else { y },
+                            width: 1.0,
+                            height: if corners {
+                                cell.height - (rule_y - y)
+                            } else {
+                                cell.height
+                            },
+                        },
+                        p.fg_faint,
+                    );
+                    // A rule is otherwise nothing but its line, running to the right edge.
+                    if v.kind == VirtualRowKind::Rule {
+                        fill(
+                            renderer,
+                            Rectangle {
+                                x: rail_x,
+                                y: rule_y,
+                                width: bounds.width - (rail_x - bounds.x),
+                                height: 1.0,
+                            },
+                            p.fg_faint,
+                        );
+                        continue;
+                    }
+                    // Runs split at the server's span boundaries; the gaps between spans fall back
+                    // to the muted foreground, since chrome is never plain body text.
+                    let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
+                    let mut pos = 0usize;
+                    for h in &v.highlights {
+                        let s = (h.start as usize).min(v.text.len());
+                        let e = (h.end as usize).min(v.text.len());
+                        if s > pos {
+                            runs.push((pos, s, None));
+                        }
+                        if e > s {
+                            runs.push((s, e, Some(h.kind.as_str())));
+                        }
+                        pos = pos.max(e);
+                    }
+                    if pos < v.text.len() {
+                        runs.push((pos, v.text.len(), None));
+                    }
+                    for (s, e, kind) in runs {
+                        let color = kind
+                            .and_then(|k| theme::highlight_color(p.mode, k))
+                            .unwrap_or(p.fg_muted);
+                        draw_text_run(
+                            renderer,
+                            v.text[s..e].to_string(),
+                            Point::new(text_x(v.text[..s].chars().count() as u32), y),
+                            cell,
+                            color,
+                            highlight_font(kind),
+                            content_clip,
+                            text_shaping,
+                        );
+                    }
+                    // A file boundary is the heaviest break in the buffer, so it trails a rule out
+                    // to the right edge. Hunk separators deliberately don't — that would chop the
+                    // file into equal-looking pieces and flatten the hierarchy.
+                    // A section heading trails a muted rule to the right edge; the file's own rule
+                    // is the row above it.
+                    if v.kind == VirtualRowKind::HunkHeader {
+                        let x = text_x(v.text.chars().count() as u32 + 1);
+                        let right = bounds.x + bounds.width - PAD;
+                        if right - x > cell.width {
+                            fill(
+                                renderer,
+                                Rectangle {
+                                    x,
+                                    y: y + (cell.height * 0.5).floor(),
+                                    width: right - x,
+                                    height: 1.0,
+                                },
+                                p.fg_faint,
+                            );
+                        }
+                    }
                     continue;
                 }
                 let staged = v.stage == DiffStage::Staged;
@@ -577,8 +686,29 @@ where
                     (Some(ConflictLine::Theirs), true) => Some(p.cursor_line_conflict_theirs_bg),
                     _ => None,
                 };
-                let row_bg =
-                    conflict_bg.or(match (on_cursor_line, diff_bg, line.diff_marker, staged) {
+                // A generated patch's own sides, ungated like the conflict tints and for the same
+                // reason: the buffer *is* a diff. Deliberately the diff view's own colours (the
+                // core's `Theme::patch_line_bg` says the same in the palette's Rgb space); the two
+                // can never land on the same line, since a patch has no baseline to be diffed
+                // against.
+                let patch_bg = match (line.patch, on_cursor_line) {
+                    // Staged changes take the dimmed pair: the hue says which side, the
+                    // brightness whether it still needs staging. Only the working-tree diff has
+                    // the distinction; a commit's patch is always unstaged.
+                    (Some(PatchLine::Added), false) if staged => Some(p.git_staged_added_bg),
+                    (Some(PatchLine::Added), true) if staged => Some(p.cursor_line_staged_added_bg),
+                    (Some(PatchLine::Removed), false) if staged => Some(p.git_staged_deleted_bg),
+                    (Some(PatchLine::Removed), true) if staged => {
+                        Some(p.cursor_line_staged_deleted_bg)
+                    }
+                    (Some(PatchLine::Added), false) => Some(p.git_added_bg),
+                    (Some(PatchLine::Added), true) => Some(p.cursor_line_added_bg),
+                    (Some(PatchLine::Removed), false) => Some(p.git_deleted_bg),
+                    (Some(PatchLine::Removed), true) => Some(p.cursor_line_deleted_bg),
+                    (None, _) => None,
+                };
+                let row_bg = conflict_bg.or(patch_bg).or(
+                    match (on_cursor_line, diff_bg, line.diff_marker, staged) {
                         (false, bg, ..) => bg,
                         (true, None, ..) => Some(p.cursor_line_bg),
                         (true, Some(_), Some(DiffMarker::Added), false) => {
@@ -594,7 +724,8 @@ where
                             Some(p.cursor_line_staged_modified_bg)
                         }
                         (true, Some(_), ..) => Some(p.cursor_line_bg),
-                    });
+                    },
+                );
                 if let Some(bg) = row_bg {
                     fill(renderer, row_bounds, bg);
                 }
@@ -609,10 +740,13 @@ where
                     .filter_map(|r| grid::byte_range_span(&cells, r.start, r.end))
                     .collect();
                 if !emph_spans.is_empty() {
-                    let emph_bg = if staged {
-                        p.git_staged_modified_emph_bg
-                    } else {
-                        p.git_modified_emph_bg
+                    // A patch line's emphasis follows its own side's hue; everywhere else the
+                    // change is a *modification* of one line, so the olive pair applies.
+                    let emph_bg = match line.patch {
+                        Some(PatchLine::Added) => p.git_added_emph_bg,
+                        Some(PatchLine::Removed) => p.git_deleted_emph_bg,
+                        None if staged => p.git_staged_modified_emph_bg,
+                        None => p.git_modified_emph_bg,
                     };
                     let inset = emphasis_inset(cell.height);
                     for &(s, e) in &emph_spans {
@@ -723,6 +857,27 @@ where
                             height: cell.height,
                         },
                         p.git_conflict_marker,
+                    );
+                } else if let Some(side) = line.patch {
+                    // A generated patch marks its own sides. Dropping the `+`/`-` columns left the
+                    // background tint as the only signal of which side a line is; the bar carries
+                    // it too, and dims for a change already staged.
+                    let staged = line.diff_stage == DiffStage::Staged;
+                    let color = match (side, staged) {
+                        (PatchLine::Added, false) => p.git_added,
+                        (PatchLine::Added, true) => p.git_staged_added,
+                        (PatchLine::Removed, false) => p.git_deleted,
+                        (PatchLine::Removed, true) => p.git_staged_deleted,
+                    };
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: cell.width * 0.5,
+                            height: cell.height,
+                        },
+                        color,
                     );
                 } else if let Some(marker) = gutter_marker {
                     let color = gutter_color(p, marker, line.diff_stage);
@@ -1004,6 +1159,53 @@ where
                             content_left,
                         );
                     }
+                }
+            }
+
+            // Closing chrome, drawn after the line's own rows — a patch's final rule, which has no
+            // trailing line to sit above.
+            for v in &line.virtual_rows_below {
+                let y = bounds.y + PAD + abs_row as f32 * cell.height - scroll;
+                abs_row += 1;
+                if y + cell.height < bounds.y || y > bounds.y + bounds.height {
+                    continue;
+                }
+                fill(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x,
+                        y,
+                        width: bounds.width,
+                        height: cell.height,
+                    },
+                    p.patch_chrome_bg,
+                );
+                let rail_x = bounds.x + cell.width * 0.25;
+                let rule_y = y + (cell.height * 0.5).floor();
+                let closes = v.kind == VirtualRowKind::Rule;
+                // On the closing rule the rail runs in from above and *stops*, reaching only as far
+                // as the horizontal it corners into; the blank above it carries the rail through.
+                fill(
+                    renderer,
+                    Rectangle {
+                        x: rail_x,
+                        y,
+                        width: 1.0,
+                        height: if closes { rule_y - y } else { cell.height },
+                    },
+                    p.fg_faint,
+                );
+                if closes {
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: rail_x,
+                            y: rule_y,
+                            width: bounds.width - (rail_x - bounds.x),
+                            height: 1.0,
+                        },
+                        p.fg_faint,
+                    );
                 }
             }
         }

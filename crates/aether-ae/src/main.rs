@@ -582,6 +582,32 @@ fn server_status() -> anyhow::Result<()> {
             );
             return Ok(());
         }
+        // Nothing of ours is running, yet the port answers: someone else has it. Distinguish a
+        // foreign *profile* — which the probe can name, and which is the common case when profiles
+        // in separate config roots can't see each other's port records — from an unrelated process,
+        // because the two want different fixes: stop that profile, or move off the port.
+        //
+        // Without this the foreign server was reported as *this* profile's, right down to printing
+        // its config and state paths, while `server stop` correctly said nothing was running.
+        (None, true) => match aether_server::fetch_status(port).ok().map(|s| s.profile) {
+            // Ours after all: the pid record can go missing (a crashed write, a cleaned runtime
+            // dir) without the server having gone anywhere. Fall through and report it running.
+            Some(p) if p == profile => {}
+            Some(other) => {
+                println!(
+                    "server: stopped  (profile '{profile}' — port {port} is held by profile \
+                     '{other}')"
+                );
+                return Ok(());
+            }
+            None => {
+                println!(
+                    "server: stopped  (profile '{profile}' — port {port} is held by another \
+                     process)"
+                );
+                return Ok(());
+            }
+        },
         // Port answers → running. Fall through to the detailed report.
         (_, true) => {}
     }

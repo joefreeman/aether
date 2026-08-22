@@ -16,7 +16,7 @@ use aether_protocol::settings::ThemeMode;
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
     ConflictLine, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
-    Highlight, VisualRow, WrapMode,
+    Highlight, PatchLine, VirtualRow, VirtualRowKind, VisualRow, WrapMode,
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
@@ -1541,7 +1541,9 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     // server's `total_display_rows` — it has to be added on whichever path we take. Worktrees is
     // the first kind to be *both* grouped and creatable, which is how it came to be missing here.
     let create = picker.synthetic_create_idx.is_some() as u32;
-    if picker.kind.is_some_and(|k| k.renders_group_headers()) {
+    // `collapsible` first, not the kind alone: a collapsible view's headers *are* rows, and the
+    // buffer-locked changes picker collapses over a patch though its kind is headerless.
+    if picker.collapsible || picker.kind.is_some_and(|k| k.renders_group_headers()) {
         let rows = picker.total_display_rows.unwrap_or(picker.total_matches);
         if picker.groups.is_empty() {
             return rows + create;
@@ -5154,7 +5156,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         let local = (top as i64) - (state.ed().window_first_logical_line as i64);
         if local >= 0 && (local as usize) < state.ed().lines.len() {
             let r = &state.ed().lines[local as usize];
-            let h = (r.virtual_rows_above.len() + r.visual_rows.len().max(1)) as u32;
+            let h = (r.virtual_rows_above.len()
+                + r.visual_rows.len().max(1)
+                + r.virtual_rows_below.len()) as u32;
             state.ed().scroll_skip_rows.min(h.saturating_sub(1))
         } else {
             0
@@ -5175,7 +5179,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         // screen rows (and so are counted here) but carry no cursor position. Each band is a
         // visible change, so it gets a red change-*bar* in the gutter (matching add/modify),
         // rather than the compact `▔` top-marker used when there's no band.
-        for vrow in &render.virtual_rows_above {
+        for (chrome_idx, vrow) in render.virtual_rows_above.iter().enumerate() {
             if skip_rows > 0 {
                 skip_rows -= 1;
                 continue;
@@ -5183,17 +5187,36 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             if lines.len() >= viewport_rows {
                 break 'outer;
             }
-            let mut spans =
-                deleted_virtual_row_spans(&vrow.text, viewport_cols, vrow.stage, &vrow.emphasis);
-            // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
-            spans.insert(
-                0,
-                gutter_bar(stage_color(
-                    vrow.stage,
-                    c(th().git_deleted),
-                    c(th().git_staged_deleted),
-                )),
-            );
+            let spans = match vrow.kind {
+                VirtualRowKind::Deleted => {
+                    let mut spans = deleted_virtual_row_spans(
+                        &vrow.text,
+                        viewport_cols,
+                        vrow.stage,
+                        &vrow.emphasis,
+                    );
+                    // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
+                    spans.insert(
+                        0,
+                        gutter_bar(stage_color(
+                            vrow.stage,
+                            c(th().git_deleted),
+                            c(th().git_staged_deleted),
+                        )),
+                    );
+                    spans
+                }
+                kind => chrome_virtual_row_spans(
+                    vrow,
+                    kind,
+                    viewport_cols,
+                    if chrome_idx > 0 {
+                        RailJoin::Tees
+                    } else {
+                        RailJoin::Opens
+                    },
+                ),
+            };
             lines.push(Line::from(spans));
         }
         // The gutter change-bar reflects this line's marker (always on). With the diff view on, a
@@ -5211,16 +5234,25 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         // A conflict's side tints come first and are *not* gated on the diff view: the file has no
         // diff to show (no baseline while conflicted), and which side a line belongs to is the only
         // way to read it.
+        // A patch buffer's own +/- tints sit alongside these and are *not* gated on the diff view:
+        // the buffer is a diff, so there is nothing to toggle off (`conflict`'s reasoning exactly).
         let line_tint = if logical_line == cursor_line {
             let marker = if diff_view { render.diff_marker } else { None };
             Some(
                 render
                     .conflict
                     .and_then(cursor_line_conflict_bg)
+                    .or_else(|| {
+                        render
+                            .patch
+                            .map(|p| c(th().patch_line_bg(p, render.diff_stage, true)))
+                    })
                     .unwrap_or_else(|| cursor_line_bg(marker, render.diff_stage)),
             )
         } else if let Some(side) = render.conflict {
             conflict_bg(side)
+        } else if let Some(patch) = render.patch {
+            Some(c(th().patch_line_bg(patch, render.diff_stage, false)))
         } else if diff_view {
             render
                 .diff_marker
@@ -5291,6 +5323,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                         gutter_mark,
                         render.diff_stage,
                         render.conflict,
+                        render.patch,
                         spans,
                     ));
                     continue;
@@ -5397,11 +5430,16 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 clipped_sel,
                 &clipped_matches,
                 &clipped_emphasis,
-                stage_color(
-                    render.diff_stage,
-                    c(th().git_modified_emph_bg),
-                    c(th().git_staged_modified_emph_bg),
-                ),
+                // A patch line's emphasis follows its own side's hue; everywhere else the change
+                // is a *modification* of one line, so the olive pair applies.
+                match render.patch {
+                    Some(side) => c(th().patch_emphasis_bg(side)),
+                    None => stage_color(
+                        render.diff_stage,
+                        c(th().git_modified_emph_bg),
+                        c(th().git_staged_modified_emph_bg),
+                    ),
+                },
                 &clipped_brackets,
                 &clipped_diags,
                 &clipped_sneak,
@@ -5443,8 +5481,23 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 gutter_mark,
                 render.diff_stage,
                 render.conflict,
+                render.patch,
                 spans,
             ));
+            // Closing chrome, after the line's own rows — a patch's final rule.
+            if is_last_vrow_of_line {
+                for vrow in &render.virtual_rows_below {
+                    if lines.len() >= viewport_rows {
+                        break 'outer;
+                    }
+                    lines.push(Line::from(chrome_virtual_row_spans(
+                        vrow,
+                        vrow.kind,
+                        viewport_cols,
+                        RailJoin::Closes,
+                    )));
+                }
+            }
         }
         logical_line = match logical_line.checked_add(1) {
             Some(n) => n,
@@ -5484,6 +5537,98 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// `emphasis` ranges (the parts the paired buffer line actually replaced) sit on a stronger red
 /// fill. Tabs expand to spaces for stable width; content wider than the viewport is clipped. The
 /// gutter cell is added separately by [`prepend_gutter`].
+/// A generated patch's chrome row — a file or hunk separator, or the blank space between them.
+///
+/// The server's spans already say which part is the path, the counts or the `@@` ranges, so this
+/// only styles them and draws the rule that makes a file boundary read as one. No change-bar in
+/// the gutter: chrome belongs to no line of either side, which is the same reason the cursor can't
+/// reach it.
+/// What the left rail does where a `Rule` crosses it. Named rather than passed as loose booleans
+/// so an incoherent combination can't be spelled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RailJoin {
+    /// Nothing above — the first file in the patch.
+    Opens,
+    /// The rail runs in from above and continues below.
+    Tees,
+    /// The rail runs in from above and stops — the rule closing the patch.
+    Closes,
+}
+
+fn chrome_virtual_row_spans(
+    row: &VirtualRow,
+    kind: VirtualRowKind,
+    width: u16,
+    join: RailJoin,
+) -> Vec<Span<'static>> {
+    let bg = c(th().patch_chrome_bg);
+    let rule = Style::default().fg(c(th().fg_faint)).bg(bg);
+
+    // The gutter cell carries a left rail down the file's chrome, so the heading rows read as
+    // belonging to the file above them rather than floating in the diff. A file's rule tees off
+    // that rail when one runs into it from above (the blank closing the previous file's last
+    // section) and corners when nothing does — the first file in the patch, where a stub above the
+    // corner would read as a line to nowhere.
+    //
+    // `width` is the *content* width, as it is for every other row: the gutter column sits outside
+    // it, which is why chrome must not subtract one for it.
+    let glyph = match (kind, join) {
+        (VirtualRowKind::Rule, RailJoin::Closes) => "└",
+        (VirtualRowKind::Rule, RailJoin::Tees) => "├",
+        (VirtualRowKind::Rule, RailJoin::Opens) => "┌",
+        _ => "│",
+    };
+    let mut spans = vec![Span::styled(glyph.to_string(), rule)];
+    let text_width = width as usize;
+
+    if kind == VirtualRowKind::Rule {
+        spans.push(Span::styled("─".repeat(text_width), rule));
+        return spans;
+    }
+
+    // A space between the rail and the text: chrome is a heading, not code, so it reads better
+    // set in from the rail than aligned to the column content starts at.
+    spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
+    let mut text_spans = build_spans(
+        &row.text,
+        &row.highlights,
+        None,
+        &[],
+        &[],
+        Color::Reset,
+        &[],
+        &[],
+        &[],
+        width.saturating_sub(1),
+    );
+    // The band has to reach behind the text too, not just the padding around it.
+    for span in text_spans.iter_mut() {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(bg);
+        }
+    }
+    spans.append(&mut text_spans);
+
+    let used = row.text.chars().count();
+    let remaining = text_width.saturating_sub(used + 1);
+    match kind {
+        // A section heading trails a muted rule from the end of the signature to the right edge,
+        // so the eye can follow it across; the file's own rule is the row that opened the block.
+        VirtualRowKind::HunkHeader if remaining > 2 => {
+            spans.push(Span::styled(
+                format!(" {} ", "─".repeat(remaining - 2)),
+                rule,
+            ));
+        }
+        // Everything else just carries the band to the edge.
+        _ if remaining > 0 => {
+            spans.push(Span::styled(" ".repeat(remaining), Style::default().bg(bg)));
+        }
+        _ => {}
+    }
+    spans
+}
+
 fn deleted_virtual_row_spans(
     text: &str,
     width: u16,
@@ -5581,11 +5726,23 @@ fn git_gutter_cell(
     mark: Option<DiffMarker>,
     stage: DiffStage,
     conflict: Option<ConflictLine>,
+    patch: Option<PatchLine>,
 ) -> Span<'static> {
     // One unbroken bar down the whole block, in one colour: the gutter's job here is "this region
     // is a conflict", and which side each line is on is what the background tints say.
     if conflict.is_some() {
         return gutter_bar(c(th().git_conflict_marker));
+    }
+    // A generated patch marks its own sides. Dropping the `+`/`-` columns left the background tint
+    // as the only signal of which side a line is, and a tint alone is a thin thing to rely on — so
+    // the bar carries it too, in the same hues, and dims for a change already staged.
+    if let Some(side) = patch {
+        return gutter_bar(match (side, stage) {
+            (PatchLine::Added, DiffStage::Staged) => c(th().git_staged_added),
+            (PatchLine::Added, _) => c(th().git_added),
+            (PatchLine::Removed, DiffStage::Staged) => c(th().git_staged_deleted),
+            (PatchLine::Removed, _) => c(th().git_deleted),
+        });
     }
     match mark {
         Some(DiffMarker::Added) => gutter_bar(stage_color(
@@ -5622,6 +5779,7 @@ fn prepend_gutter(
     mark: Option<DiffMarker>,
     stage: DiffStage,
     conflict: Option<ConflictLine>,
+    patch: Option<PatchLine>,
     mut spans: Vec<Span<'static>>,
 ) -> Line<'static> {
     if conflict == Some(ConflictLine::Marker) {
@@ -5634,7 +5792,7 @@ fn prepend_gutter(
             }
         }
     }
-    spans.insert(0, git_gutter_cell(mark, stage, conflict));
+    spans.insert(0, git_gutter_cell(mark, stage, conflict, patch));
     Line::from(spans)
 }
 
@@ -7328,7 +7486,9 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
         let local = (top as i64) - (state.ed().window_first_logical_line as i64);
         if local >= 0 && (local as usize) < state.ed().lines.len() {
             let r = &state.ed().lines[local as usize];
-            let h = (r.virtual_rows_above.len() + r.visual_rows.len().max(1)) as u32;
+            let h = (r.virtual_rows_above.len()
+                + r.visual_rows.len().max(1)
+                + r.virtual_rows_below.len()) as u32;
             state.ed().scroll_skip_rows.min(h.saturating_sub(1))
         } else {
             0
@@ -9658,6 +9818,7 @@ mod tests {
             None,
             DiffStage::Unstaged,
             Some(ConflictLine::Marker),
+            None,
             vec![plain, selected],
         );
         // [0] is the gutter bar, which every line of a conflict block carries.

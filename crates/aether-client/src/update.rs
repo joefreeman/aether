@@ -51,7 +51,8 @@ use aether_protocol::git::{
     GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
-    GitFetchResult, GitFetchStatus, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
+    GitFetchResult, GitFetchStatus, GitFollowPatchLine, GitFollowPatchLineParams,
+    GitFollowPatchLineResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
     GitOperationChanged, GitOperationChangedParams, GitPrepareCommit, GitPrepareCommitParams,
     GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult, GitPullStatus, GitPush,
     GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation, GitReset, GitResetParams,
@@ -161,6 +162,8 @@ pub enum Event {
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
     /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
+    /// `Enter` in a patch resolved (or didn't) to a file at a revision.
+    PatchLineFollowed(Result<GitFollowPatchLineResult, String>),
     /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt. Guarded
     /// against staleness — the buffer may have switched, or moved to a newer revision, while the
     /// fetch was in flight.
@@ -452,11 +455,13 @@ impl Session {
         let buffer_id = self.buffer.buffer_id;
         let mut fx = Effects::none();
 
-        // Blame label: Normal mode on a file-backed buffer. Insert mode unfollows so typing
-        // never has the server recomputing whole-file blame in the pauses.
-        let want_blame =
-            (self.mode == Mode::Normal && buffer_id != 0 && self.buffer.path.is_some())
-                .then_some(buffer_id);
+        // Blame label: Normal mode on anything with a history to attribute — a file-backed buffer,
+        // or a file at a revision (which has no path but blames at its own revision). Insert mode
+        // unfollows so typing never has the server recomputing whole-file blame in the pauses.
+        let want_blame = (self.mode == Mode::Normal
+            && buffer_id != 0
+            && (self.buffer.path.is_some() || self.buffer.is_revision_file()))
+        .then_some(buffer_id);
         if self.blame_follow_on != want_blame {
             if let Some(old) = self.blame_follow_on {
                 fx = fx.and(self.request::<GitSetBlameFollow>(
@@ -644,6 +649,15 @@ impl Session {
                 }
                 self.adopt_navigation(open)
             }
+            // Same landing as any other switch. `opened: None` means the cursor was on the
+            // metadata block or the message — nothing to follow, and deliberately silent: `Enter`
+            // is a common key and a toast for pressing it on the subject line would be noise.
+            Event::PatchLineFollowed(Ok(r)) => match r.opened {
+                Some(open) => self.adopt_navigation(open),
+                None => Effects::none(),
+            },
+            Event::PatchLineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
+
             Event::Switched(Err(e)) => {
                 // A failed jump-shaped open must not leave its flag armed for the next
                 // (unrelated) switch — it would wrongly land a markdown file in the editor.
@@ -1854,6 +1868,25 @@ impl Session {
                         Event::Switched,
                     )
                 }
+
+                // The pathless counterpart of `FileAt`: a generated patch was materialised, not
+                // loaded, so its rows can only be addressed by buffer id. Usually the buffer
+                // you're already reading — `Space c` lists that patch's own hunks — which makes
+                // this a jump rather than a switch, and no nav-history entry: browser history is
+                // for moving *between* files, and the jumplist already covers moving within one.
+                PickerSelectResult::BufferAt {
+                    buffer_id,
+                    position,
+                } => self.request_str::<BufferOpen>(
+                    BufferOpenParams {
+                        buffer_id: Some(buffer_id),
+                        jump_to: Some(position),
+                        record_nav_from: (buffer_id != self.buffer.buffer_id)
+                            .then_some(self.buffer.buffer_id),
+                        ..Default::default()
+                    },
+                    Event::Switched,
+                ),
 
                 PickerSelectResult::Workspace { name } => {
                     // Activate and land on the workspace's last buffer (or a fresh transient
@@ -4892,23 +4925,33 @@ impl Session {
                 // A stash *is* a commit, so previewing it is the log picker's Enter verbatim: its
                 // first-parent diff is exactly what `git stash show -p` prints.
                 let params = aether_protocol::git::GitShowParams {
-                    repo_id: repo_id.clone(),
-                    rev: oid.clone(),
-                    path: None,
+                    repo_id: Some(repo_id.clone()),
+                    buffer_id: None,
+                    target: aether_protocol::git::ShowTarget::Commit { rev: oid.clone() },
+                    focus_path: None, // a stash is about no file in particular
                 };
                 let hide = self.close_picker();
                 return hide.and(
                     self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
                 );
             }
-            PickerItem::GitCommit { repo_id, hash, .. } => {
+            PickerItem::GitCommit {
+                repo_id,
+                hash,
+                path,
+                ..
+            } => {
                 // The row *is* the revision, so this needs no resolution: `git/show` materialises
                 // the commit as a read-only virtual buffer and the result adopts exactly like a
                 // `buffer/open` (same shape), so the picker closes onto the diff.
+                //
+                // From a *file's* history the row also names that file, and the cursor lands on its
+                // changes — you asked about one path, not about everything the commit touched.
                 let params = aether_protocol::git::GitShowParams {
-                    repo_id: repo_id.clone(),
-                    rev: hash.clone(),
-                    path: None,
+                    repo_id: Some(repo_id.clone()),
+                    buffer_id: None,
+                    target: aether_protocol::git::ShowTarget::Commit { rev: hash.clone() },
+                    focus_path: path.clone(),
                 };
                 let hide = self.close_picker();
                 return hide.and(
@@ -9192,6 +9235,16 @@ impl Session {
                 )
             }
 
+            // Server-resolved repo, like every other git verb: the client has no repo in hand.
+            A::ShowWorkingChanges => self.request_str::<aether_protocol::git::GitShow>(
+                aether_protocol::git::GitShowParams {
+                    repo_id: None,
+                    buffer_id: Some(self.buffer.buffer_id),
+                    target: aether_protocol::git::ShowTarget::WorkingChanges,
+                    focus_path: None,
+                },
+                Event::Switched,
+            ),
             A::GitFetch => self.request_str::<GitFetch>(
                 GitFetchParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
@@ -9290,6 +9343,13 @@ impl Session {
             A::OpenExplorerAtRoot => self.open_explorer(true),
 
             // ---- LSP ----
+            // `Enter` means "follow what's under the cursor". In a generated patch that's the file
+            // the line came from, resolved through the patch index rather than a language server —
+            // the same gesture, a different resolver, exactly as it is in the reading view.
+            A::GotoDefinition if self.buffer.is_patch => self.request_str::<GitFollowPatchLine>(
+                GitFollowPatchLineParams { buffer_id },
+                Event::PatchLineFollowed,
+            ),
             A::GotoDefinition => self
                 .request_str::<LspGotoDefinition>(LspBufferParams { buffer_id }, Event::Definition),
             A::Hover => {

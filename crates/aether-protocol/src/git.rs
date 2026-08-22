@@ -1370,13 +1370,112 @@ impl RpcMethod for GitShow {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitShowParams {
-    pub repo_id: RepoId,
-    /// Anything `git rev-parse` accepts: a hash, a branch, a tag, `HEAD~3`. Unresolvable is an
-    /// error, not an empty buffer.
-    pub rev: String,
-    /// Repo-relative path to show *at* `rev`. `None` shows the commit itself.
+    /// The repo to read. Normally `None` for a keystroke — the client has none in hand — and
+    /// resolved from `buffer_id` instead; set where it's already known (a picker row, or
+    /// re-materialising a buffer from its key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub repo_id: Option<RepoId>,
+    /// Which buffer to resolve the repo from when `repo_id` is absent. The same hint
+    /// [`GitPrepareCommit`] takes, and for the same reason: a multi-repo workspace can't otherwise
+    /// tell whose history to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_id: Option<BufferId>,
+    pub target: ShowTarget,
+    /// Land the cursor on this repo-relative file's first change within the generated patch.
+    /// Meaningful only on the diff targets — a single file has nothing to choose between.
+    ///
+    /// Set by the file-locked log picker: it is showing you this commit *because of* that file, so
+    /// opening at the top of a diff that touches thirty others answers a question you didn't ask.
+    /// A path the diff doesn't touch (or an already-open buffer being re-shown) leaves the cursor
+    /// where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_path: Option<String>,
+}
+
+/// What to materialise. Three shapes on two axes — scope (one file vs a whole diff) and source (a
+/// commit vs the working tree) — which is every combination that isn't just an ordinary file.
+///
+/// [`Self::rev`] is the axis that matters at runtime: a target naming a revision is **immutable**,
+/// so re-showing one attaches to the buffer already holding it, while the working tree has moved
+/// and is regenerated. Same operation either way; the revision is only what decides whether the
+/// work can be skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShowTarget {
+    /// A commit's diff against its first parent (against the empty tree for a root commit, so an
+    /// initial commit shows as all additions). `rev` is anything `git rev-parse` accepts — a hash,
+    /// a branch, a tag, `HEAD~3`; unresolvable is an error, not an empty buffer.
+    Commit { rev: String },
+    /// One file's content as of a commit — `git show <rev>:<path>`. Not a patch: it has a grammar
+    /// and a live parse tree, so it highlights exactly like its working-tree twin.
+    File { rev: String, path: String },
+    /// Everything not yet committed — `git diff HEAD`.
+    ///
+    /// **Composed**, not split into staged and unstaged. The inline diff view already composes
+    /// HEAD→index→buffer and tags each line with its [`crate::viewport::DiffStage`], and
+    /// [`GitApplyHunk`] already resolves a stage *within* that composed picture, so composing here
+    /// is both well-defined and consistent with what the editor already shows you. A staged-only
+    /// view answers a different question — "what am I about to commit?" — and would be a fourth
+    /// shape rather than a competing design for this one.
+    WorkingChanges,
+}
+
+impl ShowTarget {
+    /// The revision this names, or `None` for the working tree — which must never be handed to
+    /// `rev-parse`, and which is what makes a target worth regenerating rather than attaching to.
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            Self::Commit { rev } | Self::File { rev, .. } => Some(rev),
+            Self::WorkingChanges => None,
+        }
+    }
+
+    /// The single file this is *of*. A commit's diff and the working-tree diff both span many, so
+    /// neither answers this.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File { path, .. } => Some(path),
+            Self::Commit { .. } | Self::WorkingChanges => None,
+        }
+    }
+}
+
+// ---- git/follow_patch_line -----------------------------------------------------------------------
+
+/// Follow the patch line under the cursor to the file it came from, at the revision that side of
+/// the diff belongs to — `Enter` in a generated patch.
+///
+/// Resolved from the client's cursor server-side, like every other position-bearing Git method: the
+/// client sends no position, and the server reads the `(file, side, source line)` the patch index
+/// already holds.
+///
+/// A `-` line opens the **old** side (the commit's first parent), a `+` or context line the **new**
+/// one. A deleted file has only an old side and an added file only a new one, so those override the
+/// rule rather than opening something that doesn't exist. A placeholder line — a binary swap, a
+/// bare mode change — has no line to land on and opens the file at the top.
+pub struct GitFollowPatchLine;
+impl RpcMethod for GitFollowPatchLine {
+    const NAME: &'static str = "git/follow_patch_line";
+    type Params = GitFollowPatchLineParams;
+    type Result = GitFollowPatchLineResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitFollowPatchLineParams {
+    /// The patch buffer being read. Not a patch, or not a buffer at all, answers `opened: None`.
+    pub buffer_id: BufferId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitFollowPatchLineResult {
+    /// The file opened at that revision, in the same shape `git/show` returns, with the cursor
+    /// already on the line the patch line came from.
+    ///
+    /// `None` when the cursor is on a line belonging to no file — the metadata block or the commit
+    /// message. A quiet no-op rather than an error: `Enter` is a common key, and being told off for
+    /// pressing it on the subject line would be noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<crate::buffer::BufferOpenResult>,
 }
 
 // ---- git/stash_* --------------------------------------------------------------------------------

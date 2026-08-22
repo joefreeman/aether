@@ -852,8 +852,21 @@ impl WorkspaceSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionBuffer {
-    File { path: PathBuf },
-    Scratch { number: u32 },
+    File {
+        path: PathBuf,
+    },
+    Scratch {
+        number: u32,
+    },
+    /// A materialised revision, by its `VirtualSource::key` (`<repo>@<rev>[:<path>]`). Only kept
+    /// diffs get here — they open transient, so one has to have been pinned with `Space k`.
+    ///
+    /// Stable across restarts because a repo id is its canonical workdir. Nothing of the content is
+    /// stored: it regenerates from the repo, and a revision that has been rewritten away since
+    /// simply doesn't come back.
+    Virtual {
+        key: String,
+    },
 }
 
 /// The whole session file: every named workspace's [`WorkspaceSession`], keyed by workspace name. A

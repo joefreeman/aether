@@ -596,7 +596,7 @@ function rowsBeforeLine(w: BufferWindow, line: number): number | null {
   let rows = 0;
   for (const l of w.lines) {
     if (l.logical_line === line) return rows;
-    rows += (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length;
+    rows += (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length + (l.virtual_rows_below?.length ?? 0);
   }
   return null;
 }
@@ -2937,7 +2937,9 @@ export class Shell {
 
   private loadedVisualRows(w: BufferWindow): number {
     let rows = 0;
-    for (const l of w.lines) rows += (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length;
+    for (const l of w.lines)
+      rows +=
+        (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length + (l.virtual_rows_below?.length ?? 0);
     return rows;
   }
 

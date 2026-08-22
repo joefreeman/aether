@@ -542,6 +542,7 @@ fn logical_line_render_virtual_rows_shape() {
         logical_line: 0,
         visual_rows: vec![],
         search_matches: vec![],
+        virtual_rows_below: vec![],
         virtual_rows_above: vec![],
         diff_marker: None,
         diff_stage: DiffStage::Unstaged,
@@ -549,6 +550,7 @@ fn logical_line_render_virtual_rows_shape() {
         conflict: None,
         diagnostics: vec![],
         sneak_targets: vec![],
+        patch: None,
     };
     let v = to_value(&bare).unwrap();
     assert!(
@@ -579,16 +581,22 @@ fn logical_line_render_virtual_rows_shape() {
         v.get("conflict").is_none(),
         "no conflict omitted from wire — every line of every unconflicted file"
     );
+    assert!(
+        v.get("patch").is_none(),
+        "no patch side omitted from wire — every line of every buffer that isn't a patch"
+    );
 
     let with_del = LogicalLineRender {
         logical_line: 4,
         visual_rows: vec![],
         search_matches: vec![],
+        virtual_rows_below: vec![],
         virtual_rows_above: vec![VirtualRow {
             text: "old line".into(),
             kind: VirtualRowKind::Deleted,
             stage: DiffStage::Staged,
             emphasis: vec![EmphasisRange { start: 4, end: 8 }],
+            highlights: vec![],
         }],
         diff_marker: Some(DiffMarker::Modified),
         diff_stage: DiffStage::Staged,
@@ -601,6 +609,7 @@ fn logical_line_render_virtual_rows_shape() {
             message: "unused variable".into(),
         }],
         sneak_targets: vec![],
+        patch: None,
     };
     let v = to_value(&with_del).unwrap();
     assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
@@ -608,6 +617,10 @@ fn logical_line_render_virtual_rows_shape() {
     assert_eq!(v["virtual_rows_above"][0]["stage"], "staged");
     assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["start"], 4);
     assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["end"], 8);
+    assert!(
+        v["virtual_rows_above"][0].get("highlights").is_none(),
+        "a deleted row carries no spans — omitted rather than sent empty"
+    );
     assert_eq!(v["diff_marker"], "modified");
     assert_eq!(v["diff_stage"], "staged");
     assert_eq!(v["diff_emphasis"][0]["start"], 0);
@@ -639,6 +652,7 @@ fn logical_line_render_conflict_shape() {
         logical_line: 3,
         visual_rows: vec![],
         search_matches: vec![],
+        virtual_rows_below: vec![],
         virtual_rows_above: vec![],
         diff_marker: None,
         diff_stage: DiffStage::Unstaged,
@@ -646,6 +660,7 @@ fn logical_line_render_conflict_shape() {
         conflict: Some(conflict),
         diagnostics: vec![],
         sneak_targets: vec![],
+        patch: None,
     };
     for (side, wire) in [
         (ConflictLine::Marker, "marker"),
@@ -658,6 +673,86 @@ fn logical_line_render_conflict_shape() {
         assert!(v.get("diff_marker").is_none());
         let back: LogicalLineRender = from_value(v).unwrap();
         assert_eq!(back.conflict, Some(side));
+    }
+}
+
+#[test]
+fn logical_line_render_patch_shape() {
+    use aether_protocol::viewport::PatchLine;
+    // The two sides are snake_case on the wire, and a patch line carries no diff marker: a
+    // generated patch has no baseline of its own, so the two decorations never share a buffer.
+    let line = |patch| LogicalLineRender {
+        logical_line: 7,
+        visual_rows: vec![],
+        search_matches: vec![],
+        virtual_rows_below: vec![],
+        virtual_rows_above: vec![],
+        diff_marker: None,
+        diff_stage: DiffStage::Unstaged,
+        diff_emphasis: vec![],
+        conflict: None,
+        diagnostics: vec![],
+        sneak_targets: vec![],
+        patch: Some(patch),
+    };
+    for (side, wire) in [(PatchLine::Added, "added"), (PatchLine::Removed, "removed")] {
+        let v = to_value(line(side)).unwrap();
+        assert_eq!(v["patch"], wire);
+        assert!(v.get("diff_marker").is_none());
+        let back: LogicalLineRender = from_value(v).unwrap();
+        assert_eq!(back.patch, Some(side));
+    }
+}
+
+#[test]
+fn patch_chrome_virtual_row_shape() {
+    use aether_protocol::viewport::Highlight;
+    // A generated patch's separators ride the same channel as the inline diff's phantom deleted
+    // rows, so that chrome costs no buffer lines and therefore no cursor positions. Unlike a
+    // deleted row they carry spans, which is what lets a path be styled apart from its counts.
+    //
+    // A section heading is the enclosing signature alone — git's `@@ -a,b +c,d @@` ranges are
+    // dropped, so a patch shows no line numbers anywhere.
+    let row = VirtualRow {
+        text: "fn render_window(".into(),
+        kind: VirtualRowKind::HunkHeader,
+        stage: DiffStage::Unstaged,
+        emphasis: vec![],
+        highlights: vec![Highlight {
+            start: 0,
+            end: 17,
+            kind: "diff.hunk".into(),
+        }],
+    };
+    let v = to_value(&row).unwrap();
+    assert_eq!(v["kind"], "hunk_header");
+    assert!(
+        v.get("stage").is_none(),
+        "stage is meaningless on chrome — left at its default and omitted"
+    );
+    assert_eq!(v["highlights"][0]["kind"], "diff.hunk");
+    let back: VirtualRow = from_value(v).unwrap();
+    assert_eq!(back.kind, VirtualRowKind::HunkHeader);
+    assert_eq!(back.highlights.len(), 1);
+
+    for (kind, wire) in [
+        (VirtualRowKind::Deleted, "deleted"),
+        (VirtualRowKind::FileHeader, "file_header"),
+        (VirtualRowKind::HunkHeader, "hunk_header"),
+        (VirtualRowKind::Rule, "rule"),
+        (VirtualRowKind::Spacer, "spacer"),
+    ] {
+        let v = to_value(VirtualRow {
+            text: String::new(),
+            kind,
+            stage: DiffStage::Unstaged,
+            emphasis: vec![],
+            highlights: vec![],
+        })
+        .unwrap();
+        assert_eq!(v["kind"], wire);
+        let back: VirtualRow = from_value(v).unwrap();
+        assert_eq!(back.kind, kind);
     }
 }
 
@@ -1592,6 +1687,7 @@ fn buffer_open_result_shape() {
         }),
         title: None,
         read_only: false,
+        is_patch: false,
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -1627,6 +1723,7 @@ fn buffer_open_result_restored_scroll() {
         lsp_server: None,
         title: None,
         read_only: false,
+        is_patch: false,
     })
     .unwrap();
     assert_eq!(v["scroll"]["logical_line"], 7);
@@ -2526,11 +2623,107 @@ fn buffer_changed_notification_shape() {
 }
 
 #[test]
+fn git_show_target_shape() {
+    use aether_protocol::git::{GitShowParams, ShowTarget};
+
+    // One RPC, three targets — tagged, so the shape says which it is rather than leaving the
+    // server to infer it from which fields happen to be set.
+    for (target, wire) in [
+        (
+            ShowTarget::Commit {
+                rev: "abc1234".into(),
+            },
+            json!({ "kind": "commit", "rev": "abc1234" }),
+        ),
+        (
+            ShowTarget::File {
+                rev: "abc1234".into(),
+                path: "src/a.rs".into(),
+            },
+            json!({ "kind": "file", "rev": "abc1234", "path": "src/a.rs" }),
+        ),
+        (
+            ShowTarget::WorkingChanges,
+            json!({ "kind": "working_changes" }),
+        ),
+    ] {
+        assert_eq!(to_value(&target).unwrap(), wire);
+        let back: ShowTarget = from_value(wire).unwrap();
+        assert_eq!(back, target);
+    }
+
+    // The working tree names no revision — which is what stops it being handed to `rev-parse`,
+    // and what decides that it must be regenerated rather than attached to.
+    assert_eq!(ShowTarget::WorkingChanges.rev(), None);
+    assert_eq!(ShowTarget::WorkingChanges.path(), None);
+
+    // Both repo hints are optional: a keystroke sends the buffer, a picker row sends the repo.
+    let v = to_value(GitShowParams {
+        repo_id: None,
+        buffer_id: Some(4),
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "buffer_id": 4, "target": { "kind": "working_changes" } })
+    );
+}
+
+#[test]
+fn follow_patch_line_shape() {
+    use aether_protocol::buffer::BufferOpenResult;
+    use aether_protocol::git::{GitFollowPatchLineParams, GitFollowPatchLineResult};
+
+    let v = to_value(GitFollowPatchLineParams { buffer_id: 7 }).unwrap();
+    assert_eq!(v, json!({ "buffer_id": 7 }), "the cursor stays server-side");
+
+    // Nothing to follow — the cursor was on the metadata block or the message. A quiet no-op, so
+    // the field drops off the wire entirely rather than riding as an explicit null.
+    let v = to_value(GitFollowPatchLineResult { opened: None }).unwrap();
+    assert_eq!(v, json!({}));
+    let back: GitFollowPatchLineResult = from_value(v).unwrap();
+    assert!(back.opened.is_none());
+
+    // `is_patch` distinguishes a commit's diff from a file at a revision — both read-only, only
+    // the first has an index for `Enter` to follow through. Omitted when false, like `read_only`.
+    let revision_buffer = |is_patch: bool| BufferOpenResult {
+        buffer_id: 3,
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: None,
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None,
+        transient: true,
+        title: Some("abc1234:src/a.rs".into()),
+        read_only: true,
+        is_patch,
+    };
+    let v = to_value(revision_buffer(false)).unwrap();
+    assert_eq!(v["read_only"], true);
+    assert!(
+        v.get("is_patch").is_none(),
+        "a file at a revision is read-only but not a patch"
+    );
+    let v = to_value(revision_buffer(true)).unwrap();
+    assert_eq!(v["is_patch"], true);
+    let back: BufferOpenResult = from_value(v).unwrap();
+    assert!(back.is_patch);
+}
+
+#[test]
 fn nav_goto_params_shape() {
     use aether_protocol::cursor::CursorState;
     use aether_protocol::nav::NavGotoParams;
     // File entry: path fields present, buffer_id omitted; cursor carries the selection.
     let p = NavGotoParams {
+        virtual_key: None,
         buffer_id: None,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),

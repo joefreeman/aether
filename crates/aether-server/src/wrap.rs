@@ -60,12 +60,14 @@ pub fn render_line(
         visual_rows,
         search_matches: Vec::new(),
         virtual_rows_above: Vec::new(),
+        virtual_rows_below: Vec::new(),
         diff_marker: None,
         diff_stage: Default::default(),
         diff_emphasis: Vec::new(),
         conflict: None,
         diagnostics: Vec::new(),
         sneak_targets: Vec::new(),
+        patch: None,
     }
 }
 

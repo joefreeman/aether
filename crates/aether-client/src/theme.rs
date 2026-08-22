@@ -23,7 +23,7 @@
 use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::settings::ThemeMode;
-use aether_protocol::viewport::DiagnosticSeverity;
+use aether_protocol::viewport::{DiagnosticSeverity, DiffStage, PatchLine};
 
 /// A palette colour, sRGB 8-bit. The core stays shell-agnostic: shells convert to their own
 /// colour type at the draw boundary.
@@ -107,6 +107,15 @@ pub struct Theme {
     pub match_bracket: Rgb,
     /// Current-line tint — between `bg` and `bg_panel` (Nord has no shade in between).
     pub cursor_line_bg: Rgb,
+    /// Backdrop for a generated patch's chrome rows — the file rules, path headers and section
+    /// headings the cursor cannot reach.
+    ///
+    /// Its job is to make *unreachable* legible: without it, chrome looks like ordinary text that
+    /// the cursor mysteriously skips. Deliberately a touch further from `bg` than
+    /// [`Self::cursor_line_bg`], so a chrome row reads as a band rather than as the line you are
+    /// on, and it runs edge to edge — gutter included — because the gutter belongs to the rows the
+    /// cursor *can* reach.
+    pub patch_chrome_bg: Rgb,
     /// Outline for floating overlays' frames and separators.
     pub overlay_border: Rgb,
     /// Hairline borders on chrome panels (inputs, dialogs, toasts, table frames) — a step
@@ -176,6 +185,10 @@ pub struct Theme {
     // sub-line ranges a change actually touched. Only Modified lines and phantom deleted rows
     // carry emphasis, so there is no added variant. Sits below search/selection fills.
     pub git_modified_emph_bg: Rgb,
+    /// The added counterpart, which the inline diff view has no use for: there a modified line's
+    /// new side is tinted *modified*, and its old side is a phantom row. A patch pairs a red `-`
+    /// with a green `+`, so the emphasis has to follow each side's own hue.
+    pub git_added_emph_bg: Rgb,
     pub git_deleted_emph_bg: Rgb,
     pub git_staged_modified_emph_bg: Rgb,
     pub git_staged_deleted_emph_bg: Rgb,
@@ -183,7 +196,15 @@ pub struct Theme {
     pub cursor_line_added_bg: Rgb,
     pub cursor_line_modified_bg: Rgb,
     pub cursor_line_staged_added_bg: Rgb,
+    /// The staged-deleted counterpart, needed for the same reason `cursor_line_deleted_bg` is: in
+    /// a patch both sides are lines the cursor can land on, where the inline diff view's removals
+    /// are phantom rows it can't reach.
+    pub cursor_line_staged_deleted_bg: Rgb,
     pub cursor_line_staged_modified_bg: Rgb,
+    /// The deleted counterpart, which the inline diff view has no use for — there a removal is a
+    /// phantom row the cursor can't reach. A `git/show` patch needs it: both sides of the change
+    /// are ordinary lines you can land on.
+    pub cursor_line_deleted_bg: Rgb,
     // Merge conflicts: which side of a block a line belongs to. A second encoding on top of the
     // diff one would normally be a mistake, but the two never land on the same line — the server
     // masks the diff out of the conflict blocks — so the hues only have to be distinguishable from
@@ -231,7 +252,8 @@ impl Theme {
         sneak_prefix_bg: NORD3_BRIGHT,
         match_highlight: NORD13,
         match_bracket: NORD12,
-        cursor_line_bg: rgb(0x343a48), // ~40% from NORD0 toward NORD1
+        cursor_line_bg: rgb(0x343a48),  // ~40% from NORD0 toward NORD1
+        patch_chrome_bg: rgb(0x373e4d), // ~60% from NORD0 toward NORD1 — a band, not a cursorline
         overlay_border: NORD3_BRIGHTER,
         border_subtle: NORD3,
         fg: NORD4,
@@ -269,13 +291,21 @@ impl Theme {
         // into the phantom bg) so the fill reads as a stronger wash of the same glass, not a
         // solid pigment.
         git_modified_emph_bg: rgb(0x665b41),
+        // Lifted from `git_added_bg` by the same proportion `git_deleted_emph_bg` takes from
+        // `git_deleted_bg`, so the two sides read as equally emphasised.
+        git_added_emph_bg: rgb(0x4c624c),
         git_deleted_emph_bg: rgb(0x65363c),
         git_staged_modified_emph_bg: rgb(0x544e3d),
         git_staged_deleted_emph_bg: rgb(0x503339),
         cursor_line_added_bg: rgb(0x3a4d3a),
         cursor_line_modified_bg: rgb(0x4a4632),
         cursor_line_staged_added_bg: rgb(0x3a453c),
+        // Lifted from `git_staged_deleted_bg` by the step the other cursorline pairs take.
+        cursor_line_staged_deleted_bg: rgb(0x44343a),
         cursor_line_staged_modified_bg: rgb(0x434138),
+        // Lifted from `git_deleted_bg` by the same step the added pair takes, which lands it well
+        // clear of `git_deleted_emph_bg` — the two must not be confusable on a patch line.
+        cursor_line_deleted_bg: rgb(0x4c2c31),
         // Hue-shifted from NORD0 rather than lightened, like the diff tints: a wash the text still
         // reads through. Teal reads against a blue-grey background where a plain blue would sink
         // into it.
@@ -311,6 +341,7 @@ impl Theme {
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
         match_bracket: rgb(0xab5f38),   // = syn_macro today; free to diverge
         cursor_line_bg: rgb(0xe4e9f0),  // ~40% from NORD6 toward NORD5
+        patch_chrome_bg: rgb(0xe1e6ee), // ~60% toward NORD5, as the dark pair is
         overlay_border: rgb(0xaab4c4),
         border_subtle: rgb(0xd8dfe8), // = fill_dim today; borders can darken independently
         fg: NORD0,
@@ -343,13 +374,16 @@ impl Theme {
         git_staged_modified_bg: rgb(0xebe7d8),
         git_staged_deleted_bg: rgb(0xefe0e2),
         git_modified_emph_bg: rgb(0xe3c366),
+        git_added_emph_bg: rgb(0xb2dfac), // deepened from git_added_bg, as the deleted pair is
         git_deleted_emph_bg: rgb(0xf1abb0),
         git_staged_modified_emph_bg: rgb(0xe4d29a),
         git_staged_deleted_emph_bg: rgb(0xf0c1c6),
         cursor_line_added_bg: rgb(0xd3e4cb),
         cursor_line_modified_bg: rgb(0xe6dfc0),
         cursor_line_staged_added_bg: rgb(0xdde7d8),
+        cursor_line_staged_deleted_bg: rgb(0xe6d5d7), // darkened, as the staged-added pair is
         cursor_line_staged_modified_bg: rgb(0xe7e3d2),
+        cursor_line_deleted_bg: rgb(0xe9d1d1), // darkened from git_deleted_bg, as the added pair is
         git_conflict_ours_bg: rgb(0xd6e8ec),
         git_conflict_theirs_bg: rgb(0xe2d2ee),
         git_conflict_marker: NORD10,
@@ -434,8 +468,57 @@ impl Theme {
                 bold: true,
                 ..SyntaxStyle::default()
             },
+            // Generated patch chrome (`git/show`): the `commit` / `Author:` / `Date:` field names,
+            // the stat line, a hunk separator's trailing function context, a placeholder line's
+            // prose. Deliberately not `comment`, which is the same shade but italic — italics read
+            // badly on a hash or a path, and this is chrome rather than prose.
+            "diff.meta" => color(self.fg_muted),
+            // `@@ -a,b +c,d @@`. Teal is the one accent that can't be misread as add or remove.
+            // With no line numbers in the gutter this is where a patch's line numbers live, so it
+            // has to be findable by eye.
+            "diff.hunk" => color(self.syn_type),
+            // A file separator's path: the heaviest boundary in a patch, so it takes the same
+            // weight a heading does.
+            "diff.file" => SyntaxStyle {
+                bold: true,
+                ..color(self.fg)
+            },
+            // The `+N` / `−M` counts beside it. The diff hues rather than the tints — these are
+            // foreground text on chrome, not a changed line.
+            "diff.added" => color(self.git_added),
+            "diff.removed" => color(self.git_deleted),
             _ => return None,
         })
+    }
+
+    /// Line background for a side of a generated patch (`git/show`). Deliberately the inline diff
+    /// view's own tints: the two are different mechanisms and the same thing to look at, so they
+    /// consolidate here rather than on the wire. `on_cursor_line` picks the variant that keeps the
+    /// change colour visible under the cursorline.
+    pub fn patch_line_bg(&self, line: PatchLine, stage: DiffStage, on_cursor_line: bool) -> Rgb {
+        // Staged changes take the dimmed pair, exactly as they do in the inline diff view: the
+        // hue says which side, the brightness says whether it still needs staging. A commit's
+        // patch is always `Unstaged`, so it renders as it always did.
+        match (line, stage, on_cursor_line) {
+            (PatchLine::Added, DiffStage::Unstaged, false) => self.git_added_bg,
+            (PatchLine::Added, DiffStage::Unstaged, true) => self.cursor_line_added_bg,
+            (PatchLine::Added, DiffStage::Staged, false) => self.git_staged_added_bg,
+            (PatchLine::Added, DiffStage::Staged, true) => self.cursor_line_staged_added_bg,
+            (PatchLine::Removed, DiffStage::Unstaged, false) => self.git_deleted_bg,
+            (PatchLine::Removed, DiffStage::Unstaged, true) => self.cursor_line_deleted_bg,
+            (PatchLine::Removed, DiffStage::Staged, false) => self.git_staged_deleted_bg,
+            (PatchLine::Removed, DiffStage::Staged, true) => self.cursor_line_staged_deleted_bg,
+        }
+    }
+
+    /// Intra-line emphasis background for a side of a generated patch. Follows the side's own hue
+    /// rather than the inline diff view's "modified" olive: in a patch a change is a red line
+    /// paired with a green one, so a shared emphasis colour would clash with one of them.
+    pub fn patch_emphasis_bg(&self, line: PatchLine) -> Rgb {
+        match line {
+            PatchLine::Added => self.git_added_emph_bg,
+            PatchLine::Removed => self.git_deleted_emph_bg,
+        }
     }
 
     /// The underline / message colour for a diagnostic severity. Hint is deliberately the plain

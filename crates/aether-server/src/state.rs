@@ -354,6 +354,11 @@ pub struct NavEntry {
     pub buffer_id: BufferId,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
+    /// [`VirtualSource::key`] when the entry is a materialised revision — a commit's patch or a
+    /// file at a revision. The reopen handle for buffers that have no path: they were *generated*,
+    /// not loaded, so without this a virtual buffer would die with its id and stepping back to a
+    /// diff you followed a line out of would find nothing to return to.
+    pub virtual_key: Option<String>,
     pub cursor: CursorState,
 }
 
@@ -490,6 +495,10 @@ pub enum DormantSource {
     File(PathBuf),
     /// A scratch buffer that had unsaved content; its per-workspace display number (and backup key).
     Scratch { number: u32 },
+    /// A materialised revision — a commit's diff, or a file at one — by its [`VirtualSource::key`].
+    /// Nothing is stored: the content regenerates from the repo when the buffer is first viewed,
+    /// which is also why a revision that has since been rewritten away simply doesn't come back.
+    Virtual { key: String },
 }
 
 impl DormantBuffer {
@@ -497,7 +506,7 @@ impl DormantBuffer {
     pub fn path(&self) -> Option<&Path> {
         match &self.source {
             DormantSource::File(p) => Some(p.as_path()),
-            DormantSource::Scratch { .. } => None,
+            DormantSource::Scratch { .. } | DormantSource::Virtual { .. } => None,
         }
     }
 }
@@ -1404,9 +1413,11 @@ impl ServerState {
     /// buffer-list clutter the transient mechanism exists to avoid. A scratch is only worth restoring
     /// if it has unsaved content (it's dirty, hence has a backup); an empty scratch is dropped.
     ///
-    /// **Virtual** buffers ([`VirtualSource`]) are excluded twice over, which is deliberate rather
-    /// than incidental: they open transient, and they have neither a path nor a scratch number to
-    /// be keyed by. Restoring "the diff of a commit you looked at last Tuesday" is not a session.
+    /// **Virtual** buffers ([`VirtualSource`]) are included only once *kept*, which the transient
+    /// rule above already enforces: a revision opens transient, so it takes a deliberate `Space k`
+    /// to persist one. That's the whole gate — a diff you glanced at from the log picker is a
+    /// preview and stays out, a diff you pinned is somewhere you were working. Keyed by
+    /// `VirtualSource::key`, which is stable across restarts (a repo id is its canonical workdir).
     pub fn session_buffers(&self, workspace_name: &str) -> Vec<crate::config::SessionBuffer> {
         use crate::config::SessionBuffer;
         let Some(workspace) = self.workspaces.get(workspace_name) else {
@@ -1415,6 +1426,7 @@ impl ServerState {
         let mut out: Vec<SessionBuffer> = Vec::new();
         let mut seen_paths: std::collections::HashSet<&Path> = std::collections::HashSet::new();
         let mut seen_scratch: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut seen_virtual: std::collections::HashSet<String> = std::collections::HashSet::new();
         for id in &workspace.mru_buffers {
             let Some(buf) = self.buffers.get(id) else {
                 continue;
@@ -1430,6 +1442,11 @@ impl ServerState {
                     out.push(SessionBuffer::File {
                         path: path.to_path_buf(),
                     });
+                }
+            } else if let Some(source) = doc.virtual_source.as_ref() {
+                let key = source.target.key();
+                if seen_virtual.insert(key.clone()) {
+                    out.push(SessionBuffer::Virtual { key });
                 }
             } else if let Some(number) = buf.scratch_number {
                 // Only dirty scratches carry content worth restoring (and therefore a backup).
@@ -1448,6 +1465,11 @@ impl ServerState {
                 DormantSource::Scratch { number } => {
                     if seen_scratch.insert(*number) {
                         out.push(SessionBuffer::Scratch { number: *number });
+                    }
+                }
+                DormantSource::Virtual { key } => {
+                    if seen_virtual.insert(key.clone()) {
+                        out.push(SessionBuffer::Virtual { key: key.clone() });
                     }
                 }
             }
@@ -1676,13 +1698,88 @@ pub struct Buffer {
 /// carrying a separate flag keeps the two from disagreeing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualSource {
-    /// Identity for reuse: `<repo_id>@<rev>` for a commit, `<repo_id>@<rev>:<path>` for a file.
-    /// Re-showing the same revision attaches to the existing document instead of stacking
-    /// duplicates — the pathless equivalent of the canonical-path sharing key.
-    pub key: String,
-    /// Display name (`abc1234 — subject`, `abc1234:src/main.rs`), shipped as
+    /// What it was materialised *from*, and the identity for reuse: re-showing the same target
+    /// attaches to the existing document instead of stacking duplicates — the pathless equivalent
+    /// of the canonical-path sharing key.
+    pub target: VirtualTarget,
+    /// Display name (`abc1234 — subject`, `abc1234:src/main.rs`, `Working changes`), shipped as
     /// `BufferOpenResult::title`.
     pub title: String,
+}
+
+/// What a virtual document was generated from: a repo, plus which of its states.
+///
+/// **Structured, not a string.** It was a string once, and every consumer that wanted one field out
+/// of it — the repo, the rev, the path — re-split it by hand, each slightly differently
+/// (`rsplit_once('@')`, `split_once(':')`). Adding a fourth shape quietly broke one of those
+/// splits, which is the failure mode this exists to remove: ask for the field you want and a shape
+/// that hasn't got one answers `None`.
+///
+/// The string form survives only as an *encoding*, for the one place that needs to write a target
+/// down and read it back: the session file. See [`Self::key`] and [`Self::parse_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTarget {
+    /// Canonical workdir of the repo — which is what makes a key stable across restarts.
+    pub repo_id: String,
+    pub what: aether_protocol::git::ShowTarget,
+}
+
+impl VirtualTarget {
+    pub fn new(repo_id: impl Into<String>, what: aether_protocol::git::ShowTarget) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            what,
+        }
+    }
+
+    pub fn rev(&self) -> Option<&str> {
+        self.what.rev()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.what.path()
+    }
+
+    /// Whether re-showing this can attach to a buffer already holding it. A revision can't change
+    /// under us; the working tree can, and has to be rebuilt.
+    pub fn is_immutable(&self) -> bool {
+        self.rev().is_some()
+    }
+
+    /// Stable string encoding, for writing a target into the session file.
+    ///
+    /// `#` separates the working tree rather than `@`, so a round-trip can never mistake it for a
+    /// revision named `worktree`.
+    pub fn key(&self) -> String {
+        use aether_protocol::git::ShowTarget;
+        match &self.what {
+            ShowTarget::Commit { rev } => format!("{}@{rev}", self.repo_id),
+            ShowTarget::File { rev, path } => format!("{}@{rev}:{path}", self.repo_id),
+            ShowTarget::WorkingChanges => format!("{}#worktree", self.repo_id),
+        }
+    }
+
+    /// Inverse of [`Self::key`]. Split from the right: a repo id is a filesystem path and may
+    /// itself contain `@`; the remainder can't, so the `:` split after it is unambiguous.
+    pub fn parse_key(key: &str) -> Option<Self> {
+        use aether_protocol::git::ShowTarget;
+        if let Some(repo_id) = key.strip_suffix("#worktree") {
+            return Some(Self::new(repo_id, ShowTarget::WorkingChanges));
+        }
+        let (repo_id, rest) = key.rsplit_once('@')?;
+        Some(Self::new(
+            repo_id,
+            match rest.split_once(':') {
+                Some((rev, path)) => ShowTarget::File {
+                    rev: rev.to_string(),
+                    path: path.to_string(),
+                },
+                None => ShowTarget::Commit {
+                    rev: rest.to_string(),
+                },
+            },
+        ))
+    }
 }
 
 pub struct Document {
@@ -1708,6 +1805,9 @@ pub struct Document {
     /// renders are unhighlighted, and `apply_edit` skips tree maintenance — the background task
     /// re-checks `revision` and reparses until it catches up.
     pub syntax_pending: bool,
+    /// Decorations and structure computed once when the content was *generated*, for documents no
+    /// grammar spans — the commit patch behind `git/show`. See [`crate::patch::GeneratedPatch`].
+    pub generated: Option<crate::patch::GeneratedPatch>,
     /// Detected (or defaulted) once on load; stable for the buffer's lifetime so further edits
     /// don't make the unit drift.
     pub indent_style: IndentStyle,
@@ -1842,6 +1942,7 @@ impl Document {
             last_modified_unix_ms,
             syntax,
             syntax_pending: defer_parse,
+            generated: None,
             indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -1876,6 +1977,7 @@ impl Document {
             last_modified_unix_ms: None,
             syntax,
             syntax_pending: false,
+            generated: None,
             indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -1892,11 +1994,16 @@ impl Document {
     /// A **virtual** document: pathless, read-only, content materialised from a revision
     /// ([`VirtualSource`]). Structurally a scratch with content and a title — the difference that
     /// matters is that nothing may write to it, and nothing should try to persist it.
+    ///
+    /// `language` and `generated` are alternatives, not companions: a file at a revision has a
+    /// grammar and gets a live tree, a generated patch has neither and carries
+    /// [`crate::patch::GeneratedPatch`] instead.
     pub fn virtual_content(
         id: DocumentId,
         source: VirtualSource,
         text: String,
         language: Option<String>,
+        generated: Option<crate::patch::GeneratedPatch>,
     ) -> Self {
         let text = ropey::Rope::from_str(&text);
         let syntax = language
@@ -1915,6 +2022,7 @@ impl Document {
             last_modified_unix_ms: None,
             syntax,
             syntax_pending: false,
+            generated,
             indent_style,
             saved_revision: Some(0),
             next_revision_id: 1,
@@ -1951,6 +2059,7 @@ impl Document {
             last_modified_unix_ms: None,
             syntax,
             syntax_pending: false,
+            generated: None,
             indent_style,
             // Treat empty scratch as "clean"; first edit makes it dirty.
             saved_revision: Some(0),
@@ -2254,6 +2363,25 @@ impl Document {
         self.dirty = self.saved_revision != Some(self.revision);
     }
 
+    /// Swap a generated document's content in place — rebuilding the working-changes patch after
+    /// the working tree, or the index, moved under it.
+    ///
+    /// Bumps the revision, because viewport pushes are revision-guarded and would otherwise be
+    /// discarded as stale. Moves `saved_revision` with it, because the document stays **clean**: a
+    /// read-only buffer has nothing to save, and leaving the two apart would show a dirty marker
+    /// for content the user never edited.
+    pub fn replace_generated(
+        &mut self,
+        text: &str,
+        generated: Option<crate::patch::GeneratedPatch>,
+    ) {
+        self.text = ropey::Rope::from_str(text);
+        self.generated = generated;
+        self.revision += 1;
+        self.saved_revision = Some(self.revision);
+        self.recompute_dirty();
+    }
+
     /// Re-parse the entire buffer from scratch. Used after operations (undo/redo) that swap the
     /// whole rope — the incremental InputEdit pathway can't help when the buffer is replaced.
     fn reparse_full(&mut self) {
@@ -2372,6 +2500,82 @@ impl Viewport {
             marker_width: self.continuation_marker_width,
             tab_width: self.tab_width,
         }
+    }
+}
+
+#[cfg(test)]
+mod virtual_target_tests {
+    use super::*;
+    use aether_protocol::git::ShowTarget;
+
+    /// The string form is an *encoding*, used only where a target has to be written down and read
+    /// back (the session file). Every shape must survive the round trip, including the awkward
+    /// ones: a repo path containing `@`, and the working tree — which is not a revision and must
+    /// never decode as one.
+    #[test]
+    fn every_target_shape_survives_its_key() {
+        let cases = [
+            VirtualTarget::new(
+                "/home/joe/proj",
+                ShowTarget::Commit {
+                    rev: "abc1234".into(),
+                },
+            ),
+            VirtualTarget::new(
+                "/home/joe/proj",
+                ShowTarget::File {
+                    rev: "abc1234".into(),
+                    path: "src/a.rs".into(),
+                },
+            ),
+            VirtualTarget::new("/home/joe/proj", ShowTarget::WorkingChanges),
+            // A repo path with an `@` in it — why the key splits from the right.
+            VirtualTarget::new(
+                "/home/joe/w@rk/proj",
+                ShowTarget::File {
+                    rev: "abc1234".into(),
+                    path: "src/a.rs".into(),
+                },
+            ),
+        ];
+        for target in cases {
+            let key = target.key();
+            assert_eq!(
+                VirtualTarget::parse_key(&key),
+                Some(target.clone()),
+                "round trip through {key:?}"
+            );
+        }
+    }
+
+    /// Asking a shape for a field it hasn't got answers `None` — the whole point of the type. When
+    /// this was a string every consumer re-split it by hand, and the working tree (which has no
+    /// revision) came out looking like a commit named `worktree`.
+    ///
+    /// `is_immutable` is the one that earns its keep at runtime: it decides whether re-showing a
+    /// target can attach to the buffer already holding it, or has to rebuild it.
+    #[test]
+    fn a_shape_without_a_field_answers_none() {
+        let working = VirtualTarget::new("/proj", ShowTarget::WorkingChanges);
+        assert_eq!(working.repo_id, "/proj");
+        assert_eq!(working.rev(), None, "never hand this to rev-parse");
+        assert_eq!(working.path(), None);
+        assert!(!working.is_immutable(), "the worktree moves; rebuild it");
+
+        let commit = VirtualTarget::new("/proj", ShowTarget::Commit { rev: "abc".into() });
+        assert_eq!(commit.rev(), Some("abc"));
+        assert_eq!(commit.path(), None, "a commit's diff spans many files");
+        assert!(commit.is_immutable(), "a commit can't change; attach to it");
+
+        let file = VirtualTarget::new(
+            "/proj",
+            ShowTarget::File {
+                rev: "abc".into(),
+                path: "a.rs".into(),
+            },
+        );
+        assert_eq!(file.path(), Some("a.rs"));
+        assert!(file.is_immutable());
     }
 }
 

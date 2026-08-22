@@ -14,6 +14,8 @@ import type {
   EmphasisRange,
   LogicalLineRender,
   LogicalPosition,
+  PatchLine,
+  VirtualRow,
   VisualRow,
 } from "./protocol";
 
@@ -55,6 +57,11 @@ const HL_CLASS: Record<string, string> = {
   "text.reference": "reference",
   "text.emphasis": "emphasis",
   "text.strong": "strong",
+  "diff.meta": "diff-meta",
+  "diff.hunk": "diff-hunk",
+  "diff.file": "diff-file",
+  "diff.added": "diff-added",
+  "diff.removed": "diff-removed",
 };
 
 export function highlightClass(kind: string): string | null {
@@ -212,12 +219,18 @@ function renderVisualRow(
   const stage = line.diff_stage ?? "unstaged";
   if (diffView && line.diff_marker === "added") rowEl.classList.add("added-bg");
   else if (diffView && line.diff_marker === "modified") rowEl.classList.add("modified-bg");
-  if (diffView && stage === "staged") rowEl.classList.add("staged");
+  // A patch buffer *is* a diff, so its staged/unstaged split is ungated — there is no view
+  // to toggle it behind (the same reasoning as the patch tints themselves).
+  if ((diffView || line.patch) && stage === "staged") rowEl.classList.add("staged");
   // A merge conflict's side tints, which unlike the diff ones are *not* gated on the diff view:
   // the sides are how the file is read at all. They never collide with the diff tints — the server
   // masks the diff out of the blocks. The marker lines get a class too (their text colour) but no
   // tint.
   if (line.conflict) rowEl.classList.add("conflict", `conflict-${line.conflict}`);
+  // A generated patch's own sides. Ungated for the same reason the conflict tints are: the buffer
+  // *is* a diff, so there's no view to toggle it behind. Shares the diff view's colours — the
+  // mechanisms differ, what you look at doesn't.
+  if (line.patch) rowEl.classList.add(`patch-${line.patch}`);
   // Current-line highlight (Vim's `cursorline`). `cursorByte` is non-null on exactly the cursor's
   // logical line, so every visual row of that line (under soft wrap) gets tinted as a whole. The CSS
   // rule is ordered after the diff tints so it wins on the cursor's changed line; the gutter
@@ -225,7 +238,7 @@ function renderVisualRow(
   if (cursorByte !== null) rowEl.classList.add("cursor-line");
 
   rowEl.appendChild(
-    gutter(line.diff_marker ?? null, diffView, stage, line.conflict ?? null),
+    gutter(line.diff_marker ?? null, diffView, stage, line.conflict ?? null, line.patch ?? null),
   );
 
   const content = document.createElement("span");
@@ -458,6 +471,7 @@ function gutter(
   diffView: boolean,
   stage: DiffStage,
   conflict: ConflictLine | null = null,
+  patch: PatchLine | null = null,
 ): HTMLElement {
   const g = document.createElement("span");
   g.className = "gutter";
@@ -467,11 +481,61 @@ function gutter(
     g.classList.add("conflict");
     return g;
   }
+  // A generated patch marks its own sides. Dropping the `+`/`-` columns left the background tint as
+  // the only signal of which side a line is; the bar carries it too, dimmed once staged.
+  if (patch) {
+    g.classList.add(patch === "added" ? "added" : "patch-removed");
+    if (stage === "staged") g.classList.add("staged");
+    return g;
+  }
   if (marker === "added" || marker === "modified") g.classList.add(marker);
   else if (marker === "deleted" && !diffView) g.classList.add("deleted");
   // A staged change dims the bar to the muted variant of its kind colour.
   if (marker && stage === "staged") g.classList.add("staged");
   return g;
+}
+
+/** A generated patch's file or hunk separator, or the blank space between them.
+ *
+ *  Chrome, not content: it holds no cursor position (that's the whole reason it's a virtual row
+ *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
+ *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
+ *  left. */
+function chromeRow(v: VirtualRow, opensBlock: boolean, closes = false): HTMLElement {
+  const rowEl = document.createElement("div");
+  rowEl.className = "row patch-chrome " + v.kind.replace("_", "-");
+  // A file's rule corners when nothing runs into it from above; otherwise it tees off the rail.
+  if (v.kind === "rule" && opensBlock) rowEl.classList.add("corners");
+  // The rail runs in from above and stops here, so it reaches only as far as the rule.
+  if (closes) rowEl.classList.add("closes");
+  const g = document.createElement("span");
+  g.className = "gutter";
+  rowEl.appendChild(g);
+  const content = document.createElement("span");
+  content.className = "content";
+  if (v.kind !== "rule") {
+    // Runs split at the server's span boundaries; gaps between spans take the muted default,
+    // since chrome is never plain body text.
+    const { cps, byteStart } = decodeRow(v.text);
+    const n = cps.length;
+    const cls: (string | null)[] = new Array(n).fill(null);
+    for (const h of v.highlights ?? []) {
+      const c = highlightClass(h.kind);
+      markRange(byteStart, n, h.start, h.end, (i) => (cls[i] = c));
+    }
+    let i = 0;
+    while (i < n) {
+      let j = i + 1;
+      while (j < n && cls[j] === cls[i]) j++;
+      const span = document.createElement("span");
+      if (cls[i]) span.className = cls[i] as string;
+      span.textContent = cps.slice(i, j).join("");
+      content.appendChild(span);
+      i = j;
+    }
+  }
+  rowEl.appendChild(content);
+  return rowEl;
 }
 
 function phantomRow(text: string, stage: DiffStage, emphasis: EmphasisRange[]): HTMLElement {
@@ -554,8 +618,13 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
 
   const frag = document.createDocumentFragment();
   for (const line of window.lines) {
-    for (const v of line.virtual_rows_above ?? [])
-      frag.appendChild(phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? []));
+    (line.virtual_rows_above ?? []).forEach((v, i) =>
+      frag.appendChild(
+        v.kind === "deleted"
+          ? phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? [])
+          : chromeRow(v, i === 0),
+      ),
+    );
 
     const L = line.logical_line;
     const cursorByte = cursor.position.line === L ? cursor.position.col : null;
@@ -595,6 +664,9 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
         ),
       );
     });
+    // Closing chrome, after the line's own rows — a patch's final rule, which has no trailing line
+    // to sit above.
+    for (const v of line.virtual_rows_below ?? []) frag.appendChild(chromeRow(v, false, true));
   }
   // Virtual scroll: a full-document-height spacer (so the native scrollbar reflects the whole
   // file), with the loaded window absolutely positioned at its visual-row offset. Both axes scroll

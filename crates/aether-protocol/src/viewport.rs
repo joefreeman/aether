@@ -31,14 +31,29 @@ pub struct LogicalLineRender {
     /// to each line they touch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search_matches: Vec<SearchMatchRange>,
-    /// Virtual (non-buffer) rows rendered *above* this logical line, only populated when the
-    /// viewport has the inline diff view enabled. Currently these are the baseline lines a hunk
-    /// removed or replaced, shown as phantom "deleted" rows that have no cursor position. The
-    /// client renders them before the line's `visual_rows` and counts them as occupied screen
-    /// rows, but never lets the cursor land on them. Deletions at end-of-buffer anchor to the
-    /// trailing empty line.
+    /// Virtual (non-buffer) rows rendered *above* this logical line. The client renders them
+    /// before the line's `visual_rows` and counts them as occupied screen rows, but never lets the
+    /// cursor land on them — which is the whole point of the mechanism.
+    ///
+    /// Two unrelated producers, which can never both apply to one buffer:
+    ///
+    /// - **Inline diff view** ([`VirtualRowKind::Deleted`]): the baseline lines a hunk removed or
+    ///   replaced, as phantom rows. Only while the viewport has the diff view on. Deletions at
+    ///   end-of-buffer anchor to the trailing empty line.
+    /// - **Generated patches** (the other kinds): a commit's file and hunk separators. These are
+    ///   *not* buffer text — that is deliberate and load-bearing. Chrome the cursor can't reach is
+    ///   free here, whereas making some buffer lines unaddressable would need a skip rule in every
+    ///   motion, in search landing, in sneak, and in jumplist/nav restore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_rows_above: Vec<VirtualRow>,
+    /// Virtual rows rendered *below* this logical line, on the same terms as
+    /// [`Self::virtual_rows_above`]: they occupy screen rows and hold no cursor position.
+    ///
+    /// Only ever the closing chrome of a generated patch, and only on its last line — chrome that
+    /// has to sit *after* the final line has nowhere to hang otherwise, and a patch deliberately
+    /// ends without a trailing newline, so there is no empty last line to anchor it to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_rows_below: Vec<VirtualRow>,
     /// Per-line Git change marker, computed whenever the buffer's hunks are known (independent of
     /// the diff-view toggle) so the client can always draw a gutter change-bar. `Added` /
     /// `Modified` are the new-side lines of those hunks; `Deleted` marks the line a pure deletion
@@ -85,6 +100,14 @@ pub struct LogicalLineRender {
     /// sneak session is active for this client. See [`crate::sneak`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sneak_targets: Vec<SneakTarget>,
+    /// Which side of a **generated patch** this line is, for the read-only buffers `git/show`
+    /// materialises from a commit. `None` on every ordinary buffer, and on the patch's own
+    /// metadata and header lines — those take their styling from the syntax channel.
+    ///
+    /// **Not gated on the inline diff view**, for the same reason [`Self::conflict`] isn't: the
+    /// buffer *is* a patch, so there is nothing to toggle off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<PatchLine>,
 }
 
 /// One diagnostic's footprint on a single logical line.
@@ -117,6 +140,22 @@ pub enum DiffMarker {
     /// Lines were removed immediately above this one (a pure deletion). The line itself is
     /// unchanged — only the gutter flags it; it carries no background tint.
     Deleted,
+}
+
+/// Which side of a generated patch a line is — see [`LogicalLineRender::patch`].
+///
+/// Deliberately separate from [`DiffMarker`], which decorates a *file* against its baseline: there
+/// a removal is a phantom row with no cursor position, and `Deleted` flags the surviving line
+/// underneath. In a patch both sides are ordinary buffer text the cursor can land on, so the two
+/// carry different meanings and only ever share their theme colours. They never appear on the same
+/// buffer — a patch has no baseline of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchLine {
+    /// A `+` line: present in the new side only.
+    Added,
+    /// A `-` line: present in the old side only.
+    Removed,
 }
 
 /// Which part of a conflict block a line belongs to — see [`LogicalLineRender::conflict`].
@@ -178,7 +217,7 @@ pub struct VirtualRow {
     /// Staged (the row's text is HEAD's, already replaced in the index) vs unstaged (the text is
     /// the index's, still present there). At most one layer per anchor: where both would stack,
     /// the server sends only the unstaged rows, so what's shown deleted is exactly what a revert
-    /// would restore.
+    /// would restore. Meaningless on the patch-chrome kinds, which leave it at its default.
     #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
     pub stage: DiffStage,
     /// Intra-line emphasis on the old side: the byte ranges of this removed baseline line that
@@ -186,6 +225,16 @@ pub struct VirtualRow {
     /// [`LogicalLineRender::diff_emphasis`]). Empty for whole-line changes and pure deletions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emphasis: Vec<EmphasisRange>,
+    /// Syntax spans over `text`, byte offsets within the row. Same shape and same meaning as
+    /// [`Segment::highlights`], so a shell styles a virtual row exactly the way it styles a real
+    /// one. Empty on [`VirtualRowKind::Deleted`], whose colour comes wholly from the diff palette;
+    /// the patch-chrome kinds use it to separate a path from its counts, or `@@ -a,b +c,d @@` from
+    /// the enclosing signature git prints after it.
+    ///
+    /// A virtual row is **one screen row** — virtual rows do not take part in soft wrap — so a
+    /// shell truncates rather than wrapping, and these spans index the untruncated text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<Highlight>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +242,21 @@ pub struct VirtualRow {
 pub enum VirtualRowKind {
     /// A baseline line removed or replaced in the working buffer (inline diff).
     Deleted,
+    /// A full-width horizontal line opening a generated patch's file block — the heaviest
+    /// boundary in the buffer, and the only one drawn edge to edge.
+    Rule,
+    /// A generated patch's file separator: the path (or `old → new` for a rename) and its change
+    /// counts, on the row below its [`Self::Rule`].
+    FileHeader,
+    /// Blank vertical space inside a chrome block — band and left rail, no text. One sits above
+    /// and below every run of code, so a section reads as boxed in by its chrome rather than
+    /// running straight into it. A row rather than an empty buffer line, so the breathing room
+    /// costs no cursor positions.
+    Spacer,
+    /// A generated patch's section heading: the enclosing signature git names for the hunk,
+    /// followed by a muted rule filling the rest of the row. Empty text where git found no
+    /// signature, leaving just the rule.
+    HunkHeader,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

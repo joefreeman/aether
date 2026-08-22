@@ -68,7 +68,9 @@ export interface SneakTarget {
   label?: string | null;
 }
 
-export type VirtualRowKind = "deleted";
+/** "deleted" is the inline diff view's phantom baseline row; the rest are a generated patch's
+ *  chrome, which is deliberately not buffer text so the cursor can never land on it. */
+export type VirtualRowKind = "deleted" | "rule" | "file_header" | "hunk_header" | "spacer";
 
 /** One intra-line diff emphasis range: byte offsets within the owning line's / row's text. */
 export interface EmphasisRange {
@@ -84,6 +86,10 @@ export interface VirtualRow {
   stage?: DiffStage;
   /** Intra-line emphasis on this removed line (the parts its paired buffer line replaced). */
   emphasis?: EmphasisRange[];
+  /** Syntax spans over `text`, same shape as Segment.highlights. Empty on "deleted" rows, whose
+   *  colour is wholly the diff palette's. A virtual row is one screen row (no soft wrap), so these
+   *  index the untruncated text. */
+  highlights?: Highlight[];
 }
 
 export type DiffMarker = "added" | "modified" | "deleted";
@@ -92,6 +98,11 @@ export type DiffMarker = "added" | "modified" | "deleted";
  *  or rebase left conflicted; the blocks are masked out of that file's diff, so a line never
  *  carries both this and a diff_marker. */
 export type ConflictLine = "marker" | "ours" | "base" | "theirs";
+
+/** Which side of a *generated* patch a line is — the read-only buffers `git/show` materialises
+ *  from a commit. Separate from DiffMarker, which decorates a file against its baseline: there a
+ *  removal is a phantom row, here both sides are ordinary lines. Never both on one buffer. */
+export type PatchLine = "added" | "removed";
 
 /** Which side of the index a change sits on. Binary by design: where staged and unstaged
  *  overlap (modified, staged, modified again), the unstaged top layer wins. Omitted when
@@ -122,6 +133,8 @@ export interface LogicalLineRender {
   visual_rows: VisualRow[];
   search_matches?: SearchMatchRange[];
   virtual_rows_above?: VirtualRow[];
+  /** Closing chrome after the final line — a patch has no trailing newline to hang it on. */
+  virtual_rows_below?: VirtualRow[];
   diff_marker?: DiffMarker | null;
   /** Qualifies diff_marker in the combined view; omitted when "unstaged". */
   diff_stage?: DiffStage;
@@ -132,6 +145,9 @@ export interface LogicalLineRender {
   conflict?: ConflictLine | null;
   diagnostics?: DiagnosticSpan[];
   sneak_targets?: SneakTarget[];
+  /** Which side of a generated patch this line is; absent on every ordinary buffer. Like
+   *  `conflict` and unlike the diff tint, not gated on the diff view. */
+  patch?: PatchLine | null;
 }
 
 export interface BufferWindow {

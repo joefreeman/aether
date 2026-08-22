@@ -16,6 +16,7 @@ mod indent;
 mod jumplist;
 mod lsp;
 mod number;
+mod patch;
 mod picker;
 mod server;
 mod sneak;

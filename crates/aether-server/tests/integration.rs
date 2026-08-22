@@ -20,11 +20,12 @@ use aether_protocol::envelope::{ClientInbound, JsonRpc, NotificationMethod, Requ
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, ConflictSide, GitAbortOperation, GitAbortOperationParams,
     GitAbortOperationResult, GitAbortStatus, GitApplyHunk, GitApplyHunkParams, GitApplyHunkResult,
-    GitBlameChanged, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitCancel,
-    GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
+    GitBlameChanged, GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitBlameLineResult,
+    GitCancel, GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
-    GitFetchResult, GitFetchStatus, GitHead, GitNavigateHunk, GitNavigateHunkParams,
+    GitFetchResult, GitFetchStatus, GitFollowPatchLine, GitFollowPatchLineParams,
+    GitFollowPatchLineResult, GitHead, GitNavigateHunk, GitNavigateHunkParams,
     GitNavigateHunkResult, GitOperationChanged, GitOperationKind, GitPrepareCommit,
     GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
     GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRefresh,
@@ -36,7 +37,7 @@ use aether_protocol::git::{
     GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitWorktreeAdd,
     GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemove,
     GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus, HunkAction,
-    HunkDirection, ResolveConflictStatus,
+    HunkDirection, ResolveConflictStatus, ShowTarget,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams, EditRedo, EditResult, EditUndo,
@@ -74,7 +75,9 @@ use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
-use aether_protocol::viewport::{ConflictLine, DiagnosticSeverity, DiffMarker, EmphasisRange};
+use aether_protocol::viewport::{
+    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
+};
 use aether_protocol::viewport::{
     ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
@@ -26936,6 +26939,7 @@ async fn nav_goto_reopens_by_path() {
         &mut ws,
         30,
         &NavGotoParams {
+            virtual_key: None,
             buffer_id: Some(buf_a), // stale on purpose
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
@@ -34396,9 +34400,10 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
         &mut ws,
         2,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: head.clone(),
-            path: None,
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
         },
     )
     .await;
@@ -34422,10 +34427,16 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
         },
     )
     .await;
-    assert!(content.text.starts_with(&format!("commit {head}\n")));
+    assert!(content.text.starts_with(&format!("commit {head}")));
     assert!(content.text.contains("\n    init\n"), "message is indented");
-    assert!(content.text.contains("+one"), "the patch is included");
-    assert!(content.text.contains("--- /dev/null") || content.text.contains("+++ b/a.rs"));
+    // The file's own lines, with no `+` column: the separators that would have carried the paths
+    // are virtual rows, so the buffer holds only what you would want to select, copy or search.
+    assert!(content.text.contains("\none\n"), "the patch is included");
+    assert!(
+        !content.text.contains("+one") && !content.text.contains("+++ b/a.rs"),
+        "chrome and origin columns are not buffer text:\n{}",
+        content.text
+    );
 
     // Every mutation is refused at the server, whatever the client thinks.
     let err = send_request_expect_err::<InputText>(
@@ -34484,9 +34495,10 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     let params = || GitShowParams {
-        repo_id: root.to_string_lossy().into_owned(),
-        rev: head.clone(),
-        path: None,
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::Commit { rev: head.clone() },
+        focus_path: None,
     };
     let opened: BufferOpenResult = send_request::<GitShow>(&mut ws, 2, &params()).await;
     let again: BufferOpenResult = send_request::<GitShow>(&mut ws, 3, &params()).await;
@@ -34497,9 +34509,10 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
         &mut ws,
         4,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: first.clone(),
-            path: None,
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: first.clone() },
+            focus_path: None,
         },
     )
     .await;
@@ -34531,9 +34544,13 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
         &mut ws,
         2,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: first.clone(),
-            path: Some("src/main.rs".into()),
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: first.clone(),
+                path: "src/main.rs".into(),
+            },
+            focus_path: None,
         },
     )
     .await;
@@ -34564,9 +34581,13 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
         &mut ws,
         4,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: first,
-            path: Some("nope.rs".into()),
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: first,
+                path: "nope.rs".into(),
+            },
+            focus_path: None,
         },
     )
     .await;
@@ -34597,9 +34618,10 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
         &mut ws,
         2,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: head.clone(),
-            path: None,
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
         },
     )
     .await;
@@ -34623,6 +34645,1506 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
     assert!(
         !displays.iter().any(|d| d.starts_with("(scratch")),
         "and doesn't call it a scratch: {displays:?}"
+    );
+
+    drop(server);
+}
+
+/// A commit patch reaches the viewport already decorated, even though no grammar spans it and the
+/// buffer has no Git baseline to be diffed against: `show_commit` classifies the text as it
+/// generates it, and the render path serves those spans wherever a parse tree's would go.
+///
+/// The `patch` side is deliberately **not** gated on the diff view — this subscribes with
+/// `diff_view: false`, which is what every client opens with.
+#[tokio::test]
+async fn git_show_decorates_the_patch_it_generates() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\nfn three() {}\n");
+    commit_file(&repo, "a.rs", "fn one() {}\nfn TWO() {}\nfn three() {}\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
+        },
+    )
+    .await;
+    assert_eq!(opened.language, None, "no grammar spans a patch");
+
+    let window = window_of(&mut ws, 3, opened.buffer_id).await;
+    let row = |prefix: &str| {
+        window
+            .lines
+            .iter()
+            .find(|l| {
+                l.visual_rows
+                    .iter()
+                    .flat_map(|r| &r.segments)
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+                    .starts_with(prefix)
+            })
+            .unwrap_or_else(|| panic!("no rendered line starting {prefix:?}"))
+    };
+    let kinds = |prefix: &str| -> Vec<String> {
+        row(prefix)
+            .visual_rows
+            .iter()
+            .flat_map(|r| &r.segments)
+            .flat_map(|s| &s.highlights)
+            .map(|h| h.kind.clone())
+            .collect()
+    };
+
+    // (b) The two sides of the change carry a side; context carries none. No `+`/`-` column: a
+    // content line is byte-identical to that line of the real file.
+    assert_eq!(row("fn TWO").patch, Some(PatchLine::Added));
+    assert_eq!(row("fn two").patch, Some(PatchLine::Removed));
+    assert_eq!(row("fn one").patch, None);
+    // ...and none of it is the *file* diff decoration, which a patch buffer has no baseline for.
+    assert!(window.lines.iter().all(|l| l.diff_marker.is_none()));
+
+    // (a) The metadata block and the subject are styled through the ordinary syntax channel, so
+    // every shell renders them with no new machinery.
+    // Field name, hash, then the refs pointing here — `(HEAD -> master)`, as git decorates it.
+    assert_eq!(kinds("commit "), vec!["diff.meta", "constant", "diff.meta"]);
+    let commit_line: String = row("commit ")
+        .visual_rows
+        .iter()
+        .flat_map(|r| &r.segments)
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(commit_line.contains("(HEAD -> "), "{commit_line:?}");
+    assert_eq!(kinds("Author: "), vec!["diff.meta"]);
+    assert_eq!(kinds("    "), vec!["text.title"], "the subject line");
+    // Content lines carry syntax spans too, projected at generation from a parse of the whole blob
+    // each side came from — so a patch line highlights exactly as that line does in the file.
+    assert!(
+        kinds("fn TWO").contains(&"keyword".to_string()),
+        "the added line is highlighted: {:?}",
+        kinds("fn TWO")
+    );
+    assert!(
+        kinds("fn two").contains(&"keyword".to_string()),
+        "and so is the removed line, from the *old* blob: {:?}",
+        kinds("fn two")
+    );
+
+    // (c) Chrome reaches the viewport as virtual rows, never as buffer lines — which is what makes
+    // it unreachable by the cursor without a skip rule in every motion.
+    let chrome: Vec<&aether_protocol::viewport::VirtualRow> = window
+        .lines
+        .iter()
+        .flat_map(|l| &l.virtual_rows_above)
+        .collect();
+    let file_header = chrome
+        .iter()
+        .find(|r| r.kind == VirtualRowKind::FileHeader)
+        .expect("a file separator");
+    assert!(file_header.text.starts_with("a.rs"), "{file_header:?}");
+    assert_eq!(
+        file_header.highlights.first().map(|h| h.kind.as_str()),
+        Some("diff.file")
+    );
+    // The file block opens with a full-width rule; its path sits on the row below.
+    assert!(
+        chrome.iter().any(|r| r.kind == VirtualRowKind::Rule),
+        "a file block opens with a rule"
+    );
+    // A section heading is the enclosing signature alone — git's `@@` ranges are dropped, and this
+    // fixture is small enough that git names no signature, so it is empty.
+    let hunk_header = chrome
+        .iter()
+        .find(|r| r.kind == VirtualRowKind::HunkHeader)
+        .expect("a section heading");
+    assert!(
+        !hunk_header.text.contains("@@"),
+        "no line ranges anywhere: {hunk_header:?}"
+    );
+    for line in &window.lines {
+        let text: String = line
+            .visual_rows
+            .iter()
+            .flat_map(|r| &r.segments)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            !text.starts_with("@@") && !text.starts_with("diff --git"),
+            "chrome leaked into the buffer: {text:?}"
+        );
+    }
+
+    drop(server);
+}
+
+/// A patch's chrome occupies screen rows, so it has to count toward the scroll extent as the diff
+/// view's phantom rows do.
+///
+/// Regression: it didn't, and because the no-wrap path short-circuits to the plain line count when
+/// there are no virtual rows, the buffer reported itself shorter than it drew. The scrollbar came
+/// up short, the last lines couldn't be scrolled to, and the GUI let the cursor sit below the
+/// scrollable area.
+#[tokio::test]
+async fn patch_chrome_counts_toward_the_scroll_extent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    commit_file(&repo, "b.rs", "fn two() {}\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+
+    let window = window_of(&mut ws, 3, opened.buffer_id).await;
+    // The fixture is small enough that the window covers the whole buffer, so the totals compare.
+    assert_eq!(window.first_logical_line, 0);
+    assert_eq!(window.last_logical_line_exclusive, window.line_count);
+
+    // Above *and* below: the rule closing the patch draws after the final line, but for the scroll
+    // arithmetic a row is a row — leaving either out puts the bottom of the patch out of reach.
+    let chrome: usize = window
+        .lines
+        .iter()
+        .map(|l| l.virtual_rows_above.len() + l.virtual_rows_below.len())
+        .sum();
+    let real: usize = window.lines.iter().map(|l| l.visual_rows.len()).sum();
+    assert!(chrome > 0, "the fixture has separators to account for");
+    assert_eq!(
+        window.total_visual_rows as usize,
+        real + chrome,
+        "every chrome row is an occupied row"
+    );
+    assert!(
+        window.total_visual_rows as usize > window.line_count as usize,
+        "taller than its line count, which is what the short-circuit missed"
+    );
+
+    drop(server);
+}
+
+/// `c`/`Alt-c` step a patch's own hunks, crossing file boundaries as it goes.
+///
+/// The third source `git/navigate_hunk` resolves against, after a file's baseline diff and a
+/// conflicted file's blocks: same keys, same gesture, whatever "the next change" means for the
+/// buffer you're in. Landing on a hunk's first *content* line is what puts its `@@` separator —
+/// where a patch's line numbers live — directly above the cursor.
+#[tokio::test]
+async fn hunk_navigation_steps_a_patchs_own_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Padded so each hunk carries git's three lines of leading context — the case that proves a
+    // stop lands on the change rather than on the context above it.
+    let pad = |marker: &str| {
+        (1..=9)
+            .map(|i| {
+                if i == 5 {
+                    format!("{marker}\n")
+                } else {
+                    format!("fn pad{i}() {{}}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    commit_file(&repo, "a.rs", &pad("fn one() {}"));
+    commit_file(&repo, "b.rs", &pad("fn two() {}"));
+    // One commit touching *both* files, so the walk has to cross a file boundary. Built by hand:
+    // `commit_file` commits a single path at a time.
+    std::fs::write(root.join("a.rs"), pad("fn ONE() {}")).unwrap();
+    std::fs::write(root.join("b.rs"), pad("fn TWO() {}")).unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.add_path(std::path::Path::new("b.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "shout", &tree, &[&parent])
+            .unwrap();
+    }
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+    let buffer_id = opened.buffer_id;
+
+    // Walk forward from the top, collecting every stop.
+    let mut stops = Vec::new();
+    let mut from = 0u32;
+    for id in 0..6u64 {
+        let step: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+            &mut ws,
+            10 + id,
+            &GitNavigateHunkParams {
+                buffer_id,
+                from_line: from,
+                direction: HunkDirection::Next,
+                count: 1,
+                extend: false,
+            },
+        )
+        .await;
+        if !step.moved {
+            break;
+        }
+        from = step.cursor.position.line;
+        stops.push(from);
+    }
+    assert!(
+        stops.len() >= 2,
+        "one stop per hunk, across both files: {stops:?}"
+    );
+
+    // Every stop is on a line that actually *changed* — not the context git puts above it, and
+    // never the metadata block or chrome (which isn't buffer text at all).
+    let window = window_of(&mut ws, 30, buffer_id).await;
+    for &stop in &stops {
+        let line = window
+            .lines
+            .iter()
+            .find(|l| l.logical_line == stop)
+            .unwrap_or_else(|| panic!("stop {stop} outside the window"));
+        let text: String = line
+            .visual_rows
+            .iter()
+            .flat_map(|r| &r.segments)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            line.patch.is_some(),
+            "stop {stop} landed on {text:?}, which is context rather than a change"
+        );
+    }
+    // ...and the walk reaches the second file, not just the first.
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 31, &BufferContentParams { buffer_id }).await;
+    let lines: Vec<&str> = content.text.lines().collect();
+    assert!(
+        stops
+            .iter()
+            .any(|&s| lines[s as usize].contains("TWO") || lines[s as usize].contains("two")),
+        "the walk crosses into b.rs: {stops:?}"
+    );
+
+    // Backward from the last stop returns to the previous one — the property a repeated press
+    // relies on.
+    let back: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        &mut ws,
+        40,
+        &GitNavigateHunkParams {
+            buffer_id,
+            from_line: *stops.last().unwrap(),
+            direction: HunkDirection::Prev,
+            count: 1,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(back.moved);
+    assert_eq!(back.cursor.position.line, stops[stops.len() - 2]);
+
+    drop(server);
+}
+
+/// `Space c` in a patch lists that patch's own hunks, grouped by the file each came from.
+///
+/// Same key, same question — "the changes in this buffer" — and the grouping is a consequence of
+/// the scope rather than a different picker: one file's rows need no headers, a commit's do.
+/// Selecting a row jumps *within* the patch, because a materialised buffer has no path to reopen.
+#[tokio::test]
+async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
+    use aether_protocol::picker::GroupHeader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    commit_file(&repo, "b.rs", "fn two() {}\n");
+    std::fs::write(root.join("a.rs"), "fn ONE() {}\n").unwrap();
+    std::fs::write(root.join("b.rs"), "fn TWO() {}\n").unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.add_path(std::path::Path::new("b.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "shout", &tree, &[&parent])
+            .unwrap();
+    }
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+    let buffer_id = opened.buffer_id;
+
+    let view = send_request::<PickerView>(
+        &mut ws,
+        5,
+        &PickerViewParams {
+            buffer_id: Some(buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::GitChangesFile)
+        },
+    )
+    .await;
+    let items = view.update.expect("window").items().to_vec();
+
+    // Headers are *labels*, not file headers: a patch names files relative to the repo, which may
+    // sit outside every workspace root, so there's no root label to render.
+    let labels: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::Label { label },
+                ..
+            } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.contains(&"a.rs".to_string()) && labels.contains(&"b.rs".to_string()),
+        "one group per file in the patch: {labels:?}"
+    );
+
+    // Groups start collapsed, so expand one to get at its hunk rows.
+    let (_, update) = expand_file_group(&mut ws, 6, PickerKind::GitChangesFile, "a.rs").await;
+    let row = update
+        .items()
+        .iter()
+        .find(|i| matches!(i, PickerItem::GitChange { .. }))
+        .expect("a hunk row under the expanded group")
+        .clone();
+    let PickerItem::GitChange { line, .. } = &row else {
+        unreachable!()
+    };
+    let expected = *line;
+
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        6,
+        &PickerSelectParams {
+            kind: PickerKind::GitChangesFile,
+            item: row,
+        },
+    )
+    .await;
+    match result {
+        PickerSelectResult::BufferAt {
+            buffer_id: target,
+            position,
+        } => {
+            assert_eq!(target, buffer_id, "jumps within the patch it came from");
+            assert_eq!(position.line, expected);
+        }
+        other => panic!("expected BufferAt, got {other:?}"),
+    }
+
+    // And the row it lands on is a changed line of the patch, not chrome or metadata.
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 7, &BufferContentParams { buffer_id }).await;
+    let landed = content.text.lines().nth(expected as usize).unwrap();
+    assert!(landed.contains("fn "), "landed on {landed:?}");
+
+    drop(server);
+}
+
+/// Opening `Space c` inside a patch lands on the change the cursor is in — and expands its group,
+/// since a collapsed one would hide the very row it centred on.
+///
+/// The buffer-locked picker centres on the cursor like its workspace-wide sibling, but the file
+/// picker's rule can't apply: it matches rows by absolute path, and a patch buffer has none. The
+/// rows *are* lines of this buffer, so they resolve against the cursor directly.
+#[tokio::test]
+async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
+    use aether_protocol::picker::GroupHeader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let pad = |marker: &str| {
+        (1..=9)
+            .map(|i| {
+                if i == 5 {
+                    format!("{marker}\n")
+                } else {
+                    format!("fn pad{i}() {{}}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    commit_file(&repo, "a.rs", &pad("fn one() {}"));
+    commit_file(&repo, "b.rs", &pad("fn two() {}"));
+    std::fs::write(root.join("a.rs"), pad("fn ONE() {}")).unwrap();
+    std::fs::write(root.join("b.rs"), pad("fn TWO() {}")).unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.add_path(std::path::Path::new("b.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "shout", &tree, &[&parent])
+            .unwrap();
+    }
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+    let buffer_id = opened.buffer_id;
+
+    // Park the cursor on b.rs's change — the *second* one, so centring has to do real work.
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 3, &BufferContentParams { buffer_id }).await;
+    let target = content
+        .text
+        .lines()
+        .position(|l| l.contains("fn TWO"))
+        .expect("b.rs's added line") as u32;
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition {
+                    line: target,
+                    col: 0,
+                },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+
+    // Open exactly as the client does: reset All, offset 0, centring on the cursor.
+    let view = send_request::<PickerView>(
+        &mut ws,
+        5,
+        &PickerViewParams {
+            buffer_id: Some(buffer_id),
+            center_on_cursor: Some(buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::GitChangesFile)
+        },
+    )
+    .await;
+
+    let centred = view
+        .effective_center_on
+        .as_ref()
+        .expect("the open resolves a row from the cursor");
+    let PickerItem::GitChange {
+        line,
+        added,
+        removed,
+        ..
+    } = centred
+    else {
+        panic!("expected a change row, got {centred:?}");
+    };
+    // The row is the change *block*, anchored at its first line — here the removal, with the
+    // addition the cursor sits on directly below it. Both belong to the one change.
+    let extent = (added + removed).max(1);
+    assert!(
+        *line <= target && target < line + extent,
+        "centred row {line}..{} doesn't contain the cursor at {target}",
+        line + extent
+    );
+
+    // The window is not blank, and b.rs's group is open — a collapsed one would hide the row the
+    // open just centred on.
+    let items = view.update.as_ref().expect("window").items().to_vec();
+    assert!(!items.is_empty(), "the picker opens with rows");
+    let expanded: Vec<(String, bool)> = items
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::Label { label },
+                expanded,
+                ..
+            } => Some((label.clone(), *expanded)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        expanded.contains(&("b.rs".to_string(), true)),
+        "the centred row's group is expanded: {expanded:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, PickerItem::GitChange { line: l, .. } if l == line)),
+        "and the row itself is in the window"
+    );
+
+    // Group spans reach the client. Without them `governing_span` finds nothing, so `Alt-h`
+    // ("collapse the run I'm in") has no run to act on and silently does nothing — the gate used
+    // to be the *kind*, which is headerless for this picker over an ordinary file.
+    let update = view.update.as_ref().expect("window");
+    assert!(
+        !update.groups.is_empty(),
+        "the window describes its group runs"
+    );
+    assert!(
+        update.groups.iter().any(
+            |s| matches!(&s.header, GroupHeader::Label { label } if label == "b.rs")
+                && s.expanded == Some(true)
+        ),
+        "including the expanded one: {:?}",
+        update.groups
+    );
+
+    // And a row-space total, not a candidate count. The shells size and scroll the list from this;
+    // falling back to `total_matches` counts items while the collapsed row space holds headers, so
+    // the GUI sized for far more rows than exist and scrolled past every one of them.
+    let rows = update
+        .total_display_rows
+        .expect("a grouped view reports its row space");
+    assert_eq!(
+        rows as usize,
+        items.len(),
+        "the reported row space is the rows actually rendered — headers included"
+    );
+    assert_ne!(
+        rows, update.total_matches,
+        "and it is not the candidate count, which is what the shells fell back to"
+    );
+
+    drop(server);
+}
+
+/// `Enter` in a patch opens the file the line came from, at the revision that *side* belongs to —
+/// and `Backspace` comes back, even though the transient patch closed behind us.
+///
+/// The return trip is the part worth pinning: nav history reopens a closed buffer by path, and a
+/// materialised revision has none, so the entry carries the patch's key and regenerates it.
+#[tokio::test]
+async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let pad = |marker: &str| {
+        (1..=9)
+            .map(|i| {
+                if i == 5 {
+                    format!("{marker}\n")
+                } else {
+                    format!("fn pad{i}() {{}}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    commit_file(&repo, "a.rs", &pad("fn before() {}"));
+    commit_file(&repo, "a.rs", &pad("fn after() {}"));
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = |rev: &str| GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::Commit {
+            rev: rev.to_string(),
+        },
+        focus_path: None,
+    };
+    let patch: BufferOpenResult = send_request::<GitShow>(&mut ws, 2, &show(&head)).await;
+    let patch_buffer = patch.buffer_id;
+    assert!(
+        patch.is_patch,
+        "a commit's diff is a patch, not just read-only"
+    );
+
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        3,
+        &BufferContentParams {
+            buffer_id: patch_buffer,
+        },
+    )
+    .await;
+    let line_of = |want: &str| {
+        content
+            .text
+            .lines()
+            .position(|l| l == want)
+            .unwrap_or_else(|| panic!("no line {want:?} in:\n{}", content.text)) as u32
+    };
+
+    // A `+` line follows to the *new* side and lands on its line there (5th of 9).
+    let goto = |line: u32| CursorMoveParams {
+        buffer_id: patch_buffer,
+        motion: Motion::Goto {
+            position: LogicalPosition { line, col: 0 },
+        },
+        extend_selection: false,
+    };
+    let follow = GitFollowPatchLineParams {
+        buffer_id: patch_buffer,
+    };
+
+    let _: CursorState =
+        send_request::<CursorMove>(&mut ws, 10, &goto(line_of("fn after() {}"))).await;
+    let added: GitFollowPatchLineResult =
+        send_request::<GitFollowPatchLine>(&mut ws, 11, &follow).await;
+    let opened = added.opened.expect("a `+` line follows somewhere");
+    assert!(!opened.is_patch, "it opened a file, not another patch");
+    assert_eq!(
+        opened.title.as_deref().map(|t| t.ends_with(":a.rs")),
+        Some(true),
+        "title names the file at a revision: {:?}",
+        opened.title
+    );
+    assert_eq!(opened.cursor.position.line, 4, "the 5th line, 0-based");
+
+    // ...and `Backspace` returns to the patch, which had closed behind us.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        50,
+        &NavStepParams {
+            buffer_id: opened.buffer_id,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let returned = back.target.expect("a step back to the patch");
+    assert!(returned.is_patch, "back to the diff we came from");
+    assert_eq!(
+        returned.cursor.position.line,
+        line_of("fn after() {}"),
+        "on the line we left from"
+    );
+
+    // A `-` line follows to the *old* side — the first parent's blob, where the pre-change text is.
+    let _: CursorState =
+        send_request::<CursorMove>(&mut ws, 60, &goto(line_of("fn before() {}"))).await;
+    let removed: GitFollowPatchLineResult =
+        send_request::<GitFollowPatchLine>(&mut ws, 61, &follow).await;
+    let old = removed.opened.expect("a `-` line follows somewhere");
+    let old_content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        70,
+        &BufferContentParams {
+            buffer_id: old.buffer_id,
+        },
+    )
+    .await;
+    assert!(
+        old_content.text.contains("fn before() {}"),
+        "the parent's blob, not the commit's"
+    );
+    assert_eq!(old.cursor.position.line, 4);
+
+    drop(server);
+}
+
+/// A *kept* diff is part of the session; a glanced-at one isn't.
+///
+/// The transient rule is the whole gate. A revision opens transient, so it takes `Space k` to
+/// persist one — a diff you skimmed from the log picker is a preview, a diff you pinned is
+/// somewhere you were working. It restores by key rather than by content: nothing of the patch is
+/// written to the session file, it regenerates from the repo.
+#[tokio::test]
+async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    let sessions_path = root.join("sessions.json");
+
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(server.ws_url())
+        .await
+        .unwrap();
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        1,
+        &WorkspaceActivateParams {
+            name: "p".into(),
+            worktrees: None,
+            open_last: false,
+        },
+    )
+    .await;
+
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(opened.transient, "a revision opens as a preview");
+
+    // Force a session write while it's still a preview, by opening a file permanently.
+    let _: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        3,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let session = std::fs::read_to_string(&sessions_path).unwrap_or_default();
+    assert!(
+        !session.contains(&head),
+        "a previewed diff stays out of the session: {session}"
+    );
+
+    // `Space k` keeps it — and persists directly, since there's no later save to rely on.
+    let _: BufferSetTransientResult = send_request::<BufferSetTransient>(
+        &mut ws,
+        4,
+        &BufferSetTransientParams {
+            buffer_id: opened.buffer_id,
+            transient: false,
+        },
+    )
+    .await;
+    let session = std::fs::read_to_string(&sessions_path).unwrap();
+    assert!(
+        session.contains(&format!("{}@{head}", root.to_string_lossy())),
+        "a kept diff is recorded by key, not by content: {session}"
+    );
+    assert!(
+        !session.contains("fn one"),
+        "and none of the patch text is written: {session}"
+    );
+
+    drop(server);
+}
+
+/// A file at a revision blames — at *that* revision, not at HEAD.
+///
+/// Simpler than the working-tree case and deliberately so: the buffer's content is the committed
+/// blob, so there is nothing to re-map onto and no line can read as uncommitted.
+#[tokio::test]
+async fn a_file_at_a_revision_blames_at_that_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    let first = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: first.clone(),
+                path: "a.rs".into(),
+            },
+            focus_path: None,
+        },
+    )
+    .await;
+
+    let blamed: GitBlameLineResult = send_request::<GitBlameLine>(
+        &mut ws,
+        3,
+        &GitBlameLineParams {
+            buffer_id: opened.buffer_id,
+            line: 0,
+            include_commit_info: true,
+        },
+    )
+    .await;
+    let blame = blamed
+        .blame
+        .expect("a file at a revision attributes its lines");
+    assert!(
+        first.starts_with(&blame.commit),
+        "attributed to the commit that introduced it ({}), got {}",
+        &first[..7],
+        blame.commit
+    );
+    assert!(
+        !blame.is_uncommitted,
+        "every line of a committed blob is committed"
+    );
+    // The details come back in the same round trip, resolved from the key rather than a baseline
+    // (a virtual buffer has none).
+    let info = blamed.commit_info.expect("commit details resolve too");
+    assert_eq!(info.commit, first);
+
+    drop(server);
+}
+
+/// `Space g i` shows everything not committed as one patch — staged and unstaged together — and
+/// **regenerates** on re-open rather than attaching to a stale snapshot.
+///
+/// The working tree moves under you, which is the one way this differs from a commit's diff: a
+/// revision is immutable and re-showing it attaches, whereas this rebuilds in place, keeping the
+/// same buffer id so viewports, the cursor and the nav history stay pointed at it.
+#[tokio::test]
+async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "staged.rs", "fn s1() {}\n");
+    commit_file(&repo, "loose.rs", "fn l1() {}\n");
+
+    // One change staged, one left in the working tree — the composed view shows both.
+    std::fs::write(root.join("staged.rs"), "fn s1() {}\nfn STAGED() {}\n").unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("staged.rs")).unwrap();
+        index.write().unwrap();
+    }
+    std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LOOSE() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(
+        opened.is_patch,
+        "it's a patch, so `c` and `Enter` work in it"
+    );
+    assert!(opened.read_only);
+    assert_eq!(opened.title.as_deref(), Some("Working changes"));
+
+    let first: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        3,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    assert!(
+        first.text.contains("fn STAGED() {}") && first.text.contains("fn LOOSE() {}"),
+        "staged and unstaged compose into one view:\n{}",
+        first.text
+    );
+    assert!(first.text.contains("Working changes"), "and it says so");
+
+    // Change the tree, re-open: same buffer, rebuilt content.
+    std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LATER() {}\n").unwrap();
+    let again: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        4,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        again.buffer_id, opened.buffer_id,
+        "the same buffer, so cursors and nav history keep pointing at it"
+    );
+    let second: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        5,
+        &BufferContentParams {
+            buffer_id: again.buffer_id,
+        },
+    )
+    .await;
+    assert!(
+        second.text.contains("fn LATER() {}"),
+        "re-opening picked up the newer working tree:\n{}",
+        second.text
+    );
+    assert!(
+        !second.text.contains("fn LOOSE() {}"),
+        "and dropped what is no longer there"
+    );
+
+    drop(server);
+}
+
+/// The working-changes view marks which blocks are already staged.
+///
+/// Load-bearing, not decoration: staging does **not** change `git diff HEAD`, so the text is
+/// byte-identical before and after. The stage tag is the only thing that moves, which makes it the
+/// only way the view can show you that staging did anything.
+#[tokio::test]
+async fn working_changes_mark_staged_blocks_apart_from_unstaged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Two edits far apart in one file: the first staged, the second left loose. Same file, so a
+    // per-file verdict couldn't answer this — it has to be per block.
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn STAGED() {}\n"),
+    )
+    .unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+    }
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn STAGED() {}\n")
+            .replace("fn f17() {}\n", "fn LOOSE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+
+    let window = window_of(&mut ws, 3, opened.buffer_id).await;
+    let stage_of = |want: &str| {
+        window
+            .lines
+            .iter()
+            .find(|l| {
+                l.visual_rows
+                    .iter()
+                    .flat_map(|r| &r.segments)
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+                    == want
+            })
+            .unwrap_or_else(|| panic!("no line {want:?}"))
+            .diff_stage
+    };
+    assert_eq!(stage_of("fn STAGED() {}"), DiffStage::Staged);
+    assert_eq!(stage_of("fn LOOSE() {}"), DiffStage::Unstaged);
+    // Their removals sit in the same blocks, so they inherit the same verdict.
+    assert_eq!(stage_of("fn f3() {}"), DiffStage::Staged);
+    assert_eq!(stage_of("fn f17() {}"), DiffStage::Unstaged);
+
+    drop(server);
+}
+
+/// `Space g s` from the working-changes view stages the block under the cursor — and the view
+/// updates to say so.
+///
+/// The patch buffer isn't the file being staged, so the cursor is resolved to a file and a range of
+/// *its* lines, and the ordinary apply runs against that file's buffer. The visible result is only
+/// the stage tag, since staging leaves `git diff HEAD` byte-identical.
+#[tokio::test]
+async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    // Two loose edits; we'll stage only the first.
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn ONE() {}\n")
+            .replace("fn f17() {}\n", "fn TWO() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    };
+    let opened: BufferOpenResult = send_request::<GitShow>(&mut ws, 2, &show).await;
+    let buffer_id = opened.buffer_id;
+
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 3, &BufferContentParams { buffer_id }).await;
+    let line_of = |want: &str| {
+        content
+            .text
+            .lines()
+            .position(|l| l == want)
+            .unwrap_or_else(|| panic!("no line {want:?} in:\n{}", content.text)) as u32
+    };
+
+    // Park on the first change and stage it.
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        4,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition {
+                    line: line_of("fn ONE() {}"),
+                    col: 0,
+                },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    let applied: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        5,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Stage,
+            scope: ApplyScope::Cursor,
+        },
+    )
+    .await;
+    assert_eq!(applied.status, ApplyHunkStatus::Staged);
+
+    // It really reached the index — and only that block did.
+    let index_blob = {
+        let repo = git2::Repository::open(&root).unwrap();
+        let entry = repo
+            .index()
+            .unwrap()
+            .get_path(std::path::Path::new("a.rs"), 0)
+            .expect("a.rs is in the index");
+        let blob = String::from_utf8(repo.find_blob(entry.id).unwrap().content().to_vec()).unwrap();
+        blob
+    };
+    assert!(index_blob.contains("fn ONE() {}"), "the staged block");
+    assert!(
+        !index_blob.contains("fn TWO() {}"),
+        "and not the one left loose"
+    );
+
+    // ...and the view now says so. Same text (staging doesn't move HEAD), different tags.
+    let window = window_of(&mut ws, 6, buffer_id).await;
+    let stage_of = |want: &str| {
+        window
+            .lines
+            .iter()
+            .find(|l| {
+                l.visual_rows
+                    .iter()
+                    .flat_map(|r| &r.segments)
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+                    == want
+            })
+            .unwrap_or_else(|| panic!("no line {want:?}"))
+            .diff_stage
+    };
+    assert_eq!(stage_of("fn ONE() {}"), DiffStage::Staged);
+    assert_eq!(stage_of("fn TWO() {}"), DiffStage::Unstaged);
+
+    // Unstage is the exact inverse, from the same place.
+    let undone: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        7,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Unstage,
+            scope: ApplyScope::Cursor,
+        },
+    )
+    .await;
+    assert_eq!(undone.status, ApplyHunkStatus::Unstaged);
+
+    // Revert isn't offered here: it's an undoable *edit*, and delegating it would bury the undo in
+    // a transient buffer the user never opened. `Enter` goes to the file, where it means something.
+    let reverted: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        8,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Revert,
+            scope: ApplyScope::Cursor,
+        },
+    )
+    .await;
+    assert_eq!(reverted.status, ApplyHunkStatus::Unavailable);
+
+    // Regenerating must not make the buffer look edited. `dirty` is `revision != saved_revision`,
+    // and the rebuild bumps the revision so its viewport pushes aren't discarded as stale — so the
+    // save marker has to move with it, or a read-only buffer shows a dirty dot for content nobody
+    // typed.
+    let reopened: BufferOpenResult = send_request::<GitShow>(&mut ws, 9, &show).await;
+    assert_eq!(reopened.buffer_id, buffer_id);
+    assert_eq!(
+        reopened.revision, reopened.saved_revision,
+        "a rebuilt patch is clean: there was never anything to save"
+    );
+
+    drop(server);
+}
+
+/// Staging tells the client the rebuilt patch is still **clean**.
+///
+/// Separate from the server-state check above, because the client doesn't derive dirtiness from one
+/// message: it takes `revision` from `viewport/lines_changed` and `saved_revision` only from
+/// `buffer/state`. Sending the content push alone leaves the two apart, and the read-only buffer
+/// grows a dirty marker for content nobody typed — so the pushes are what this asserts.
+#[tokio::test]
+async fn staging_pushes_the_rebuilt_patch_as_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=12).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f5() {}\n", "fn EDITED() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let buffer_id = opened.buffer_id;
+    // Subscribe, so this client actually receives the rebuild's pushes.
+    let _ = window_of(&mut ws, 3, buffer_id).await;
+
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, 4, &BufferContentParams { buffer_id }).await;
+    let target = content
+        .text
+        .lines()
+        .position(|l| l == "fn EDITED() {}")
+        .expect("the changed line") as u32;
+    let _: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        5,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::Goto {
+                position: LogicalPosition {
+                    line: target,
+                    col: 0,
+                },
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+
+    let applied: GitApplyHunkResult = send_request::<GitApplyHunk>(
+        &mut ws,
+        6,
+        &GitApplyHunkParams {
+            buffer_id,
+            action: HunkAction::Stage,
+            scope: ApplyScope::Cursor,
+        },
+    )
+    .await;
+    assert_eq!(applied.status, ApplyHunkStatus::Staged);
+
+    // The rebuild pushes content first, then state — the pair the client derives dirtiness from.
+    // Bounded: without the state push this waits forever, and a hung suite is a worse signal than
+    // a failed assertion.
+    let within = std::time::Duration::from_secs(5);
+    let content_push: ViewportLinesChangedParams =
+        expect_notification_within::<ViewportLinesChanged>(&mut ws, within).await;
+    let state_push: BufferStateParams =
+        expect_notification_within::<BufferState>(&mut ws, within).await;
+    assert_eq!(
+        content_push.revision, state_push.saved_revision,
+        "the client would render a dirty marker on a read-only buffer otherwise"
+    );
+
+    drop(server);
+}
+
+/// The cursor-line blame *label* follows in a file at a revision too.
+///
+/// A separate path from `git/blame_line`: the follow refresh has its own "nothing to attribute"
+/// gate, which it checks before ever reaching the shared blame computation. Fixing the popover
+/// alone left the inline label dark.
+#[tokio::test]
+async fn blame_follow_pushes_a_label_in_a_file_at_a_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    let first = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        2,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: first.clone(),
+                path: "a.rs".into(),
+            },
+            focus_path: None,
+        },
+    )
+    .await;
+
+    let _: () = send_request::<GitSetBlameFollow>(
+        &mut ws,
+        3,
+        &GitSetBlameFollowParams {
+            buffer_id: opened.buffer_id,
+            enabled: true,
+        },
+    )
+    .await;
+    let pushed: GitBlameChangedParams = expect_notification::<GitBlameChanged>(&mut ws).await;
+    assert_eq!(pushed.buffer_id, opened.buffer_id);
+    let blame = pushed
+        .blame
+        .expect("the label carries the line's attribution");
+    assert!(first.starts_with(&blame.commit), "got {}", blame.commit);
+    assert!(!blame.author.is_empty(), "and its author");
+
+    drop(server);
+}
+
+/// Opening a commit from a *file's* history lands on that file's changes.
+///
+/// You asked about one path; a commit touching thirty others shouldn't open at the top of the
+/// diff. The row carries the path for the same reason it carries the repo — resolution ran off the
+/// active buffer when the list was built, and that buffer can change while the list is up.
+#[tokio::test]
+async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // `later.rs` sorts after `a.rs`, so its section is well down the patch — landing there can't
+    // be mistaken for opening at the top.
+    commit_file(&repo, "a.rs", "fn a1() {}\nfn a2() {}\nfn a3() {}\n");
+    commit_file(&repo, "later.rs", "fn z1() {}\n");
+    std::fs::write(
+        root.join("a.rs"),
+        "fn a1() {}\nfn CHANGED() {}\nfn a3() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("later.rs"), "fn z1() {}\nfn z2() {}\n").unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.add_path(std::path::Path::new("later.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "touch both", &tree, &[&parent])
+            .unwrap();
+    }
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    // Open `later.rs` and ask for *its* history — that's what locks the picker to the path.
+    let file: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        2,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("later.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let view = send_request::<PickerView>(
+        &mut ws,
+        3,
+        &PickerViewParams {
+            buffer_id: Some(file.buffer_id),
+            ..view_params(PickerKind::GitLogFile)
+        },
+    )
+    .await;
+    let row = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitCommit { hash, path, .. } if *hash == head => Some(path.clone()),
+            _ => None,
+        })
+        .expect("the commit that touched later.rs");
+    assert_eq!(
+        row.as_deref(),
+        Some("later.rs"),
+        "the row names the file its history is of"
+    );
+
+    // Selecting it opens the commit's diff focused on that file's first change.
+    let opened: BufferOpenResult = send_request::<GitShow>(
+        &mut ws,
+        4,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: row,
+        },
+    )
+    .await;
+    assert!(opened.is_patch);
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        5,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    let landed = content
+        .text
+        .lines()
+        .nth(opened.cursor.position.line as usize)
+        .expect("the cursor is inside the buffer");
+    assert_eq!(
+        landed, "fn z2() {}",
+        "landed on later.rs's own change, not a.rs's and not the top"
     );
 
     drop(server);
@@ -34781,9 +36303,10 @@ async fn git_log_rows_carry_what_git_show_needs() {
         &mut ws,
         3,
         &GitShowParams {
-            repo_id: repo_id.clone(),
-            rev: hash.clone(),
-            path: None,
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: hash.clone() },
+            focus_path: None,
         },
     )
     .await;
@@ -34865,9 +36388,10 @@ async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
         &mut ws,
         2,
         &GitShowParams {
-            repo_id: root.to_string_lossy().into_owned(),
-            rev: first.clone(),
-            path: None,
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: first.clone() },
+            focus_path: None,
         },
     )
     .await;
@@ -35520,9 +37044,10 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
         &mut ws,
         6,
         &GitShowParams {
-            repo_id: repo_id.clone(),
-            rev: older.clone(),
-            path: None,
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: older.clone() },
+            focus_path: None,
         },
     )
     .await;

@@ -496,6 +496,9 @@ pub enum Action {
     /// Touches no file, so unlike the other git verbs it needs no unsaved-work pre-flight. The
     /// periodic fetcher (the `git_auto_fetch` app setting) runs the same operation on a timer.
     GitFetch,
+    /// `Space g w` — everything not yet committed ("working" changes), as one read-only patch
+    /// buffer: the same view a commit gets, over the changes you haven't made into one yet.
+    ShowWorkingChanges,
     /// `Space g Alt-p` — publish the current branch's commits (`↑ahead`). Never force-pushes: the
     /// Alt slot here is the *outward* sibling of pull, not an escalation of it, and force-push has
     /// no key at all.
@@ -1382,6 +1385,7 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::NONE), A::GitCommit { amend: false }, "Git", "Commit staged changes"),
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('z'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
+    bind!(LG, ch('w'), Exact(Mods::NONE), A::ShowWorkingChanges, "Git", "Working changes (uncommitted diff)"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPull, "Git", "Pull from remote"),
     bind!(LG, ch('p'), Exact(Mods::ALT), A::GitPush, "Git", "Push commits to remote"),
@@ -1778,12 +1782,17 @@ mod tests {
             git(ch('d'), Mods::NONE),
             Some(Action::GitAbortOperation)
         ));
-        // The inline diff is on the leader now, and nothing on the git sub-leader answers `i`.
+        // The inline diff is on the leader, and nothing on the git sub-leader answers `i`.
         assert!(matches!(
             lookup(KeyContext::Leader, ch('i'), Mods::NONE).map(|b| b.action),
             Some(Action::ToggleDiffView)
         ));
         assert!(git(ch('i'), Mods::NONE).is_none());
+        // `w` for *working* changes. Free since worktrees folded into the branch picker.
+        assert!(matches!(
+            git(ch('w'), Mods::NONE),
+            Some(Action::ShowWorkingChanges)
+        ));
         // A key with no git meaning resolves to nothing, so the chord just cancels.
         assert!(git(ch('j'), Mods::NONE).is_none());
 

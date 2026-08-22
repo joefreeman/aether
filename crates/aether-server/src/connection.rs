@@ -26,9 +26,10 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     GitAbortOperation, GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit,
-    GitDeleteBranch, GitFetch, GitNavigateHunk, GitPrepareCommit, GitPull, GitPush, GitRefresh,
-    GitRepos, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow, GitSetDiffView,
-    GitShow, GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd, GitWorktreeRemove,
+    GitDeleteBranch, GitFetch, GitFollowPatchLine, GitNavigateHunk, GitPrepareCommit, GitPull,
+    GitPush, GitRefresh, GitRepos, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow,
+    GitSetDiffView, GitShow, GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd,
+    GitWorktreeRemove,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -563,6 +564,7 @@ async fn dispatch(
         GitCommit::NAME => run!(GitCommit, handlers::git_commit),
         GitReset::NAME => run!(GitReset, handlers::git_reset),
         GitShow::NAME => run!(GitShow, handlers::git_show),
+        GitFollowPatchLine::NAME => run!(GitFollowPatchLine, handlers::git_follow_patch_line),
         GitStashPush::NAME => run!(GitStashPush, handlers::git_stash_push),
         GitStashApply::NAME => run!(GitStashApply, handlers::git_stash_apply),
         GitStashDrop::NAME => run!(GitStashDrop, handlers::git_stash_drop),

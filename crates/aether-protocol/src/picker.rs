@@ -818,6 +818,15 @@ pub enum PickerItem {
         repo_id: crate::git::RepoId,
         /// Full 40-char hash — what `git/show` receives.
         hash: String,
+        /// Repo-relative path this history is *of*, for the file-locked log (`Space g Alt-l`);
+        /// `None` for the whole-repo log, which is about no file in particular.
+        ///
+        /// Carried per row for the same reason `repo_id` is: it's resolved from the active buffer
+        /// when the list is built, and that buffer can change while the list is up. The client
+        /// echoes it back as `GitShowParams::focus_path`, so opening a commit from a file's history
+        /// lands on *that* file's changes rather than at the top of a diff that may touch dozens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
         /// Abbreviated hash for display, as git prints it.
         short_hash: String,
         /// First line of the message. Empty when unreadable.
@@ -1356,6 +1365,16 @@ pub enum PickerSelectResult {
         /// symbol's identifier selected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor: Option<LogicalPosition>,
+    },
+    /// Attach to an already-open buffer *and* land the cursor somewhere in it — [`Self::Buffer`]
+    /// with a position, and the pathless counterpart of [`Self::FileAt`].
+    ///
+    /// For buffers there is no file to reopen: a generated patch was materialised rather than
+    /// loaded, so its rows can only be addressed by buffer id. The client attaches via
+    /// `buffer/open { buffer_id, jump_to }` exactly as it would for a file.
+    BufferAt {
+        buffer_id: BufferId,
+        position: LogicalPosition,
     },
     /// A workspace was selected. The client follows up with `workspace/activate` to switch.
     Workspace {

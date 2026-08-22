@@ -89,6 +89,21 @@ pub struct BufferInfo {
     /// content (`git/show`). The server is the authority; the client declines locally so a
     /// keystroke doesn't cost a round trip to be told no, and marks it in the status bar.
     pub read_only: bool,
+    /// This buffer is a generated patch (`git/show` on a commit) rather than merely read-only.
+    /// Routes `Enter` through `git/follow_patch_line` instead of the language server.
+    pub is_patch: bool,
+}
+
+impl BufferInfo {
+    /// A **file at a revision** (`git/show <rev>:<path>`), as opposed to a commit's whole diff or a
+    /// scratch. Blameable, though it has no path.
+    ///
+    /// Derived rather than carried: `read_only` is set exactly for the buffers materialised from a
+    /// revision, and `is_patch` separates the two kinds — a commit's diff spans many files and has
+    /// no single history to attribute, one file's content at a revision does.
+    pub fn is_revision_file(&self) -> bool {
+        self.read_only && !self.is_patch
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1533,6 +1548,7 @@ impl Session {
                 transient: false,
                 lsp_server: None,
                 read_only: false,
+                is_patch: false,
             },
         )
     }
@@ -1586,6 +1602,7 @@ pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
         transient: open.transient,
         lsp_server: open.lsp_server,
         read_only: open.read_only,
+        is_patch: open.is_patch,
     }
 }
 

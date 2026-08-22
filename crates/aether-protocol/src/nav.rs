@@ -67,6 +67,12 @@ pub struct NavGotoParams {
     pub path_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_path: Option<String>,
+    /// Reopen handle for a **materialised revision** (a commit's patch, or a file at one), which
+    /// has no path: `<repo>@<rev>[:<path>]`. Wins over the path fields when set, and regenerates
+    /// the buffer if it has since closed — otherwise following a line out of a diff would leave
+    /// nothing to step back to, since a transient patch closes as soon as nothing shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_key: Option<String>,
     /// The cursor/selection to restore (anchor + position). Clamped to the buffer's current
     /// bounds server-side. `match_bracket`/`jumplist_position` are recomputed and may be omitted.
     pub cursor: CursorState,

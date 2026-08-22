@@ -118,6 +118,14 @@ pub struct BufferOpenResult {
     /// early so a keystroke doesn't cost a round trip to be told no.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// This buffer is a **generated patch** (`git/show` on a commit), not merely read-only — a file
+    /// at a revision is read-only too but is ordinary text.
+    ///
+    /// The client needs the distinction for one reason: `Enter` means "follow what's under the
+    /// cursor", and in a patch that resolves through `git/follow_patch_line` rather than through
+    /// the language server. Everything else about a patch is server-side.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_patch: bool,
 }
 
 // ---- buffer/save --------------------------------------------------------------------------------

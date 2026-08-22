@@ -2918,6 +2918,7 @@ fn enter_on_a_log_row_shows_the_commit() {
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![PickerItem::GitCommit {
+            path: None,
             repo_id: "/p".into(),
             hash: "abc1234def5678".into(),
             short_hash: "abc1234".into(),
@@ -2932,11 +2933,10 @@ fn enter_on_a_log_row_shows_the_commit() {
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     let params = find_request(&fx, "git/show").expect("Enter shows the commit");
     assert_eq!(params["repo_id"], json!("/p"));
-    assert_eq!(params["rev"], json!("abc1234def5678"));
-    assert!(
-        params.get("path").is_none(),
-        "the commit itself, not a file within it"
-    );
+    // The target is tagged: a commit's whole diff, not one file within it.
+    assert_eq!(params["target"]["kind"], json!("commit"));
+    assert_eq!(params["target"]["rev"], json!("abc1234def5678"));
+    assert!(params["target"].get("path").is_none());
     // The picker closes onto the diff, like the branch picker's checkout.
     assert!(find_request(&fx, "picker/hide").is_some());
 }
@@ -2970,7 +2970,8 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     open(&mut s);
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     let params = find_request(&fx, "git/show").expect("Enter previews the entry");
-    assert_eq!(params["rev"], json!("abc1234def"));
+    assert_eq!(params["target"]["kind"], json!("commit"));
+    assert_eq!(params["target"]["rev"], json!("abc1234def"));
 
     // Ctrl-p pops; Ctrl-Alt-p applies without dropping.
     let mut s = session();
@@ -3768,6 +3769,7 @@ fn jumplist_step_adopts_the_opened_entry() {
         transient: true,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     let _ = s.on_event(Event::JumplistStepped(
         Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
@@ -5500,6 +5502,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
         transient: false,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     let _ = s.on_event(Event::Switched(Ok(successor)));
     assert_eq!(
@@ -7425,6 +7428,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
             transient: false,
             lsp_server: None,
             read_only: false,
+            is_patch: false,
         },
     );
     assert_eq!(s.workspace_projects.len(), 1);
@@ -8655,6 +8659,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
         transient: false,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     let result = serde_json::to_value(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
@@ -8914,6 +8919,7 @@ fn hint_session() -> Session {
             transient: false,
             lsp_server: None,
             read_only: false,
+            is_patch: false,
         },
     )
 }
@@ -10947,6 +10953,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
         transient: true,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     let step = |position: Option<LogicalPosition>, buffer_id: u64, path: &str| {
         Event::JumplistStepped(

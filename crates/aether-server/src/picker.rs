@@ -160,6 +160,25 @@ pub struct GitChangeCandidate {
     /// File-level: the file has no HEAD blob and no index blob (wholly untracked). All hunks of one
     /// file share this. The `hide_untracked` filter drops these; a staged-new file is `false`.
     pub untracked: bool,
+    /// Set when this row points into an open **patch** buffer rather than a file on disk — the
+    /// rows `Space c` shows while you are reading a commit. See [`PatchRowTarget`].
+    pub patch: Option<PatchRowTarget>,
+}
+
+/// Addressing for a changes row that points into an open patch buffer.
+///
+/// A patch was materialised, not loaded, so it has no path to reopen and `path_index` means
+/// nothing — the files it names are repo-relative and may sit outside every workspace root. The
+/// row therefore addresses a buffer id, and groups under a plain label rather than a root-relative
+/// file header.
+#[derive(Debug, Clone)]
+pub struct PatchRowTarget {
+    pub buffer: BufferId,
+    /// Buffer line of each entry in [`GitChangeCandidate::lines`], parallel to it. Explicit rather
+    /// than `line + i` because in a patch both sides are ordinary buffer lines with context
+    /// sitting between them — so a query matching a *removed* line still lands on it, where in a
+    /// file's diff a removal has no position of its own to jump to.
+    pub line_of: Vec<u32>,
 }
 
 impl GitChangeCandidate {
@@ -186,6 +205,35 @@ impl GitChangeCandidate {
             removed,
             lines,
             untracked: false,
+            patch: None,
+        }
+    }
+
+    /// One hunk of an open patch buffer. `lines` are the hunk's changed lines and `line_of` their
+    /// buffer lines, in the same order.
+    pub fn for_patch(
+        target: PatchRowTarget,
+        path: String,
+        hunk_index: u32,
+        line: u32,
+        added: u32,
+        removed: u32,
+        lines: Vec<String>,
+    ) -> Self {
+        GitChangeCandidate {
+            // Meaningless for a patch — the group renders from a label instead — but kept at a
+            // fixed value so `(path_index, relative_path, hunk_index)` stays a stable row identity.
+            path_index: 0,
+            relative_path: path,
+            abs_path: String::new(),
+            hunk_index,
+            line,
+            stage: DiffStage::Unstaged,
+            added,
+            removed,
+            lines,
+            untracked: false,
+            patch: Some(target),
         }
     }
 
@@ -220,8 +268,12 @@ impl GitChangeCandidate {
     /// sits above). The hunk's new-side lines are `lines[0..added]` at buffer lines `line..line+added`.
     pub fn select_line(&self, re: Option<&regex::Regex>) -> u32 {
         let Some(re) = re else { return self.line };
-        match regex_line_match(&self.lines, re) {
-            Some((i, _, _)) if (i as u32) < self.added => self.line + i as u32,
+        let matched = regex_line_match(&self.lines, re);
+        match (&self.patch, matched) {
+            // In a patch every one of the hunk's lines is a real buffer line — both sides are
+            // ordinary text there — so a match on a removal is addressable too.
+            (Some(p), Some((i, _, _))) => p.line_of.get(i).copied().unwrap_or(self.line),
+            (None, Some((i, _, _))) if (i as u32) < self.added => self.line + i as u32,
             _ => self.line,
         }
     }
@@ -466,6 +518,8 @@ pub struct GitBranchCandidate {
 pub struct GitCommitCandidate {
     pub repo_id: String,
     pub hash: String,
+    /// Repo-relative path this history is of, for the file-locked log; `None` for the repo-wide one.
+    pub path: Option<String>,
     pub short_hash: String,
     pub subject: String,
     pub author: String,
@@ -507,10 +561,13 @@ impl GitCommitCandidate {
         }
     }
 
-    pub fn new(repo_id: String, c: crate::git::LogCommit) -> Self {
+    /// `path` is the file the history is *of* (the file-locked log), or `None` for the repo-wide
+    /// one — carried on every row so a select can echo it back without re-resolving the buffer.
+    pub fn new(repo_id: String, path: Option<String>, c: crate::git::LogCommit) -> Self {
         let haystack = c.subject.clone();
         GitCommitCandidate {
             repo_id,
+            path,
             hash: c.hash,
             short_hash: c.short_hash,
             subject: c.subject,
@@ -949,6 +1006,7 @@ impl PickerCandidates {
                 PickerItem::GitCommit {
                     repo_id: c.repo_id.clone(),
                     hash: c.hash.clone(),
+                    path: c.path.clone(),
                     short_hash: c.short_hash.clone(),
                     subject: c.subject.clone(),
                     author: c.author.clone(),
@@ -1264,13 +1322,22 @@ impl PickerCandidates {
 /// matched, or the anchor with no query. Factored out so `select_result` (query-less) and
 /// `resolve_select` (query-aware) share one construction.
 fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> PickerSelectResult {
-    PickerSelectResult::FileAt {
-        path: c.abs_path.clone(),
-        position: LogicalPosition {
-            line: c.select_line(re),
-            col: 0,
+    let position = LogicalPosition {
+        line: c.select_line(re),
+        col: 0,
+    };
+    match &c.patch {
+        // A patch buffer was materialised, not loaded: there is no path to reopen, so the jump
+        // addresses the buffer itself.
+        Some(p) => PickerSelectResult::BufferAt {
+            buffer_id: p.buffer,
+            position,
         },
-        anchor: None,
+        None => PickerSelectResult::FileAt {
+            path: c.abs_path.clone(),
+            position,
+            anchor: None,
+        },
     }
 }
 
@@ -2139,6 +2206,7 @@ impl PickerState {
             return PickerItem::GitCommit {
                 repo_id: c.repo_id.clone(),
                 hash: c.hash.clone(),
+                path: c.path.clone(),
                 short_hash: c.short_hash.clone(),
                 subject: c.subject.clone(),
                 author: c.author.clone(),
@@ -2191,6 +2259,11 @@ impl PickerState {
     fn group_key_at(&self, ci: usize) -> Option<(u32, &str)> {
         match &self.candidates {
             PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
+            // Patch rows group under a label, so they key on `LABEL_KEY` — must agree with
+            // `group_header_at`, same convention as the jumplist's label groups.
+            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => {
+                Some((LABEL_KEY, v[ci].relative_path.as_str()))
+            }
             PickerCandidates::GitChanges(v) => {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
@@ -2222,6 +2295,12 @@ impl PickerState {
             PickerCandidates::Grep(v) => Some(GroupHeader::File {
                 path_index: v[ci].path_index,
                 relative_path: v[ci].relative_path.clone(),
+            }),
+            // A `Label`, not a `File`: a patch names files relative to the *repo*, which may sit
+            // outside every workspace root, so there is no `path_index` to render a root label
+            // from. Same reasoning as WorkspaceSymbols below.
+            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => Some(GroupHeader::Label {
+                label: v[ci].relative_path.clone(),
             }),
             PickerCandidates::GitChanges(v) => Some(GroupHeader::File {
                 path_index: v[ci].path_index,
@@ -2257,16 +2336,35 @@ impl PickerState {
     /// `PickerViewResult::collapsible`, and what every server-side decision about group rows must
     /// consult instead of [`PickerKind::collapsible`].
     ///
-    /// The kind predicate is the rule; the exception is a Jumplist captured from a file-shaped
-    /// picker, whose entries are whole targets carrying no group. Grouping is all-or-nothing per
-    /// capture, so the first entry answers for the list — and an empty one has no rows to key
-    /// either way.
+    /// The kind predicate is the rule, and the candidates are allowed two exceptions.
+    ///
+    /// A Jumplist captured from a file-shaped picker holds whole targets carrying no group;
+    /// grouping is all-or-nothing per capture, so the first entry answers for the list — and an
+    /// empty one has no rows to key either way.
+    ///
+    /// The buffer-locked changes picker is flat over a *file*, where one group would only repeat
+    /// the filename. Over a **patch** it is the same picker on a scope that spans several files, so
+    /// its rows group like the workspace-wide picker's. The scope decides, not the kind.
     pub fn collapsible(&self) -> bool {
-        self.kind.collapsible()
-            && match &self.candidates {
-                PickerCandidates::Jumplist(v) => v.first().is_none_or(|e| e.group.is_some()),
-                _ => true,
+        match &self.candidates {
+            PickerCandidates::GitChanges(v) if v.first().is_some_and(|c| c.patch.is_some()) => true,
+            PickerCandidates::Jumplist(v) => {
+                self.kind.collapsible() && v.first().is_none_or(|e| e.group.is_some())
             }
+            _ => self.kind.collapsible(),
+        }
+    }
+
+    /// Whether *this picker* renders group headers — the state-level authority, standing to
+    /// [`PickerKind::renders_group_headers`] exactly as [`Self::collapsible`] stands to the kind's
+    /// own predicate, and what every header decision here must consult.
+    ///
+    /// Collapsible implies it: a collapsible view's headers *are* window rows, so a view that
+    /// collapses necessarily renders them. That's what carries the buffer-locked changes picker
+    /// over a patch, whose kind is headerless because over a *file* one header would only repeat
+    /// the filename.
+    pub fn renders_group_headers(&self) -> bool {
+        self.collapsible() || self.kind.renders_group_headers()
     }
 
     /// The collapsible views' row-space layout ([`RowLayout`]); `None` for the flat ones. Derived
@@ -2403,13 +2501,13 @@ impl PickerState {
     /// span per group transition and — the invariant clients rely on — always one at
     /// `start: 0` for a non-empty window, so a window beginning mid-group repeats the split
     /// group's header and is self-describing (this replaces the clients' old "synthesize a
-    /// header above the first row" convention). Empty for the kinds that don't render group
-    /// headers — gated on the *kind*: the buffer-locked GitChangesFile shares GitChanges'
-    /// candidate shape but renders headerless. For the collapsible kinds `offset`/`len` are in
-    /// row space and the spans carry the count/expanded decoration
+    /// header above the first row" convention). Empty for a view that renders no group headers —
+    /// gated on [`Self::renders_group_headers`], *not* the kind: the buffer-locked GitChangesFile
+    /// is headerless over a file but grouped over a patch. For the collapsible kinds `offset`/`len`
+    /// are in row space and the spans carry the count/expanded decoration
     /// ([`Self::build_row_window_spans`]).
     pub fn build_window_spans(&self, offset: u32, len: usize) -> Vec<GroupSpan> {
-        if !self.kind.renders_group_headers() {
+        if !self.renders_group_headers() {
             return Vec::new();
         }
         if let Some(layout) = self.row_layout() {
@@ -2483,7 +2581,7 @@ impl PickerState {
     /// virtual-scroll spacer + positioning are exact. Display rows are an abstract uniform
     /// unit — clients map them to terminal lines / `ROW_H` / measured pixel heights.
     fn grouped_display_metrics(&self, offset: u32) -> Option<(u32, u32)> {
-        if !self.kind.renders_group_headers() {
+        if !self.renders_group_headers() {
             return None;
         }
         // Collapsible kinds: the row space IS the display space — headers are real window rows — so

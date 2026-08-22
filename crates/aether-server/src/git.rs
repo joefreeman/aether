@@ -27,6 +27,8 @@ use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::patch::{GeneratedPatch, PatchBuilder, META};
+
 /// One contiguous run of changes between the baseline and the live buffer, in **0-based buffer
 /// line** coordinates.
 // Phase 1 produces and stores these; the fields are consumed by the inline diff renderer
@@ -1829,13 +1831,46 @@ pub fn compute_blame(repo: &GitRepo, current: &ropey::Rope) -> Option<Vec<Option
     // Re-map the committed blame onto the in-memory buffer so unsaved edits are attributed to the
     // working tree rather than the line they displaced.
     let blame = committed.blame_buffer(text.as_bytes()).ok()?;
+    Some(blame_lines(&git_repo, &blame, current.len_lines()))
+}
 
-    // Resolve each commit at most once — many lines typically share a commit. `None` marks an oid
-    // that doesn't resolve to a commit, which is exactly the working-tree (uncommitted) case:
-    // libgit2's buffer-blame gives those hunks a null signature, so we must *not* read it
-    // directly (it dereferences a null pointer) — going through `find_commit` sidesteps that.
+/// Blame a file **as of a revision** — `git blame <rev> -- <path>` — for the read-only buffers
+/// `git/show <rev>:<path>` materialises.
+///
+/// Simpler than [`compute_blame`], and deliberately so: that one blames the working tree and then
+/// re-maps onto the live buffer so unsaved edits read as uncommitted. Here the buffer's content
+/// *is* the committed blob, so there is nothing to re-map and no line can be uncommitted — the
+/// revision bound alone does the work.
+pub fn compute_blame_at(
+    workdir: &Path,
+    rel_path: &Path,
+    rev: &str,
+    current: &ropey::Rope,
+) -> Option<Vec<Option<BlameInfo>>> {
+    let git_repo = git2::Repository::open(workdir).ok()?;
+    let newest = git_repo
+        .revparse_single(rev)
+        .and_then(|o| o.peel_to_commit())
+        .ok()?
+        .id();
+    let mut opts = git2::BlameOptions::new();
+    opts.newest_commit(newest);
+    let blame = git_repo.blame_file(rel_path, Some(&mut opts)).ok()?;
+    Some(blame_lines(&git_repo, &blame, current.len_lines()))
+}
+
+/// Per-line [`BlameInfo`] for a computed blame.
+///
+/// Resolves each commit at most once — many lines typically share one. A `None` entry in the cache
+/// marks an oid that doesn't resolve to a commit, which is exactly the working-tree (uncommitted)
+/// case: libgit2's buffer-blame gives those hunks a null signature, so we must *not* read it
+/// directly (it dereferences a null pointer) — going through `find_commit` sidesteps that.
+fn blame_lines(
+    git_repo: &git2::Repository,
+    blame: &git2::Blame<'_>,
+    line_count: usize,
+) -> Vec<Option<BlameInfo>> {
     let mut commits: HashMap<git2::Oid, Option<CommitMeta>> = HashMap::new();
-    let line_count = current.len_lines();
     let mut out = Vec::with_capacity(line_count);
     for i in 0..line_count {
         // libgit2 blame lines are 1-based; a line past the content (trailing empty line) is None.
@@ -1866,7 +1901,7 @@ pub fn compute_blame(repo: &GitRepo, current: &ropey::Rope) -> Option<Vec<Option
             }
         }));
     }
-    Some(out)
+    out
 }
 
 /// Resolved author/time for one commit, cached across the lines that share it.
@@ -2054,17 +2089,59 @@ pub struct RevisionContent {
     /// syntax for the file form, so it reads the way you'd type it.
     pub title: String,
     pub text: String,
-    /// Detected from the path for a file; `None` for a commit's patch (no diff grammar is
-    /// bundled — the patch renders unhighlighted, which is legible enough to defer).
+    /// Detected from the path for a file. `None` for a commit's patch: no grammar spans a patch,
+    /// and none needs to — the text is *generated* here, so its structure is classified at the
+    /// point of generation and travels as `generated` instead.
     pub language: Option<String>,
+    /// Decorations and structure for generated patch text. `None` for a file at a revision, which
+    /// has a grammar and a live tree of its own.
+    pub generated: Option<GeneratedPatch>,
+}
+
+/// The refs pointing at `id`, in git's own `(HEAD -> main, origin/main, tag: v1.0)` order-ish, for
+/// the commit line. Empty when nothing points here, which is the common case deep in history.
+fn refs_at(repo: &git2::Repository, id: git2::Oid) -> Vec<String> {
+    let head_branch = repo
+        .head()
+        .ok()
+        .filter(|h| h.target() == Some(id))
+        .and_then(|h| h.shorthand().ok().map(str::to_string));
+    let mut names = Vec::new();
+    if let Some(branch) = &head_branch {
+        names.push(format!("HEAD -> {branch}"));
+    }
+    let Ok(refs) = repo.references() else {
+        return names;
+    };
+    for r in refs.flatten() {
+        // `target_peel` as well as `target`, so an annotated tag — whose ref points at the tag
+        // object rather than the commit — is still recognised as being here.
+        if r.target() != Some(id) && r.target_peel() != Some(id) {
+            continue;
+        }
+        let Ok(name) = r.shorthand() else { continue };
+        if Some(name.to_string()) == head_branch {
+            continue;
+        }
+        if r.is_tag() {
+            names.push(format!("tag: {name}"));
+        } else if r.is_branch() || r.is_remote() {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// A commit as `git show` prints it: metadata and message, then the patch against its first parent
 /// (against the empty tree for a root commit, so the initial commit shows as all additions).
 ///
-/// libgit2 rather than the CLI, per decision 1 — this is a read, and the patch text libgit2's
-/// printer emits is the same format. Merge commits diff against the *first* parent only, which is
-/// what `git show` does too.
+/// libgit2 rather than the CLI, per decision 1 — this is a read, and libgit2 hands over the same
+/// structure its printer would format.
+///
+/// **Merge commits diff against the first parent**, and the header says so. The alternative — git's
+/// own default, a combined (`--cc`) diff showing only what differs from *every* parent — isolates
+/// what a human did while merging, but is usually empty, reads like a bug when it is, and has no
+/// libgit2 support at all (it is tree-to-tree only), so it would mean shelling out.
 pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, String> {
     let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
     let commit = repo
@@ -2080,41 +2157,185 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
         .to_string();
     let short = short_hash(&commit.id().to_string());
 
-    let mut text = String::new();
-    text.push_str(&format!("commit {}\n", commit.id()));
-    text.push_str(&format!(
-        "Author: {} <{}>\n",
-        sig.name().unwrap_or("(unknown)"),
-        sig.email().unwrap_or_default()
-    ));
-    text.push_str(&format!("Date:   {}\n\n", format_commit_time(sig.when())));
-    // Indented four spaces, as git prints a message body.
-    for line in commit.message().unwrap_or_default().trim_end().lines() {
-        text.push_str(&format!("    {line}\n"));
+    let mut b = PatchBuilder::default();
+
+    // Field names are scenery; the hash is the one thing on the block anyone copies out.
+    let hash = commit.id().to_string();
+    let mut line = format!("commit {hash}");
+    let mut spans = vec![(0, 6, META), (7, line.len(), "constant")];
+    let refs = refs_at(&repo, commit.id());
+    if !refs.is_empty() {
+        let decoration = format!(" ({})", refs.join(", "));
+        spans.push((line.len(), line.len() + decoration.len(), META));
+        line.push_str(&decoration);
     }
-    text.push('\n');
+    b.header_line(&line, &spans);
+
+    // A merge's parents, so the header states what the diff below is actually against — and so
+    // `Enter` has a hash to follow when walking back through history.
+    if commit.parent_count() > 1 {
+        let parents: Vec<String> = commit
+            .parent_ids()
+            .map(|id| short_hash(&id.to_string()))
+            .collect();
+        let line = format!(
+            "Merge:  {} (showing changes against the first)",
+            parents.join(" ")
+        );
+        let tail = line.find(" (").unwrap_or(line.len());
+        b.header_line(&line, &[(0, 6, META), (tail, line.len(), META)]);
+    }
+
+    b.header_line(
+        &format!(
+            "Author: {} <{}>",
+            sig.name().unwrap_or("(unknown)"),
+            sig.email().unwrap_or_default()
+        ),
+        &[(0, 7, META)],
+    );
+    b.header_line(
+        &format!("Date:   {}", format_commit_time(sig.when())),
+        &[(0, 5, META)],
+    );
+    // Only when it differs from the author — on the overwhelming majority of commits the two are
+    // the same person and a second identical line is noise.
+    let committer = commit.committer();
+    if committer.name() != sig.name() || committer.email() != sig.email() {
+        b.header_line(
+            &format!(
+                "Commit: {} <{}>",
+                committer.name().unwrap_or("(unknown)"),
+                committer.email().unwrap_or_default()
+            ),
+            &[(0, 7, META)],
+        );
+    }
+
+    b.header_line("", &[]);
+    // Indented four spaces, as git prints a message body. The first line is the subject — what
+    // `git log --oneline` shows — so it takes the emphasis the gitcommit grammar gives it there.
+    for (i, line) in commit
+        .message()
+        .unwrap_or_default()
+        .trim_end()
+        .lines()
+        .enumerate()
+    {
+        let text = format!("    {line}");
+        let spans = if i == 0 && !line.is_empty() {
+            vec![(0, text.len(), "text.title")]
+        } else {
+            Vec::new()
+        };
+        b.header_line(&text, &spans);
+    }
 
     let new_tree = commit.tree().map_err(|e| e.message().to_string())?;
     let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let diff = repo
+    let mut diff = repo
         .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
         .map_err(|e| e.message().to_string())?;
-    diff.print(git2::DiffFormat::Patch, |_, _, line| {
-        // The origin character is part of the patch for content lines but not for headers;
-        // libgit2 hands it over separately either way.
-        if matches!(line.origin(), '+' | '-' | ' ') {
-            text.push(line.origin());
-        }
-        text.push_str(&String::from_utf8_lossy(line.content()));
-        true
-    })
-    .map_err(|e| e.message().to_string())?;
+    // Without this a rename is an add plus a delete: twice the noise, and the old side would be
+    // detected as the wrong language (or none) when its highlights are projected.
+    let _ = diff.find_similar(None);
 
+    if let Ok(stats) = diff.stats() {
+        b.header_line("", &[]);
+        let text = format!(
+            "{} file{} changed, +{} −{}",
+            stats.files_changed(),
+            if stats.files_changed() == 1 { "" } else { "s" },
+            stats.insertions(),
+            stats.deletions()
+        );
+        b.header_line(&text, &[(0, text.len(), META)]);
+    }
+
+    crate::patch::render_diff(&repo, &diff, &mut b, false)?;
+
+    let (text, generated) = b.finish();
     Ok(RevisionContent {
         title: format!("{short} — {subject}"),
         text,
         language: None,
+        generated: Some(generated),
     })
+}
+
+/// Everything not committed, as one patch: `git diff HEAD`.
+///
+/// **Composed**, not split into staged and unstaged. The inline diff view already composes
+/// HEAD→index→buffer and tags each line with its [`DiffStage`], and `git/apply_hunk` already
+/// resolves a stage *within* that composed picture — so composing here is both well-defined and the
+/// consistent choice. A staged-only view answers a different question ("what am I about to
+/// commit?") and would be a second source, not a competing design for this one.
+///
+/// Regenerated on every open rather than followed live: the working tree moves under you, and a
+/// buffer that silently rewrote itself mid-read would be worse than one that is honestly a
+/// snapshot.
+pub fn show_working_changes(repo_path: &Path) -> Result<RevisionContent, String> {
+    let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
+    let mut b = PatchBuilder::default();
+
+    let line = "Working changes";
+    b.header_line(line, &[(0, line.len(), "text.title")]);
+    // Where these changes sit, which is the one piece of context a commit's header gives for free.
+    if let Some(head) = head_state(&repo) {
+        let line = match &head {
+            GitHead::Branch { name, .. } => format!("On:     {name}"),
+            GitHead::Unborn { name } => format!("On:     {name} (unborn)"),
+            GitHead::Detached { oid } => format!("At:     {} (detached)", short_hash(oid)),
+        };
+        b.header_line(&line, &[(0, 7, META)]);
+    }
+
+    // HEAD's tree, or the empty tree on an unborn branch so a first commit's worth of new files
+    // still shows as additions rather than as nothing at all.
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .and_then(|c| c.tree().ok());
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), None)
+        .map_err(|e| e.message().to_string())?;
+    let _ = diff.find_similar(None);
+
+    if let Ok(stats) = diff.stats() {
+        b.header_line("", &[]);
+        let text = format!(
+            "{} file{} changed, +{} −{}",
+            stats.files_changed(),
+            if stats.files_changed() == 1 { "" } else { "s" },
+            stats.insertions(),
+            stats.deletions()
+        );
+        b.header_line(&text, &[(0, text.len(), META)]);
+    }
+
+    crate::patch::render_diff(&repo, &diff, &mut b, true)?;
+
+    let (text, generated) = b.finish();
+    Ok(RevisionContent {
+        title: "Working changes".to_string(),
+        text,
+        language: None,
+        generated: Some(generated),
+    })
+}
+
+/// The first parent of `rev`, as a full hash — the revision a patch's `-` lines belong to.
+///
+/// `None` for a root commit, which is also the case that can't arise: a root commit is diffed
+/// against the empty tree, so its patch is all additions and has no old side to follow.
+pub fn first_parent(repo_path: &Path, rev: &str) -> Option<String> {
+    let repo = git2::Repository::discover(repo_path).ok()?;
+    let commit = repo
+        .revparse_single(rev)
+        .and_then(|o| o.peel_to_commit())
+        .ok()?;
+    commit.parent(0).ok().map(|p| p.id().to_string())
 }
 
 /// One file's content as of `rev` — `git show <rev>:<path>`. `path` is repo-relative. Binary
@@ -2143,6 +2364,7 @@ pub fn show_file(repo_path: &Path, rev: &str, path: &str) -> Result<RevisionCont
         // Detected from the path, so a file at a revision highlights exactly like its working-tree
         // twin — the whole point of showing it in the editor rather than a pager.
         language: crate::syntax::config_for_path(Path::new(path)).map(|c| c.name.to_string()),
+        generated: None,
     })
 }
 
@@ -3953,5 +4175,508 @@ mod tests {
             .unwrap();
 
         assert!(!branch_is_merged(dir.path(), "feature"));
+    }
+
+    // ---- show_commit: a generated patch document ------------------------------------------------
+
+    use crate::patch::{GeneratedPatch, PatchFileStatus, HUNK};
+    use aether_protocol::viewport::{PatchLine, VirtualRow, VirtualRowKind};
+
+    /// The text a highlight span covers, so assertions read as "this word is a keyword" rather
+    /// than as byte arithmetic.
+    fn span_text(line: &str, start: u32, end: u32) -> &str {
+        &line[start as usize..end as usize]
+    }
+
+    /// The patch document generated for the repo's HEAD commit.
+    fn head_patch(dir: &Path) -> (String, GeneratedPatch) {
+        let repo = git2::Repository::open(dir).unwrap();
+        let head = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+        let content = show_commit(dir, &head).expect("show");
+        let generated = content.generated.expect("a patch carries generated data");
+        (content.text, generated)
+    }
+
+    /// Stage `name` as it stands on disk and commit it on top of HEAD.
+    fn stage_and_commit(dir: &Path, name: &str, message: &str) {
+        let repo = git2::Repository::open(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .unwrap();
+    }
+
+    fn commit_change(dir: &Path, name: &str, content: &str, message: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        stage_and_commit(dir, name, message);
+    }
+
+    /// Index of the buffer line whose text is exactly `want`.
+    fn line_at(text: &str, want: &str) -> usize {
+        text.lines()
+            .position(|l| l == want)
+            .unwrap_or_else(|| panic!("no line {want:?} in:\n{text}"))
+    }
+
+    fn side_of(text: &str, g: &GeneratedPatch, want: &str) -> Option<PatchLine> {
+        g.decorations.patch[line_at(text, want)]
+    }
+
+    fn chrome(g: &GeneratedPatch, kind: VirtualRowKind) -> Vec<&VirtualRow> {
+        g.decorations
+            .virtual_rows
+            .iter()
+            .flatten()
+            .filter(|r| r.kind == kind)
+            .collect()
+    }
+
+    /// Everything the renderer does is `get(line_index)`, so one off-by-one silently paints the
+    /// wrong rows. Every vector has to stay index-aligned with the text's lines.
+    #[test]
+    fn generated_vectors_are_parallel_to_the_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
+        let (text, g) = head_patch(dir.path());
+
+        let n = text.lines().count();
+        assert_eq!(g.decorations.patch.len(), n);
+        assert_eq!(g.decorations.highlights.len(), n);
+        assert_eq!(g.decorations.stage.len(), n);
+        assert_eq!(g.decorations.emphasis.len(), n);
+        assert_eq!(g.index.lines.len(), n);
+        // Strictly equal again: the patch ends without a trailing newline, so there is no empty
+        // last line, and the chrome that would have anchored there is `trailing_rows` instead.
+        assert_eq!(g.decorations.virtual_rows.len(), n);
+        assert!(
+            !text.ends_with('\n'),
+            "no trailing newline — the empty last line it makes is one the cursor can land on, \
+             below everything the patch has to show"
+        );
+        assert!(
+            !g.decorations.trailing_rows.is_empty(),
+            "the closing rule lives here, having no line to sit above"
+        );
+    }
+
+    /// The property the whole design rests on: a content line of the patch is byte-identical to
+    /// that line of the real file, because the `+`/`-` column is gone. That is what lets syntax
+    /// highlights be projected from a whole-blob parse at zero offset, what makes `Enter` land an
+    /// exact column, and what makes a copied selection paste as code.
+    #[test]
+    fn content_lines_carry_no_origin_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
+        commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
+        let (text, g) = head_patch(dir.path());
+
+        assert_eq!(side_of(&text, &g, "TWO"), Some(PatchLine::Added));
+        assert_eq!(side_of(&text, &g, "two"), Some(PatchLine::Removed));
+        // Context is in both versions, so it belongs to neither side and takes no tint.
+        assert_eq!(side_of(&text, &g, "one"), None);
+        assert_eq!(side_of(&text, &g, "three"), None);
+    }
+
+    /// Chrome lives in virtual rows and never in the text. That is what makes it unreachable by
+    /// the cursor for free — the alternative, buffer lines the cursor refuses to land on, would
+    /// need a skip rule in every motion, in search landing, in sneak and in nav restore.
+    #[test]
+    fn chrome_is_never_buffer_text() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
+        commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
+        let (text, g) = head_patch(dir.path());
+
+        for line in text.lines() {
+            for marker in ["@@", "diff --git", "index ", "+++ ", "--- "] {
+                assert!(
+                    !line.starts_with(marker),
+                    "{marker:?} chrome leaked into the buffer: {line:?}"
+                );
+            }
+        }
+        assert_eq!(chrome(&g, VirtualRowKind::FileHeader).len(), 1);
+        assert_eq!(chrome(&g, VirtualRowKind::HunkHeader).len(), 1);
+    }
+
+    /// A section heading is the enclosing signature alone.
+    ///
+    /// git prints `@@ -a,b +c,d @@ <signature>`; only the signature survives, because it says
+    /// *where you are* and that is what a heading is for. The ranges go with it — so a patch shows
+    /// no line numbers anywhere, the gutter having none either.
+    #[test]
+    fn hunk_separator_carries_the_enclosing_signature_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(
+            dir.path(),
+            "src.rs",
+            "fn wrapper() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n}\n",
+        );
+        commit_change(
+            dir.path(),
+            "src.rs",
+            "fn wrapper() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 44;\n}\n",
+            "tweak",
+        );
+        let (_, g) = head_patch(dir.path());
+
+        let rows = chrome(&g, VirtualRowKind::HunkHeader);
+        let row = rows.first().expect("a section heading");
+        assert_eq!(row.text, "fn wrapper() {", "the signature, nothing else");
+        assert!(
+            !row.text.contains("@@"),
+            "the ranges are gone: {:?}",
+            row.text
+        );
+        let kinds: Vec<&str> = row.highlights.iter().map(|h| h.kind.as_str()).collect();
+        assert_eq!(kinds, [HUNK]);
+
+        // The file block opens with a full-width rule, and its path sits on the row below.
+        assert_eq!(chrome(&g, VirtualRowKind::Rule).len(), 1);
+    }
+
+    /// The file separator is the file-scope handle — for `Space g Alt-s` and for the eye — so it
+    /// has to name the path and how much changed in it.
+    #[test]
+    fn file_separator_names_the_path_and_its_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
+        commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
+        let (_, g) = head_patch(dir.path());
+
+        let rows = chrome(&g, VirtualRowKind::FileHeader);
+        let row = rows.first().expect("a file separator");
+        assert!(row.text.starts_with("src.rs"), "{:?}", row.text);
+        assert!(row.text.contains("+1"), "{:?}", row.text);
+        assert!(row.text.contains("−1"), "{:?}", row.text);
+    }
+
+    /// A file with no trailing newline makes libgit2 emit a `\ No newline at end of file` note.
+    /// That note is an artefact of the patch *format*, and this view deliberately isn't one — so
+    /// it is dropped, and the line it closes is still an ordinary addition.
+    #[test]
+    fn missing_trailing_newline_note_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one");
+        let (text, g) = head_patch(dir.path());
+
+        assert_eq!(side_of(&text, &g, "one"), Some(PatchLine::Added));
+        assert!(
+            !text.contains("No newline"),
+            "patch-format scenery, not content:\n{text}"
+        );
+    }
+
+    /// A delta git gives no hunks for has nothing to hang its separator on, and would silently
+    /// vanish from the view. The placeholder is *real* buffer text so the file keeps a cursor
+    /// position — without one it could not be staged, followed into, or listed in the picker.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_only_change_gets_a_placeholder_content_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = repo_with_committed_file(dir.path(), "run.sh", "echo hi\n");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stage_and_commit(dir.path(), "run.sh", "make it executable");
+        let (text, g) = head_patch(dir.path());
+
+        let i = text
+            .lines()
+            .position(|l| l.starts_with("mode "))
+            .unwrap_or_else(|| panic!("no mode placeholder in:\n{text}"));
+        let line = text.lines().nth(i).unwrap();
+        assert!(
+            line.contains("100644") && line.contains("100755"),
+            "{line:?}"
+        );
+
+        let info = g.index.lines[i].expect("the placeholder belongs to its file");
+        assert!(
+            info.hunk.is_none(),
+            "a placeholder stands in for having no hunks at all"
+        );
+        assert_eq!(g.index.files[info.file as usize].path(), "run.sh");
+        assert_eq!(
+            g.index.files[info.file as usize].status,
+            PatchFileStatus::ModeChanged
+        );
+    }
+
+    /// Rename detection is on. Without it a rename is an add plus a delete: twice the noise, and
+    /// the old side gets handed to the wrong grammar when its highlights are projected.
+    #[test]
+    fn renames_are_detected_as_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "old.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+        std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.rs")).unwrap();
+        index.add_path(Path::new("new.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "rename", &tree, &[&parent])
+            .unwrap();
+
+        let (_, g) = head_patch(dir.path());
+        assert_eq!(g.index.files.len(), 1, "one file, not an add plus a delete");
+        let f = &g.index.files[0];
+        assert_eq!(f.status, PatchFileStatus::Renamed);
+        assert_eq!(f.old_path.as_deref(), Some("old.rs"));
+        assert_eq!(f.new_path.as_deref(), Some("new.rs"));
+    }
+
+    /// The index is what every feature over a patch buffer reads: stepping between changes,
+    /// staging the one under the cursor and following a line back to its file all resolve a cursor
+    /// position through it.
+    #[test]
+    fn index_maps_lines_back_to_their_source_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
+        commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
+        let (text, g) = head_patch(dir.path());
+
+        let at = |want: &str| g.index.lines[line_at(&text, want)].expect("a content line");
+        // A removal exists only on the old side, an addition only on the new one.
+        assert_eq!(at("two").old_lineno, Some(2));
+        assert_eq!(at("two").new_lineno, None);
+        assert_eq!(at("TWO").new_lineno, Some(2));
+        assert_eq!(at("TWO").old_lineno, None);
+        // Context is in both, so it carries both numbers.
+        assert_eq!(at("one").old_lineno, Some(1));
+        assert_eq!(at("one").new_lineno, Some(1));
+
+        // The metadata block and the message belong to no file.
+        assert!(g.index.lines[line_at(&text, "    shout")].is_none());
+
+        let file = &g.index.files[0];
+        assert_eq!((file.added, file.removed), (1, 1));
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.new_language.as_deref(), Some("rust"));
+        assert!(file.start_line < file.end_line);
+        for i in file.start_line..file.end_line {
+            assert!(
+                g.index.lines[i as usize].is_some(),
+                "line {i} is inside the file's content range"
+            );
+        }
+    }
+
+    /// Highlights are projected from a parse of the **whole blob**, never of the patch's own text.
+    /// That is the difference between a line highlighting the way it does in the file and the way a
+    /// lone fragment would: tree-sitter is error tolerant, so a fragment does parse — just wrongly,
+    /// because highlight queries key on parent context.
+    #[test]
+    fn content_lines_are_highlighted_from_their_own_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(
+            dir.path(),
+            "src.rs",
+            "fn alpha() -> u32 {\n    let x = 1;\n    x\n}\n",
+        );
+        commit_change(
+            dir.path(),
+            "src.rs",
+            "fn alpha() -> u32 {\n    let x = 2;\n    x\n}\n",
+            "bump",
+        );
+        let (text, g) = head_patch(dir.path());
+
+        let words = |want: &str| -> Vec<(String, String)> {
+            g.decorations.highlights[line_at(&text, want)]
+                .iter()
+                .map(|h| (span_text(want, h.start, h.end).to_string(), h.kind.clone()))
+                .collect()
+        };
+        // Both sides of the pair are highlighted, each from its own side's blob.
+        let added = words("    let x = 2;");
+        let removed = words("    let x = 1;");
+        assert!(
+            added.contains(&("let".to_string(), "keyword".to_string())),
+            "{added:?}"
+        );
+        assert!(
+            removed.contains(&("let".to_string(), "keyword".to_string())),
+            "{removed:?}"
+        );
+        // Context too — and `alpha` is classified as a *function definition*, which only a parse
+        // with the surrounding `fn` item in view can know.
+        let ctx = words("fn alpha() -> u32 {");
+        assert!(
+            ctx.contains(&("fn".to_string(), "keyword".to_string())),
+            "{ctx:?}"
+        );
+        assert!(
+            ctx.iter()
+                .any(|(w, k)| w == "alpha" && k.starts_with("function")),
+            "{ctx:?}"
+        );
+    }
+
+    /// Spans are line-local, so one crossing a line in the blob — a block comment, a multi-line
+    /// string — has to be split at the boundaries. An unclipped span would run off the end of a
+    /// short line and paint bytes that aren't there.
+    #[test]
+    fn spans_crossing_lines_are_clipped_to_each_line() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(
+            dir.path(),
+            "src.rs",
+            "/* aaa\n   bbb\n   ccc */\nfn f() {}\n",
+        );
+        commit_change(
+            dir.path(),
+            "src.rs",
+            "/* aaa\n   BBB\n   ccc */\nfn f() {}\n",
+            "shout",
+        );
+        let (text, g) = head_patch(dir.path());
+
+        let i = line_at(&text, "   BBB");
+        let spans = &g.decorations.highlights[i];
+        assert!(!spans.is_empty(), "inside a block comment");
+        assert!(spans.iter().all(|h| h.kind == "comment"), "{spans:?}");
+
+        // The invariant, over the whole document: no span may reach past its own line.
+        for (i, line) in text.lines().enumerate() {
+            for h in &g.decorations.highlights[i] {
+                assert!(h.start <= h.end, "line {i}: inverted span {h:?}");
+                assert!(
+                    h.end as usize <= line.len(),
+                    "line {i}: span {h:?} runs past {line:?}"
+                );
+            }
+        }
+    }
+
+    /// A paired removal and addition carry emphasis on **both** sides. The inline diff view only
+    /// ever emphasises the new side as a line — its old side is a phantom row with its own field —
+    /// but in a patch both sides are ordinary buffer lines.
+    #[test]
+    fn paired_lines_get_intraline_emphasis_on_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "let user_name = 1;\n");
+        commit_change(dir.path(), "src.rs", "let user_email = 1;\n", "rename it");
+        let (text, g) = head_patch(dir.path());
+
+        let old = &g.decorations.emphasis[line_at(&text, "let user_name = 1;")];
+        let new = &g.decorations.emphasis[line_at(&text, "let user_email = 1;")];
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(new.len(), 1, "{new:?}");
+        // The word that differs, not the whole line — that's what makes it worth drawing.
+        assert_eq!(
+            span_text("let user_name = 1;", old[0].start, old[0].end),
+            "user_name"
+        );
+        assert_eq!(
+            span_text("let user_email = 1;", new[0].start, new[0].end),
+            "user_email"
+        );
+        // Context has no counterpart, so nothing to emphasise.
+        assert!(g.decorations.emphasis[line_at(&text, "    rename it")].is_empty());
+    }
+
+    /// A file no grammar covers still renders — it just renders plainly. Worth pinning because the
+    /// projection has several ways to decline (no grammar, binary, over the size cap) and all of
+    /// them have to degrade to "unhighlighted", never to "missing".
+    #[test]
+    fn a_file_with_no_grammar_renders_unhighlighted() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "notes.qqq", "alpha\n");
+        commit_change(dir.path(), "notes.qqq", "alpha\nbeta\n", "add a line");
+        let (text, g) = head_patch(dir.path());
+
+        let i = line_at(&text, "beta");
+        assert!(g.decorations.highlights[i].is_empty());
+        assert_eq!(g.decorations.patch[i], Some(PatchLine::Added));
+        assert!(g.index.files[0].new_language.is_none());
+    }
+
+    /// A change is a *block* of `+`/`-` lines, not a hunk.
+    ///
+    /// Two properties, both of which a hunk gets wrong. A hunk opens with the context lines that
+    /// make it readable, so its start sits several lines above anything that changed — stepping
+    /// there lands you on unchanged code. And one hunk routinely holds several separate edits,
+    /// which have to be several stops rather than one.
+    #[test]
+    fn changes_are_blocks_of_changed_lines_not_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two edits far enough apart to be separate blocks, close enough to share one hunk (git's
+        // default is three lines of context either side).
+        let before = (1..=14).map(|i| format!("line {i}\n")).collect::<String>();
+        let after = before
+            .replace("line 4\n", "LINE 4\n")
+            .replace("line 11\n", "LINE 11\n");
+        repo_with_committed_file(dir.path(), "src.rs", &before);
+        commit_change(dir.path(), "src.rs", &after, "two edits");
+        let (text, g) = head_patch(dir.path());
+
+        let file = &g.index.files[0];
+        assert_eq!(file.hunks.len(), 1, "one hunk covers both edits");
+        assert_eq!(file.changes.len(), 2, "but they are two changes");
+
+        // Each block starts on a *changed* line, never on the context above it.
+        let lines: Vec<&str> = text.lines().collect();
+        for change in &file.changes {
+            let at = lines[change.start_line as usize];
+            assert!(
+                at.starts_with("LINE ") || at.starts_with("line "),
+                "unexpected {at:?}"
+            );
+            assert!(
+                g.decorations.patch[change.start_line as usize].is_some(),
+                "block starts on a changed line, not context: {at:?}"
+            );
+            // A modification is one block, not a removal block plus an addition block.
+            assert_eq!((change.added, change.removed), (1, 1));
+        }
+        assert_eq!(lines[file.changes[0].start_line as usize], "line 4");
+        assert_eq!(lines[file.changes[1].start_line as usize], "line 11");
+    }
+
+    /// A merge's diff is against the first parent only, so the header has to say so — otherwise
+    /// the view quietly answers a different question from the one it appears to.
+    #[test]
+    fn merge_commit_header_names_its_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "one\n");
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let base = repo.head().unwrap().peel_to_commit().unwrap();
+
+        std::fs::write(dir.path().join("other.rs"), "two\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("other.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let side = repo
+            .commit(None, &sig, &sig, "side", &tree, &[&base])
+            .unwrap();
+        let side = repo.find_commit(side).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "merge", &tree, &[&base, &side])
+            .unwrap();
+
+        let (text, _) = head_patch(dir.path());
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Merge:"))
+            .unwrap_or_else(|| panic!("no Merge line in:\n{text}"));
+        assert!(
+            line.contains("showing changes against the first"),
+            "{line:?}"
+        );
     }
 }

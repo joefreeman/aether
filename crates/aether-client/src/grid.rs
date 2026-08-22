@@ -90,7 +90,7 @@ pub fn row_end_byte(row: &VisualRow) -> u32 {
 /// Visual rows a line occupies: its phantom deleted rows (inline diff view) plus its (possibly
 /// wrapped) content rows.
 pub fn line_rows(line: &LogicalLineRender) -> u32 {
-    (line.virtual_rows_above.len() + line.visual_rows.len()) as u32
+    (line.virtual_rows_above.len() + line.visual_rows.len() + line.virtual_rows_below.len()) as u32
 }
 
 /// The window-relative index of the line's first visual row — phantom rows included, so this
@@ -400,6 +400,7 @@ mod tests {
             logical_line,
             visual_rows: rows,
             search_matches: vec![],
+            virtual_rows_below: vec![],
             virtual_rows_above: vec![],
             diff_marker: None,
             diff_stage: Default::default(),
@@ -407,6 +408,7 @@ mod tests {
             diff_emphasis: vec![],
             diagnostics: vec![],
             sneak_targets: vec![],
+            patch: None,
         }
     }
 
@@ -553,12 +555,14 @@ mod tests {
                 kind: VirtualRowKind::Deleted,
                 stage: Default::default(),
                 emphasis: vec![],
+                highlights: vec![],
             },
             VirtualRow {
                 text: "removed 2".into(),
                 kind: VirtualRowKind::Deleted,
                 stage: Default::default(),
                 emphasis: vec![],
+                highlights: vec![],
             },
         ];
         let w = window(10, 20, vec![l10, line(11, vec![row(0, 0, "next")])]);

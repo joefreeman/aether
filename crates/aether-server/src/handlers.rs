@@ -93,7 +93,7 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::viewport::{
     BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
-    LogicalLineRange, LogicalLineRender, ScrollPosition, ViewportLinesChanged,
+    LogicalLineRange, LogicalLineRender, PatchLine, ScrollPosition, ViewportLinesChanged,
     ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRow,
     VirtualRowKind, Window,
@@ -679,6 +679,9 @@ async fn activate_context(
                                 crate::backup::exists(&crate::backup::file_backup_path(root, p))
                             })
                         }
+                        // A revision is read-only, so it can never hold unsaved content to rescue;
+                        // it regenerates when first viewed, like a dormant file with no backup.
+                        crate::state::DormantSource::Virtual { .. } => false,
                     })
                     .map(|d| d.id)
                     .collect();
@@ -922,6 +925,9 @@ fn restore_dormant_sources(
                 });
                 has_backup.then_some(DormantSource::Scratch { number: *number })
             }
+            // Nothing on disk to check for: a revision is regenerated from the repo on first view,
+            // and one that no longer resolves reports itself then rather than being probed here.
+            SessionBuffer::Virtual { key } => Some(DormantSource::Virtual { key: key.clone() }),
         })
         .collect();
     if let Some(root) = backups_root {
@@ -929,7 +935,7 @@ fn restore_dormant_sources(
             .iter()
             .filter_map(|src| match src {
                 DormantSource::Scratch { number } => Some(*number),
-                DormantSource::File(_) => None,
+                DormantSource::File(_) | DormantSource::Virtual { .. } => None,
             })
             .collect();
         if let Ok(dir) = std::fs::read_dir(root.join("scratch").join(workspace_name)) {
@@ -2271,6 +2277,7 @@ async fn open_restored_scratch(
         transient: buf.transient,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
@@ -2285,67 +2292,249 @@ async fn open_restored_scratch(
     Ok(result)
 }
 
-/// `git/show`: materialise a revision into a read-only virtual buffer — the commit's patch, or one
-/// file as of that commit.
+/// `git/show`: materialise one of a repo's states into a read-only buffer — a commit's patch, one
+/// file as of a commit, or everything not yet committed.
+///
+/// One handler for all three because they *are* one operation: build a diff (or read a blob),
+/// render it, install it. The only thing the target changes is whether the work can be skipped —
+/// a revision can't move, so re-showing one attaches to the buffer already holding it, while the
+/// working tree has to be rebuilt. That is a guard, not a second code path.
 ///
 /// Resolution is against **reachable** repos, not writable ones: this is a read, and decision 2 is
 /// explicit that a repo reachable only through an open buffer stays fully read-eligible. Nothing
 /// here can mutate anything, so the reachability guard that protects writes doesn't apply.
 ///
-/// Re-showing the same `(repo, rev, path)` attaches to the existing buffer — the pathless
-/// equivalent of the canonical-path sharing key — so walking a log picker doesn't leave a trail of
-/// duplicates. The content is generated off the lock: a large commit's patch is O(diff), which has
-/// no business on the keystroke path's mutex.
+/// The content is generated off the lock: a large commit's patch is O(diff), which has no business
+/// on the keystroke path's mutex.
 pub async fn git_show(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: aether_protocol::git::GitShowParams,
 ) -> Result<BufferOpenResult, RpcError> {
     let client_id = ctx.client_id;
-    let key = match &params.path {
-        Some(path) => format!("{}@{}:{}", params.repo_id, params.rev, path),
-        None => format!("{}@{}", params.repo_id, params.rev),
+    let (target, workspace) = {
+        let s = state.lock().await;
+        let repo_id = match &params.repo_id {
+            Some(repo_id) => resolve_repo(&s, client_id, repo_id)?.repo_id,
+            None => resolve_readable_repo(&s, client_id, params.buffer_id)?.repo_id,
+        };
+        (
+            crate::state::VirtualTarget::new(repo_id, params.target.clone()),
+            s.active_workspace_or_err(client_id)?.id.clone(),
+        )
     };
 
-    // Already open? Attach to it — same buffer, same cursor, no regeneration.
-    {
+    // Is this target already open? Its buffer is the one to reuse, whether by attaching to it or
+    // by rewriting it in place.
+    let existing = {
         let s = state.lock().await;
-        let workspace = s.active_workspace_or_err(client_id)?.id.clone();
-        let existing = s.buffers_in_workspace(&workspace).into_iter().find(|id| {
+        s.buffers_in_workspace(&workspace).into_iter().find(|id| {
             s.buffers
                 .get(id)
                 .and_then(|b| s.documents.get(&b.document))
                 .and_then(|d| d.virtual_source.as_ref())
-                .is_some_and(|v| v.key == key)
-        });
-        if let Some(buffer_id) = existing {
-            drop(s);
-            return buffer_open_inner(
-                state,
-                ctx,
-                BufferOpenParams {
-                    buffer_id: Some(buffer_id),
-                    transient: params_transient_of(&params),
-                    ..Default::default()
-                },
-            )
-            .await;
-        }
+                .is_some_and(|v| v.target == target)
+        })
+    };
+    // An immutable target that's already open has nothing to regenerate — attach, keeping whatever
+    // cursor and pinned state it has, so re-selecting a log row lands you where you were.
+    if let Some(buffer_id) = existing.filter(|_| target.is_immutable()) {
+        return buffer_open_inner(
+            state,
+            ctx,
+            BufferOpenParams {
+                buffer_id: Some(buffer_id),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
-    let workdir = {
-        let s = state.lock().await;
-        std::path::PathBuf::from(resolve_repo(&s, client_id, &params.repo_id)?.repo_id)
-    };
-    let (rev, path) = (params.rev.clone(), params.path.clone());
-    let content = tokio::task::spawn_blocking(move || match &path {
-        Some(path) => crate::git::show_file(&workdir, &rev, path),
-        None => crate::git::show_commit(&workdir, &rev),
+    let workdir = std::path::PathBuf::from(&target.repo_id);
+    let what = target.what.clone();
+    let content = tokio::task::spawn_blocking(move || {
+        use aether_protocol::git::ShowTarget;
+        match &what {
+            ShowTarget::Commit { rev } => crate::git::show_commit(&workdir, rev),
+            ShowTarget::File { rev, path } => crate::git::show_file(&workdir, rev, path),
+            ShowTarget::WorkingChanges => crate::git::show_working_changes(&workdir),
+        }
     })
     .await
     .map_err(|e| RpcError::internal(format!("git show: {e}")))?
     .map_err(RpcError::git_show_failed)?;
 
+    // A mutable target that's already open is rewritten in place — same buffer id, so viewports,
+    // cursors and the nav history stay pointed at it, and the client's scroll anchor keeps your
+    // place across the rebuild.
+    if let Some(buffer_id) = existing {
+        {
+            let mut s = state.lock().await;
+            let doc_id = s.buffers[&buffer_id].document;
+            if let Some(doc) = s.documents.get_mut(&doc_id) {
+                doc.replace_generated(&content.text, content.generated);
+            }
+            // Clamp every viewer's cursor into the rebuilt text, as a reload does.
+            let viewers: Vec<ClientId> = s
+                .cursors
+                .keys()
+                .filter(|(_, b)| *b == buffer_id)
+                .map(|(c, _)| *c)
+                .collect();
+            for c in viewers {
+                let remembered = s.cursors[&(c, buffer_id)];
+                restore_cursor(&mut s, c, buffer_id, remembered);
+            }
+        }
+        return buffer_open_inner(
+            state,
+            ctx,
+            BufferOpenParams {
+                buffer_id: Some(buffer_id),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    open_generated_buffer(state, ctx, target, content, params.focus_path.as_deref()).await
+}
+
+/// `Enter` in a generated patch: open the file the line under the cursor came from, at the
+/// revision that side of the diff belongs to.
+pub async fn git_follow_patch_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::git::GitFollowPatchLineParams,
+) -> Result<aether_protocol::git::GitFollowPatchLineResult, RpcError> {
+    use crate::patch::PatchFileStatus;
+    use aether_protocol::git::{GitFollowPatchLineResult, GitShowParams};
+
+    let client_id = ctx.client_id;
+    let none = || GitFollowPatchLineResult { opened: None };
+
+    // Resolve everything the jump needs under one short lock, then let go: materialising the file
+    // is `git_show`'s job and it takes the lock itself.
+    let Some((repo_id, rev, path, lineno)) = ({
+        let s = state.lock().await;
+        let Some(doc) = s.try_doc_of(params.buffer_id) else {
+            return Ok(none());
+        };
+        let (Some(generated), Some(source)) = (doc.generated.as_ref(), doc.virtual_source.as_ref())
+        else {
+            return Ok(none());
+        };
+        let (repo_id, Some(rev)) = (source.target.repo_id.as_str(), source.target.rev()) else {
+            return Ok(none());
+        };
+        let cursor_line = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .map(|c| c.position.line)
+            .unwrap_or_default();
+        // The metadata block and the message belong to no file — nothing to follow.
+        let Some(Some(info)) = generated.index.lines.get(cursor_line as usize).copied() else {
+            return Ok(none());
+        };
+        let Some(file) = generated.index.files.get(info.file as usize) else {
+            return Ok(none());
+        };
+
+        // A deleted file exists only on the old side and an added file only on the new one, so
+        // those decide before the line's own side does — otherwise `Enter` on a context line of a
+        // deleted file would ask for a blob that isn't there.
+        let take_old = match file.status {
+            PatchFileStatus::Deleted => true,
+            PatchFileStatus::Added => false,
+            _ => info.side == Some(aether_protocol::viewport::PatchLine::Removed),
+        };
+        let (path, lineno) = if take_old {
+            (file.old_path.clone(), info.old_lineno)
+        } else {
+            (file.new_path.clone(), info.new_lineno)
+        };
+        let Some(path) = path else {
+            return Ok(none());
+        };
+        let rev = if take_old {
+            // The old side is the first parent's blob. A root commit has none, but also has no
+            // removals to follow, so this can't be reached for one.
+            let Some(parent) = crate::git::first_parent(std::path::Path::new(repo_id), rev) else {
+                return Ok(none());
+            };
+            parent
+        } else {
+            rev.to_string()
+        };
+        Some((repo_id.to_string(), rev, path, lineno))
+    }) else {
+        return Ok(none());
+    };
+
+    // Record the jump origin before leaving, as an ordinary open would through
+    // `record_nav_from` — `git/show` mints its buffer itself, so nothing else would. This is what
+    // `Backspace` walks back to, and the entry carries the patch's key rather than a path, so it
+    // returns even though the transient patch closes the moment this open hides it.
+    {
+        let mut s = state.lock().await;
+        if let Some(entry) = nav_entry_for(&s, client_id, params.buffer_id) {
+            s.nav_history.entry(client_id).or_default().record(entry);
+        }
+    }
+
+    let opened = git_show(
+        state,
+        ctx,
+        GitShowParams {
+            repo_id: Some(repo_id),
+            buffer_id: None,
+            target: aether_protocol::git::ShowTarget::File { rev, path },
+            focus_path: None,
+        },
+    )
+    .await?;
+
+    // Land on the line the patch line came from. libgit2 counts from 1; buffers from 0. A
+    // placeholder line (a binary or mode-only delta) carries no line number and opens at the top.
+    let Some(lineno) = lineno else {
+        return Ok(GitFollowPatchLineResult {
+            opened: Some(opened),
+        });
+    };
+    let mut s = state.lock().await;
+    let buf = s.doc_of(opened.buffer_id);
+    let position = motion::clamp_position(
+        buf,
+        LogicalPosition {
+            line: lineno.saturating_sub(1),
+            col: 0,
+        },
+    );
+    let cursor = CursorState {
+        position,
+        anchor: position,
+        match_bracket: None,
+        jumplist_position: None,
+    };
+    set_cursor(&mut s, (client_id, opened.buffer_id), cursor);
+    Ok(GitFollowPatchLineResult {
+        opened: Some(BufferOpenResult { cursor, ..opened }),
+    })
+}
+
+/// Install a freshly materialised revision or diff as a new read-only buffer.
+///
+/// Shared by `git/show` and `git/show_changes`: both produce a [`crate::git::RevisionContent`] and
+/// want identical buffer semantics from it, differing only in what they generated and what key it
+/// answers to.
+async fn open_generated_buffer(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    target: crate::state::VirtualTarget,
+    content: crate::git::RevisionContent,
+    focus_path: Option<&str>,
+) -> Result<BufferOpenResult, RpcError> {
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
     let active_workspace_name = s.active_workspace_or_err(client_id)?.id.clone();
     let id = s.allocate_buffer_id();
@@ -2353,11 +2542,12 @@ pub async fn git_show(
     let doc = Document::virtual_content(
         doc_id,
         crate::state::VirtualSource {
-            key,
+            target,
             title: content.title.clone(),
         },
         content.text,
         content.language,
+        content.generated,
     );
     // Transient: a revision view is a preview, so it closes itself once nothing shows it. Since a
     // read-only buffer can never be promoted by an edit or a save, `Space k` is the only way to
@@ -2368,6 +2558,26 @@ pub async fn git_show(
         scratch_number: None,
         transient: true,
     };
+    // Land on the file the caller came here *for* — the file-locked log picker is showing this
+    // commit because of one path, so opening at the top of a diff touching thirty others answers a
+    // question nobody asked. Its first *change*, not its header: the header is a virtual row and
+    // has no cursor position, and the changes are what you came to read.
+    let focused = focus_path
+        .zip(doc.generated.as_ref())
+        .and_then(|(want, generated)| {
+            let file = generated.index.files.iter().find(|f| f.path() == want)?;
+            let line = file
+                .changes
+                .first()
+                .map_or(file.start_line, |c| c.start_line);
+            Some(CursorState {
+                position: LogicalPosition { line, col: 0 },
+                anchor: LogicalPosition { line, col: 0 },
+                match_bracket: None,
+                jumplist_position: None,
+            })
+        })
+        .unwrap_or_default();
     let result = BufferOpenResult {
         buffer_id: id,
         language: doc.language.clone(),
@@ -2377,17 +2587,23 @@ pub async fn git_show(
         saved_revision: doc.saved_revision(),
         path: None,
         scratch_number: None,
-        cursor: Default::default(),
+        cursor: focused,
         scroll: None,
         lsp_server: None, // no file on disk for a server to have an opinion about
         transient: buf.transient,
         title: Some(content.title),
         read_only: true,
+        // A commit's diff, not a file at a revision — both are read-only, only the first has a
+        // patch index for `Enter` to follow through.
+        is_patch: doc.generated.is_some(),
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
+    if focused.position.line != 0 {
+        set_cursor(&mut s, (client_id, id), focused);
+    }
     s.touch_mru(id);
     let pushes = refresh_buffer_pickers(&mut s);
     drop(s);
@@ -2395,13 +2611,6 @@ pub async fn git_show(
         let _ = sender.send(notif).await;
     }
     Ok(result)
-}
-
-/// Re-showing an already-open revision keeps whatever pinned state it has: `None` leaves the
-/// transient flag alone, so a buffer the user kept with `Space k` doesn't silently become a
-/// preview again.
-fn params_transient_of(_params: &aether_protocol::git::GitShowParams) -> Option<bool> {
-    None
 }
 
 async fn buffer_open_inner(
@@ -2450,6 +2659,15 @@ async fn buffer_open_inner(
             Some(crate::state::DormantSource::Scratch { number }) => {
                 return open_restored_scratch(state, ctx, params, number).await;
             }
+            // A revision regenerates from its key. An unresolvable one — a commit rebased away
+            // since the session was written — surfaces as the `git/show` error rather than a
+            // silently empty buffer.
+            Some(crate::state::DormantSource::Virtual { key }) => {
+                return match Box::pin(materialise_virtual_key(state, ctx, &key)).await {
+                    Some(opened) => opened,
+                    None => Err(RpcError::buffer_not_found(buffer_id)),
+                };
+            }
             None => {}
         }
 
@@ -2470,6 +2688,7 @@ async fn buffer_open_inner(
         // buffers picker, which opens by id because there's no path to dispatch on.
         let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
         let read_only = doc.read_only();
+        let is_patch = doc.generated.is_some();
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
         let clamped_anchor = params
             .jump_to_anchor
@@ -2493,6 +2712,7 @@ async fn buffer_open_inner(
             transient: s.buffers[&buffer_id].transient,
             title: virtual_title,
             read_only,
+            is_patch,
         };
         s.touch_mru(buffer_id);
         pushes.extend(refresh_buffer_pickers(&mut s));
@@ -2557,6 +2777,7 @@ async fn buffer_open_inner(
                     transient: buf.transient,
                     title: None,
                     read_only: false,
+                    is_patch: false,
                 };
                 s.documents.insert(doc_id, doc);
                 s.buffers.insert(id, buf);
@@ -2672,6 +2893,7 @@ async fn buffer_open_inner(
                 transient: s.buffers[&existing].transient,
                 title: None,
                 read_only: false,
+                is_patch: false,
             };
             s.touch_mru(existing);
             pushes.extend(refresh_buffer_pickers(&mut s));
@@ -2887,6 +3109,7 @@ async fn buffer_open_inner(
         transient,
         title: None,
         read_only: false,
+        is_patch: false,
     };
     s.touch_mru(id);
     let mut pushes = refresh_buffer_pickers(&mut s);
@@ -3246,8 +3469,7 @@ fn resolve_readable_repo(
         let from_revision = s
             .try_doc_of(buffer_id)
             .and_then(|d| d.virtual_source.as_ref())
-            .and_then(|v| v.key.rsplit_once('@'))
-            .map(|(repo, _)| repo.to_string());
+            .map(|v| v.target.repo_id.clone());
         let from_baseline = s
             .git_baseline
             .get(&buffer_id)
@@ -6234,21 +6456,34 @@ pub async fn git_blame_line(
     let buf = s
         .try_doc_of(params.buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
-    if buf.canonical_path.is_none() {
+    // A file at a revision blames too, from the `(repo, rev, path)` its key names. Only a buffer
+    // that is neither — a scratch, or a commit's whole patch — has nothing to attribute.
+    let revision_file = revision_file_of(buf);
+    if buf.canonical_path.is_none() && revision_file.is_none() {
         return Ok(GitBlameLineResult {
             blame: None,
             commit_info: None,
-        }); // scratch buffer
+        });
     }
     let blame = cursor_line_blame(&mut s, params.buffer_id, params.line);
     // Composite post-step: resolve the commit's details in the same round-trip. Best-effort — an
     // unresolvable hash just yields `None`.
     let commit_info = match &blame {
-        Some(b) if params.include_commit_info && !b.is_uncommitted => s
-            .git_baseline
-            .get(&params.buffer_id)
-            .and_then(|base| base.repo.as_ref())
-            .and_then(|repo| crate::git::commit_info(repo, &b.commit)),
+        Some(b) if params.include_commit_info && !b.is_uncommitted => match &revision_file {
+            // No cached baseline to borrow the repo from, so name it from the key.
+            Some((workdir, rel_path, _)) => crate::git::commit_info(
+                &crate::git::GitRepo {
+                    workdir: workdir.clone(),
+                    rel_path: rel_path.clone(),
+                },
+                &b.commit,
+            ),
+            None => s
+                .git_baseline
+                .get(&params.buffer_id)
+                .and_then(|base| base.repo.as_ref())
+                .and_then(|repo| crate::git::commit_info(repo, &b.commit)),
+        },
         _ => None,
     };
     Ok(GitBlameLineResult { blame, commit_info })
@@ -6258,6 +6493,20 @@ pub async fn git_blame_line(
 /// stale. Shared by the `git/blame_line` request (the commit-details popover) and the
 /// blame-follow refresher (`spawn_blame_refresh`). `None` for a missing buffer, no repo, an
 /// untracked file, or a line past end-of-file.
+/// `(workdir, repo-relative path, rev)` for a **file at a revision** — the buffers
+/// `git/show <rev>:<path>` materialises.
+///
+/// `None` for everything else, including a *commit's* patch: that names many files and is not one
+/// of them, so nothing here can be asked of it.
+fn revision_file_of(doc: &Document) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let target = &doc.virtual_source.as_ref()?.target;
+    Some((
+        std::path::PathBuf::from(&target.repo_id),
+        std::path::PathBuf::from(target.path()?),
+        target.rev()?.to_string(),
+    ))
+}
+
 fn cursor_line_blame(
     s: &mut ServerState,
     buffer_id: BufferId,
@@ -6273,9 +6522,17 @@ fn cursor_line_blame(
         // Blame via the cached repo (no rediscovery). `None` repo (untracked / no repo) → empty.
         // The `buf`/`git_baseline` borrows end at the `compute_blame` call; `lines` is owned, so
         // the `git_blame` mutation below is free of them.
-        let lines = match s.git_baseline.get(&buffer_id).and_then(|b| b.repo.as_ref()) {
-            Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
-            None => Vec::new(),
+        let lines = match revision_file_of(buf) {
+            // A file at a revision has no baseline (nothing registers one) and no working-tree
+            // content to reconcile — it blames at the revision its key names.
+            Some((workdir, rel_path, rev)) => {
+                crate::git::compute_blame_at(&workdir, &rel_path, &rev, &buf.text)
+                    .unwrap_or_default()
+            }
+            None => match s.git_baseline.get(&buffer_id).and_then(|b| b.repo.as_ref()) {
+                Some(repo) => crate::git::compute_blame(repo, &buf.text).unwrap_or_default(),
+                None => Vec::new(),
+            },
         };
         s.git_blame
             .insert(buffer_id, BlameCache { revision, lines });
@@ -6347,8 +6604,11 @@ pub fn spawn_blame_refresh(
             let Some(buf) = s.try_doc_of(buffer_id) else {
                 return;
             };
-            if buf.canonical_path.is_none() {
-                return; // scratch buffer — never has blame
+            // A file at a revision blames from its key, like `git/blame_line`. Only a buffer that
+            // is neither a file nor one of those — a scratch, or a commit's whole patch — has
+            // nothing to attribute.
+            if buf.canonical_path.is_none() && revision_file_of(buf).is_none() {
+                return;
             }
             let revision = buf.revision;
             if s.blame_last_pushed.get(&key) == Some(&(line, revision)) {
@@ -6514,11 +6774,24 @@ pub async fn git_navigate_hunk(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
-    // In a conflicted file the hunks are the wrong targets — there are none, because a conflicted
-    // path has no baseline to diff against — and the things worth stepping between are the conflict
-    // blocks. Same keys, same gesture ("take me to the next thing to deal with"), better answer.
+    // Three sources for "the next thing worth stepping to", picked by what the buffer *is*. Same
+    // keys, same gesture, better answer — the pattern the conflict branch established.
     let conflicts = buffer_conflicts(&s, params.buffer_id);
-    let anchors: Vec<u32> = if !conflicts.is_empty() {
+    let anchors: Vec<u32> = if let Some(generated) = s.doc_of(params.buffer_id).generated.as_ref() {
+        // A generated patch: its own change blocks, already in buffer-line coordinates.
+        // Deliberately the blocks and not the hunks — a hunk opens with the context lines that
+        // make it readable, so stopping at its start would land several lines above anything that
+        // actually changed, and a hunk holding two separate edits would only stop once.
+        generated
+            .index
+            .files
+            .iter()
+            .flat_map(|f| f.changes.iter().map(|c| c.start_line))
+            .collect()
+    } else if !conflicts.is_empty() {
+        // In a conflicted file the hunks are the wrong targets — there are none, because a
+        // conflicted path has no baseline to diff against — and the things worth stepping between
+        // are the conflict blocks.
         conflicts.iter().map(|r| r.start_line).collect()
     } else {
         // Diff against the cached baselines — cheap (no repo I/O) and correct regardless of whether
@@ -6602,6 +6875,215 @@ pub async fn git_navigate_hunk(
     })
 }
 
+/// Where a stage/unstage issued from a working-changes patch actually lands: the file on disk, and
+/// the worktree lines the cursor's change block covers.
+struct PatchApplyTarget {
+    abs_path: std::path::PathBuf,
+    /// 0-based worktree lines the block occupies. Empty for a pure removal, which holds no line of
+    /// its own — `anchor` locates it instead.
+    lines: Vec<u32>,
+    /// 0-based worktree line a pure removal sits above.
+    anchor: u32,
+}
+
+/// Resolve a stage/unstage against a patch buffer, or `None` when this isn't one.
+///
+/// Only the **working-changes** view: a commit's diff is history, and there is nothing in it to
+/// stage. A cursor on the metadata block or on a file with no textual content resolves to nothing.
+async fn resolve_patch_apply_target(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Result<Option<PatchApplyTarget>, RpcError> {
+    let s = state.lock().await;
+    let Some(doc) = s.try_doc_of(buffer_id) else {
+        return Ok(None);
+    };
+    let (Some(generated), Some(source)) = (doc.generated.as_ref(), doc.virtual_source.as_ref())
+    else {
+        return Ok(None);
+    };
+    if source.target.what != aether_protocol::git::ShowTarget::WorkingChanges {
+        return Ok(None);
+    }
+    let line = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .map(|c| c.position.line)
+        .unwrap_or_default();
+    let Some(Some(info)) = generated.index.lines.get(line as usize).copied() else {
+        return Ok(None);
+    };
+    let Some(file) = generated.index.files.get(info.file as usize) else {
+        return Ok(None);
+    };
+    let Some(path) = file.new_path.as_deref() else {
+        return Ok(None);
+    };
+    // The block the cursor is in — the unit staging acts on, and the same one `c` steps between.
+    let Some(block) = file
+        .changes
+        .iter()
+        .find(|c| (c.start_line..c.end_line).contains(&line))
+    else {
+        return Ok(None);
+    };
+    let lines: Vec<u32> = (block.start_line..block.end_line)
+        .filter_map(|i| generated.index.lines.get(i as usize).copied().flatten())
+        .filter_map(|i| i.new_lineno)
+        .map(|n| n.saturating_sub(1))
+        .collect();
+    // A pure removal sits above the next surviving line; fall back to the file's first line.
+    let anchor = (block.end_line..file.end_line)
+        .filter_map(|i| generated.index.lines.get(i as usize).copied().flatten())
+        .find_map(|i| i.new_lineno)
+        .map_or(0, |n| n.saturating_sub(1));
+    Ok(Some(PatchApplyTarget {
+        abs_path: std::path::PathBuf::from(&source.target.repo_id).join(path),
+        lines,
+        anchor,
+    }))
+}
+
+/// Open the file the block belongs to, seat this client's cursor on the block, and run the ordinary
+/// apply against it — then rebuild the patch, whose stage tags are the only thing the action moved.
+async fn apply_hunk_via_patch(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: GitApplyHunkParams,
+    target: PatchApplyTarget,
+) -> Result<GitApplyHunkResult, RpcError> {
+    let client_id = ctx.client_id;
+    let patch_buffer = params.buffer_id;
+
+    // Revert is deliberately not offered from here. Stage and unstage are index writes and need no
+    // buffer; a revert is an *undoable edit*, so delegating it would put the undo in a transient
+    // buffer the user never opened and can't see — and losing an undo is worse than not offering
+    // the key. `Enter` opens the file, where reverting means what it says.
+    if params.action == HunkAction::Revert {
+        let s = state.lock().await;
+        let cursor = s
+            .cursors
+            .get(&(client_id, patch_buffer))
+            .copied()
+            .unwrap_or_default();
+        return Ok(GitApplyHunkResult {
+            cursor: wrap_for_response(&s, client_id, patch_buffer, cursor),
+            status: ApplyHunkStatus::Unavailable,
+        });
+    }
+
+    // Transient: staging from the diff shouldn't leave a trail of buffers you never asked to open.
+    let file = Box::pin(buffer_open(
+        state,
+        ctx,
+        BufferOpenParams {
+            absolute_path: Some(target.abs_path.to_string_lossy().into_owned()),
+            transient: Some(true),
+            ..Default::default()
+        },
+    ))
+    .await?;
+
+    {
+        let mut s = state.lock().await;
+        // `ApplyScope::File` ignores the cursor, so only the block scope needs seating. A pure
+        // removal has no line of its own — address the line it sits above, which is what
+        // `WholeHunkAt` resolves a deletion by.
+        let (lo, hi) = match (target.lines.first(), target.lines.last()) {
+            (Some(&lo), Some(&hi)) => (lo, hi),
+            _ => (target.anchor, target.anchor),
+        };
+        let doc = s.doc_of(file.buffer_id);
+        let position = motion::clamp_position(doc, LogicalPosition { line: hi, col: 0 });
+        let anchor = motion::clamp_position(doc, LogicalPosition { line: lo, col: 0 });
+        set_cursor(
+            &mut s,
+            (client_id, file.buffer_id),
+            CursorState {
+                position,
+                anchor,
+                match_bracket: None,
+                jumplist_position: None,
+            },
+        );
+    }
+
+    let applied = Box::pin(git_apply_hunk(
+        state,
+        ctx,
+        GitApplyHunkParams {
+            buffer_id: file.buffer_id,
+            ..params
+        },
+    ))
+    .await?;
+
+    // The patch's *text* is unchanged — staging doesn't move HEAD — but its stage tags are, so it
+    // has to be rebuilt for the change to be visible at all.
+    if matches!(
+        applied.status,
+        ApplyHunkStatus::Staged | ApplyHunkStatus::Unstaged | ApplyHunkStatus::Reverted
+    ) {
+        regenerate_patch_buffer(state, patch_buffer).await;
+    }
+
+    // Report against the patch buffer the user is actually looking at, not the file we borrowed.
+    let s = state.lock().await;
+    let cursor = s
+        .cursors
+        .get(&(client_id, patch_buffer))
+        .copied()
+        .unwrap_or_default();
+    Ok(GitApplyHunkResult {
+        cursor: wrap_for_response(&s, client_id, patch_buffer, cursor),
+        status: applied.status,
+    })
+}
+
+/// Rebuild a working-changes buffer in place and push the new content to whoever is viewing it.
+async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
+    let workdir = {
+        let s = state.lock().await;
+        match s
+            .try_doc_of(buffer_id)
+            .and_then(|d| d.virtual_source.as_ref())
+        {
+            Some(source) => std::path::PathBuf::from(&source.target.repo_id),
+            None => return,
+        }
+    };
+    let Ok(content) =
+        tokio::task::spawn_blocking(move || crate::git::show_working_changes(&workdir)).await
+    else {
+        return;
+    };
+    let Ok(content) = content else { return };
+
+    let pushes = {
+        let mut s = state.lock().await;
+        let Some(doc_id) = s.buffers.get(&buffer_id).map(|b| b.document) else {
+            return;
+        };
+        if let Some(doc) = s.documents.get_mut(&doc_id) {
+            doc.replace_generated(&content.text, content.generated);
+        }
+        clamp_doc_cursors(&mut s, buffer_id);
+        let line_count = s.doc_of(buffer_id).line_count();
+        refresh_viewport_ranges_for_buffer(&mut s, buffer_id, line_count);
+        let revision = s.doc_of(buffer_id).revision;
+        let mut pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+        // The state push as well as the content one, exactly as a reload sends both. A client
+        // takes its `revision` from `viewport/lines_changed` but its `saved_revision` only from
+        // `buffer/state` — so content alone leaves the two apart, and the buffer reads as edited.
+        pushes.extend(collect_buffer_state_pushes(&s, buffer_id));
+        pushes
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+}
+
 /// Stage, unstage or revert the change under the cursor (bare cursor → the whole hunk it sits on)
 /// or the selected lines (any wider selection, snapped to whole lines). The server resolves the
 /// client's cursor/selection authoritatively — no positions in the params.
@@ -6625,6 +7107,15 @@ pub async fn git_apply_hunk(
 ) -> Result<GitApplyHunkResult, RpcError> {
     let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
+
+    // Staging *from the working-changes view*. The patch buffer isn't the file being staged, so
+    // resolve which file and which of its lines the cursor addresses, then run the ordinary apply
+    // against that file's own buffer — reusing the dirty-buffer guard, the layer resolution and the
+    // status reporting rather than reimplementing an index write here.
+    if let Some(resolved) = resolve_patch_apply_target(state, client_id, params.buffer_id).await? {
+        return apply_hunk_via_patch(state, ctx, params, resolved).await;
+    }
+
     let mut s = state.lock().await;
 
     // Echo the (wrap-adjusted) current cursor with a non-`Applied` status — mirrors `lsp/format`.
@@ -9274,6 +9765,9 @@ pub async fn buffer_close(
                         crate::state::DormantSource::Scratch { number } => crate::backup::delete(
                             &crate::backup::scratch_backup_path(root, &workspace, *number),
                         ),
+                        // A revision is read-only, so it never had a backup to discard. Dropping
+                        // the dormant entry (above) is the whole of closing one.
+                        crate::state::DormantSource::Virtual { .. } => {}
                     }
                 }
                 let pushes = refresh_buffer_pickers(&mut s);
@@ -9414,12 +9908,38 @@ fn nav_entry_for(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> O
         .copied()
         .unwrap_or_default();
     let (path_index, relative_path) = buffer_path_ref(s, client_id, buffer_id);
+    let virtual_key = s
+        .try_doc_of(buffer_id)
+        .and_then(|d| d.virtual_source.as_ref())
+        .map(|v| v.target.key());
     Some(NavEntry {
         buffer_id,
         path_index,
         relative_path,
+        virtual_key,
         cursor,
     })
+}
+
+/// Re-materialise whatever a virtual key names. Shared by nav-history restore and the dormant
+/// (session) restore, which both hold an encoded key and no buffer.
+///
+/// `None` when the key doesn't decode — a session written by a future version, say — which the
+/// callers treat as "not restorable" rather than as an error.
+async fn materialise_virtual_key(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    key: &str,
+) -> Option<Result<BufferOpenResult, RpcError>> {
+    let target = crate::state::VirtualTarget::parse_key(key)?;
+    let params = aether_protocol::git::GitShowParams {
+        repo_id: Some(target.repo_id),
+        buffer_id: None,
+        target: target.what,
+        // A reopen restores its own cursor; focusing a file would fight that.
+        focus_path: None,
+    };
+    Some(git_show(state, ctx, params).await)
 }
 
 /// Open `entry`'s buffer (reopening a closed file by path, else attaching by id) and restore its
@@ -9430,6 +9950,18 @@ async fn navigate_to(
     ctx: &mut ConnectionCtx,
     entry: NavEntry,
 ) -> Result<BufferOpenResult, RpcError> {
+    // A materialised revision has no path to reopen from, so it regenerates from its key — which
+    // is stable across restarts (a repo id is its canonical workdir). Re-showing an already-open
+    // revision attaches to the same buffer, so this is a switch when it's still there and a
+    // regeneration when it isn't.
+    if let Some(key) = entry.virtual_key.as_deref() {
+        if let Some(opened) = materialise_virtual_key(state, ctx, key).await {
+            let mut result = opened?;
+            let mut s = state.lock().await;
+            result.cursor = restore_cursor(&mut s, ctx.client_id, result.buffer_id, entry.cursor);
+            return Ok(result);
+        }
+    }
     // Prefer reopening by path (survives a close); fall back to the id (the only handle a scratch
     // buffer has). `jump_to` is left unset — we restore the full selection below, not a point.
     let by_path = entry.path_index.is_some() || entry.relative_path.is_some();
@@ -9451,20 +9983,30 @@ async fn navigate_to(
     let mut result = buffer_open(state, ctx, open_params).await?;
 
     let mut s = state.lock().await;
-    let restored = match s.try_doc_of(result.buffer_id) {
+    result.cursor = restore_cursor(&mut s, ctx.client_id, result.buffer_id, entry.cursor);
+    Ok(result)
+}
+
+/// Seat a remembered cursor in `buffer_id`, clamped to what the buffer holds now.
+///
+/// A direct insert, *not* `record_motion` — a jump-back must not feed the per-buffer `z` history.
+fn restore_cursor(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    remembered: CursorState,
+) -> CursorState {
+    let restored = match s.try_doc_of(buffer_id) {
         Some(buf) => CursorState {
-            position: motion::clamp_position(buf, entry.cursor.position),
-            anchor: motion::clamp_position(buf, entry.cursor.anchor),
+            position: motion::clamp_position(buf, remembered.position),
+            anchor: motion::clamp_position(buf, remembered.anchor),
             match_bracket: None,
             jumplist_position: None,
         },
-        None => entry.cursor,
+        None => remembered,
     };
-    // Direct insert, *not* via record_motion — a jump-back must not feed `z`.
-    s.cursors
-        .insert((ctx.client_id, result.buffer_id), restored);
-    result.cursor = restored;
-    Ok(result)
+    s.cursors.insert((client_id, buffer_id), restored);
+    restored
 }
 
 /// Shared back/forward step: pop the chosen stack (skipping unrecoverable entries — a closed
@@ -9489,9 +10031,11 @@ async fn nav_step_dir(
                 }
             });
             let Some(entry) = popped else { break };
-            // A file entry can always be reopened; a scratch entry only if it's still open.
+            // A file entry can always be reopened, and so can a revision (it regenerates from its
+            // key); a scratch entry only if it's still open.
             let resolvable = entry.path_index.is_some()
                 || entry.relative_path.is_some()
+                || entry.virtual_key.is_some()
                 || s.buffers.contains_key(&entry.buffer_id);
             if resolvable {
                 chosen = Some(entry);
@@ -9542,6 +10086,7 @@ pub async fn nav_goto(
         buffer_id: params.buffer_id.unwrap_or(0),
         path_index: params.path_index,
         relative_path: params.relative_path,
+        virtual_key: params.virtual_key,
         cursor: params.cursor,
     };
     Ok(NavStepResult {
@@ -10372,11 +10917,7 @@ pub async fn viewport_scroll_to_row(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let line_count = buf.line_count();
     // Row-count use only — no emphasis needed to resolve a visual row to a line.
-    let deleted_rows = if diff_view {
-        deleted_rows_by_anchor(hunks, line_count, None)
-    } else {
-        HashMap::new()
-    };
+    let deleted_rows = virtual_rows_by_line(buf, diff_view, hunks, None);
     let top_line = logical_line_at_visual_row(
         buf,
         cols,
@@ -10672,6 +11213,46 @@ fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) {
 /// staged and an unstaged layer would stack at one anchor (a region modified, staged, then
 /// modified again), only the unstaged rows are kept — what's shown deleted is exactly what a
 /// revert would restore, and HEAD's text resurfaces once the top layer is staged or reverted.
+/// Every virtual row above each line, from whichever producer this buffer has.
+///
+/// The two are mutually exclusive by construction: the inline diff view's phantom deleted rows
+/// need a Git baseline to diff against, and a generated patch has none of its own. They merge here
+/// rather than at the render site because **the scroll arithmetic needs the same answer** — a
+/// chrome row occupies a screen row exactly as a phantom one does, so leaving it out of the extent
+/// makes the scrollbar short, puts the last lines out of reach, and lets the cursor sit below the
+/// scrollable area.
+fn virtual_rows_by_line(
+    buf: &Document,
+    diff_view: bool,
+    hunks: &[crate::git::DiffHunk],
+    intraline: Option<&IntralineEmphasis>,
+) -> HashMap<u32, Vec<VirtualRow>> {
+    if let Some(generated) = buf.generated.as_ref() {
+        let mut map: HashMap<u32, Vec<VirtualRow>> = generated
+            .decorations
+            .virtual_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(i, rows)| (i as u32, rows.clone()))
+            .collect();
+        // The closing rule renders *below* the last line, but for the scroll arithmetic a row is a
+        // row — it occupies one either way, and leaving it out would put the bottom of the patch
+        // out of reach exactly as the chrome rows once did.
+        if !generated.decorations.trailing_rows.is_empty() {
+            map.entry(buf.line_count().saturating_sub(1))
+                .or_default()
+                .extend(generated.decorations.trailing_rows.iter().cloned());
+        }
+        return map;
+    }
+    if diff_view {
+        deleted_rows_by_anchor(hunks, buf.line_count(), intraline)
+    } else {
+        HashMap::new()
+    }
+}
+
 fn deleted_rows_by_anchor(
     hunks: &[crate::git::DiffHunk],
     line_count: u32,
@@ -10694,6 +11275,9 @@ fn deleted_rows_by_anchor(
                     .and_then(|m| m.rows.get(&(hunk_idx, row_idx)))
                     .cloned()
                     .unwrap_or_default(),
+                // A deleted row's colour is entirely the diff palette's: it has no grammar of its
+                // own here (the baseline text isn't parsed), so there is nothing to span.
+                highlights: Vec::new(),
             }
         }));
     }
@@ -12107,11 +12691,7 @@ fn render_window(
     } else {
         IntralineEmphasis::default()
     };
-    let deleted_rows = if diff_view {
-        deleted_rows_by_anchor(hunks, buf.line_count(), Some(&intraline))
-    } else {
-        HashMap::new()
-    };
+    let deleted_rows = virtual_rows_by_line(buf, diff_view, hunks, Some(&intraline));
 
     // For highlighting we need the whole source as bytes. Computed once per render rather than
     // per line. Skipped entirely when no syntax is attached.
@@ -12119,6 +12699,9 @@ fn render_window(
         .syntax
         .as_ref()
         .map(|_| buf.text.chunks().collect::<String>());
+    // Generated read-only content (a commit's patch) instead of a parse tree — see
+    // [`crate::patch::GeneratedPatch`]. Both are never present at once.
+    let generated = buf.generated.as_ref().map(|g| &g.decorations);
 
     for i in first..last_excl {
         let line_slice = buf.text.line(i as usize);
@@ -12141,7 +12724,12 @@ fn render_window(
                     line_byte_end,
                 )
             }
-            _ => Vec::new(),
+            // No tree — but generated content classified itself when it was built, and those spans
+            // are already in this exact shape.
+            _ => generated
+                .and_then(|d| d.highlights.get(i as usize))
+                .cloned()
+                .unwrap_or_default(),
         };
 
         let mut render =
@@ -12152,15 +12740,47 @@ fn render_window(
         if let Some(entry) = sneak {
             render.sneak_targets = sneak_targets_on_line(entry, i, text.len() as u32);
         }
-        if let Some(rows) = deleted_rows.get(&i) {
-            render.virtual_rows_above = rows.clone();
+        // A generated patch's above-rows come straight from its decorations, *not* from the map
+        // the scroll math uses: that map folds the closing chrome in (a row is a row, wherever it
+        // draws), and folding it in here would render it above the last line instead of below it.
+        match generated {
+            Some(g) => {
+                if let Some(rows) = g.virtual_rows.get(i as usize) {
+                    render.virtual_rows_above = rows.clone();
+                }
+            }
+            None => {
+                if let Some(rows) = deleted_rows.get(&i) {
+                    render.virtual_rows_above = rows.clone();
+                }
+            }
+        }
+        // The patch's closing rule, on its final line — see `GeneratedPatch::trailing_rows`.
+        if i + 1 == buf.line_count() {
+            if let Some(g) = generated {
+                render.virtual_rows_below = g.trailing_rows.clone();
+            }
         }
         if let Some((marker, stage)) = markers.get(&i).copied() {
             render.diff_marker = Some(marker);
             render.diff_stage = stage;
         }
         render.conflict = conflict_lines.get(&i).copied();
+        // Ungated, like `conflict` and for the same reason: a patch buffer *is* a diff, so there's
+        // no view to toggle it behind.
+        render.patch = generated
+            .and_then(|d| d.patch.get(i as usize).copied())
+            .flatten();
+        // Which layer this change sits in. In the working-tree diff it is the only visible effect
+        // of staging — the text is identical either way, because staging doesn't move HEAD.
+        if let Some(stage) = generated.and_then(|d| d.stage.get(i as usize).copied()) {
+            render.diff_stage = stage;
+        }
         if let Some(spans) = intraline.lines.get(&i) {
+            render.diff_emphasis = spans.clone();
+        } else if let Some(spans) = generated.and_then(|d| d.emphasis.get(i as usize)) {
+            // A patch's emphasis is precomputed, and lands on *both* sides — unlike the inline
+            // diff view, where the old side is a phantom row carrying its own `emphasis` instead.
             render.diff_emphasis = spans.clone();
         }
         render.diagnostics = diagnostic_spans_on_line(diagnostics, i, text.len() as u32);
@@ -16476,13 +17096,29 @@ fn dormant_candidate(
             crate::workspace_index::workspace_relative_parts(p, roots),
         ),
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
+        // The key's own tail is the readable part — `abc1234` or `abc1234:src/a.rs`. The real
+        // buffer's title is generated with the content, which a dormant entry hasn't paid for yet.
+        crate::state::DormantSource::Virtual { key } => (
+            key.rsplit_once('@').map_or(key.clone(), |(_, r)| {
+                let short: String = r.chars().take(7).collect();
+                match r.split_once(':') {
+                    Some((_, path)) => format!("{short}:{path}"),
+                    None => short,
+                }
+            }),
+            None,
+        ),
     };
     // A dormant *file* row is Clean — its content lives safely on disk; closing it just forgets the
     // session entry. A dormant *scratch* exists only because unsaved content survived as a backup, so
     // it's inherently Unsaved: report that, both for an accurate dirty dot and so `Ctrl-d` routes
     // through the discard-confirm prompt instead of silently dropping the backup.
     let status = match &d.source {
-        crate::state::DormantSource::File(_) => BufferDirtyState::Clean,
+        // A revision is Clean for the same reason a file is, and more so: it is read-only, so
+        // there was never anything to save.
+        crate::state::DormantSource::File(_) | crate::state::DormantSource::Virtual { .. } => {
+            BufferDirtyState::Clean
+        }
         crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
     };
     picker_state::BufferCandidate {
@@ -16492,7 +17128,10 @@ fn dormant_candidate(
         path,
         abs_path: match &d.source {
             crate::state::DormantSource::File(p) => Some(p.to_string_lossy().into_owned()),
-            crate::state::DormantSource::Scratch { .. } => None,
+            // No file to open behind either: a revision is regenerated, and a scratch is content
+            // with nowhere on disk to live.
+            crate::state::DormantSource::Scratch { .. }
+            | crate::state::DormantSource::Virtual { .. } => None,
         },
         transient: false,
     }
@@ -17362,6 +18001,75 @@ fn build_file_git_status(
         .collect()
 }
 
+/// The changes-picker rows for an open **patch** buffer: one per hunk, grouped by the file it came
+/// from.
+///
+/// `Space c` means "the changes in this buffer" either way. In a patch that happens to span
+/// several files, so the rows carry group headers where a single file's rows wouldn't — the
+/// grouping is a consequence of the scope, not a different picker.
+fn build_patch_change_candidates(
+    buffer_id: BufferId,
+    generated: &crate::patch::GeneratedPatch,
+    text: &ropey::Rope,
+) -> Vec<crate::picker::GitChangeCandidate> {
+    let mut out = Vec::new();
+    for file in &generated.index.files {
+        // One row per *change block*, not per hunk: a hunk routinely holds several separate edits,
+        // and each is its own thing to find and jump to. A delta with no hunks has a block over its
+        // placeholder line, so a binary swap or a bare `chmod` still gets a row.
+        for (change_index, block) in file.changes.iter().enumerate() {
+            let (start, end) = (block.start_line, block.end_line);
+            let (added, removed) = (block.added, block.removed);
+            // New side first, then removed, matching the file-diff rows.
+            let side_of = |i: u32| {
+                generated
+                    .decorations
+                    .patch
+                    .get(i as usize)
+                    .copied()
+                    .flatten()
+            };
+            let line_text = |i: u32| -> String {
+                text.line(i as usize)
+                    .chunks()
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            };
+            let mut lines = Vec::new();
+            let mut line_of = Vec::new();
+            for i in (start..end).filter(|&i| side_of(i) == Some(PatchLine::Added)) {
+                lines.push(line_text(i));
+                line_of.push(i);
+            }
+            for i in (start..end).filter(|&i| side_of(i) == Some(PatchLine::Removed)) {
+                lines.push(line_text(i));
+                line_of.push(i);
+            }
+            // A placeholder line is neither side; it is still the row's only content.
+            if lines.is_empty() {
+                for i in start..end {
+                    lines.push(line_text(i));
+                    line_of.push(i);
+                }
+            }
+            out.push(crate::picker::GitChangeCandidate::for_patch(
+                crate::picker::PatchRowTarget {
+                    buffer: buffer_id,
+                    line_of,
+                },
+                file.path().to_string(),
+                change_index as u32,
+                start,
+                added,
+                removed,
+                lines,
+            ));
+        }
+    }
+    out
+}
+
 /// The hunks one open buffer contributes to the Git-changes picker: a row per conflict block plus
 /// the diff outside them when the file is conflicted, otherwise the combined staged+unstaged diff.
 ///
@@ -17781,7 +18489,20 @@ pub async fn picker_view(
             // that buffer's live hunks, no disk walk. Like Diagnostics, a fresh open carries the
             // buffer id and rebuilds; a scroll/resume re-view passes `None` and `preserve_existing`
             // keeps the snapshot.
-            let open = match params.buffer_id {
+            // A patch buffer answers the same question with its own hunks — it *is* a set of
+            // changes, just one spanning several files rather than one file's working tree.
+            let patch_rows = match params.buffer_id {
+                Some(buffer_id) => {
+                    let s = state.lock().await;
+                    s.try_doc_of(buffer_id).and_then(|d| {
+                        d.generated
+                            .as_ref()
+                            .map(|g| build_patch_change_candidates(buffer_id, g, &d.text))
+                    })
+                }
+                None => None,
+            };
+            let open = match params.buffer_id.filter(|_| patch_rows.is_none()) {
                 Some(buffer_id) => {
                     let s = state.lock().await;
                     let roots = s.active_workspace_or_err(client_id)?.paths.clone();
@@ -17821,7 +18542,13 @@ pub async fn picker_view(
                 None => Vec::new(),
             };
             // Empty `roots` ⇒ no disk walk; only the single open buffer's hunks are built.
-            picker_state::PickerCandidates::GitChanges(build_git_change_candidates(&[], open))
+            match patch_rows {
+                Some(rows) => picker_state::PickerCandidates::GitChanges(rows),
+                None => picker_state::PickerCandidates::GitChanges(build_git_change_candidates(
+                    &[],
+                    open,
+                )),
+            }
         }
         // The client ships the rows (its keymap tables aren't server knowledge). A fresh open
         // carries them; a scroll/resume re-view sends none and `preserve_existing` keeps the
@@ -17912,8 +18639,8 @@ pub async fn picker_view(
                         // to do, so take the path out of its key rather than refusing.
                         let from_revision = doc
                             .and_then(|d| d.virtual_source.as_ref())
-                            .and_then(|v| v.key.split_once(':'))
-                            .map(|(_, path)| path.to_string());
+                            .and_then(|v| v.target.path())
+                            .map(str::to_string);
                         Some(
                             from_disk
                                 .or(from_revision)
@@ -17925,6 +18652,7 @@ pub async fn picker_view(
                 (workdir, path)
             };
             let repo_id = workdir.to_string_lossy().into_owned();
+            let row_path = path.clone();
             let (rows, truncated) = tokio::task::spawn_blocking(move || {
                 crate::git::log_commits(&workdir, path.as_deref(), LOG_MAX_EXAMINED)
             })
@@ -17933,7 +18661,13 @@ pub async fn picker_view(
             log_truncated = Some(truncated);
             picker_state::PickerCandidates::GitLog(
                 rows.into_iter()
-                    .map(|row| picker_state::GitCommitCandidate::new(repo_id.clone(), row))
+                    .map(|row| {
+                        picker_state::GitCommitCandidate::new(
+                            repo_id.clone(),
+                            row_path.clone(),
+                            row,
+                        )
+                    })
                     .collect(),
             )
         }
@@ -18000,13 +18734,8 @@ pub async fn picker_view(
                 let revision = s
                     .try_doc_of(buffer_id)
                     .and_then(|d| d.virtual_source.as_ref())
-                    .and_then(|v| v.key.rsplit_once('@'))
-                    .map(|(_, rest)| {
-                        rest.split_once(':')
-                            .map(|(rev, _)| rev)
-                            .unwrap_or(rest)
-                            .to_string()
-                    });
+                    .and_then(|v| v.target.rev())
+                    .map(str::to_string);
                 Some(CursorCentering {
                     leading_edge,
                     abs_path: current_abs,
@@ -18243,6 +18972,23 @@ pub async fn picker_view(
                 .iter()
                 .position(|c| c.row.oid == *rev)
                 .map(|idx| picker.candidates.make_item(idx, Vec::new())),
+            // A patch's rows are lines of this very buffer, so the cursor resolves against them
+            // directly — no path to match on (there isn't one), and no per-file scoping either,
+            // because the patch *is* the scope.
+            (
+                Some(CursorCentering {
+                    leading_edge,
+                    buffer_id,
+                    ..
+                }),
+                picker_state::PickerCandidates::GitChanges(c),
+            ) if c
+                .first()
+                .is_some_and(|x| x.patch.as_ref().is_some_and(|p| p.buffer == *buffer_id)) =>
+            {
+                find_nearest_patch_change(c, leading_edge.line)
+                    .map(|idx| picker.candidates.make_item(idx, Vec::new()))
+            }
             // GitChanges: land on the hunk in the buffer's own file nearest the cursor line. No
             // fall-through to "some other file" — if the active file has no changes, leave the
             // highlight at the top rather than jumping to an unrelated file.
@@ -19158,6 +19904,22 @@ mod document_highlight_tests {
 /// to that file's last hunk when the cursor sits past them all. `None` when the file has no changes
 /// (the picker then opens at the top rather than jumping to an unrelated file). Used by
 /// `picker/view`'s `center_on_cursor` to land the Git-changes picker on "where you are".
+/// The patch row the cursor is **on**, else the first one after it, else the last.
+///
+/// The same "on or after, else the end" rule [`find_nearest_git_change`] uses, but over the whole
+/// patch rather than within one file — a patch is a single scope. Every line of a change block is a
+/// changed line, so the block's extent is `added + removed` (a placeholder occupies one line and
+/// counts neither side, hence the floor).
+fn find_nearest_patch_change(
+    cands: &[picker_state::GitChangeCandidate],
+    cursor_line: u32,
+) -> Option<usize> {
+    cands
+        .iter()
+        .position(|c| cursor_line < c.line + (c.added + c.removed).max(1))
+        .or_else(|| cands.len().checked_sub(1))
+}
+
 fn find_nearest_git_change(
     cands: &[picker_state::GitChangeCandidate],
     current_abs_path: &str,
@@ -19281,6 +20043,35 @@ mod restore_tests {
                 DormantSource::Scratch { number: 1 },
                 // scratch 5 recovered from the backup dir scan, after the session entries.
                 DormantSource::Scratch { number: 5 },
+            ]
+        );
+    }
+
+    /// A kept revision comes back unconditionally: there is nothing on disk to probe for, because
+    /// its content is regenerated from the repo on first view. A commit that has been rebased away
+    /// since reports itself then — when `git/show` can say what went wrong — rather than being
+    /// silently dropped here, where the only honest message would be "something didn't restore".
+    #[test]
+    fn restore_dormant_sources_keeps_revisions() {
+        let entries = vec![
+            SessionBuffer::Virtual {
+                key: "/repo@abc1234".into(),
+            },
+            SessionBuffer::Virtual {
+                key: "/repo@abc1234:src/a.rs".into(),
+            },
+        ];
+        // No backups dir at all: a revision doesn't need one, unlike a scratch.
+        let sources = restore_dormant_sources(&entries, "p", None);
+        assert_eq!(
+            sources,
+            vec![
+                DormantSource::Virtual {
+                    key: "/repo@abc1234".into()
+                },
+                DormantSource::Virtual {
+                    key: "/repo@abc1234:src/a.rs".into()
+                },
             ]
         );
     }

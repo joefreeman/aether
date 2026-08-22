@@ -43,7 +43,8 @@
   --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
   --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
   --match-bracket: var(--nord12); /* paired-bracket highlight under the cursor — chrome, not syntax */
-  --cursor-line-bg: #343a48; /* current-line tint, ~40% from NORD0 toward NORD1 */
+  --cursor-line-bg: #343a48;
+  --patch-chrome-bg: #373e4d; /* current-line tint, ~40% from NORD0 toward NORD1 */
   --overlay-border: var(--nord3-brighter); /* outline for floating overlays' frames */
   --border-subtle: var(--nord3); /* hairline chrome borders — a step quieter than overlay-border */
   /* Foregrounds */
@@ -84,6 +85,7 @@
      (modified lines and phantom deleted rows only), saturated enough to survive the cursor-line
      variant backgrounds too */
   --git-modified-emph-bg: #665b41;
+  --git-added-emph-bg: #4c624c;
   --git-deleted-emph-bg: #65363c;
   --git-staged-modified-emph-bg: #544e3d;
   --git-staged-deleted-emph-bg: #503339;
@@ -91,7 +93,11 @@
   --cursor-line-added-bg: #3a4d3a;
   --cursor-line-modified-bg: #4a4632;
   --cursor-line-staged-added-bg: #3a453c;
+  --cursor-line-staged-deleted-bg: #44343a;
   --cursor-line-staged-modified-bg: #434138;
+  /* The deleted counterpart, which only a `git/show` patch needs: in the diff view a removal is a
+     phantom row the cursor can't reach, in a patch it's an ordinary line. */
+  --cursor-line-deleted-bg: #4c2c31;
   /* Merge conflicts: which side of a block a line is on. A second encoding on top of the diff
      one, safe because the two never land on the same line — the server masks the diff out of the
      conflict blocks. Hue-shifted from the background like the diff tints, teal for ours and purple
@@ -153,7 +159,8 @@
   --sneak-prefix-bg: #c4cedb; /* darker than fill-dim: prominence inverts on light */
   --match-highlight: #9a7522; /* = warning today; free to diverge */
   --match-bracket: #ab5f38; /* = syn-macro today; free to diverge */
-  --cursor-line-bg: #e4e9f0; /* ~40% from NORD6 toward NORD5 */
+  --cursor-line-bg: #e4e9f0;
+  --patch-chrome-bg: #e1e6ee; /* ~40% from NORD6 toward NORD5 */
   --overlay-border: #aab4c4;
   --border-subtle: #d8dfe8; /* = fill-dim today; borders can darken independently */
   --fg: var(--nord0);
@@ -186,13 +193,16 @@
   --git-staged-modified-bg: #ebe7d8;
   --git-staged-deleted-bg: #efe0e2;
   --git-modified-emph-bg: #e3c366;
+  --git-added-emph-bg: #b2dfac;
   --git-deleted-emph-bg: #f1abb0;
   --git-staged-modified-emph-bg: #e4d29a;
   --git-staged-deleted-emph-bg: #f0c1c6;
   --cursor-line-added-bg: #d3e4cb;
   --cursor-line-modified-bg: #e6dfc0;
   --cursor-line-staged-added-bg: #dde7d8;
+  --cursor-line-staged-deleted-bg: #e6d5d7;
   --cursor-line-staged-modified-bg: #e7e3d2;
+  --cursor-line-deleted-bg: #e9d1d1;
   --git-conflict-ours-bg: #d6e8ec;
   --git-conflict-theirs-bg: #e2d2ee;
   --git-conflict-marker: var(--nord10);
@@ -656,6 +666,49 @@ html, body, #app {
 .row.modified-bg { background: var(--git-modified-bg); }
 .row.added-bg.staged { background: var(--git-staged-added-bg); }
 .row.modified-bg.staged { background: var(--git-staged-modified-bg); }
+/* A generated patch's separators. No background fill and no gutter bar — chrome belongs to no line
+   of either side, which is the same reason it holds no cursor position. The file separator's rule
+   is a flex filler, so it runs out to whatever width is left after the path and its counts. */
+/* The band runs edge to edge, gutter included: the gutter belongs to the rows the cursor can
+   reach, and chrome is not one of them. Making "unreachable" legible is its whole job. */
+.row.patch-chrome { color: var(--fg-muted); background: var(--patch-chrome-bg); }
+/* A left rail down the file's chrome, in the gutter column, meeting the rule that opens the block —
+   so the heading rows read as belonging to the file above rather than floating in the diff. */
+.row.patch-chrome .gutter { border-left-color: var(--fg-faint); }
+/* The first file has no rail running into it, so its rule corners rather than teeing: the rail
+   starts halfway down, where the horizontal line meets it. */
+.row.patch-chrome.rule.closes .gutter {
+  border-left-color: transparent;
+  background-image: linear-gradient(to bottom, var(--fg-faint) 50%, transparent 50%);
+  background-size: 1px 100%;
+  background-repeat: no-repeat;
+}
+.row.patch-chrome.rule.corners .gutter {
+  border-left-color: transparent;
+  background-image: linear-gradient(to bottom, transparent 50%, var(--fg-faint) 50%);
+  background-size: 1px 100%;
+  background-repeat: no-repeat;
+}
+.row.patch-chrome .content { display: flex; align-items: center; }
+/* A file block opens with a rule drawn edge to edge; its path and counts sit on the row below. */
+.row.patch-chrome.rule .content::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--fg-faint);
+}
+/* A section heading trails its rule from the end of the signature to the right edge. */
+.row.patch-chrome.hunk-header .content::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  margin-left: 0.75ch;
+  background: var(--fg-faint);
+}
+.hl-diff-file { color: var(--fg); font-weight: 600; }
+.hl-diff-added { color: var(--git-added); }
+.hl-diff-removed { color: var(--git-deleted); }
+
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--git-deleted); }
 .row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }
 /* Intra-line diff emphasis fill, resolved per row kind/stage via a custom property so the
@@ -663,6 +716,10 @@ html, body, #app {
    paint over it, mirroring the terminal's stacking. */
 .row { --diff-emph-bg: var(--git-modified-emph-bg); }
 .row.staged { --diff-emph-bg: var(--git-staged-modified-emph-bg); }
+/* A patch line's emphasis follows its own side's hue: a change there is a red line paired with a
+   green one, so the olive "modified" fill would clash with one of them. */
+.row.patch-added { --diff-emph-bg: var(--git-added-emph-bg); }
+.row.patch-removed { --diff-emph-bg: var(--git-deleted-emph-bg); }
 .row.deleted-phantom { --diff-emph-bg: var(--git-deleted-emph-bg); }
 .row.deleted-phantom.staged { --diff-emph-bg: var(--git-staged-deleted-emph-bg); }
 /* Current-line highlight (Vim's `cursorline`). A subtle custom tint (see --cursor-line-bg), kept
@@ -685,6 +742,26 @@ html, body, #app {
 .row.cursor-line.conflict-ours { background: var(--cursor-line-conflict-ours-bg); }
 .row.cursor-line.conflict-theirs { background: var(--cursor-line-conflict-theirs-bg); }
 .row.conflict-marker .content { color: var(--git-conflict-marker); }
+
+/* Generated-patch sides (`git/show`). Not gated on the diff view — the buffer *is* a patch, so
+   there is nothing to toggle off — and ordered after the cursorline for the same reason the
+   conflict sides are: the change colour has to survive the cursor parking on it. Deliberately the
+   diff view's own tints; the mechanisms differ, what you look at doesn't. Unlike the diff view a
+   removed line here is real text the cursor can land on, hence --cursor-line-deleted-bg. */
+/* A patch's gutter bar: the removed side needs its own class because `.gutter.deleted` is the
+   inline diff view's "removed above" triangle, which is a different thing. */
+.gutter.patch-removed { border-left-color: var(--git-deleted); }
+.gutter.patch-removed.staged { border-left-color: var(--git-staged-deleted); }
+.row.patch-added { background: var(--git-added-bg); }
+.row.patch-removed { background: var(--git-deleted-bg); }
+.row.cursor-line.patch-added { background: var(--cursor-line-added-bg); }
+.row.cursor-line.patch-removed { background: var(--cursor-line-deleted-bg); }
+/* Staged changes take the dimmed pair: hue says which side, brightness says whether it still
+   needs staging. Only the working-tree diff has the distinction. */
+.row.staged.patch-added { background: var(--git-staged-added-bg); }
+.row.staged.patch-removed { background: var(--git-staged-deleted-bg); }
+.row.cursor-line.staged.patch-added { background: var(--cursor-line-staged-added-bg); }
+.row.cursor-line.staged.patch-removed { background: var(--cursor-line-staged-deleted-bg); }
 
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */
@@ -766,8 +843,8 @@ html, body, #app {
 /* Comments are themed NORD3-BRIGHTER — only ~2:1 against the NORD3 fill — so a match inside one
    would be barely legible. Lift just that text to the normal foreground (the italic from
    .hl-comment stays); the compound selector outranks .hl-comment so this wins. Every other
-   syntax color reads fine on NORD3. */
-.search-hit.hl-comment { color: var(--fg); }
+   syntax color reads fine on NORD3. Patch chrome is the same dim shade and needs the same lift. */
+.search-hit.hl-comment, .search-hit.hl-diff-meta { color: var(--fg); }
 .sel { background: var(--bg-visual); }
 /* Selected-whitespace indicators (terminal parity): a muted NORD3 glyph over the selection blue —
    `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→` overlaid
@@ -795,7 +872,7 @@ html, body, #app {
 /* Sneak (s/S) word-jump: candidate words get the same quiet NORD3 tint as a search hit; comment
    text inside one is lifted to NORD4 so it stays visible (mirrors .search-hit.hl-comment). */
 .sneak-target { background: var(--fill-dim); }
-.sneak-target.hl-comment { color: var(--fg); }
+.sneak-target.hl-comment, .sneak-target.hl-diff-meta { color: var(--fg); }
 /* The label glyph painted over a word's first cell: a bold dark char on Aurora yellow, the
    high-contrast "press this to jump" marker (matches the terminal/iced label style). Overrides any
    syntax colour on that cell. */
@@ -805,7 +882,7 @@ html, body, #app {
 .sneak-chip { background: var(--sneak-prefix-bg); }
 /* Comment text on the chip band is ~1.5:1 — lift it like the hit/target rules above (terminal
    parity: the TUI lifts dim foregrounds on this band too). */
-.sneak-chip.hl-comment { color: var(--fg); }
+.sneak-chip.hl-comment, .sneak-chip.hl-diff-meta { color: var(--fg); }
 /* End-of-line git blame for the cursor line. */
 .blame-eol { color: var(--fg-faint); font-style: italic; }
 
@@ -1464,6 +1541,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .hl-reference { color: var(--syn-function); }
 .hl-emphasis { font-style: italic; }
 .hl-strong { font-weight: bold; }
+/* Generated patch chrome. Same shade as .hl-comment but deliberately not italic — italics read
+   badly on a hash or a path, and this is chrome rather than prose. */
+.hl-diff-meta { color: var(--fg-muted); }
+.hl-diff-hunk { color: var(--syn-type); }
 
 /* ---- markdown reading view (docs/markdown-view.md §2.8) --------------------------------------- */
 
