@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 license = "MIT"
 
@@ -87,9 +87,9 @@ tree-sitter-containerfile = "0.9"
 # Commit messages (`COMMIT_EDITMSG`). We ship our own highlights query rather than the crate's:
 # upstream captures use nvim's `markup.*` vocabulary, which `theme.rs` doesn't map.
 tree-sitter-gitcommit = "0.5"
-# Quiver grammar, tracking the upstream repo's `main` branch (the crate lives in its `tree-sitter`
-# subdirectory; Cargo resolves it by package name). Cargo.lock pins the exact commit.
-tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", branch = "main" }
+# Quiver grammar, pinned to the upstream repo's latest release tag (the crate lives in its
+# `tree-sitter` subdirectory; Cargo resolves it by package name). Not published to crates.io.
+tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", tag = "v0.5.0" }
 streaming-iterator = "0.1"
 # Git integration (diff/blame). Local-only: default features (ssh/https/network) disabled so
 # the build doesn't pull in openssl/libssh2 — we never talk to a remote.

@@ -4381,12 +4381,6 @@ fn git_branch_item_spans(
     spans
 }
 
-/// One commit row: `abc1234  subject          author · 3w ago`. The hash leads (it's the row's
-/// identity and what you'd quote elsewhere), the subject takes the space, and the author and
-/// relative date trail dim. The subject highlights where the fuzzy match landed; the hash
-/// highlights the leading `hash_match_len` characters the query abbreviated. The author is shown
-/// but never matched.
-#[allow(clippy::too_many_arguments)]
 /// One baseline row: just its label.
 ///
 /// No marker for the baseline in force — a fresh open highlights that row instead
@@ -4406,6 +4400,12 @@ fn git_baseline_item_spans(
     match_highlighted_spans(label.to_string(), match_indices, base, match_style)
 }
 
+/// One commit row: `abc1234  subject          author · 3w ago`. The hash leads (it's the row's
+/// identity and what you'd quote elsewhere), the subject takes the space, and the author and
+/// relative date trail dim. The subject highlights where the fuzzy match landed; the hash
+/// highlights the leading `hash_match_len` characters the query abbreviated. The author is shown
+/// but never matched.
+#[allow(clippy::too_many_arguments)]
 fn git_commit_item_spans(
     short_hash: &str,
     subject: &str,
