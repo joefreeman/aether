@@ -54,7 +54,7 @@ struct WatcherInner {
     /// `None` once [`WatcherHandle::shutdown`] has run. Dropping the `notify` watcher is the only
     /// way to hand the kernel back its **inotify instance**, so the slot has to be emptiable.
     watcher: Option<RecommendedWatcher>,
-    /// Every path currently registered with the kernel: kept directories plus single-file roots.
+    /// Every path currently registered with the kernel: the kept directories.
     watched: HashSet<PathBuf>,
 }
 
@@ -224,15 +224,11 @@ pub fn watch_buffer_parent(handle: &WatcherHandle, file: &Path) {
 }
 
 /// Everything under `roots` that should carry a kernel watch: each root's non-ignored directories
-/// (same `ignore` semantics as `workspace_index::walk_with` with both exclusions on), the git
-/// internals any of those directories host, and single-file roots as themselves.
+/// (same `ignore` semantics as `workspace_index::walk_with` with both exclusions on) and the git
+/// internals any of those directories host.
 fn watch_targets(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for root in roots {
-        if root.is_file() {
-            out.push(root.clone());
-            continue;
-        }
         let walker = ignore::WalkBuilder::new(root)
             .follow_links(false)
             .hidden(true)
@@ -866,14 +862,6 @@ mod tests {
         }
         // But not the noisy internals a recursive watch used to cover.
         assert!(!targets.contains(&root.join(".git/objects")));
-    }
-
-    #[test]
-    fn watch_targets_single_file_root_is_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes.txt");
-        std::fs::write(&file, "hi\n").unwrap();
-        assert_eq!(watch_targets(std::slice::from_ref(&file)), vec![file]);
     }
 
     #[test]

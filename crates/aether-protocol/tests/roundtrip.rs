@@ -1759,11 +1759,27 @@ fn method_name_constants() {
 
 #[test]
 fn directory_list_params_shape() {
+    // The bounded default is the whole-message shape: `unrestricted` is skipped when clear, so
+    // every existing caller's wire bytes are unchanged by the flag's existence.
     let v = to_value(DirectoryListParams {
         path: "/home/foo/proj/src".into(),
+        unrestricted: false,
     })
     .unwrap();
     assert_eq!(v, json!({ "path": "/home/foo/proj/src" }));
+
+    let v = to_value(DirectoryListParams {
+        path: "~/code".into(),
+        unrestricted: true,
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "path": "~/code", "unrestricted": true }));
+
+    // And an old client's message still parses — the flag defaults to the bounded mode rather
+    // than to the permissive one.
+    let back: DirectoryListParams =
+        serde_json::from_value(json!({ "path": "/home/foo/proj/src" })).unwrap();
+    assert!(!back.unrestricted);
 }
 
 #[test]
@@ -2185,17 +2201,19 @@ fn workspace_info_carries_projects() {
         name: "aether".into(),
         paths: vec!["/src/aether".into()],
         projects: vec![
+            // `.` is the root itself — a project is a directory, so this is the ordinary form for
+            // a single-crate workspace rather than a special case.
             WorkspaceProject {
                 path_index: 0,
-                relative_path: "Cargo.toml".into(),
+                relative_path: ".".into(),
                 language: "rust".into(),
                 error: None,
             },
             WorkspaceProject {
                 path_index: 0,
-                relative_path: "gone/go.mod".into(),
+                relative_path: "gone".into(),
                 language: "go".into(),
-                error: Some("project marker does not exist: /src/aether/gone/go.mod".into()),
+                error: Some("project directory does not exist: /src/aether/gone".into()),
             },
         ],
     };
@@ -2203,12 +2221,12 @@ fn workspace_info_carries_projects() {
     assert_eq!(
         v["projects"],
         json!([
-            {"path_index": 0, "relative_path": "Cargo.toml", "language": "rust"},
+            {"path_index": 0, "relative_path": ".", "language": "rust"},
             {
                 "path_index": 0,
-                "relative_path": "gone/go.mod",
+                "relative_path": "gone",
                 "language": "go",
-                "error": "project marker does not exist: /src/aether/gone/go.mod",
+                "error": "project directory does not exist: /src/aether/gone",
             },
         ]),
         "a resolving project carries no `error` key",
@@ -2222,23 +2240,24 @@ fn workspace_add_project_params_round_trip() {
     use aether_protocol::workspace::{WorkspaceAddProject, WorkspaceAddProjectParams};
     assert_eq!(WorkspaceAddProject::NAME, "workspace/add_project");
 
-    // Bare form: the language is inferred from the marker's file name.
+    // Bare form: the language is inferred from the build manifests inside the directory.
     let p = WorkspaceAddProjectParams {
         workspace: "aether".into(),
         path_index: 0,
-        relative_path: "Cargo.toml".into(),
+        relative_path: ".".into(),
         language: None,
     };
     assert_eq!(
         to_value(&p).unwrap(),
-        json!({"workspace": "aether", "path_index": 0, "relative_path": "Cargo.toml"}),
+        json!({"workspace": "aether", "path_index": 0, "relative_path": "."}),
     );
 
-    // Explicit form, for a marker that can't imply one, under a second root.
+    // Explicit form, for a directory whose manifests don't single out one language, under a second
+    // root.
     let p = WorkspaceAddProjectParams {
         workspace: "aether".into(),
         path_index: 1,
-        relative_path: "web/package.json".into(),
+        relative_path: "web".into(),
         language: Some("typescript".into()),
     };
     assert_eq!(
@@ -2246,7 +2265,7 @@ fn workspace_add_project_params_round_trip() {
         json!({
             "workspace": "aether",
             "path_index": 1,
-            "relative_path": "web/package.json",
+            "relative_path": "web",
             "language": "typescript",
         }),
     );
@@ -2259,11 +2278,11 @@ fn workspace_remove_project_params_round_trip() {
     let p = WorkspaceRemoveProjectParams {
         workspace: "aether".into(),
         path_index: 0,
-        relative_path: "Cargo.toml".into(),
+        relative_path: "web".into(),
     };
     assert_eq!(
         to_value(&p).unwrap(),
-        json!({"workspace": "aether", "path_index": 0, "relative_path": "Cargo.toml"}),
+        json!({"workspace": "aether", "path_index": 0, "relative_path": "web"}),
     );
 }
 

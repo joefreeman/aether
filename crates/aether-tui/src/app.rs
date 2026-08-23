@@ -214,7 +214,10 @@ pub struct AppState {
     /// Active open-from-path prompt (`Space Alt-w`): a single-line path input shown in the status
     /// row. `Some` holds the field's text + caret; text entry is shell-owned (synced into the
     /// core's `Prompt::OpenPath`), `Enter` opens via `workspace/open_path`, `Esc` cancels.
-    pub open_path_prompt: Option<crate::text_input::TextInput>,
+    /// The open-from-path prompt, projected the same way the save prompt is — it is the same core
+    /// `PathEditor`, so it renders through the same span builder (with its own label) and gets the
+    /// same ghosts. Always single-segment: an absolute path has no root to choose.
+    pub open_path_prompt: Option<crate::save_prompt::SavePromptState>,
     /// Active binary y/N confirmation prompt. Layers on top of any other overlay (including
     /// `save_prompt`, e.g. for the save-as overwrite confirm). Holds the question text and the
     /// action to run on `y`.
@@ -342,8 +345,8 @@ pub struct WorkspaceSettingsState {
     /// the projects, the add-project input.
     pub rows: Vec<SettingsListRow>,
     pub selected: usize,
-    /// Text being typed into the add-root input row.
-    pub add_input: crate::text_input::TextInput,
+    /// The add-root row's path editor, projected for rendering.
+    pub add: PathFieldState,
     /// The add-project row's path editor, projected for rendering.
     pub add_project: ProjectEditorState,
     /// In-dialog error from the last add or remove attempt. Rendered as the bottom line of the
@@ -367,6 +370,25 @@ impl WorkspaceSettingsState {
             .iter()
             .position(|r| r.select == Some(self.selected))
     }
+}
+
+/// A single-segment path field, projected from the core's `PathEditor` — the add-root row, whose
+/// value is an absolute filesystem path and so has no root segment to choose and no language to
+/// pin. Its own struct rather than a half-filled [`ProjectEditorState`]: the fields that don't
+/// apply here shouldn't be sitting there empty, inviting a renderer to draw them.
+#[derive(Debug, Clone, Default)]
+pub struct PathFieldState {
+    pub input: crate::text_input::TextInput,
+    /// The completion suffix beyond what's typed, drawn dim after it. `None` when nothing matches.
+    pub ghost: Option<String>,
+    /// The dir portion failed to list — drawn red, as an advisory.
+    pub invalid: bool,
+    /// Whether this row has focus — gates the ghost, which is a completion aid for the segment
+    /// being edited rather than part of the value.
+    pub focused: bool,
+    /// The affordance to draw *instead of* the field, from the core's `add_placeholder` — so all
+    /// three shells collapse the row on the same rule, with the same words.
+    pub placeholder: Option<&'static str>,
 }
 
 /// The add-project row's two-segment path editor, projected from the core's `PathEditor` — the same
@@ -400,6 +422,9 @@ pub struct ProjectEditorState {
     pub language_invalid: bool,
     /// The language segment has focus.
     pub on_language: bool,
+    /// The affordance to draw *instead of* the field, from the core's `add_placeholder` — the same
+    /// single source the add-root row reads.
+    pub placeholder: Option<&'static str>,
 }
 
 impl ProjectEditorState {
@@ -432,7 +457,7 @@ pub enum SettingsRowView {
     /// A non-focusable spacer, so the sections breathe. Counted as a row so the scroll math and
     /// the renderer agree on how many lines the list occupies.
     Blank,
-    /// A declared project: its marker path, the language it pins a server for, and the reason it
+    /// A declared project: its directory path, the language it pins a server for, and the reason it
     /// can't be used (rendered red in place of the language).
     Project {
         path: String,

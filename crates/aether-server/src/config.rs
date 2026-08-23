@@ -335,8 +335,8 @@ impl ProjectRef {
 
 /// Repair a flat project list after the root at `removed` is dropped from a workspace.
 ///
-/// Projects under that root go with it — they have no root left to live in, and their markers are
-/// outside the workspace now. Everything above shifts down one.
+/// Projects under that root go with it — they have no root left to live in, and their directories
+/// are outside the workspace now. Everything above shifts down one.
 ///
 /// This is the one place a root *index* has to be maintained by hand. The config file nests projects
 /// under their root specifically so the on-disk form can't drift; in memory they're flat (so
@@ -529,8 +529,11 @@ fn manifest_languages(dir: &Path) -> Result<Vec<&'static str>, String> {
 /// ```toml
 /// [[roots]]
 /// path = "/src/aether"
-/// projects = ["Cargo.toml"]
+/// projects = ["."]
 /// ```
+///
+/// Both halves are directories: a root is a tree to index and watch, and a project is the directory
+/// a language server is rooted at (`"."` being the root itself).
 ///
 /// `roots` is deliberately **required** — no `#[serde(default)]`. A missing or misspelled key is a
 /// broken config, and failing to parse says so; defaulting would activate a workspace with no roots
@@ -637,6 +640,30 @@ pub fn load_workspace_in(dir: &Path, name: &str) -> Result<WorkspaceConfig, Load
     })?;
     // The filename is the source of truth for the workspace name; the file body doesn't carry it.
     config.name = name.to_string();
+    // A root is a directory. `workspace/add_root` refuses anything else, so the only way one gets
+    // in is a hand-edited file — dropped here rather than carried, which is what makes the
+    // directory-ness of `WorkspaceEntry::paths` an invariant instead of a convention.
+    //
+    // Dropped, not rejected: failing the load would lock you out of the whole workspace over one
+    // bad line, with no way to fix it from the settings overlay. The root's projects nest inside it
+    // and go with it, which also keeps `project_refs`'s indices consistent — this runs before
+    // anything enumerates them.
+    config.roots.retain(|root| {
+        // Only *exists and isn't a directory* is a bad root. A path that doesn't resolve at all is
+        // an unmounted drive or a detached worktree, which has always been allowed to come back —
+        // `is_dir()` alone would silently eat those.
+        match std::fs::metadata(&root.path) {
+            Ok(meta) if !meta.is_dir() => {
+                tracing::warn!(
+                    workspace = %name,
+                    path = %root.path.display(),
+                    "dropping workspace root: not a directory"
+                );
+                false
+            }
+            _ => true,
+        }
+    });
     Ok(config)
 }
 
@@ -1837,7 +1864,7 @@ mod tests {
             r#"
             [[roots]]
             path = "/src/aether"
-            projects = ["Cargo.toml", { path = "web/package.json", language = "typescript" }]
+            projects = [".", { path = "web", language = "typescript" }]
 
             [[roots]]
             path = "/src/other"
@@ -1853,7 +1880,7 @@ mod tests {
         let refs = cfg.project_refs();
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].root_index, 0);
-        assert_eq!(refs[0].relative_path, PathBuf::from("Cargo.toml"));
+        assert_eq!(refs[0].relative_path, PathBuf::from("."));
         assert_eq!(refs[0].language, None);
         assert_eq!(refs[1].root_index, 0);
         assert_eq!(refs[1].language.as_deref(), Some("typescript"));
@@ -1867,6 +1894,62 @@ mod tests {
         );
     }
 
+    /// The load-time half of the directory-only root rule. `workspace/add_root` guards the RPC; this
+    /// guards the hand-edited file, and together they're what make "every root is a directory" an
+    /// invariant the index and watcher can rely on rather than re-check.
+    ///
+    /// The distinction that matters is *exists and isn't a directory* versus *doesn't resolve*: an
+    /// unmounted drive or a detached worktree has always been allowed to come back, and a bare
+    /// `is_dir()` would have quietly eaten it.
+    #[test]
+    fn load_drops_file_roots_but_keeps_ones_that_merely_do_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("workspaces");
+        std::fs::create_dir_all(&store).unwrap();
+
+        let real = dir.path().join("tree");
+        std::fs::create_dir_all(real.join("web")).unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "hi\n").unwrap();
+        let absent = dir.path().join("not-mounted-yet");
+
+        std::fs::write(
+            store.join("w.toml"),
+            format!(
+                r#"
+                [[roots]]
+                path = "{}"
+                projects = ["web"]
+
+                [[roots]]
+                path = "{}"
+                projects = ["."]
+
+                [[roots]]
+                path = "{}"
+                "#,
+                real.display(),
+                file.display(),
+                absent.display(),
+            ),
+        )
+        .unwrap();
+
+        let cfg = load_workspace_in(&store, "w").unwrap();
+        assert_eq!(
+            cfg.paths(),
+            vec![real.clone(), absent],
+            "the file root is dropped; the not-yet-there root is kept"
+        );
+
+        // Projects nest inside their root, so the dropped root took its own with it — and the
+        // survivor's index is still the position it now occupies, with nothing to renumber.
+        let refs = cfg.project_refs();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].root_index, 0);
+        assert_eq!(refs[0].relative_path, PathBuf::from("web"));
+    }
+
     /// A bare path stays a bare string on the way back out, and projects re-nest under the root
     /// their index names — so a round-trip through memory is lossless.
     #[test]
@@ -1875,19 +1958,19 @@ mod tests {
         let projects = vec![
             ProjectRef {
                 root_index: 0,
-                relative_path: PathBuf::from("Cargo.toml"),
+                relative_path: PathBuf::from("."),
                 language: None,
             },
             ProjectRef {
                 root_index: 1,
-                relative_path: PathBuf::from("web/package.json"),
+                relative_path: PathBuf::from("web"),
                 language: Some("typescript".into()),
             },
         ];
         let cfg = WorkspaceConfig::from_parts("aether".into(), &paths, &projects);
         let body = toml::to_string_pretty(&cfg).unwrap();
         assert!(
-            body.contains(r#""Cargo.toml""#),
+            body.contains(r#"".""#),
             "a language-less entry stays a bare string:\n{body}"
         );
         let back: WorkspaceConfig = toml::from_str(&body).unwrap();
@@ -1906,7 +1989,7 @@ mod tests {
         let paths = vec![PathBuf::from("/src/aether")];
         let projects = vec![ProjectRef {
             root_index: 7,
-            relative_path: PathBuf::from("Cargo.toml"),
+            relative_path: PathBuf::from("web"),
             language: None,
         }];
         let cfg = WorkspaceConfig::from_parts("aether".into(), &paths, &projects);

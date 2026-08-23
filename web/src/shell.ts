@@ -267,21 +267,10 @@ type ConfirmKind =
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
-  | {
-      /** Save-as: a root + path completion editor mirroring the dir chip editor — the focused
-       *  segment is a native `<input>` over a gray ghost-suggestion span; the core owns the
-       *  completion/validity logic and feeds the ghosts + validity back through the view. */
-      kind: "saveas";
-      field: "root" | "path";
-      input: string;
-      root_filter: string;
-      multi_root: boolean;
-      root_ghost: string | null;
-      root_invalid: boolean;
-      root_display: string | null;
-      path_ghost: string | null;
-      path_invalid: boolean;
-    }
+  /** Save-as: a root + path completion editor mirroring the dir chip editor — the focused segment
+   *  is a native `<input>` over a gray ghost-suggestion span; the core owns the completion/validity
+   *  logic and feeds the ghosts + validity back through the view. */
+  | ({ kind: "saveas" } & PathEditorView)
   | { kind: "lspinfo"; status: LspServerStatus }
   /** Application info (`Space ?`). Pre-composed by the core into titled sections of label/value
    *  rows, so all three shells show identical content; `warn` marks the client/server build
@@ -293,9 +282,10 @@ type PromptView =
         rows: { label: string; value: string; warn: boolean }[];
       }[];
     }
-  /** Open-from-path: a single plain `<input>` path field (no root chips). The core opens it via
-   *  `workspace/open_path` on Enter and syncs typed text via `open_path_set_input`. */
-  | { kind: "openpath"; input: string };
+  /** Open-from-path: the same editor as save-as, over an *absolute* path — so `multi_root` is
+   *  always false and the root half never applies. The core opens it via `workspace/open_path` on
+   *  Enter and syncs typed text via `open_path_set_input`. */
+  | ({ kind: "openpath" } & PathEditorView);
 
 /** The web client's phrasing for each confirmation reason — a presentational choice, matching the
  *  native/TUI wording. The modal then offers Yes/No (the destructive action in red). */
@@ -534,8 +524,15 @@ interface WorkspaceSettingsView {
   input_index: number;
   add_project_index: number;
   first_project_index: number;
-  add: EditorInput;
+  /** The add-root row. A full path editor like `add_project`, but over an *absolute* path — so its
+   *  `multi_root` is always false and the root-segment half of `PathEditorView` never applies. */
+  add: PathEditorView;
   add_project: PathEditorView;
+  /** The affordance each add row shows *instead of* its editor, or null to draw the editor. The
+   *  core owns both the rule (unfocused and untouched — which a seeded `~/` still satisfies) and
+   *  the words, so the three shells can't drift apart. */
+  add_placeholder: string | null;
+  add_project_placeholder: string | null;
   /** The add-project row's optional language override — empty means "infer from the directory". */
   add_project_language: {
     input: string;
@@ -1069,6 +1066,9 @@ export class Shell {
    *  focus/caret across renders), parallel to save-as. */
   private readonly openPathEl: HTMLElement;
   private readonly openPathInput: HTMLInputElement;
+  /** The open-from-path field area — holds the input inside its ghost wrap, built once. */
+  private readonly openPathFieldEl: HTMLElement;
+  private openPathGhost: HTMLElement | null = null;
   private openPathOpen = false;
   private readonly pickerEl: HTMLElement;
   private readonly pickerInput: HTMLInputElement;
@@ -1164,6 +1164,9 @@ export class Shell {
   private readonly psProjectsEl: HTMLElement;
   private readonly psNameInput: HTMLInputElement;
   private readonly psAddInput: HTMLInputElement;
+  /** The add-root row's field area, rebuilt per render like the add-project row's. */
+  private readonly psAddFieldEl: HTMLElement;
+  private psAddGhost: HTMLElement | null = null;
   private readonly psAddProjectInput: HTMLInputElement;
   private readonly psAddProjectRootInput: HTMLInputElement;
   private readonly psAddProjectLanguageInput: HTMLInputElement;
@@ -1340,15 +1343,19 @@ export class Shell {
     const openMsg = document.createElement("div");
     openMsg.className = "modal-message";
     openMsg.textContent = "Open file";
-    const openField = document.createElement("div");
-    openField.className = "modal-field saveas-field";
+    this.openPathFieldEl = document.createElement("div");
+    this.openPathFieldEl.className = "modal-field saveas-field";
     this.openPathInput = document.createElement("input");
     this.openPathInput.className = "picker-editor-input";
     this.openPathInput.spellcheck = false;
     this.openPathInput.autocapitalize = "off";
     this.openPathInput.setAttribute("autocomplete", "off");
-    this.openPathInput.placeholder = "path to open";
-    this.openPathInput.addEventListener("keydown", (e) => this.routeOverlayKey(e));
+    // No native `placeholder`: the ghost layer sits over this input, so a placeholder would render
+    // through it. The seeded `~/` is the affordance instead.
+    // The save-as handler, not the generic `routeOverlayKey`: this field now has completion, so
+    // Alt-l / Alt-j / Alt-k / Alt-Backspace must reach the core — and off `e.code`, since macOS
+    // Option composes glyphs into `e.key`.
+    this.openPathInput.addEventListener("keydown", (e) => this.onSaveAsInputKey(e));
     this.openPathInput.addEventListener("input", () => {
       if (this.session) {
         this.runEffects(
@@ -1356,7 +1363,6 @@ export class Shell {
         );
       }
     });
-    openField.append(this.openPathInput);
     const openButtons = document.createElement("div");
     openButtons.className = "modal-buttons";
     const openCancel = document.createElement("span");
@@ -1368,7 +1374,7 @@ export class Shell {
     openOk.textContent = "Open";
     openOk.addEventListener("click", () => this.saveAsCommand("Enter"));
     openButtons.append(openCancel, openOk);
-    openModal.append(openMsg, openField, openButtons);
+    openModal.append(openMsg, this.openPathFieldEl, openButtons);
     this.openPathEl.append(openModal);
     // The picker overlay is persistent DOM (built once) so its native <input> keeps focus + caret
     // across re-renders — only the jumplist is rebuilt. The input owns text editing and syncs
@@ -1564,8 +1570,10 @@ export class Shell {
     // bulleted item. Persistent — so a root-list rebuild never re-parents the input and steals its
     // caret mid-type. The bullet is a static lead; the input is borderless (the caret is its cue).
     this.psAddInput = document.createElement("input");
-    this.psAddInput.className = "ps-add-input";
-    this.psAddInput.placeholder = "Add root...";
+    // The shared completing-field DOM, like the add-project row and the save-as prompt: the input
+    // sits over a ghost layer. The unfocused-and-empty affordance is a `ps-placeholder` span the
+    // render swaps in, not a native `placeholder` attribute.
+    this.psAddInput.className = "picker-editor-input";
     this.psAddInput.spellcheck = false;
     this.psAddInput.autocapitalize = "off";
     this.psAddInput.setAttribute("autocomplete", "off");
@@ -1578,7 +1586,11 @@ export class Shell {
     const psAddBullet = document.createElement("span");
     psAddBullet.className = "ps-bullet";
     psAddBullet.textContent = "•";
-    psAddRow.append(psAddBullet, this.psAddInput);
+    // Rebuilt per render (the row collapses to a placeholder when unfocused and empty); the input
+    // inside it is persistent, so a rebuild never steals a caret mid-type.
+    this.psAddFieldEl = document.createElement("span");
+    this.psAddFieldEl.className = "picker-editor-field";
+    psAddRow.append(psAddBullet, this.psAddFieldEl);
     // The Projects group, the same shape as Roots: a rebuilt `<ul>` plus a persistent add row
     // outside it, so a list rebuild never steals the input's caret mid-type.
     const psProjectsLabel = document.createElement("div");
@@ -3172,8 +3184,11 @@ export class Shell {
   }
 
   private onSaveAsInputKey(e: KeyboardEvent): void {
+    // Shared by both path prompts: they are the same core editor, so they take the same keys. The
+    // open-from-path one is always single-segment (`multi_root` false), which makes the two
+    // root-boundary gates below dead for it rather than needing a branch.
     const p = this.snapshot?.prompt;
-    if (p?.kind !== "saveas" || !this.session) return;
+    if ((p?.kind !== "saveas" && p?.kind !== "openpath") || !this.session) return;
     const k = e.key;
     if (k === "Shift" || k === "Control" || k === "Alt" || k === "Meta") {
       e.preventDefault(); // swallow lone modifiers so they don't reach the window handler
@@ -3270,8 +3285,20 @@ export class Shell {
       this.overlayEl.style.display = "none";
       this.overlayEl.replaceChildren();
       this.openPathEl.style.display = "";
-      // Sync the value out-of-band only when it actually differs, so the live caret survives.
-      if (this.openPathInput.value !== p.input) this.openPathInput.value = p.input;
+      // One segment always (the path is absolute), so unlike save-as there is no structure to
+      // rebuild — the wrap is built once and only its contents re-sync.
+      if (!this.openPathGhost) {
+        const wrap = Shell.pathWrap(this.openPathInput, false);
+        this.openPathGhost = wrap.firstElementChild as HTMLElement;
+        this.openPathFieldEl.replaceChildren(wrap);
+      }
+      // `setInputValue`, not a plain `.value =`: it parks the caret at the end of a core-driven
+      // rewrite, which is what an `Alt-l` accept or an `Alt-Backspace` pop is.
+      if (this.openPathInput.value !== p.input) {
+        this.setInputValue(this.openPathInput, p.input);
+      }
+      this.openPathInput.classList.toggle("invalid", p.path_invalid);
+      this.fillGhost(this.openPathGhost, p.input, p.path_ghost);
       return;
     }
     if (wasOpenPath) {
@@ -3493,14 +3520,24 @@ export class Shell {
    *  otherwise it stretches across the row (the path segment). Records the ghost for per-keystroke
    *  refills. */
   private saveAsWrap(input: HTMLInputElement, hug: boolean): HTMLElement {
+    const wrap = Shell.pathWrap(input, hug);
+    const ghost = wrap.firstElementChild as HTMLElement;
+    if (hug) this.saveAsRootGhost = ghost;
+    else this.saveAsPathGhost = ghost;
+    return wrap;
+  }
+
+  /** The ghost-over-input stack every completing field is built from: a `picker-editor-ghost` span
+   *  first, the input over it. `hug` makes the ghost the in-flow sizer (for a segment that must
+   *  size to its content) rather than the input. Pure — the caller owns where the ghost is cached,
+   *  since each field tracks its own. */
+  private static pathWrap(input: HTMLInputElement, hug: boolean): HTMLElement {
     const wrap = document.createElement("span");
     wrap.className = hug ? "picker-editor-rootwrap hug" : "picker-editor-rootwrap";
     const ghost = document.createElement("span");
     ghost.className = "picker-editor-ghost";
     input.classList.add("picker-editor-root");
     wrap.append(ghost, input);
-    if (hug) this.saveAsRootGhost = ghost;
-    else this.saveAsPathGhost = ghost;
     return wrap;
   }
 
@@ -3541,13 +3578,7 @@ export class Shell {
     // `setInputValue` parks the caret at the end of a core-driven rewrite — which is what an
     // `Alt-l` accept is. A plain `.value =` leaves the caret at its old index, mid-string.
     if (this.psNameInput.value !== ps.name.text) this.setInputValue(this.psNameInput, ps.name.text);
-    if (this.psAddInput.value !== ps.add.text) this.setInputValue(this.psAddInput, ps.add.text);
-    // Placeholders only while the row is unfocused: once focused the caret is the cue, and the
-    // ghost carries any suggestion. Matches the native clients.
-    const onAddRoot = ps.selected === ps.input_index;
-    this.psAddInput.placeholder = onAddRoot ? "" : "Add root...";
-    if (this.psNameInput.value !== ps.name.text) this.setInputValue(this.psNameInput, ps.name.text);
-    if (this.psAddInput.value !== ps.add.text) this.setInputValue(this.psAddInput, ps.add.text);
+    this.renderAddRootField(ps);
     this.renderAddProjectField(ps);
     this.psNameInput.classList.toggle("focused", ps.selected === 0);
 
@@ -3630,6 +3661,47 @@ export class Shell {
     if (document.activeElement !== target) target.focus();
   }
 
+  /** The add-root row's field: a single ghost-stacked `<input>`, since its value is an absolute
+   *  filesystem path with no root segment to choose. The simpler sibling of
+   *  `renderAddProjectField` — same DOM, same `picker-editor-*` classes, minus the root and
+   *  language halves. */
+  private renderAddRootField(ps: WorkspaceSettingsView): void {
+    const ed = ps.add;
+    const focused = ps.selected === ps.input_index;
+    // The core decides when the row collapses to its affordance, and with what words.
+    if (ps.add_placeholder !== null) {
+      const hint = document.createElement("span");
+      hint.className = "ps-placeholder";
+      hint.textContent = ps.add_placeholder;
+      this.psAddFieldEl.replaceChildren(hint);
+      this.psAddGhost = null;
+      return;
+    }
+    this.psAddGhost = null;
+    if (focused) {
+      const wrap = document.createElement("span");
+      wrap.className = "picker-editor-rootwrap";
+      const ghost = document.createElement("span");
+      ghost.className = "picker-editor-ghost";
+      this.psAddInput.classList.add("picker-editor-root");
+      wrap.append(ghost, this.psAddInput);
+      this.psAddGhost = ghost;
+      this.psAddFieldEl.replaceChildren(wrap);
+      if (this.psAddInput.value !== ed.input) {
+        // Parks the caret at the end of a core-driven rewrite — which an `Alt-l` accept is. A plain
+        // `.value =` would leave it at its old index, mid-string.
+        this.setInputValue(this.psAddInput, ed.input);
+      }
+      this.psAddInput.classList.toggle("invalid", ed.path_invalid);
+      this.fillGhost(this.psAddGhost, ed.input, ed.path_ghost);
+    } else {
+      const span = document.createElement("span");
+      span.className = "picker-editor-seg";
+      span.textContent = ed.input;
+      this.psAddFieldEl.replaceChildren(span);
+    }
+  }
+
   /** The add-project row's field: whichever segment has focus is a ghost-stacked `<input>`, the
    *  other is static text — the same shape (and the same `picker-editor-*` DOM) as the save-as
    *  prompt, so the two read and behave identically. Rebuilt per render because which segment is an
@@ -3638,11 +3710,11 @@ export class Shell {
   private renderAddProjectField(ps: WorkspaceSettingsView): void {
     const ed = ps.add_project;
     const focused = ps.selected === ps.add_project_index;
-    // Unfocused and empty, the row collapses to its affordance — as the add-root row does.
-    if (!focused && ed.input.length === 0) {
+    // The core decides when the row collapses to its affordance — as the add-root row does.
+    if (ps.add_project_placeholder !== null) {
       const hint = document.createElement("span");
       hint.className = "ps-placeholder";
-      hint.textContent = "Add project...";
+      hint.textContent = ps.add_project_placeholder;
       this.psAddProjectFieldEl.replaceChildren(hint);
       this.psAddProjectGhost = null;
       this.psAddProjectRootGhost = null;

@@ -3344,6 +3344,7 @@ async fn directory_list_returns_children_and_parent() {
         &mut ws,
         &DirectoryListParams {
             path: target.display().to_string(),
+            unrestricted: false,
         },
     )
     .await;
@@ -3375,6 +3376,7 @@ async fn directory_list_at_root_omits_parent_and_sorts_dirs_first() {
         &mut ws,
         &DirectoryListParams {
             path: root.display().to_string(),
+            unrestricted: false,
         },
     )
     .await;
@@ -3407,6 +3409,9 @@ async fn directory_list_rejects_path_outside_workspace() {
         &mut ws,
         &DirectoryListParams {
             path: "/etc".into(),
+            // The point of this test: the boundary is the *default*, and stays so now that
+            // `unrestricted` exists to opt out of it.
+            unrestricted: false,
         },
     )
     .await;
@@ -3428,12 +3433,154 @@ async fn directory_list_rejects_missing_path() {
         &mut ws,
         &DirectoryListParams {
             path: missing.display().to_string(),
+            unrestricted: false,
         },
     )
     .await;
     assert!(
         err.contains("canonicalizing"),
         "missing path should fail canonicalization; got: {err}"
+    );
+    drop(server);
+}
+
+// ---- directory/list, unrestricted -------------------------------------------------------------
+//
+// The mode the client's two absolute-path fields use: add-root (naming a directory the workspace
+// by definition does not contain) and open-from-path (workspace-agnostic). Both would complete
+// nothing at all under the boundary the tests above pin.
+
+/// The same path the bounded mode refuses is listed when `unrestricted` is set.
+#[tokio::test]
+async fn directory_list_unrestricted_lists_outside_the_workspace() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+
+    // A tree with no relationship to the workspace at all.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("beta")).unwrap();
+    std::fs::write(outside.path().join("alpha.txt"), "hi\n").unwrap();
+
+    let result: DirectoryListResult = send_request::<DirectoryList>(
+        &mut ws,
+        &DirectoryListParams {
+            path: outside.path().display().to_string(),
+            unrestricted: true,
+        },
+    )
+    .await;
+    let names: Vec<&str> = result.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["beta", "alpha.txt"],
+        "dirs before files, alphabetical within each — same order every completing field presents"
+    );
+    assert!(
+        result.parent.is_none(),
+        "unrestricted has no boundary to report a parent relative to"
+    );
+    drop(server);
+}
+
+/// The case that actually matters for the open-from-path prompt: it can run before any workspace
+/// exists, so the listing must not require one. The bounded mode's `active_workspace_or_err` would
+/// refuse this outright.
+#[tokio::test]
+async fn directory_list_unrestricted_works_without_an_active_workspace() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    server.keep_alive(tempfile::tempdir().unwrap());
+    // Connected but deliberately never activated.
+    let mut ws = Ws::connect(&server).await;
+
+    let result: DirectoryListResult = send_request::<DirectoryList>(
+        &mut ws,
+        &DirectoryListParams {
+            path: dir.path().display().to_string(),
+            unrestricted: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        result
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sub"]
+    );
+    drop(server);
+}
+
+/// `~` is expanded server-side, because the client core compiles to wasm for the browser shell and
+/// has no `$HOME` to expand it against. Without the expansion this canonicalizes a literal `~` and
+/// errors, so a successful listing *is* the assertion.
+#[tokio::test]
+async fn directory_list_unrestricted_expands_home() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams, DirectoryListResult};
+    let Ok(home) = std::env::var("HOME") else {
+        return; // nothing to expand to
+    };
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let result: DirectoryListResult = send_request::<DirectoryList>(
+        &mut ws,
+        &DirectoryListParams {
+            path: "~".into(),
+            unrestricted: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        result.path,
+        std::fs::canonicalize(&home).unwrap().display().to_string(),
+        "`~` resolves to the home directory"
+    );
+    drop(server);
+}
+
+/// Relative paths are refused even here — the same rule, and the same reason, as
+/// `workspace/open_path`: they would resolve against the *daemon's* working directory, so the
+/// completions would come from somewhere the commit then rejects.
+#[tokio::test]
+async fn directory_list_unrestricted_refuses_a_relative_path() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let (server, mut ws, _root) = setup_explorer_workspace().await;
+    let err = send_request_expect_err::<DirectoryList>(
+        &mut ws,
+        &DirectoryListParams {
+            path: "src".into(),
+            unrestricted: true,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("must be absolute"),
+        "expected an absolute-path rejection, got: {err}"
+    );
+    drop(server);
+}
+
+/// A file is not a directory to complete *within*. Pinned because the unrestricted branch no longer
+/// borrows the Explorer's builder, which was where this check used to live.
+#[tokio::test]
+async fn directory_list_unrestricted_refuses_a_file() {
+    use aether_protocol::directory::{DirectoryList, DirectoryListParams};
+    let (server, mut ws, root) = setup_explorer_workspace().await;
+    let err = send_request_expect_err::<DirectoryList>(
+        &mut ws,
+        &DirectoryListParams {
+            path: root.join("README.md").display().to_string(),
+            unrestricted: true,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("is not a directory"),
+        "expected a not-a-directory rejection, got: {err}"
     );
     drop(server);
 }

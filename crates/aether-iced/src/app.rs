@@ -832,7 +832,7 @@ impl App {
         // typing flows through `on_input`. The root segment only exists in multi-root workspaces.
         match &self.session.prompt {
             Some(Prompt::SaveAs(ed)) => {
-                let multi_root = self.session.workspace_paths.len() > 1;
+                let multi_root = ed.multi_root(&self.session.workspace_paths);
                 return Some(
                     if multi_root && ed.field == crate::chips::ChipEditorField::Root {
                         OverlayField::SaveAsRoot
@@ -877,7 +877,7 @@ impl App {
                 // Two segments — focus follows whichever the editor has active.
                 SettingsRow::AddProject => Some(if s.on_add_project_language {
                     OverlayField::WorkspaceAddProjectLanguage
-                } else if self.session.workspace_paths.len() > 1
+                } else if s.add_project.multi_root(&self.session.workspace_paths)
                     && s.add_project.field == aether_client::chips::ChipEditorField::Root
                 {
                     OverlayField::WorkspaceAddProjectRoot
@@ -1906,7 +1906,7 @@ impl App {
         // needs the same caret snap: `Alt-l` rewrites the value under the controlled `text_input`,
         // which otherwise leaves its caret at the old index — mid-string, right after an accept.
         if let Some(ps) = &self.session.workspace_settings {
-            let multi_root = self.session.workspace_paths.len() > 1;
+            let multi_root = ps.add_project.multi_root(&self.session.workspace_paths);
             match ps.row() {
                 SettingsRow::AddProject => {
                     return Some(
@@ -1928,7 +1928,7 @@ impl App {
                     return Some((OverlayField::WorkspaceName, ps.name.text.clone()));
                 }
                 SettingsRow::AddRoot => {
-                    return Some((OverlayField::WorkspaceAddRoot, ps.add.text.clone()));
+                    return Some((OverlayField::WorkspaceAddRoot, ps.add.input.text.clone()));
                 }
                 // The root/project list rows hold no editable field.
                 _ => {}
@@ -1936,7 +1936,7 @@ impl App {
         }
         match &self.session.prompt {
             Some(Prompt::SaveAs(ed)) => {
-                let multi_root = self.session.workspace_paths.len() > 1;
+                let multi_root = ed.multi_root(&self.session.workspace_paths);
                 return Some(
                     if multi_root && ed.field == crate::chips::ChipEditorField::Root {
                         (OverlayField::SaveAsRoot, ed.root_filter.text.clone())
@@ -1945,8 +1945,8 @@ impl App {
                     },
                 );
             }
-            Some(Prompt::OpenPath(field)) => {
-                return Some((OverlayField::OpenPath, field.text.clone()));
+            Some(Prompt::OpenPath(ed)) => {
+                return Some((OverlayField::OpenPath, ed.input.text.clone()));
             }
             _ => {}
         }
@@ -3028,20 +3028,41 @@ impl App {
         // is the focus cue (web/terminal parity), not a box.
         // Placeholder only while unfocused — once you're typing here the caret is the cue, and a
         // greyed prompt sitting under it is noise. Same rule as the add-project row.
-        let add_root_placeholder = if s.row() == SettingsRow::AddRoot {
-            ""
-        } else {
-            "Add root..."
+        let add_root_row: Element<'_, Message> = {
+            use crate::picker::{field_with_ghost, Boundary, PickerMsg};
+            let ed = &s.add;
+            if let Some(placeholder) = s.add_placeholder(SettingsRow::AddRoot) {
+                text(placeholder)
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(p.fg_dim)
+                    .into()
+            } else {
+                // One segment, and so `Boundary::None`: the path is absolute, with no root segment
+                // for `:` or Backspace-at-start to step into.
+                field_with_ghost(
+                    &ed.input,
+                    ed.path_ghost(),
+                    ed.path_invalid(),
+                    OverlayField::WorkspaceAddRoot.id(self.window),
+                    "",
+                    "",
+                    PickerMsg::EditorPath,
+                    false,
+                    Boundary::None,
+                    ui,
+                    p,
+                )
+                .map(|m| match m {
+                    PickerMsg::EditorPath(s) => {
+                        Message::OverlayInput(OverlayField::WorkspaceAddRoot, s)
+                    }
+                    PickerMsg::CoreKey(code) => core_key_message(code),
+                    _ => Message::Noop,
+                })
+            }
         };
-        roots_col = roots_col.push(bulleted(
-            field(
-                OverlayField::WorkspaceAddRoot,
-                &s.add.text,
-                add_root_placeholder,
-            ),
-            ui,
-            p,
-        ));
+        roots_col = roots_col.push(bulleted(add_root_row, ui, p));
         col = col.push(roots_col);
 
         // The Projects group: declared directories whose language servers stay pinned while the
@@ -3117,151 +3138,152 @@ impl App {
         // Rendering the ghosts is what makes `Alt-j/k` cycling *visible* — without them the
         // candidate changes underneath and the row looks inert.
         //
-        // Unfocused and empty, it collapses to a plain "Add project..." label instead — the same
-        // affordance the add-root row gives.
+        // Unfocused and untouched, it collapses to a plain label instead — the core decides when,
+        // and with what words, so all three shells agree.
         use crate::picker::{field_with_ghost, Boundary, PickerMsg};
         let ed = &s.add_project;
         let roots = &self.session.workspace_paths;
         let labels = crate::labels::root_labels(roots);
-        let multi_root = roots.len() > 1;
+        let multi_root = ed.multi_root(roots);
         let focused = s.row() == SettingsRow::AddProject;
-        let project_row: Element<'_, Message> = if !focused && ed.input.text.is_empty() {
-            text("Add project...")
-                .size(ui.body())
-                .font(SANS)
-                .color(p.fg_dim)
-                .into()
-        } else {
-            let mut project_row = row![].align_y(iced::Alignment::Center);
-            if multi_root {
-                let invalid = ed.root_invalid(&labels);
-                let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
-                // A live input only while this row *and* the root segment have focus; otherwise the
-                // settled label, so an unfocused row never shows a stray caret.
-                if focused && ed.field == crate::chips::ChipEditorField::Root {
-                    root_group = root_group.push(field_with_ghost(
-                        &ed.root_filter,
-                        ed.root_ghost(&labels).map(|(_, suffix)| suffix),
-                        invalid,
-                        OverlayField::WorkspaceAddProjectRoot.id(self.window),
-                        "",
-                        ":",
-                        PickerMsg::EditorRoot,
-                        true,
-                        Boundary::ConfirmRoot,
-                        ui,
-                        p,
-                    ));
-                } else {
-                    let display = if invalid {
-                        ed.root_filter.text.clone()
-                    } else {
-                        labels
-                            .get(ed.chosen_root(&labels) as usize)
-                            .cloned()
-                            .unwrap_or_default()
-                    };
-                    let color = if invalid { p.error } else { p.accent };
-                    root_group =
-                        root_group.push(text(display).size(ui.body()).font(SANS).color(color));
-                    // Only the settled label needs its separator pushed; the focused segment draws
-                    // its own (flush against the text — see `field_with_ghost`'s `trailing`).
-                    root_group =
-                        root_group.push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
-                }
-                project_row = project_row.push(root_group).spacing(6);
-            }
-            // A live input only while the path segment itself has focus. Otherwise static text —
-            // a ghost left showing while another segment is focused reads as part of the value
-            // (`databricks/` trailed by `.databricks/` looks like the path you're committing).
-            if s.on_add_project_language {
-                project_row = project_row.push(
-                    text(ed.input.text.clone())
-                        .size(ui.body())
-                        .font(SANS)
-                        .color(if ed.path_invalid() {
-                            p.error
-                        } else {
-                            p.fg_bright
-                        }),
-                );
+        let project_row: Element<'_, Message> =
+            if let Some(placeholder) = s.add_placeholder(SettingsRow::AddProject) {
+                text(placeholder)
+                    .size(ui.body())
+                    .font(SANS)
+                    .color(p.fg_dim)
+                    .into()
             } else {
-                // Placeholder is always empty here: the ghost layer behind the input is what shows
-                // suggestions, and a placeholder drawn on top of it would overlap.
-                project_row = project_row.push(field_with_ghost(
-                    &ed.input,
-                    ed.path_ghost(),
-                    ed.path_invalid(),
-                    OverlayField::WorkspaceAddProject.id(self.window),
-                    "",
-                    "",
-                    PickerMsg::EditorPath,
-                    false,
-                    if multi_root {
-                        Boundary::PathToRoot
+                let mut project_row = row![].align_y(iced::Alignment::Center);
+                if multi_root {
+                    let invalid = ed.root_invalid(&labels);
+                    let mut root_group = row![].spacing(0).align_y(iced::Alignment::Center);
+                    // A live input only while this row *and* the root segment have focus; otherwise the
+                    // settled label, so an unfocused row never shows a stray caret.
+                    if focused && ed.field == crate::chips::ChipEditorField::Root {
+                        root_group = root_group.push(field_with_ghost(
+                            &ed.root_filter,
+                            ed.root_ghost(&labels).map(|(_, suffix)| suffix),
+                            invalid,
+                            OverlayField::WorkspaceAddProjectRoot.id(self.window),
+                            "",
+                            ":",
+                            PickerMsg::EditorRoot,
+                            true,
+                            Boundary::ConfirmRoot,
+                            ui,
+                            p,
+                        ));
                     } else {
-                        Boundary::None
-                    },
-                    ui,
-                    p,
-                ));
-            }
-            // The optional language override, right-aligned like the language tags on the project
-            // rows above. Only appears once it has focus or a value — an empty segment on every row
-            // would be noise for the nine-in-ten projects whose language is inferable.
-            if s.on_add_project_language || !s.add_project_language.text.is_empty() {
-                // A plain gap rather than a glyph: the row already reads `root: path`, and a second
-                // punctuation mark competes with the `:` for meaning. When the path renders as
-                // static text it hugs its content, so the gap does the pushing (`Fill`); a focused
-                // path is a `Fill` input that already pushes the segment to the right edge, and a
-                // second `Fill` would steal half its width.
-                let gap: Length = if s.on_add_project_language {
-                    Length::Fill
-                } else {
-                    ui.at(12.0).into()
-                };
-                project_row = project_row.push(iced::widget::Space::new().width(gap));
+                        let display = if invalid {
+                            ed.root_filter.text.clone()
+                        } else {
+                            labels
+                                .get(ed.chosen_root(&labels) as usize)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
+                        let color = if invalid { p.error } else { p.accent };
+                        root_group =
+                            root_group.push(text(display).size(ui.body()).font(SANS).color(color));
+                        // Only the settled label needs its separator pushed; the focused segment draws
+                        // its own (flush against the text — see `field_with_ghost`'s `trailing`).
+                        root_group =
+                            root_group.push(text(":").size(ui.body()).font(SANS).color(p.fg_dim));
+                    }
+                    project_row = project_row.push(root_group).spacing(6);
+                }
+                // A live input only while the path segment itself has focus. Otherwise static text —
+                // a ghost left showing while another segment is focused reads as part of the value
+                // (`databricks/` trailed by `.databricks/` looks like the path you're committing).
                 if s.on_add_project_language {
-                    project_row = project_row.push(field_with_ghost(
-                        &s.add_project_language,
-                        s.language_ghost(),
-                        s.language_invalid(),
-                        OverlayField::WorkspaceAddProjectLanguage.id(self.window),
-                        "language",
-                        "",
-                        PickerMsg::EditorExtra,
-                        true,
-                        Boundary::None,
-                        ui,
-                        p,
-                    ));
-                } else {
                     project_row = project_row.push(
-                        text(s.add_project_language.text.clone())
+                        text(ed.input.text.clone())
                             .size(ui.body())
                             .font(SANS)
-                            .color(if s.language_invalid() {
+                            .color(if ed.path_invalid() {
                                 p.error
                             } else {
-                                p.fg_dim
+                                p.fg_bright
                             }),
                     );
+                } else {
+                    // Placeholder is always empty here: the ghost layer behind the input is what shows
+                    // suggestions, and a placeholder drawn on top of it would overlap.
+                    project_row = project_row.push(field_with_ghost(
+                        &ed.input,
+                        ed.path_ghost(),
+                        ed.path_invalid(),
+                        OverlayField::WorkspaceAddProject.id(self.window),
+                        "",
+                        "",
+                        PickerMsg::EditorPath,
+                        false,
+                        if multi_root {
+                            Boundary::PathToRoot
+                        } else {
+                            Boundary::None
+                        },
+                        ui,
+                        p,
+                    ));
                 }
-            }
-            Element::from(project_row).map(|m| match m {
-                PickerMsg::EditorRoot(s) => {
-                    Message::OverlayInput(OverlayField::WorkspaceAddProjectRoot, s)
+                // The optional language override, right-aligned like the language tags on the project
+                // rows above. Only appears once it has focus or a value — an empty segment on every row
+                // would be noise for the nine-in-ten projects whose language is inferable.
+                if s.on_add_project_language || !s.add_project_language.text.is_empty() {
+                    // A plain gap rather than a glyph: the row already reads `root: path`, and a second
+                    // punctuation mark competes with the `:` for meaning. When the path renders as
+                    // static text it hugs its content, so the gap does the pushing (`Fill`); a focused
+                    // path is a `Fill` input that already pushes the segment to the right edge, and a
+                    // second `Fill` would steal half its width.
+                    let gap: Length = if s.on_add_project_language {
+                        Length::Fill
+                    } else {
+                        ui.at(12.0).into()
+                    };
+                    project_row = project_row.push(iced::widget::Space::new().width(gap));
+                    if s.on_add_project_language {
+                        project_row = project_row.push(field_with_ghost(
+                            &s.add_project_language,
+                            s.language_ghost(),
+                            s.language_invalid(),
+                            OverlayField::WorkspaceAddProjectLanguage.id(self.window),
+                            "language",
+                            "",
+                            PickerMsg::EditorExtra,
+                            true,
+                            Boundary::None,
+                            ui,
+                            p,
+                        ));
+                    } else {
+                        project_row = project_row.push(
+                            text(s.add_project_language.text.clone())
+                                .size(ui.body())
+                                .font(SANS)
+                                .color(if s.language_invalid() {
+                                    p.error
+                                } else {
+                                    p.fg_dim
+                                }),
+                        );
+                    }
                 }
-                PickerMsg::EditorPath(s) => {
-                    Message::OverlayInput(OverlayField::WorkspaceAddProject, s)
-                }
-                PickerMsg::EditorExtra(s) => {
-                    Message::OverlayInput(OverlayField::WorkspaceAddProjectLanguage, s)
-                }
-                PickerMsg::CoreKey(code) => core_key_message(code),
-                _ => Message::Noop,
-            })
-        };
+                Element::from(project_row).map(|m| match m {
+                    PickerMsg::EditorRoot(s) => {
+                        Message::OverlayInput(OverlayField::WorkspaceAddProjectRoot, s)
+                    }
+                    PickerMsg::EditorPath(s) => {
+                        Message::OverlayInput(OverlayField::WorkspaceAddProject, s)
+                    }
+                    PickerMsg::EditorExtra(s) => {
+                        Message::OverlayInput(OverlayField::WorkspaceAddProjectLanguage, s)
+                    }
+                    PickerMsg::CoreKey(code) => core_key_message(code),
+                    _ => Message::Noop,
+                })
+            };
         projects_col = projects_col.push(bulleted(project_row, ui, p));
         col = col.push(projects_col);
 
@@ -3750,7 +3772,7 @@ impl App {
                 use crate::picker::{field_with_ghost, Boundary, PickerMsg};
                 let roots = &self.session.workspace_paths;
                 let labels = crate::labels::root_labels(roots);
-                let multi_root = roots.len() > 1;
+                let multi_root = ed.multi_root(roots);
                 let mut field = row![].align_y(iced::Alignment::Center);
                 if multi_root {
                     let invalid = ed.root_invalid(&labels);
@@ -3849,30 +3871,32 @@ impl App {
                 .spacing(14)
                 .into()
             }
-            Prompt::OpenPath(field) => {
-                // A plain single-line path input — no root chips, unlike save-as. Edits sync via
-                // `OverlayInput`; Enter (open) / Esc (cancel) bubble to `on_key` since `on_submit`
-                // is unset (focused inputs report Enter `Ignored` and Esc is force-forwarded — see
+            Prompt::OpenPath(ed) => {
+                // The same ghost-stacked field as save-as — it is the same editor — but always a
+                // single segment: the value is an absolute path, so there is no root to choose and
+                // `Boundary::None` (nothing for `:` or Backspace-at-start to step into).
+                // Enter (open) / Esc (cancel) bubble to `on_key` since `on_submit` is unset
+                // (focused inputs report Enter `Ignored` and Esc is force-forwarded — see
                 // `subscription`).
-                // `on_input` produces `String` (a `Clone` message, which `text_input` requires),
-                // then the element is mapped to `Message`, mirroring the search bar.
-                let inner = iced::widget::text_input("path to open", &field.text)
-                    .id(OverlayField::OpenPath.id(self.window))
-                    .on_input(|s| s)
-                    .font(SANS)
-                    .size(ui.body())
-                    .padding(0)
-                    .width(Length::Fill)
-                    .style(move |_theme, _status| iced::widget::text_input::Style {
-                        background: iced::Background::Color(iced::Color::TRANSPARENT),
-                        border: iced::Border::default(),
-                        icon: p.fg_bright,
-                        placeholder: p.fg_dim,
-                        value: p.fg_bright,
-                        selection: p.accent,
-                    });
-                let input: Element<'_, Message> = Element::from(inner)
-                    .map(|s: String| Message::OverlayInput(OverlayField::OpenPath, s));
+                use crate::picker::{field_with_ghost, Boundary, PickerMsg};
+                let input: Element<'_, Message> = field_with_ghost(
+                    &ed.input,
+                    ed.path_ghost(),
+                    ed.path_invalid(),
+                    OverlayField::OpenPath.id(self.window),
+                    "",
+                    "",
+                    PickerMsg::EditorPath,
+                    false,
+                    Boundary::None,
+                    ui,
+                    p,
+                )
+                .map(|m| match m {
+                    PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::OpenPath, s),
+                    PickerMsg::CoreKey(code) => core_key_message(code),
+                    _ => Message::Noop,
+                });
                 column![
                     text("Open file")
                         .size(ui.body())

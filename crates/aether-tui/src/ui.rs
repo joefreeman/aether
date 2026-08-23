@@ -1138,8 +1138,32 @@ fn draw_settings_rows(
                 lines.push(Line::from(spans));
             }
             SettingsRowView::AddRoot => {
-                let placeholder = if highlighted { "" } else { "Add root..." };
-                lines.push(input_line(&settings.add_input.text, placeholder));
+                let ed = &settings.add;
+                // The core decides when the row collapses to its affordance (unfocused and
+                // untouched — which covers the seeded `~/`, not just an empty field).
+                if let Some(placeholder) = ed.placeholder {
+                    lines.push(input_line("", placeholder));
+                } else {
+                    let text_style = Style::default().fg(c(th().fg)).bg(c(th().bg));
+                    let ghost_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
+                    let mut spans = vec![Span::styled(" ", base_style)];
+                    spans.push(Span::styled(
+                        ed.input.text.clone(),
+                        if ed.invalid {
+                            text_style.fg(c(th().error))
+                        } else {
+                            text_style
+                        },
+                    ));
+                    // Same rule as the add-project row: the ghost only shows on the focused field,
+                    // or it reads as part of the value rather than as a suggestion.
+                    if ed.focused {
+                        if let Some(ghost) = &ed.ghost {
+                            spans.push(Span::styled(ghost.clone(), ghost_style));
+                        }
+                    }
+                    lines.push(Line::from(spans));
+                }
             }
             SettingsRowView::Section(label) => {
                 // Flush left (no indent) so it reads as a heading over the rows beneath it, and
@@ -1202,12 +1226,13 @@ fn project_editor_line<'a>(
     base_style: Style,
     placeholder_style: Style,
 ) -> Line<'a> {
-    // Unfocused and empty, the row collapses to its affordance — the same shape the add-root row
-    // has. Focused, the caret is the cue and the ghost carries the suggestion.
-    if !ed.focused && ed.path_input.text.is_empty() {
+    // The core decides when the row collapses to its affordance — the same rule, and the same
+    // words, the add-root row uses. Focused, the caret is the cue and the ghost carries the
+    // suggestion.
+    if let Some(placeholder) = ed.placeholder {
         return Line::from(vec![
             Span::styled(" ", base_style),
-            Span::styled("Add project...".to_string(), placeholder_style),
+            Span::styled(placeholder.to_string(), placeholder_style),
         ]);
     }
     let mut spans = vec![Span::styled(" ", base_style)];
@@ -1340,7 +1365,7 @@ fn place_settings_input_cursor(
         0
     };
     let (input, prefix_w) = match settings.focused() {
-        Some(crate::app::SettingsRowView::AddRoot) => (&settings.add_input, 0),
+        Some(crate::app::SettingsRowView::AddRoot) => (&settings.add.input, 0),
         Some(crate::app::SettingsRowView::AddProject) if ed.on_root => (&ed.root_input, 0),
         // The language segment is drawn after the path plus its two-space gap.
         Some(crate::app::SettingsRowView::AddProject) if ed.on_language => (
@@ -6473,10 +6498,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" {}? [y/N]", confirm.message))])
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
-        Line::from(draw_save_prompt_spans(prompt, state, area.width as usize).0)
-    } else if let Some(input) = state.open_path_prompt.as_ref() {
+        Line::from(draw_save_prompt_spans(prompt, state, SAVE_AS_LABEL, area.width as usize).0)
+    } else if let Some(prompt) = state.open_path_prompt.as_ref() {
         // Open-from-path overlay: a single-line path input in the status row.
-        Line::from(draw_open_path_prompt_spans(input, area.width as usize).0)
+        Line::from(draw_save_prompt_spans(prompt, state, OPEN_PATH_LABEL, area.width as usize).0)
     } else if !state.has_editor() {
         // No editor: at boot while `Connecting` the row carries the connection indicator (the
         // same slot that shows "Reconnecting…" mid-session); otherwise just transient feedback.
@@ -6735,28 +6760,19 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 /// - the **path** segment — the typed text (red if the parent dir failed to list) plus a gray
 ///   ghost suffix completing the highlighted entry (a trailing `/` only behind a directory).
 ///
-/// Status-row spans for the open-from-path prompt (`Space Alt-w`): an ` open: ` prefix then the
-/// typed path. Returns the spans plus the caret's column offset so the terminal cursor lands in
-/// the input. A plain single-line field — no root chips / suggestions, unlike save-as.
-fn draw_open_path_prompt_spans(
-    input: &crate::text_input::TextInput,
-    _total_width: usize,
-) -> (Vec<Span<'static>>, u16) {
-    const PREFIX: &str = " open: ";
-    let prefix_style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent));
-    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
-    let spans = vec![
-        Span::styled(PREFIX, prefix_style),
-        Span::styled(input.text.clone(), base_style),
-    ];
-    let cursor_byte = input.cursor.min(input.text.len());
-    let cursor_col = PREFIX.width() + input.text[..cursor_byte].width();
-    (spans, cursor_col as u16)
-}
+/// The open-from-path prompt (`Space Alt-w`) renders through this too, with its own label: it is
+/// the same `PathEditor`, so it gets the same ghosts, the same red-when-the-parent-doesn't-list,
+/// and the same caret arithmetic. Its `multi_root` is always false (an absolute path has no root
+/// segment), so the root half below simply doesn't run for it.
+/// Status-row labels for the two prompts that share the builder below. Both carry their own leading
+/// and trailing space — they're pushed as-is, and the caret offset counts their width.
+const SAVE_AS_LABEL: &str = " save as: ";
+const OPEN_PATH_LABEL: &str = " open: ";
 
 fn draw_save_prompt_spans(
     prompt: &crate::save_prompt::SavePromptState,
     state: &AppState,
+    label: &str,
     _total_width: usize,
 ) -> (Vec<Span<'static>>, u16) {
     use crate::picker::ChipEditorField;
@@ -6779,7 +6795,7 @@ fn draw_save_prompt_spans(
         spans.push(Span::styled(text, style));
     };
 
-    push(&mut spans, &mut w, " save as: ".into(), base_style);
+    push(&mut spans, &mut w, label.to_string(), base_style);
 
     if prompt.multi_root {
         let labels = crate::labels::root_labels(&state.workspace_paths);
@@ -7409,7 +7425,8 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     if let Some(prompt) = state.save_prompt.as_ref() {
         // The span builder reports the caret offset of the focused segment (root or path), so the
         // terminal cursor lands in sync with the rendered text.
-        let (_, cursor_off) = draw_save_prompt_spans(prompt, state, status_area.width as usize);
+        let (_, cursor_off) =
+            draw_save_prompt_spans(prompt, state, SAVE_AS_LABEL, status_area.width as usize);
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));
@@ -7417,8 +7434,9 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         f.set_cursor_position((col, status_area.y));
         return;
     }
-    if let Some(input) = state.open_path_prompt.as_ref() {
-        let (_, cursor_off) = draw_open_path_prompt_spans(input, status_area.width as usize);
+    if let Some(prompt) = state.open_path_prompt.as_ref() {
+        let (_, cursor_off) =
+            draw_save_prompt_spans(prompt, state, OPEN_PATH_LABEL, status_area.width as usize);
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));

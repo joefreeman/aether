@@ -2126,6 +2126,57 @@ async fn workspace_rename_moves_the_definition_in_the_store() {
     drop(server);
 }
 
+/// A root is a directory. `add_root` is the only RPC that writes one, so this is the boundary that
+/// lets the index, the watcher and `buffer/open`'s `base.join(rel)` treat every root as a tree —
+/// they used to carry their own "what if this is a file" branches, kept alive by refactors from an
+/// era when a workspace was a hand-authored list of arbitrary paths.
+#[tokio::test]
+async fn add_root_refuses_a_file() {
+    let (server, store, root) = setup_workspace_store().await;
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceCreate>(
+        &mut ws,
+        &WorkspaceCreateParams {
+            name: "proj".into(),
+        },
+    )
+    .await;
+
+    let err = send_request_expect_err::<WorkspaceAddRoot>(
+        &mut ws,
+        &WorkspaceAddRootParams {
+            workspace: "proj".into(),
+            // The fixture's own file, so this is a path that exists and canonicalizes — the
+            // rejection is about what it *is*, not about it being missing.
+            path: root.join("a.txt").to_string_lossy().into(),
+        },
+    )
+    .await;
+    assert!(
+        err.contains("must be directories"),
+        "expected a directory-only rejection, got {err:?}"
+    );
+    assert!(
+        !std::fs::read_to_string(store.join("proj.toml"))
+            .unwrap()
+            .contains("a.txt"),
+        "a refused root must not reach the TOML"
+    );
+
+    // The same workspace still takes the directory, so the guard rejects the file rather than
+    // wedging the workspace.
+    let ok: WorkspaceInfo = send_request::<WorkspaceAddRoot>(
+        &mut ws,
+        &WorkspaceAddRootParams {
+            workspace: "proj".into(),
+            path: root.to_string_lossy().into(),
+        },
+    )
+    .await;
+    assert_eq!(ok.paths.len(), 1);
+    drop(server);
+}
+
 /// Declaring a project pins a language server to a subdirectory; dropping it takes it back out.
 /// Both write the workspace's TOML, so both were untestable before the store could be redirected.
 #[tokio::test]

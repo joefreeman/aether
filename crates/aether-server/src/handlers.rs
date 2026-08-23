@@ -363,7 +363,7 @@ pub(crate) async fn flush_history(state: &SharedState) {
 /// roots. The client-facing view of a workspace's declared projects, re-resolved against its roots
 /// on every read.
 ///
-/// Deliberately not cached: resolution depends on the filesystem, so a project whose marker was
+/// Deliberately not cached: resolution depends on the filesystem, so a project whose directory was
 /// deleted by a branch switch starts reporting an error, and one that comes back stops — with no
 /// reactivation and no invalidation to remember. An entry that fails still appears, carrying its
 /// reason, because a broken declaration the user can see and fix beats one that silently vanishes.
@@ -1372,6 +1372,19 @@ pub async fn workspace_add_root(
 ) -> Result<WorkspaceInfo, RpcError> {
     let canonical = crate::config::canonicalize_workspace_path(std::path::Path::new(&params.path))
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing root: {e}")))?;
+    // A root is a directory. This is the only RPC that writes one, so rejecting here (together with
+    // the load-time filter in `config::load_workspace_in`) is what lets everything downstream treat
+    // `WorkspaceEntry::paths` as directories without re-checking: the index walks them, the watcher
+    // registers them, and `buffer/open` joins a relative path onto them.
+    //
+    // Safe after canonicalization, which already required the path to exist — so a `false` here
+    // means "not a directory", never "not there yet".
+    if !canonical.is_dir() {
+        return Err(RpcError::invalid_path(format!(
+            "workspace roots must be directories: {} is not one",
+            canonical.display()
+        )));
+    }
 
     // A bound workspace's roots are a *materialisation* of its configured ones, so a root added to
     // it has to be materialised too — appended raw it would be the one root in the list that
@@ -2857,14 +2870,8 @@ async fn buffer_open_inner(
                     })?
                     .clone();
                 drop(s);
-                let base_is_file = base.is_file();
                 let candidate = match rel {
                     None | Some("") => base.clone(),
-                    Some(r) if base_is_file => {
-                        return Err(RpcError::invalid_path(format!(
-                        "path_index {idx} is a single-file entry; relative_path must be empty (got {r:?})"
-                    )));
-                    }
                     Some(r) => base.join(r),
                 };
                 // Resolve to a canonical-shaped path. When the target file already exists,
@@ -9953,7 +9960,7 @@ fn buffer_path_ref(
     };
     for (i, root) in workspace.paths.iter().enumerate() {
         if canonical == *root {
-            return (Some(i as u32), Some(String::new())); // single-file root, or the root itself
+            return (Some(i as u32), Some(String::new())); // the root directory itself
         }
         if let Ok(rel) = canonical.strip_prefix(root) {
             return (Some(i as u32), Some(rel.to_string_lossy().into_owned()));
@@ -17876,14 +17883,75 @@ pub(crate) fn build_explorer_candidates_for_canonical(
     })
 }
 
-/// One-shot directory listing for status-line prompts (save-as cycling). Same boundary rules and
-/// sort order as the Explorer picker, but without any per-client state — just canonicalize, read,
-/// return. The client filters/cycles locally.
+/// A directory's immediate children as `(name, is_dir)`, dirs first then files, alphabetical within
+/// each — the order every path-completing surface presents.
+///
+/// Deliberately *not* [`build_explorer_candidates_for_canonical`], which this used to borrow: that
+/// one runs [`crate::git::dir_statuses`] — a `Repository::discover` walk-up plus a whole-repo status
+/// pass with untracked *and* ignored included — and [`DirectoryEntry`] has nowhere to put the
+/// answer, so every byte of it was thrown away. Harmless-looking until the completing field is an
+/// absolute path: `~/` is the most-typed prefix there, and a home directory is very often itself a
+/// repo, which would mean a full status pass per keystroke.
+fn read_dir_sorted(canonical: &std::path::Path) -> Result<Vec<DirectoryEntry>, RpcError> {
+    let mut entries: Vec<DirectoryEntry> = Vec::new();
+    for ent in std::fs::read_dir(canonical).map_err(RpcError::file_io)? {
+        let Ok(ent) = ent else { continue };
+        let Ok(name) = ent.file_name().into_string() else {
+            continue;
+        };
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push(DirectoryEntry { name, is_dir });
+    }
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    Ok(entries)
+}
+
+/// One-shot directory listing for the client's path-completing fields. No per-client state — just
+/// canonicalize, read, return; the client filters and cycles locally.
+///
+/// Two modes, per [`DirectoryListParams::unrestricted`]: bounded (the default — inside the active
+/// workspace, same rule as the Explorer picker) and unrestricted (anywhere readable, no workspace
+/// required). The bounded mode keeps the Explorer's `parent` convention — `None` at or above a
+/// root, so a client can't walk out. Unrestricted has no boundary to report a parent relative to,
+/// and its callers don't use the field.
 pub async fn directory_list(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: DirectoryListParams,
 ) -> Result<DirectoryListResult, RpcError> {
+    if params.unrestricted {
+        // `~/…` is resolved here rather than client-side: the client core compiles to wasm for the
+        // browser shell, where there is no `$HOME` to expand against.
+        let raw = crate::config::expand_home(std::path::Path::new(&params.path));
+        // The same rule (and the same reason) as `workspace/open_path`: a relative path would
+        // resolve against the *daemon's* working directory, which is meaningless to the user — so
+        // the completions would come from one place while the commit refused the path outright.
+        if !raw.is_absolute() {
+            return Err(RpcError::invalid_path(format!(
+                "path must be absolute: {}",
+                raw.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(&raw).map_err(|e| {
+            RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display()))
+        })?;
+        if !canonical.is_dir() {
+            return Err(RpcError::invalid_path(format!(
+                "{} is not a directory",
+                canonical.display()
+            )));
+        }
+        return Ok(DirectoryListResult {
+            path: canonical.display().to_string(),
+            parent: None,
+            entries: read_dir_sorted(&canonical)?,
+        });
+    }
+
     let workspace_paths = {
         let s = state.lock().await;
         s.active_workspace_or_err(ctx.client_id)?.paths.clone()
@@ -17891,23 +17959,30 @@ pub async fn directory_list(
     let raw = std::path::PathBuf::from(&params.path);
     let canonical = std::fs::canonicalize(&raw)
         .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", raw.display())))?;
-    // Prompt listings (save-as cycling) are never filter-scoped — pass the no-op default.
-    let candidates = build_explorer_candidates_for_canonical(
-        &canonical,
-        &workspace_paths,
-        &aether_protocol::picker::PickerFilters::default(),
-    )?;
+    let in_workspace = |p: &std::path::Path| -> bool {
+        workspace_paths
+            .iter()
+            .any(|root| p == root.as_path() || p.starts_with(root))
+    };
+    if !in_workspace(&canonical) {
+        return Err(RpcError::invalid_path(format!(
+            "{} is outside the workspace's access boundary",
+            canonical.display()
+        )));
+    }
+    if !canonical.is_dir() {
+        return Err(RpcError::invalid_path(format!(
+            "{} is not a directory",
+            canonical.display()
+        )));
+    }
     Ok(DirectoryListResult {
-        path: candidates.path,
-        parent: candidates.parent,
-        entries: candidates
-            .entries
-            .into_iter()
-            .map(|e| DirectoryEntry {
-                name: e.name,
-                is_dir: e.is_dir,
-            })
-            .collect(),
+        path: canonical.display().to_string(),
+        parent: canonical
+            .parent()
+            .filter(|p| in_workspace(p))
+            .map(|p| p.display().to_string()),
+        entries: read_dir_sorted(&canonical)?,
     })
 }
 

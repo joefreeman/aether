@@ -1,19 +1,29 @@
-//! The save-as prompt's editor (`Alt-s`): a workspace-relative path field with the same
-//! directory-completion UX as the picker's dir-scope chip editor, so saving somewhere reuses the
-//! muscle memory of scoping a search there.
+//! The path field every path-naming surface uses, with the same directory-completion UX as the
+//! picker's dir-scope chip editor — so naming a path anywhere reuses the muscle memory of scoping a
+//! search.
+//!
+//! Four users, split by two independent switches. [`PathBase`] says what the path is measured
+//! against: **rooted** (save-as `Alt-s`, and the workspace-settings add-project row) or **absolute**
+//! (the add-root row, and the open-from-path prompt `Space Alt-w`). `allow_files` says whether a
+//! file may complete: yes for the two that name a file (save-as overwrites one, open-from-path
+//! opens one), no for the two that name a directory (a project *is* its directory; so is a root).
 //!
 //! It mirrors [`crate::chips::ChipEditor`]'s dir half — a multi-root workspaces' leading root field
 //! (inline smartcase typeahead, `:` separator) ahead of a `directory/list`-backed path field with
-//! ghost suggestions, `Tab`/`Alt-l` accept, `Alt-j`/`k` cycle, and fish-style `Alt-Backspace`
-//! segment pop — with two deliberate departures, because the path's final segment is a *new
-//! filename* rather than an existing subdirectory:
+//! ghost suggestions, `Alt-l` accept (never `Tab` — that traverses fields, one key one meaning),
+//! `Alt-j`/`k` cycle, and fish-style `Alt-Backspace`
+//! segment pop — including its `allow_files` switch over what the listing keeps, and with one
+//! deliberate departure:
 //!
-//! - The cached listing keeps **files as well as directories** ([`set_dir_listing`]): completing
-//!   onto an existing file is how you overwrite it. The ghost appends `/` only behind a directory.
-//! - Committing saves the **literal typed path** ([`save_target`]); a partially typed leaf is *not*
-//!   silently snapped to the highlighted suggestion (that is what `Tab` is for), and a non-matching
-//!   leaf never blocks the save — you're naming a file that needn't exist yet. A missing *parent*
-//!   directory still renders red ([`path_invalid`]) as an advisory.
+//! - Committing saves the **literal typed path** ([`PathEditor::save_target`]); a partially typed
+//!   leaf is *not* silently snapped to the highlighted suggestion (that is what `Tab` is for), and
+//!   a non-matching leaf never blocks the commit — when saving, you're naming a file that needn't
+//!   exist yet. A missing *parent* directory still renders red ([`PathEditor::path_invalid`]) as an
+//!   advisory.
+//!
+//! Suggesting what the surface would then reject is the failure both switches exist to prevent — a
+//! file offered for a root, or a workspace-relative completion for a path that isn't relative to
+//! one.
 //!
 //! Text editing (caret, insert, delete) is owned by each shell's input, which syncs the whole
 //! value via [`crate::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps
@@ -26,21 +36,56 @@ use crate::chips::{
 use crate::labels::root_labels;
 use aether_protocol::directory::DirectoryEntry;
 
-/// The save-as path editor. In single-root workspaces only the path field exists (`field` is always
-/// `Path`); multi-root workspaces add the leading root field.
+/// What the typed path is measured against — the editor's mode, and the thing every other
+/// difference follows from.
+///
+/// It is a mode rather than, say, an `Option<u32> root_index`, because none of the differences are
+/// about *which* root: they are which directory to list, which commit shape to produce, and whether
+/// a root segment exists to focus at all. A `None` root index would say none of that, and would
+/// leave `root_filter`/`root_selected` live and meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathBase {
+    /// Root-relative: the path is under one of the workspace's roots, picked by the root segment in
+    /// multi-root workspaces. Commits as `(path_index, relative_path)`. Save-as and add-project.
+    Rooted,
+    /// An absolute filesystem path, standing on its own — no root segment, ever. Commits as the
+    /// literal typed string. Add-root and open-from-path, the two fields that name somewhere the
+    /// workspace doesn't already reach.
+    Absolute,
+}
+
+/// The path editor. In single-root workspaces (and always, in [`PathBase::Absolute`]) only the path
+/// field exists — `field` is always `Path`; multi-root [`PathBase::Rooted`] adds the leading root
+/// field.
 #[derive(Debug)]
 pub struct PathEditor {
-    /// Which segment has focus. Always `Path` in single-root workspaces.
+    /// What the path is measured against. Decides [`PathEditor::multi_root`], and through it every
+    /// root-segment behaviour in the shared key handler and all three shells.
+    pub base: PathBase,
+    /// Which segment has focus. Always `Path` in single-root workspaces and in `Absolute`.
     pub field: ChipEditorField,
-    /// The root-relative path being typed (directory portion + filename leaf).
+    /// The path being typed (directory portion + leaf) — root-relative in `Rooted`, absolute in
+    /// `Absolute`, where a leading `~` is kept as typed and expanded server-side.
     pub input: Input,
+    /// What the field opened with — `~/` for the absolute ones, empty for the rest.
+    ///
+    /// Kept so [`PathEditor::is_untouched`] can tell a seed apart from something the user typed,
+    /// which is what lets a seeded field still show its "Add root…" affordance. Compared against
+    /// rather than latched: deleting back down to the seed makes the field untouched again, which
+    /// is the honest answer — there is nothing invested in it either way.
+    pub seed: String,
     /// Multi-root: the prefix filter typed into the root field.
     pub root_filter: Input,
     /// Multi-root: highlight within [`root_candidates`]' matches for the current filter.
     pub root_selected: usize,
     /// The root the editor opened with — the fallback when the filter matches nothing.
     pub root_index: u32,
-    /// Cached `directory/list` entries (files *and* directories) for the dir portion of `input`.
+    /// When true the editor may complete to a file, not just subdirectories — set for the save-as
+    /// prompt (completing onto a file overwrites it), cleared for the add-project row (a project is
+    /// a directory). Controls what [`PathEditor::set_dir_listing`] keeps.
+    pub allow_files: bool,
+    /// Cached `directory/list` entries for the dir portion of `input` — subdirectories only, unless
+    /// `allow_files` (then files are kept too, so a file name can complete).
     pub listing: Vec<DirectoryEntry>,
     /// The absolute path `listing` was last synced against (the staleness key).
     pub listing_dir_abs: String,
@@ -53,17 +98,21 @@ pub struct PathEditor {
 impl PathEditor {
     /// Open the editor pre-filled with `path` under root `root_index`. `field` is the initially
     /// focused segment (callers focus the root field for a brand-new buffer in a multi-root
-    /// workspace, the path field otherwise). `listing_dir_abs` starts empty so the caller's first
+    /// workspace, the path field otherwise). `allow_files` decides whether the path field may
+    /// complete to a file. `listing_dir_abs` starts empty so the caller's first
     /// [`PathEditor::sync_dir_listing`] always reports a refetch is due.
-    pub fn new(path: String, field: ChipEditorField, root_index: u32) -> Self {
+    pub fn new(path: String, field: ChipEditorField, root_index: u32, allow_files: bool) -> Self {
         PathEditor {
+            base: PathBase::Rooted,
             field,
+            seed: path.clone(),
             input: Input::new(path),
             root_filter: Input::default(),
             // Empty filter → candidates are all roots in order, so the opening root's index
             // doubles as its position among them.
             root_selected: root_index as usize,
             root_index,
+            allow_files,
             listing: Vec::new(),
             listing_dir_abs: String::new(),
             listing_state: DirListingState::Pending,
@@ -71,7 +120,51 @@ impl PathEditor {
         }
     }
 
-    // ---- root field (multi-root only) ----------------------------------------------------------
+    /// Open an editor over an **absolute** filesystem path ([`PathBase::Absolute`]).
+    ///
+    /// A separate constructor rather than a fifth argument to [`PathEditor::new`], because `new`'s
+    /// `field` and `root_index` are both meaningless here — and threading them through would invite
+    /// a caller to pass `ChipEditorField::Root`, focusing a segment this editor does not have.
+    pub fn absolute(path: String, allow_files: bool) -> Self {
+        PathEditor {
+            base: PathBase::Absolute,
+            field: ChipEditorField::Path,
+            seed: path.clone(),
+            input: Input::new(path),
+            root_filter: Input::default(),
+            root_selected: 0,
+            root_index: 0,
+            allow_files,
+            listing: Vec::new(),
+            listing_dir_abs: String::new(),
+            listing_state: DirListingState::Pending,
+            suggestion_idx: 0,
+        }
+    }
+
+    /// Whether this editor has a leading root segment — the question every root-related behaviour
+    /// actually turns on.
+    ///
+    /// It lives here rather than at the call sites because it used to be re-derived, as
+    /// `workspace_paths.len() > 1`, in the shared key handler, the web view projection and both
+    /// native shells. An absolute editor in a multi-root workspace would have answered `true` at
+    /// every one of them, and `path_editor_key`'s `BackTab` / `Alt-h` / `Alt-Backspace`-at-empty
+    /// arms would then have moved focus into a root segment that does not exist.
+    pub fn multi_root(&self, workspace_paths: &[String]) -> bool {
+        self.base == PathBase::Rooted && workspace_paths.len() > 1
+    }
+
+    /// Nothing has been invested in this field: it still holds exactly what it opened with.
+    ///
+    /// For an unseeded editor that is simply "empty"; for a seeded one it also covers the bare `~/`
+    /// it opens with, which is what lets a seeded row keep showing its "Add root…" affordance while
+    /// unfocused. A field the user has typed into and then deleted back down to the seed counts as
+    /// untouched again — there is nothing in it either way, so nothing to preserve.
+    pub fn is_untouched(&self) -> bool {
+        self.input.text == self.seed
+    }
+
+    // ---- root field (Rooted, multi-root only) --------------------------------------------------
 
     /// The root the editor would save into: the highlighted candidate for the current filter,
     /// falling back to the root it opened with when the filter matches nothing.
@@ -138,10 +231,22 @@ impl PathEditor {
 
     // ---- directory listing ---------------------------------------------------------------------
 
-    /// The absolute directory the path field's suggestions should list: the dir portion of the
-    /// typed path, resolved under the chosen root. `None` under an *invalid* root (suggestions
-    /// beneath the fallback root would read as silently defaulting to it).
+    /// The absolute directory the path field's suggestions should list.
+    ///
+    /// `Rooted`: the dir portion of the typed path, resolved under the chosen root. `None` under an
+    /// *invalid* root — suggestions beneath the fallback root would read as silently defaulting to
+    /// it.
+    ///
+    /// `Absolute`: the dir portion **verbatim**, tilde and all (the server expands it). Not through
+    /// `join_root_relative`, which trims the trailing separator and would turn the filesystem root
+    /// `"/"` into `""`. `None` for an empty dir portion — there is nothing to list yet, and asking
+    /// for `""` would come back as a canonicalize failure and paint the field red before the user
+    /// has typed anything.
     pub fn dir_listing_path(&self, workspace_paths: &[String]) -> Option<String> {
+        let dir = dir_of_input(&self.input.text);
+        if self.base == PathBase::Absolute {
+            return (!dir.is_empty()).then(|| dir.to_string());
+        }
         let root = if workspace_paths.len() > 1 {
             let labels = root_labels(workspace_paths);
             if self.root_invalid(&labels) {
@@ -151,17 +256,18 @@ impl PathEditor {
         } else {
             0
         };
-        Some(join_root_relative(
-            workspace_paths,
-            root,
-            dir_of_input(&self.input.text),
-        ))
+        Some(join_root_relative(workspace_paths, root, dir))
     }
 
-    /// Store a `directory/list` response, keeping **every** entry — unlike the dir-scope chip
-    /// editor, a file completes a save path (you're overwriting it).
+    /// Store a `directory/list` response. Without `allow_files`, keep only subdirectories — a file
+    /// can't be a project. With it, keep files too, so a file name can complete a save path
+    /// (you're overwriting it).
     pub fn set_dir_listing(&mut self, entries: Vec<DirectoryEntry>) {
-        self.listing = entries;
+        self.listing = if self.allow_files {
+            entries
+        } else {
+            entries.into_iter().filter(|e| e.is_dir).collect()
+        };
         self.listing_state = DirListingState::Loaded;
         self.suggestion_idx = 0;
     }
@@ -179,6 +285,21 @@ impl PathEditor {
     /// for [`PathEditor::dir_listing_path`].
     pub fn sync_dir_listing(&mut self, workspace_paths: &[String]) -> bool {
         let Some(abs) = self.dir_listing_path(workspace_paths) else {
+            // Absolute: no dir portion, so there is nothing to list *and* nothing the old listing
+            // still describes. Dropping it matters — an early return here would leave a field that
+            // has been emptied after a bad path stuck `Failed` (red forever, since `path_invalid`
+            // reads the state alone), and would keep ghosting the previous directory's entries onto
+            // whatever unrelated leaf is typed next.
+            //
+            // The `Rooted` invalid-root case takes the early return it always has. It is arguably
+            // wrong there too, for the second of those reasons, but that is a live behaviour change
+            // for save-as and add-project and belongs in its own commit.
+            if self.base == PathBase::Absolute {
+                self.listing_dir_abs.clear();
+                self.listing.clear();
+                self.listing_state = DirListingState::Pending;
+                self.suggestion_idx = 0;
+            }
             return false;
         };
         if abs == self.listing_dir_abs {
@@ -260,9 +381,20 @@ impl PathEditor {
     }
 
     /// The `(path_index, relative_path)` a commit should save to — the literal typed path under
-    /// the chosen root. `None` for an empty path (nothing to save to). Absolute paths (a leading
-    /// `/`) are handled by the caller, which re-resolves them against the roots.
+    /// the chosen root. `None` for an empty path (nothing to save to), and `None` in
+    /// [`PathBase::Absolute`], where there is no root to be relative to.
+    ///
+    /// That second `None` is the point of the pair: an absolute editor reaching this would
+    /// otherwise hand back `(0, "/home/me/code")` and the caller would post an absolute path as a
+    /// *relative* one. Each commit site calls exactly one of this and
+    /// [`PathEditor::absolute_target`], and gets `None` if it picked the wrong one.
+    ///
+    /// Absolute paths *typed into a rooted editor* (a leading `/` in save-as) are a different
+    /// thing, and are re-resolved against the roots by the caller.
     pub fn save_target(&self, workspace_paths: &[String]) -> Option<(u32, String)> {
+        if self.base == PathBase::Absolute {
+            return None;
+        }
         let path = self.input.text.trim().to_string();
         if path.is_empty() {
             return None;
@@ -273,6 +405,20 @@ impl PathEditor {
             0
         };
         Some((path_index, path))
+    }
+
+    /// The literal absolute path a commit should use — the counterpart to
+    /// [`PathEditor::save_target`], and `None` in [`PathBase::Rooted`] for the same reason.
+    ///
+    /// Returned verbatim, `~` included: the server expands it (the client core compiles to wasm,
+    /// where there is no `$HOME`), and both `workspace/add_root` and `workspace/open_path` already
+    /// do so on the way in.
+    pub fn absolute_target(&self) -> Option<String> {
+        if self.base == PathBase::Rooted {
+            return None;
+        }
+        let path = self.input.text.trim().to_string();
+        (!path.is_empty()).then_some(path)
     }
 }
 
@@ -290,7 +436,7 @@ mod tests {
     #[test]
     fn single_root_path_listing_and_ghost() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0, true);
         // First sync establishes the listing key and asks for a refetch.
         assert!(ed.sync_dir_listing(&roots));
         assert_eq!(ed.listing_dir_abs, "/tmp/root");
@@ -304,10 +450,154 @@ mod tests {
         assert_eq!(ed.path_ghost().as_deref(), Some("ain.rs"));
     }
 
+    /// Without `allow_files` the listing keeps directories only, so a file can never be ghosted,
+    /// cycled to, or accepted — the add-project row's whole reason for the flag. A project is its
+    /// directory, and the server refuses anything else, so offering a file could only ever bait a
+    /// rejection.
+    #[test]
+    fn without_allow_files_only_directories_complete() {
+        let roots = vec!["/tmp/root".to_string()];
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0, false);
+        ed.sync_dir_listing(&roots);
+        ed.set_dir_listing(vec![
+            entry("src", true),
+            entry("Cargo.toml", false),
+            entry("scripts", true),
+        ]);
+        assert_eq!(
+            ed.listing
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src", "scripts"],
+            "files are dropped on the way in, so nothing downstream has to re-check"
+        );
+
+        // The manifest is exactly what you'd reach for under the old marker-file model, and it is
+        // precisely what must not complete now.
+        ed.input.set("Car".into());
+        assert_eq!(ed.path_ghost(), None);
+        assert!(!ed.accept_path_suggestion(&roots));
+        assert_eq!(ed.input.text, "Car", "a non-matching leaf is left alone");
+
+        // Directories still complete, and still carry the trailing `/`.
+        ed.input.set("scr".into());
+        assert_eq!(ed.path_ghost().as_deref(), Some("ipts/"));
+
+        // The same listing under the save-as prompt keeps the file — the flag is the only
+        // difference between the two users.
+        let mut save_as = PathEditor::new(String::new(), ChipEditorField::Path, 0, true);
+        save_as.sync_dir_listing(&roots);
+        save_as.set_dir_listing(vec![entry("src", true), entry("Cargo.toml", false)]);
+        save_as.input.set("Car".into());
+        assert_eq!(save_as.path_ghost().as_deref(), Some("go.toml"));
+    }
+
+    // ---- absolute mode -------------------------------------------------------------------------
+
+    /// What an absolute editor asks the server to list, across the shapes a half-typed path passes
+    /// through. The dir portion goes out **verbatim** — no root join, tilde intact.
+    #[test]
+    fn absolute_lists_the_dir_portion_verbatim() {
+        // Deliberately multi-root: an absolute editor must ignore the roots entirely.
+        let roots = vec!["/work/api".to_string(), "/personal/web".to_string()];
+        let dir_for = |typed: &str| {
+            let ed = PathEditor::absolute(typed.into(), true);
+            ed.dir_listing_path(&roots)
+        };
+
+        assert_eq!(dir_for("/hom").as_deref(), Some("/"));
+        assert_eq!(dir_for("/etc/ngin").as_deref(), Some("/etc/"));
+        // The filesystem root survives: `join_root_relative` would have trimmed this to `""`.
+        assert_eq!(dir_for("/").as_deref(), Some("/"));
+        // The tilde is the server's to expand — the client core has no `$HOME` under wasm.
+        assert_eq!(dir_for("~/Pro").as_deref(), Some("~/"));
+        assert_eq!(dir_for("~/").as_deref(), Some("~/"));
+        // Nothing typed yet: nothing to list. Asking for `""` would come back a canonicalize
+        // failure and paint the field red before the user has done anything.
+        assert_eq!(dir_for(""), None);
+        assert_eq!(dir_for("hom"), None);
+    }
+
+    /// An absolute editor never has a root segment, however many roots the workspace has — the
+    /// property that keeps `path_editor_key`'s BackTab / Alt-h / Alt-Backspace arms from moving
+    /// focus somewhere that doesn't exist.
+    #[test]
+    fn absolute_never_has_a_root_segment() {
+        let one = vec!["/work/api".to_string()];
+        let many = vec!["/work/api".to_string(), "/personal/web".to_string()];
+
+        let abs = PathEditor::absolute("/etc".into(), true);
+        assert!(!abs.multi_root(&one));
+        assert!(!abs.multi_root(&many));
+        assert_eq!(abs.field, ChipEditorField::Path);
+
+        // A rooted editor still answers the original question.
+        let rooted = PathEditor::new(String::new(), ChipEditorField::Path, 0, true);
+        assert!(!rooted.multi_root(&one));
+        assert!(rooted.multi_root(&many));
+    }
+
+    /// The two commit accessors are exclusive, so a commit site that reaches for the wrong one gets
+    /// `None` rather than a plausible-looking wrong answer — an absolute path posted as a relative
+    /// one, in particular.
+    #[test]
+    fn commit_accessors_are_exclusive() {
+        let roots = vec!["/work/api".to_string(), "/personal/web".to_string()];
+
+        let abs = PathEditor::absolute("/home/me/code".into(), false);
+        assert_eq!(abs.absolute_target().as_deref(), Some("/home/me/code"));
+        assert_eq!(abs.save_target(&roots), None);
+
+        let rooted = PathEditor::new("notes.md".into(), ChipEditorField::Path, 1, true);
+        assert_eq!(rooted.save_target(&roots), Some((1, "notes.md".into())));
+        assert_eq!(rooted.absolute_target(), None);
+
+        // Empty is nothing to commit either way.
+        assert_eq!(
+            PathEditor::absolute("   ".into(), false).absolute_target(),
+            None
+        );
+    }
+
+    /// Emptying an absolute field after a bad path clears the failure with it.
+    ///
+    /// Without the reset in `sync_dir_listing`'s `None` branch, both halves of this go wrong: the
+    /// field stays red forever (`path_invalid` reads the listing state alone), and the dead listing
+    /// keeps ghosting its entries onto whatever is typed next.
+    #[test]
+    fn emptying_an_absolute_field_clears_the_stale_listing() {
+        let roots = vec!["/work/api".to_string()];
+        let mut ed = PathEditor::absolute(String::new(), true);
+
+        ed.input.set("/etc/ho".into());
+        ed.sync_dir_listing(&roots);
+        ed.set_dir_listing(vec![entry("hosts", false), entry("nginx", true)]);
+        assert_eq!(ed.path_ghost().as_deref(), Some("sts"));
+
+        // Back to a bare leaf with no dir portion: the `/etc` entries must not follow it.
+        ed.input.set("ho".into());
+        assert!(!ed.path_edited(&roots));
+        assert!(ed.listing.is_empty());
+        assert_eq!(ed.path_ghost(), None);
+
+        // And a failure doesn't outlive the text that caused it.
+        ed.input.set("/nope/".into());
+        ed.sync_dir_listing(&roots);
+        ed.set_dir_listing_failed();
+        assert!(ed.path_invalid());
+        ed.input.set(String::new());
+        assert!(!ed.path_edited(&roots));
+        assert!(
+            !ed.path_invalid(),
+            "an emptied field is unknown, not invalid"
+        );
+    }
+
     #[test]
     fn accepting_a_dir_refetches_but_a_file_does_not() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0, true);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing(vec![entry("src", true), entry("main.rs", false)]);
 
@@ -326,7 +616,7 @@ mod tests {
     #[test]
     fn save_target_is_literal_input_not_the_suggestion() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Path, 0, true);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing(vec![entry("macros", true)]);
         // Typing `ma` highlights `macros/` as a ghost, but Enter saves the literal `ma`.
@@ -340,7 +630,7 @@ mod tests {
     #[test]
     fn missing_parent_dir_is_advisory_invalid() {
         let roots = vec!["/tmp/root".to_string()];
-        let mut ed = PathEditor::new("nope/file.rs".into(), ChipEditorField::Path, 0);
+        let mut ed = PathEditor::new("nope/file.rs".into(), ChipEditorField::Path, 0, true);
         ed.sync_dir_listing(&roots);
         ed.set_dir_listing_failed();
         assert!(ed.path_invalid());
@@ -352,7 +642,7 @@ mod tests {
     fn multi_root_field_resolves_chosen_root() {
         let roots = vec!["/work/api".to_string(), "/personal/web".to_string()];
         let labels = root_labels(&roots);
-        let mut ed = PathEditor::new(String::new(), ChipEditorField::Root, 0);
+        let mut ed = PathEditor::new(String::new(), ChipEditorField::Root, 0, true);
         // Filter to the second root, then commit the root field → focus moves to the path.
         ed.root_filter.set("web".into());
         ed.root_selected = 0;

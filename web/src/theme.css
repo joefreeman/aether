@@ -1067,20 +1067,8 @@ html, body, #app {
   line-height: 1.2;
 }
 .ps-root-delete:hover { background: var(--error); }
-/* The add-root field is a borderless input after its bullet — the caret is the focus cue (like the
-   terminal's input row), not a box. */
-.ps-add-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  outline: none;
-  padding: 0;
-  color: var(--fg-bright);
-  font: inherit;
-}
-.ps-add-input::placeholder { color: var(--fg-muted); font-style: italic; }
-.ps-add-input.invalid { color: var(--error); }
+/* (The add-root field's own `.ps-add-input` rules are gone: the row now reuses the shared
+   `picker-editor-*` ghost-stacking DOM, like the add-project row and the save-as prompt.) */
 /* The add-project row's field. It reuses the dir/save-as editor's `picker-editor-*` ghost-stacking
    DOM wholesale, so only the flex container is defined here: the segments size themselves (the root
    hugs its content, the path takes the rest) exactly as they do in the picker. */

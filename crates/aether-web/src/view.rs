@@ -189,8 +189,16 @@ fn workspace_settings(s: &Session) -> Value {
         "add_project_index": ps.add_project_index(),
         // Where the projects list starts, so the shell can place its section heading.
         "first_project_index": ps.input_index() + 1,
-        "add": field(&ps.add),
+        // A full path editor now, like `add_project` — its `multi_root` comes back `false` (the
+        // path is absolute), so the shell's whole root-segment branch falls away for it.
+        "add": path_editor(&ps.add, &s.workspace_paths),
         "add_project": path_editor(&ps.add_project, &s.workspace_paths),
+        // The affordance each add row shows *instead of* its editor, or null to draw the editor.
+        // The rule (unfocused and untouched) and the words both come from the core, so the three
+        // shells can't drift — and so a seeded field still collapses to its label.
+        "add_placeholder": ps.add_placeholder(aether_client::session::SettingsRow::AddRoot),
+        "add_project_placeholder": ps
+            .add_placeholder(aether_client::session::SettingsRow::AddProject),
         // The add-project row's optional language override — a typeahead over the languages a
         // server exists for, so the field can only ever produce one that starts something.
         "add_project_language": {
@@ -305,10 +313,11 @@ fn chip_editor(ce: &Option<ChipEditor>, workspace_paths: &[String]) -> Value {
     })
 }
 
-/// The save-as prompt's projection — [`path_editor`] under its own `kind` tag.
-fn save_as(ed: &PathEditor, workspace_paths: &[String]) -> Value {
+/// A path-editing prompt's projection — [`path_editor`] under its own `kind` tag. Both prompts that
+/// use one project identically; only the tag (and so which DOM the shell drives) differs.
+fn path_prompt(ed: &PathEditor, workspace_paths: &[String], kind: &str) -> Value {
     let mut v = path_editor(ed, workspace_paths);
-    v["kind"] = json!("saveas");
+    v["kind"] = json!(kind);
     v
 }
 
@@ -320,7 +329,9 @@ fn save_as(ed: &PathEditor, workspace_paths: &[String]) -> Value {
 /// editor.
 fn path_editor(ed: &PathEditor, workspace_paths: &[String]) -> Value {
     let labels = aether_client::labels::root_labels(workspace_paths);
-    let multi_root = workspace_paths.len() > 1;
+    // The editor's own answer: `false` for an absolute-path field regardless of root count, which
+    // is what makes the shell's whole root-segment branch fall away for it.
+    let multi_root = ed.multi_root(workspace_paths);
     json!({
         "field": match ed.field {
             ChipEditorField::Root => "root",
@@ -353,7 +364,7 @@ fn prompt(
         Some(Prompt::Confirm { kind, .. }) => {
             json!({ "kind": "confirm", "confirm": confirm_kind(kind) })
         }
-        Some(Prompt::SaveAs(ed)) => save_as(ed, workspace_paths),
+        Some(Prompt::SaveAs(ed)) => path_prompt(ed, workspace_paths, "saveas"),
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
         // App info: ship the *composed sections*, not the raw snapshot. Row selection, ordering and
         // wording are the core's (shared with the native shells); the browser only paints them, so
@@ -372,9 +383,10 @@ fn prompt(
                 }))
                 .collect::<Vec<_>>(),
         }),
-        // Open-from-path: a single plain path field (no root chips). The shell renders an
-        // `<input>` and syncs its value via `open_path_set_input`.
-        Some(Prompt::OpenPath(field)) => json!({ "kind": "openpath", "input": field.text }),
+        // Open-from-path: the same editor as save-as, over an absolute path — so `multi_root` comes
+        // back false and the shell's root-segment branch never runs. Syncs via
+        // `open_path_set_input`.
+        Some(Prompt::OpenPath(ed)) => path_prompt(ed, workspace_paths, "openpath"),
     }
 }
 

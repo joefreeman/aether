@@ -303,8 +303,8 @@ pub enum Prompt {
         action: ConfirmAction,
     },
     /// The save-as path editor (`Alt-s`): a workspace-relative path field with the picker dir-chip
-    /// editor's directory-completion UX (ghost suggestions, `Tab`/`Alt-l` accept, multi-root inline
-    /// root field). Text editing is owned by each shell's input, which syncs the value via
+    /// editor's directory-completion UX (ghost suggestions, `Alt-l` accept, multi-root inline root
+    /// field). Text editing is owned by each shell's input, which syncs the value via
     /// [`super::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps the value
     /// and the command keys. See [`crate::path_editor::PathEditor`].
     SaveAs(Box<crate::path_editor::PathEditor>),
@@ -318,12 +318,17 @@ pub enum Prompt {
     /// build identity + the connection state) — being able to see diagnostics is most valuable
     /// exactly when the connection is down.
     AppInfo(Option<Box<aether_protocol::app::AppInfo>>),
-    /// The open-from-path overlay (`Space Alt-w`): a single, workspace-agnostic path field. Unlike
-    /// [`Self::SaveAs`] (a root-relative chip editor), this is a plain absolute/relative path —
-    /// `Enter` opens it via `workspace/open_path` (external buffer outside the roots, or a fresh
-    /// ephemeral context with no workspace active), `Esc` cancels. Text editing is shell-owned and
+    /// The open-from-path overlay (`Space Alt-w`): a single, workspace-agnostic path field.
+    ///
+    /// The same [`crate::path_editor::PathEditor`] as [`Self::SaveAs`], but an **absolute** one
+    /// ([`crate::path_editor::PathBase::Absolute`]) — so no root segment, and its completions come
+    /// from the unrestricted listing, which is what lets this work with no workspace active at all.
+    /// Files are offered as well as directories, since a file is what it opens. Seeded `~/`.
+    ///
+    /// `Enter` opens via `workspace/open_path` (an external buffer outside the roots, or a fresh
+    /// ephemeral context when nothing is active), `Esc` cancels. Text editing is shell-owned and
     /// synced via [`super::update`]'s `open_path_set_input`; the core keeps the value.
-    OpenPath(TextField),
+    OpenPath(Box<crate::path_editor::PathEditor>),
 }
 
 /// A single editable text field. The workspace-settings overlay holds two (name + add-root). Text
@@ -378,8 +383,15 @@ pub struct WorkspaceSettings {
     /// the reason it can't be used.
     pub projects: Vec<WorkspaceProject>,
     pub selected: usize,
-    /// Text being typed into the add-root input row.
-    pub add: TextField,
+    /// The add-root row's path editor — an **absolute** one
+    /// ([`crate::path_editor::PathBase::Absolute`]), completing directories only, since a root is a
+    /// directory somewhere on the filesystem rather than anywhere relative to this workspace. That
+    /// is also why its listing is the unrestricted kind: the directory you are adding is by
+    /// definition one the workspace does not already contain.
+    ///
+    /// Seeded `~/` on open so suggestions are there immediately rather than after you have guessed
+    /// a prefix.
+    pub add: Box<crate::path_editor::PathEditor>,
     /// The add-project row's path editor — the same component the save-as prompt uses, so declaring
     /// a project reuses the muscle memory of saving somewhere: a root typeahead segment in
     /// multi-root workspaces, then a directory-completing path field. A project is stored relative
@@ -470,6 +482,26 @@ impl WorkspaceSettings {
     /// keystrokes to a text field rather than treat them as commands.
     pub fn on_input(&self) -> bool {
         matches!(self.row(), SettingsRow::AddRoot | SettingsRow::AddProject)
+    }
+
+    /// The affordance an add row shows *instead of* its editor, or `None` to draw the editor.
+    ///
+    /// A row collapses to its label while it is unfocused and untouched: there is nothing to read
+    /// in an empty field, and — for the seeded add-root row — a bare `~/` says far less about what
+    /// the row is for than "Add root…" does. Focusing it swaps the seed in, which is also when its
+    /// completions become useful.
+    ///
+    /// Both the rule and the two strings live here because all three shells drew them, and drew
+    /// them from three separate string literals apiece. The rule in particular had already gone
+    /// wrong once: written as "unfocused **and empty**", it silently stopped firing for add-root
+    /// the moment that field gained a seed.
+    pub fn add_placeholder(&self, row: SettingsRow) -> Option<&'static str> {
+        let (ed, label) = match row {
+            SettingsRow::AddRoot => (&self.add, "Add root..."),
+            SettingsRow::AddProject => (&self.add_project, "Add project..."),
+            _ => return None,
+        };
+        (self.row() != row && ed.is_untouched()).then_some(label)
     }
 
     /// The root under the current selection, when a root row is focused.

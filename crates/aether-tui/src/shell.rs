@@ -965,7 +965,7 @@ impl Shell {
                 // Multi-root save-as has a leading root-typeahead segment; focus follows the core
                 // editor's `field`. Single-root workspaces only ever have the path segment.
                 Prompt::SaveAs(ed) => Some(
-                    if self.session.workspace_paths.len() > 1
+                    if ed.multi_root(&self.session.workspace_paths)
                         && ed.field == aether_client::chips::ChipEditorField::Root
                     {
                         OverlayField::SaveAsRoot
@@ -1011,7 +1011,7 @@ impl Shell {
                 // segment it has active (the root typeahead only exists in multi-root workspaces).
                 SettingsRow::AddProject => Some(if ps.on_add_project_language {
                     OverlayField::WorkspaceAddProjectLanguage
-                } else if self.session.workspace_paths.len() > 1
+                } else if ps.add_project.multi_root(&self.session.workspace_paths)
                     && ps.add_project.field == ChipEditorField::Root
                 {
                     OverlayField::WorkspaceAddProjectRoot
@@ -1038,7 +1038,7 @@ impl Shell {
                 _ => String::new(),
             },
             OverlayField::OpenPath => match &self.session.prompt {
-                Some(Prompt::OpenPath(field)) => field.text.clone(),
+                Some(Prompt::OpenPath(ed)) => ed.input.text.clone(),
                 _ => String::new(),
             },
             OverlayField::Search => self.session.search.query.clone(),
@@ -1070,7 +1070,7 @@ impl Shell {
                 .session
                 .workspace_settings
                 .as_ref()
-                .map(|s| s.add.text.clone())
+                .map(|s| s.add.input.text.clone())
                 .unwrap_or_default(),
             OverlayField::PickerQuery => self
                 .session
@@ -1922,14 +1922,26 @@ impl Shell {
         let mut name_input = crate::text_input::TextInput::default();
         name_input.set(core.name.text.clone());
         name_input.cursor = field_cursor(OverlayField::WorkspaceName, core.name.text.len());
-        let mut add_input = crate::text_input::TextInput::default();
-        add_input.set(core.add.text.clone());
-        add_input.cursor = field_cursor(OverlayField::WorkspaceAddRoot, core.add.text.len());
+        // The add-root row is a path editor too — a single-segment one, since its value is an
+        // absolute path with no root to be relative to.
+        let add = {
+            let ed = &core.add;
+            let mut input = crate::text_input::TextInput::default();
+            input.set(ed.input.text.clone());
+            input.cursor = field_cursor(OverlayField::WorkspaceAddRoot, ed.input.text.len());
+            crate::app::PathFieldState {
+                input,
+                ghost: ed.path_ghost(),
+                invalid: ed.path_invalid(),
+                focused: core.row() == SettingsRow::AddRoot,
+                placeholder: core.add_placeholder(SettingsRow::AddRoot),
+            }
+        };
         // The add-project row is a path editor: project its two segments (plus the ghosts and
         // validity the core computes) the way the save prompt does.
         let labels = aether_client::labels::root_labels(&self.session.workspace_paths);
-        let multi_root = self.session.workspace_paths.len() > 1;
         let ed = &core.add_project;
+        let multi_root = ed.multi_root(&self.session.workspace_paths);
         let mut add_project_input = crate::text_input::TextInput::default();
         add_project_input.set(ed.input.text.clone());
         add_project_input.cursor =
@@ -1968,6 +1980,7 @@ impl Shell {
             language_ghost: core.language_ghost(),
             language_invalid: core.language_invalid(),
             on_language: core.on_add_project_language,
+            placeholder: core.add_placeholder(SettingsRow::AddProject),
         };
 
         // Flatten the core's row model into display order, carrying each row's selection index so
@@ -2028,7 +2041,7 @@ impl Shell {
             name_input,
             rows,
             selected: core.selected,
-            add_input,
+            add,
             add_project,
             error: core.error.clone(),
         });
@@ -2532,7 +2545,7 @@ impl Shell {
             .as_ref()
             .filter(|e| e.field == crate::overlay_input::OverlayField::OpenPath)
             .map(|e| e.input.cursor);
-        let multi_root = self.session.workspace_paths.len() > 1;
+        let workspace_paths = self.session.workspace_paths.clone();
         let st = &mut self.state;
         st.confirm_prompt = None;
         st.save_prompt = None;
@@ -2554,16 +2567,16 @@ impl Shell {
             Some(Prompt::SaveAs(ed)) => {
                 st.save_prompt = Some(save_as_view(
                     ed,
-                    multi_root,
+                    ed.multi_root(&workspace_paths),
                     save_root_cursor,
                     save_path_cursor,
                 ));
             }
-            Some(Prompt::OpenPath(field)) => {
-                let mut input = crate::text_input::TextInput::default();
-                input.set(field.text.clone());
-                input.cursor = open_path_cursor.unwrap_or(field.text.len());
-                st.open_path_prompt = Some(input);
+            Some(Prompt::OpenPath(ed)) => {
+                // The same projection as save-as — it is the same editor. `multi_root` is forced
+                // false: the value is an absolute path, so there is no root segment, and no root
+                // caret to carry either.
+                st.open_path_prompt = Some(save_as_view(ed, false, None, open_path_cursor));
             }
             Some(Prompt::AppInfo(info)) => {
                 // Rows come from the core so all three shells agree; the TUI adds only scroll.

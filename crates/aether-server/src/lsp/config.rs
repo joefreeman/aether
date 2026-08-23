@@ -354,8 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn markerless_languages_are_not_projects() {
-        // These have no root markers, so nothing can declare them as a project.
+    fn markerless_languages_cannot_be_inferred() {
+        // These have no root markers, so no directory's contents can *infer* them — declaring one
+        // means naming the language explicitly, which `resolve_project` allows (it only requires a
+        // server to exist for it). The marker table is an inference input, not a gate on what may
+        // be declared.
         for lang in [
             "json",
             "html",

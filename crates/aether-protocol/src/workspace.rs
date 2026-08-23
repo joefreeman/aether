@@ -133,8 +133,8 @@ pub struct WorkspaceWorktree {
     pub branch: String,
 }
 
-/// One declared project — a marker file whose language server is pinned open while the workspace is
-/// active.
+/// One declared project — a directory whose language server is pinned open while the workspace is
+/// active. The directory *is* the server's root; there is no parent-of-a-marker-file indirection.
 ///
 /// Rendered as the canonical `[root]: [path]` buffer-location format (`aether-client/labels.rs`),
 /// like every other in-workspace file reference.
@@ -147,13 +147,14 @@ pub struct WorkspaceProject {
     pub path_index: u32,
     /// Project directory relative to that root (`.`, `web`, `crates/server`).
     pub relative_path: String,
-    /// The language whose server this project pins — inferred from the marker's file name, or
-    /// declared explicitly for markers that don't imply one. Empty when the entry doesn't resolve.
+    /// The language whose server this project pins — inferred from the build manifests inside the
+    /// directory (`Cargo.toml` → rust, `go.mod` → go, …), or declared explicitly for a directory
+    /// whose manifests don't single one out. Empty when the entry doesn't resolve.
     #[serde(default)]
     pub language: String,
-    /// Why this project is unusable, when it is: a deleted marker (branch switch), an unrecognised
-    /// file name, a path outside every root. Recomputed on every read rather than cached, so a
-    /// project that comes back stops erroring without reactivating the workspace.
+    /// Why this project is unusable, when it is: a deleted directory (branch switch), manifests
+    /// that name no language or several, a path outside every root. Recomputed on every read rather
+    /// than cached, so a project that comes back stops erroring without reactivating the workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -227,9 +228,9 @@ pub struct WorkspaceOpenPathParams {
     pub create_if_missing: bool,
 }
 
-/// Add a root path to an existing workspace. Server canonicalizes the path, refuses duplicates,
-/// updates the TOML, watches the new path for external changes, and invalidates the workspace's
-/// workspace index (so the next picker open re-walks).
+/// Add a root path to an existing workspace. Server canonicalizes the path, refuses duplicates and
+/// non-directories, updates the TOML, watches the new path for external changes, and invalidates
+/// the workspace's workspace index (so the next picker open re-walks).
 pub struct WorkspaceAddRoot;
 impl RpcMethod for WorkspaceAddRoot {
     const NAME: &'static str = "workspace/add_root";
@@ -242,7 +243,9 @@ pub struct WorkspaceAddRootParams {
     /// Workspace to modify. Doesn't have to be the caller's active workspace (the TUI only uses it
     /// for the active workspace today, but the protocol stays general).
     pub workspace: String,
-    /// Path on disk. Must exist and be canonicalizable. Leading `~/` is expanded server-side.
+    /// Path on disk. Must exist, be canonicalizable, and be a **directory** — a root is a tree the
+    /// index walks and the watcher registers, so a file is refused rather than admitted as a
+    /// one-entry root. Leading `~/` is expanded server-side.
     pub path: String,
 }
 

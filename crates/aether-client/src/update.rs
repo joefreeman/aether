@@ -11,7 +11,16 @@ use super::hints::{
     ContextId as HintCtx, HintFacts, HintView, PickerCmd, WireEvent as HintWireEvent,
 };
 use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
-use super::path_editor::PathEditor;
+use super::path_editor::{PathBase, PathEditor};
+
+/// What the two absolute-path fields open seeded with, so their completions are on screen before
+/// the first keystroke instead of after the user has guessed a prefix.
+///
+/// Stays a literal `~/` in the field rather than being expanded to a home path: the client core
+/// compiles to wasm for the browser shell and has no `$HOME` to expand against, so every consumer —
+/// `directory/list`, `workspace/add_root`, `workspace/open_path` — resolves it server-side. It is
+/// also simply shorter to read and to edit back out of.
+const HOME_PREFIX: &str = "~/";
 use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, strip_longest_root,
@@ -326,14 +335,15 @@ pub enum Event {
         abs: String,
         result: Result<DirectoryListResult, String>,
     },
-    /// `directory/list` for the save-as path editor resolved; `abs` is the staleness key.
-    SaveAsListing {
-        abs: String,
-        result: Result<DirectoryListResult, String>,
-    },
-    /// `directory/list` for the settings overlay's add-project row, keyed by the absolute directory
-    /// it was requested for so a stale reply (the editor moved on) is dropped.
-    AddProjectListing {
+    /// `directory/list` for one of the [`PathEditor`] surfaces resolved, keyed by the absolute
+    /// directory it was requested for so a stale reply (the editor moved on) is dropped.
+    ///
+    /// One event for all four rather than one each: they differ only in which editor to route the
+    /// answer to, which is exactly what `owner` says. (The dir-chip editor keeps its own
+    /// [`Event::PickerChipListing`] — it drives a [`crate::chips::ChipEditor`], and resolving its
+    /// listing also re-applies live filters.)
+    PathEditorListing {
+        owner: PathEditorOwner,
         abs: String,
         result: Result<DirectoryListResult, String>,
     },
@@ -427,6 +437,73 @@ pub enum Event {
     },
     /// A fire-and-forget RPC completed; result ignored.
     Noop,
+}
+
+/// Which [`PathEditor`] a `directory/list` round-trip belongs to.
+///
+/// The four surfaces split cleanly by what they name, and that split is what decides whether the
+/// listing may leave the workspace: the two `Rooted` ones complete *within* it, the two `Absolute`
+/// ones exist precisely to reach outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathEditorOwner {
+    /// The save-as prompt (`Alt-s`) — root-relative, files included.
+    SaveAs,
+    /// The workspace-settings add-project row — root-relative, directories only.
+    AddProject,
+    /// The workspace-settings add-root row — absolute, directories only.
+    AddRoot,
+    /// The open-from-path prompt (`Space Alt-w`) — absolute, files included.
+    OpenPath,
+}
+
+impl Session {
+    /// The editor `owner` names, when its surface is open.
+    ///
+    /// The single place that resolves an owner to an editor, so the request site, the response site
+    /// and the key router can't disagree about which one they mean.
+    fn path_editor_mut(&mut self, owner: PathEditorOwner) -> Option<&mut PathEditor> {
+        match owner {
+            PathEditorOwner::SaveAs => match self.prompt.as_mut() {
+                Some(Prompt::SaveAs(ed)) => Some(ed),
+                _ => None,
+            },
+            PathEditorOwner::AddProject => self
+                .workspace_settings
+                .as_mut()
+                .map(|s| s.add_project.as_mut()),
+            PathEditorOwner::AddRoot => self.workspace_settings.as_mut().map(|s| s.add.as_mut()),
+            PathEditorOwner::OpenPath => match self.prompt.as_mut() {
+                Some(Prompt::OpenPath(ed)) => Some(ed),
+                _ => None,
+            },
+        }
+    }
+
+    /// Fire `directory/list` for `owner`'s current dir portion, if its surface is open and has one.
+    /// The requested path rides on the result event as the staleness key, so a response that lands
+    /// after the editor has moved on is discarded rather than applied.
+    ///
+    /// This is the **only** place `unrestricted` is set, and it reads the answer off the editor's
+    /// own [`PathBase`] rather than taking it from the caller — so an absolute editor cannot be
+    /// added later and quietly get a bounded listing that completes nothing.
+    fn refresh_path_editor_listing(&mut self, owner: PathEditorOwner) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(ed) = self.path_editor_mut(owner) else {
+            return Effects::none();
+        };
+        let unrestricted = ed.base == PathBase::Absolute;
+        let Some(path) = ed.dir_listing_path(&workspace_paths) else {
+            return Effects::none();
+        };
+        let abs = path.clone();
+        self.request::<DirectoryList>(DirectoryListParams { path, unrestricted }, move |__r| {
+            Event::PathEditorListing {
+                owner,
+                abs,
+                result: __r.map_err(|e| e.message),
+            }
+        })
+    }
 }
 
 impl Session {
@@ -1986,11 +2063,11 @@ impl Session {
                 // The natural next step for a freshly created (rootless) workspace is adding a root,
                 // so — unlike the default open, which focuses the name field — land on the add-root
                 // input here.
-                self.open_workspace_settings();
+                let opened = self.open_workspace_settings();
                 if let Some(s) = self.workspace_settings.as_mut() {
                     s.selected = s.input_index();
                 }
-                fx
+                fx.and(opened)
             }
             Event::WorkspaceCreated(Err(e)) => Effects::error_detail("Create workspace failed", e),
 
@@ -2024,13 +2101,23 @@ impl Session {
                     Ok(info) => {
                         let name = info.name.clone();
                         self.sync_workspace_info(info);
+                        let workspace_paths = self.workspace_paths.clone();
                         if let Some(s) = self.workspace_settings.as_mut() {
-                            s.add.clear();
+                            // Back to the seed rather than to empty, so the next add starts where
+                            // the last one did. `path_edited` re-keys the listing to `~/` — without
+                            // it the just-added root's entries would keep ghosting into a field
+                            // that no longer describes them.
+                            s.add.input.set(HOME_PREFIX.to_string());
+                            s.add.path_edited(&workspace_paths);
                             s.error = None;
                             // Re-focus the add-root input (now one row further down).
                             s.selected = s.input_index();
                         }
-                        Effects::toast(format!("Added root to {name}"), ToastKind::Success)
+                        let relist = self.refresh_add_root_listing();
+                        relist.and(Effects::toast(
+                            format!("Added root to {name}"),
+                            ToastKind::Success,
+                        ))
                     }
                     Err(e) => {
                         if let Some(s) = self.workspace_settings.as_mut() {
@@ -2217,28 +2304,15 @@ impl Session {
                 self.sync_live_filters()
             }
 
-            Event::SaveAsListing { abs, result } => {
-                // Stale responses (the editor moved to another directory, or closed) are dropped
-                // by the abs-path staleness key. Refreshes only the ghost — no live results behind
-                // the save prompt, so nothing else to re-run.
-                if let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() {
+            Event::PathEditorListing { owner, abs, result } => {
+                // Stale responses (the editor moved to another directory, or its surface closed)
+                // are dropped by the abs-path staleness key. Refreshes only the ghost — none of
+                // these surfaces has live results behind it, so there is nothing else to re-run.
+                if let Some(ed) = self.path_editor_mut(owner) {
                     if ed.listing_dir_abs == abs {
                         match result {
                             Ok(r) => ed.set_dir_listing(r.entries),
                             Err(_) => ed.set_dir_listing_failed(),
-                        }
-                    }
-                }
-                Effects::none()
-            }
-
-            Event::AddProjectListing { abs, result } => {
-                // Same staleness rule as `SaveAsListing`, against the settings overlay's editor.
-                if let Some(st) = self.workspace_settings.as_mut() {
-                    if st.add_project.listing_dir_abs == abs {
-                        match result {
-                            Ok(r) => st.add_project.set_dir_listing(r.entries),
-                            Err(_) => st.add_project.set_dir_listing_failed(),
                         }
                     }
                 }
@@ -3467,36 +3541,11 @@ impl Session {
                 self.prompt = Some(Prompt::SaveAs(editor));
                 self.on_save_as_key(code, mods, text)
             }
-            Prompt::OpenPath(mut field) => {
-                // Plain single-line path field — text entry is shell-owned (synced via
-                // `open_path_set_input`); only Enter (open), Esc (cancel) and the segment delete
-                // are command keys.
-                let no_chord = !mods.ctrl && !mods.alt;
-                match code {
-                    // Alt-Backspace pops one path segment, fish-style — the same grain the save-as
-                    // prompt's path field uses, since this is the same kind of value.
-                    KeyCode::Backspace if mods.alt && !mods.ctrl => {
-                        let shortened = chips::pop_segment(&field.text);
-                        field.set(shortened);
-                        self.prompt = Some(Prompt::OpenPath(field));
-                        Effects::none()
-                    }
-                    KeyCode::Enter if no_chord => {
-                        let path = field.text.trim().to_string();
-                        if path.is_empty() {
-                            self.prompt = Some(Prompt::OpenPath(field)); // nothing typed — stay open
-                            Effects::none()
-                        } else {
-                            self.commit_open_path(path)
-                        }
-                    }
-                    // Esc: the prompt was already taken above, so just leaving it `None` cancels.
-                    KeyCode::Esc => Effects::none(),
-                    _ => {
-                        self.prompt = Some(Prompt::OpenPath(field));
-                        Effects::none()
-                    }
-                }
+            Prompt::OpenPath(editor) => {
+                // Same shape as the `SaveAs` arm above: the editor owns the command keys, so put it
+                // back before handing them over.
+                self.prompt = Some(Prompt::OpenPath(editor));
+                self.on_open_path_key(code, mods, text)
             }
         }
     }
@@ -4146,13 +4195,27 @@ impl Session {
     /// Replace the workspace-settings add-root input text wholesale (native `<input>` parity, as
     /// above). No-op unless the overlay is open.
     pub fn workspace_settings_set_add(&mut self, text: String) -> Effects {
-        if let Some(s) = self.workspace_settings.as_mut() {
-            if s.add.text != text {
-                s.add.set(text);
-                s.error = None;
-            }
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(s) = self.workspace_settings.as_mut() else {
+            return Effects::none();
+        };
+        if s.add.input.text == text {
+            return Effects::none();
         }
-        Effects::none()
+        s.add.input.set(text);
+        s.error = None;
+        if s.add.path_edited(&workspace_paths) {
+            self.refresh_add_root_listing()
+        } else {
+            Effects::none()
+        }
+    }
+
+    /// Fire `directory/list` for the add-root editor. See [`Self::refresh_path_editor_listing`],
+    /// which every path-editing surface shares — and which reads this editor's `Absolute` base to
+    /// send the unrestricted listing it needs.
+    fn refresh_add_root_listing(&mut self) -> Effects {
+        self.refresh_path_editor_listing(PathEditorOwner::AddRoot)
     }
 
     /// Replace the add-project row's path-segment text wholesale (native `<input>` parity, as
@@ -4195,25 +4258,10 @@ impl Session {
         fx.and(self.sync_add_project_inference())
     }
 
-    /// Fire `directory/list` for the add-project editor's current (root, dir-portion) pair. Mirrors
-    /// [`Self::refresh_save_as_listing`]; the requested path rides on the result event so a stale
-    /// response (the editor moved on) can be discarded.
+    /// Fire `directory/list` for the add-project editor. See
+    /// [`Self::refresh_path_editor_listing`], which every path-editing surface shares.
     fn refresh_add_project_listing(&mut self) -> Effects {
-        let workspace_paths = self.workspace_paths.clone();
-        let path = self
-            .workspace_settings
-            .as_ref()
-            .and_then(|s| s.add_project.dir_listing_path(&workspace_paths));
-        let Some(path) = path else {
-            return Effects::none();
-        };
-        let abs = path.clone();
-        self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
-            Event::AddProjectListing {
-                abs,
-                result: __r.map_err(|e| e.message),
-            }
-        })
+        self.refresh_path_editor_listing(PathEditorOwner::AddProject)
     }
 
     /// Keep the add-project row's language suggestion in step with its (root, path) pair: when the
@@ -4568,12 +4616,16 @@ impl Session {
         };
         let abs = path.clone();
 
-        self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
-            Event::PickerChipListing {
+        self.request::<DirectoryList>(
+            DirectoryListParams {
+                path,
+                unrestricted: false,
+            },
+            move |__r| Event::PickerChipListing {
                 abs,
                 result: __r.map_err(|e| e.message),
-            }
-        })
+            },
+        )
     }
 
     /// Commit the chip editor line. A dir editor only commits a *valid* scope — a root that
@@ -5827,25 +5879,48 @@ impl Session {
         }
     }
 
+    /// Keys while the open-from-path prompt is up — the absolute-path twin of
+    /// [`Self::on_save_as_key`].
+    fn on_open_path_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(Prompt::OpenPath(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        match path_editor_key(ed, &workspace_paths, code, mods, text) {
+            // The empty guard lives *here*, not in `commit_open_path` — that one closes the prompt
+            // on its first line, so letting an empty Enter reach it would dismiss the overlay
+            // instead of doing nothing. (`open_path_from_os` calls it too, and wants exactly that
+            // closing behaviour.)
+            PathEditorKey::Commit => match ed.absolute_target() {
+                Some(path) => self.commit_open_path(path),
+                None => Effects::none(),
+            },
+            PathEditorKey::Cancel => {
+                self.prompt = None;
+                Effects::none()
+            }
+            PathEditorKey::Handled { refresh: true } => self.refresh_open_path_listing(),
+            // The prompt *is* the editor — one segment, no enclosing form, so a Tab off either end
+            // has nowhere to go and simply stops.
+            PathEditorKey::Handled { refresh: false }
+            | PathEditorKey::NextField
+            | PathEditorKey::PrevField
+            | PathEditorKey::Ignored => Effects::none(),
+        }
+    }
+
+    /// Fire `directory/list` for the open-from-path editor. See
+    /// [`Self::refresh_path_editor_listing`], which reads this editor's `Absolute` base to send the
+    /// unrestricted listing — the one that works with no workspace active.
+    fn refresh_open_path_listing(&mut self) -> Effects {
+        self.refresh_path_editor_listing(PathEditorOwner::OpenPath)
+    }
+
     /// Fire `directory/list` for the save-as editor's current (root, dir-portion) pair. The
     /// requested path rides on the result event so a stale response (the editor moved on) can be
     /// discarded. No-op for an invalid root or a closed prompt.
     fn refresh_save_as_listing(&mut self) -> Effects {
-        let workspace_paths = self.workspace_paths.clone();
-        let path = match self.prompt.as_ref() {
-            Some(Prompt::SaveAs(ed)) => ed.dir_listing_path(&workspace_paths),
-            _ => None,
-        };
-        let Some(path) = path else {
-            return Effects::none();
-        };
-        let abs = path.clone();
-        self.request::<DirectoryList>(DirectoryListParams { path }, move |__r| {
-            Event::SaveAsListing {
-                abs,
-                result: __r.map_err(|e| e.message),
-            }
-        })
+        self.refresh_path_editor_listing(PathEditorOwner::SaveAs)
     }
 
     /// Commit the save-as prompt: save the literal typed path under the chosen root. A leading `/`
@@ -5884,10 +5959,19 @@ impl Session {
 
     /// Sync the open-from-path field's value from the shell's input (the shell owns text entry).
     pub fn open_path_set_input(&mut self, text: String) -> Effects {
-        if let Some(Prompt::OpenPath(field)) = self.prompt.as_mut() {
-            field.set(text);
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(Prompt::OpenPath(ed)) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        if ed.input.text == text {
+            return Effects::none();
         }
-        Effects::none()
+        ed.input.set(text);
+        if ed.path_edited(&workspace_paths) {
+            self.refresh_open_path_listing()
+        } else {
+            Effects::none()
+        }
     }
 
     /// Open a file the *operating system* handed us: macOS "Open With" / a Dock drop delivering
@@ -7033,10 +7117,15 @@ impl Session {
     }
 
     /// Open the workspace-settings overlay (`Space .`), seeded from the active workspace's name and
-    /// roots. Cheap — no RPC. Focus lands on the always-present add-root input row at the bottom,
-    /// since most opens (especially the post-create flow) are to add a root; the name field is
-    /// above the roots and reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
-    pub fn open_workspace_settings(&mut self) {
+    /// roots. Focus lands on the always-present add-root input row at the bottom, since most opens
+    /// (especially the post-create flow) are to add a root; the name field is above the roots and
+    /// reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
+    ///
+    /// Emits the add-root row's first `directory/list`, for the `~/` it opens seeded with — so the
+    /// completions are on screen before the first keystroke rather than after you have guessed a
+    /// prefix. (Its return type changed from `()` for exactly this; the overlay is otherwise still
+    /// free to open.)
+    pub fn open_workspace_settings(&mut self) -> Effects {
         let roots = self.workspace_paths.clone();
         let projects = self.workspace_projects.clone();
         let workspace_name = self.workspace.clone();
@@ -7046,7 +7135,9 @@ impl Session {
             roots,
             projects,
             selected: 0, // the workspace-name field
-            add: TextField::default(),
+            // Seeded `~/`, and directories-only: a root is a directory, so a file suggestion here
+            // could only ever lead to the server's rejection.
+            add: Box::new(PathEditor::absolute(HOME_PREFIX.to_string(), false)),
             // Multi-root workspaces open on the root segment (there's a choice to make); a
             // single-root one skips straight to the path, where its only root is implied.
             add_project_language: crate::chips::Input::default(),
@@ -7062,9 +7153,17 @@ impl Session {
                     ChipEditorField::Path
                 },
                 0,
+                // Directories only: a project *is* its directory, so a file suggestion here could
+                // only ever lead to the server's rejection.
+                false,
             )),
             error: None,
         });
+        let workspace_paths = self.workspace_paths.clone();
+        if let Some(s) = self.workspace_settings.as_mut() {
+            s.add.sync_dir_listing(&workspace_paths);
+        }
+        self.refresh_add_root_listing()
     }
 
     /// Keys while the workspace-settings overlay is open. Migrated from the TUI's
@@ -7164,6 +7263,32 @@ impl Session {
             }
         }
 
+        // The add-root row is a path editor too, and gets the key on the same terms — but a
+        // single-segment one (its path is absolute, so there is no root to choose), which is why
+        // `NextField`/`PrevField` simply traverse the dialog instead of stepping into a language
+        // field the way add-project's do.
+        if row == SettingsRow::AddRoot {
+            let workspace_paths = self.workspace_paths.clone();
+            let outcome = self
+                .workspace_settings
+                .as_mut()
+                .map(|s| path_editor_key(&mut s.add, &workspace_paths, code, mods, text.clone()));
+            match outcome {
+                Some(PathEditorKey::Commit) => return self.commit_add_root(),
+                Some(PathEditorKey::Cancel) => {
+                    self.workspace_settings = None;
+                    return Effects::none();
+                }
+                Some(PathEditorKey::Handled { refresh: true }) => {
+                    return self.refresh_add_root_listing()
+                }
+                Some(PathEditorKey::Handled { refresh: false }) => return Effects::none(),
+                Some(PathEditorKey::NextField) => return self.settings_step_field(true),
+                Some(PathEditorKey::PrevField) => return self.settings_step_field(false),
+                Some(PathEditorKey::Ignored) | None => {}
+            }
+        }
+
         // Tab / Shift-Tab traverse the dialog's fields — the form convention, and the reason the
         // editor above no longer claims Tab for completion.
         if code == KeyCode::Tab || code == KeyCode::BackTab {
@@ -7199,30 +7324,22 @@ impl Session {
             }
         }
 
+        // Both input rows commit through their own editor above; only the name field reaches here.
         if code == KeyCode::Enter {
             match row {
                 SettingsRow::Name => return self.commit_rename_if_changed(),
-                SettingsRow::AddRoot => return self.commit_add_root(),
-                SettingsRow::AddProject => return self.commit_add_project(),
                 _ => return Effects::none(),
             }
         }
 
-        // Alt-Backspace deletes the last unit of the focused field, at the field's own grain: a
-        // word in the workspace name, a `/` segment in the add-root path — the same split the
-        // add-project row already gets from the path editor above.
+        // Alt-Backspace deletes the last unit of the focused field, at the field's own grain. Only
+        // the name field's grain (a word) lives here now — both path rows pop a `/` segment through
+        // the editor above, which also refreshes their listing to follow the pop.
         if code == KeyCode::Backspace && mods.alt && !mods.ctrl {
             if let Some(s) = self.workspace_settings.as_mut() {
-                match row {
-                    SettingsRow::Name => {
-                        let shortened = chips::pop_word(&s.name.text);
-                        s.name.set(shortened);
-                    }
-                    SettingsRow::AddRoot => {
-                        let shortened = chips::pop_segment(&s.add.text);
-                        s.add.set(shortened);
-                    }
-                    _ => {}
+                if row == SettingsRow::Name {
+                    let shortened = chips::pop_word(&s.name.text);
+                    s.name.set(shortened);
                 }
             }
             return Effects::none();
@@ -7338,10 +7455,11 @@ impl Session {
         } else {
             Effects::none()
         };
-        let multi_root = self.workspace_paths.len() > 1;
+        let workspace_paths = self.workspace_paths.clone();
         let Some(s) = self.workspace_settings.as_mut() else {
             return rename;
         };
+        let multi_root = s.add_project.multi_root(&workspace_paths);
         let count = s.row_count();
         s.selected = if forward {
             (s.selected + 1) % count
@@ -7389,16 +7507,17 @@ impl Session {
     /// Commit the add-root input row: emit a `workspace/add_root` request for the trimmed path.
     /// [`Event::WorkspaceRootAdded`] reconciles the result. Migrated from the TUI's `commit_add_root`.
     fn commit_add_root(&mut self) -> Effects {
-        let Some((workspace, path)) = self
+        // `absolute_target` rather than `save_target`: this editor has no root to be relative to,
+        // and the pair is exclusive so reaching for the wrong one yields `None` instead of a
+        // plausible-looking `(0, "/home/me/code")`. The `~` travels verbatim — `workspace/add_root`
+        // expands it server-side, where there is a `$HOME` to expand against.
+        let Some((workspace, Some(path))) = self
             .workspace_settings
             .as_ref()
-            .map(|s| (s.workspace_name.clone(), s.add.text.trim().to_string()))
+            .map(|s| (s.workspace_name.clone(), s.add.absolute_target()))
         else {
             return Effects::none();
         };
-        if path.is_empty() {
-            return Effects::none();
-        }
         if let Some(s) = self.workspace_settings.as_mut() {
             s.error = None;
         }
@@ -7523,7 +7642,11 @@ impl Session {
     fn hint_context(&self) -> Option<HintCtx> {
         if let Some(prompt) = &self.prompt {
             return match prompt {
-                Prompt::SaveAs(_) => Some(HintCtx::SaveAs),
+                // Both path prompts report the same context: they are the same `PathEditor`, with
+                // the same Alt-l / Alt-j/k / Alt-Backspace vocabulary, so a hint written for one is
+                // true of the other. A separate `OpenPath` variant would only split the curriculum
+                // in two to say the same thing twice.
+                Prompt::SaveAs(_) | Prompt::OpenPath(_) => Some(HintCtx::SaveAs),
                 _ => None,
             };
         }
@@ -8336,7 +8459,8 @@ impl Session {
         } else {
             ChipEditorField::Path
         };
-        let mut ed = PathEditor::new(input, field, path_index);
+        // Files are offered: completing onto an existing one is how you overwrite it.
+        let mut ed = PathEditor::new(input, field, path_index, true);
         ed.sync_dir_listing(&workspace_paths);
         self.prompt = Some(Prompt::SaveAs(Box::new(ed)));
         self.refresh_save_as_listing()
@@ -8868,8 +8992,7 @@ impl Session {
             A::OpenWorkspaceSettings => {
                 // The workspace-settings overlay now lives in the core (state + key handling); every
                 // shell renders it from `session.workspace_settings`.
-                self.open_workspace_settings();
-                Effects::none()
+                self.open_workspace_settings()
             }
             A::OpenAppSettings => {
                 // Like the workspace-settings overlay, the app-settings overlay lives in the core;
@@ -9092,12 +9215,14 @@ impl Session {
                 self.open_save_as(path_index, input)
             }
             A::OpenPath => {
-                // Open the workspace-agnostic path overlay (empty field). The shell focuses it and
-                // syncs typed text via `open_path_set_input`; Enter opens via `workspace/open_path`.
-                self.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(
-                    String::new(),
-                )));
-                Effects::none()
+                // The workspace-agnostic path overlay, seeded `~/` so its completions are on screen
+                // before the first keystroke. Files as well as directories: a file is what it
+                // opens. The shell focuses it and syncs typed text via `open_path_set_input`; Enter
+                // opens via `workspace/open_path`.
+                let mut ed = PathEditor::absolute(HOME_PREFIX.to_string(), true);
+                ed.sync_dir_listing(&self.workspace_paths);
+                self.prompt = Some(Prompt::OpenPath(Box::new(ed)));
+                self.refresh_open_path_listing()
             }
             A::Reload => {
                 if self.buffer.path.is_none() {
@@ -11176,8 +11301,8 @@ mod tests {
         let mut s = Session::placeholder();
         s.workspace = "proj".into();
         s.workspace_paths = vec!["/proj".into()];
-        s.prompt = Some(Prompt::OpenPath(crate::session::TextField::new(
-            "half-typed".into(),
+        s.prompt = Some(Prompt::OpenPath(Box::new(
+            crate::path_editor::PathEditor::absolute("half-typed".into(), true),
         )));
 
         let fx = s.open_path_from_os("/elsewhere/notes.md".into());
@@ -11380,7 +11505,9 @@ pub(crate) fn path_editor_key(
     text: Option<String>,
 ) -> PathEditorKey {
     let labels = super::labels::root_labels(workspace_paths);
-    let multi_root = workspace_paths.len() > 1;
+    // Asked of the editor, not of the root count: an absolute editor has no root segment however
+    // many roots the workspace has, and the arms below move focus into one whenever this is true.
+    let multi_root = ed.multi_root(workspace_paths);
     let in_root = multi_root && ed.field == ChipEditorField::Root;
     let no_chord = !mods.ctrl && !mods.alt;
     // Whether the path field's suggestion listing went stale and needs a directory/list.

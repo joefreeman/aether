@@ -539,6 +539,7 @@ fn save_as_prompt_is_value_synced_not_keycode_edited() {
         "notes".into(),
         ChipEditorField::Path,
         0,
+        true,
     ))));
     let _ = key(&mut s, 'x');
     match &s.prompt {
@@ -564,7 +565,7 @@ fn save_as_prompt_is_value_synced_not_keycode_edited() {
 #[test]
 fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
     use aether_client::session::Prompt;
-    use aether_client::update::Event;
+    use aether_client::update::{Event, PathEditorOwner};
     use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
@@ -575,7 +576,8 @@ fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
     assert_eq!(params["path"], json!("/p"));
 
     // The listing lands with a directory and a file — unlike the dir-scope chip, files are kept.
-    let _ = s.on_event(Event::SaveAsListing {
+    let _ = s.on_event(Event::PathEditorListing {
+        owner: PathEditorOwner::SaveAs,
         abs: "/p".into(),
         result: Ok(DirectoryListResult {
             path: "/p".into(),
@@ -7388,9 +7390,15 @@ fn workspace_created_with_no_roots_opens_a_scratch_and_settings() {
             .collect();
     assert_eq!(
         methods,
-        vec!["history/state", "buffer/open"],
-        "opens a fresh scratch in the new workspace"
+        vec!["history/state", "buffer/open", "directory/list"],
+        "opens a fresh scratch in the new workspace, and the auto-opened settings overlay asks for \
+         its add-root completions up front"
     );
+    // That listing is the *unrestricted* kind — this workspace has no roots at all, so a bounded
+    // one would have nothing to complete against, which is precisely the case this flow lands in.
+    let list = find_request(&fx, "directory/list").expect("the add-root row lists its seed");
+    assert_eq!(list["path"], json!("~/"));
+    assert_eq!(list["unrestricted"], json!(true));
     // The settings overlay auto-opens, focused on the add-root input (index = roots.len + 1 = 1).
     let ps = s.workspace_settings.as_ref().expect("settings opened");
     assert_eq!(ps.workspace_name, "fresh");
@@ -7452,9 +7460,10 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     assert_eq!(s.workspace_paths, vec!["/a".to_string(), "/b".to_string()]);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.roots.len(), 2);
-    assert!(
-        ps.add.text.is_empty(),
-        "the input clears after a successful add"
+    assert_eq!(
+        ps.add.input.text, "~/",
+        "the input resets to its seed after a successful add, so the next one starts where the \
+         last did"
     );
 }
 
@@ -7484,7 +7493,7 @@ fn workspace_symbols_empty_note_names_the_missing_projects() {
     // (like Grep), and nothing has been searched yet, so a note would read as a failed one.
     s.workspace_projects = vec![WorkspaceProject {
         path_index: 0,
-        relative_path: "Cargo.toml".into(),
+        relative_path: "crates/core".into(),
         language: "rust".into(),
         error: None,
     }];
@@ -7525,7 +7534,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
             paths: vec!["/a".into()],
             projects: vec![WorkspaceProject {
                 path_index: 0,
-                relative_path: "Cargo.toml".into(),
+                relative_path: "crates/core".into(),
                 language: "rust".into(),
                 error: None,
             }],
@@ -7551,7 +7560,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
     s.open_workspace_settings();
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.projects.len(), 1);
-    assert_eq!(ps.projects[0].relative_path, "Cargo.toml");
+    assert_eq!(ps.projects[0].relative_path, "crates/core");
 }
 
 /// Tab/Shift-Tab traverse the dialog's fields, and step *through* the add-project row's two
@@ -7935,13 +7944,13 @@ fn settings_selection_model_spans_both_lists() {
     s.workspace_projects = vec![
         WorkspaceProject {
             path_index: 0,
-            relative_path: "Cargo.toml".into(),
+            relative_path: "crates/core".into(),
             language: "rust".into(),
             error: None,
         },
         WorkspaceProject {
             path_index: 1,
-            relative_path: "go.mod".into(),
+            relative_path: "svc".into(),
             language: "go".into(),
             error: None,
         },
@@ -8021,12 +8030,12 @@ fn settings_add_project_emits_request_and_its_result_updates_state() {
     for _ in 0..3 {
         s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
     }
-    let _ = s.workspace_settings_set_add_project("Cargo.toml".into());
+    let _ = s.workspace_settings_set_add_project("crates/core".into());
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     let add = find_request(&fx, "workspace/add_project").expect("workspace/add_project fired");
     assert_eq!(add["workspace"], json!("aether"));
     assert_eq!(add["path_index"], json!(0));
-    assert_eq!(add["relative_path"], json!("Cargo.toml"));
+    assert_eq!(add["relative_path"], json!("crates/core"));
     assert!(
         add.get("language").is_none(),
         "no language sent — the server infers it from the marker"
@@ -8038,7 +8047,7 @@ fn settings_add_project_emits_request_and_its_result_updates_state() {
         paths: vec!["/a".into()],
         projects: vec![WorkspaceProject {
             path_index: 0,
-            relative_path: "Cargo.toml".into(),
+            relative_path: "crates/core".into(),
             language: "rust".into(),
             error: None,
         }],
@@ -8064,7 +8073,7 @@ fn settings_delete_on_a_project_row_confirms_then_removes() {
     s.workspace_paths = vec!["/a".into()];
     s.workspace_projects = vec![WorkspaceProject {
         path_index: 0,
-        relative_path: "Cargo.toml".into(),
+        relative_path: "crates/core".into(),
         language: "rust".into(),
         error: None,
     }];
@@ -8089,7 +8098,7 @@ fn settings_delete_on_a_project_row_confirms_then_removes() {
     let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None, ROWS);
     let req = find_request(&fx, "workspace/remove_project").expect("remove fired on accept");
     assert_eq!(req["path_index"], json!(0));
-    assert_eq!(req["relative_path"], json!("Cargo.toml"));
+    assert_eq!(req["relative_path"], json!("crates/core"));
 }
 
 #[test]
@@ -8217,11 +8226,155 @@ fn settings_set_name_and_add_sync_text() {
     s.workspace_settings_set_add("/new/root".into());
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.name.text, "renamed");
-    assert_eq!(ps.add.text, "/new/root");
+    assert_eq!(ps.add.input.text, "/new/root");
     // No-op outside the overlay.
     s.workspace_settings = None;
     let fx = s.workspace_settings_set_name("x".into());
     assert!(fx.0.is_empty());
+}
+
+/// Both add rows collapse to their affordance while unfocused and untouched — and "untouched"
+/// means *still holding the seed*, not merely empty.
+///
+/// That distinction is the whole point: seeding add-root with `~/` made an emptiness test stop
+/// firing, so the row rendered a bare `~/` where it used to say what it was for. Pinned in the core
+/// because all three shells draw this from the one rule.
+#[test]
+fn add_rows_show_their_affordance_until_something_is_typed() {
+    use aether_client::session::SettingsRow;
+    let mut s = session();
+    s.workspace = "aether".into();
+    s.workspace_paths = vec!["/a".into()];
+    let _ = s.open_workspace_settings();
+
+    // Open focuses the name field, so both add rows are unfocused — and the add-root row is holding
+    // its `~/` seed, which must not count as content.
+    {
+        let ps = s.workspace_settings.as_ref().unwrap();
+        assert_eq!(ps.add.input.text, "~/", "the seed is there...");
+        assert_eq!(
+            ps.add_placeholder(SettingsRow::AddRoot),
+            Some("Add root..."),
+            "...but an untouched field still says what the row is for"
+        );
+        assert_eq!(
+            ps.add_placeholder(SettingsRow::AddProject),
+            Some("Add project...")
+        );
+    }
+
+    // Focusing the add-root row swaps the seed in — which is also when its completions matter.
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    {
+        let ps = s.workspace_settings.as_ref().unwrap();
+        assert_eq!(ps.row(), SettingsRow::AddRoot);
+        assert_eq!(ps.add_placeholder(SettingsRow::AddRoot), None);
+        // The other row is still untouched, so it keeps its label.
+        assert_eq!(
+            ps.add_placeholder(SettingsRow::AddProject),
+            Some("Add project...")
+        );
+    }
+
+    // Type something and navigate away: now there is content worth showing, so no placeholder.
+    let _ = s.workspace_settings_set_add("~/code".into());
+    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_placeholder(SettingsRow::AddRoot),
+        None,
+        "a typed path outlives the focus that produced it"
+    );
+
+    // Delete back down to the seed and the affordance returns — there is nothing invested either
+    // way, so the label is the more useful thing to render.
+    let _ = s.workspace_settings_set_add("~/".into());
+    assert_eq!(
+        s.workspace_settings
+            .as_ref()
+            .unwrap()
+            .add_placeholder(SettingsRow::AddRoot),
+        Some("Add root...")
+    );
+}
+
+/// The add-root row completes path segments like every other path field — over **absolute** paths,
+/// via the unrestricted listing, since the directory you are adding is by definition one the
+/// workspace does not already contain.
+#[test]
+fn settings_add_root_completes_absolute_paths() {
+    use aether_client::update::{Event, PathEditorOwner};
+    use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
+    let mut s = session();
+    s.workspace = "aether".into();
+    // Multi-root on purpose: an absolute field must never grow a root segment.
+    s.workspace_paths = vec!["/a".into(), "/b".into()];
+    let fx = s.open_workspace_settings();
+
+    // Opening asks for the seed's directory, unrestricted.
+    let list = find_request(&fx, "directory/list").expect("the seed is listed on open");
+    assert_eq!(list["path"], json!("~/"));
+    assert_eq!(list["unrestricted"], json!(true));
+
+    let _ = s.on_event(Event::PathEditorListing {
+        owner: PathEditorOwner::AddRoot,
+        abs: "~/".into(),
+        result: Ok(DirectoryListResult {
+            path: "/home/me".into(),
+            parent: None,
+            entries: vec![
+                DirectoryEntry {
+                    name: "Projects".into(),
+                    is_dir: true,
+                },
+                DirectoryEntry {
+                    name: ".bashrc".into(),
+                    is_dir: false,
+                },
+            ],
+        }),
+    });
+
+    // Tab to the row, then a typed prefix ghosts the directory — and only the directory: a root is
+    // a directory, so the file is never offered.
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    assert!(s.workspace_settings.as_ref().unwrap().on_input());
+    let _ = s.workspace_settings_set_add("~/Pro".into());
+    {
+        let ed = &s.workspace_settings.as_ref().unwrap().add;
+        assert_eq!(ed.path_ghost().as_deref(), Some("jects/"));
+        assert!(
+            !ed.multi_root(&s.workspace_paths),
+            "an absolute field has no root segment, whatever the workspace's root count"
+        );
+    }
+    let _ = s.workspace_settings_set_add("~/.bash".into());
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().add.path_ghost(),
+        None,
+        "files are never offered for a root"
+    );
+
+    // Alt-l accepts the directory and re-lists one level down.
+    let _ = s.workspace_settings_set_add("~/Pro".into());
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    assert_eq!(
+        s.workspace_settings.as_ref().unwrap().add.input.text,
+        "~/Projects/"
+    );
+    let list = find_request(&fx, "directory/list").expect("accepting a dir re-lists");
+    assert_eq!(list["path"], json!("~/Projects/"));
+    assert_eq!(list["unrestricted"], json!(true));
+
+    // And Enter commits the literal path, tilde intact — the server expands it.
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let add = find_request(&fx, "workspace/add_root").expect("workspace/add_root fired");
+    assert_eq!(add["path"], json!("~/Projects/"));
 }
 
 #[test]
@@ -8738,14 +8891,18 @@ fn persisted_workspace_close_keeps_open_next_scratch() {
 /// and the result is adopted like a workspace switch (workspace + buffer).
 #[test]
 fn open_path_prompt_submits_via_open_path_rpc() {
-    use aether_client::session::{Prompt, TextField};
+    use aether_client::path_editor::PathEditor;
+    use aether_client::session::Prompt;
     use aether_protocol::buffer::BufferOpenResult;
     use aether_protocol::workspace::{WorkspaceActivateResult, WorkspaceInfo};
 
     let mut s = session();
     s.workspace = "proj".into();
     // Opening the overlay (what `A::OpenPath` does).
-    s.prompt = Some(Prompt::OpenPath(TextField::new(String::new())));
+    s.prompt = Some(Prompt::OpenPath(Box::new(PathEditor::absolute(
+        String::new(),
+        true,
+    ))));
 
     // The shell syncs typed text into the core.
     let _ = s.open_path_set_input("/etc/hosts".into());
@@ -8795,10 +8952,14 @@ fn open_path_prompt_submits_via_open_path_rpc() {
 /// Esc cancels the open-from-path overlay without opening anything.
 #[test]
 fn open_path_prompt_esc_cancels() {
-    use aether_client::session::{Prompt, TextField};
+    use aether_client::path_editor::PathEditor;
+    use aether_client::session::Prompt;
     let mut s = session();
     s.workspace = "proj".into();
-    s.prompt = Some(Prompt::OpenPath(TextField::new("/some/path".into())));
+    s.prompt = Some(Prompt::OpenPath(Box::new(PathEditor::absolute(
+        "/some/path".into(),
+        true,
+    ))));
     let fx = s.on_prompt_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.prompt.is_none(), "Esc closes the overlay");
     assert!(
@@ -8810,10 +8971,14 @@ fn open_path_prompt_esc_cancels() {
 /// Submitting an empty path is a no-op that keeps the overlay open (nothing to open yet).
 #[test]
 fn open_path_empty_submit_keeps_overlay_open() {
-    use aether_client::session::{Prompt, TextField};
+    use aether_client::path_editor::PathEditor;
+    use aether_client::session::Prompt;
     let mut s = session();
     s.workspace = "proj".into();
-    s.prompt = Some(Prompt::OpenPath(TextField::new("   ".into()))); // whitespace only
+    s.prompt = Some(Prompt::OpenPath(Box::new(PathEditor::absolute(
+        "   ".into(),
+        true,
+    )))); // whitespace only
     let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         matches!(s.prompt, Some(Prompt::OpenPath(_))),
@@ -8822,23 +8987,90 @@ fn open_path_empty_submit_keeps_overlay_open() {
     assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
 }
 
+/// The open-from-path overlay completes absolute paths, files included — it opens a file, so a file
+/// is a valid answer here in a way it never is for a root.
+///
+/// The listing is the unrestricted kind, and this test runs with **no workspace roots at all**: the
+/// bounded listing requires an active workspace, so it would refuse outright. That is the case this
+/// overlay exists for.
+#[test]
+fn open_path_prompt_completes_absolute_paths_including_files() {
+    use aether_client::session::Prompt;
+    use aether_client::update::{Event, PathEditorOwner};
+    use aether_protocol::directory::{DirectoryEntry, DirectoryListResult};
+    let mut s = session();
+    s.workspace_paths = Vec::new();
+
+    // `Space Alt-w` opens it.
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let list = find_request(&fx, "directory/list").expect("opening lists the seed");
+    assert_eq!(list["path"], json!("~/"));
+    assert_eq!(list["unrestricted"], json!(true));
+
+    let _ = s.on_event(Event::PathEditorListing {
+        owner: PathEditorOwner::OpenPath,
+        abs: "~/".into(),
+        result: Ok(DirectoryListResult {
+            path: "/home/me".into(),
+            parent: None,
+            entries: vec![
+                DirectoryEntry {
+                    name: "Projects".into(),
+                    is_dir: true,
+                },
+                DirectoryEntry {
+                    name: "notes.md".into(),
+                    is_dir: false,
+                },
+            ],
+        }),
+    });
+
+    let ghost = |s: &Session| match s.prompt.as_ref() {
+        Some(Prompt::OpenPath(ed)) => ed.path_ghost(),
+        _ => panic!("the overlay should still be open"),
+    };
+    // A directory completes with its trailing `/`...
+    let _ = s.open_path_set_input("~/Pro".into());
+    assert_eq!(ghost(&s).as_deref(), Some("jects/"));
+    // ...and so does a file, outright — the difference from the add-root row.
+    let _ = s.open_path_set_input("~/not".into());
+    assert_eq!(ghost(&s).as_deref(), Some("es.md"));
+
+    // Alt-l absorbs it, and Enter opens the literal path with the tilde intact.
+    let _ = s.on_prompt_key(KeyCode::Char('l'), Mods::ALT, None);
+    let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
+    let open = find_request(&fx, "workspace/open_path").expect("workspace/open_path fired");
+    assert_eq!(open["path"], json!("~/notes.md"));
+}
+
 /// Alt-Backspace in the open-from-path overlay pops one path segment, fish-style — the grain the
 /// save-as prompt's path field already uses, because it holds the same kind of value.
 #[test]
 fn open_path_alt_backspace_pops_a_path_segment() {
-    use aether_client::session::{Prompt, TextField};
+    use aether_client::path_editor::PathEditor;
+    use aether_client::session::Prompt;
     let mut s = session();
     s.workspace = "proj".into();
-    s.prompt = Some(Prompt::OpenPath(TextField::new("/etc/nginx/conf.d".into())));
+    s.prompt = Some(Prompt::OpenPath(Box::new(PathEditor::absolute(
+        "/etc/nginx/conf.d".into(),
+        true,
+    ))));
 
     let text = |s: &Session| match s.prompt.as_ref() {
-        Some(Prompt::OpenPath(f)) => f.text.clone(),
+        Some(Prompt::OpenPath(ed)) => ed.input.text.clone(),
         _ => panic!("the overlay should still be open"),
     };
 
     let fx = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
-    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
     assert_eq!(text(&s), "/etc/nginx/");
+    // The pop now re-lists: the field completes, so the suggestions have to follow it up the tree
+    // rather than keep describing the directory you just left. (This assertion was the inverse
+    // before the field gained completion — there was nothing to refresh.)
+    let list = find_request(&fx, "directory/list").expect("popping a segment re-lists");
+    assert_eq!(list["path"], json!("/etc/nginx/"));
+    assert_eq!(list["unrestricted"], json!(true));
     let _ = s.on_prompt_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(text(&s), "/etc/");
     // Down to nothing, then a clean no-op — never a close.
@@ -8872,7 +9104,7 @@ fn settings_alt_backspace_matches_each_fields_grain() {
     let _ = s.workspace_settings_set_add("/home/me/code".into());
     s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
     assert_eq!(
-        s.workspace_settings.as_ref().unwrap().add.text,
+        s.workspace_settings.as_ref().unwrap().add.input.text,
         "/home/me/",
         "a path field pops a segment, not a word"
     );

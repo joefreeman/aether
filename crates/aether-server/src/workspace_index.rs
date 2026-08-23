@@ -131,18 +131,6 @@ pub fn walk_with(
 
     for (path_index, root) in roots.iter().enumerate() {
         let path_index = path_index as u32;
-        let root_basename = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
-
-        if root.is_file() {
-            if let Some(abs) = root.to_str() {
-                out.push(CachedFile {
-                    abs: abs.to_string(),
-                    path_index,
-                    relative_path: root_basename.to_string(),
-                });
-            }
-            continue;
-        }
 
         let walker = ignore::WalkBuilder::new(root)
             .follow_links(false)
