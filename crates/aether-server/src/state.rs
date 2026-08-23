@@ -976,6 +976,44 @@ impl ServerState {
         true
     }
 
+    /// The live temporary workspace an open of `canonical` should **join** rather than mint a rival
+    /// to: one that already has the path open as a buffer, or — for a `directory`, which has no
+    /// buffer to match on — one whose roots already contain it. `None` when no temporary context
+    /// claims the path, which is the caller's cue to mint one.
+    ///
+    /// Without this, two clients opening the same external path (`ae /etc/hosts` in two terminals;
+    /// the `ae --web` launcher and the browser tab it opens) land in two rival contexts holding two
+    /// buffers over one shared document — where two clients in a *named* workspace simply share the
+    /// buffer. Joining makes a temporary context behave like any other one, and it is what lets the
+    /// web tether wait on the very buffer the browser will close.
+    ///
+    /// Ties break on the lowest context number, so the answer doesn't depend on map iteration order
+    /// when several contexts hold the same path (the state this rule stops accumulating).
+    pub fn ephemeral_workspace_for(&self, canonical: &Path, directory: bool) -> Option<String> {
+        let mut claiming: Vec<(u32, &str)> = self
+            .workspaces
+            .values()
+            .filter(|w| w.is_ephemeral())
+            .filter(|w| {
+                if directory {
+                    w.contains(canonical)
+                } else {
+                    self.buffer_for_path_in_workspace(&w.id, canonical)
+                        .is_some()
+                }
+            })
+            .map(|w| {
+                let n =
+                    w.id.strip_prefix(aether_protocol::EPHEMERAL_WORKSPACE_PREFIX)
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(u32::MAX);
+                (n, w.id.as_str())
+            })
+            .collect();
+        claiming.sort_unstable();
+        claiming.first().map(|(_, id)| id.to_string())
+    }
+
     /// Ephemeral workspaces a *new* one supersedes: every throwaway context nothing is using any
     /// more. See [`Self::supersede_ephemeral_workspaces`] for the rule and why it exists.
     fn superseded_ephemeral_workspaces(&self) -> Vec<String> {

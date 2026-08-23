@@ -93,6 +93,7 @@ fn workspace_open_path_roundtrip() {
                 path: "/etc/hosts".into(),
                 transient: None,
                 create_if_missing: false,
+                jump_to: None,
             })
             .unwrap(),
         ),
@@ -103,6 +104,17 @@ fn workspace_open_path_roundtrip() {
     assert_eq!(v["params"]["path"], "/etc/hosts");
     // `transient: None` stays off the wire.
     assert!(v["params"].get("transient").is_none());
+    // Nor does an absent jump — `ae PATH` with no `:LINE` suffix, and every overlay open.
+    assert!(v["params"].get("jump_to").is_none());
+    // A jump rides in `buffer/open`'s shape (0-based), which this delegates to: `ae /etc/hosts:42`.
+    let jumped = to_value(WorkspaceOpenPathParams {
+        path: "/etc/hosts".into(),
+        transient: None,
+        create_if_missing: false,
+        jump_to: Some(aether_protocol::LogicalPosition { line: 41, col: 9 }),
+    })
+    .unwrap();
+    assert_eq!(jumped["jump_to"], serde_json::json!({"line": 41, "col": 9}));
     // `create_if_missing` rides the wire when set, and an old-style params object without it
     // (or with it false — serialized either way) still parses.
     let with: WorkspaceOpenPathParams = serde_json::from_value(

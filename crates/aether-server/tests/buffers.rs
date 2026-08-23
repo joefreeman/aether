@@ -1750,6 +1750,7 @@ async fn ephemeral_open_attaches_to_named_workspaces_document() {
             path: path.display().to_string(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -1937,6 +1938,7 @@ async fn ephemeral_file_edits_survive_restart_via_path_keyed_backup() {
                 path: file.display().to_string(),
                 transient: None,
                 create_if_missing: false,
+                jump_to: None,
             },
         )
         .await;
@@ -2124,6 +2126,7 @@ async fn open_path_with_no_workspace_creates_ephemeral() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2165,6 +2168,7 @@ async fn open_path_with_a_directory_roots_a_temporary_workspace() {
             transient: None,
             // The boot route always sets it; a directory that exists never exercises it.
             create_if_missing: true,
+            jump_to: None,
         },
     )
     .await;
@@ -2213,6 +2217,7 @@ async fn open_path_directory_extends_the_temporary_workspace_it_is_already_in() 
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2224,6 +2229,7 @@ async fn open_path_directory_extends_the_temporary_workspace_it_is_already_in() 
             path: other_dir.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2240,6 +2246,167 @@ async fn open_path_directory_extends_the_temporary_workspace_it_is_already_in() 
         extended.opened.expect("still lands on a buffer").buffer_id,
         file_buffer,
         "with something to return to, the landing buffer is the MRU — not a new scratch"
+    );
+    drop(server);
+}
+
+/// Two clients opening the same external path with no workspace active **share** a temporary
+/// context and a buffer, rather than each minting a rival one over the same document — which is how
+/// two clients in a named workspace behave, and what lets `ae --web file` wait on the very buffer
+/// the browser closes.
+#[tokio::test]
+async fn open_path_joins_the_temporary_workspace_already_holding_the_file() {
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let first: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_a,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let buffer = first.opened.expect("the file opens").buffer_id;
+
+    let mut ws_b = Ws::connect(&server).await;
+    let second: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        second.workspace.name, first.workspace.name,
+        "the second client joins the temporary context holding the path"
+    );
+    assert_eq!(
+        second.opened.expect("the file opens").buffer_id,
+        buffer,
+        "and lands on the same buffer, not a rival one over the same document"
+    );
+    drop(server);
+}
+
+/// The same rule for a directory, which has no buffer to match on: a live temporary context whose
+/// roots already cover it is joined rather than duplicated.
+#[tokio::test]
+async fn open_path_joins_the_temporary_workspace_already_rooted_at_the_directory() {
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let ext_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    let first: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_a,
+        &WorkspaceOpenPathParams {
+            path: ext_dir.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    let mut ws_b = Ws::connect(&server).await;
+    let second: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        &WorkspaceOpenPathParams {
+            path: ext_dir.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        second.workspace.name, first.workspace.name,
+        "the directory's own temporary context is joined, not duplicated"
+    );
+    assert_eq!(
+        second.workspace.paths,
+        vec![ext_dir],
+        "and it keeps its single root"
+    );
+    drop(server);
+}
+
+/// `ae /etc/hosts:42` — the jump rides through to the delegated `buffer/open`, which clamps it.
+/// Before, an external open dropped the position and landed at the top of the file.
+#[tokio::test]
+async fn open_path_lands_on_the_requested_position() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    std::fs::write(&ext_abs, "one\ntwo\nthree\nfour\n").unwrap();
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: Some(aether_protocol::LogicalPosition { line: 2, col: 1 }),
+        },
+    )
+    .await;
+    let buf = opened.opened.expect("the file opens");
+    assert_eq!(
+        (buf.cursor.position.line, buf.cursor.position.col),
+        (2, 1),
+        "the cursor lands where the launch asked"
+    );
+    drop(server);
+}
+
+/// A path with no file behind it is an error — unless a buffer is already *bound* to it, which is
+/// the `ae --web path/to/new-file` tether: this client created the unsaved buffer, and the browser
+/// then attaches to it by path without asking to create anything.
+#[tokio::test]
+async fn open_path_attaches_to_an_unsaved_new_file_without_the_create_flag() {
+    let (server, mut ws_a, ext_abs) = setup_with_external_file().await;
+    let missing = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .join("not-yet.md")
+        .display()
+        .to_string();
+
+    let created: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_a,
+        &WorkspaceOpenPathParams {
+            path: missing.clone(),
+            transient: None,
+            create_if_missing: true,
+            jump_to: None,
+        },
+    )
+    .await;
+    let buffer = created.opened.expect("the buffer is created").buffer_id;
+
+    let mut ws_b = Ws::connect(&server).await;
+    let attached: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws_b,
+        &WorkspaceOpenPathParams {
+            path: missing.clone(),
+            transient: None,
+            // The web boot never creates: a mangled link must error, not mint a file.
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        attached.opened.expect("attaches").buffer_id,
+        buffer,
+        "the second client reaches the unsaved buffer rather than failing to canonicalize"
+    );
+    assert!(
+        !std::path::Path::new(&missing).exists(),
+        "and still nothing is written until the first save"
     );
     drop(server);
 }
@@ -2270,6 +2437,7 @@ async fn open_path_rejects_a_directory_in_a_persisted_workspace() {
             path: ext_dir,
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2298,6 +2466,7 @@ async fn open_path_create_if_missing_binds_a_buffer_saved_on_write() {
             path: missing_str.clone(),
             transient: None,
             create_if_missing: true,
+            jump_to: None,
         },
     )
     .await;
@@ -2338,6 +2507,7 @@ async fn open_path_missing_file_without_create_flag_still_errors() {
             path: missing.display().to_string(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2369,6 +2539,7 @@ async fn open_path_rejects_a_relative_path() {
             path: "some/relative/file.rs".into(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2398,6 +2569,7 @@ async fn open_path_external_within_active_workspace_keeps_workspace() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2419,6 +2591,7 @@ async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2470,6 +2643,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2528,6 +2702,7 @@ async fn a_new_temporary_workspace_supersedes_the_idle_one_before_it() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2554,6 +2729,7 @@ async fn a_new_temporary_workspace_supersedes_the_idle_one_before_it() {
             path: sibling_external_file(&ext_abs, "second.rs"),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2591,6 +2767,7 @@ async fn a_dirty_or_occupied_temporary_workspace_survives_a_new_one() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2618,6 +2795,7 @@ async fn a_dirty_or_occupied_temporary_workspace_survives_a_new_one() {
             path: sibling_external_file(&ext_abs, "occupied.rs"),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2641,6 +2819,7 @@ async fn a_dirty_or_occupied_temporary_workspace_survives_a_new_one() {
             path: sibling_external_file(&ext_abs, "third.rs"),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2672,6 +2851,7 @@ async fn a_temporary_workspace_is_rooted_at_its_files_directory() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2734,6 +2914,7 @@ async fn a_temporary_workspace_gains_a_root_per_directory() {
             path: ext_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2746,6 +2927,7 @@ async fn a_temporary_workspace_gains_a_root_per_directory() {
                 .to_string(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2766,6 +2948,7 @@ async fn a_temporary_workspace_gains_a_root_per_directory() {
             path: sibling,
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;
@@ -2806,6 +2989,7 @@ async fn a_temporary_workspace_gets_no_language_server() {
             path: outside_abs.clone(),
             transient: None,
             create_if_missing: false,
+            jump_to: None,
         },
     )
     .await;

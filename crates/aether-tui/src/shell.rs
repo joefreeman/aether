@@ -2989,6 +2989,9 @@ pub async fn bootstrap(
                             path: abs.display().to_string(),
                             transient: None,
                             create_if_missing: true,
+                            // `ae /etc/hosts:42` lands on line 42; a directory has no position to
+                            // jump to and the server ignores it.
+                            jump_to,
                         })
                         .await?;
                     let workspace_paths = opened.workspace.paths.clone();
@@ -3072,6 +3075,7 @@ pub async fn bootstrap(
                                 path: abs,
                                 transient: None,
                                 create_if_missing: true,
+                                jump_to,
                             })
                             .await?
                             .opened

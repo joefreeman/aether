@@ -194,9 +194,12 @@ pub struct WorkspaceCreateParams {
 /// - if a workspace is active but the path is **outside** its roots, opens it there as an *external*
 ///   buffer (the workspace hosts it as a guest — no git, trust-restricted LSP) — it is **not**
 ///   re-homed into whichever other configured workspace might contain it;
-/// - if **no** workspace is active, synthesizes a fresh *ephemeral* workspace (no name, no config on
-///   disk, auto-removed when its last buffer closes — and superseded by the next one, so throwaway
-///   contexts don't accumulate), activates it, and opens the file there. Such a workspace is rooted
+/// - if **no** workspace is active, joins the live ephemeral workspace that already claims this path
+///   (one holding it open as a buffer, or rooted over it for a directory) — so two clients opening
+///   the same external path share a buffer, as two clients in a named workspace do — and otherwise
+///   synthesizes a fresh *ephemeral* workspace (no name, no config on disk, auto-removed when its
+///   last buffer closes — and superseded by the next one, so throwaway contexts don't accumulate),
+///   activates it, and opens the file there. Such a workspace is rooted
 ///   at the **directory of the file that created it** (each further directory opened into it adds a
 ///   root), so its file-oriented pickers have something to work over. That root is bookkeeping, not
 ///   trust: an ephemeral workspace still gets **no language server**, however its files sit relative
@@ -233,6 +236,12 @@ pub struct WorkspaceOpenPathParams {
     /// delegates to. Powers `ae path/to/new-file`; ignored for existing files.
     #[serde(default)]
     pub create_if_missing: bool,
+    /// Land the cursor here, exactly as `buffer/open`'s field of the same name (0-based, clamped
+    /// server-side) — this delegates to it. Powers `ae /etc/hosts:42` and the web client's
+    /// `?path=…#L:C`, which previously opened at the top because the jump had nowhere to ride.
+    /// Ignored for a directory `path` (there's no file to jump within).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_to: Option<crate::LogicalPosition>,
 }
 
 /// Add a root path to an existing workspace. Server canonicalizes the path, refuses duplicates and

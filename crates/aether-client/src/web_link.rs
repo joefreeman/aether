@@ -1,6 +1,6 @@
-//! Web-client share links — the `?workspace=&root=&file=` (+ 1-based `#L:C`) URL scheme the web
-//! shell boots from and its picker links use (`web/src/shell.ts`: the boot parser and
-//! `pickerItemUrl`/`fileQuery`). One builder shared by the core's copy-web-url gesture
+//! Web-client share links — the `?workspace=&root=&file=` / `?path=` / `?dir=` (+ 1-based `#L:C`)
+//! URL scheme the web shell boots from and its picker links use (`web/src/shell.ts`: the boot
+//! parser and `pickerItemUrl`/`fileQuery`). One builder shared by the core's copy-web-url gesture
 //! (`Space Alt-z`) and the `ae --web` launcher, so every producer emits exactly what the boot
 //! parses. Only the query + fragment live here: the base is the caller's — the CLI knows the
 //! server's loopback address, the web shell its own origin (which may be a port-forward the
@@ -20,14 +20,30 @@ pub enum WebLinkTarget<'a> {
     /// A scratch buffer (`?buffer=<id>`). Ids are daemon-session-scoped; the web boot falls
     /// back to the workspace's MRU when the id has gone stale.
     Buffer(BufferId),
+    /// An absolute **file** path with no workspace to be relative to (`?path=/etc/hosts`): one
+    /// outside every configured root, or any file in a temporary context. The web boot hands it to
+    /// `workspace/open_path`, which resolves the context server-side — so, unlike `workspace`,
+    /// nothing session-scoped ends up in the link. Emitted **without** a `workspace` param even
+    /// from a named one: the path is the whole address.
+    Path {
+        path: &'a str,
+        at: Option<(u32, u32)>,
+    },
+    /// An absolute **directory** to browse (`?dir=/home/j/notes`): the boot lands normally and
+    /// raises the explorer there, as `ae DIR` does. A separate param from `Path` because the
+    /// browser can't stat, and the two open different things — a file, versus a place to look
+    /// around in. Keeps `workspace` when the directory is inside one; without it the server takes
+    /// the directory as a temporary context of its own.
+    Directory { path: &'a str },
     /// Just the workspace — or the chooser, when `workspace` is `None` too.
     Workspace,
 }
 
 /// Build the query (+ fragment) for a target: `?workspace=aether&file=src/main.rs#42:10`,
-/// `?workspace=aether&buffer=7`, `?workspace=aether`, or `""` for the bare chooser. `root` is
-/// omitted when 0 and the fragment is 1-based, both matching the web shell's own links. Append
-/// to a base ending in `/` (the served page).
+/// `?workspace=aether&buffer=7`, `?path=/etc/hosts#42:10`, `?workspace=aether&dir=/abs/dir`,
+/// `?workspace=aether`, or `""` for the bare chooser. `root` is omitted when 0 and the fragment is
+/// 1-based, both matching the web shell's own links. Append to a base ending in `/` (the served
+/// page).
 pub fn web_link(workspace: Option<&str>, target: WebLinkTarget) -> String {
     use core::fmt::Write;
     let mut link = String::new();
@@ -40,21 +56,31 @@ pub fn web_link(workspace: Option<&str>, target: WebLinkTarget) -> String {
         );
         sep = '&';
     };
+    // An absolute-path link names its own context: the server derives one from the path, and a
+    // `workspace` alongside it would be either redundant or a contradiction.
+    let workspace = workspace.filter(|_| !matches!(target, WebLinkTarget::Path { .. }));
     if let Some(ws) = workspace {
         push(&mut link, "workspace", ws);
     }
+    let mut fragment = None;
     match target {
         WebLinkTarget::File { root, path, at } => {
             if root != 0 {
                 push(&mut link, "root", &root.to_string());
             }
             push(&mut link, "file", path);
-            if let Some((line, col)) = at {
-                let _ = write!(link, "#{}:{}", line + 1, col + 1);
-            }
+            fragment = at;
         }
+        WebLinkTarget::Path { path, at } => {
+            push(&mut link, "path", path);
+            fragment = at;
+        }
+        WebLinkTarget::Directory { path } => push(&mut link, "dir", path),
         WebLinkTarget::Buffer(id) => push(&mut link, "buffer", &id.to_string()),
         WebLinkTarget::Workspace => {}
+    }
+    if let Some((line, col)) = fragment {
+        let _ = write!(link, "#{}:{}", line + 1, col + 1);
     }
     link
 }
@@ -126,6 +152,48 @@ mod tests {
         assert_eq!(
             web_link(Some("aether"), WebLinkTarget::Buffer(7)),
             "?workspace=aether&buffer=7"
+        );
+        // An absolute path addresses itself — no `workspace`, even when one is passed (a file
+        // outside a named workspace's roots is still opened by path).
+        assert_eq!(
+            web_link(
+                None,
+                WebLinkTarget::Path {
+                    path: "/etc/hosts",
+                    at: None,
+                }
+            ),
+            "?path=/etc/hosts"
+        );
+        assert_eq!(
+            web_link(
+                Some("aether"),
+                WebLinkTarget::Path {
+                    path: "/etc/hosts",
+                    at: Some((41, 9)),
+                }
+            ),
+            "?path=/etc/hosts#42:10"
+        );
+        // A directory keeps its workspace when it has one (browse inside it)…
+        assert_eq!(
+            web_link(
+                Some("aether"),
+                WebLinkTarget::Directory {
+                    path: "/home/j/aether/src",
+                }
+            ),
+            "?workspace=aether&dir=/home/j/aether/src"
+        );
+        // …and stands alone when it doesn't (a temporary context rooted there).
+        assert_eq!(
+            web_link(
+                None,
+                WebLinkTarget::Directory {
+                    path: "/home/j/notes"
+                }
+            ),
+            "?dir=/home/j/notes"
         );
     }
 

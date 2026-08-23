@@ -49,6 +49,7 @@ import type {
   PickerItem,
   PickerKind,
   WorkspaceActivateResult,
+  WorkspaceInfo,
   WorkspaceListResult,
   ScrollPosition,
   SymbolKind,
@@ -1754,6 +1755,15 @@ export class Shell {
       const sp = new URLSearchParams(location.search);
       const urlWorkspace = sp.get("workspace");
       const urlFile = sp.get("file");
+      // An absolute *file* with no workspace to be relative to (`ae /etc/hosts`): the server
+      // resolves the context for it — a temporary one when the file is outside every configured
+      // root. Never carries a `workspace` param; the path is the whole address.
+      const urlPath = sp.get("path");
+      // An absolute *directory* to browse (`ae ~/notes`): the explorer opens there once we land.
+      // A separate param from `path` because the two open different things and the browser can't
+      // stat. With a `workspace` it browses inside it; without one the directory is a temporary
+      // context of its own. (Both mirror aether-client's `web_link`.)
+      const urlDir = sp.get("dir");
       const urlRoot = Number(sp.get("root")) || 0;
       const urlBufferRaw = sp.get("buffer");
       const urlBuffer =
@@ -1770,11 +1780,14 @@ export class Shell {
       }
       const known = list.workspaces.some((pr) => pr.name === urlWorkspace);
       const specified = (known ? urlWorkspace : null) ?? cfg.workspace ?? null;
-      // A URL-directed open (file/buffer link) opens separately; otherwise `open_last` folds the
-      // landing buffer into the activate.
-      const directed = Boolean(urlFile) || urlBuffer != null;
-      // Workspace selection is explicit. With none specified (and not a direct file/buffer link) we
-      // DON'T activate one: keep a placeholder session and raise the Workspaces chooser — nothing is
+      // A URL-directed *buffer* open (file/path/buffer link): it opens separately, so the activate
+      // shouldn't also fold a landing buffer in. A `dir` link isn't one — it browses over whatever
+      // the workspace lands on, exactly as `ae DIR` does.
+      const directedBuffer = Boolean(urlFile) || urlBuffer != null || Boolean(urlPath);
+      // Whether the URL named anything at all to open.
+      const directed = directedBuffer || Boolean(urlDir);
+      // Workspace selection is explicit. With none specified (and nothing named to open) we DON'T
+      // activate one: keep a placeholder session and raise the Workspaces chooser — nothing is
       // rendered behind it. Picking a workspace activates it (PickerSelected → WorkspaceActivated →
       // adopt_switch) and the editor first appears then. Matches the native shells' no-args start.
       if (specified === null && !directed) {
@@ -1783,58 +1796,84 @@ export class Shell {
         this.capture.focus();
         return;
       }
-      const name = specified ?? list.workspaces[0]?.name;
-      if (!name) {
-        this.toast("No workspaces configured", "error", {
-          body: "The server has none to open",
-        });
-        return;
-      }
-      const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
-        name,
-        // Omitted, not empty, when the URL names none: the server enters whichever context this
-        // workspace was last used in.
-        worktrees: Object.keys(urlWorktrees).length ? urlWorktrees : undefined,
-        open_last: !directed,
-      });
-      const lastOrScratch = (): Promise<BufferOpenResult> =>
-        this.client.rpc<BufferOpenResult>("buffer/open", {
-          buffer_id: activated.last_buffer_id ?? null,
-          create_if_missing: false,
-          ...(activated.last_buffer_id == null ? { transient: true } : {}),
-        });
       const jump = this.parseFragment(location.hash); // `#L:C` from a grep-hit / shared-cursor link
+      let workspace: WorkspaceInfo;
       let open: BufferOpenResult;
-      if (urlFile) {
-        try {
-          open = await this.client.rpc<BufferOpenResult>("buffer/open", {
-            path_index: urlRoot,
-            relative_path: urlFile,
-            create_if_missing: false,
-            ...(jump ? { jump_to: jump } : {}),
-          });
-        } catch {
-          this.toast(`Couldn't open ${urlFile}`, "warning");
-          open = await lastOrScratch();
-        }
-      } else if (urlBuffer != null) {
-        // A scratch-buffer link (`?buffer=<id>`); the id is session-scoped, so fall back if stale.
-        try {
-          open = await this.client.rpc<BufferOpenResult>("buffer/open", {
-            buffer_id: urlBuffer,
-            create_if_missing: false,
-          });
-        } catch {
-          open = await lastOrScratch();
-        }
+      // Where the explorer should open once the session exists — the `dir` link's directory.
+      let explorerDir: string | null = urlDir;
+
+      // A path (or a directory with no workspace to browse it in) goes through `workspace/open_path`:
+      // it resolves the context itself — joining the temporary one that already holds the path, or
+      // minting one rooted at it — so this route needs no workspace and works with none configured
+      // at all. It is the same call `ae PATH` makes.
+      const openPathTarget = urlPath ?? (specified === null ? urlDir : null);
+      if (openPathTarget) {
+        const opened = await this.client.rpc<WorkspaceActivateResult>("workspace/open_path", {
+          path: openPathTarget,
+          create_if_missing: false,
+          // A directory has no position to land on; its landing buffer is a scratch.
+          ...(jump && urlPath ? { jump_to: jump } : {}),
+        });
+        if (!opened.opened) throw new Error(`${openPathTarget} opened no buffer`);
+        workspace = opened.workspace;
+        open = opened.opened;
       } else {
-        open = activated.opened ?? (await lastOrScratch());
+        const name = specified ?? list.workspaces[0]?.name;
+        if (!name) {
+          this.toast("No workspaces configured", "error", {
+            body: "The server has none to open",
+          });
+          return;
+        }
+        const activated = await this.client.rpc<WorkspaceActivateResult>("workspace/activate", {
+          name,
+          // Omitted, not empty, when the URL names none: the server enters whichever context this
+          // workspace was last used in.
+          worktrees: Object.keys(urlWorktrees).length ? urlWorktrees : undefined,
+          open_last: !directedBuffer,
+        });
+        workspace = activated.workspace;
+        const lastOrScratch = (): Promise<BufferOpenResult> =>
+          this.client.rpc<BufferOpenResult>("buffer/open", {
+            buffer_id: activated.last_buffer_id ?? null,
+            create_if_missing: false,
+            ...(activated.last_buffer_id == null ? { transient: true } : {}),
+          });
+        if (urlFile) {
+          try {
+            open = await this.client.rpc<BufferOpenResult>("buffer/open", {
+              path_index: urlRoot,
+              relative_path: urlFile,
+              create_if_missing: false,
+              ...(jump ? { jump_to: jump } : {}),
+            });
+          } catch {
+            this.toast(`Couldn't open ${urlFile}`, "warning");
+            open = await lastOrScratch();
+          }
+        } else if (urlBuffer != null) {
+          // A scratch-buffer link (`?buffer=<id>`); the id is session-scoped, so fall back if stale.
+          try {
+            open = await this.client.rpc<BufferOpenResult>("buffer/open", {
+              buffer_id: urlBuffer,
+              create_if_missing: false,
+            });
+          } catch {
+            open = await lastOrScratch();
+          }
+        } else {
+          open = activated.opened ?? (await lastOrScratch());
+        }
       }
 
-      this.session = WasmSession.bootstrap(activated.workspace, open);
+      this.session = WasmSession.bootstrap(workspace, open);
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
+      // A directory link browses it, exactly as `ae DIR` does in the native shells.
+      if (explorerDir) {
+        this.runEffects(this.session.open_explorer_at(explorerDir) as CoreEffect[]);
+      }
       // Boot installs the session directly (no adopt_switch), so the markdown reading-view
       // decision runs here. A `view=read|source` param is the
       // presentation this URL was captured in (a refresh, a shared reading link) and wins
@@ -1847,7 +1886,8 @@ export class Shell {
           this.session.boot_read_presentation_explicit(urlView === "read") as CoreEffect[],
         );
       } else {
-        this.runEffects(this.session.boot_read_presentation(Boolean(urlFile && jump)) as CoreEffect[]);
+        const jumpShaped = Boolean(jump && (urlFile || urlPath));
+        this.runEffects(this.session.boot_read_presentation(jumpShaped) as CoreEffect[]);
       }
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
@@ -4291,8 +4331,17 @@ export class Shell {
       for (const [repo, tree] of trees) params.append("worktree", `${repo}=${tree}`);
       return params;
     };
+    const ephemeral = workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
     const fileQuery = (pathIndex: number, relativePath: string): string => {
       const params = new URLSearchParams();
+      // A temporary context can't be named in a link — its id is recycled and it dies with its last
+      // buffer — so its files are addressed absolutely, the `?path=` the CLI and `Space Alt-z` emit.
+      // The server resolves the context from the path (joining this very one while it lives).
+      const root = ephemeral ? v.workspace_paths[pathIndex] : undefined;
+      if (root) {
+        params.set("path", `${root}/${relativePath}`);
+        return params.toString();
+      }
       if (workspace) params.set("workspace", workspace);
       withContext(params, here);
       if (pathIndex) params.set("root", String(pathIndex));
@@ -4310,6 +4359,9 @@ export class Shell {
         if (item.path_index != null && item.relative_path != null) {
           return fromPath(item.path_index, item.relative_path);
         }
+        // A scratch is reachable only by id, which is scoped to the workspace holding it — and a
+        // temporary context is not something a link can name. Non-link, like the core's refusal.
+        if (ephemeral) return null;
         const params = new URLSearchParams();
         if (workspace) params.set("workspace", workspace);
         withContext(params, here);
@@ -4352,7 +4404,8 @@ export class Shell {
   }
 
   /** Keep the address bar reflecting the current buffer + cursor, the way the boot URL reader consumes
-   * it (`?workspace=&root=&file=#L:C`, or `?workspace=&buffer=<id>` for a scratch), so a reload or
+   * it (`?workspace=&root=&file=#L:C`, `?path=<abs>#L:C` for a file with no workspace to be relative
+   * to, or `?workspace=&buffer=<id>` for a scratch), so a reload or
    * a copied link reopens where you are. `replaceState`, not `push` — browser back/forward isn't a
    * second nav system; in-file/cross-file nav is the core's job (Alt-←/→). A pushState experiment
    * (2026-08-03) was reverted: the browser stack and the editor's nav history each turned the
@@ -4369,17 +4422,29 @@ export class Shell {
 
   private buildUrl(v: CoreView): string {
     const params = new URLSearchParams();
-    if (v.workspace) params.set("workspace", v.workspace);
     const path = v.buffer.path;
-    const r = path ? this.resolvePath(path, v.workspace_paths) : null;
+    // A temporary context is never named in a URL: its id is recycled as contexts come and go, so a
+    // reload could land in an unrelated one. Its files are addressed absolutely instead.
+    const ephemeral = v.workspace.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
+    const r = path && !ephemeral ? this.resolvePath(path, v.workspace_paths) : null;
     if (r) {
+      if (v.workspace) params.set("workspace", v.workspace);
       if (r.path_index) params.set("root", String(r.path_index));
       params.set("file", r.relative_path);
     } else if (path) {
-      params.set("file", path); // a file outside every root — fall back to the absolute path
-    } else {
-      params.set("buffer", String(v.buffer.buffer_id)); // scratch buffer: key on the session id
+      // Nothing to be relative to — a file outside every root, or any file in a temporary context.
+      // The absolute path is the address and the server resolves the context from it, exactly as
+      // `ae PATH` does. (This used to put the absolute path in `file=`, which the boot would have
+      // joined onto root 0.)
+      params.set("path", path);
+    } else if (!ephemeral) {
+      // A scratch: keyed on the session id, and scoped to the workspace holding it.
+      if (v.workspace) params.set("workspace", v.workspace);
+      params.set("buffer", String(v.buffer.buffer_id));
     }
+    // …and a scratch in a temporary context has no address at all (the core's `Space Alt-z` refuses
+    // it for the same reason): leave the URL bare, so a reload offers the chooser rather than
+    // reopening something that isn't there.
     // Record the presentation for markdown buffers, so a refresh restores what's on screen —
     // without this the `#line:col` cursor restore below reads as a jump-shaped open and a reading
     // view reloads as source.

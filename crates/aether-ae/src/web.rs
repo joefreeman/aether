@@ -15,17 +15,24 @@
 //! exits, git proceeds. Ctrl-C closes the buffer (best-effort) and exits non-zero, so an
 //! abandoned edit aborts the caller instead of hanging it.
 //!
-//! Deliberately out of scope for now (each bails with a message rather than half-working): external
-//! files — a path outside every configured workspace needs an ephemeral context, which the web boot
-//! can't address by name; and the native shells' release gesture (`Space k`) has no web analogue —
+//! A path outside every configured workspace rides the URL as an absolute `?path=` / `?dir=`, which
+//! the boot hands to `workspace/open_path` — the same call the native shells make, landing in a
+//! temporary context. The tether still pre-opens the buffer here, and the browser *joins* the
+//! temporary context holding it rather than minting a rival one, so both clients end up on the same
+//! buffer and the close reaches this waiter.
+//!
+//! Deliberately out of scope: the native shells' release gesture (`Space k`) has no web analogue —
 //! the waiter only ends on close or Ctrl-C (server-side tether registration is the future fix).
 
+use aether_client::web_link::WebLinkTarget;
 use aether_connection::{ConnectError, Handle, Inbound};
 use aether_protocol::buffer::{
     BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferOpen, BufferOpenParams,
 };
 use aether_protocol::envelope::NotificationMethod;
-use aether_protocol::workspace::{WorkspaceActivate, WorkspaceActivateParams};
+use aether_protocol::workspace::{
+    WorkspaceActivate, WorkspaceActivateParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
+};
 use anyhow::{bail, Context};
 
 /// Run the `--web` launch. `workspace` is the resolved (explicit or inferred) workspace, `path`
@@ -46,28 +53,78 @@ pub fn run(
     match resolved {
         // No path: land on the workspace (or the chooser when none was named) — pure launcher.
         None => launch_only(port, workspace.as_deref()),
-        // A directory is a session, not an errand (it never tethers natively either): land in
-        // the workspace it infers to. The explorer-at-dir nicety needs a URL param the web boot
-        // doesn't have yet, so this opens the workspace's last buffer instead.
-        Some(dir) if dir.is_dir() => match workspace {
-            Some(ws) => launch_only(port, Some(&ws)),
-            None => bail!(
-                "{} is outside every configured workspace — external paths aren't supported \
-                 with --web yet",
-                dir.display()
-            ),
-        },
-        Some(file) => {
-            let Some(ws) = workspace else {
-                bail!(
-                    "{} is outside every configured workspace — external files aren't supported \
-                     with --web yet",
-                    file.display()
-                );
-            };
-            crate::runtime()?.block_on(open_in_workspace(port, ws, file, jump, tether, version))
+        // A directory is a session, not an errand (it never tethers natively either): land in the
+        // workspace it infers to — or, outside every one, in a temporary context rooted there — and
+        // browse it. Pure launcher either way; the boot raises the explorer.
+        Some(dir) if dir.is_dir() => {
+            wait_for_server(port)?;
+            let url = web_url_for(
+                port,
+                workspace.as_deref(),
+                WebLinkTarget::Directory {
+                    path: &dir.display().to_string(),
+                },
+            );
+            open_in_browser(&url);
+            Ok(())
         }
+        Some(file) => match workspace {
+            Some(ws) => {
+                crate::runtime()?.block_on(open_in_workspace(port, ws, file, jump, tether, version))
+            }
+            // Outside every configured workspace: the URL carries the absolute path and the server
+            // resolves a temporary context for it.
+            None => crate::runtime()?.block_on(open_external(port, file, jump, tether, version)),
+        },
     }
+}
+
+/// The external-file case (`ae --web /etc/hosts`): the browser opens it by absolute path, in a
+/// temporary context the server resolves. Without a tether that's the whole job — launch and exit.
+///
+/// The tether opens the buffer from *this* client first, exactly as [`open_in_workspace`] does and
+/// for the same reason: it puts the buffer in a context this client is parked in, which is what
+/// routes the `buffer/closed` broadcast here. The browser's own `workspace/open_path` then **joins**
+/// that temporary context (it already holds the path) instead of minting a rival one, so both land
+/// on the same buffer — including a not-yet-existing file, which is created here and attached to
+/// there.
+async fn open_external(
+    port: u16,
+    file: std::path::PathBuf,
+    jump: Option<(u32, u32)>,
+    tether: bool,
+    version: String,
+) -> anyhow::Result<()> {
+    let abs = file.display().to_string();
+    let url = web_url_for(
+        port,
+        None,
+        WebLinkTarget::Path {
+            path: &abs,
+            at: jump,
+        },
+    );
+    if !tether {
+        wait_for_server(port)?;
+        open_in_browser(&url);
+        return Ok(());
+    }
+
+    let (handle, mut inbound) = connect_with_retry(port, &version).await?;
+    let opened = handle
+        .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
+            path: abs.clone(),
+            transient: None,
+            create_if_missing: true,
+            jump_to: None,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("could not open {abs}: {e}"))?
+        .opened
+        .ok_or_else(|| anyhow::anyhow!("workspace/open_path returned no buffer"))?;
+    open_in_browser(&url);
+    println!("Waiting for {abs} to be closed in the browser (Ctrl-C to abort)…");
+    wait_for_close(&handle, &mut inbound, opened.buffer_id).await
 }
 
 /// Open the browser on a workspace (or the chooser) with nothing to wait for. The server was
@@ -225,7 +282,6 @@ fn web_url(
     file: Option<(u32, &str)>,
     jump: Option<(u32, u32)>,
 ) -> String {
-    use aether_client::web_link::{web_link, WebLinkTarget};
     let target = match file {
         Some((root, path)) => WebLinkTarget::File {
             root,
@@ -234,7 +290,16 @@ fn web_url(
         },
         None => WebLinkTarget::Workspace,
     };
-    format!("http://127.0.0.1:{port}/{}", web_link(workspace, target))
+    web_url_for(port, workspace, target)
+}
+
+/// [`web_url`] for a target built by the caller — the absolute-path and directory links, which
+/// don't fit its `(root, relative path)` shape.
+fn web_url_for(port: u16, workspace: Option<&str>, target: WebLinkTarget) -> String {
+    format!(
+        "http://127.0.0.1:{port}/{}",
+        aether_client::web_link::web_link(workspace, target)
+    )
 }
 
 /// Hand a URL to the OS opener, and always print it — the fallback for launches with no opener
@@ -295,6 +360,44 @@ mod tests {
         assert_eq!(
             web_url(2385, Some("aether"), None, Some((41, 9))),
             "http://127.0.0.1:2385/?workspace=aether"
+        );
+    }
+
+    /// The launches that have no workspace to be relative to: an external file rides as an absolute
+    /// `?path=` (jump included), a directory as `?dir=` — which keeps its workspace when it has one,
+    /// because the boot browses *inside* that workspace rather than making a temporary context.
+    #[test]
+    fn web_url_carries_external_paths_and_directories() {
+        assert_eq!(
+            web_url_for(
+                2385,
+                None,
+                WebLinkTarget::Path {
+                    path: "/etc/hosts",
+                    at: Some((41, 9)),
+                }
+            ),
+            "http://127.0.0.1:2385/?path=/etc/hosts#42:10"
+        );
+        assert_eq!(
+            web_url_for(
+                2385,
+                None,
+                WebLinkTarget::Directory {
+                    path: "/home/j/notes",
+                }
+            ),
+            "http://127.0.0.1:2385/?dir=/home/j/notes"
+        );
+        assert_eq!(
+            web_url_for(
+                2385,
+                Some("aether"),
+                WebLinkTarget::Directory {
+                    path: "/home/j/aether/src",
+                }
+            ),
+            "http://127.0.0.1:2385/?workspace=aether&dir=/home/j/aether/src"
         );
     }
 

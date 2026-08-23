@@ -6665,6 +6665,9 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                     path: abs.display().to_string(),
                     transient: None,
                     create_if_missing: true,
+                    // `ae /etc/hosts:42` lands on line 42; a directory has no position to jump to
+                    // and the server ignores it.
+                    jump_to: args.jump_to,
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -6757,14 +6760,14 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                         })
                         .await
                         .map_err(|e| e.to_string())?,
-                    // Outside the named workspace's roots: open as an external (guest) buffer in it.
-                    // `workspace/open_path` carries no jump, so a `path:line:col` on an external file
-                    // opens at the top.
+                    // Outside the named workspace's roots: open as an external (guest) buffer in it,
+                    // `path:line:col` jump included.
                     None => handle
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs_str,
                             transient: None,
                             create_if_missing: true,
+                            jump_to: args.jump_to,
                         })
                         .await
                         .map_err(|e| e.to_string())?

@@ -1243,6 +1243,10 @@ pub async fn workspace_create(
 /// workspace at itself and lands on the landing buffer — a fresh transient scratch for a brand new
 /// context — over which the client opens its explorer. Only a temporary context can take one; a
 /// persisted workspace owns its roots, so a directory there is an error.
+///
+/// With no workspace active we **join** a temporary context that already claims the path before
+/// minting a new one ([`ServerState::ephemeral_workspace_for`]), so two clients opening the same
+/// external path share a buffer instead of holding rival ones over the same document.
 pub async fn workspace_open_path(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1261,6 +1265,11 @@ pub async fn workspace_open_path(
             params.path
         )));
     }
+    // A path with no file behind it that some buffer is nonetheless *already bound to* — an unsaved
+    // new file (`ae --web path/to/new-file`, written at the first save), which a second client is
+    // now attaching to. Only ever *reaches* an existing buffer, so it creates nothing on its own and
+    // needs no `create_if_missing`. `None` when the path resolves normally or nothing holds it.
+    let mut attaching_to_unsaved = false;
     let canonical = match std::fs::canonicalize(&raw) {
         Ok(c) => c,
         // A not-yet-existing file (`ae path/to/new-file`): canonicalize the deepest existing
@@ -1269,10 +1278,23 @@ pub async fn workspace_open_path(
         Err(_) if params.create_if_missing => canonicalize_partial(&raw)
             .map_err(|e| RpcError::invalid_path(format!("resolving {}: {e}", raw.display())))?,
         Err(e) => {
-            return Err(RpcError::invalid_path(format!(
-                "canonicalizing {}: {e}",
-                raw.display()
-            )))
+            let partial = canonicalize_partial(&raw).ok();
+            let held = match &partial {
+                Some(p) => !state.lock().await.buffers_for_path(p).is_empty(),
+                None => false,
+            };
+            match partial.filter(|_| held) {
+                Some(p) => {
+                    attaching_to_unsaved = true;
+                    p
+                }
+                None => {
+                    return Err(RpcError::invalid_path(format!(
+                        "canonicalizing {}: {e}",
+                        raw.display()
+                    )))
+                }
+            }
         }
     };
 
@@ -1317,7 +1339,19 @@ pub async fn workspace_open_path(
             )));
         }
         let mut superseded_pushes = Vec::new();
-        let (id, created) = match active {
+        let (id, created) = match active.or_else(|| {
+            // No workspace active: join the temporary context that already claims this path, if any
+            // (`ephemeral_workspace_for`) — the same buffer rather than a rival one, which is how
+            // the `--web` tether and the browser tab it opens end up on the same buffer.
+            let joined = s.ephemeral_workspace_for(&canonical, directory);
+            if let Some(id) = &joined {
+                if let Some(session) = s.clients.get_mut(&client_id) {
+                    session.active_workspace = Some(id.clone());
+                }
+                tracing::info!(%client_id, workspace = %id, "joined the temporary workspace holding this path");
+            }
+            joined
+        }) {
             Some(id) => (id, false),
             None => {
                 // A new temporary workspace replaces the idle ones before it, like a transient
@@ -1405,7 +1439,11 @@ pub async fn workspace_open_path(
             BufferOpenParams {
                 absolute_path: Some(canonical.display().to_string()),
                 transient: params.transient,
-                create_if_missing: params.create_if_missing,
+                // The delegate canonicalizes again, and would refuse the unsaved-file path for the
+                // same reason we didn't: pass the flag so it resolves, then its own
+                // already-open-buffer reuse returns that buffer before anything is created.
+                create_if_missing: params.create_if_missing || attaching_to_unsaved,
+                jump_to: params.jump_to,
                 ..Default::default()
             },
         )

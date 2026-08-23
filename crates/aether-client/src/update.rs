@@ -3357,41 +3357,46 @@ impl Session {
     /// Copy the web client's URL for the current view (`Space Alt-z`): a file buffer becomes the
     /// root-relative `?workspace=&root=&file=` link with the cursor as its 1-based `#L:C`
     /// fragment (a shared-cursor link — the web boot jumps there); a scratch becomes a
-    /// `?workspace=&buffer=` link. Warns for the targets the web client can't address — an
-    /// ephemeral (no-workspace) context, or an external file outside every root — the same set
-    /// `ae --web` refuses. The shell prepends its own base URL and writes the clipboard
-    /// ([`ShellAction::CopyWebUrl`]); the toast is emitted here, like every copy gesture.
+    /// `?workspace=&buffer=` link. A file with no workspace to be relative to — one outside every
+    /// root, or any file in an ephemeral (no-workspace) context — becomes an absolute `?path=`
+    /// link, which the web boot opens exactly as `ae PATH` does. Only a *pathless* buffer in a
+    /// temporary context has nothing to address. The shell prepends its own base URL and writes the
+    /// clipboard ([`ShellAction::CopyWebUrl`]); the toast is emitted here, like every copy gesture.
     fn copy_web_url(&mut self) -> Effects {
         use crate::web_link::{web_link, WebLinkTarget};
-        if self.workspace.is_empty() || aether_protocol::is_ephemeral_workspace_id(&self.workspace)
-        {
-            return Effects::toast_detail(
-                "No web URL",
-                "This buffer isn't in a workspace",
-                ToastKind::Warning,
-            );
-        }
+        let at = self.buffer.cursor.position;
+        let named = !self.workspace.is_empty()
+            && !aether_protocol::is_ephemeral_workspace_id(&self.workspace);
         let path_query = match self.buffer.path.as_deref() {
-            Some(path) => match strip_longest_root(path, &self.workspace_paths) {
-                Some((root, rel)) => {
-                    let at = self.buffer.cursor.position;
-                    web_link(
-                        Some(&self.workspace),
-                        WebLinkTarget::File {
-                            root,
-                            path: &rel,
-                            at: Some((at.line, at.col)),
-                        },
-                    )
-                }
-                None => {
-                    return Effects::toast_detail(
-                        "No web URL",
-                        "This file is outside the workspace's roots",
-                        ToastKind::Warning,
-                    )
-                }
+            // In a named workspace, a file under one of its roots is addressed relative to it: the
+            // link survives the workspace moving on disk, and reads as what it is.
+            Some(path) => match strip_longest_root(path, &self.workspace_paths).filter(|_| named) {
+                Some((root, rel)) => web_link(
+                    Some(&self.workspace),
+                    WebLinkTarget::File {
+                        root,
+                        path: &rel,
+                        at: Some((at.line, at.col)),
+                    },
+                ),
+                // Nothing to be relative to: address the file itself.
+                None => web_link(
+                    None,
+                    WebLinkTarget::Path {
+                        path,
+                        at: Some((at.line, at.col)),
+                    },
+                ),
             },
+            // A scratch is reachable only by id, which is scoped to the workspace it lives in — and
+            // a temporary context is not something a link can name (its id is recycled).
+            None if !named => {
+                return Effects::toast_detail(
+                    "No web URL",
+                    "This scratch buffer isn't in a workspace",
+                    ToastKind::Warning,
+                )
+            }
             None => web_link(
                 Some(&self.workspace),
                 WebLinkTarget::Buffer(self.buffer.buffer_id),
@@ -6047,6 +6052,8 @@ impl Session {
                 // The overlay stays existing-files-only (a typo'd path should error readably,
                 // not silently mint a buffer); the CLI boot is the create route.
                 create_if_missing: false,
+                // Typed by hand, with no position to carry: open where the file was left.
+                jump_to: None,
             },
             |r| {
                 Event::WorkspaceActivated(r.and_then(|a| {
@@ -11486,31 +11493,50 @@ mod tests {
         );
     }
 
-    /// The targets the web client can't address — an external file outside every root, and any
-    /// buffer in an ephemeral (no-workspace) context — warn instead of copying a broken link.
-    /// Same set `ae --web` refuses.
+    /// A file with no workspace to be relative to — outside every root, or in an ephemeral
+    /// (no-workspace) context — is addressed by absolute path, the `?path=` link the web boot hands
+    /// to `workspace/open_path`. It carries no `workspace`: naming one would be a lie about where
+    /// the file lives, and a temporary context's id is recycled, so it can't be named at all.
     #[test]
-    fn copy_web_url_warns_for_web_unaddressable_targets() {
-        let unaddressable = |s: &mut Session| {
-            let fx = s.copy_web_url();
-            assert_eq!(copied_web_url(&fx), None, "nothing lands on the clipboard");
-            assert!(
-                fx.0.iter().any(|e| matches!(
-                    e,
-                    Effect::Toast {
-                        kind: ToastKind::Warning,
-                        ..
-                    }
-                )),
-                "the refusal is audible"
-            );
-        };
+    fn copy_web_url_addresses_unrooted_files_by_absolute_path() {
+        // An external file, hosted as a guest by a named workspace.
         let mut s = web_url_session();
         s.buffer.path = Some("/elsewhere/b.rs".into());
-        unaddressable(&mut s);
+        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        assert_eq!(
+            copied_web_url(&s.copy_web_url()).as_deref(),
+            Some("?path=/elsewhere/b.rs#42:10")
+        );
+        // A file in a temporary context, even one under the root that context adopted.
         let mut s = web_url_session();
-        s.workspace = format!("{}x", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
-        unaddressable(&mut s);
+        s.workspace = format!("{}1", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
+        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        assert_eq!(
+            copied_web_url(&s.copy_web_url()).as_deref(),
+            Some("?path=/proj/src/a.rs#42:10")
+        );
+    }
+
+    /// The one target left with no address: a *pathless* buffer in a temporary context. A scratch
+    /// is reachable only by an id scoped to the workspace holding it, and that workspace is not
+    /// something a link can name — so this warns rather than copying a link that won't reopen.
+    #[test]
+    fn copy_web_url_warns_for_a_scratch_with_no_workspace() {
+        let mut s = web_url_session();
+        s.workspace = format!("{}1", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
+        s.buffer.path = None;
+        let fx = s.copy_web_url();
+        assert_eq!(copied_web_url(&fx), None, "nothing lands on the clipboard");
+        assert!(
+            fx.0.iter().any(|e| matches!(
+                e,
+                Effect::Toast {
+                    kind: ToastKind::Warning,
+                    ..
+                }
+            )),
+            "the refusal is audible"
+        );
     }
 }
 

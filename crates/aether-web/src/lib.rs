@@ -289,6 +289,18 @@ impl WasmSession {
         )))
     }
 
+    /// Open the Explorer at `dir` — the boot raises it over the landing buffer when the URL named a
+    /// directory (`?path=/some/dir`), as the native shells do for `ae DIR`. Returns `Effect[]`.
+    pub fn open_explorer_at(&mut self, dir: String) -> Result<JsValue, JsValue> {
+        to_js(&effects_to_json(self.inner.open_picker(
+            aether_protocol::picker::PickerKind::Explorer,
+            Some(dir),
+            None,
+            false,
+            None,
+        )))
+    }
+
     /// Select the rightmost filter chip (Left/Backspace at the query start). Returns `Effect[]`.
     pub fn picker_select_last_chip(&mut self) -> Result<JsValue, JsValue> {
         to_js(&effects_to_json(self.inner.picker_select_last_chip()))
