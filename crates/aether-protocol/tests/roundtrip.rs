@@ -5578,6 +5578,10 @@ fn app_settings_carry_a_path_and_stay_backward_compatible() {
 ///
 /// Asserted in `const` blocks: the flags are compile-time facts, so getting one wrong should fail
 /// the build rather than one test run. Nothing here executes.
+// A constant asserted to be what it is reads to clippy as a tautology, which is the point here.
+// The pinned toolchain's clippy fires on that even inside `const {}`; newer ones don't — so this
+// is `allow` rather than `expect`, which would itself warn on the toolchains that stay quiet.
+#[allow(clippy::assertions_on_constants)]
 #[test]
 fn mutates_text_marks_the_buffer_a_method_names() {
     use aether_protocol::buffer::{BufferContent, BufferCut};
