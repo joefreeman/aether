@@ -29,6 +29,36 @@ pub enum Reveal {
     Run,
 }
 
+/// The scroll offset that frames a freshly-opened group run — the shell-side geometry behind
+/// [`Reveal::Run`]. `None` means the run already fits and nothing should move.
+///
+/// **Unit-agnostic**: the terminal passes view rows, the GUI and the browser pass pixels. All four
+/// arguments must be in the same unit; the answer comes back in it too. That is the only thing the
+/// three shells ever disagreed about, so it is the only thing left to them — the policy itself
+/// lives here, once:
+///
+/// - the header above the viewport (a backward step) aligns it to the start edge;
+/// - a run overflowing the far edge scrolls the minimum that brings its last row into view, capped
+///   so the header never leaves the start edge;
+/// - a run taller than the viewport therefore sits at that cap, header at the very top where it
+///   renders itself, with as many items below as fit.
+///
+/// `run_end` is the edge just *past* the run's last row, so a run of `len` items whose header sits
+/// at row `h` spans `h .. h + len + 1`.
+pub fn frame_run(current: f64, viewport: f64, run_start: f64, run_end: f64) -> Option<f64> {
+    if run_start < current {
+        return Some(run_start);
+    }
+    if run_end > current + viewport {
+        // Capped at `run_start`: never scroll the header off the top to chase the run's tail.
+        let target = (run_end - viewport).min(run_start);
+        // The cap can already be where we are (an over-tall run framed once already), and a
+        // reveal must never scroll *backwards* here — that is the first branch's job.
+        return (target > current).then_some(target);
+    }
+    None
+}
+
 /// Which level of the two-level model the selection is on, for the collapsible kinds. **Stored, not
 /// derived**: the row-space facts a derivation would read — `selected` (moved by the `set_group`
 /// reply) and `focus_run` (moved by the reshaping push) — arrive on separate, order-independent
@@ -1154,6 +1184,59 @@ pub struct PendingCreate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-reveal rules, in the terminal's unit (view rows). A run of `len` items with its
+    /// header at row `h` spans `h .. h + len + 1`.
+    fn run_top(top: f64, pane: f64, header: f64, len: f64) -> f64 {
+        frame_run(top, pane, header, header + len + 1.0).unwrap_or(top)
+    }
+
+    #[test]
+    fn framing_a_run_that_fits_below_bottom_aligns_its_last_row() {
+        // Pane of 6 rows; header at row 8 with 3 items (rows 9..=11), viewport starting at 4.
+        assert_eq!(run_top(4.0, 6.0, 8.0, 3.0), 6.0);
+    }
+
+    #[test]
+    fn a_run_already_in_view_does_not_move() {
+        assert_eq!(frame_run(6.0, 6.0, 8.0, 12.0), None);
+        assert_eq!(frame_run(7.0, 6.0, 8.0, 12.0), None);
+    }
+
+    #[test]
+    fn a_header_above_the_viewport_aligns_to_the_start_edge() {
+        // A backward step: this is the one case that scrolls *towards* the start.
+        assert_eq!(frame_run(10.0, 6.0, 8.0, 12.0), Some(8.0));
+    }
+
+    #[test]
+    fn a_run_taller_than_the_viewport_caps_at_its_header() {
+        // 10 items in a 6-row pane: showing the last row would push the header off the top, so the
+        // reveal stops at the header and the first items show below it.
+        assert_eq!(run_top(0.0, 6.0, 2.0, 10.0), 2.0);
+        // And sitting at that cap already is stable — no thrash on a repeat.
+        assert_eq!(run_top(2.0, 6.0, 2.0, 10.0), 2.0);
+    }
+
+    #[test]
+    fn a_degenerate_one_row_viewport_still_lands_on_the_header() {
+        assert_eq!(run_top(5.0, 1.0, 3.0, 2.0), 3.0);
+    }
+
+    /// The GUI and browser pass pixels, and their viewport is not a whole number of rows. The rule
+    /// is the same; only the unit differs.
+    #[test]
+    fn the_same_rules_hold_in_pixels() {
+        let row_h = 24.0;
+        // Header at row 8, 3 items, in a 150px pane (6.25 rows) scrolled to 4 rows.
+        let (start, end) = (8.0 * row_h, (8.0 + 3.0 + 1.0) * row_h);
+        assert_eq!(frame_run(4.0 * row_h, 150.0, start, end), Some(end - 150.0));
+        // Fractional viewport: the answer is not row-aligned, which is the point of keeping the
+        // unit out of here.
+        assert_eq!(frame_run(4.0 * row_h, 150.0, start, end), Some(138.0));
+        // Header above the viewport still wins outright.
+        assert_eq!(frame_run(10.0 * row_h, 150.0, start, end), Some(start));
+    }
     use aether_protocol::git::GitStatus;
 
     #[test]

@@ -14,11 +14,11 @@ use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
 use super::path_editor::PathEditor;
 use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
-    buffer_info, min_pos, severity_label, step_font_size, strip_longest_root, AfterSave,
-    AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind, ConnState,
-    HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView, ReloadTry,
-    RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SettingsRow, SneakState,
-    TextField, WorkspaceSettings,
+    buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, strip_longest_root,
+    AfterSave, AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind,
+    ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView,
+    ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SettingsRow,
+    SneakState, TextField, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -112,7 +112,8 @@ use aether_protocol::search::{
     SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{
-    AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet, ThemeMode,
+    AppSettings, MarkdownWidth, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
+    ThemeMode,
 };
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
@@ -7666,8 +7667,8 @@ impl Session {
             return Effects::none();
         }
 
-        // Left/Right step a value row (either font size) without wrapping — a natural stepper.
-        // They're inert on a toggle row (Enter/Space flips those).
+        // Left/Right step a multi-value row (either font size, the reading width) without
+        // wrapping — a natural stepper. They're inert on a toggle row (Enter/Space flips those).
         let left = code == KeyCode::Left || (mods.alt && code == KeyCode::Char('h'));
         let right = code == KeyCode::Right || (mods.alt && code == KeyCode::Char('l'));
         if left || right {
@@ -7677,6 +7678,9 @@ impl Session {
                 }
                 Some(AppSettingId::UiFontSize) => {
                     self.set_ui_font_size(step_font_size(self.ui_font_size, right, false))
+                }
+                Some(AppSettingId::MarkdownWidth) => {
+                    self.set_markdown_width(step_markdown_width(self.markdown_width, right, false))
                 }
                 _ => Effects::none(),
             };
@@ -7728,6 +7732,10 @@ impl Session {
             self.read_on = settings.markdown_read;
         }
         self.markdown_read_default = settings.markdown_read;
+        // The reading width is shell-render-only: each shell resolves it through `read_layout`'s
+        // measure table every frame, so adopting the value is enough. The TUI's layout cache keys
+        // off the resolved column count, so it re-lays out on its own.
+        self.markdown_width = settings.markdown_width;
         // Theme is shell-render-only too: the shells resolve `self.theme` to a role table each
         // frame (web also stamps `data-theme`), so adopting the mode is enough.
         self.theme = settings.theme;
@@ -7796,6 +7804,12 @@ impl Session {
                 self.read_on = self.markdown_read_default;
                 self.persist_app_settings()
             }
+            // Reading width: activating the row cycles to the next option (wrapping), like the
+            // font-size rows. Shell-render-only — every shell re-resolves the measure on the next
+            // frame, so an open reading view rewidens under the overlay as you step through.
+            AppSettingId::MarkdownWidth => {
+                self.set_markdown_width(step_markdown_width(self.markdown_width, true, true))
+            }
             // Background fetch: the toast is the affordance, because turning this *on* has no
             // visible effect until the next tick — and turning it on is the moment to be explicit
             // that the editor will now talk to the network on its own.
@@ -7849,6 +7863,7 @@ impl Session {
             ui_font_size: self.ui_font_size,
             hints: self.hints_enabled,
             markdown_read: self.markdown_read_default,
+            markdown_width: self.markdown_width,
             theme: self.theme,
             git_auto_fetch: self.git_auto_fetch,
             worktree_store: self.worktree_store.clone(),
@@ -7880,6 +7895,17 @@ impl Session {
             return Effects::none();
         }
         self.ui_font_size = font_size;
+        self.persist_app_settings()
+    }
+
+    /// Persist a new reading-view width + apply it. No-op when unchanged (the Left/Right stepper
+    /// clamps at the ends, so it lands here repeatedly). Nothing to reflow: the reading view is
+    /// laid out shell-side from the measure, so the next frame is the new width.
+    fn set_markdown_width(&mut self, width: MarkdownWidth) -> Effects {
+        if width == self.markdown_width {
+            return Effects::none();
+        }
+        self.markdown_width = width;
         self.persist_app_settings()
     }
 

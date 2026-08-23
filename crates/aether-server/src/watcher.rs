@@ -51,12 +51,33 @@ pub struct WatcherHandle {
 }
 
 struct WatcherInner {
-    watcher: RecommendedWatcher,
+    /// `None` once [`WatcherHandle::shutdown`] has run. Dropping the `notify` watcher is the only
+    /// way to hand the kernel back its **inotify instance**, so the slot has to be emptiable.
+    watcher: Option<RecommendedWatcher>,
     /// Every path currently registered with the kernel: kept directories plus single-file roots.
     watched: HashSet<PathBuf>,
 }
 
 impl WatcherHandle {
+    /// Drop the `notify` watcher, synchronously.
+    ///
+    /// This is the only way to release the **inotify instance** it holds, and the kernel caps
+    /// those at `fs.inotify.max_user_instances` (128 by default) — orders of magnitude below
+    /// `ulimit -n`. A process that builds many servers, as the test binaries do, exhausts them and
+    /// starts failing unrelated work with `EMFILE`.
+    ///
+    /// Dropping the watcher also closes the event sender it owns, which ends the pump task's
+    /// receiver, which lets the pump drop its `SharedState` clone — so the reference cycle that
+    /// otherwise keeps the whole server alive unwinds from here.
+    pub fn shutdown(&self) {
+        self.lock().watcher = None;
+    }
+
+    /// Whether [`shutdown`](Self::shutdown) has run — the OS handle is gone.
+    pub fn is_shut_down(&self) -> bool {
+        self.lock().watcher.is_none()
+    }
+
     fn lock(&self) -> MutexGuard<'_, WatcherInner> {
         match self.inner.lock() {
             Ok(g) => g,
@@ -81,7 +102,7 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     })?;
     let handle = Arc::new(WatcherHandle {
         inner: Mutex::new(WatcherInner {
-            watcher,
+            watcher: Some(watcher),
             watched: HashSet::new(),
         }),
         rescan_pending: AtomicBool::new(false),
@@ -121,7 +142,11 @@ pub fn watch_workspace_paths(handle: &WatcherHandle, paths: &[PathBuf]) {
         if inner.watched.contains(&target) {
             continue;
         }
-        match inner.watcher.watch(&target, RecursiveMode::NonRecursive) {
+        // Shut down (see `WatcherHandle::shutdown`): nothing left to register against.
+        let Some(w) = inner.watcher.as_mut() else {
+            break;
+        };
+        match w.watch(&target, RecursiveMode::NonRecursive) {
             Ok(()) => {
                 inner.watched.insert(target);
                 added += 1;
@@ -163,7 +188,7 @@ pub fn unwatch_workspace_paths(handle: &WatcherHandle, paths: &[PathBuf]) {
             .cloned()
             .collect();
         for p in under {
-            if let Err(e) = inner.watcher.unwatch(&p) {
+            if let Some(Err(e)) = inner.watcher.as_mut().map(|w| w.unwatch(&p)) {
                 tracing::debug!(path = %p.display(), error = %e, "failed to unwatch path");
             }
             inner.watched.remove(&p);
@@ -185,7 +210,10 @@ pub fn watch_buffer_parent(handle: &WatcherHandle, file: &Path) {
     if inner.watched.contains(dir) {
         return;
     }
-    match inner.watcher.watch(dir, RecursiveMode::NonRecursive) {
+    let Some(w) = inner.watcher.as_mut() else {
+        return;
+    };
+    match w.watch(dir, RecursiveMode::NonRecursive) {
         Ok(()) => {
             inner.watched.insert(dir.to_path_buf());
         }
@@ -369,7 +397,7 @@ fn prune_dead_watches(handle: &WatcherHandle, event_paths: &[PathBuf]) {
         .cloned()
         .collect();
     for p in dead {
-        if let Err(e) = inner.watcher.unwatch(&p) {
+        if let Some(Err(e)) = inner.watcher.as_mut().map(|w| w.unwatch(&p)) {
             tracing::debug!(path = %p.display(), error = %e, "failed to unwatch dead path");
         }
         inner.watched.remove(&p);

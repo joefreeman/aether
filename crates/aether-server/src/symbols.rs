@@ -335,7 +335,11 @@ pub async fn merge_results(
 /// Only the newly-ready server is asked; everything already accumulated stays, and the merge dedupes
 /// against it. The picker's *current* generation is used, so a query the user has since changed
 /// discards this the same way any late arrival is discarded.
-pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager::LspServerKey) {
+pub async fn requery_ready_server(
+    state: &SharedState,
+    key: &crate::lsp::manager::LspServerKey,
+    token: crate::state::DeferredToken,
+) {
     let pending: Vec<(ClientId, u64, String, SymbolServer, Vec<PathBuf>)> = {
         let mut s = state.lock().await;
         // A server is keyed by `(root, language)` and can serve several workspaces, so the ones to
@@ -412,7 +416,9 @@ pub async fn requery_ready_server(state: &SharedState, key: &crate::lsp::manager
     };
     for (client_id, generation, query, server, roots) in pending {
         let state = state.clone();
+        let token = token.clone();
         tokio::spawn(async move {
+            let _token = token;
             let found = query_server(&server, &query, &roots).await;
             merge_results(&state, client_id, generation, found).await;
         });

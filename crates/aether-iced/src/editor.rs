@@ -1761,3 +1761,143 @@ fn char_at(window: &Window, pos: LogicalPosition) -> Option<char> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(line: u32, col: u32) -> LogicalPosition {
+        LogicalPosition { line, col }
+    }
+
+    fn cursor(anchor: LogicalPosition, position: LogicalPosition) -> CursorState {
+        CursorState {
+            position,
+            anchor,
+            match_bracket: None,
+            jumplist_position: None,
+        }
+    }
+
+    /// The endpoints come back in document order however the selection was dragged — a backwards
+    /// selection is the same range as a forwards one, and everything downstream assumes `min <= max`.
+    #[test]
+    fn selection_endpoints_order_the_pair_whichever_way_it_was_dragged() {
+        let (a, b) = (pos(1, 2), pos(3, 4));
+        assert_eq!(selection_endpoints(&cursor(a, b)), (a, b));
+        assert_eq!(
+            selection_endpoints(&cursor(b, a)),
+            (a, b),
+            "dragged upwards"
+        );
+        // Same line, cursor behind the anchor.
+        let (c, d) = (pos(5, 9), pos(5, 2));
+        assert_eq!(selection_endpoints(&cursor(c, d)), (d, c));
+        // A collapsed cursor is a degenerate range at its own position.
+        assert_eq!(selection_endpoints(&cursor(a, a)), (a, a));
+    }
+
+    /// Selections are **inclusive on both endpoints** — the protocol's convention — so the char
+    /// under the cursor is part of the range. Off-by-one here shows up as a selection that renders
+    /// one cell short.
+    #[test]
+    fn pos_in_selection_includes_both_endpoints() {
+        let (min, max) = (pos(1, 2), pos(3, 4));
+        assert!(pos_in_selection(1, 2, min, max), "the first char is in");
+        assert!(pos_in_selection(3, 4, min, max), "and so is the last");
+        assert!(!pos_in_selection(1, 1, min, max), "one before is not");
+        assert!(!pos_in_selection(3, 5, min, max), "one after is not");
+        // Whole interior lines are covered regardless of column.
+        assert!(pos_in_selection(2, 0, min, max));
+        assert!(pos_in_selection(2, 9_999, min, max));
+        // Lines outside the range never are.
+        assert!(!pos_in_selection(0, 9_999, min, max));
+        assert!(!pos_in_selection(4, 0, min, max));
+    }
+
+    /// A single-cell selection covers exactly one cell.
+    #[test]
+    fn a_collapsed_selection_covers_one_cell() {
+        let p = pos(2, 7);
+        assert!(pos_in_selection(2, 7, p, p));
+        assert!(!pos_in_selection(2, 6, p, p));
+        assert!(!pos_in_selection(2, 8, p, p));
+    }
+
+    fn line_with(diags: Vec<(u32, u32, DiagnosticSeverity)>) -> LogicalLineRender {
+        LogicalLineRender {
+            logical_line: 0,
+            visual_rows: Vec::new(),
+            search_matches: Vec::new(),
+            virtual_rows_above: Vec::new(),
+            virtual_rows_below: Vec::new(),
+            diff_marker: None,
+            diff_stage: DiffStage::default(),
+            diff_emphasis: Vec::new(),
+            conflict: None,
+            diagnostics: diags
+                .into_iter()
+                .map(
+                    |(start, end, severity)| aether_protocol::viewport::DiagnosticSpan {
+                        start,
+                        end,
+                        severity,
+                        message: String::new(),
+                    },
+                )
+                .collect(),
+            sneak_targets: Vec::new(),
+            patch: None,
+        }
+    }
+
+    /// Overlapping diagnostics report the worst one, so a warning can't mask an error underneath.
+    #[test]
+    fn diagnostic_at_reports_the_worst_overlapping_severity() {
+        use DiagnosticSeverity as S;
+        let line = line_with(vec![
+            (0, 10, S::Warning),
+            (4, 6, S::Error),
+            (0, 10, S::Hint),
+        ]);
+        assert_eq!(diagnostic_at(&line, 5), Some(S::Error));
+        assert_eq!(
+            diagnostic_at(&line, 1),
+            Some(S::Warning),
+            "outside the error"
+        );
+        assert_eq!(diagnostic_at(&line, 10), None, "the end is exclusive");
+    }
+
+    /// A zero-width diagnostic — one clamped to the line end — still matches the cell it sits on,
+    /// or the cursor parked there would show nothing.
+    #[test]
+    fn a_zero_width_diagnostic_still_covers_its_cell() {
+        use DiagnosticSeverity as S;
+        let line = line_with(vec![(7, 7, S::Error)]);
+        assert_eq!(diagnostic_at(&line, 7), Some(S::Error));
+        assert_eq!(diagnostic_at(&line, 6), None);
+        assert_eq!(diagnostic_at(&line, 8), None);
+    }
+
+    /// Clipping a rectangle to the gutter edge: it keeps what's right of `left`, and disappears
+    /// entirely once nothing is.
+    #[test]
+    fn clamp_left_trims_or_drops_a_rectangle() {
+        let r = Rectangle {
+            x: 10.0,
+            y: 0.0,
+            width: 20.0,
+            height: 5.0,
+        };
+        // Wholly right of the edge: untouched.
+        let kept = clamp_left(r, 5.0).expect("kept");
+        assert_eq!((kept.x, kept.width), (10.0, 20.0));
+        // Straddling: the left part is trimmed and the width shrinks to match.
+        let trimmed = clamp_left(r, 15.0).expect("trimmed");
+        assert_eq!((trimmed.x, trimmed.width), (15.0, 15.0));
+        // Entirely left of the edge: nothing survives.
+        assert!(clamp_left(r, 30.0).is_none());
+        assert!(clamp_left(r, 100.0).is_none());
+    }
+}

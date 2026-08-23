@@ -1546,7 +1546,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .hl-diff-meta { color: var(--fg-muted); }
 .hl-diff-hunk { color: var(--syn-type); }
 
-/* ---- markdown reading view (docs/markdown-view.md §2.8) --------------------------------------- */
+/* ---- markdown reading view -------------------------------------------------------------------- */
 
 /* The buffer element hosts a typographic document instead of the row grid while reading. The
    grid's `white-space: pre` must not leak in (it would kill paragraph wrapping), and native text
@@ -1565,9 +1565,11 @@ a.picker-row:not(.selected):hover .picker-main {
 
 .md-read {
   /* Relative to the reading size (inherited from the host's scaled em), so a bigger type
-     setting keeps the same ~characters-per-line. Matches the native READ_MEASURE_EM;
-     42.5 × the 18px default reading size = 765px. */
-  max-width: 42.5em;
+     setting keeps the same ~characters-per-line. The shell stamps `--md-measure` from the
+     `markdown_width` app setting, resolved through the core's shared measure table (`none` at
+     the full-width setting); the fallback is the narrow default — 42.5 × the 18px default
+     reading size = 765px. */
+  max-width: var(--md-measure, 42.5em);
   margin: 0 auto;
   padding: 1.5rem 1rem;
   color: var(--fg);

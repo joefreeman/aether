@@ -7,8 +7,8 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, Document, DocumentId, EditKindTag, LineEnding, NavEntry, SearchEntry,
-    ServerState, SharedState, SneakCandidate, SneakEntry, Viewport,
+    BlameCache, Buffer, DeferredToken, Document, DocumentId, EditKindTag, LineEnding, NavEntry,
+    SearchEntry, ServerState, SharedState, SneakCandidate, SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -133,12 +133,16 @@ pub struct ConnectionCtx {
 /// caller uses this to populate the workspace picker. Doesn't indicate which workspace (if any) the
 /// caller has active — the client tracks that locally.
 pub async fn workspace_list(
-    _state: &SharedState,
+    state: &SharedState,
     _ctx: &mut ConnectionCtx,
     _params: WorkspaceListParams,
 ) -> Result<WorkspaceListResult, RpcError> {
-    let names = crate::config::list_workspace_names()
-        .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?;
+    let names = {
+        let s = state.lock().await;
+        s.workspaces_dir()
+            .and_then(|d| crate::config::list_workspace_names_in(&d))
+            .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?
+    };
     Ok(WorkspaceListResult {
         workspaces: names
             .into_iter()
@@ -178,11 +182,16 @@ pub async fn app_info(
 /// Read the global application settings (`$XDG_CONFIG_HOME/aether/settings.toml`). Returns defaults
 /// when no settings file exists yet. App-wide, so it ignores the caller's active workspace.
 pub async fn settings_get(
-    _state: &SharedState,
+    state: &SharedState,
     _ctx: &mut ConnectionCtx,
     _params: SettingsGetParams,
 ) -> Result<AppSettings, RpcError> {
-    crate::config::load_app_settings()
+    let path = state
+        .lock()
+        .await
+        .app_settings_path()
+        .map_err(|e| RpcError::internal(format!("resolving app settings path: {e}")))?;
+    crate::config::load_app_settings_at(&path)
         .map_err(|e| RpcError::internal(format!("loading app settings: {e}")))
 }
 
@@ -195,7 +204,12 @@ pub async fn settings_set(
     ctx: &mut ConnectionCtx,
     params: AppSettings,
 ) -> Result<AppSettings, RpcError> {
-    crate::config::write_app_settings(&params)
+    let path = state
+        .lock()
+        .await
+        .app_settings_path()
+        .map_err(|e| RpcError::internal(format!("resolving app settings path: {e}")))?;
+    crate::config::write_app_settings_at(&path, &params)
         .map_err(|e| RpcError::internal(format!("writing app settings: {e}")))?;
 
     let changed = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
@@ -550,7 +564,12 @@ async fn activate_context(
         let (roots, base_paths) = materialise(&params.name, configured, &bindings, true).await?;
         Some((params.name.clone(), roots, projects, base_paths))
     } else {
-        let cfg = match crate::config::load_workspace(&params.name) {
+        let workspaces_dir = state
+            .lock()
+            .await
+            .workspaces_dir()
+            .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
+        let cfg = match crate::config::load_workspace_in(&workspaces_dir, &params.name) {
             Ok(c) => c,
             // A config that isn't there and one that won't parse are different problems: the first
             // is a wrong name, the second a broken (or stale-format) file the user has to go and
@@ -1117,18 +1136,25 @@ pub async fn workspace_create(
 ) -> Result<WorkspaceActivateResult, RpcError> {
     let client_id = ctx.client_id;
     let name = validate_workspace_name(&params.name)?;
-    let exists = crate::config::workspace_config_exists(&name)
-        .map_err(|e| RpcError::internal(format!("checking workspace config: {e}")))?;
+    let workspaces_dir = state
+        .lock()
+        .await
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
+    let exists = crate::config::workspace_config_exists_in(&workspaces_dir, &name);
     if exists {
         return Err(RpcError::invalid_params(format!(
             "workspace {name} already exists"
         )));
     }
     // Write the TOML outside the state lock — file I/O.
-    crate::config::write_workspace_config(&crate::config::WorkspaceConfig {
-        name: name.clone(),
-        roots: Vec::new(),
-    })
+    crate::config::write_workspace_config_in(
+        &workspaces_dir,
+        &crate::config::WorkspaceConfig {
+            name: name.clone(),
+            roots: Vec::new(),
+        },
+    )
     .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
 
     let mut s = state.lock().await;
@@ -1444,11 +1470,16 @@ pub async fn workspace_add_root(
     // — their `workspace_paths` is what every path they render is resolved against.
     let pushes = workspace_changed_pushes(&s, &params.workspace, ctx.client_id);
     let watcher = s.watcher.clone();
+    // Captured before the lock goes: the workspace store is a field on the state so a test
+    // can point it at a tempdir instead of the developer's own configured workspaces.
+    let workspaces_dir = s
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
     drop(s);
 
     // TOML write + watcher registration happen outside the lock; registration also moves to a
     // blocking task so the response doesn't wait on the new root's (ignore-filtered) walk.
-    crate::config::write_workspace_config(&updated)
+    crate::config::write_workspace_config_in(&workspaces_dir, &updated)
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
         // The live path, not the configured one — the watcher registers directories that exist.
@@ -1536,9 +1567,14 @@ pub async fn workspace_add_project(
         ctx.client_id,
     ));
     let entry_projects = workspace_project_views_by_id(&s, &context);
+    // Captured before the lock goes: the workspace store is a field on the state so a test
+    // can point it at a tempdir instead of the developer's own configured workspaces.
+    let workspaces_dir = s
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
     drop(s);
 
-    crate::config::write_workspace_config(&updated)
+    crate::config::write_workspace_config_in(&workspaces_dir, &updated)
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     spawn_pinned_launches(state, launches);
     for (sender, notif) in pushes {
@@ -1637,9 +1673,14 @@ pub async fn workspace_remove_project(
         ctx.client_id,
     ));
     let entry_projects = workspace_project_views_by_id(&s, &context);
+    // Captured before the lock goes: the workspace store is a field on the state so a test
+    // can point it at a tempdir instead of the developer's own configured workspaces.
+    let workspaces_dir = s
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
     drop(s);
 
-    crate::config::write_workspace_config(&updated)
+    crate::config::write_workspace_config_in(&workspaces_dir, &updated)
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     spawn_pinned_launches(state, launches);
     for (sender, notif) in pushes {
@@ -1817,9 +1858,14 @@ pub async fn workspace_remove_root(
     let mut pushes = workspace_changed_pushes(&s, &params.workspace, client_id);
     pushes.extend(refresh_buffer_pickers(&mut s));
     pushes.extend(buffer_closed_pushes(&s, &other_clients));
+    // Captured before the lock goes: the workspace store is a field on the state so a test
+    // can point it at a tempdir instead of the developer's own configured workspaces.
+    let workspaces_dir = s
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
     drop(s);
 
-    crate::config::write_workspace_config(&updated)
+    crate::config::write_workspace_config_in(&workspaces_dir, &updated)
         .map_err(|e| RpcError::internal(format!("writing workspace config: {e}")))?;
     if let Some(w) = watcher {
         crate::watcher::unwatch_workspace_paths(&w, &[canonical]);
@@ -1886,8 +1932,12 @@ pub async fn workspace_rename(
     }
 
     // Refuse clobbering another workspace's config; `fs::rename` would otherwise overwrite it.
-    let exists = crate::config::workspace_config_exists(&new_name)
-        .map_err(|e| RpcError::internal(format!("checking workspace config: {e}")))?;
+    let workspaces_dir = state
+        .lock()
+        .await
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
+    let exists = crate::config::workspace_config_exists_in(&workspaces_dir, &new_name);
     if exists {
         return Err(RpcError::invalid_params(format!(
             "workspace {new_name} already exists"
@@ -1895,7 +1945,7 @@ pub async fn workspace_rename(
     }
 
     // Disk first, outside the lock (file I/O). If this fails, in-memory state is untouched.
-    crate::config::rename_workspace_config(&old_name, &new_name)
+    crate::config::rename_workspace_config_in(&workspaces_dir, &old_name, &new_name)
         .map_err(|e| RpcError::internal(format!("renaming workspace config: {e}")))?;
 
     // Carry the persisted session across to the new name (recency stamp + restored buffers). Held
@@ -2019,7 +2069,12 @@ pub async fn workspace_delete(
     // watcher drops events that don't map to a loaded workspace.
     drop(s);
 
-    crate::config::delete_workspace_config(&name)
+    let workspaces_dir = state
+        .lock()
+        .await
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
+    crate::config::delete_workspace_config_in(&workspaces_dir, &name)
         .map_err(|e| RpcError::internal(format!("deleting workspace config: {e}")))?;
 
     // Drop its persisted session too, so a deleted workspace doesn't leave an orphan behind. Held
@@ -4453,7 +4508,11 @@ fn configured_workspace_roots(
     if let Some(entry) = s.workspaces.get(id) {
         return Ok(entry.configured_paths().to_vec());
     }
-    let cfg = crate::config::load_workspace(id).map_err(|_| RpcError::unknown_workspace(id))?;
+    let dir = s
+        .workspaces_dir()
+        .map_err(|e| RpcError::internal(format!("resolving workspaces dir: {e}")))?;
+    let cfg =
+        crate::config::load_workspace_in(&dir, id).map_err(|_| RpcError::unknown_workspace(id))?;
     cfg.paths()
         .iter()
         .map(|p| crate::config::canonicalize_workspace_path(p))
@@ -6575,7 +6634,8 @@ pub async fn git_set_blame_follow(
         }
     };
     if let Some(epoch) = armed {
-        spawn_blame_refresh(state.clone(), client_id, params.buffer_id, epoch);
+        let token = state.lock().await.deferred.start();
+        spawn_blame_refresh(state.clone(), client_id, params.buffer_id, epoch, token);
     }
     Ok(())
 }
@@ -6589,8 +6649,10 @@ pub fn spawn_blame_refresh(
     client_id: ClientId,
     buffer_id: BufferId,
     epoch: u64,
+    token: DeferredToken,
 ) {
     tokio::spawn(async move {
+        let _token = token;
         tokio::time::sleep(BLAME_FOLLOW_DEBOUNCE).await;
         let key = (client_id, buffer_id);
         let (sender, notif) = {
@@ -6643,9 +6705,10 @@ pub fn spawn_blame_refresh(
 /// which the deeply-nested handler paths that move cursors don't have in scope.
 pub async fn cursor_follow_loop(
     state: SharedState,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(ClientId, BufferId)>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(ClientId, BufferId, DeferredToken)>,
 ) {
-    while let Some(key) = rx.recv().await {
+    while let Some((client_id, buffer_id, token)) = rx.recv().await {
+        let key = (client_id, buffer_id);
         let (blame_epoch, hl_epoch, symbol_path_pushes) = {
             let mut s = state.lock().await;
             let blame = s.blame_follow.contains(&key).then(|| {
@@ -6668,11 +6731,14 @@ pub async fn cursor_follow_loop(
             let crumbs = collect_symbol_path_pushes(&mut s, key.1);
             (blame, hl, crumbs)
         };
+        // The token rides into whatever this arms, so the work stays counted until the debounced
+        // task actually finishes — or returns early, superseded. Nothing armed means it drops here
+        // and the server is quiet again.
         if let Some(epoch) = blame_epoch {
-            spawn_blame_refresh(state.clone(), key.0, key.1, epoch);
+            spawn_blame_refresh(state.clone(), key.0, key.1, epoch, token.clone());
         }
         if let Some(epoch) = hl_epoch {
-            spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch);
+            spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch, token.clone());
         }
         for (sender, notif) in symbol_path_pushes {
             let _ = sender.send(notif).await;
@@ -7748,7 +7814,8 @@ pub async fn lsp_document_highlight(
         s.symbol_highlight_gen.insert(key, epoch);
         epoch
     };
-    spawn_symbol_highlight_refresh(state.clone(), client_id, buffer_id, epoch);
+    let token = state.lock().await.deferred.start();
+    spawn_symbol_highlight_refresh(state.clone(), client_id, buffer_id, epoch, token);
     Ok(())
 }
 
@@ -7762,8 +7829,10 @@ pub fn spawn_symbol_highlight_refresh(
     client_id: ClientId,
     buffer_id: BufferId,
     epoch: u64,
+    token: DeferredToken,
 ) {
     tokio::spawn(async move {
+        let _token = token;
         tokio::time::sleep(SYMBOL_HIGHLIGHT_DEBOUNCE).await;
         let key = (client_id, buffer_id);
         // Resolve the request at the settled position — but only if no newer move superseded us.
@@ -8628,7 +8697,8 @@ fn attach_git_baseline(
     for key in followers {
         s.blame_last_pushed.remove(&key);
         if let Some(tx) = &s.cursor_moved_tx {
-            let _ = tx.send(key);
+            let token = s.deferred.start();
+            let _ = tx.send((key.0, key.1, token));
         }
     }
     collect_buffer_refresh_pushes(s, buffer_id)
@@ -9275,7 +9345,11 @@ fn set_cursor(s: &mut ServerState, key: (ClientId, BufferId), new: CursorState) 
         || s.document_symbols.contains_key(&key.1);
     if follows {
         if let Some(tx) = &s.cursor_moved_tx {
-            let _ = tx.send(key);
+            // Counted here — synchronously, under the caller's state lock — so the work is already
+            // outstanding by the time the provoking RPC replies. Counting it in the follow loop
+            // instead would leave a window where the server looks quiet but a refresh is coming.
+            let token = s.deferred.start();
+            let _ = tx.send((key.0, key.1, token));
         }
     }
 }
@@ -17351,7 +17425,10 @@ pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
         return Vec::new();
     }
     // One disk read of the workspaces directory, shared by every subscribed picker.
-    let names = match crate::config::list_workspace_names() {
+    let names = match s
+        .workspaces_dir()
+        .and_then(|d| crate::config::list_workspace_names_in(&d))
+    {
         Ok(n) => n,
         Err(_) => return Vec::new(), // can't enumerate — leave the pickers as they are
     };
@@ -18368,8 +18445,12 @@ pub async fn picker_view(
         PickerKind::Workspaces => {
             // Configured-workspace enumeration is a synchronous read of one directory under
             // `$XDG_CONFIG_HOME/aether/workspaces/`. No active-workspace check; works pre-activation.
-            let names = crate::config::list_workspace_names()
-                .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?;
+            let names = {
+                let s = state.lock().await;
+                s.workspaces_dir()
+                    .and_then(|d| crate::config::list_workspace_names_in(&d))
+                    .map_err(|e| RpcError::internal(format!("listing workspaces: {e}")))?
+            };
             let s = state.lock().await;
             picker_state::PickerCandidates::Workspaces(workspace_candidates(&s, &names))
         }
@@ -19356,6 +19437,11 @@ pub async fn picker_query(
     } else {
         None
     };
+    // Captured before the lock goes: the fan-out below is counted as deferred work,
+    // and the count has to be taken while this handler is still running — its reply is
+    // sent after it returns, so anything counted here is outstanding before the client
+    // can observe the response.
+    let deferred = s.deferred.clone();
     drop(s);
 
     if let (Some(sender), Some(params)) = (outbound, update) {
@@ -19363,11 +19449,14 @@ pub async fn picker_query(
     }
 
     if let Some((servers, roots)) = symbol_fanout {
+        let token = deferred.start();
         for server in servers {
             let state = state.clone();
             let query = query_for_grep.clone();
             let roots = roots.clone();
+            let token = token.clone();
             tokio::spawn(async move {
+                let _token = token;
                 let found = crate::symbols::query_server(&server, &query, &roots).await;
                 crate::symbols::merge_results(&state, client_id, generation, found).await;
             });
@@ -20130,6 +20219,7 @@ mod next_buffer_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
+                pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
         );
@@ -20465,6 +20555,7 @@ mod subscribe_snapshot_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
+                pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
         );
@@ -20555,6 +20646,7 @@ mod subscribe_snapshot_tests {
             crate::state::ClientSession {
                 client_id,
                 outbound: tx,
+                pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
         );

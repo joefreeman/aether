@@ -7109,6 +7109,86 @@ fn app_settings_apply_and_toggle_theme() {
     assert_eq!(params["theme"], json!("dark"));
 }
 
+/// The reading-view width setting: a three-way choice, so the row cycles on activate and steps
+/// (clamping) on Left/Right — the same two gestures the font-size rows use, and the reason the
+/// stepper isn't a toggle.
+#[test]
+fn app_settings_apply_and_cycle_markdown_width() {
+    use aether_client::keymap::{KeyCode, Mods};
+    use aether_client::session::{AppSettingControl, AppSettingId};
+    use aether_client::update::Event;
+    use aether_protocol::settings::{AppSettings, MarkdownWidth};
+
+    // Narrow by default; a persisted width is adopted with no shell effect — every shell resolves
+    // the measure on its next frame, so there's nothing to reflow.
+    let mut s = session();
+    assert_eq!(s.markdown_width, MarkdownWidth::Narrow);
+    let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
+        markdown_width: MarkdownWidth::Wide,
+        ..AppSettings::default()
+    })));
+    assert_eq!(
+        s.markdown_width,
+        MarkdownWidth::Wide,
+        "persisted width adopted"
+    );
+    assert!(fx.0.is_empty(), "reading width is render-only");
+
+    s.open_app_settings();
+    let idx = s
+        .app_setting_rows()
+        .iter()
+        .position(|r| r.id == AppSettingId::MarkdownWidth)
+        .expect("a MarkdownWidth row");
+    assert_eq!(
+        s.app_setting_rows()[idx].control,
+        AppSettingControl::Choice("Wide"),
+        "the row shows where the setting stands"
+    );
+
+    // Activating cycles wide → full → narrow → wide, persisting each step: pressing Enter
+    // repeatedly must reach every option and come back, or an option would be unreachable.
+    for want in [
+        MarkdownWidth::Full,
+        MarkdownWidth::Narrow,
+        MarkdownWidth::Wide,
+    ] {
+        let fx = s.app_settings_toggle(idx);
+        assert_eq!(s.markdown_width, want, "activate cycles to {want:?}");
+        let params = find_request(&fx, "settings/set").expect("settings/set fired");
+        assert_eq!(params["markdown_width"], json!(to_tag(want)));
+    }
+
+    // Left/Right step without wrapping, and clamp at the ends — a stepper, not a cycle.
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.markdown_width, MarkdownWidth::Narrow, "Left narrows");
+    assert!(find_request(&fx, "settings/set").is_some());
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    assert_eq!(s.markdown_width, MarkdownWidth::Narrow, "clamped at narrow");
+    assert!(
+        find_request(&fx, "settings/set").is_none(),
+        "an unchanged width doesn't write settings.toml"
+    );
+    for want in [
+        MarkdownWidth::Wide,
+        MarkdownWidth::Full,
+        MarkdownWidth::Full,
+    ] {
+        let _ = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+        assert_eq!(s.markdown_width, want, "Right widens then clamps at full");
+    }
+}
+
+/// The wire tag for a reading width, for asserting what `settings/set` carried.
+fn to_tag(width: aether_protocol::settings::MarkdownWidth) -> &'static str {
+    use aether_protocol::settings::MarkdownWidth as W;
+    match width {
+        W::Narrow => "narrow",
+        W::Wide => "wide",
+        W::Full => "full",
+    }
+}
+
 // ---- workspace creation + settings (docs: workspace creation + workspace settings) -----------------
 
 #[test]

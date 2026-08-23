@@ -20,7 +20,14 @@ import "./theme.css";
 // bundle; adopting the whole sheet rather than a buffer-only subset avoids a second file to keep in
 // sync with the theme (`--role` custom properties still inherit through the boundary as normal).
 import themeCss from "./theme.css?inline";
-import init, { WasmSession, hover_key } from "./wasm/aether_web";
+import init, {
+  WasmSession,
+  format_blame,
+  hover_key,
+  picker_frame_run,
+  picker_placeholder,
+  time_ago,
+} from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
 import { applyFenceHighlights, markFocus, renderReadView, revealFocus, type ReadDoc } from "./read";
@@ -67,48 +74,7 @@ const GROUP_GAP_PX = 6;
 // `CURSOR_REST_FRACTION` (the web jump-reveal + subscribe framing don't cross the wasm boundary).
 const CURSOR_REST_FRACTION = 0.2;
 
-/** Coarse "N{unit} ago" rendering of an author timestamp (Unix seconds) for the inline blame label.
- *  Ports aether-tui/src/shell.rs::time_ago — the last minute and any future (clock-skew) time read
- *  as "just now". */
-function timeAgo(unixSecs: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  const secs = Math.max(0, now - unixSecs);
-  if (secs < 60) return "just now";
-  let n: number, unit: string;
-  if (secs < 3600) [n, unit] = [secs / 60, "m"];
-  else if (secs < 86_400) [n, unit] = [secs / 3600, "h"];
-  else if (secs < 604_800) [n, unit] = [secs / 86_400, "d"];
-  else if (secs < 31_536_000) [n, unit] = [secs / 604_800, "w"];
-  else [n, unit] = [secs / 31_536_000, "y"];
-  return `${Math.floor(n)}${unit} ago`;
-}
 
-/** The EOL blame label from the raw fields the core view carries (server blame-follow push). */
-function formatBlame(b: { author: string; timestamp: number; is_uncommitted: boolean }): string {
-  return b.is_uncommitted ? "uncommitted" : `${b.author} · ${timeAgo(b.timestamp)}`;
-}
-
-const PLACEHOLDER: Record<PickerKind, string> = {
-  files: "Find files…",
-  buffers: "Switch buffer…",
-  grep: "Grep workspace…",
-  git_changes_file: "Changes in current file…",
-  git_changes: "Changes in workspace…",
-  explorer: "Explore files…",
-  workspaces: "Select workspace…",
-  diagnostics: "Diagnostics in current file…",
-  diagnostics_workspace: "Diagnostics in workspace…",
-  lsp_servers: "List LSPs…",
-  references: "List references…",
-  document_symbols: "Go to symbol…",
-  workspace_symbols: "Go to symbol in workspace…",
-  keybindings: "Search keybindings…",
-  jumplist: "Filter the jumplist…",
-  git_branches: "Branches & worktrees…",
-  git_log: "Search history…",
-  git_log_file: "Search this file\u2019s history…",
-  git_stash: "Find stash…",
-};
 
 /** The kind's full lowercase name, shown as a dim tag on a document-symbol row. Mirrors
  *  aether-protocol::picker::SymbolKind::label. */
@@ -487,6 +453,10 @@ interface CoreView {
   /** Chrome text size in px (the synced `ui_font_size` app setting) — status bar, pickers,
    *  dialogs, hover, toasts, hints. */
   ui_font_size: number;
+  /** The reading view's measure in ems of the reading size (the synced `markdown_width` app
+   *  setting, resolved by the core), or null for full width — no cap, the document fills the
+   *  window. Stamped as `--md-measure` on the buffer element. */
+  markdown_measure_em: number | null;
   /** Colour theme (the synced `theme` app setting). The shell stamps it onto
    *  `<html data-theme>`; theme.css switches its role variables (and `color-scheme`) on it. */
   theme: "dark" | "light";
@@ -582,7 +552,8 @@ interface WorkspaceSettingsView {
  *  `selected` is the flat row index across all groups. */
 type AppSettingControl =
   | { kind: "toggle"; value: boolean }
-  | { kind: "value"; value: number };
+  | { kind: "value"; value: number }
+  | { kind: "choice"; value: string };
 
 interface AppSettingsView {
   selected: number;
@@ -907,7 +878,7 @@ function describePickerItem(
       // the terminal client. Only the divergence counts go in the right-aligned meta group.
       const dim: string[] = [];
       if (item.subject) dim.push(item.subject);
-      if (item.timestamp) dim.push(timeAgo(item.timestamp));
+      if (item.timestamp) dim.push(time_ago(item.timestamp));
       // Each arrow only when it has a count, matching the status bar and `git status`.
       const arrows: string[] = [];
       if (item.ahead) arrows.push(`↑${item.ahead}`);
@@ -946,7 +917,7 @@ function describePickerItem(
         primary: item.message ?? "",
         matches: item.match_indices,
         prefix: `stash@{${item.index}}`,
-        meta: item.timestamp ? timeAgo(item.timestamp) : "",
+        meta: item.timestamp ? time_ago(item.timestamp) : "",
       };
     }
     case "git_commit": {
@@ -956,7 +927,7 @@ function describePickerItem(
       const author = item.author ?? "";
       const dim: string[] = [];
       if (author) dim.push(author);
-      if (item.timestamp) dim.push(timeAgo(item.timestamp));
+      if (item.timestamp) dim.push(time_ago(item.timestamp));
       const hashLen = item.hash_match_len ?? 0;
       return {
         primary: item.subject ?? "",
@@ -3068,6 +3039,14 @@ export class Shell {
       }
     }
     if (v.read) {
+      // The reading measure (the `markdown_width` setting, resolved to ems by the core) — a CSS
+      // variable rather than a class so the width table stays in one place, the core's. Set on
+      // every read render: no DOM rebuild is involved, so a width change applies to the document
+      // already on screen.
+      this.bufferEl.style.setProperty(
+        "--md-measure",
+        v.markdown_measure_em === null ? "none" : `${v.markdown_measure_em}em`,
+      );
       // Rebuild the DOM only when the parsed content changes — a focus move or an unrelated
       // re-render (hint tick, toast) just re-marks focus, so <img> elements aren't re-fetched.
       // Rebuild only when the *content* changes; arriving fence highlights patch in place
@@ -3125,7 +3104,7 @@ export class Shell {
       // cursor line in Normal mode only, and only when the followed line is still the cursor's.
       blame:
         v.blame && v.mode === "normal" && v.blame.line === v.buffer.cursor.position.line
-          ? formatBlame(v.blame)
+          ? format_blame(v.blame.author, v.blame.timestamp, v.blame.is_uncommitted)
           : null,
       diffView: v.diff_view,
     });
@@ -3850,8 +3829,9 @@ export class Shell {
         const activate = () => {
           if (this.session) this.runEffects(this.session.app_settings_toggle(i) as CoreEffect[]);
         };
-        if (r.control.kind === "value") {
-          // A stepped numeric setting (font size): show the current value as a button that cycles.
+        if (r.control.kind === "value" || r.control.kind === "choice") {
+          // A stepped setting — a number (font size) or a named option (reading width): show where
+          // it stands as a button that cycles.
           const btn = document.createElement("button");
           btn.type = "button";
           btn.className = "as-value";
@@ -3951,7 +3931,8 @@ export class Shell {
     // ghost says it too — and it's drawn *over* the input, from the same x as the placeholder when
     // the query is empty, so the two would render on top of each other (native-client parity: iced
     // and the TUI suppress the placeholder for either).
-    this.pickerInput.placeholder = prefix || p.completion ? "" : PLACEHOLDER[p.kind];
+    this.pickerInput.placeholder =
+      prefix || p.completion ? "" : picker_placeholder(p.kind);
     // The input is the source of truth for the text while focused; only write when the core changed
     // it out from under us (grep priming, a seeded open) to avoid clobbering the caret mid-type.
     if (this.pickerInput.value !== p.query) this.pickerInput.value = p.query;
@@ -4784,18 +4765,20 @@ export class Shell {
       this.pickerScrollReset = false;
       this.pickerReveal = null;
     } else if (this.pickerReveal === "run" && p.focus_run && p.focus_run.header_row === p.selected) {
-      // Frame the freshly-opened group run: scroll the minimum that brings the run's last row into
-      // view, capped so the header never leaves the top — at the cap the header row itself sits at
-      // the very top (its own sticky position), so nothing hides under it. Applied only once the
-      // view reflects the selected run (header_row === selected); until then it stays armed, like
-      // the selected-row reveal below. Collapsible row space carries no gap pixels, so this is pure
-      // row arithmetic.
+      // Frame the freshly-opened group run. The rule — minimum scroll that brings the run's last
+      // row into view, capped so the header never leaves the top — is the core's
+      // (`picker::frame_run`), shared with the terminal and native shells; all this side supplies
+      // is the unit (pixels) and the measured row height. Applied only once the view reflects the
+      // selected run (header_row === selected); until then it stays armed, like the selected-row
+      // reveal below. Collapsible row space carries no gap pixels, so this is pure row arithmetic.
       const run = p.focus_run;
-      const top = run.header_row * this.pickerRowH;
-      const bottom = (run.header_row + run.len + 1) * this.pickerRowH;
-      const h = list.clientHeight;
-      if (top < list.scrollTop) list.scrollTop = top;
-      else if (bottom > list.scrollTop + h) list.scrollTop = Math.min(bottom - h, top);
+      const target = picker_frame_run(
+        list.scrollTop,
+        list.clientHeight,
+        run.header_row * this.pickerRowH,
+        (run.header_row + run.len + 1) * this.pickerRowH,
+      );
+      if (target != null) list.scrollTop = target;
       this.pickerReveal = null;
     } else if (this.pickerReveal !== null && this.pickerReveal !== "run" && selectedRow) {
       selectedRow.scrollIntoView({ block: "nearest" });

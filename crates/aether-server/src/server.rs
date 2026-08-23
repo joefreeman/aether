@@ -403,6 +403,9 @@ pub struct ServerHandle {
     /// that no RPC can set without writing to the real config dir.
     pub state: SharedState,
     join: tokio::task::JoinHandle<()>,
+    /// Held so [`Drop`] can release the watcher's inotify instance synchronously — reaching it
+    /// through `state` would mean racing for an async lock that `Drop` cannot await on.
+    watcher: Option<Arc<crate::watcher::WatcherHandle>>,
     /// Values whose lifetime is tied to this server's — see [`ServerHandle::keep_alive`].
     keep_alive: Vec<Box<dyn std::any::Any + Send>>,
 }
@@ -445,6 +448,27 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.join.abort();
+        // Release the file watcher's OS handle now rather than whenever the last `SharedState`
+        // clone happens to go.
+        //
+        // `watcher::spawn` parks the `notify` watcher in `state.watcher` and then spawns a
+        // detached pump task that itself holds `state` — so the watcher keeps the event sender
+        // alive, the sender keeps the pump's receiver open, and the pump keeps the state (and
+        // therefore the watcher) alive. Aborting `self.join` only stops the accept loop, so that
+        // cycle outlives the test that made it.
+        //
+        // Each watcher is one **inotify instance**, and `fs.inotify.max_user_instances` defaults
+        // to 128 — far below `ulimit -n`. A test binary that spawns servers faster than the cycle
+        // unwinds hits `EMFILE ("Too many open files")` in unrelated tests, which is how this
+        // surfaces: a burst of fast tests fails intermittently while slow ones never do.
+        //
+        // `WatcherHandle::shutdown` drops the watcher, which closes the sender, which ends the
+        // pump, which drops its state clone — the whole cycle unwinds from here. It takes a
+        // `std::sync::Mutex`, so this is synchronous and cannot lose a race the way reaching
+        // through `state`'s async lock did.
+        if let Some(watcher) = &self.watcher {
+            watcher.shutdown();
+        }
     }
 }
 
@@ -637,14 +661,15 @@ pub async fn spawn_for_test_full(
     // `watch_workspace_paths` immediately. (The run task also kicks off `watcher::spawn` but it's a
     // no-op once `state.watcher` is set.)
     crate::watcher::spawn(state.clone()).await?;
-    {
+    let watcher = {
         let s = state.lock().await;
         if let Some(w) = s.watcher.clone() {
             for (_, paths) in &workspaces {
                 crate::watcher::watch_workspace_paths(&w, paths);
             }
         }
-    }
+        s.watcher.clone()
+    };
 
     let join = tokio::spawn({
         let state = state.clone();
@@ -657,6 +682,7 @@ pub async fn spawn_for_test_full(
         workspace_name,
         state,
         join,
+        watcher,
         keep_alive: Vec::new(),
     };
     handle.keep_alive(RemoveOnDrop(worktree_store));

@@ -1398,7 +1398,8 @@ impl Shell {
                         ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
                         ScrollDir::Down => self.read_scroll_by(delta as i32),
                         ScrollDir::Left | ScrollDir::Right => {
-                            let (content_cols, _) = crate::ui::read_measure(self.term.0);
+                            let (content_cols, _) =
+                                crate::ui::read_measure(self.term.0, self.session.markdown_width);
                             let window = content_cols.saturating_sub(2).max(1) as i32;
                             let step = match unit {
                                 ScrollUnit::Line => 6,
@@ -2050,10 +2051,12 @@ impl Shell {
                 scroll: 0,
                 hscroll: std::collections::HashMap::new(),
                 loading: true,
+                width: self.session.markdown_width,
             });
         }
         let (area_cols, _) = self.term;
-        let (content_cols, _margin) = crate::ui::read_measure(area_cols);
+        let (content_cols, _margin) =
+            crate::ui::read_measure(area_cols, self.session.markdown_width);
         let key = (read.buffer_id, read.revision, read.hl_gen, content_cols);
         let stale = self
             .read_cache
@@ -2159,6 +2162,7 @@ impl Shell {
             scroll: self.read_scroll,
             hscroll: self.read_hscroll.clone(),
             loading,
+            width: self.session.markdown_width,
         })
     }
 
@@ -2176,7 +2180,7 @@ impl Shell {
         let Some(rows) = self.read_cache.as_ref().map(|c| c.4.clone()) else {
             return;
         };
-        let (content_cols, _) = crate::ui::read_measure(self.term.0);
+        let (content_cols, _) = crate::ui::read_measure(self.term.0, self.session.markdown_width);
         let widest = aether_client::read_layout::hscroll_content_width(&rows, e);
         // The painter's window, mirrored: the text measure (already net of the gutter), minus
         // the two pad/indicator columns — which a code panel always reserves but a table spends
@@ -2229,7 +2233,7 @@ impl Shell {
         let r = (self.read_scroll as usize + row as usize)
             .checked_sub(crate::ui::READ_PAD_TOP as usize)
             .and_then(|i| rows.get(i))?;
-        let (_, margin) = crate::ui::read_measure(self.term.0);
+        let (_, margin) = crate::ui::read_measure(self.term.0, self.session.markdown_width);
         let mut element = r.element;
         let mut interactive = false;
         let col_in_content = i32::from(col) - i32::from(margin) - i32::from(crate::ui::READ_GUTTER);
@@ -2343,7 +2347,10 @@ impl Shell {
             // lacks; the data itself arrives via the server's blame-follow push.
             blame: BlameState {
                 line: s.blame.as_ref().map(|(l, _)| *l),
-                text: s.blame.as_ref().map(|(_, b)| format_blame(b)),
+                text: s
+                    .blame
+                    .as_ref()
+                    .map(|(_, b)| aether_client::labels::format_blame(b)),
             },
             transient: s.buffer.transient,
             tethered: s.tethered(),
@@ -2472,7 +2479,7 @@ impl Shell {
         // carries the on-screen position across a recentering refetch (and preserves it through
         // the empty-items frames a fast scroll produces, rather than snapping to the top).
         let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups, core.collapsible);
-        let pin = crate::ui::pins_group_header(core.kind) && !p.groups.is_empty();
+        let pin = core.kind.pins_group_header() && !p.groups.is_empty();
         self.picker_scroll = crate::ui::picker_scroll_step(
             &rows,
             p.selected,
@@ -2921,38 +2928,6 @@ async fn dial(
         restore: Some((activated.workspace, open)),
         restarted: false,
     })
-}
-
-/// The EOL blame label for a pushed [`aether_protocol::git::BlameInfo`].
-fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
-    if b.is_uncommitted {
-        "uncommitted".into()
-    } else {
-        format!("{} · {}", b.author, time_ago(b.timestamp))
-    }
-}
-
-/// Coarse relative age for the blame line ("3w ago") and the branch picker's tip dates.
-pub(crate) fn time_ago(unix_secs: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let secs = (now - unix_secs).max(0);
-    let (n, unit) = if secs < 60 {
-        return "just now".into();
-    } else if secs < 3600 {
-        (secs / 60, "m")
-    } else if secs < 86_400 {
-        (secs / 3600, "h")
-    } else if secs < 604_800 {
-        (secs / 86_400, "d")
-    } else if secs < 31_536_000 {
-        (secs / 604_800, "w")
-    } else {
-        (secs / 31_536_000, "y")
-    };
-    format!("{n}{unit} ago")
 }
 
 /// Bootstrap a session over an established connection: activate (landing on the last

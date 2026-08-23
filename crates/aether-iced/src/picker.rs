@@ -211,34 +211,10 @@ pub(crate) enum Boundary {
 /// *not* pin (at most two short sections). The single source for the pin itself (`overlay`) AND
 /// the one-row reveal clearance (`app::reveal_target`) — a revealed row must clear the pinned
 /// header or it slides underneath it, so the two must never disagree about which kinds pin.
-pub fn pins_group_header(kind: PickerKind) -> bool {
-    kind.groups_by_file() || matches!(kind, PickerKind::Keybindings | PickerKind::Jumplist)
-}
-
-/// Query-input placeholder per picker — kept in sync with the web client's `PLACEHOLDER` map
-/// and the TUI's `picker_placeholder`.
+/// Query-input placeholder, from the shared table every shell reads
+/// ([`aether_client::labels::picker_placeholder`]).
 fn placeholder(kind: PickerKind) -> &'static str {
-    match kind {
-        PickerKind::Files => "Find files…",
-        PickerKind::Buffers => "Switch buffer…",
-        PickerKind::Grep => "Grep workspace…",
-        PickerKind::Explorer => "Explore files…",
-        PickerKind::Workspaces => "Select workspace…",
-        PickerKind::Diagnostics => "Diagnostics in current file…",
-        PickerKind::DiagnosticsWorkspace => "Diagnostics in workspace…",
-        PickerKind::LspServers => "List LSPs…",
-        PickerKind::References => "List references…",
-        PickerKind::DocumentSymbols => "Go to symbol…",
-        PickerKind::WorkspaceSymbols => "Go to symbol in workspace…",
-        PickerKind::GitChangesFile => "Changes in current file…",
-        PickerKind::GitChanges => "Changes in workspace…",
-        PickerKind::Keybindings => "Search keybindings…",
-        PickerKind::GitBranches => "Branches & worktrees…",
-        PickerKind::GitLog => "Search history…",
-        PickerKind::GitLogFile => "Search this file's history…",
-        PickerKind::GitStash => "Find stash…",
-        PickerKind::Jumplist => "Filter the jumplist…",
-    }
+    aether_client::labels::picker_placeholder(Some(kind))
 }
 
 const SANS: iced::Font = iced::Font {
@@ -564,7 +540,7 @@ pub fn overlay<'a>(
     // Headerless kinds (e.g. the single-file GitChangesFile) send no spans; the kind gate also
     // keeps References — which does send spans — deliberately unpinned (at most two short
     // sections).
-    let pinned: Option<&GroupSpan> = if !pins_group_header(state.kind) {
+    let pinned: Option<&GroupSpan> = if !state.kind.pins_group_header() {
         None
     } else {
         window_row_at(state, scroll_y, ui).and_then(|rel| {
@@ -1608,7 +1584,7 @@ fn render_item<'a>(
             // message, then a relative date.
             let mut m = String::new();
             if *timestamp > 0 {
-                m.push_str(&crate::app::time_ago(*timestamp));
+                m.push_str(&aether_client::labels::time_ago(*timestamp));
             }
             row![
                 text(format!("stash@{{{index}}}"))
@@ -1643,7 +1619,7 @@ fn render_item<'a>(
                 if !m.is_empty() {
                     m.push_str(" · ");
                 }
-                m.push_str(&crate::app::time_ago(*timestamp));
+                m.push_str(&aether_client::labels::time_ago(*timestamp));
             }
             row![
                 highlighted_owned(
@@ -1682,7 +1658,7 @@ fn render_item<'a>(
                 if !m.is_empty() {
                     m.push_str(" · ");
                 }
-                m.push_str(&crate::app::time_ago(*timestamp));
+                m.push_str(&aether_client::labels::time_ago(*timestamp));
             }
             // Each arrow only when it has a count, matching the status bar and `git status`.
             let mut arrows = String::new();
@@ -2078,5 +2054,100 @@ fn dirty_color(p: &theme::Palette, s: BufferDirtyState) -> Option<iced::Color> {
         BufferDirtyState::Unsaved => Some(p.state_unsaved),
         BufferDirtyState::ExternallyModified => Some(p.state_changed),
         BufferDirtyState::ExternallyDeleted => Some(p.state_deleted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether_client::picker::PickerState;
+    use aether_protocol::picker::{PickerItem, PickerUpdateParams};
+
+    fn ui() -> theme::Ui {
+        theme::Ui::new(aether_protocol::settings::default_ui_font_size())
+    }
+
+    /// A flat list of `n` rows with no groups — the simplest shape for the height and px→row maths.
+    fn flat(n: u32) -> PickerState {
+        let mut s = PickerState::new(PickerKind::Files);
+        let items: Vec<PickerItem> = (0..n)
+            .map(|i| PickerItem::File {
+                path_index: 0,
+                relative_path: format!("f{i}.txt"),
+                match_indices: vec![],
+                git_status: None,
+            })
+            .collect();
+        assert!(s.apply_update(PickerUpdateParams {
+            kind: PickerKind::Files,
+            generation: 0,
+            offset: 0,
+            items: Some(items),
+            total_matches: n,
+            total_candidates: n,
+            ticking: false,
+            groups: vec![],
+            display_offset: Some(0),
+            total_display_rows: Some(n),
+            focus_run: None,
+            center_on: None,
+            explorer_peek_missing: false,
+        }));
+        s
+    }
+
+    /// A list shorter than the viewport shrinks to fit it, so the panel doesn't reserve blank rows
+    /// that would read as missing entries.
+    #[test]
+    fn list_height_shrinks_to_a_short_list() {
+        let ui = ui();
+        assert_eq!(list_height(&flat(3), ui), 3.0 * ui.row_h());
+        assert_eq!(list_height(&flat(1), ui), ui.row_h());
+    }
+
+    /// Nothing to list collapses the viewport entirely rather than leaving one empty row.
+    #[test]
+    fn list_height_collapses_when_there_is_nothing_to_list() {
+        assert_eq!(list_height(&flat(0), ui()), 0.0);
+    }
+
+    /// Past the cap the viewport stops growing — the list scrolls instead.
+    #[test]
+    fn list_height_caps_at_the_visible_rows() {
+        let ui = ui();
+        let capped = VISIBLE_ROWS as f32 * ui.row_h();
+        assert_eq!(list_height(&flat(VISIBLE_ROWS as u32), ui), capped);
+        assert_eq!(list_height(&flat(500), ui), capped);
+    }
+
+    /// The px→row estimate the refetch path uses: a plain division, so a row's own height maps to
+    /// that row for every pixel inside it.
+    #[test]
+    fn first_visible_row_floors_within_a_row() {
+        let ui = ui();
+        let h = ui.row_h();
+        assert_eq!(first_visible_row(0.0, ui), 0);
+        assert_eq!(first_visible_row(h - 1.0, ui), 0);
+        assert_eq!(first_visible_row(h, ui), 1);
+        assert_eq!(first_visible_row(h * 4.5, ui), 4);
+        // A negative offset (rubber-band scroll) reads as the top rather than underflowing.
+        assert_eq!(first_visible_row(-50.0, ui), 0);
+    }
+
+    /// The exact mapping the sticky pin needs. On a flat list there are no gap pixels, so it agrees
+    /// with the estimate — the two diverge only once inter-group gaps enter, which is why the pin
+    /// can't use the cheap division.
+    #[test]
+    fn window_row_at_maps_pixels_to_rows_and_declines_outside() {
+        let ui = ui();
+        let h = ui.row_h();
+        let s = flat(5);
+        assert_eq!(window_row_at(&s, 0.0, ui), Some(0));
+        assert_eq!(window_row_at(&s, h - 0.5, ui), Some(0));
+        assert_eq!(window_row_at(&s, h, ui), Some(1));
+        assert_eq!(window_row_at(&s, h * 4.0, ui), Some(4));
+        // Past the last row there is nothing to pin against.
+        assert_eq!(window_row_at(&s, h * 5.0, ui), None);
+        assert_eq!(window_row_at(&s, h * 99.0, ui), None);
     }
 }

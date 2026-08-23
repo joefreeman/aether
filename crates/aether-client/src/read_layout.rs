@@ -7,15 +7,54 @@
 //! pure function of `(blocks, elements, cols)` — shells cache it by `(buffer, revision, cols)`.
 
 use crate::markdown::{AlertKind, Block, ColAlign, Element, Inline, ListItem, Span};
+use aether_protocol::settings::MarkdownWidth;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Maximum content columns — the reading measure. Wider viewports center the column; the shell
-/// computes the margin via [`measure`].
+/// Maximum content columns at the narrow (default) measure. Wider viewports center the column; the
+/// shell computes the margin via [`measure`].
 pub const READ_MEASURE: u16 = 92;
 
-/// Content width and left margin for a viewport `area_cols` wide.
-pub fn measure(area_cols: u16) -> (u16, u16) {
-    let content = area_cols.clamp(10, READ_MEASURE);
+/// The wide measure, ~1.3× the narrow one: still readable as prose, but wide enough that tables and
+/// code fences stop scrolling.
+pub const READ_MEASURE_WIDE: u16 = 120;
+
+/// The narrow measure for the pixel shells, in ems of the reading body size — the column tracks the
+/// type size, so a bigger font keeps the same characters-per-line. 42.5 × the 18px default reading
+/// size = 765px, which is [`READ_MEASURE`]'s 92 columns of proportional text.
+pub const READ_MEASURE_EM: f32 = 42.5;
+
+/// [`READ_MEASURE_WIDE`] in ems — the same ~1.3× step, so the terminal and the pixel shells widen
+/// by the same amount.
+pub const READ_MEASURE_WIDE_EM: f32 = 55.5;
+
+/// Content columns the reading measure caps at, or `None` for [`MarkdownWidth::Full`] (the column
+/// is the viewport). The terminal shell's half of the width table; [`measure_em`] is the pixel
+/// shells' half, and the two are kept proportional so every client reads the same.
+pub fn measure_cols(width: MarkdownWidth) -> Option<u16> {
+    match width {
+        MarkdownWidth::Narrow => Some(READ_MEASURE),
+        MarkdownWidth::Wide => Some(READ_MEASURE_WIDE),
+        MarkdownWidth::Full => None,
+    }
+}
+
+/// The same table in ems of the reading body size, for the shells that lay out in pixels rather
+/// than cells. `None` is [`MarkdownWidth::Full`]: no maximum, the document fills the window.
+pub fn measure_em(width: MarkdownWidth) -> Option<f32> {
+    match width {
+        MarkdownWidth::Narrow => Some(READ_MEASURE_EM),
+        MarkdownWidth::Wide => Some(READ_MEASURE_WIDE_EM),
+        MarkdownWidth::Full => None,
+    }
+}
+
+/// Content width and left margin for a viewport `area_cols` wide at the given measure. Full-width
+/// takes the whole viewport, so its margin is zero and the column no longer centers.
+pub fn measure(area_cols: u16, width: MarkdownWidth) -> (u16, u16) {
+    let content = match measure_cols(width) {
+        Some(max) => area_cols.clamp(10, max),
+        None => area_cols.max(10),
+    };
     let margin = area_cols.saturating_sub(content) / 2;
     (content, margin)
 }
@@ -1679,8 +1718,41 @@ mod tests {
 
     #[test]
     fn measure_centers_wide_viewports() {
-        assert_eq!(measure(200), (92, 54));
-        assert_eq!(measure(80), (80, 0));
+        assert_eq!(measure(200, MarkdownWidth::Narrow), (92, 54));
+        assert_eq!(measure(80, MarkdownWidth::Narrow), (80, 0));
+    }
+
+    #[test]
+    fn measure_widens_and_fills_by_mode() {
+        // Wide takes more of the same viewport, still centered; full takes all of it and stops
+        // centering. A viewport narrower than the measure is unaffected by the choice — there's
+        // nothing to give away.
+        assert_eq!(measure(200, MarkdownWidth::Wide), (120, 40));
+        assert_eq!(measure(200, MarkdownWidth::Full), (200, 0));
+        for w in [
+            MarkdownWidth::Narrow,
+            MarkdownWidth::Wide,
+            MarkdownWidth::Full,
+        ] {
+            assert_eq!(measure(80, w), (80, 0), "{w:?} at a narrow viewport");
+        }
+        // The floor holds everywhere, so layout never divides by a zero-width column.
+        for w in [
+            MarkdownWidth::Narrow,
+            MarkdownWidth::Wide,
+            MarkdownWidth::Full,
+        ] {
+            assert_eq!(measure(4, w).0, 10, "{w:?} floors at 10 columns");
+        }
+        // The two unit tables step together — the pixel shells widen by what the terminal does.
+        let ratio = READ_MEASURE_WIDE_EM / READ_MEASURE_EM;
+        let cols_ratio = f32::from(READ_MEASURE_WIDE) / f32::from(READ_MEASURE);
+        assert!(
+            (ratio - cols_ratio).abs() < 0.02,
+            "em and column measures drifted apart: {ratio} vs {cols_ratio}"
+        );
+        assert_eq!(measure_cols(MarkdownWidth::Full), None);
+        assert_eq!(measure_em(MarkdownWidth::Full), None);
     }
 
     #[test]

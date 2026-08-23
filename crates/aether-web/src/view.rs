@@ -45,6 +45,9 @@ pub fn build_view(s: &Session) -> Value {
         "ligatures": s.ligatures,
         "buffer_font_size": s.buffer_font_size,
         "ui_font_size": s.ui_font_size,
+        // The reading view's column width, in ems of the reading size (the core's shared measure
+        // table) — the shell stamps it as `--md-measure`. `null` is the full-width setting: no cap.
+        "markdown_measure_em": aether_client::read_layout::measure_em(s.markdown_width),
         // "dark" | "light" (ThemeMode's lowercase wire form): the shell stamps this onto
         // `<html data-theme>` and theme.css switches its role variables on it.
         "theme": jv(&s.theme),
@@ -148,6 +151,9 @@ fn app_settings(s: &Session) -> Value {
                         let control = match r.control {
                             C::Toggle(v) => json!({ "kind": "toggle", "value": v }),
                             C::Value(v) => json!({ "kind": "value", "value": v }),
+                            // The core resolved the option to its label; the shell renders it in
+                            // the same pill a stepped value gets.
+                            C::Choice(v) => json!({ "kind": "choice", "value": v }),
                         };
                         json!({ "label": r.label, "control": control, "hint": r.hint })
                     })

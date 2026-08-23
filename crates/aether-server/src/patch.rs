@@ -1028,3 +1028,172 @@ fn emit_hunk(
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str, side: Option<PatchLine>) -> HunkLine {
+        HunkLine {
+            text: text.to_string(),
+            side,
+            old_lineno: None,
+            new_lineno: None,
+        }
+    }
+
+    fn removed(text: &str) -> HunkLine {
+        line(text, Some(PatchLine::Removed))
+    }
+    fn added(text: &str) -> HunkLine {
+        line(text, Some(PatchLine::Added))
+    }
+    fn context(text: &str) -> HunkLine {
+        line(text, None)
+    }
+
+    /// The emphasised substrings of each line, so the assertions read as "this bit changed"
+    /// rather than as byte arithmetic.
+    fn emphasised(lines: &[HunkLine]) -> Vec<Vec<String>> {
+        intraline_for_hunk(lines)
+            .into_iter()
+            .zip(lines)
+            .map(|(ranges, l)| {
+                ranges
+                    .into_iter()
+                    .map(|r| l.text[r.start as usize..r.end as usize].to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pairs_a_removal_with_the_addition_that_replaced_it() {
+        let lines = [
+            context("fn main() {"),
+            removed("    let x = 1;"),
+            added("    let x = 2;"),
+            context("}"),
+        ];
+        assert_eq!(
+            emphasised(&lines),
+            vec![
+                Vec::<String>::new(),
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                Vec::<String>::new(),
+            ],
+            "only the digit that actually changed is emphasised, and context is never touched"
+        );
+    }
+
+    #[test]
+    fn pairs_are_positional_within_the_change_block() {
+        let lines = [
+            removed("alpha one"),
+            removed("beta two"),
+            added("alpha ONE"),
+            added("beta TWO"),
+        ];
+        let e = emphasised(&lines);
+        assert_eq!(e[0], vec!["one"], "first removal pairs with first addition");
+        assert_eq!(e[2], vec!["ONE"]);
+        assert_eq!(e[1], vec!["two"], "second with second");
+        assert_eq!(e[3], vec!["TWO"]);
+    }
+
+    /// A lopsided block has no counterpart for the extra lines, so they keep the whole-line tint
+    /// and nothing more rather than being paired with something arbitrary.
+    #[test]
+    fn unpaired_lines_in_a_lopsided_block_get_no_emphasis() {
+        // The pair differs on *both* sides, so "was not paired" is distinguishable from "was
+        // paired and turned out identical" — both of which render as no emphasis.
+        let lines = [
+            removed("keep A"),
+            removed("two"),
+            removed("three"),
+            added("keep B"),
+        ];
+        let e = emphasised(&lines);
+        assert_eq!(e[0], vec!["A"], "the one pair that exists is analysed");
+        assert_eq!(e[3], vec!["B"]);
+        assert!(e[1].is_empty(), "no addition to compare `two` against");
+        assert!(e[2].is_empty(), "nor `three`");
+    }
+
+    #[test]
+    fn a_pure_deletion_or_addition_has_nothing_to_compare() {
+        let deleted = [context("keep"), removed("gone"), removed("also gone")];
+        assert!(emphasised(&deleted).iter().all(|e| e.is_empty()));
+
+        let inserted = [context("keep"), added("new"), added("also new")];
+        assert!(emphasised(&inserted).iter().all(|e| e.is_empty()));
+    }
+
+    /// Context between two change blocks separates them: the second block pairs from its own
+    /// start, not against leftovers from the first.
+    #[test]
+    fn context_separates_change_blocks() {
+        let lines = [
+            removed("a 1"),
+            added("a 2"),
+            context("unchanged"),
+            removed("b 3"),
+            added("b 4"),
+        ];
+        let e = emphasised(&lines);
+        assert_eq!(e[0], vec!["1"]);
+        assert_eq!(e[1], vec!["2"]);
+        assert!(e[2].is_empty());
+        assert_eq!(e[3], vec!["3"]);
+        assert_eq!(e[4], vec!["4"]);
+    }
+
+    /// An addition run that comes *before* its removals is not a change block — that shape is a
+    /// deletion following an insertion, and pairing across it would emphasise unrelated text.
+    #[test]
+    fn additions_before_removals_are_not_paired() {
+        let lines = [added("new line"), removed("old line")];
+        assert!(emphasised(&lines).iter().all(|e| e.is_empty()));
+    }
+
+    /// A pair whose text is identical (whitespace-only move, say) folds to no emphasis rather than
+    /// emphasising the whole line.
+    #[test]
+    fn an_identical_pair_is_not_emphasised() {
+        let lines = [removed("same"), added("same")];
+        assert!(emphasised(&lines).iter().all(|e| e.is_empty()));
+    }
+
+    #[test]
+    fn human_size_switches_units_at_1024_and_keeps_bytes_exact() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
+        // Past the last unit it keeps scaling GB rather than inventing one.
+        assert_eq!(human_size(2 * 1024 * 1024 * 1024 * 1024), "2048.0 GB");
+    }
+
+    #[test]
+    fn mode_string_is_gits_octal_spelling() {
+        assert_eq!(mode_string(git2::FileMode::Blob), "100644");
+        assert_eq!(mode_string(git2::FileMode::BlobExecutable), "100755");
+        assert_eq!(mode_string(git2::FileMode::Link), "120000");
+        assert_eq!(mode_string(git2::FileMode::Commit), "160000");
+        assert_eq!(mode_string(git2::FileMode::Tree), "040000");
+        assert_eq!(mode_string(git2::FileMode::Unreadable), "000000");
+    }
+
+    #[test]
+    fn language_of_reads_the_extension_and_shrugs_at_the_unknown() {
+        assert_eq!(
+            language_of(Some(&"src/main.rs".to_string())).as_deref(),
+            Some("rust")
+        );
+        assert_eq!(language_of(None), None);
+        assert_eq!(language_of(Some(&"notes.unknownext".to_string())), None);
+    }
+}

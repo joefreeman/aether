@@ -658,13 +658,18 @@ async fn bring_up(
         tracing::info!(server = caps.name.as_deref().unwrap_or(&key.language), language = %key.language, root = %key.root.display(), "language server ready");
         let mut out = collect_status_pushes(s, &key);
         out.extend(crate::handlers::refresh_lsp_server_pickers(s));
-        out
+        // Counted here, inside the lock that publishes `Ready`, not down in the re-query: a
+        // watcher polling for readiness sees it the moment this block ends, and the re-query is
+        // only decided afterwards. Counting it there would leave a window where the server reads
+        // as ready and quiet while a fan-out is still coming.
+        (out, s.deferred.start())
     };
+    let (pushes, ready_token) = pushes;
     send_all(pushes).await;
 
     // A pinned server arriving late must not leave an already-typed workspace-symbols query
     // permanently missing its results — hence the re-query once it is ready.
-    crate::symbols::requery_ready_server(state, &key).await;
+    crate::symbols::requery_ready_server(state, &key, ready_token).await;
 
     inbound_loop(state.clone(), key, generation, inbound).await;
 }

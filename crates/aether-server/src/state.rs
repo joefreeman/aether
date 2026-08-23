@@ -136,7 +136,11 @@ pub struct ServerState {
     /// sends the key here whenever a *followed* cursor changes; the server's follow loop debounces
     /// and refreshes the cursor-tracking decorations. `None` only in unit tests that construct a
     /// bare state.
-    pub cursor_moved_tx: Option<tokio::sync::mpsc::UnboundedSender<(ClientId, BufferId)>>,
+    pub cursor_moved_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<(ClientId, BufferId, DeferredToken)>>,
+    /// Outstanding deferred work, so a caller can wait for the server to go quiet rather than
+    /// guess at how long its debounces take. See [`Deferred`].
+    pub deferred: Arc<Deferred>,
     /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
     /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
     /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
@@ -229,6 +233,24 @@ pub struct ServerState {
     /// The alternative — an environment variable set per test — races: `set_var` is process-global
     /// and the suite runs in parallel.
     pub worktree_store: Option<PathBuf>,
+    /// Where the workspace definitions (`<name>.toml`) live. Same convention as
+    /// [`Self::settings_path`]: `None` means the profile's real workspaces directory, not
+    /// "disabled" — workspace CRUD has to work in production.
+    ///
+    /// It exists so `workspace/list`, `/create`, `/rename`, `/add_project` and `/remove_project`
+    /// can be tested at all. Without it a test would list, litter, or clobber the developer's own
+    /// configured workspaces, which is why those handlers went untested.
+    pub workspaces_dir: Option<PathBuf>,
+    /// Where `settings/get` and `settings/set` read and write the app settings
+    /// ([`aether_protocol::settings::AppSettings`]). Follows [`Self::worktree_store`]'s convention
+    /// rather than [`Self::sessions_path`]'s: `None` means *the profile's real `settings.toml`*,
+    /// not "disabled" — the settings RPCs have to work in production, and a client with no settings
+    /// is not a thing.
+    ///
+    /// It exists so those two handlers can be tested at all. Every other persisted file already had
+    /// an injectable path and this one did not, which is why it went untested: a test calling
+    /// `settings/set` would have overwritten the developer's own editor settings.
+    pub settings_path: Option<PathBuf>,
     /// Where to read/write the hint learning state ([`crate::config::HintsState`]). Same convention
     /// as [`Self::sessions_path`]: `Some` in the real server (and in tests that point it at a
     /// tempfile); `None` disables persistence — `hints/record` still aggregates in memory so a
@@ -602,6 +624,7 @@ impl ServerState {
             blame_last_pushed: HashMap::new(),
             symbol_path_sent: HashMap::new(),
             cursor_moved_tx: None,
+            deferred: Arc::new(Deferred::default()),
             last_scroll: HashMap::new(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
@@ -622,6 +645,8 @@ impl ServerState {
             sessions_path: None,
             backups_path: None,
             worktree_store: None,
+            workspaces_dir: None,
+            settings_path: None,
             hints_path: None,
             hints: crate::config::HintsState::default(),
             hints_dirty: false,
@@ -1555,6 +1580,24 @@ impl ServerState {
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC
     /// except `expand` / `contract` (and from every buffer mutation) so the contract chain only
     /// follows a contiguous run of expands.
+    /// Where this server's workspace definitions live: the tempdir a test pointed us at, or the
+    /// profile's real workspaces directory.
+    pub fn workspaces_dir(&self) -> anyhow::Result<PathBuf> {
+        match &self.workspaces_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => crate::config::workspaces_dir(),
+        }
+    }
+
+    /// Where the app settings live for this server: the tempfile a test pointed us at, or the
+    /// profile's real `settings.toml`.
+    pub fn app_settings_path(&self) -> anyhow::Result<PathBuf> {
+        match &self.settings_path {
+            Some(path) => Ok(path.clone()),
+            None => crate::config::app_settings_path(),
+        }
+    }
+
     pub fn clear_tree_selection_history(&mut self, client_id: ClientId, buffer_id: BufferId) {
         self.tree_selection_history.remove(&(client_id, buffer_id));
     }
@@ -2551,6 +2594,10 @@ pub struct ClientSession {
     pub client_id: ClientId,
     /// Channel for sending notifications to this client's connection task.
     pub outbound: mpsc::Sender<Notification>,
+    /// Notifications actually written to this client's socket. Observability, and the only way to
+    /// tell "the server pushed nothing" apart from "the writer kept up" when a test is trying to
+    /// establish backpressure — the channel's own capacity reads the same either way.
+    pub pushes_written: Arc<std::sync::atomic::AtomicU64>,
     /// The workspace this client is currently working in. `None` between connect and the first
     /// successful `workspace/activate`. Updated on every `workspace/activate`.
     pub active_workspace: Option<String>,
@@ -2667,6 +2714,80 @@ mod virtual_target_tests {
 }
 
 #[cfg(test)]
+mod deferred_tests {
+    use super::*;
+
+    /// The barrier's whole point: a quiet server answers instantly, so waiting for quiescence
+    /// costs nothing when there is nothing to wait for.
+    #[tokio::test]
+    async fn quiet_by_default_and_waiting_is_free() {
+        let d = Arc::new(Deferred::default());
+        assert!(d.is_quiet());
+        tokio::time::timeout(std::time::Duration::from_millis(50), d.wait_quiet())
+            .await
+            .expect("an idle server resolves immediately");
+    }
+
+    #[tokio::test]
+    async fn outstanding_work_holds_the_barrier_until_it_drops() {
+        let d = Arc::new(Deferred::default());
+        let token = d.start();
+        assert!(!d.is_quiet());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), d.wait_quiet())
+                .await
+                .is_err(),
+            "outstanding work must hold the barrier"
+        );
+        drop(token);
+        assert!(d.is_quiet());
+    }
+
+    /// One provoking event can arm several follow-ups, so the token clones — and the work is only
+    /// done when the last of them is.
+    #[tokio::test]
+    async fn clones_all_have_to_finish() {
+        let d = Arc::new(Deferred::default());
+        let a = d.start();
+        let b = a.clone();
+        drop(a);
+        assert!(!d.is_quiet(), "one clone still outstanding");
+        drop(b);
+        assert!(d.is_quiet());
+    }
+
+    /// A waiter parked before the work finishes is woken by it — the case the `notified()`-before-
+    /// check ordering in `wait_quiet` exists to protect.
+    #[tokio::test]
+    async fn a_waiter_is_woken_when_the_last_token_drops() {
+        let d = Arc::new(Deferred::default());
+        let token = d.start();
+        let waiter = {
+            let d = d.clone();
+            tokio::spawn(async move { d.wait_quiet().await })
+        };
+        tokio::task::yield_now().await;
+        drop(token);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter is woken, not left parked")
+            .unwrap();
+    }
+
+    /// Independent units are counted, not collapsed: two armed refreshes both have to finish.
+    #[tokio::test]
+    async fn separate_units_are_counted_separately() {
+        let d = Arc::new(Deferred::default());
+        let one = d.start();
+        let two = d.start();
+        drop(one);
+        assert!(!d.is_quiet());
+        drop(two);
+        assert!(d.is_quiet());
+    }
+}
+
+#[cfg(test)]
 mod workspace_state_tests {
     use super::*;
 
@@ -2737,6 +2858,7 @@ mod workspace_state_tests {
             ClientSession {
                 client_id: id,
                 outbound: tx,
+                pushes_written: Default::default(),
                 active_workspace: Some(active.to_string()),
             },
         )
@@ -3400,5 +3522,74 @@ mod workspace_state_tests {
 
         // The freed number is reused, so the replacement is `(workspace 1)` again rather than 5.
         assert_eq!(s.register_ephemeral_workspace(), idle);
+    }
+}
+
+/// A count of the server's outstanding **deferred work** — the debounced, spawned follow-ups that
+/// finish after the RPC that provoked them has already replied.
+///
+/// It exists so that "has the server finished reacting?" can be *asked* rather than waited out.
+/// Debounced work is otherwise unobservable until it produces a side effect, which makes the
+/// absence of a side effect — "this settle was correctly deduped and pushed nothing" — impossible
+/// to assert except by sleeping longer than the debounce and hoping. That is a guess, and it is
+/// wrong on a loaded machine.
+#[derive(Default)]
+pub struct Deferred {
+    outstanding: std::sync::atomic::AtomicUsize,
+    quiet: tokio::sync::Notify,
+}
+
+impl Deferred {
+    /// Register one unit of deferred work, counted until every clone of the returned token is
+    /// dropped.
+    ///
+    /// The token must be taken at the point the work becomes *inevitable* — while the provoking
+    /// RPC still holds the state lock — not when the task is eventually spawned. Otherwise there
+    /// is a window where the RPC has replied, the work is coming, and the server looks quiet.
+    pub fn start(self: &Arc<Self>) -> DeferredToken {
+        self.outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DeferredToken(Arc::new(TokenInner(self.clone())))
+    }
+
+    pub fn is_quiet(&self) -> bool {
+        self.outstanding.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    /// Resolve once no deferred work is outstanding. Returns immediately when already quiet.
+    pub async fn wait_quiet(&self) {
+        loop {
+            // Register for the wakeup *before* testing, so a completion landing between the two
+            // can't be missed.
+            let waiting = self.quiet.notified();
+            if self.is_quiet() {
+                return;
+            }
+            waiting.await;
+        }
+    }
+}
+
+/// Keeps a unit of deferred work counted. Cloneable: one provoking event can arm several
+/// follow-ups, and the work is done when the last of them is.
+///
+/// Release is by `Drop` rather than an explicit call because most of these tasks return *early* —
+/// superseded by a newer cursor move — and a barrier that only counts down on the happy path
+/// wedges the moment anything is superseded.
+#[derive(Clone)]
+pub struct DeferredToken(#[allow(dead_code)] Arc<TokenInner>);
+
+struct TokenInner(Arc<Deferred>);
+
+impl Drop for TokenInner {
+    fn drop(&mut self) {
+        if self
+            .0
+            .outstanding
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.quiet.notify_waiters();
+        }
     }
 }

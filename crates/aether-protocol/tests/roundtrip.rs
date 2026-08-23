@@ -4861,6 +4861,7 @@ fn app_settings_wire_shape_and_defaults() {
         ui_font_size: 12,
         hints: false,
         markdown_read: false,
+        markdown_width: aether_protocol::settings::MarkdownWidth::Full,
         theme: aether_protocol::settings::ThemeMode::Light,
         git_auto_fetch: true,
         worktree_store: String::new(),
@@ -4874,6 +4875,7 @@ fn app_settings_wire_shape_and_defaults() {
             "ui_font_size": 12,
             "hints": false,
             "markdown_read": false,
+            "markdown_width": "full",
             "theme": "light",
             "git_auto_fetch": true,
         })
@@ -4901,6 +4903,25 @@ fn app_settings_wire_shape_and_defaults() {
     );
     assert!(parsed.hints, "hints default on");
     assert!(parsed.markdown_read, "markdown reading view defaults on");
+    assert_eq!(
+        parsed.markdown_width,
+        aether_protocol::settings::MarkdownWidth::Narrow,
+        "reading width defaults narrow — the width the view has always had"
+    );
+    // Each option's wire tag, pinned: a settings.toml written by one client is read by every other.
+    for (width, tag) in [
+        (aether_protocol::settings::MarkdownWidth::Narrow, "narrow"),
+        (aether_protocol::settings::MarkdownWidth::Wide, "wide"),
+        (aether_protocol::settings::MarkdownWidth::Full, "full"),
+    ] {
+        assert_eq!(to_value(width).unwrap(), json!(tag));
+        assert_eq!(
+            from_value::<AppSettings>(json!({ "markdown_width": tag }))
+                .unwrap()
+                .markdown_width,
+            width
+        );
+    }
     assert_eq!(
         parsed.theme,
         aether_protocol::settings::ThemeMode::Dark,
@@ -5549,4 +5570,273 @@ fn mutates_text_marks_the_buffer_a_method_names() {
         )
     };
     const { assert!(!BufferContent::MUTATES_TEXT) };
+}
+
+// ---- the generic round trip ---------------------------------------------------------------------
+
+/// Serialize → deserialize → serialize, and assert the JSON is identical both times.
+///
+/// Catches the asymmetric-serde family — a field that serializes under one name and deserializes
+/// under another, a `skip_serializing_if` with no matching `default`, an enum whose tagging differs
+/// by direction — without needing `PartialEq` on the type, which most params structs don't derive.
+/// It does **not** replace the golden-JSON tests above: those pin the shape a client actually sees,
+/// and would still fail if a field were renamed on both sides at once.
+/// Round-trip `value`, and assert its wire object has exactly these keys.
+///
+/// The key set is the half [`round_trips`] cannot see: it re-serializes what it just deserialized,
+/// so a field *rename* passes straight through — both directions rename together. Names are a live
+/// contract because the browser client parses them by hand in TypeScript (`buffer_id`,
+/// `viewport_id`, `relative_path` and friends appear as string literals there), where a Rust-side
+/// rename compiles cleanly on both Rust sides and breaks only at runtime, in the shell no Rust test
+/// covers.
+fn wire_keys<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T, expected: &[&str]) {
+    round_trips(value);
+    let v = to_value(value).expect("serializes");
+    let mut got: Vec<&str> = v
+        .as_object()
+        .expect("params and results are objects")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want = expected.to_vec();
+    want.sort_unstable();
+    assert_eq!(got, want, "the wire key set changed");
+}
+
+fn round_trips<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) {
+    let first = to_value(value).expect("serializes");
+    let parsed: T = from_value(first.clone()).expect("deserializes from its own output");
+    let second = to_value(&parsed).expect("re-serializes");
+    assert_eq!(first, second, "round trip changed the wire shape");
+}
+
+// ---- viewport/* results (the highest-bandwidth type on the wire) --------------------------------
+
+fn sample_window() -> aether_protocol::viewport::Window {
+    use aether_protocol::viewport::{Highlight, Segment, VisualRow, Window};
+    Window {
+        first_logical_line: 4,
+        last_logical_line_exclusive: 6,
+        line_count: 120,
+        max_scroll_logical_line: 110,
+        total_visual_rows: 130,
+        first_visual_row: 5,
+        max_line_width: 88,
+        git_status: None,
+        lines: vec![LogicalLineRender {
+            logical_line: 4,
+            visual_rows: vec![VisualRow {
+                byte_offset: 0,
+                continuation_indent: 0,
+                segments: vec![Segment {
+                    text: "fn main() {".into(),
+                    highlights: vec![Highlight {
+                        start: 0,
+                        end: 2,
+                        kind: "keyword".into(),
+                    }],
+                }],
+            }],
+            search_matches: Vec::new(),
+            virtual_rows_above: Vec::new(),
+            virtual_rows_below: Vec::new(),
+            diff_marker: None,
+            diff_stage: DiffStage::default(),
+            diff_emphasis: Vec::new(),
+            conflict: None,
+            diagnostics: Vec::new(),
+            sneak_targets: Vec::new(),
+            patch: None,
+        }],
+    }
+}
+
+/// Every rendered row, highlight and diff marker a client ever sees rides this type, and until now
+/// nothing pinned its shape. All four viewport methods return it.
+#[test]
+fn viewport_window_result_wire_shape() {
+    use aether_protocol::viewport::ViewportWindowResult;
+    let r = ViewportWindowResult {
+        window: sample_window(),
+    };
+    let v = to_value(&r).unwrap();
+    assert_eq!(v["window"]["first_logical_line"], 4);
+    assert_eq!(v["window"]["last_logical_line_exclusive"], 6);
+    assert_eq!(v["window"]["line_count"], 120);
+    assert_eq!(v["window"]["max_scroll_logical_line"], 110);
+    assert_eq!(v["window"]["total_visual_rows"], 130);
+    assert_eq!(v["window"]["first_visual_row"], 5);
+    assert_eq!(v["window"]["max_line_width"], 88);
+    assert!(
+        v["window"].get("git_status").is_none(),
+        "absent outside a repo rather than null"
+    );
+    let row = &v["window"]["lines"][0]["visual_rows"][0];
+    assert_eq!(row["byte_offset"], 0);
+    assert_eq!(row["segments"][0]["text"], "fn main() {");
+    assert_eq!(row["segments"][0]["highlights"][0]["kind"], "keyword");
+    // Empty per-line extras stay off the wire — they ride every rendered line, so this is the
+    // difference between a compact frame and a bloated one.
+    let line = &v["window"]["lines"][0];
+    for absent in [
+        "search_matches",
+        "virtual_rows_above",
+        "virtual_rows_below",
+        "diff_marker",
+        "diff_emphasis",
+        "conflict",
+        "diagnostics",
+        "sneak_targets",
+        "patch",
+    ] {
+        assert!(
+            line.get(absent).is_none(),
+            "{absent} should be skipped when empty"
+        );
+    }
+    round_trips(&r);
+}
+
+/// The four viewport methods' params.
+#[test]
+fn viewport_params_round_trip() {
+    use aether_protocol::viewport::{
+        ViewportResizeParams, ViewportScrollParams, ViewportScrollToRowParams,
+        ViewportSetWrapParams,
+    };
+    wire_keys(
+        &ViewportResizeParams {
+            viewport_id: 3,
+            cols: 100,
+            rows: 40,
+        },
+        &["viewport_id", "cols", "rows"],
+    );
+    wire_keys(
+        &ViewportScrollParams {
+            viewport_id: 3,
+            scroll: aether_protocol::viewport::ScrollPosition {
+                logical_line: 12,
+                sub_row: 0.5,
+            },
+        },
+        &["viewport_id", "scroll"],
+    );
+    wire_keys(
+        &ViewportScrollToRowParams {
+            viewport_id: 3,
+            top_visual_row: 42,
+        },
+        &["viewport_id", "top_visual_row"],
+    );
+    wire_keys(
+        &ViewportSetWrapParams {
+            viewport_id: 3,
+            wrap: aether_protocol::viewport::WrapMode::Soft,
+        },
+        &["viewport_id", "wrap"],
+    );
+}
+
+/// The remaining methods that had no wire coverage at all.
+#[test]
+fn previously_unpinned_params_round_trip() {
+    use aether_protocol::buffer::{BufferCopyParams, BufferSaveParams, CopyScope};
+    use aether_protocol::cursor::CursorUndoParams;
+    use aether_protocol::git::{GitCancelParams, GitResetParams};
+    use aether_protocol::picker::PickerHideParams;
+    use aether_protocol::search::{SearchClearParams, SearchStepParams};
+
+    wire_keys(
+        &BufferSaveParams {
+            buffer_id: 1,
+            path_index: Some(0),
+            relative_path: Some("a/b.rs".into()),
+            overwrite: true,
+        },
+        &["buffer_id", "path_index", "relative_path", "overwrite"],
+    );
+    // `buffer/close`: the composite result carries the follow-on open, and both optional halves
+    // stay off the wire when the close was a plain one.
+    {
+        use aether_protocol::buffer::{BufferCloseParams, BufferCloseResult};
+        let plain = BufferCloseResult {
+            next_buffer_id: None,
+            opened: None,
+        };
+        let v = to_value(&plain).unwrap();
+        assert_eq!(v, json!({}), "a plain close is an empty object");
+        round_trips(&plain);
+        wire_keys(
+            &BufferCloseParams {
+                buffer_id: 7,
+                open_next: true,
+            },
+            &["buffer_id", "open_next"],
+        );
+    }
+    wire_keys(
+        &BufferCopyParams {
+            buffer_id: 1,
+            scope: CopyScope::Selection,
+        },
+        &["buffer_id", "scope"],
+    );
+    wire_keys(
+        &CursorUndoParams {
+            buffer_id: 1,
+            count: 1,
+        },
+        &["buffer_id"],
+    );
+    wire_keys(
+        &GitCancelParams {
+            repo_id: "/repo".into(),
+        },
+        &["repo_id"],
+    );
+    wire_keys(
+        &GitResetParams {
+            repo_id: Some("/repo".into()),
+            buffer_id: None,
+            rev: "HEAD~1".into(),
+        },
+        &["repo_id", "rev"],
+    );
+    wire_keys(
+        &PickerHideParams {
+            kind: aether_protocol::picker::PickerKind::Files,
+        },
+        &["kind"],
+    );
+    wire_keys(&SearchClearParams { buffer_id: 1 }, &["buffer_id"]);
+    // `search/step` skips its defaults hard: `direction` is absent when Forward and `options` when
+    // default, while `extend` is never skipped. Both branches are pinned, so a name can't drift on
+    // the side that happens not to be exercised.
+    wire_keys(
+        &SearchStepParams {
+            buffer_id: 1,
+            direction: aether_protocol::cursor::Direction::Forward,
+            extend: false,
+            count: 2,
+            set_query: Some("needle".into()),
+            options: MatchOptions::default(),
+        },
+        &["buffer_id", "extend", "count", "set_query"],
+    );
+    wire_keys(
+        &SearchStepParams {
+            buffer_id: 1,
+            direction: aether_protocol::cursor::Direction::Backward,
+            extend: true,
+            count: 1,
+            set_query: None,
+            options: MatchOptions {
+                regex: true,
+                ..MatchOptions::default()
+            },
+        },
+        &["buffer_id", "direction", "extend", "options"],
+    );
 }

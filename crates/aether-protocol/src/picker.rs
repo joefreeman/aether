@@ -225,6 +225,19 @@ impl PickerKind {
         )
     }
 
+    /// Whether this picker pins a **sticky group header** over the list's first visible row: the
+    /// file-grouped kinds, plus Keybindings and Jumplist. References renders section labels but
+    /// deliberately doesn't pin.
+    ///
+    /// The pin covers the top row, so the shells that draw it also owe a revealed row one row of
+    /// clearance or it slides underneath. Lives here beside [`Self::groups_by_file`], which it is
+    /// defined in terms of, rather than once per shell — it was previously spelled out
+    /// character-for-character in both the terminal and native clients. The browser has no copy:
+    /// it pins with CSS `position: sticky` and never asks the question.
+    pub fn pins_group_header(self) -> bool {
+        self.groups_by_file() || matches!(self, PickerKind::Keybindings | PickerKind::Jumplist)
+    }
+
     /// Whether this kind's groups are collapsible: group headers are pushed as first-class
     /// *selectable rows* ([`PickerItem::Group`]) interleaved into the window — the whole
     /// window/offset/selection space counts rows, not bare items — with every group collapsed
@@ -1654,5 +1667,27 @@ impl PickerUpdateParams {
     /// from "empty result set"; consumers that do (e.g. `apply_update`) match on `items` directly.
     pub fn items(&self) -> &[PickerItem] {
         self.items.as_deref().unwrap_or(&[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which kinds pin a sticky group header. Every shell that draws one reads this, and the two
+    /// that used to spell it out themselves owed a revealed row a row of clearance to match — so a
+    /// kind moving in or out of this set is a rendering change in all of them at once.
+    #[test]
+    fn only_the_grouped_kinds_pin_a_header() {
+        assert!(PickerKind::Grep.pins_group_header());
+        assert!(PickerKind::GitChanges.pins_group_header());
+        assert!(PickerKind::DiagnosticsWorkspace.pins_group_header());
+        assert!(PickerKind::Keybindings.pins_group_header());
+        assert!(PickerKind::Jumplist.pins_group_header());
+        // Renders section labels, but deliberately doesn't pin one.
+        assert!(!PickerKind::References.pins_group_header());
+        assert!(!PickerKind::Files.pins_group_header());
+        // A single file needs no header repeating its own name.
+        assert!(!PickerKind::GitChangesFile.pins_group_header());
     }
 }

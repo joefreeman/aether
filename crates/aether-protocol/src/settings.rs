@@ -48,6 +48,11 @@ pub struct AppSettings {
     /// behaviour the server only stores.
     #[serde(default = "default_markdown_read")]
     pub markdown_read: bool,
+    /// How wide the reading view's text column runs. Client-side render only, like the rest of the
+    /// view settings: each shell resolves the mode to its own unit (terminal columns, ems) at draw
+    /// time. Applies to the reading view alone — the editor's width is the viewport's.
+    #[serde(default = "default_markdown_width")]
+    pub markdown_width: MarkdownWidth,
     /// Colour theme, app-wide across every client. Purely a client-side render choice the server
     /// only stores: shells resolve the mode to a role→shade table (the client core's `theme`
     /// module) at draw time.
@@ -114,6 +119,26 @@ fn default_markdown_read() -> bool {
     true
 }
 
+/// The reading view's text-column width. Not a number of columns or pixels: the two units the
+/// shells draw in (character cells, ems of the reading size) can't share one figure, so the wire
+/// carries the *choice* and each shell resolves it — the client core's `read_layout` holds the
+/// table both sides read from, so the terminal and the pixel shells stay in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkdownWidth {
+    /// The classic reading measure — long-established as the comfortable one for prose.
+    Narrow,
+    /// Roughly a third wider. Prose still reads well and wide tables/code fences stop scrolling.
+    Wide,
+    /// No column at all: the document fills the window.
+    Full,
+}
+
+/// Narrow — the measure the reading view has always used, and the one prose is easiest to read at.
+pub const fn default_markdown_width() -> MarkdownWidth {
+    MarkdownWidth::Narrow
+}
+
 /// Which colour theme the clients render with. One value for the whole app, like every other app
 /// setting — there is deliberately no per-client override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +166,7 @@ impl Default for AppSettings {
             ui_font_size: default_ui_font_size(),
             hints: default_hints(),
             markdown_read: default_markdown_read(),
+            markdown_width: default_markdown_width(),
             theme: default_theme(),
             git_auto_fetch: default_git_auto_fetch(),
             worktree_store: String::new(),

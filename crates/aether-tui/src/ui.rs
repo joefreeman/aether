@@ -12,7 +12,7 @@ use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::search::SearchMatchRange;
-use aether_protocol::settings::ThemeMode;
+use aether_protocol::settings::{MarkdownWidth, ThemeMode};
 use aether_protocol::sneak::SneakTarget;
 use aether_protocol::viewport::{
     ConflictLine, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
@@ -337,12 +337,13 @@ fn draw_app_settings_overlay(f: &mut Frame, state: &AppState, area: Rect) {
             lines.push(Line::from(""));
             // Label flush-left, control right-aligned. Only the control carries the focus highlight
             // (the selection background). A toggle shows a checkbox; a stepped value (font size) shows the
-            // number — the terminal can't change its own font, but the value is shown for parity and
-            // because the setting is synced (it drives the GUI/web clients).
+            // number and a named choice its label — the terminal can't change its own font, but the value
+            // is shown for parity and because the setting is synced (it drives the GUI/web clients).
             let (control_text, control_fg) = match row.control {
                 AppSettingControl::Toggle(true) => ("[\u{2713}]".to_string(), c(th().accent)),
                 AppSettingControl::Toggle(false) => ("[ ]".to_string(), c(th().fg_bright)),
                 AppSettingControl::Value(v) => (v.to_string(), c(th().accent)),
+                AppSettingControl::Choice(label) => (label.to_string(), c(th().accent)),
             };
             let control_w = control_text.chars().count().max(CHECK_W);
             let check_bg = c(if selected { th().bg_selection } else { th().bg });
@@ -1659,7 +1660,7 @@ pub fn collapsible_pin<'a>(
     top: usize,
 ) -> Option<&'a GroupSpan> {
     let kind = state.picker.kind?;
-    if !state.picker.collapsible || !pins_group_header(kind) {
+    if !state.picker.collapsible || !kind.pins_group_header() {
         return None;
     }
     let PickerRow::Item(i) = rows.get(top)? else {
@@ -1687,15 +1688,6 @@ pub fn picker_governing_group(rows: &[PickerRow], top: usize) -> Option<usize> {
         PickerRow::Header(gi) => Some(*gi),
         _ => None,
     })
-}
-
-/// Whether this picker kind pins a sticky group header over the pane's top row — mirrors the
-/// native/web clients (`aether_iced::picker::pins_group_header`): the file-grouped kinds, the
-/// Jumplist, and Keybindings pin their header; References renders section labels but
-/// deliberately doesn't pin.
-/// The pinned header covers the top view row, so the scroll math keeps the selection below it.
-pub fn pins_group_header(kind: PickerKind) -> bool {
-    kind.groups_by_file() || matches!(kind, PickerKind::Keybindings | PickerKind::Jumplist)
 }
 
 /// The view-row scroll offset (`top`, an index into [`picker_window_rows`]) that keeps the selected
@@ -1742,18 +1734,17 @@ pub fn picker_scroll_for_run(
     header_rel: usize,
     len: usize,
 ) -> usize {
-    let pane = pane_height.max(1);
-    let last = header_rel + len;
-    if header_rel < top {
-        // Header above the pane (a backward step): align it to the top.
-        header_rel
-    } else if last >= top + pane {
-        // Run overflows the pane bottom: scroll the minimum that shows its last row, capped
-        // so the header stays visible.
-        (last + 1 - pane).min(header_rel)
-    } else {
-        top
-    }
+    // The rule itself is shared with the GUI and browser shells
+    // ([`aether_client::picker::frame_run`]); all this adds is the terminal's unit — whole view
+    // rows, where the others count pixels.
+    aether_client::picker::frame_run(
+        top as f64,
+        pane_height.max(1) as f64,
+        header_rel as f64,
+        (header_rel + len + 1) as f64,
+    )
+    .map(|t| t as usize)
+    .unwrap_or(top)
 }
 
 /// The shell's picker-scroll continuity state: the first visible view row (`top`), the selected
@@ -1955,7 +1946,7 @@ pub fn picker_hit(state: &AppState, cols: u16, rows: u16, row: u16, col: u16) ->
     let pinned = if collapsible {
         collapsible_pin(state, &view_rows, top).is_some()
     } else {
-        state.picker.kind.is_some_and(pins_group_header)
+        state.picker.kind.is_some_and(PickerKind::pins_group_header)
             && !state.picker.groups.is_empty()
             && picker_governing_group(&view_rows, top).is_some()
     };
@@ -2535,33 +2526,10 @@ fn explorer_input_prefix(state: &AppState, available: usize) -> (String, String)
     (String::new(), format!("{shrunk}/"))
 }
 
-/// Placeholder for the picker's query input: the picker's action, ellipsised. Kept in sync with
-/// the web client's `PLACEHOLDER` map (web/src/picker.ts).
+/// The query-input placeholder, from the shared table every shell reads
+/// ([`aether_client::labels::picker_placeholder`]).
 fn picker_placeholder(kind: Option<aether_protocol::picker::PickerKind>) -> &'static str {
-    match kind {
-        Some(aether_protocol::picker::PickerKind::Files) => "Find files…",
-        Some(aether_protocol::picker::PickerKind::Buffers) => "Switch buffer…",
-        Some(aether_protocol::picker::PickerKind::Grep) => "Grep workspace…",
-        Some(aether_protocol::picker::PickerKind::Explorer) => "Explore files…",
-        Some(aether_protocol::picker::PickerKind::Workspaces) => "Select workspace…",
-        Some(aether_protocol::picker::PickerKind::Diagnostics) => "Diagnostics in current file…",
-        Some(aether_protocol::picker::PickerKind::DiagnosticsWorkspace) => {
-            "Diagnostics in workspace…"
-        }
-        Some(aether_protocol::picker::PickerKind::LspServers) => "List LSPs…",
-        Some(aether_protocol::picker::PickerKind::References) => "List references…",
-        Some(aether_protocol::picker::PickerKind::DocumentSymbols) => "Go to symbol…",
-        Some(aether_protocol::picker::PickerKind::WorkspaceSymbols) => "Go to symbol in workspace…",
-        Some(aether_protocol::picker::PickerKind::GitChangesFile) => "Changes in current file…",
-        Some(aether_protocol::picker::PickerKind::GitChanges) => "Changes in workspace…",
-        Some(aether_protocol::picker::PickerKind::Keybindings) => "Find keybinding…",
-        Some(aether_protocol::picker::PickerKind::Jumplist) => "Filter the jumplist…",
-        Some(aether_protocol::picker::PickerKind::GitBranches) => "Branches & worktrees…",
-        Some(aether_protocol::picker::PickerKind::GitLog) => "Search history…",
-        Some(aether_protocol::picker::PickerKind::GitLogFile) => "Search this file's history…",
-        Some(aether_protocol::picker::PickerKind::GitStash) => "Find stash…",
-        None => "Search…",
-    }
+    aether_client::labels::picker_placeholder(kind)
 }
 
 /// Horizontal line under the input. Extends the line *into* the side borders with tee characters
@@ -2747,7 +2715,7 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
                     ));
                 }
             }
-        } else if pins_group_header(kind) && !groups.is_empty() {
+        } else if kind.pins_group_header() && !groups.is_empty() {
             if let (Some(first), Some(gi)) = (lines.first_mut(), picker_governing_group(&rows, top))
             {
                 *first = Line::from(header_spans(&groups[gi].header));
@@ -4263,7 +4231,7 @@ fn git_branch_item_spans(
     }
     if timestamp > 0 {
         tail.push_str(if tail.is_empty() { "  " } else { " · " });
-        tail.push_str(&crate::shell::time_ago(timestamp));
+        tail.push_str(&aether_client::labels::time_ago(timestamp));
     }
     // Divergence, right-aligned at the row's edge and in the same accent the status bar gives it —
     // it annotates the branch, not the commit, and the two clusters should read alike. Each arrow
@@ -4413,7 +4381,7 @@ fn git_commit_item_spans(
         if !tail.is_empty() {
             tail.push_str(" · ");
         }
-        tail.push_str(&crate::shell::time_ago(timestamp));
+        tail.push_str(&aether_client::labels::time_ago(timestamp));
     }
     // Two columns of breathing room so a full-width subject can't touch the metadata.
     let subject_budget = max_width
@@ -4704,7 +4672,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
     let Some(rv) = state.read.as_ref() else {
         return;
     };
-    let (content_cols, margin) = read_measure(area.width);
+    let (content_cols, margin) = read_measure(area.width, rv.width);
     // The rect hosts the gutter *plus* the text measure: the layout wraps rows to
     // `content_cols` alone, so a full line just reaches the right edge instead of losing its
     // last cells to the Paragraph clip.
@@ -5025,12 +4993,12 @@ pub const READ_PAD_BOTTOM: u16 = 2;
 /// The reading-position gutter every painted line leads with (`"▎ "` / `"  "`).
 pub const READ_GUTTER: u16 = 2;
 
-/// Text measure + centering margin for a terminal `term_cols` wide. The measure is taken over
-/// the columns left of the gutter and the margin centers gutter+text as one block, so a
-/// full-measure line plus the gutter exactly fills the painted rect — laying out at the raw
-/// terminal width instead used to clip the last [`READ_GUTTER`] cells of every full line.
-pub fn read_measure(term_cols: u16) -> (u16, u16) {
-    aether_client::read_layout::measure(term_cols.saturating_sub(READ_GUTTER).max(10))
+/// Text measure + centering margin for a terminal `term_cols` wide, at the reading-width setting.
+/// The measure is taken over the columns left of the gutter and the margin centers gutter+text as
+/// one block, so a full-measure line plus the gutter exactly fills the painted rect — laying out at
+/// the raw terminal width instead used to clip the last [`READ_GUTTER`] cells of every full line.
+pub fn read_measure(term_cols: u16, width: MarkdownWidth) -> (u16, u16) {
+    aether_client::read_layout::measure(term_cols.saturating_sub(READ_GUTTER).max(10), width)
 }
 
 /// Map a core reading-view [`aether_client::read_layout::SpanStyle`] to the terminal theme.
@@ -7927,17 +7895,6 @@ mod tests {
             picker_governing_group(&picker_window_rows(3, &[], false), 1),
             None
         );
-    }
-
-    /// The pin gate mirrors the native/web clients: file-grouped kinds and Keybindings pin;
-    /// References (which still sends section spans) does not.
-    #[test]
-    fn only_the_grouped_kinds_pin_a_header() {
-        assert!(pins_group_header(PickerKind::Grep));
-        assert!(pins_group_header(PickerKind::GitChanges));
-        assert!(pins_group_header(PickerKind::Keybindings));
-        assert!(!pins_group_header(PickerKind::References));
-        assert!(!pins_group_header(PickerKind::Files));
     }
 
     /// Terminal size the picker render tests draw into.

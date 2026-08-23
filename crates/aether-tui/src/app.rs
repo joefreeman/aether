@@ -275,6 +275,9 @@ pub struct ReadViewState {
     pub hscroll: std::collections::HashMap<usize, u16>,
     /// True while the first content fetch is still in flight (an empty page briefly).
     pub loading: bool,
+    /// The reading-width setting the rows were laid out at — the painter re-derives the same
+    /// measure to place the centered column.
+    pub width: aether_protocol::settings::MarkdownWidth,
 }
 
 /// One block of hover-popup content. `severity` colors the block to match the gutter dot (for

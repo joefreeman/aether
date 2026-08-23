@@ -2704,7 +2704,7 @@ impl App {
                         blame: (self.session.mode == Mode::Normal)
                             .then_some(self.session.blame.as_ref())
                             .flatten()
-                            .map(|(line, b)| (*line, format_blame(b))),
+                            .map(|(line, b)| (*line, aether_client::labels::format_blame(b))),
                         tab_width: TAB_WIDTH,
                         ligatures: self.session.ligatures,
                         font_size: self.session.buffer_font_size as f32,
@@ -3336,45 +3336,45 @@ impl App {
                 let focused = s.selected == i;
                 // The focus ring sits on just the control (a future row may carry several
                 // controls, so highlighting the whole row would be ambiguous). A toggle renders a
-                // checkbox; a stepped value (font size) renders a pill button — clicking either
-                // activates the row (flip / step to the next preset), the same as Enter/Space.
+                // checkbox; a stepped value (font size) or a named choice (reading width) renders a
+                // pill button — clicking either activates the row (flip / step to the next
+                // value), the same as Enter/Space.
+                // The pill a stepped row wears, showing where its setting stands.
+                let pill = |shown: String| -> Element<'_, Message> {
+                    // `button` needs a `Clone` press message and `Message` isn't `Clone`, so the
+                    // button carries the row index (a `usize`) and we map it to `Message` — the
+                    // same pattern as the workspace-settings delete button.
+                    let btn = iced::widget::button(
+                        text(shown).size(ui.body()).font(SANS).color(p.fg_bright),
+                    )
+                    .padding([2, 8])
+                    .style(move |_, status| iced::widget::button::Style {
+                        background: Some(
+                            if matches!(status, iced::widget::button::Status::Hovered) {
+                                p.fill_dim
+                            } else {
+                                p.bg_selection
+                            }
+                            .into(),
+                        ),
+                        text_color: p.fg_bright,
+                        border: iced::Border {
+                            color: p.border_subtle,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..iced::widget::button::Style::default()
+                    })
+                    .on_press(i);
+                    Element::from(btn).map(|idx| Message::Core(CoreEvent::AppSettingToggle(idx)))
+                };
                 let control: Element<'_, Message> = match r.control {
                     AppSettingControl::Toggle(on) => iced::widget::checkbox(on)
                         .size(ui.control())
                         .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i)))
                         .into(),
-                    AppSettingControl::Value(v) => {
-                        // `button` needs a `Clone` press message and `Message` isn't `Clone`, so the
-                        // button carries the row index (a `usize`) and we map it to `Message` — the
-                        // same pattern as the workspace-settings delete button.
-                        let btn = iced::widget::button(
-                            text(v.to_string())
-                                .size(ui.body())
-                                .font(SANS)
-                                .color(p.fg_bright),
-                        )
-                        .padding([2, 8])
-                        .style(move |_, status| iced::widget::button::Style {
-                            background: Some(
-                                if matches!(status, iced::widget::button::Status::Hovered) {
-                                    p.fill_dim
-                                } else {
-                                    p.bg_selection
-                                }
-                                .into(),
-                            ),
-                            text_color: p.fg_bright,
-                            border: iced::Border {
-                                color: p.border_subtle,
-                                width: 1.0,
-                                radius: 4.0.into(),
-                            },
-                            ..iced::widget::button::Style::default()
-                        })
-                        .on_press(i);
-                        Element::from(btn)
-                            .map(|idx| Message::Core(CoreEvent::AppSettingToggle(idx)))
-                    }
+                    AppSettingControl::Value(v) => pill(v.to_string()),
+                    AppSettingControl::Choice(label) => pill(label.to_string()),
                 };
                 let check = container(control)
                     .padding(2)
@@ -4968,10 +4968,13 @@ fn md_plain(inlines: &[MdInline]) -> String {
 /// wants larger type than code. Matches the web's `#buffer.md-read-host { font-size: 1.125em }`.
 const READ_SCALE: f32 = 1.125;
 
-/// The reading measure in ems of the body size — the column tracks the reading size (a
-/// bigger type setting keeps the same ~characters-per-line), like the web's `max-width: 42.5em`.
-/// 42.5 × the 18px default reading size = 765px.
-const READ_MEASURE_EM: f32 = 42.5;
+/// The reading measure in pixels for a `body`-px reading size, at the session's width setting —
+/// the column tracks the reading size (a bigger type setting keeps the same ~characters-per-line),
+/// like the web's `max-width` in ems. `None` is the full-width setting: no cap, the document fills
+/// the window. The em table itself is the core's, shared with the terminal shell's column measure.
+fn read_measure_px(session: &Session, body: f32) -> Option<f32> {
+    aether_client::read_layout::measure_em(session.markdown_width).map(|em| body * em)
+}
 
 /// Heading text size by level — the web's ladder (1.75/1.45/1.25/1.1 em). Shared by the
 /// heading arm and the view loop's air-above-headings computation.
@@ -5116,6 +5119,7 @@ impl App {
             return iced::widget::Space::new().into();
         };
         let body = self.session.buffer_font_size as f32 * READ_SCALE;
+        let measure = read_measure_px(&self.session, body);
         // Two projections of the one server cursor: the block bar always marks the reading
         // position; the target pill inverts the interactive span the cursor sits inside, on top of
         // it. An extended selection adds the NORD2 tint over its blocks and suppresses the pill
@@ -5171,13 +5175,18 @@ impl App {
             };
             let inner = container(wrapped)
                 .width(Length::Fill)
-                .max_width(body * READ_MEASURE_EM)
                 .padding(iced::Padding {
                     top: 3.0 + air,
                     bottom: 3.0,
                     left: 16.0,
                     right: 16.0,
                 });
+            // The measure caps each block's band; at the full-width setting there's no cap and the
+            // `Fill` runs to the window edge (the centering below then has nothing to center).
+            let inner = match measure {
+                Some(px) => inner.max_width(px),
+                None => inner,
+            };
             // The reveal probe's anchor is claimed by the focused *block* inside `read_block`
             // (and by a focused list item in its List arm), so it works at any nesting depth
             // rather than only for the top-level band.
@@ -5608,7 +5617,8 @@ impl App {
     /// block's own horizontal padding and the focus-bar inset. An estimate like the column
     /// widths themselves — over-shooting costs a horizontal scrollbar, not a broken layout.
     fn read_table_avail(&self, body: f32) -> f32 {
-        let column = (self.view_size.width - theme::SCROLLBAR_W).min(body * READ_MEASURE_EM);
+        let window = self.view_size.width - theme::SCROLLBAR_W;
+        let column = read_measure_px(&self.session, body).map_or(window, |px| window.min(px));
         // 32px of block padding, 13px of focus-bar inset, and 4px spare: a fitted table lands
         // exactly on this number, so a slightly optimistic estimate would show a scrollbar for
         // a couple of stray pixels.
@@ -6405,18 +6415,16 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
     // row space carries no gap pixels, so this is pure row arithmetic.
     if let Reveal::Run = reveal {
         let run = p.focus_run.filter(|r| r.header_row == p.selected)?;
-        let run_top = run.header_row as f32 * ui.row_h();
-        let run_bottom = (run.header_row + run.len + 1) as f32 * ui.row_h();
-        let h = crate::picker::list_height(p, ui);
-        if run_top < scroll_y {
-            return Some(run_top);
-        }
-        if run_bottom > scroll_y + h {
-            // Already sitting at the cap (header at the top of an over-tall run): no move.
-            let target = (run_bottom - h).min(run_top);
-            return (target > scroll_y).then_some(target);
-        }
-        return None;
+        let row_h = ui.row_h() as f64;
+        // The rule is shared with the terminal and browser shells; this shell's contribution is
+        // only the unit — pixels, where the terminal counts view rows.
+        return aether_client::picker::frame_run(
+            scroll_y as f64,
+            crate::picker::list_height(p, ui) as f64,
+            run.header_row as f64 * row_h,
+            (run.header_row + run.len + 1) as f64 * row_h,
+        )
+        .map(|y| y as f32);
     }
     let sd = p.selected_display_row()?;
     // Row-index × ROW_H, plus the inter-group gap pixels above the row (gaps sit outside the
@@ -6428,7 +6436,7 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
     // Kinds that pin a sticky group header over the top row (grep's file path, Keybindings'
     // group label) need a revealed row to clear one row's height or it slides under the header
     // (the bug grep hit first, then Keybindings). Same predicate as the pin itself.
-    let clearance = if crate::picker::pins_group_header(p.kind) {
+    let clearance = if p.kind.pins_group_header() {
         ui.row_h()
     } else {
         0.0
@@ -6443,33 +6451,6 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
         Reveal::Minimal if bottom > scroll_y + h => Some(bottom - h),
         Reveal::Minimal => None,
         Reveal::Run => unreachable!("handled above"),
-    }
-}
-
-/// `3w ago`-style age from a unix timestamp (seconds).
-/// The EOL blame label for a pushed [`aether_protocol::git::BlameInfo`].
-fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
-    if b.is_uncommitted {
-        "uncommitted".into()
-    } else {
-        format!("{} · {}", b.author, time_ago(b.timestamp))
-    }
-}
-
-pub(crate) fn time_ago(ts: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let s = (now - ts).max(0);
-    match s {
-        0..=59 => "now".into(),
-        60..=3599 => format!("{}m ago", s / 60),
-        3600..=86_399 => format!("{}h ago", s / 3600),
-        86_400..=604_799 => format!("{}d ago", s / 86_400),
-        604_800..=2_591_999 => format!("{}w ago", s / 604_800),
-        2_592_000..=31_535_999 => format!("{}mo ago", s / 2_592_000),
-        _ => format!("{}y ago", s / 31_536_000),
     }
 }
 

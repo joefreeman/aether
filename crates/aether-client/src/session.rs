@@ -13,7 +13,7 @@ use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
-use aether_protocol::settings::ThemeMode;
+use aether_protocol::settings::{MarkdownWidth, ThemeMode};
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
@@ -566,6 +566,8 @@ pub enum AppSettingId {
     Hints,
     /// Open markdown buffers as the reading view.
     MarkdownRead,
+    /// How wide the reading view's text column runs.
+    MarkdownWidth,
     /// Light vs dark colour theme (the toggle is "light on/off"; off is dark).
     Theme,
     /// Periodic background `git fetch`.
@@ -595,9 +597,15 @@ pub fn step_font_size(current: u32, up: bool, wrap: bool) -> u32 {
                 .map(|(i, _)| i)
         })
         .unwrap_or(0);
-    let n = presets.len();
-    let next = if up {
-        if idx + 1 < n {
+    presets[step_index(idx, presets.len(), up, wrap)]
+}
+
+/// One step along a list of options: `up` moves toward the end, `wrap` cycles past either end
+/// rather than clamping there. Shared by every stepped settings row, so activate-cycles and the
+/// Left/Right stepper behave identically whatever the row holds.
+fn step_index(idx: usize, len: usize, up: bool, wrap: bool) -> usize {
+    if up {
+        if idx + 1 < len {
             idx + 1
         } else if wrap {
             0
@@ -607,22 +615,51 @@ pub fn step_font_size(current: u32, up: bool, wrap: bool) -> u32 {
     } else if idx > 0 {
         idx - 1
     } else if wrap {
-        n - 1
+        len.saturating_sub(1)
     } else {
         idx
-    };
-    presets[next]
+    }
 }
 
-/// The control a settings row presents: an on/off checkbox, or a stepped numeric value (font size).
-/// The shells render each kind; activating a row (Enter / Space / click) advances it — flips a
-/// toggle, or steps a value to the next preset (wrapping) — via [`Session::activate_app_setting`].
+/// The reading-view width options, in stepping order (narrow → wide → full). The order is the
+/// display order the settings row cycles through, so it reads as "more width" in one direction.
+pub const MARKDOWN_WIDTHS: &[MarkdownWidth] = &[
+    MarkdownWidth::Narrow,
+    MarkdownWidth::Wide,
+    MarkdownWidth::Full,
+];
+
+/// Step `current` to an adjacent reading width. Mirrors [`step_font_size`]: `up` moves toward the
+/// wider end, `wrap` cycles past the ends (Enter/Space) rather than clamping (Left/Right).
+pub fn step_markdown_width(current: MarkdownWidth, up: bool, wrap: bool) -> MarkdownWidth {
+    let opts = MARKDOWN_WIDTHS;
+    let idx = opts.iter().position(|&v| v == current).unwrap_or(0);
+    opts[step_index(idx, opts.len(), up, wrap)]
+}
+
+/// The settings row's label for a reading width. Presentation, so it lives here rather than on the
+/// protocol type — the wire carries the lowercase tag.
+pub fn markdown_width_label(width: MarkdownWidth) -> &'static str {
+    match width {
+        MarkdownWidth::Narrow => "Narrow",
+        MarkdownWidth::Wide => "Wide",
+        MarkdownWidth::Full => "Full",
+    }
+}
+
+/// The control a settings row presents: an on/off checkbox, a stepped numeric value (font size), or
+/// a named choice from a small set (reading width). The shells render each kind; activating a row
+/// (Enter / Space / click) advances it — flips a toggle, or steps to the next value/option
+/// (wrapping) — via [`Session::activate_app_setting`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppSettingControl {
     /// `true` is "on" / checked.
     Toggle(bool),
     /// The current value (px, for font size); presets + stepping live in the core.
     Value(u32),
+    /// The current option's label; the option set + stepping live in the core. Rendered like
+    /// [`Self::Value`] — a pill showing where the setting stands — since both are "one of a few".
+    Choice(&'static str),
 }
 
 /// One row of the application-settings overlay: its identity, label, current control state, and a
@@ -948,6 +985,11 @@ pub struct Session {
     /// and synced via `settings/changed`. The persisted *default* [`Self::read_on`] starts from,
     /// not the live state.
     pub markdown_read_default: bool,
+    /// App-wide reading-view width setting (`Space ,`), seeded from `settings/get` and synced via
+    /// `settings/changed`. Shells resolve it through `read_layout`'s measure table at draw time —
+    /// there's no live state to seed here, unlike [`Self::markdown_read_default`], because a width
+    /// is the same question for every document.
+    pub markdown_width: MarkdownWidth,
     /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and consumed
     /// by `adopt_switch`: jump-shaped opens land in the editor, not the reading view.
     pub(crate) open_route_jumped: bool,
@@ -1396,6 +1438,7 @@ impl Session {
             read: None,
             read_on: true,
             markdown_read_default: true,
+            markdown_width: aether_protocol::settings::default_markdown_width(),
             open_route_jumped: false,
             pending_read_anchor: None,
             diagnostics: DiagnosticCounts::default(),
@@ -1462,6 +1505,14 @@ impl Session {
                         label: "Markdown reading view",
                         control: AppSettingControl::Toggle(self.markdown_read_default),
                         hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
+                    },
+                    AppSettingRow {
+                        id: AppSettingId::MarkdownWidth,
+                        label: "Markdown reading width",
+                        control: AppSettingControl::Choice(markdown_width_label(
+                            self.markdown_width,
+                        )),
+                        hint: "Width of the reading view's text column (full fills the window)",
                     },
                     AppSettingRow {
                         id: AppSettingId::Theme,

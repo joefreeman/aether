@@ -607,8 +607,16 @@ impl std::fmt::Display for LoadWorkspaceError {
 }
 
 pub fn load_workspace(name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError> {
-    let path = workspace_config_path(name)
+    let dir = workspaces_dir()
         .map_err(|e| LoadWorkspaceError::Invalid(format!("resolving config path: {e}")))?;
+    load_workspace_in(&dir, name)
+}
+
+/// Directory-parameterized core of [`load_workspace`]. Callers that hold a `ServerState` resolve
+/// the directory through it (`ServerState::workspaces_dir`), so a test can point the whole
+/// workspace store at a tempdir instead of the developer's own configured workspaces.
+pub fn load_workspace_in(dir: &Path, name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError> {
+    let path = workspace_config_path_in(dir, name);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -632,10 +640,10 @@ pub fn load_workspace(name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError>
     Ok(config)
 }
 
-pub fn workspace_config_path(name: &str) -> anyhow::Result<PathBuf> {
-    Ok(profile_config_dir()?
-        .join("workspaces")
-        .join(format!("{name}.toml")))
+/// A workspace's config file inside `dir`. The filename is the workspace name — the body doesn't
+/// carry it — so this is also the naming rule.
+pub fn workspace_config_path_in(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.toml"))
 }
 
 /// Path to the active profile's application-settings file
@@ -652,14 +660,9 @@ pub fn load_app_settings() -> anyhow::Result<AppSettings> {
     load_app_settings_at(&app_settings_path()?)
 }
 
-/// Write (or overwrite) the application settings. Creates the config directory if needed.
-pub fn write_app_settings(settings: &AppSettings) -> anyhow::Result<()> {
-    write_app_settings_at(&app_settings_path()?, settings)
-}
-
 /// Path-parameterized core of [`load_app_settings`], kept free of XDG resolution so it can be
 /// unit-tested against a tempdir without clobbering the developer's real settings.
-fn load_app_settings_at(path: &Path) -> anyhow::Result<AppSettings> {
+pub(crate) fn load_app_settings_at(path: &Path) -> anyhow::Result<AppSettings> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AppSettings::default()),
@@ -670,8 +673,9 @@ fn load_app_settings_at(path: &Path) -> anyhow::Result<AppSettings> {
     toml::from_str(&content).with_context(|| format!("parsing app settings at {}", path.display()))
 }
 
-/// Path-parameterized core of [`write_app_settings`]. See [`load_app_settings_at`].
-fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyhow::Result<()> {
+/// Write (or overwrite) the application settings at `path`, creating its directory if needed.
+/// Callers resolve the path (`ServerState::app_settings_path`) so tests can redirect it.
+pub(crate) fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
@@ -1170,8 +1174,12 @@ pub fn workspaces_dir() -> anyhow::Result<PathBuf> {
 /// Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
 /// install with no workspaces configured shouldn't be a server-side fatal.
 pub fn list_workspace_names() -> anyhow::Result<Vec<String>> {
-    let dir = workspaces_dir()?;
-    let entries = match std::fs::read_dir(&dir) {
+    list_workspace_names_in(&workspaces_dir()?)
+}
+
+/// Directory-parameterized core of [`list_workspace_names`]. See [`load_workspace_in`].
+pub fn list_workspace_names_in(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
@@ -1384,11 +1392,9 @@ pub fn canonicalize_workspace_path(p: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("canonicalizing workspace path {}", expanded.display()))
 }
 
-/// Write (or overwrite) a workspace's TOML config. Creates the workspaces directory if it doesn't
-/// yet exist. Caller is responsible for refusing to overwrite when not desired (see
-/// `workspace_config_exists`).
-pub fn write_workspace_config(config: &WorkspaceConfig) -> anyhow::Result<()> {
-    let path = workspace_config_path(&config.name)?;
+/// Directory-parameterized core of [`write_workspace_config`]. See [`load_workspace_in`].
+pub fn write_workspace_config_in(dir: &Path, config: &WorkspaceConfig) -> anyhow::Result<()> {
+    let path = workspace_config_path_in(dir, &config.name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating workspaces dir {}", parent.display()))?;
@@ -1400,18 +1406,15 @@ pub fn write_workspace_config(config: &WorkspaceConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True if `<workspaces_dir>/<name>.toml` already exists. Used by `workspace/create` to refuse
-/// overwriting an existing config.
-pub fn workspace_config_exists(name: &str) -> anyhow::Result<bool> {
-    Ok(workspace_config_path(name)?.exists())
+/// Directory-parameterized core of [`workspace_config_exists`]. See [`load_workspace_in`].
+pub fn workspace_config_exists_in(dir: &Path, name: &str) -> bool {
+    workspace_config_path_in(dir, name).exists()
 }
 
-/// Rename a workspace's TOML config on disk (`<old>.toml` → `<new>.toml`). Used by
-/// `workspace/rename`. The caller is responsible for refusing when the destination already exists
-/// (see `workspace_config_exists`) — `fs::rename` would otherwise silently clobber it.
-pub fn rename_workspace_config(old: &str, new: &str) -> anyhow::Result<()> {
-    let from = workspace_config_path(old)?;
-    let to = workspace_config_path(new)?;
+/// Directory-parameterized core of [`rename_workspace_config`]. See [`load_workspace_in`].
+pub fn rename_workspace_config_in(dir: &Path, old: &str, new: &str) -> anyhow::Result<()> {
+    let from = workspace_config_path_in(dir, old);
+    let to = workspace_config_path_in(dir, new);
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating workspaces dir {}", parent.display()))?;
@@ -1426,11 +1429,9 @@ pub fn rename_workspace_config(old: &str, new: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delete a workspace's TOML config from disk. Used by `workspace/delete`. Does not remove the source
-/// files under the workspace's roots — only the workspace definition. A missing file is treated as
-/// success (the end state — no config — is what was asked for).
-pub fn delete_workspace_config(name: &str) -> anyhow::Result<()> {
-    let path = workspace_config_path(name)?;
+/// Directory-parameterized core of [`delete_workspace_config`]. See [`load_workspace_in`].
+pub fn delete_workspace_config_in(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let path = workspace_config_path_in(dir, name);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

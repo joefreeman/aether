@@ -556,6 +556,57 @@ pub fn hover_key(key: &str, ctrl: bool, alt: bool, shift: bool) -> Result<JsValu
     to_js(&value)
 }
 
+/// The query-input placeholder for a picker kind (the wire spelling, e.g. `"git_changes"`), or the
+/// generic prompt for `null`/an unknown kind.
+///
+/// Exported so the browser reads the same table as the other shells
+/// ([`aether_client::labels::picker_placeholder`]) instead of keeping a fourth copy of the strings.
+#[wasm_bindgen]
+pub fn picker_placeholder(kind: Option<String>) -> String {
+    let parsed = kind
+        .and_then(|k| serde_json::from_value::<aether_protocol::picker::PickerKind>(json!(k)).ok());
+    aether_client::labels::picker_placeholder(parsed).to_string()
+}
+
+/// Coarse relative age (`just now`, `3w ago`) for a Unix-seconds timestamp.
+///
+/// Exported so the browser reads the same ladder as the other shells
+/// ([`aether_client::labels::time_ago`]) instead of keeping a third copy — the three had already
+/// drifted over whether a sub-minute age is `now` or `just now`, and whether months exist.
+#[wasm_bindgen]
+pub fn time_ago(unix_secs: f64) -> String {
+    aether_client::labels::time_ago(unix_secs as i64)
+}
+
+/// The end-of-line blame label — author and relative age, or `uncommitted`.
+#[wasm_bindgen]
+pub fn format_blame(author: &str, timestamp: f64, is_uncommitted: bool) -> String {
+    aether_client::labels::format_blame(&aether_protocol::git::BlameInfo {
+        commit: String::new(),
+        author: author.to_string(),
+        timestamp: timestamp as i64,
+        is_uncommitted,
+    })
+}
+
+/// Frame a freshly-opened picker group run — the `run` flavour of the reveal effect.
+///
+/// All arguments and the result are in **pixels** here (the browser's unit); the shared rule in
+/// [`aether_client::picker::frame_run`] is unit-agnostic and the terminal shell passes view rows.
+/// Returns `null` when the run already fits and the list should not scroll.
+///
+/// Exported rather than reimplemented in the shell: this was the third hand-written copy of the
+/// same policy, and the only one no test covered.
+#[wasm_bindgen]
+pub fn picker_frame_run(
+    scroll_top: f64,
+    viewport: f64,
+    run_start: f64,
+    run_end: f64,
+) -> Option<f64> {
+    aether_client::picker::frame_run(scroll_top, viewport, run_start, run_end)
+}
+
 // ---- key normalisation (mirrors aether-iced/src/input.rs) -----------------------------------
 
 /// Browser `KeyboardEvent.key` → the core's [`KeyCode`]. `None` for keys we don't bind (modifier

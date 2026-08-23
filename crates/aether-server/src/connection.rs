@@ -174,6 +174,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Notification>(OUTBOUND_CHANNEL_CAPACITY);
 
     let client_id: ClientId = Uuid::new_v4();
+    let pushes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let mut s = state.lock().await;
         s.clients.insert(
@@ -181,6 +182,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             ClientSession {
                 client_id,
                 outbound: outbound_tx.clone(),
+                pushes_written: pushes_written.clone(),
                 active_workspace: None,
             },
         );
@@ -225,6 +227,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
                     if writer.send(Message::text(json)).await.is_err() {
                         break;
                     }
+                    pushes_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

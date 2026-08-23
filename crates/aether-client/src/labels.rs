@@ -1,4 +1,5 @@
-//! Presentation labels for workspace roots and buffer locations. This is the client-side home for
+//! Presentation labels shared by every shell — workspace roots, buffer locations, picker prompts
+//! and relative timestamps. This is the client-side home for
 //! *how a path is printed*: the disambiguated root labels ([`root_labels`]), the canonical
 //! `"[root]: [path]"` form ([`root_relative_display`]) shown in the status bar and window title,
 //! plus window-title assembly and path truncation.
@@ -14,6 +15,7 @@
 //! workspaces have nothing to disambiguate, so the label is empty and the prefix is omitted.
 
 use aether_protocol::lsp::SymbolCrumb;
+use aether_protocol::picker::PickerKind;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -390,9 +392,170 @@ pub fn window_title(workspace: &str, label: &str) -> String {
 /// Stand-in title for a window with no workspace and no buffer. See [`window_title`].
 pub const APP_NAME: &str = "Aether";
 
+/// The query-input placeholder for a picker. `None` — no picker kind yet — is the generic prompt.
+///
+/// One table for every shell. It used to be three (terminal, native, browser), each with a comment
+/// claiming it was kept in sync with the others; by the time they were compared, two of nineteen
+/// entries had drifted. Exhaustive over [`PickerKind`], so a new kind cannot be added without
+/// giving it a prompt.
+pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
+    let Some(kind) = kind else {
+        return "Search…";
+    };
+    match kind {
+        PickerKind::Files => "Find files…",
+        PickerKind::Buffers => "Switch buffer…",
+        PickerKind::Grep => "Grep workspace…",
+        PickerKind::Explorer => "Explore files…",
+        PickerKind::Workspaces => "Select workspace…",
+        PickerKind::Diagnostics => "Diagnostics in current file…",
+        PickerKind::DiagnosticsWorkspace => "Diagnostics in workspace…",
+        PickerKind::LspServers => "List LSPs…",
+        PickerKind::References => "List references…",
+        PickerKind::DocumentSymbols => "Go to symbol…",
+        PickerKind::WorkspaceSymbols => "Go to symbol in workspace…",
+        PickerKind::GitChangesFile => "Changes in current file…",
+        PickerKind::GitChanges => "Changes in workspace…",
+        PickerKind::Keybindings => "Search keybindings…",
+        PickerKind::GitBranches => "Branches & worktrees…",
+        PickerKind::GitLog => "Search history…",
+        PickerKind::GitLogFile => "Search this file's history…",
+        PickerKind::GitStash => "Find stash…",
+        PickerKind::Jumplist => "Filter the jumplist…",
+    }
+}
+
+/// Coarse relative age — `just now`, `5m ago`, `3w ago`, `2y ago` — for the inline blame label and
+/// the git pickers' commit dates.
+///
+/// One implementation for every shell. There were three, and they had drifted: the native client
+/// said `now` under a minute and carried a months bucket the other two lacked, so a six-month-old
+/// commit read `6mo ago` there and `26w ago` elsewhere. This is the terminal/browser shape, which
+/// is both the majority and the newer of the two — the browser's copy was a stated port of the
+/// terminal's.
+pub fn time_ago(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    time_ago_between(now, unix_secs)
+}
+
+/// The clock-free core of [`time_ago`], so the buckets can be tested without waiting for or
+/// faking time. A `then` in the future (clock skew between the commit's author and this machine)
+/// clamps to zero rather than counting backwards.
+pub fn time_ago_between(now: i64, then: i64) -> String {
+    let secs = (now - then).max(0);
+    if secs < 60 {
+        return "just now".into();
+    }
+    let (n, unit) = if secs < 3_600 {
+        (secs / 60, "m")
+    } else if secs < 86_400 {
+        (secs / 3_600, "h")
+    } else if secs < 604_800 {
+        (secs / 86_400, "d")
+    } else if secs < 31_536_000 {
+        (secs / 604_800, "w")
+    } else {
+        (secs / 31_536_000, "y")
+    };
+    format!("{n}{unit} ago")
+}
+
+/// The end-of-line blame label: author and how long ago, or `uncommitted` for a line that has
+/// never been committed.
+pub fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
+    if b.is_uncommitted {
+        "uncommitted".into()
+    } else {
+        format!("{} · {}", b.author, time_ago(b.timestamp))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bucket ladder, exercised without touching the clock — which is why
+    /// [`time_ago_between`] exists as a separate function at all.
+    #[test]
+    fn time_ago_walks_the_bucket_ladder() {
+        let now = 1_000_000_000;
+        let ago = |secs: i64| time_ago_between(now, now - secs);
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(59), "just now");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(3_599), "59m ago");
+        assert_eq!(ago(3_600), "1h ago");
+        assert_eq!(ago(86_399), "23h ago");
+        assert_eq!(ago(86_400), "1d ago");
+        assert_eq!(ago(604_799), "6d ago");
+        assert_eq!(ago(604_800), "1w ago");
+        // Weeks run all the way to a year — there is deliberately no months bucket, which is
+        // where the three shells had diverged.
+        assert_eq!(ago(31_535_999), "52w ago");
+        assert_eq!(ago(31_536_000), "1y ago");
+    }
+
+    /// A commit stamped in the future (clock skew between the author's machine and this one)
+    /// reads as `just now`, not as a negative age.
+    #[test]
+    fn a_future_timestamp_clamps_to_just_now() {
+        assert_eq!(time_ago_between(1_000, 9_999), "just now");
+    }
+
+    #[test]
+    fn blame_labels_an_uncommitted_line_without_a_time() {
+        let b = aether_protocol::git::BlameInfo {
+            commit: "abc123".into(),
+            author: "Ada".into(),
+            timestamp: 0,
+            is_uncommitted: true,
+        };
+        assert_eq!(format_blame(&b), "uncommitted");
+        let committed = aether_protocol::git::BlameInfo {
+            is_uncommitted: false,
+            ..b
+        };
+        assert!(format_blame(&committed).starts_with("Ada · "));
+    }
+
+    /// One table, read by every shell. The `match` is exhaustive so a new kind can't slip through
+    /// without a prompt; this pins the house style and the no-kind fallback.
+    #[test]
+    fn every_picker_has_a_prompt_in_the_house_style() {
+        use aether_protocol::picker::PickerKind::*;
+        assert_eq!(picker_placeholder(None), "Search…");
+        for kind in [
+            Files,
+            Buffers,
+            Grep,
+            Explorer,
+            Workspaces,
+            Diagnostics,
+            DiagnosticsWorkspace,
+            LspServers,
+            References,
+            DocumentSymbols,
+            WorkspaceSymbols,
+            GitChangesFile,
+            GitChanges,
+            Keybindings,
+            GitBranches,
+            GitLog,
+            GitLogFile,
+            GitStash,
+            Jumplist,
+        ] {
+            let p = picker_placeholder(Some(kind));
+            assert!(p.ends_with('…'), "{kind:?} prompt should trail off: {p:?}");
+            assert!(
+                p.chars().next().is_some_and(|c| c.is_uppercase()),
+                "{kind:?} prompt should open with a capital: {p:?}"
+            );
+        }
+    }
 
     fn s(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| (*s).to_string()).collect()
