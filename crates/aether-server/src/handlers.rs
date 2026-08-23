@@ -746,27 +746,7 @@ async fn activate_context(
         }
     }
 
-    // Most-recently-used buffer in the newly-active workspace. The MRU lives on `WorkspaceEntry`
-    // (not per-client) so it survives client disconnects — a fresh TUI invocation sees the same
-    // top-of-MRU buffer the prior session left there. The client uses this to reattach instead
-    // of spawning a fresh scratch on every switch.
-    // Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
-    // loaded yet — land on the most-recently-used *dormant* buffer, which `buffer_open` materializes
-    // by id. `None` only when the workspace is genuinely empty (first ever visit), giving a scratch.
-    //
-    // Deliberately kind-blind: a scratch you were editing is where you left off, and coming back to
-    // it is the point. A fresh scratch is only ever minted when there is no buffer of any kind to
-    // return to — a state with no file to prefer — so this never opens a blank scratch over a file.
-    let last_buffer_id = s
-        .workspaces
-        .get(&context)
-        .and_then(|p| {
-            p.mru_buffers
-                .iter()
-                .find(|id| s.buffers.contains_key(id))
-                .copied()
-        })
-        .or_else(|| s.first_dormant_id(&context));
+    let last_buffer_id = landing_buffer_id(&s, &context);
 
     tracing::info!(
         %client_id,
@@ -856,6 +836,32 @@ async fn activate_context(
         opened,
         server_started_at,
     })
+}
+
+/// The buffer a client lands on when it arrives in `context` with nothing specific to open — a
+/// workspace switch, or a directory opened as a temporary context. The MRU lives on
+/// `WorkspaceEntry` (not per-client) so it survives client disconnects: a fresh invocation sees the
+/// same top-of-MRU buffer the prior session left there, and reattaches instead of spawning a fresh
+/// scratch on every switch.
+///
+/// Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
+/// loaded yet — the most-recently-used *dormant* buffer, which `buffer_open` materializes by id.
+/// `None` only when the workspace is genuinely empty (a first ever visit, and always the case for a
+/// freshly minted temporary one), which is the caller's cue to mint a transient scratch.
+///
+/// Deliberately kind-blind: a scratch you were editing is where you left off, and coming back to it
+/// is the point. A fresh scratch is only ever minted when there is no buffer of any kind to return
+/// to — a state with no file to prefer — so this never opens a blank scratch over a file.
+fn landing_buffer_id(s: &ServerState, context: &str) -> Option<BufferId> {
+    s.workspaces
+        .get(context)
+        .and_then(|p| {
+            p.mru_buffers
+                .iter()
+                .find(|id| s.buffers.contains_key(id))
+                .copied()
+        })
+        .or_else(|| s.first_dormant_id(context))
 }
 
 /// Persist `workspace_name`'s session — the canonical paths of its open (and still-dormant) buffers,
@@ -1228,10 +1234,15 @@ pub async fn workspace_create(
     })
 }
 
-/// Open a file by absolute path, resolving the workspace context (see [`WorkspaceOpenPath`]). Powers
-/// `ae /path/to/file`, the open-from-path overlay, and goto-definition into a file outside the
-/// active workspace. Internal when the active workspace's roots contain the path; external when a
-/// workspace is active but doesn't; an ephemeral workspace (activated here) when none is active.
+/// Open a path, resolving the workspace context (see [`WorkspaceOpenPath`]). Powers `ae PATH`, the
+/// open-from-path overlay, and goto-definition into a file outside the active workspace. Internal
+/// when the active workspace's roots contain the path; external when a workspace is active but
+/// doesn't; an ephemeral workspace (activated here) when none is active.
+///
+/// A **directory** is a context rather than a thing to open (`ae ~/notes`): it roots the temporary
+/// workspace at itself and lands on the landing buffer — a fresh transient scratch for a brand new
+/// context — over which the client opens its explorer. Only a temporary context can take one; a
+/// persisted workspace owns its roots, so a directory there is an error.
 pub async fn workspace_open_path(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1265,16 +1276,46 @@ pub async fn workspace_open_path(
         }
     };
 
+    // A directory is a context, not a file to open — the one open with no buffer of its own. The
+    // single probe here decides both the root adopted below and what gets opened at the end.
+    let directory = canonical.is_dir();
+    // The root a temporary context takes from this open: the directory itself, or the file's parent.
+    let adopt_root = if directory {
+        canonical.clone()
+    } else {
+        canonical.parent().unwrap_or(&canonical).to_path_buf()
+    };
+
     // Resolve the workspace this open lands in, activating an ephemeral one if the client has none.
     // We never re-home the file into some *other* configured workspace that happens to contain it —
     // an explicit open attaches to the active workspace (as a guest, if external) or to a fresh
     // ephemeral context.
-    let (workspace_id, workspace_paths, server_started_at, created_ephemeral, superseded_pushes) = {
+    let (
+        workspace_id,
+        workspace_paths,
+        server_started_at,
+        created_ephemeral,
+        superseded_pushes,
+        watch_after,
+    ) = {
         let mut s = state.lock().await;
         let active = s
             .clients
             .get(&client_id)
             .and_then(|c| c.active_workspace.clone());
+        // Only a temporary context can adopt a directory. A persisted workspace owns its roots (and
+        // has no file here to open), so a directory is refused before anything is mutated — which is
+        // what the open-from-path overlay hits when a typed path turns out to be a directory.
+        if directory
+            && active
+                .as_ref()
+                .is_some_and(|id| !s.workspaces.get(id).is_some_and(|w| w.is_ephemeral()))
+        {
+            return Err(RpcError::invalid_path(format!(
+                "{} is a directory, not a file",
+                canonical.display()
+            )));
+        }
         let mut superseded_pushes = Vec::new();
         let (id, created) = match active {
             Some(id) => (id, false),
@@ -1302,35 +1343,74 @@ pub async fn workspace_open_path(
                 (id, true)
             }
         };
-        // Root the temporary context at this file's directory so its pickers have something to
-        // work over (`adopt_ephemeral_root`); a no-op for a persisted workspace, and for a file
-        // already under a root of the temporary one. The buffer's parent directory is watched by
-        // `buffer/open` either way, so the new root needs no separate watch registration.
-        if s.adopt_ephemeral_root(&id, &canonical) {
-            tracing::info!(workspace = %id, root = %canonical.parent().unwrap_or(&canonical).display(), "temporary workspace adopted a root");
+        // Root the temporary context at that directory so its pickers have something to work over
+        // (`adopt_ephemeral_root`); a no-op for a persisted workspace, and for a path already under
+        // a root of the temporary one.
+        let adopted = s.adopt_ephemeral_root(&id, &adopt_root);
+        if adopted {
+            tracing::info!(workspace = %id, root = %adopt_root.display(), "temporary workspace adopted a root");
         }
+        // A file open needs no separate watch registration — `buffer/open` watches the buffer's
+        // parent directory, which is exactly the root just adopted. A directory open has no such
+        // buffer, so register the new root here (after the lock, like `activate_context` does, since
+        // registration walks the tree).
+        let watch_after = (adopted && directory)
+            .then(|| s.watcher.clone().map(|w| (w, vec![adopt_root.clone()])))
+            .flatten();
         let paths = s
             .workspaces
             .get(&id)
             .map(|p| p.paths.iter().map(|p| p.display().to_string()).collect())
             .unwrap_or_default();
-        (id, paths, s.started_at_unix_ms, created, superseded_pushes)
+        (
+            id,
+            paths,
+            s.started_at_unix_ms,
+            created,
+            superseded_pushes,
+            watch_after,
+        )
     };
     for (sender, notif) in superseded_pushes {
         let _ = sender.send(notif).await;
     }
 
-    let opened = buffer_open(
-        state,
-        ctx,
-        BufferOpenParams {
-            absolute_path: Some(canonical.display().to_string()),
-            transient: params.transient,
-            create_if_missing: params.create_if_missing,
-            ..Default::default()
-        },
-    )
-    .await?;
+    if let Some((w, roots)) = watch_after {
+        tokio::task::spawn_blocking(move || crate::watcher::watch_workspace_paths(&w, &roots));
+    }
+
+    let opened = if directory {
+        // Nothing to open: land where a client arriving in this context lands — its MRU buffer, or a
+        // fresh transient scratch when there's nothing to return to (always so for a context this
+        // open just minted). Exactly what `workspace/activate { open_last: true }` does on a first
+        // visit to a configured workspace, so `ae DIR` feels the same either side of the boundary.
+        let landing = {
+            let s = state.lock().await;
+            landing_buffer_id(&s, &workspace_id)
+        };
+        buffer_open(
+            state,
+            ctx,
+            BufferOpenParams {
+                buffer_id: landing,
+                transient: landing.is_none().then_some(true),
+                ..Default::default()
+            },
+        )
+        .await?
+    } else {
+        buffer_open(
+            state,
+            ctx,
+            BufferOpenParams {
+                absolute_path: Some(canonical.display().to_string()),
+                transient: params.transient,
+                create_if_missing: params.create_if_missing,
+                ..Default::default()
+            },
+        )
+        .await?
+    };
 
     // A freshly-minted ephemeral workspace appears in any open switcher — and any it superseded
     // drops out of it, in the same rebuild.

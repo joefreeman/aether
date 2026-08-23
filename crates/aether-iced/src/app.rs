@@ -6648,16 +6648,18 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         .map_err(BootError::from)?;
     let inbound = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
-    // No workspace on the CLI. A file outside any configured workspace (`ae /etc/hosts`) opens
-    // directly in an ephemeral "(no workspace)" context — a missing path counts as a file to
-    // create (`create_if_missing`: empty buffer, written at the first save). Otherwise (no file,
-    // or a directory) hand back the bare connection so the chooser browses on it.
+    // No workspace on the CLI. A path outside any configured workspace (`ae /etc/hosts`,
+    // `ae ~/notes`) opens directly in an ephemeral "(no workspace)" context — a missing path counts
+    // as a file to create (`create_if_missing`: empty buffer, written at the first save), and a
+    // directory becomes the context's root, landing on a scratch with the explorer over it. Only a
+    // launch that named nothing at all hands back the bare connection for the chooser to browse on.
     let Some(workspace) = args.workspace.clone() else {
         let resolved = match &args.file {
             Some(f) => Some(resolve_cli_path(f)?),
             None => None,
         };
-        if let Some(abs) = resolved.filter(|p| !p.is_dir()) {
+        if let Some(abs) = resolved {
+            let directory = abs.is_dir();
             let opened = handle
                 .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                     path: abs.display().to_string(),
@@ -6678,8 +6680,9 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                 server_started_at: opened.server_started_at,
                 buffer: buffer_info(open, &workspace_paths),
                 workspace: opened.workspace,
-                explorer_dir: None,
-                tethered: args.tether,
+                explorer_dir: directory.then(|| abs.display().to_string()),
+                // A directory is a session, not an errand — nothing to tether to.
+                tethered: args.tether && !directory,
             })));
         }
         return Ok(Bootstrap::Choose(ChooseBootstrap {

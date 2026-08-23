@@ -2146,6 +2146,140 @@ async fn open_path_with_no_workspace_creates_ephemeral() {
     drop(server);
 }
 
+/// `ae ~/notes` where nothing is configured there: a directory is a *context*, not a file to open.
+/// The temporary workspace roots at the directory **itself** (not its parent, as a file's open
+/// would) and lands on a fresh transient scratch — the buffer the client opens its explorer over.
+#[tokio::test]
+async fn open_path_with_a_directory_roots_a_temporary_workspace() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let ext_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_dir.clone(),
+            transient: None,
+            // The boot route always sets it; a directory that exists never exercises it.
+            create_if_missing: true,
+        },
+    )
+    .await;
+
+    assert!(
+        aether_protocol::is_ephemeral_workspace_id(&opened.workspace.name),
+        "expected an ephemeral workspace id, got {:?}",
+        opened.workspace.name
+    );
+    assert_eq!(
+        opened.workspace.paths,
+        vec![ext_dir],
+        "a directory roots the temporary workspace at itself"
+    );
+    let buf = opened
+        .opened
+        .expect("a directory open still lands the client on a buffer");
+    assert_eq!(buf.path, None, "nothing was named to open: a scratch");
+    assert!(
+        buf.transient,
+        "a first-visit landing scratch is transient, as `workspace/activate` mints it"
+    );
+    drop(server);
+}
+
+/// A second directory opened into the temporary context it's already in: another root (a temp
+/// context is multi-root like any other), and the client stays on the buffer it was already
+/// looking at rather than being dropped on a fresh scratch.
+#[tokio::test]
+async fn open_path_directory_extends_the_temporary_workspace_it_is_already_in() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let ext_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    let other = tempfile::tempdir().unwrap();
+    let other_dir = std::fs::canonicalize(other.path())
+        .unwrap()
+        .display()
+        .to_string();
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    let file_buffer = opened.opened.expect("the file opens").buffer_id;
+
+    let extended: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: other_dir.clone(),
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        extended.workspace.name, opened.workspace.name,
+        "the same temporary context takes the directory; nothing new is minted"
+    );
+    assert_eq!(
+        extended.workspace.paths,
+        vec![ext_dir, other_dir],
+        "the second directory becomes a second root"
+    );
+    assert_eq!(
+        extended.opened.expect("still lands on a buffer").buffer_id,
+        file_buffer,
+        "with something to return to, the landing buffer is the MRU — not a new scratch"
+    );
+    drop(server);
+}
+
+/// A persisted workspace owns its roots, and there's no file to open in it, so a directory is
+/// refused there — the open-from-path overlay's error when a typed path turns out to be one.
+#[tokio::test]
+async fn open_path_rejects_a_directory_in_a_persisted_workspace() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let ext_dir = std::path::Path::new(&ext_abs)
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+
+    let err = send_request_expect_err::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_dir,
+            transient: None,
+            create_if_missing: false,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("is a directory"),
+        "the error should name the problem, got: {err}"
+    );
+    drop(server);
+}
+
 /// `ae path/to/new-file` outside any workspace: the open-from-path route accepts a missing path
 /// when `create_if_missing` is set — an empty buffer bound to the canonical target, with nothing
 /// on disk until the first save (explorer-create semantics, delegated to `buffer/open`).

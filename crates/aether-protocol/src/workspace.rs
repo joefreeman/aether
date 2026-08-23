@@ -179,7 +179,7 @@ pub struct WorkspaceCreateParams {
     pub name: String,
 }
 
-/// Open a file by absolute path, resolving the workspace context for it. This is the workspace-agnostic
+/// Open a path, resolving the workspace context for it. This is the workspace-agnostic
 /// entry point used by `ae /path/to/file` and the `Space Alt-w` open-from-path overlay — the cases
 /// that may need to *activate* a workspace (an ephemeral one when none is active). The path must be
 /// absolute (a leading `~/` is fine): the server will **not** resolve it against its own working
@@ -202,6 +202,12 @@ pub struct WorkspaceCreateParams {
 ///   trust: an ephemeral workspace still gets **no language server**, however its files sit relative
 ///   to it.
 ///
+/// A **directory** path (`ae ~/notes` where nothing is configured there) is a context rather than a
+/// thing to open: it roots the ephemeral workspace at *itself* and lands on that workspace's landing
+/// buffer — a fresh transient scratch for a context this call just minted — which is what the client
+/// opens its explorer over. Only an ephemeral context can take a directory; a persisted workspace
+/// owns its roots and has no file to open here, so a directory is an error there.
+///
 /// Returns the (possibly newly-activated) workspace alongside the opened buffer, so the client adopts
 /// the workspace id exactly as it does after `workspace/activate`.
 pub struct WorkspaceOpenPath;
@@ -213,9 +219,10 @@ impl RpcMethod for WorkspaceOpenPath {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceOpenPathParams {
-    /// File to open. Must be absolute; a leading `~/` is expanded server-side and also counts as
-    /// absolute. A relative path is rejected (the server won't resolve it against its own cwd).
-    /// Must exist on disk unless `create_if_missing` is set.
+    /// File to open — or a directory to take as a temporary context (see above). Must be absolute;
+    /// a leading `~/` is expanded server-side and also counts as absolute. A relative path is
+    /// rejected (the server won't resolve it against its own cwd). Must exist on disk unless
+    /// `create_if_missing` is set.
     pub path: String,
     /// Open the buffer as transient (auto-closes once hidden) — used when the open is a preview.
     /// Defaults to a permanent open.

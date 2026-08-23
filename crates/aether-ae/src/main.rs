@@ -127,7 +127,8 @@ struct EditArgs {
     /// Workspace to open, overriding inference from PATH.
     ///
     /// Config lives at `$XDG_CONFIG_HOME/aether/profiles/<profile>/workspaces/<name>.toml`.
-    /// Omit to infer from PATH; with no PATH (or one outside every workspace), the picker opens.
+    /// Omit to infer from PATH; a PATH outside every workspace opens a temporary one, and with no
+    /// PATH at all the picker opens.
     #[arg(short = 'w', long)]
     workspace: Option<String>,
 
@@ -412,9 +413,10 @@ fn detach(_cmd: &mut std::process::Command) {}
 /// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: a path
 /// inside exactly one workspace opens there; a path inside *several* is an error the user must
 /// disambiguate. A path inside *no* configured workspace is no longer an error — we return `None`,
-/// and the client opens the file directly in an ephemeral "(no workspace)" context (`ae /etc/hosts`).
-/// With no PATH at all, we return `None` so a bare `ae` opens the workspace picker — the working
-/// directory is deliberately *not* used to guess a workspace (it only resolves relative file paths).
+/// and the client opens it in an ephemeral "(no workspace)" context: a file in a buffer
+/// (`ae /etc/hosts`), a directory as that context's root (`ae ~/notes`). With no PATH at all, we
+/// return `None` so a bare `ae` opens the workspace picker — the working directory is deliberately
+/// *not* used to guess a workspace (it only resolves relative file paths).
 /// Split a positional path of the form `PATH[:LINE[:COL]]` into the bare path and an optional 0-based
 /// `(line, col)` jump. The editor convention (`ae src/main.rs:42:10`): `LINE`/`COL` are 1-based as
 /// typed and returned 0-based (what the protocol uses). Because a filename may legitimately contain a

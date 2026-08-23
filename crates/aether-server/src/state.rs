@@ -942,8 +942,9 @@ impl ServerState {
         true
     }
 
-    /// Give an ephemeral workspace a root for the file it's about to host: the file's **parent
-    /// directory**. Returns whether a root was added.
+    /// Give an ephemeral workspace a root for what it's about to host — the **parent directory** of
+    /// a file it opens, or a directory opened as a context in its own right (`ae ~/notes`, where the
+    /// caller passes the directory itself). Returns whether a root was added.
     ///
     /// A rootless workspace can't answer any file-oriented question — the Files index walks roots,
     /// grep walks roots, the explorer refuses to open without one, and every picker row is addressed
@@ -951,26 +952,26 @@ impl ServerState {
     /// context used to have dead pickers. The parent directory is the smallest root that contains
     /// the file you opened: bounded, predictable, and already the directory the explorer should land
     /// in. Opening a second file from elsewhere into the same context appends its parent (a temp
-    /// context is multi-root like any other); a file already under an existing root adds nothing.
+    /// context is multi-root like any other); one already under an existing root adds nothing.
     ///
     /// Deliberately *not* the enclosing project root (an upward walk for `.git` / `Cargo.toml`): a
     /// dotfiles repo in `$HOME` would silently root the context at the home directory and hand the
     /// Files picker the whole tree. Widening to the project is a decision to make explicitly.
     ///
-    /// A file directly under the filesystem root is left rootless rather than rooting a workspace at
-    /// `/`. No-op for a persisted workspace — those own their roots, and an open must never edit them.
-    pub fn adopt_ephemeral_root(&mut self, workspace_id: &str, canonical: &Path) -> bool {
+    /// The filesystem root is refused rather than rooting a workspace at `/`. No-op for a persisted
+    /// workspace — those own their roots, and an open must never edit them.
+    pub fn adopt_ephemeral_root(&mut self, workspace_id: &str, dir: &Path) -> bool {
         let Some(workspace) = self.workspaces.get_mut(workspace_id) else {
             return false;
         };
-        if !workspace.is_ephemeral() || workspace.contains(canonical) {
+        if !workspace.is_ephemeral() || workspace.contains(dir) {
             return false;
         }
-        // `parent.parent()` is `None` only at the filesystem root.
-        let Some(parent) = canonical.parent().filter(|p| p.parent().is_some()) else {
+        // `dir.parent()` is `None` only at the filesystem root.
+        if dir.parent().is_none() {
             return false;
-        };
-        workspace.paths.push(parent.to_path_buf());
+        }
+        workspace.paths.push(dir.to_path_buf());
         workspace.workspace_index = Arc::new(WorkspaceIndex::new(workspace.paths.clone()));
         true
     }
@@ -3460,25 +3461,25 @@ mod workspace_state_tests {
         );
     }
 
-    /// A temporary workspace takes the opened file's parent directory as a root — the smallest one
-    /// that makes its pickers work. A second directory appends a root; a file already covered adds
-    /// nothing; a persisted workspace is never touched; and a file at the filesystem root is left
-    /// alone rather than rooting a workspace at `/`.
+    /// A temporary workspace takes the directory the caller hands it — the opened file's parent, or
+    /// a directory opened as a context of its own. A second directory appends a root; one already
+    /// covered adds nothing; a persisted workspace is never touched; and the filesystem root is
+    /// refused rather than rooting a workspace at `/`.
     #[test]
-    fn adopt_ephemeral_root_takes_the_files_directory() {
+    fn adopt_ephemeral_root_takes_the_directory_it_is_given() {
         let mut s = ServerState::new();
         let id = s.register_ephemeral_workspace();
-        assert!(s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes/todo.md")));
+        assert!(s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes")));
         assert_eq!(
             s.workspaces[&id].paths,
             vec![PathBuf::from("/home/joe/notes")]
         );
 
         assert!(
-            !s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes/sub/other.md")),
+            !s.adopt_ephemeral_root(&id, Path::new("/home/joe/notes/sub")),
             "already under an existing root"
         );
-        assert!(s.adopt_ephemeral_root(&id, Path::new("/etc/hosts")));
+        assert!(s.adopt_ephemeral_root(&id, Path::new("/etc")));
         assert_eq!(
             s.workspaces[&id].paths,
             vec![PathBuf::from("/home/joe/notes"), PathBuf::from("/etc")],
@@ -3486,15 +3487,15 @@ mod workspace_state_tests {
         );
 
         assert!(
-            !s.adopt_ephemeral_root(&id, Path::new("/vmlinuz")),
-            "a file at the filesystem root would root the workspace at /"
+            !s.adopt_ephemeral_root(&id, Path::new("/")),
+            "a file directly under the filesystem root would root the workspace at /"
         );
-        assert!(!s.adopt_ephemeral_root("nonexistent", Path::new("/a/b.txt")));
+        assert!(!s.adopt_ephemeral_root("nonexistent", Path::new("/a")));
 
         s.workspaces
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         assert!(
-            !s.adopt_ephemeral_root("p", Path::new("/elsewhere/x.rs")),
+            !s.adopt_ephemeral_root("p", Path::new("/elsewhere")),
             "a persisted workspace owns its roots; an open must not edit them"
         );
         assert_eq!(s.workspaces["p"].paths, vec![PathBuf::from("/p")]);

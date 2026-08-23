@@ -2964,13 +2964,14 @@ pub async fn bootstrap(
         WorkspaceActivate, WorkspaceActivateParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
     };
 
-    // Workspace selection is explicit. When none is named on the command line and no file is given
-    // we DON'T activate one — we start with a placeholder session (no workspace, no buffer) and
-    // raise the Workspaces chooser. Nothing is rendered behind it; picking a workspace activates it
-    // and lands the first buffer (`PickerSelected` → `WorkspaceActivated` → `adopt_switch`), which
-    // is when the editor first appears. When a file *is* given but no workspace (a path outside any
-    // configured workspace, e.g. `ae /etc/hosts`), we open it directly via `workspace/open_path`,
-    // which lands it in a fresh ephemeral "(no workspace)" context.
+    // Workspace selection is explicit. The chooser is for a launch that named *nothing* — no
+    // workspace and no path: we DON'T activate one, we start with a placeholder session (no
+    // workspace, no buffer) and raise the Workspaces chooser. Nothing is rendered behind it; picking
+    // a workspace activates it and lands the first buffer (`PickerSelected` → `WorkspaceActivated` →
+    // `adopt_switch`), which is when the editor first appears. When a path *is* given but no
+    // workspace (it lies outside every configured one, e.g. `ae /etc/hosts` or `ae ~/notes`), we
+    // open it directly via `workspace/open_path`, which lands it in a fresh ephemeral
+    // "(no workspace)" context — a file in a buffer, a directory as the context's root.
     let (mut session, workspace_name, workspace_paths, startup) = match workspace {
         None => {
             let resolved = match file {
@@ -2978,11 +2979,11 @@ pub async fn bootstrap(
                 None => None,
             };
             match resolved {
-                // An external file: open it in an ephemeral context. A missing path counts as a
+                // An external path: open it in an ephemeral context. A missing path counts as a
                 // file to create (`create_if_missing` binds an empty buffer, written at the first
-                // save — explorer-create semantics). Only a directory falls through to the
-                // chooser (nothing sensible to open).
-                Some(abs) if !abs.is_dir() => {
+                // save — explorer-create semantics).
+                Some(abs) => {
+                    let directory = abs.is_dir();
                     let opened = handle
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs.display().to_string(),
@@ -2998,13 +2999,25 @@ pub async fn bootstrap(
                     let workspace_name = opened.workspace.name.clone();
                     let mut session = Session::new(opened.workspace, buffer);
                     // Launched to edit this file: tether the client to it, so closing it quits
-                    // rather than dropping to the chooser.
-                    if tether {
+                    // rather than dropping to the chooser. A directory is a session, not an errand:
+                    // it lands on a scratch with the explorer over it, and has nothing to tether to.
+                    if tether && !directory {
                         session.tether = Some(session.buffer.buffer_id);
                     }
-                    (session, workspace_name, workspace_paths, Effects::none())
+                    let startup = if directory {
+                        session.open_picker(
+                            PickerKind::Explorer,
+                            Some(abs.display().to_string()),
+                            None,
+                            false,
+                            None,
+                        )
+                    } else {
+                        Effects::none()
+                    };
+                    (session, workspace_name, workspace_paths, startup)
                 }
-                _ => {
+                None => {
                     let mut session = Session::placeholder();
                     let startup =
                         session.open_picker(PickerKind::Workspaces, None, None, false, None);
