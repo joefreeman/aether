@@ -2738,6 +2738,16 @@ impl Session {
             .as_ref()
             .err()
             .is_some_and(|e| e.code == ErrorCode::BUFFER_NOT_FOUND.0);
+        // A git verb pressed where there's no repo to act on — a scratch buffer, or a file outside
+        // one. Not a failure, just an answer: the command had nowhere to go and the message says
+        // what would give it one. Errors pin until Esc, which is far too heavy for something you
+        // resolve by pressing the key again somewhere else, so this one fades like a warning.
+        // Downgraded here rather than at ~15 call sites because every git verb's error arm builds
+        // its toast the same way, and a new one should inherit this without being told.
+        let no_repo = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == ErrorCode::REPO_NOT_FOUND.0);
         let event = f(result);
         let mut effects = self.on_event(event);
         if stale_buffer {
@@ -2750,6 +2760,15 @@ impl Session {
                     }
                 )
             });
+        }
+        if no_repo {
+            for e in &mut effects.0 {
+                if let Effect::Toast { kind, .. } = e {
+                    if *kind == ToastKind::Error {
+                        *kind = ToastKind::Warning;
+                    }
+                }
+            }
         }
         effects
     }
@@ -9357,7 +9376,8 @@ impl Session {
                     return fx;
                 }
                 // The repo is resolved server-side, from the buffer we're looking at — that's
-                // where the buffer→repo mapping already lives, and it saves a `git/repos` trip.
+                // where the buffer→repo mapping already lives, and it's the only thing it's
+                // resolved from, so a scratch buffer is refused rather than guessed at.
                 self.request_str::<GitPrepareCommit>(
                     GitPrepareCommitParams {
                         buffer_id: Some(self.buffer.buffer_id),

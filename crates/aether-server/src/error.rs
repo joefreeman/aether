@@ -77,11 +77,21 @@ impl RpcError {
         )
     }
 
-    pub fn ambiguous_repo() -> Self {
+    /// The buffer a git RPC was resolved against has no repo to name: a scratch buffer, or nothing
+    /// open at all. Phrased as the remedy rather than the condition — "no repo" invites the
+    /// question this answers, which is *whose* repo the command would have used.
+    pub fn repo_needs_file() -> Self {
         Self::new(
-            ErrorCode::AMBIGUOUS_REPO,
-            "this workspace spans several repos — say which one",
+            ErrorCode::REPO_NOT_FOUND,
+            "Open a file in the repository first",
         )
+    }
+
+    /// The buffer has a path, but it isn't inside a repository. Worded exactly like the hunk
+    /// commands' long-standing refusal — one condition should not read two ways depending on which
+    /// key produced it.
+    pub fn not_in_repo() -> Self {
+        Self::new(ErrorCode::REPO_NOT_FOUND, "Not in a git repository")
     }
 
     pub fn repo_not_writable(repo_id: impl std::fmt::Display) -> Self {

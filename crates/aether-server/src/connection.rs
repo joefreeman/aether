@@ -27,7 +27,7 @@ use aether_protocol::envelope::{
 use aether_protocol::git::{
     GitAbortOperation, GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit,
     GitDeleteBranch, GitFetch, GitFollowPatchLine, GitNavigateHunk, GitPrepareCommit, GitPull,
-    GitPush, GitRefresh, GitRepos, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow,
+    GitPush, GitRefresh, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow,
     GitSetDiffView, GitShow, GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd,
     GitWorktreeRemove,
 };
@@ -560,7 +560,6 @@ async fn dispatch(
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
         GitResolveConflict::NAME => run!(GitResolveConflict, handlers::git_resolve_conflict),
         GitAbortOperation::NAME => run!(GitAbortOperation, handlers::git_abort_operation),
-        GitRepos::NAME => run!(GitRepos, handlers::git_repos),
         GitRefresh::NAME => run!(GitRefresh, handlers::git_refresh),
         GitSetBaseline::NAME => run!(GitSetBaseline, handlers::git_set_baseline),
         GitPrepareCommit::NAME => run!(GitPrepareCommit, handlers::git_prepare_commit),

@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 
-// ---- git/repos (repo identity) -----------------------------------------------------------------
+// ---- git branch picker ---------------------------------------------------------------------------
 
 /// Commit `rel` (created with `content`) so the repo has a resolvable HEAD.
 /// Commit the working-tree state of `rel` under a chosen message — for tests that care about
@@ -61,8 +61,9 @@ async fn branch_picker_lists_local_branches_with_head_first() {
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature", &head, false).unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let update = view.update.expect("the view carries its initial window");
 
     assert_eq!(update.kind, PickerKind::GitBranches);
@@ -107,8 +108,9 @@ async fn the_branch_you_are_on_is_the_initial_selection() {
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature", &head, false).unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let centred = view
         .effective_center_on
         .expect("a fresh open centres on the branch HEAD is on");
@@ -123,7 +125,7 @@ async fn the_branch_you_are_on_is_the_initial_selection() {
         &mut ws,
         &PickerViewParams {
             reset: PickerReset::Keep,
-            ..view_params(PickerKind::GitBranches)
+            ..view_params_on(PickerKind::GitBranches, buffer)
         },
     )
     .await;
@@ -142,8 +144,9 @@ async fn branch_picker_filters_on_the_branch_name() {
     repo.branch("feature/login", &head, false).unwrap();
     repo.branch("release", &head, false).unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let _ =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the view's own push
     let _: () = send_request::<PickerQuery>(
         &mut ws,
@@ -175,9 +178,13 @@ async fn branch_picker_is_empty_on_an_unborn_head() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     init_repo_at(&root);
+    // Untracked, because there is nothing to track yet — but inside the repo, which is all the
+    // buffer needs to name it.
+    std::fs::write(root.join("a.rs"), "one\n").unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let update = view.update.expect("the view carries its initial window");
 
     assert_eq!(update.total_matches, 0);
@@ -201,8 +208,9 @@ async fn branch_picker_marks_a_branch_held_by_another_worktree() {
     std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
     repo.worktree("feature", &wt_path, None).unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![main.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![main.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let update = view.update.expect("the view carries its initial window");
 
     let rows = branch_rows(update.items());
@@ -226,8 +234,10 @@ async fn branch_picker_marks_a_branch_held_by_another_worktree() {
     // Asked from *inside* the worktree, the answer inverts — and `main`'s holder is the **main
     // checkout**, which has no admin name. That empty name is exactly what `bind_worktree` reads
     // as "unbind", so selecting the row sends this repo back to main with no case of its own.
-    let (server2, mut ws2) = setup_repos_workspace(vec![wt_path.clone()]).await;
-    let view2 = send_request::<PickerView>(&mut ws2, &view_params(PickerKind::GitBranches)).await;
+    let (server2, mut ws2, buffer) = setup_repos_workspace_on(vec![wt_path.clone()], "a.rs").await;
+    let view2 =
+        send_request::<PickerView>(&mut ws2, &view_params_on(PickerKind::GitBranches, buffer))
+            .await;
     let items = view2.update.expect("initial window");
     let main_here = items
         .items()
@@ -285,8 +295,9 @@ async fn branch_picker_matches_a_drifted_worktree_on_its_branch_not_its_admin_na
         .delete()
         .unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![main.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![main.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let _ = expect_notification::<PickerUpdate>(&mut ws).await; // drain the view's own push
 
     // Unfiltered, the tree is listed — under `hotfix`, carrying `feature` as the admin name the
@@ -344,9 +355,9 @@ async fn branch_picker_matches_a_drifted_worktree_on_its_branch_not_its_admin_na
 
 #[tokio::test]
 async fn branch_picker_scroll_review_keeps_the_listing() {
-    // A re-view carries no `buffer_id`, so re-resolving the repo on one would fall through to the
-    // "exactly one writable repo" rule — fine here, `ambiguous_repo` in a multi-repo workspace.
-    // The snapshot is preserved instead, which also keeps the list from shifting under a scroll.
+    // A re-view carries no `buffer_id`, and the repo comes from the buffer — so re-resolving on
+    // one would refuse outright and fail a scroll on a picker that opened perfectly well. The
+    // snapshot is preserved instead, which also keeps the list from shifting under a scroll.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -354,8 +365,9 @@ async fn branch_picker_scroll_review_keeps_the_listing() {
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     repo.branch("feature", &head, false).unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let _ =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
 
     // Delete a branch behind the picker's back: a preserved snapshot still shows it, which is
     // what proves the re-view didn't rebuild.
@@ -370,7 +382,7 @@ async fn branch_picker_scroll_review_keeps_the_listing() {
             reset: PickerReset::Keep,
             offset: 0,
             buffer_id: None,
-            ..view_params(PickerKind::GitBranches)
+            ..view_params_on(PickerKind::GitBranches, buffer)
         },
     )
     .await;
@@ -998,7 +1010,7 @@ async fn an_empty_message_aborts_the_commit() {
 
 /// The client doesn't have to know which repo it's committing to: the server resolves it from the
 /// buffer the user is looking at. That keeps the buffer→repo mapping in the one place that
-/// already has it, and saves the client a `git/repos` round trip before every commit.
+/// already has it, and is the only way the repo is ever chosen.
 #[tokio::test]
 async fn prepare_commit_resolves_the_repo_from_the_buffer() {
     let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
@@ -1025,19 +1037,21 @@ async fn prepare_commit_resolves_the_repo_from_the_buffer() {
     drop(server);
 }
 
-/// With no hint at all, a single-repo workspace still resolves — the overwhelmingly common case
-/// should never need a chooser.
+/// With no hint at all, nothing resolves — not even in a single-repo workspace, where a fallback
+/// could have picked the only candidate. The buffer is the whole rule, and a commit going
+/// somewhere the user didn't point at isn't undoable by pressing undo.
 #[tokio::test]
-async fn prepare_commit_resolves_a_lone_repo_without_a_hint() {
-    let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
-    let prepared: GitPrepareCommitResult =
-        send_request::<GitPrepareCommit>(&mut ws, &GitPrepareCommitParams::default()).await;
-    assert_eq!(prepared.repo_id, root.to_string_lossy());
+async fn prepare_commit_without_a_hint_is_refused() {
+    let (server, mut ws, _root, _hooks) = setup_commit_workspace().await;
+    let err =
+        send_request_expect_err::<GitPrepareCommit>(&mut ws, &GitPrepareCommitParams::default())
+            .await;
+    assert_eq!(err, "Open a file in the repository first");
     drop(server);
 }
 
-/// A commit can't land in a repo the workspace only sees through an open buffer — the guard from
-/// decision 2, now that there's a mutation to guard.
+/// A commit can't land in a repo the workspace only sees through an open buffer — readable is not
+/// writable, now that there's a mutation to guard.
 #[tokio::test]
 async fn commit_refuses_a_repo_the_workspace_only_reached_through_a_buffer() {
     let (server, mut ws, _root, _hooks) = setup_commit_workspace().await;
@@ -1187,8 +1201,9 @@ async fn git_log_picker_lists_history_and_filters_it() {
     commit_file(&repo, "a.rs", "one\n");
     commit_file(&repo, "b.rs", "two\n");
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitLog)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer)).await;
     assert_eq!(view.total_candidates, 2, "both commits");
     assert!(!view.truncated, "a two-commit history is not capped");
 
@@ -1289,7 +1304,8 @@ async fn git_log_file_picker_is_locked_to_the_buffers_path() {
     );
 
     // The whole-repo picker is a separate slot and still shows everything.
-    let all = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitLog)).await;
+    let all =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer_id)).await;
     assert_eq!(all.total_candidates, 3);
 
     drop(server);
@@ -1304,8 +1320,9 @@ async fn git_log_rows_carry_what_git_show_needs() {
     let repo = init_repo_at(&root);
     commit_file(&repo, "a.rs", "one\n");
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitLog)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer)).await;
     let item = view
         .update
         .expect("window")
@@ -1351,8 +1368,8 @@ async fn git_log_query_filters_without_reordering() {
     std::fs::write(root.join("a.rs"), "three\n").unwrap();
     commit_with_message(&repo, "a.rs", "adjust the thing");
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitLog)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let _ = send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer)).await;
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         &PickerQueryParams {
@@ -1450,8 +1467,8 @@ async fn git_log_matches_hashes_by_prefix_including_longer_than_rendered() {
         .id()
         .to_string();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitLog)).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let _ = send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer)).await;
 
     async fn matches_for(ws: &mut Ws, query: String, generation: u64) -> PickerUpdateParams {
         let _: () = send_request::<PickerQuery>(
@@ -1703,7 +1720,7 @@ async fn git_stash_push_lists_and_pops() {
     commit_file(&repo, "a.rs", "one\n");
     std::fs::write(root.join("a.rs"), "CHANGED\n").unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
     let repo_id = root.to_string_lossy().into_owned();
 
     let pushed: GitStashResult = send_request::<GitStashPush>(
@@ -1724,7 +1741,8 @@ async fn git_stash_push_lists_and_pops() {
     );
 
     // The picker lists it, newest first, with git's own description.
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitStash)).await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitStash, buffer)).await;
     assert_eq!(view.total_candidates, 1);
     let item = view
         .update
@@ -1757,7 +1775,8 @@ async fn git_stash_push_lists_and_pops() {
         std::fs::read_to_string(root.join("a.rs")).unwrap(),
         "CHANGED\n"
     );
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitStash)).await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitStash, buffer)).await;
     assert_eq!(view.total_candidates, 0, "the entry is gone");
 
     drop(server);
@@ -1844,7 +1863,7 @@ async fn git_stash_actions_refuse_a_vanished_entry() {
     commit_file(&repo, "a.rs", "one\n");
     std::fs::write(root.join("a.rs"), "CHANGED\n").unwrap();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
     let repo_id = root.to_string_lossy().into_owned();
     let push = |id: u64| GitStashPushParams {
         repo_id: Some(repo_id.clone()),
@@ -1856,7 +1875,8 @@ async fn git_stash_actions_refuse_a_vanished_entry() {
     std::fs::write(root.join("a.rs"), "AGAIN\n").unwrap();
     let _: GitStashResult = send_request::<GitStashPush>(&mut ws, &push(2)).await;
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitStash)).await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitStash, buffer)).await;
     let oids: Vec<String> = view
         .update
         .expect("window")
@@ -1921,7 +1941,7 @@ async fn dropping_a_stash_refreshes_the_open_picker() {
     commit_file(&repo, "a.rs", "one\n");
     let repo_id = root.to_string_lossy().into_owned();
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
     for (id, content) in [(2u64, "first\n"), (3, "second\n")] {
         std::fs::write(root.join("a.rs"), content).unwrap();
         let _: GitStashResult = send_request::<GitStashPush>(
@@ -1937,7 +1957,8 @@ async fn dropping_a_stash_refreshes_the_open_picker() {
     }
 
     // Open (and so subscribe) the picker.
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitStash)).await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitStash, buffer)).await;
     assert_eq!(view.total_candidates, 2);
     let oid = view
         .update

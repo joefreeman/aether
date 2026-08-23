@@ -10437,7 +10437,10 @@ fn read_placeholder_names_the_loading_and_empty_states() {
     let (token, _method, _) = the_request(&fx);
     assert_eq!(s.read.as_ref().unwrap().placeholder(), Some("Loading…"));
     let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "" })));
-    assert_eq!(s.read.as_ref().unwrap().placeholder(), Some("Empty document"));
+    assert_eq!(
+        s.read.as_ref().unwrap().placeholder(),
+        Some("Empty document")
+    );
     // A document with blocks shows itself.
     assert_eq!(read_session().read.as_ref().unwrap().placeholder(), None);
 }
@@ -11524,7 +11527,7 @@ fn space_g_c_prepares_a_commit_and_alt_x_commits_it() {
     let fx = git_leader(&mut s, 'c');
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
-    // The repo is resolved server-side from the buffer we're on — no `git/repos` round trip.
+    // The repo is resolved server-side from the buffer we're on, and from nothing else.
     assert_eq!(params["buffer_id"], json!(s.buffer.buffer_id));
     assert!(params.get("amend").is_none(), "plain commit sends no amend");
 

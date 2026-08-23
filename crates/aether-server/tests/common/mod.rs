@@ -39,15 +39,14 @@ pub use aether_protocol::git::{
     GitNavigateHunkResult, GitOperationChanged, GitOperationKind, GitPrepareCommit,
     GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
     GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRefresh,
-    GitRefreshParams, GitRefreshResult, GitRepoOperation, GitRepos, GitReposParams, GitReposResult,
-    GitReset, GitResetParams, GitResetResult, GitResolveConflict, GitResolveConflictParams,
-    GitResolveConflictResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow,
-    GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitWorktreeAdd,
-    GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemove,
-    GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus, HunkAction,
-    HunkDirection, ResolveConflictStatus, ShowTarget,
+    GitRefreshParams, GitRefreshResult, GitRepoOperation, GitReset, GitResetParams, GitResetResult,
+    GitResolveConflict, GitResolveConflictParams, GitResolveConflictResult, GitSetBaseline,
+    GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams,
+    GitSetDiffView, GitSetDiffViewParams, GitShow, GitShowParams, GitStashApply,
+    GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush, GitStashPushParams,
+    GitStashResult, GitStashStatus, GitWorktreeAdd, GitWorktreeAddParams, GitWorktreeAddResult,
+    GitWorktreeAddStatus, GitWorktreeRemove, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
+    GitWorktreeRemoveStatus, HunkAction, HunkDirection, ResolveConflictStatus, ShowTarget,
 };
 pub use aether_protocol::input::{
     BlockDepthParams, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams,
@@ -339,6 +338,16 @@ pub async fn await_response<M: RpcMethod>(ws: &mut Ws, id: u64) -> M::Result {
 /// window at the top, `limit: 50`, nothing else set. Tests that deviate spell out only the
 /// deviating fields via struct update: `PickerViewParams { buffer_id: Some(b), ..view_params(k) }`
 /// — so the field a test *cares about* is the only one visible at the call site.
+/// [`view_params`] for a picker opened *over a buffer* — how the repo-resolving pickers (branches,
+/// log, stash) are invoked in practice. They take their repo from this buffer and nowhere else, so
+/// omitting it is refused rather than falling back to the workspace.
+pub fn view_params_on(kind: PickerKind, buffer_id: u64) -> PickerViewParams {
+    PickerViewParams {
+        buffer_id: Some(buffer_id),
+        ..view_params(kind)
+    }
+}
+
 pub fn view_params(kind: PickerKind) -> PickerViewParams {
     PickerViewParams {
         kind,
@@ -1141,7 +1150,13 @@ pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
     }
 }
 
-// -------- git/repos (repo identity) ---------------------------------------------------------------
+// -------- git repo fixtures ------------------------------------------------------------------------
+
+/// A path as a [`RepoId`] — the canonicalized working directory, which is the string form every
+/// repo-resolving RPC echoes back.
+pub fn root_id(path: &std::path::Path) -> String {
+    path.to_string_lossy().to_string()
+}
 
 /// A repo with a deterministic initial branch. libgit2 honours `init.defaultBranch`, so a plain
 /// `Repository::init` would let the developer's global config decide the branch name and make
@@ -1192,6 +1207,27 @@ pub async fn setup_repos_workspace(
     )
     .await;
     (server, ws)
+}
+
+/// [`setup_repos_workspace`] plus an open file, returning its buffer id.
+///
+/// Every git verb resolves its repo from the buffer it was invoked over, so a test that exercises
+/// one needs a file open — the same thing the user has to do.
+pub async fn setup_repos_workspace_on(
+    roots: Vec<std::path::PathBuf>,
+    relative_path: &str,
+) -> (aether_server::ServerHandle, Ws, u64) {
+    let (server, mut ws) = setup_repos_workspace(roots).await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some(relative_path.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    (server, ws, open.buffer_id)
 }
 
 pub async fn refresh(ws: &mut Ws, root: &std::path::Path) -> GitRefreshResult {

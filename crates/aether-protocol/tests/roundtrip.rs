@@ -20,10 +20,9 @@ use aether_protocol::git::{
     GitApplyHunkResult, GitBaselineRef, GitBlameChanged, GitBlameChangedParams, GitBlameLine,
     GitBlameLineParams, GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitHead,
     GitNavigateHunk, GitNavigateHunkParams, GitRefresh, GitRefreshParams, GitRefreshResult,
-    GitRepoInfo, GitRepos, GitReposParams, GitReposResult, GitSetBaseline, GitSetBaselineParams,
-    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
-    HunkAction, HunkDirection,
+    GitRepoInfo, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitStashPush,
+    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
@@ -261,9 +260,7 @@ fn git_blame_follow_shapes() {
 }
 
 #[test]
-fn git_repos_shapes() {
-    assert_eq!(GitRepos::NAME, "git/repos");
-
+fn git_repo_identity_shapes() {
     // The ordinary case: git dir and common dir coincide, one root, on a branch with an upstream.
     let ordinary = GitRepoInfo {
         repo_id: "/src/aether".into(),
@@ -323,13 +320,6 @@ fn git_repos_shapes() {
         .unwrap(),
         json!({"state": "unborn", "name": "main"})
     );
-
-    // A workspace touching no repo at all answers with an empty list, not an error.
-    assert_eq!(
-        to_value(&GitReposResult { repos: vec![] }).unwrap(),
-        json!({"repos": []})
-    );
-    assert_eq!(to_value(&GitReposParams {}).unwrap(), json!({}));
 }
 
 #[test]

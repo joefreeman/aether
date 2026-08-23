@@ -904,43 +904,71 @@ async fn git_navigate_hunk_honours_count() {
     drop(server);
 }
 
-// ---- git/repos (repo identity) -----------------------------------------------------------------
+// ---- repo resolution (which repo a git verb acts on) --------------------------------------------
+
+// The repo a git verb acts on comes from the buffer it was invoked over — its baseline's working
+// directory, or, for a virtual buffer, the repo its revision was materialised from. Nothing else:
+// no workspace-wide fallback, so a scratch buffer refuses rather than picking a repo the user
+// never pointed at. These assert through `git/prepare_commit`, which echoes the repo it resolved.
+
+/// Open `rel` under root 0 and return its buffer id.
+async fn open_under_root(ws: &mut Ws, rel: &str) -> u64 {
+    let res: BufferOpenResult = send_request::<BufferOpen>(
+        ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some(rel.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    res.buffer_id
+}
+
+/// The repo `git/prepare_commit` resolves from `buffer_id` — the resolution every git verb shares.
+async fn resolved_repo(ws: &mut Ws, buffer_id: Option<u64>) -> String {
+    let res: GitPrepareCommitResult = send_request::<GitPrepareCommit>(
+        ws,
+        &GitPrepareCommitParams {
+            buffer_id,
+            ..Default::default()
+        },
+    )
+    .await;
+    res.repo_id
+}
+
+/// The error code and message from a `git/prepare_commit` that could not resolve a repo.
+async fn resolve_repo_err(ws: &mut Ws, buffer_id: Option<u64>) -> Value {
+    send_request_expect_error::<GitPrepareCommit>(
+        ws,
+        &GitPrepareCommitParams {
+            buffer_id,
+            ..Default::default()
+        },
+    )
+    .await
+}
 
 #[tokio::test]
-async fn git_repos_reports_the_workspace_repo() {
+async fn resolves_the_repo_of_the_open_buffer() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
     commit_file(&repo, "a.rs", "one\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
+    let buffer = open_under_root(&mut ws, "a.rs").await;
 
-    assert_eq!(res.repos.len(), 1);
-    let r = &res.repos[0];
-    // The id is the *working directory*, and the git dir hangs off it. For an ordinary checkout
-    // (not a worktree) the common dir is the same directory — that equality is what tells a
-    // client this repo has no worktree siblings.
-    assert_eq!(r.repo_id, root.to_string_lossy());
-    assert_eq!(r.git_dir, root.join(".git").to_string_lossy());
-    assert_eq!(r.common_dir, r.git_dir);
-    assert_eq!(
-        r.head,
-        GitHead::Branch {
-            name: "main".into(),
-            // Nothing to push to in a test repo, which is exactly the never-pushed case.
-            upstream: None,
-        }
-    );
-    assert_eq!(r.roots, vec![root.to_string_lossy().to_string()]);
+    assert_eq!(resolved_repo(&mut ws, Some(buffer)).await, root_id(&root));
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_resolves_a_subdirectory_root_to_the_repo_top_level() {
-    // The root the user configured is *inside* the repo. Discovery walks up, so the id is the
-    // repo, not the root — the distinction every mutating RPC depends on (checking out a branch
-    // rewrites the whole working tree, not the root's subtree).
+async fn resolves_a_subdirectory_root_to_the_repo_top_level() {
+    // The root the user configured is *inside* the repo. Discovery walks up, so the repo is the
+    // top level, not the root — the distinction every mutating RPC depends on (checking out a
+    // branch rewrites the whole working tree, not the root's subtree).
     let dir = tempfile::tempdir().unwrap();
     let top = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&top);
@@ -948,18 +976,16 @@ async fn git_repos_resolves_a_subdirectory_root_to_the_repo_top_level() {
     let root = top.join("crates/server");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
+    let buffer = open_under_root(&mut ws, "a.rs").await;
 
-    assert_eq!(res.repos.len(), 1);
-    assert_eq!(res.repos[0].repo_id, top.to_string_lossy());
-    assert_ne!(res.repos[0].repo_id, root.to_string_lossy());
-    // The root still reports as the way this repo was reached.
-    assert_eq!(res.repos[0].roots, vec![root.to_string_lossy().to_string()]);
+    let resolved = resolved_repo(&mut ws, Some(buffer)).await;
+    assert_eq!(resolved, root_id(&top));
+    assert_ne!(resolved, root_id(&root));
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_collapses_two_roots_in_one_repo() {
+async fn two_roots_in_one_repo_resolve_to_the_same_repo() {
     let dir = tempfile::tempdir().unwrap();
     let top = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&top);
@@ -968,24 +994,21 @@ async fn git_repos_collapses_two_roots_in_one_repo() {
     let server_root = top.join("crates/server");
     let tui_root = top.join("crates/tui");
 
-    let (server, mut ws) = setup_repos_workspace(vec![server_root.clone(), tui_root.clone()]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
+    let (server, mut ws) = setup_repos_workspace(vec![server_root, tui_root]).await;
 
-    // Two roots, one repo — one entry, listing both roots that reach it.
-    assert_eq!(res.repos.len(), 1);
-    assert_eq!(res.repos[0].repo_id, top.to_string_lossy());
+    // Whichever root the file came through, the repo is the one containing both.
+    let from_server = open_under_root(&mut ws, "a.rs").await;
     assert_eq!(
-        res.repos[0].roots,
-        vec![
-            server_root.to_string_lossy().to_string(),
-            tui_root.to_string_lossy().to_string()
-        ]
+        resolved_repo(&mut ws, Some(from_server)).await,
+        root_id(&top)
     );
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_keeps_distinct_repos_separate() {
+async fn each_buffer_resolves_to_its_own_repo_in_a_multi_repo_workspace() {
+    // The case that used to be refused as ambiguous, and is now simply answered: two repos in one
+    // workspace, and the buffer says which one. Nothing about the workspace has to be consulted.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let first = base.join("alpha");
@@ -996,76 +1019,96 @@ async fn git_repos_keeps_distinct_repos_separate() {
     commit_file(&init_repo_at(&second), "b.rs", "two\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![first.clone(), second.clone()]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
 
-    // Root order, so the response is stable and the first row is a sensible default target.
-    let ids: Vec<&str> = res.repos.iter().map(|r| r.repo_id.as_str()).collect();
-    assert_eq!(ids, vec![first.to_string_lossy(), second.to_string_lossy()]);
-    // Separate repos, so no shared common dir — the check that distinguishes them from worktrees.
-    assert_ne!(res.repos[0].common_dir, res.repos[1].common_dir);
+    let in_alpha: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let in_beta: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(1),
+            relative_path: Some("b.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        resolved_repo(&mut ws, Some(in_alpha.buffer_id)).await,
+        root_id(&first)
+    );
+    assert_eq!(
+        resolved_repo(&mut ws, Some(in_beta.buffer_id)).await,
+        root_id(&second)
+    );
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_is_empty_outside_a_repo() {
+async fn a_scratch_buffer_refuses_rather_than_choosing_a_repo() {
+    // The whole point of the rule. One repo in the workspace, so a fallback *could* have picked
+    // it unambiguously — and deliberately doesn't. Committing is not undoable by pressing undo,
+    // and a scratch buffer never said which repo it meant.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    commit_file(&init_repo_at(&root), "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let scratch: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, &BufferOpenParams::default()).await;
+
+    let err = resolve_repo_err(&mut ws, Some(scratch.buffer_id)).await;
+    assert_eq!(err["code"], serde_json::json!(-32040), "got {err}");
+    // Phrased as the remedy: a scratch buffer hasn't got as far as having somewhere to look.
+    assert_eq!(
+        err["message"],
+        serde_json::json!("Open a file in the repository first")
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn no_buffer_at_all_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    commit_file(&init_repo_at(&root), "a.rs", "one\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+
+    let err = resolve_repo_err(&mut ws, None).await;
+    assert_eq!(err["code"], serde_json::json!(-32040), "got {err}");
+    assert_eq!(
+        err["message"],
+        serde_json::json!("Open a file in the repository first")
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_file_outside_any_repo_refuses_with_the_hunk_commands_wording() {
+    // A path that resolved no repo is *outside* one — a different remedy from a scratch buffer,
+    // and the same sentence `Space g s` and friends have always used for this condition.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     std::fs::write(root.join("loose.rs"), "x\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
+    let buffer = open_under_root(&mut ws, "loose.rs").await;
 
-    // No repo is an ordinary answer, not an error — the client hides git affordances rather than
-    // reporting a failure.
-    assert!(res.repos.is_empty());
+    let err = resolve_repo_err(&mut ws, Some(buffer)).await;
+    assert_eq!(err["code"], serde_json::json!(-32040), "got {err}");
+    assert_eq!(err["message"], serde_json::json!("Not in a git repository"));
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_reports_an_unborn_head() {
-    // A freshly-initialised repo: HEAD names a branch that has no commit yet. Committing is fine
-    // here; pushing needs `--set-upstream`. Flattening this to a branch name would lose that.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    init_repo_at(&root);
-
-    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
-
-    assert_eq!(res.repos.len(), 1);
-    assert_eq!(
-        res.repos[0].head,
-        GitHead::Unborn {
-            name: "main".into()
-        }
-    );
-    drop(server);
-}
-
-#[tokio::test]
-async fn git_repos_reports_a_detached_head() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let repo = init_repo_at(&root);
-    commit_file(&repo, "a.rs", "one\n");
-    let oid = repo.head().unwrap().target().unwrap();
-    repo.set_head_detached(oid).unwrap();
-
-    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
-
-    assert_eq!(res.repos.len(), 1);
-    assert_eq!(
-        res.repos[0].head,
-        GitHead::Detached {
-            oid: oid.to_string()[..7].to_string()
-        }
-    );
-    drop(server);
-}
-
-#[tokio::test]
-async fn git_repos_finds_a_repo_nested_under_a_root() {
+async fn resolves_a_repo_nested_under_a_root() {
     // The workspace root is not itself a repo but contains one (a vendored checkout). Discovery
     // from the root walks *up* and never sees it; the open buffer's cached baseline does.
     let dir = tempfile::tempdir().unwrap();
@@ -1074,39 +1117,24 @@ async fn git_repos_finds_a_repo_nested_under_a_root() {
     std::fs::create_dir_all(&vendored).unwrap();
     commit_file(&init_repo_at(&vendored), "x.rs", "one\n");
 
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let buffer = open_under_root(&mut ws, "vendor/lib/x.rs").await;
 
-    // Before anything is open, the root reaches no repo.
-    let before: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
-    assert!(before.repos.is_empty());
-
-    let _open: BufferOpenResult = send_request::<BufferOpen>(
-        &mut ws,
-        &BufferOpenParams {
-            path_index: Some(0),
-            relative_path: Some("vendor/lib/x.rs".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let after: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
-    assert_eq!(after.repos.len(), 1);
-    assert_eq!(after.repos[0].repo_id, vendored.to_string_lossy());
     // Reached through the root even though the root isn't in the repo: containment holds the
-    // other way round, and the file is one the user has open in this workspace.
+    // other way round, and the file is one the user has open in this workspace — which is also
+    // what makes it *writable* rather than merely readable.
     assert_eq!(
-        after.repos[0].roots,
-        vec![root.to_string_lossy().to_string()]
+        resolved_repo(&mut ws, Some(buffer)).await,
+        root_id(&vendored)
     );
     drop(server);
 }
 
 #[tokio::test]
-async fn git_repos_treats_a_worktree_as_its_own_repo_sharing_a_common_dir() {
+async fn a_worktree_resolves_as_its_own_repo() {
     // The case `RepoId` is keyed on the workdir *for*. A linked worktree has its own HEAD and
-    // index — so checkout and commit mean different things in each and they must be separate
-    // ids — while sharing refs, objects and the stash, which the common dir expresses.
+    // index — so checkout and commit mean different things in each — while sharing refs, objects
+    // and the stash. A buffer in one must never resolve to the other.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let main = base.join("main");
@@ -1114,50 +1142,99 @@ async fn git_repos_treats_a_worktree_as_its_own_repo_sharing_a_common_dir() {
     let repo = init_repo_at(&main);
     commit_file(&repo, "a.rs", "one\n");
 
-    // Sibling-of-the-repo layout, per the worktree convention. libgit2
-    // creates the leaf but not its parent.
+    // Sibling-of-the-repo layout, per the worktree convention. libgit2 creates the leaf but not
+    // its parent.
     let wt_path = base.join("main-worktrees/feature");
     std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
     repo.worktree("feature", &wt_path, None).unwrap();
+    // A worktree's own `.git` is a *file* pointing into the main repo.
+    assert!(wt_path.join(".git").is_file());
 
     let (server, mut ws) = setup_repos_workspace(vec![main.clone(), wt_path.clone()]).await;
-    let res: GitReposResult = send_request::<GitRepos>(&mut ws, &GitReposParams {}).await;
 
-    assert_eq!(res.repos.len(), 2);
-    let main_repo = &res.repos[0];
-    let worktree = &res.repos[1];
-    assert_eq!(main_repo.repo_id, main.to_string_lossy());
-    assert_eq!(worktree.repo_id, wt_path.to_string_lossy());
+    let in_main: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let in_worktree: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(1),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
 
-    // A worktree's own `.git` is a *file* pointing into the main repo, so its git dir lives under
-    // the main repo's `.git/worktrees/` — not beside its working tree.
-    assert!(wt_path.join(".git").is_file());
     assert_eq!(
-        worktree.git_dir,
-        main.join(".git/worktrees/feature").to_string_lossy()
-    );
-    // The shared store: equal common dirs is how a client knows these two are worktree siblings
-    // (so a stash listed in one is the same stash listed in the other) rather than separate repos.
-    assert_eq!(worktree.common_dir, main.join(".git").to_string_lossy());
-    assert_eq!(main_repo.common_dir, worktree.common_dir);
-    assert_ne!(main_repo.git_dir, worktree.git_dir);
-
-    // Each is on its own branch — the reason a branch checked out in one worktree can't be
-    // checked out in the other.
-    assert_eq!(
-        main_repo.head,
-        GitHead::Branch {
-            name: "main".into(),
-            upstream: None
-        }
+        resolved_repo(&mut ws, Some(in_main.buffer_id)).await,
+        root_id(&main)
     );
     assert_eq!(
-        worktree.head,
-        GitHead::Branch {
-            name: "feature".into(),
-            upstream: None
-        }
+        resolved_repo(&mut ws, Some(in_worktree.buffer_id)).await,
+        root_id(&wt_path)
     );
+    drop(server);
+}
+
+#[tokio::test]
+async fn an_explicit_repo_id_overrides_the_buffer() {
+    // How the branch picker acts on the repo it listed rather than on whatever buffer happens to
+    // be focused behind it.
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let first = base.join("alpha");
+    let second = base.join("beta");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    commit_file(&init_repo_at(&first), "a.rs", "one\n");
+    commit_file(&init_repo_at(&second), "b.rs", "two\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![first.clone(), second.clone()]).await;
+    let in_alpha = open_under_root(&mut ws, "a.rs").await;
+
+    let res: GitPrepareCommitResult = send_request::<GitPrepareCommit>(
+        &mut ws,
+        &GitPrepareCommitParams {
+            repo_id: Some(root_id(&second)),
+            buffer_id: Some(in_alpha),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(res.repo_id, root_id(&second));
+    drop(server);
+}
+
+#[tokio::test]
+async fn an_unreachable_repo_id_is_refused() {
+    // Ids are paths, so a client could synthesize one; validating against the reachable set is
+    // what keeps that harmless.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    commit_file(&init_repo_at(&root), "a.rs", "one\n");
+    let outside = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    init_repo_at(&outside);
+
+    let (server, mut ws) = setup_repos_workspace(vec![root]).await;
+    let buffer = open_under_root(&mut ws, "a.rs").await;
+
+    let err = send_request_expect_error::<GitPrepareCommit>(
+        &mut ws,
+        &GitPrepareCommitParams {
+            repo_id: Some(root_id(&outside)),
+            buffer_id: Some(buffer),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(err["code"], serde_json::json!(-32040), "got {err}");
     drop(server);
 }
 

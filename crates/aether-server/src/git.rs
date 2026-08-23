@@ -458,8 +458,8 @@ pub(crate) fn head_state(repo: &git2::Repository) -> Option<GitHead> {
     Some(GitHead::Unborn { name })
 }
 
-/// A repo's identity and current HEAD — everything `git/repos` reports about one repo except which
-/// workspace roots reached it (the caller knows that, this doesn't).
+/// A repo's identity and current HEAD — everything [`GitRepoInfo`] carries except which workspace
+/// roots reached it (the caller knows that, this doesn't).
 ///
 /// `workdir` is the [`RepoId`]; see there for why identity is the working directory and not the
 /// git dir. `git_dir` and `common_dir` differ only for a linked worktree, and that difference is

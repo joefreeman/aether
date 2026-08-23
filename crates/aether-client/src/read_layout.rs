@@ -1318,7 +1318,10 @@ mod tests {
         let text = rows_text(&layout(&blocks, &els, 20, &Default::default()));
         // The bar and the marker *are* the row when there's no content to ride.
         assert!(text.contains(&"┃ ".to_string()), "quote bar row: {text:?}");
-        assert!(text.contains(&"• ".to_string()), "item marker row: {text:?}");
+        assert!(
+            text.contains(&"• ".to_string()),
+            "item marker row: {text:?}"
+        );
     }
 
     #[test]

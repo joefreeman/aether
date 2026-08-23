@@ -512,40 +512,21 @@ pub struct GitSetBlameFollowParams {
     pub enabled: bool,
 }
 
-// ---- git/repos ----------------------------------------------------------------------------------
+// ---- repo identity -------------------------------------------------------------------------------
 
 /// Identity of one Git repository: its canonicalized working directory, as an absolute path.
 ///
-/// A path rather than a server-assigned token so it survives a server restart (a workspace's
-/// repo choice persists as something still meaningful next boot), so any code path holding a
-/// path can address a repo without a [`GitRepos`] round trip first, and so it reads in wire
-/// logs. The server validates incoming ids against the repos it can actually reach and rejects
-/// anything else, so clients should treat it as opaque and echo back what [`GitRepos`] gave them.
+/// A path rather than a server-assigned token so it survives a server restart, so any code path
+/// holding a path can address a repo without a round trip first, and so it reads in wire logs. The
+/// server validates incoming ids against the repos it can actually reach and rejects anything
+/// else, so clients should treat it as opaque and echo back one the server gave them — every
+/// result that resolves a repo names it, which is the only way a client comes by a valid id.
 ///
 /// Keyed on the **working directory**, not the git dir: two workspace roots inside one repo
 /// collapse to one id, while two linked worktrees of the same repo stay distinct — they have
 /// separate HEADs and indexes, so checkout and commit mean different things in each. Repos
 /// sharing a [`GitRepoInfo::common_dir`] are worktrees of one another.
 pub type RepoId = String;
-
-/// The distinct repos reachable from the client's active workspace — via its roots, and via any
-/// buffer it has open. The set a repo chooser lists, and the source of every valid [`RepoId`].
-pub struct GitRepos;
-impl RpcMethod for GitRepos {
-    const NAME: &'static str = "git/repos";
-    type Params = GitReposParams;
-    type Result = GitReposResult;
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct GitReposParams {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitReposResult {
-    /// Repos reached through a workspace root first (in root order), then repos reached only
-    /// through an open buffer (by id). Empty when the workspace touches no repo at all.
-    pub repos: Vec<GitRepoInfo>,
-}
 
 /// One repo reachable from the active workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,13 +590,12 @@ impl RpcMethod for GitPrepareCommit {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GitPrepareCommitParams {
-    /// Which repo to commit to. Omit to let the server resolve it — from `buffer_id`'s repo, or
-    /// from the workspace when it holds exactly one. Resolution lives server-side because that's
-    /// where the buffer→repo mapping already is; a client that had to work it out would need
-    /// `git/repos` plus a copy of the rules.
+    /// Which repo to commit to. Omit to let the server resolve it from `buffer_id`'s repo.
+    /// Resolution lives server-side because that's where the buffer→repo mapping already is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<RepoId>,
-    /// The buffer the user is looking at, as the resolution hint. Ignored when `repo_id` is set.
+    /// The buffer the user is looking at, and — with `repo_id` unset — the *only* thing the repo is
+    /// resolved from. Ignored when `repo_id` is set; without either, the call is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
     /// Amend the previous commit: the template is prefilled with its message, and the commit that
@@ -1837,7 +1817,7 @@ impl RpcMethod for GitRefresh {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitRefreshParams {
-    /// Which repo moved. Must be one `git/repos` reported for the caller's active workspace.
+    /// Which repo moved. Must be one the caller's active workspace can reach.
     pub repo_id: RepoId,
 }
 

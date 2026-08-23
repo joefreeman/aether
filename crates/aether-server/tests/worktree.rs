@@ -446,7 +446,10 @@ async fn the_branch_picker_lists_worktrees_and_branches_as_one_list() {
     let created = worktree_add(&mut ws, &root, "feature", true).await;
     assert_eq!(created.status, GitWorktreeAddStatus::Created);
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    // The picker takes its repo from the buffer it was opened over.
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let update = view.update.expect("the view carries its initial window");
     let rows = merged_rows(update.items());
 
@@ -1026,7 +1029,10 @@ async fn the_tree_you_are_in_is_the_pickers_opening_selection() {
     let bound = bind(&mut ws, &repo_root, &wt.name).await;
     assert_eq!(bound.workspace.paths[0], wt.path);
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    // The picker takes its repo from the buffer it was opened over.
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let centred = view
         .effective_center_on
         .expect("a fresh open centres on where you are");
@@ -1066,7 +1072,10 @@ async fn creating_a_worktree_refreshes_the_open_picker() {
     .unwrap();
 
     // Open *and* subscribe — a refresh only reaches a picker with a window.
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    // The picker takes its repo from the buffer it was opened over.
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let holds_a_tree = |update: &PickerUpdateParams, branch: &str| {
         update.items().iter().any(|i| {
             matches!(i, PickerItem::GitBranch { name, checkout: Some(_), .. }
@@ -1128,7 +1137,10 @@ async fn removing_a_worktree_refreshes_the_open_picker() {
         .unwrap();
 
     // Open *and* subscribe — a refresh only reaches a picker with a window.
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    // The picker takes its repo from the buffer it was opened over.
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     // Keyed on the row's *checkout*, not its name: since the merge the branch keeps its row after
     // the tree goes, so "is `feature` listed" stays true either way and would answer the wrong
     // question. What changes is that the row stops naming a tree.
@@ -1206,7 +1218,10 @@ async fn a_branch_row_carries_everything_its_actions_need() {
         .worktree
         .unwrap();
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::GitBranches)).await;
+    // The picker takes its repo from the buffer it was opened over.
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBranches, buffer)).await;
     let update = view.update.expect("the view carries its initial window");
     let row = update
         .items()

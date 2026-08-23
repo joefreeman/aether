@@ -42,11 +42,11 @@ use aether_protocol::git::{
     GitNavigateHunkResult, GitOperation, GitOperationChanged, GitOperationChangedParams,
     GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult, GitPullParams, GitPullResult,
     GitPullStatus, GitPushParams, GitPushResult, GitPushStatus, GitRefreshParams, GitRefreshResult,
-    GitRepoInfo, GitRepoOperation, GitReposParams, GitReposResult, GitResetParams, GitResetResult,
-    GitResolveConflictParams, GitResolveConflictResult, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams,
-    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, GitWorktreeAddParams,
-    GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
+    GitRepoInfo, GitRepoOperation, GitResetParams, GitResetResult, GitResolveConflictParams,
+    GitResolveConflictResult, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams,
+    GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams, GitStashPushParams,
+    GitStashResult, GitStashStatus, GitUpstreamStatus, GitWorktreeAddParams, GitWorktreeAddResult,
+    GitWorktreeAddStatus, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
     GitWorktreeRemoveStatus, GitWorktreeRow, HunkAction, HunkDirection, RepoId,
     ResolveConflictStatus, StagedFile,
 };
@@ -2355,9 +2355,9 @@ async fn open_restored_scratch(
 /// a revision can't move, so re-showing one attaches to the buffer already holding it, while the
 /// working tree has to be rebuilt. That is a guard, not a second code path.
 ///
-/// Resolution is against **reachable** repos, not writable ones: this is a read, and decision 2 is
-/// explicit that a repo reachable only through an open buffer stays fully read-eligible. Nothing
-/// here can mutate anything, so the reachability guard that protects writes doesn't apply.
+/// Resolution is against **reachable** repos, not writable ones: this is a read, and a repo
+/// reachable only through an open buffer stays fully read-eligible. Nothing here can mutate
+/// anything, so the writability guard doesn't apply.
 ///
 /// The content is generated off the lock: a large commit's patch is O(diff), which has no business
 /// on the keystroke path's mutex.
@@ -3339,24 +3339,6 @@ fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> Pendin
 
 // ---- git/* -------------------------------------------------------------------------------------
 
-/// The distinct repos the active workspace can reach: one per canonicalized working directory,
-/// roots first (in workspace order), then repos reached only through an open buffer.
-///
-/// Resolved on demand rather than cached. Discovery runs once per *root* — a handful of walks —
-/// and open buffers cost nothing at all, since a buffer's repo is already sitting in its cached
-/// Git baseline. There's nothing here worth invalidating yet; when the CLI runner needs somewhere
-/// to hang a per-repo operation lock, that's the point to introduce a registry.
-pub async fn git_repos(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    _params: GitReposParams,
-) -> Result<GitReposResult, RpcError> {
-    let s = state.lock().await;
-    Ok(GitReposResult {
-        repos: reachable_repos(&s, ctx.client_id)?,
-    })
-}
-
 /// Resolve a client-supplied [`RepoId`] against the set its active workspace can actually reach,
 /// erroring on anything else.
 ///
@@ -3375,6 +3357,17 @@ fn resolve_repo(
         .ok_or_else(|| RpcError::repo_not_found(repo_id))
 }
 
+/// The distinct repos the active workspace can reach: one per canonicalized working directory,
+/// roots first (in workspace order), then repos reached only through an open buffer.
+///
+/// Resolved on demand rather than cached. Discovery runs once per *root* — a handful of walks —
+/// and open buffers cost nothing at all, since a buffer's repo is already sitting in its cached
+/// Git baseline. There's nothing here worth invalidating yet; when the CLI runner needs somewhere
+/// to hang a per-repo operation lock, that's the point to introduce a registry.
+///
+/// **Not a candidate set** — no RPC picks a repo out of this. It exists to *validate*, saying
+/// whether a repo a buffer or a client named is one this workspace can act on, and to fill
+/// [`GitRepoInfo::roots`], which is what separates a readable repo from a writable one.
 fn reachable_repos(s: &ServerState, client_id: ClientId) -> Result<Vec<GitRepoInfo>, RpcError> {
     let workspace = s.active_workspace_or_err(client_id)?;
 
@@ -3392,16 +3385,16 @@ fn reachable_repos(s: &ServerState, client_id: ClientId) -> Result<Vec<GitRepoIn
     }
 
     // A repo can also sit *below* a root — a vendored subrepo under a non-repo workspace root —
-    // which an upward walk from the root never sees. Open buffers find those, via the workdir
-    // their baseline already resolved.
+    // which an upward walk from the root never sees. Open buffers find those, via the repo they
+    // already name: a baseline's workdir, or a virtual buffer's source revision.
+    //
+    // Virtual buffers count because they outlive what produced them. Reading a commit from a repo
+    // reached only through a file, then closing that file, must not strand the commit view in a
+    // workspace that no longer admits its repo exists — every git read taken from that buffer
+    // resolves through here.
     let mut nested: Vec<GitRepoInfo> = Vec::new();
     for buffer_id in s.buffers_in_workspace(&workspace.id) {
-        let Some(workdir) = s
-            .git_baseline
-            .get(&buffer_id)
-            .and_then(|b| b.repo.as_ref())
-            .map(|r| r.workdir.clone())
-        else {
+        let Some(workdir) = buffer_repo_id(s, buffer_id).map(std::path::PathBuf::from) else {
             continue;
         };
         let id = path_string(&workdir);
@@ -3506,81 +3499,81 @@ pub async fn git_prepare_commit(
 /// ended, because the query filters what was loaded.
 const LOG_MAX_EXAMINED: usize = 20_000;
 
-/// Repo resolution for a **read** — the log picker. Wider than [`resolve_writable_repo`] on
-/// purpose: decision 2 keeps a repo that's only reachable through an open buffer fully
-/// read-eligible ("gutter, blame, log all work"), and nothing this picker offers can mutate
-/// anything. Ambiguity still refuses rather than guessing, exactly as it does for a write.
+/// The repo a buffer itself names, if any: the working directory its Git baseline resolved (a
+/// file), or the repo a virtual buffer was materialised from (a commit or stash view, which has no
+/// path but does know where its content came from).
+///
+/// Baseline first. A virtual buffer never has one, so the order only matters if a buffer somehow
+/// had both, and the baseline is the live fact where the revision is a historical one.
+fn buffer_repo_id(s: &ServerState, buffer_id: BufferId) -> Option<RepoId> {
+    let from_baseline = s
+        .git_baseline
+        .get(&buffer_id)
+        .and_then(|b| b.repo.as_ref())
+        .map(|r| path_string(&r.workdir));
+    from_baseline.or_else(|| {
+        s.try_doc_of(buffer_id)
+            .and_then(|d| d.virtual_source.as_ref())
+            .map(|v| v.target.repo_id.clone())
+    })
+}
+
+/// Repo resolution for a **read**: the repo the buffer names, and nothing else.
+///
+/// The buffer is the whole rule. An earlier version fell back to the workspace's only repo when the
+/// buffer couldn't answer — which meant `Space g l` on a scratch buffer quietly picked a repo, and
+/// meant multi-repo workspaces had a separate "ambiguous, say which one" failure the client had no
+/// way to answer. Both are gone: a repo comes from the file you are looking at, or the command
+/// refuses and says so. That refusal is the feature — it names the repo by pointing at what's on
+/// screen, which is the one place the answer is never in doubt.
+///
+/// Wider than [`resolve_writable_repo`] only in what it accepts once resolved: a repo reachable
+/// solely through an open buffer stays fully read-eligible (gutter, blame, log all work), because
+/// nothing a read offers can mutate it.
 fn resolve_readable_repo(
     s: &ServerState,
     client_id: ClientId,
     buffer_id: Option<BufferId>,
 ) -> Result<GitRepoInfo, RpcError> {
-    let repos = reachable_repos(s, client_id)?;
-    if let Some(buffer_id) = buffer_id {
-        // A *virtual* buffer has no baseline — it isn't a file — but its key names the repo it was
-        // materialised from. Without this, opening the log or stash picker *while reading a commit
-        // or a stash* would be ambiguous in a multi-repo workspace, which is precisely the moment
-        // the answer is least in doubt.
-        let from_revision = s
+    let Some(buffer_id) = buffer_id else {
+        return Err(RpcError::repo_needs_file());
+    };
+    let Some(workdir) = buffer_repo_id(s, buffer_id) else {
+        // A buffer with a path that resolved no repo is *outside* one; a buffer without a path
+        // hasn't got as far as having somewhere to look. Different remedies, so different wording.
+        let has_path = s
             .try_doc_of(buffer_id)
-            .and_then(|d| d.virtual_source.as_ref())
-            .map(|v| v.target.repo_id.clone());
-        let from_baseline = s
-            .git_baseline
-            .get(&buffer_id)
-            .and_then(|b| b.repo.as_ref())
-            .map(|r| path_string(&r.workdir));
-        if let Some(workdir) = from_baseline.or(from_revision) {
-            if let Some(repo) = repos.iter().find(|r| r.repo_id == workdir) {
-                return Ok(repo.clone());
-            }
-        }
-    }
-    match repos.len() {
-        1 => Ok(repos.into_iter().next().expect("checked len")),
-        0 => Err(RpcError::repo_not_found("no repo in this workspace")),
-        _ => Err(RpcError::ambiguous_repo()),
-    }
+            .is_some_and(|d| d.canonical_path.is_some());
+        return Err(if has_path {
+            RpcError::not_in_repo()
+        } else {
+            RpcError::repo_needs_file()
+        });
+    };
+    reachable_repos(s, client_id)?
+        .into_iter()
+        .find(|r| r.repo_id == workdir)
+        .ok_or_else(RpcError::not_in_repo)
 }
 
+/// Repo resolution for a **write**: [`resolve_readable_repo`], then the requirement that the repo
+/// be one the workspace actually opened.
+///
+/// An explicit `repo_id` short-circuits the buffer entirely — that's how the branch picker's rows
+/// act on the repo they were listed for, rather than on whatever buffer happens to be focused
+/// behind the picker.
 fn resolve_writable_repo(
     s: &ServerState,
     client_id: ClientId,
     repo_id: Option<&RepoId>,
     buffer_id: Option<BufferId>,
 ) -> Result<GitRepoInfo, RpcError> {
-    if let Some(id) = repo_id {
-        let repo = resolve_repo(s, client_id, id)?;
-        require_workspace_repo(&repo)?;
-        return Ok(repo);
-    }
-
-    let reachable = reachable_repos(s, client_id)?;
-    // Writable only: a repo reached solely through an open buffer is never a commit target, so it
-    // must not make the choice look ambiguous either.
-    let writable: Vec<GitRepoInfo> = reachable
-        .into_iter()
-        .filter(|r| !r.roots.is_empty())
-        .collect();
-
-    if let Some(buffer_id) = buffer_id {
-        if let Some(workdir) = s
-            .git_baseline
-            .get(&buffer_id)
-            .and_then(|b| b.repo.as_ref())
-            .map(|r| path_string(&r.workdir))
-        {
-            if let Some(repo) = writable.iter().find(|r| r.repo_id == workdir) {
-                return Ok(repo.clone());
-            }
-        }
-    }
-
-    match writable.len() {
-        1 => Ok(writable.into_iter().next().expect("checked len")),
-        0 => Err(RpcError::repo_not_found("no repo in this workspace")),
-        _ => Err(RpcError::ambiguous_repo()),
-    }
+    let repo = match repo_id {
+        Some(id) => resolve_repo(s, client_id, id)?,
+        None => resolve_readable_repo(s, client_id, buffer_id)?,
+    };
+    require_workspace_repo(&repo)?;
+    Ok(repo)
 }
 
 /// git's own commit template: the message — empty, the previous one when amending, or the one the
@@ -18682,13 +18675,12 @@ pub async fn picker_view(
         }
         // Scroll / resume re-view: an empty placeholder that `preserve_existing` keeps, like
         // Diagnostics. Re-resolving here would be actively wrong, not just wasteful — a re-view
-        // carries no `buffer_id`, so a multi-repo workspace would fall through to the
-        // "exactly one writable repo" rule and fail the scroll with `ambiguous_repo`.
+        // carries no `buffer_id`, and the repo comes from the buffer, so it would refuse outright
+        // and fail the scroll on a picker that had already opened perfectly well.
         PickerKind::GitBranches => picker_state::PickerCandidates::GitBranches(Vec::new()),
         // The log: one repo's history, newest first. Resolved against *reachable* repos rather
-        // than writable ones — reading history is not a mutation, and decision 2 keeps a repo
-        // that's only reachable through an open buffer fully read-eligible. Ambiguity still
-        // refuses rather than guessing.
+        // than writable ones — reading history is not a mutation, and a repo that's only
+        // reachable through an open buffer stays fully read-eligible.
         //
         // `GitLogFile` narrows to the active buffer's repo-relative path, the same
         // buffer-locked shape `GitChangesFile` has.

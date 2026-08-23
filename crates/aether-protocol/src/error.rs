@@ -61,10 +61,13 @@ impl ErrorCode {
     /// confirm with the user and retry with `force: true` to discard the local edits.
     pub const WOULD_DISCARD_CHANGES: Self = Self(-32021);
     pub const LANGUAGE_NOT_FOUND: Self = Self(-32030);
-    /// A git RPC named a `RepoId` the caller's active workspace can't reach. Either the id was
-    /// never returned by `git/repos`, or the workspace has changed since it was. The client
-    /// should re-list the repos rather than retrying; ids are server-validated precisely so a
-    /// stale or invented one can't act on a repo the user never opened.
+    /// No repo to act on. Either a git RPC named a `RepoId` the caller's active workspace can't
+    /// reach (a stale id, or one the client invented — validation is what stops either acting on a
+    /// repo the user never opened), or it named no repo and the buffer it was resolved against
+    /// couldn't supply one: a scratch buffer, or a file outside any repository.
+    ///
+    /// Not retryable as sent. The message says which case it is and what would fix it, so clients
+    /// should surface it and stop rather than falling back to a repo of their own choosing.
     pub const REPO_NOT_FOUND: Self = Self(-32040);
     /// `git/set_baseline` was given a revision `git rev-parse` doesn't recognise in that repo (a
     /// typo, or a branch that only exists on a remote). The previous baseline is left in force —
@@ -75,11 +78,9 @@ impl ErrorCode {
     /// refused, because the user never opened it for editing. Add it as a workspace root to write
     /// to it. See `GitRepoInfo::roots`.
     pub const REPO_NOT_WRITABLE: Self = Self(-32042);
-    /// A git RPC that resolves its own repo found more than one candidate and no hint good enough
-    /// to choose between them. The client should ask the user (a repo chooser) and retry with an
-    /// explicit `repo_id`. Guessing is not an option: committing to the wrong repo isn't
-    /// recoverable by pressing undo.
-    pub const AMBIGUOUS_REPO: Self = Self(-32043);
+    // -32043 was AMBIGUOUS_REPO, retired when repo resolution stopped ranging over the workspace:
+    // a repo now comes from the buffer or from an explicit `repo_id`, and neither can be ambiguous.
+    // Left unused rather than recycled so an old client's error tables can't misread a new code.
     /// `git/show` could not materialise the revision — an unresolvable rev, a path that doesn't
     /// exist at it, or binary content. Carries git's own wording, since it says it better than a
     /// paraphrase would.
