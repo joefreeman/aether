@@ -3011,6 +3011,14 @@ fn picker_item_spans(
             max_width,
         );
     }
+    if let PickerItem::GitBaseline {
+        label,
+        match_indices,
+        ..
+    } = item
+    {
+        return git_baseline_item_spans(label, match_indices, highlighted);
+    }
     if let PickerItem::GitStash {
         index,
         message,
@@ -3164,6 +3172,7 @@ fn picker_item_spans(
         | PickerItem::GitBranch { .. }
         | PickerItem::GitCommit { .. }
         | PickerItem::GitStash { .. }
+        | PickerItem::GitBaseline { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -4378,6 +4387,25 @@ fn git_branch_item_spans(
 /// highlights the leading `hash_match_len` characters the query abbreviated. The author is shown
 /// but never matched.
 #[allow(clippy::too_many_arguments)]
+/// One baseline row: just its label.
+///
+/// No marker for the baseline in force — a fresh open highlights that row instead
+/// (`current_state_item` on the server), the same way the branch picker lands on the checkout you
+/// are standing in. And no trailing description: the two section headers say what kind of answer
+/// each row is, and the brackets say which ones are not revisions.
+fn git_baseline_item_spans(
+    label: &str,
+    match_indices: &[u32],
+    highlighted: bool,
+) -> Vec<Span<'static>> {
+    let bg = picker_row_bg(highlighted);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
+    match_highlighted_spans(label.to_string(), match_indices, base, match_style)
+}
+
 fn git_commit_item_spans(
     short_hash: &str,
     subject: &str,
@@ -7098,6 +7126,22 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
             label.push_str(&format!(" ({})", op.label()));
         }
         parts.push(Span::styled(label, style));
+    }
+    // A pinned baseline, named. Its own token rather than a modification of the branch label: the
+    // branch says where you *are* and the baseline says what you are being compared *against*, and
+    // on a feature branch diffed against `main` both facts are wanted at once. Deliberately not
+    // `HEAD...main` — that is git's merge-base notation, and this comparison is two-dot (the
+    // baseline against the buffer), so borrowing the spelling would say something untrue.
+    //
+    // Absent for the default baseline, and absent for the saved-file *fallback* an untracked file
+    // takes (the server only sets `baseline` for a pinned choice) — a permanent token on every
+    // untracked file would be noise in the one place on screen with no room for it, exactly like a
+    // permanent `↑0 ↓0`.
+    if let Some(base) = &status.baseline {
+        parts.push(Span::styled(
+            format!("  {}", aether_client::labels::baseline_token(base)),
+            meta,
+        ));
     }
     // Combined per-class counts: unstaged then `(staged)`.
     for (sigil, color, unstaged, staged) in [

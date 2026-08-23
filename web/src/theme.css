@@ -403,7 +403,7 @@ html, body, #app {
 /* A linked worktree, marked `⧉` — the warning colour the branch picker uses for a worktree-held
    branch (`.picker-meta-warn`), so the mark reads the same wherever it appears. */
 .git-branch-worktree { color: var(--warning); }
-.git-base { color: var(--accent-alt); }    /* Frost blue — current diff base [HEAD]/[index] */
+.git-base { color: var(--accent-alt); }    /* Frost blue — pinned diff baseline, `\u0394 main` */
 .status-icon {
   width: 1.05em;
   height: 1.05em;

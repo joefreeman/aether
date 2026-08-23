@@ -3982,3 +3982,161 @@ async fn a_cancelled_pull_reports_a_stranded_index_lock() {
 
     drop(server);
 }
+
+// -------- the baseline picker (PickerKind::GitBaseline) ------------------------------------------
+
+use aether_protocol::picker::{GroupHeader, PickerViewResult};
+
+/// The label of the row a baseline-picker view opens highlighting — the server's
+/// `effective_center_on`, which is what the client adopts as its selection.
+fn opened_on(view: &PickerViewResult) -> Option<&str> {
+    match view.effective_center_on.as_ref()? {
+        PickerItem::GitBaseline { label, .. } => Some(label.as_str()),
+        other => panic!("expected a baseline row, got {other:?}"),
+    }
+}
+
+/// Two sections — the working states, then the revisions — with the non-revisions bracketed. The
+/// order within the list is meaning, not score, so the fixed rows have to survive a query a branch
+/// name matches better.
+#[tokio::test]
+async fn baseline_picker_groups_working_state_and_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    repo.branch(
+        "feature",
+        &repo.head().unwrap().peel_to_commit().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBaseline, buffer)).await;
+    let update = view.update.clone().expect("window");
+
+    // Section headers, in order, at the boundaries the labels' brackets predict.
+    let headers: Vec<(u32, String)> = update
+        .groups
+        .iter()
+        .map(|g| match &g.header {
+            GroupHeader::Label { label } => (g.start, label.clone()),
+            other => panic!("expected a label header, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        vec![
+            (0, "Working state".to_string()),
+            (2, "Revisions".to_string())
+        ],
+        "`(index)`/`(saved)` are one section, `HEAD` and the branches the other"
+    );
+    assert!(
+        update.groups.iter().all(|g| g.count.is_none()),
+        "derived, always-expanded headers — not collapsible rows"
+    );
+
+    let items = update.items().to_vec();
+    let labels: Vec<&str> = items
+        .iter()
+        .map(|i| match i {
+            PickerItem::GitBaseline { label, .. } => label.as_str(),
+            other => panic!("expected a baseline row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        &labels[..3],
+        &["(index)", "(saved)", "HEAD"],
+        "the fixed rows lead, in meaning order, non-revisions bracketed"
+    );
+    assert!(
+        labels[3..].contains(&"feature"),
+        "branches follow the fixed rows: {labels:?}"
+    );
+
+    // Order is meaning, not score: a query a branch name matches better must not float it above
+    // the fixed rows, which are the answers worth one keystroke.
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        &PickerQueryParams {
+            kind: PickerKind::GitBaseline,
+            query: "e".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let filtered: Vec<&str> = update
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::GitBaseline { label, .. } => label.as_str(),
+            other => panic!("expected a baseline row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        filtered.first(),
+        Some(&"(index)"),
+        "`(index)` still leads a query `feature` scores higher on: {filtered:?}"
+    );
+    assert!(filtered.contains(&"feature"), "{filtered:?}");
+
+    // Where you are is the selection, not a glyph: an unpinned repo opens on `(index)`.
+    assert_eq!(
+        opened_on(&view),
+        Some("(index)"),
+        "a fresh open highlights the baseline in force"
+    );
+
+    drop(server);
+}
+
+/// Enter on the `saved` row re-baselines the repo, and the picker then marks that row instead. The
+/// round trip is what proves the row's `choice` is the same value the RPC takes.
+#[tokio::test]
+async fn baseline_picker_row_sets_the_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBaseline, buffer)).await;
+    let items = view.update.expect("window").items().to_vec();
+    let saved = items
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitBaseline {
+                repo_id,
+                choice,
+                label,
+                ..
+            } if label == "(saved)" => Some((repo_id.clone(), choice.clone())),
+            _ => None,
+        })
+        .expect("a saved row");
+
+    let res: GitSetBaselineResult = send_request::<GitSetBaseline>(
+        &mut ws,
+        &GitSetBaselineParams {
+            repo_id: saved.0,
+            source: saved.1,
+        },
+    )
+    .await;
+    assert!(matches!(res.baseline, Some(GitBaselineSource::Saved)));
+
+    // Re-opening now lands on `(saved)` — the picker says where you are by highlighting it.
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitBaseline, buffer)).await;
+    assert_eq!(opened_on(&view), Some("(saved)"));
+
+    drop(server);
+}

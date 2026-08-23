@@ -34,21 +34,21 @@ use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
 use aether_protocol::error::ErrorCode;
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, GitAbortOperationParams, GitAbortOperationResult, GitAbortStatus,
-    GitApplyHunkParams, GitApplyHunkResult, GitBaselineRef, GitBlameChanged, GitBlameChangedParams,
-    GitBlameLineParams, GitBlameLineResult, GitBufferStatus, GitCancelParams, GitCancelResult,
-    GitChangeCounts, GitCheckoutParams, GitCheckoutResult, GitCheckoutStatus, GitCommitParams,
-    GitCommitResult, GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus,
-    GitFetchParams, GitFetchResult, GitFetchStatus, GitHead, GitNavigateHunkParams,
-    GitNavigateHunkResult, GitOperation, GitOperationChanged, GitOperationChangedParams,
-    GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult, GitPullParams, GitPullResult,
-    GitPullStatus, GitPushParams, GitPushResult, GitPushStatus, GitRefreshParams, GitRefreshResult,
-    GitRepoInfo, GitRepoOperation, GitResetParams, GitResetResult, GitResolveConflictParams,
-    GitResolveConflictResult, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollowParams,
-    GitSetDiffViewParams, GitStashApplyParams, GitStashDropParams, GitStashPushParams,
-    GitStashResult, GitStashStatus, GitUpstreamStatus, GitWorktreeAddParams, GitWorktreeAddResult,
-    GitWorktreeAddStatus, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
-    GitWorktreeRemoveStatus, GitWorktreeRow, HunkAction, HunkDirection, RepoId,
-    ResolveConflictStatus, StagedFile,
+    GitApplyHunkParams, GitApplyHunkResult, GitBaselineChoice, GitBaselineSource, GitBlameChanged,
+    GitBlameChangedParams, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
+    GitCancelParams, GitCancelResult, GitChangeCounts, GitCheckoutParams, GitCheckoutResult,
+    GitCheckoutStatus, GitCommitParams, GitCommitResult, GitDeleteBranchParams,
+    GitDeleteBranchResult, GitDeleteBranchStatus, GitFetchParams, GitFetchResult, GitFetchStatus,
+    GitHead, GitNavigateHunkParams, GitNavigateHunkResult, GitOperation, GitOperationChanged,
+    GitOperationChangedParams, GitOperationKind, GitPrepareCommitParams, GitPrepareCommitResult,
+    GitPullParams, GitPullResult, GitPullStatus, GitPushParams, GitPushResult, GitPushStatus,
+    GitRefreshParams, GitRefreshResult, GitRepoInfo, GitRepoOperation, GitResetParams,
+    GitResetResult, GitResolveConflictParams, GitResolveConflictResult, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollowParams, GitSetDiffViewParams, GitStashApplyParams,
+    GitStashDropParams, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
+    GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemoveParams,
+    GitWorktreeRemoveResult, GitWorktreeRemoveStatus, GitWorktreeRow, HunkAction, HunkDirection,
+    RepoId, ResolveConflictStatus, StagedFile,
 };
 use aether_protocol::hints::{
     HintsRecordParams, HintsRecordResult, HintsStateParams, HintsStateResult,
@@ -3066,7 +3066,7 @@ async fn buffer_open_inner(
     let doc = &s.documents[&doc_id];
     let git_deferred = !git_external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
     let git = (!git_external && !git_deferred).then(|| {
-        let git_baseline = crate::git::load_baseline(&canonical, &s.git_baseline_revs);
+        let git_baseline = crate::git::load_baseline(&canonical, &s.git_baseline_choices);
         let git_unstaged = crate::git::diff_hunks(git_baseline.index_blob.as_deref(), &doc.text);
         let git_both = crate::git::compose_both(&git_baseline.staged_hunks, &git_unstaged);
         (git_baseline, git_unstaged, git_both)
@@ -3235,7 +3235,7 @@ async fn finish_git_baseline(
     // Snapshotted rather than read inside the blocking task, which holds no lock. A
     // `git/set_baseline` landing mid-load re-resolves every buffer in the repo anyway, so a
     // snapshot that's one revision stale is corrected moments later rather than left wrong.
-    let revs = state.lock().await.git_baseline_revs.clone();
+    let revs = state.lock().await.git_baseline_choices.clone();
     let Ok(baseline) =
         tokio::task::spawn_blocking(move || crate::git::load_baseline(&canonical, &revs)).await
     else {
@@ -3975,12 +3975,13 @@ fn require_workspace_repo(repo: &GitRepoInfo) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// Point a repo's diff baseline at a revision other than HEAD, or (with `rev: None`) back at it.
+/// Point a repo's diff baseline at a revision or at the files on disk, or (with `source: None`)
+/// back at the index.
 ///
 /// Repo-scoped: every open buffer in the repo re-resolves, so the gutter answers one consistent
-/// question as you move between files. The revision is resolved to a commit *once*, here, and the
-/// pinned commit is what every later baseline load uses — see [`crate::git::BaselineRev`] for why
-/// a moving baseline would be worse than a slightly stale one.
+/// question as you move between files. A revision is resolved to a commit *once*, here, and the
+/// pinned commit is what every later baseline load uses — see [`crate::git::BaselineChoices`] for
+/// why a moving baseline would be worse than a slightly stale one.
 pub async fn git_set_baseline(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -3990,24 +3991,29 @@ pub async fn git_set_baseline(
     let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
     let workdir = std::path::PathBuf::from(&repo.repo_id);
 
-    let baseline = match &params.rev {
-        Some(rev) => {
+    let baseline = match &params.source {
+        Some(GitBaselineChoice::Rev { rev }) => {
             // Resolved before anything is stored, so a typo leaves the previous baseline intact
-            // rather than silently dropping the user back to HEAD.
+            // rather than silently dropping the user back to the index.
             let commit = crate::git::resolve_rev(&workdir, rev)
                 .ok_or_else(|| RpcError::unknown_revision(rev))?;
-            let pinned = crate::git::BaselineRev {
+            let pinned = GitBaselineSource::Rev {
                 label: rev.clone(),
                 commit,
             };
-            s.git_baseline_revs.insert(workdir.clone(), pinned.clone());
-            Some(GitBaselineRef {
-                label: pinned.label,
-                commit: pinned.commit,
-            })
+            s.git_baseline_choices
+                .insert(workdir.clone(), pinned.clone());
+            Some(pinned)
+        }
+        Some(GitBaselineChoice::Saved) => {
+            // Nothing to resolve: the content is each document's own snapshot, taken when it went
+            // dirty. A repo with no dirty buffers simply shows no changes, which is the truth.
+            s.git_baseline_choices
+                .insert(workdir.clone(), GitBaselineSource::Saved);
+            Some(GitBaselineSource::Saved)
         }
         None => {
-            s.git_baseline_revs.remove(&workdir);
+            s.git_baseline_choices.remove(&workdir);
             None
         }
     };
@@ -4688,32 +4694,37 @@ fn wire_bindings(
         .collect()
 }
 
-/// The row for the checkout the caller is standing in, as the merged branch picker's initial
-/// highlight on a fresh open.
+/// The row naming where the caller already is, as a picker's initial highlight on a fresh open:
+/// the checkout you are standing in for the branch picker, the baseline in force for the baseline
+/// picker.
 ///
 /// "Where you are" is the selection, not a glyph on the row — the same move Buffers and Workspaces
-/// make. The branch picker used to mark HEAD with a `●` in a reserved leading column; expressing it
-/// by opening *on* the row is what let that marker go.
+/// make. Both of these pickers used to mark the row with a `●` in a reserved leading column;
+/// expressing it by opening *on* the row is what let those markers go.
 ///
 /// Only on a fresh open: a re-view (scroll, resume) must keep whatever the user has highlighted.
-fn current_branch_item(
+fn current_state_item(
     picker: &picker_state::PickerState,
     reset: PickerReset,
 ) -> Option<PickerItem> {
     if reset != PickerReset::All {
         return None;
     }
-    let picker_state::PickerCandidates::GitBranches(v) = &picker.candidates else {
-        return None;
-    };
-    // The current *checkout* rather than `is_head`: standing in a detached worktree there is no
-    // head branch to find, and its row — keyed by admin name — is the one to land on. The two
-    // coincide for every branch row, since `list_branches` records the tree you are in like any
-    // other.
-    let idx = v
-        .iter()
-        .position(|c| c.row.checkout.as_ref().is_some_and(|k| k.is_current))
-        .or_else(|| v.iter().position(|c| c.row.is_head))?;
+    let idx = match &picker.candidates {
+        // The current *checkout* rather than `is_head`: standing in a detached worktree there is
+        // no head branch to find, and its row — keyed by admin name — is the one to land on. The
+        // two coincide for every branch row, since `list_branches` records the tree you are in
+        // like any other.
+        picker_state::PickerCandidates::GitBranches(v) => v
+            .iter()
+            .position(|c| c.row.checkout.as_ref().is_some_and(|k| k.is_current))
+            .or_else(|| v.iter().position(|c| c.row.is_head)),
+        // The baseline in force, for the same reason and by the same means. `(index)` is the
+        // default, so an unpinned repo opens on the first row — which is where it would have
+        // opened anyway, and is now saying something.
+        picker_state::PickerCandidates::GitBaseline(v) => v.iter().position(|c| c.current),
+        _ => None,
+    }?;
     Some(picker.candidates.make_item(idx, Vec::new()))
 }
 
@@ -6861,15 +6872,24 @@ pub async fn git_navigate_hunk(
         conflicts.iter().map(|r| r.start_line).collect()
     } else {
         // Diff against the cached baselines — cheap (no repo I/O) and correct regardless of whether
-        // a viewport is currently driving the per-edit recompute. The anchors are the union of the
-        // HEAD and index diffs, so navigation reaches every change the combined view can show —
-        // including a region reverted back to HEAD's content but staged differently (in the index
-        // diff only).
+        // a viewport is currently driving the per-edit recompute. Resolved through
+        // `effective_baseline` so `c` steps between exactly the changes the gutter drew.
+        //
+        // While the comparison is the index the anchors are the union of the HEAD and index diffs,
+        // so navigation reaches every change the combined view can show — including a region
+        // reverted back to HEAD's content but staged differently (in the index diff only). Under a
+        // pinned baseline there is no second layer to union in: a revision puts the same content in
+        // both blobs, and the saved file has no HEAD side at all.
         let buf = s.doc_of(params.buffer_id);
         let baseline = s.git_baseline.get(&params.buffer_id);
-        let head = crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text);
-        let unstaged =
-            crate::git::diff_hunks(baseline.and_then(|b| b.index_blob.as_deref()), &buf.text);
+        let effective =
+            baseline.map(|b| crate::git::effective_baseline(b, buf.disk_blob.as_deref()));
+        let unstaged = crate::git::diff_hunks(effective.as_ref().and_then(|e| e.blob), &buf.text);
+        let head = if effective.as_ref().is_some_and(|e| e.pinned) {
+            Vec::new()
+        } else {
+            crate::git::diff_hunks(baseline.and_then(|b| b.blob.as_deref()), &buf.text)
+        };
         let mut anchors: Vec<u32> = head
             .iter()
             .chain(unstaged.iter())
@@ -7237,9 +7257,18 @@ pub async fn git_apply_hunk(
     // Index writes require the gutter to *be* about the index. Against a pinned revision both
     // blobs hold that commit's content, so staging would write the merge of it and the buffer into
     // the index — content the user never asked to stage — and there is no index relationship to
-    // unstage out of either. Revert stays meaningful ("put this hunk back to how it was at that
-    // commit") and falls through.
-    if baseline.rev.is_some() && !matches!(params.action, HunkAction::Revert) {
+    // unstage out of either. Against the saved file there is no git content in the comparison at
+    // all. Revert stays meaningful in both ("put this hunk back to how it was there") and falls
+    // through — against the saved file that is "discard this hunk's unsaved edits".
+    //
+    // Keyed on `pinned` rather than on the resolved blob, so the saved-file *fallback* an
+    // untracked path takes by default keeps its existing hunk-wise `git add`.
+    let pinned = crate::git::effective_baseline(
+        baseline,
+        s.try_doc_of(buffer_id).and_then(|d| d.disk_blob.as_deref()),
+    )
+    .pinned;
+    if pinned && !matches!(params.action, HunkAction::Revert) {
         return Ok(outcome(&s, ApplyHunkStatus::NotAgainstHead));
     }
     // A conflicted path is a different world: there is no stage-0 index entry and no baseline, so
@@ -8664,7 +8693,7 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
     // Re-read the committed baseline (the expensive part), then attach it — re-diffing the live
     // buffer against both the HEAD and index blobs (the latter also picks up staging done outside
     // the editor).
-    let baseline = crate::git::load_baseline(&path, &s.git_baseline_revs);
+    let baseline = crate::git::load_baseline(&path, &s.git_baseline_choices);
     attach_git_baseline(s, buffer_id, baseline)
 }
 
@@ -11590,8 +11619,9 @@ fn recompute_git_hunks(s: &mut ServerState, buffer_id: BufferId) {
     let Some(doc) = s.try_doc_of(buffer_id) else {
         return;
     };
-    let unstaged = crate::git::diff_hunks(baseline.index_blob.as_deref(), &doc.text);
-    let both = crate::git::compose_both(&baseline.staged_hunks, &unstaged);
+    let effective = crate::git::effective_baseline(baseline, doc.disk_blob.as_deref());
+    let unstaged = crate::git::diff_hunks(effective.blob, &doc.text);
+    let both = crate::git::compose_both(effective.staged, &unstaged);
     let (unstaged, both) = mask_hunks_against_conflicts(s, buffer_id, unstaged, both);
     s.git_unstaged_hunks.insert(buffer_id, unstaged);
     s.git_both_hunks.insert(buffer_id, both);
@@ -11614,21 +11644,44 @@ fn recompute_conflicts(s: &mut ServerState, buffer_id: BufferId) {
     s.git_conflicts.insert(buffer_id, regions);
 }
 
+/// Whether a baseline-picker row names the baseline currently in force.
+///
+/// Revisions compare by **label**, not by resolved commit: the row offers `main`, and what the user
+/// wants marked is the row they would have picked. Two labels resolving to the same commit (`main`
+/// and `HEAD` on a clean checkout) are still two different standing instructions, and marking both
+/// would say the picker had two current rows.
+fn baseline_row_is_current(
+    row: &crate::git::BaselineRow,
+    current: Option<&GitBaselineSource>,
+) -> bool {
+    match (&row.choice, current) {
+        (None, None) => true,
+        (Some(GitBaselineChoice::Saved), Some(GitBaselineSource::Saved)) => true,
+        (Some(GitBaselineChoice::Rev { rev }), Some(GitBaselineSource::Rev { label, .. })) => {
+            rev == label
+        }
+        _ => false,
+    }
+}
+
 /// Buffer-level Git status for the status bar: branch + staged (HEAD→index) and unstaged
 /// (index→buffer) change counts. `Some` for any file inside a repo; `None` otherwise. Staged counts
-/// come from the baseline's cached HEAD→index diff; unstaged from the per-edit index→buffer diff.
+/// come from the effective baseline's staged layer — empty under any pinned baseline, since
+/// nothing but the index has an index relationship to report — and unstaged from the per-edit diff.
 fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferStatus> {
     let baseline = s.git_baseline.get(&buffer_id)?;
     baseline.repo.as_ref()?; // only file-backed buffers inside a repo carry status
+    let disk_blob = s.try_doc_of(buffer_id).and_then(|d| d.disk_blob.as_deref());
+    let effective = crate::git::effective_baseline(baseline, disk_blob);
     Some(GitBufferStatus {
         branch: baseline.branch.clone(),
-        staged: git_change_counts(&baseline.staged_hunks),
+        staged: git_change_counts(effective.staged),
         unstaged: git_change_counts(buffer_unstaged_hunks(s, buffer_id)),
         upstream: baseline.upstream.clone(),
-        baseline: baseline.rev.as_ref().map(|r| GitBaselineRef {
-            label: r.label.clone(),
-            commit: r.commit.clone(),
-        }),
+        // Only a *pinned* baseline gets a status-bar token. The saved-file fallback an untracked
+        // path takes by default is not a state the user chose, and has no alternative to be
+        // confused with, so a permanent token on every untracked file would be pure noise.
+        baseline: effective.pinned.then(|| baseline.choice.clone()).flatten(),
         conflicts: buffer_conflicts(s, buffer_id).len() as u32,
         operation: baseline.operation,
         worktree: baseline.worktree,
@@ -18848,6 +18901,34 @@ pub async fn picker_view(
         // Scroll / resume re-view: the empty placeholder `preserve_existing` keeps, like the
         // branch picker — re-resolving carries no `buffer_id` and would fail a scroll.
         PickerKind::GitStash => picker_state::PickerCandidates::GitStash(Vec::new()),
+        // Rebuilt on a fresh open like the branch picker: both the branch rows and the `current`
+        // marker go stale as soon as HEAD or the baseline moves. Read-only — choosing a baseline
+        // writes nothing to the repo — so it resolves against reachable repos like the log.
+        PickerKind::GitBaseline if params.reset == PickerReset::All => {
+            let (workdir, current) = {
+                let s = state.lock().await;
+                let workdir = std::path::PathBuf::from(
+                    resolve_readable_repo(&s, client_id, params.buffer_id)?.repo_id,
+                );
+                let current = s.git_baseline_choices.get(&workdir).cloned();
+                (workdir, current)
+            };
+            let repo_id = workdir.to_string_lossy().into_owned();
+            let rows =
+                tokio::task::spawn_blocking(move || crate::git::baseline_picker_rows(&workdir))
+                    .await
+                    .unwrap_or_default();
+            picker_state::PickerCandidates::GitBaseline(
+                rows.into_iter()
+                    .map(|row| picker_state::GitBaselineCandidate {
+                        repo_id: repo_id.clone(),
+                        current: baseline_row_is_current(&row, current.as_ref()),
+                        row,
+                    })
+                    .collect(),
+            )
+        }
+        PickerKind::GitBaseline => picker_state::PickerCandidates::GitBaseline(Vec::new()),
     };
 
     let mut s = state.lock().await;
@@ -19016,6 +19097,10 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::GitStash(_),
                     picker_state::PickerCandidates::GitStash(new),
                 ) => new.is_empty(),
+                (
+                    picker_state::PickerCandidates::GitBaseline(_),
+                    picker_state::PickerCandidates::GitBaseline(new),
+                ) => new.is_empty(),
                 _ => false,
             };
             if !preserve_existing {
@@ -19181,7 +19266,7 @@ pub async fn picker_view(
         // Nothing to resolve from the cursor here, and the client can't name the row before it has
         // seen it — so the server supplies it, and everything below (framing, the echo back, the
         // client adopting it as its highlight) is the machinery that already exists.
-        .or_else(|| current_branch_item(picker, params.reset));
+        .or_else(|| current_state_item(picker, params.reset));
     if let Some(item) = effective_center_on.as_ref() {
         // Collapsible kinds: framing an item implies revealing it — expand its group before
         // resolving the row, so a centred open (`Space c` landing on the cursor's hunk) frames a

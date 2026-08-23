@@ -148,6 +148,11 @@ use aether_protocol::{BufferId, LogicalPosition};
 /// A core event: an async result (or shell-forwarded input) the core's update consumes.
 #[derive(Debug)]
 pub enum Event {
+    /// `git/set_baseline` resolved: what the repo's gutter now compares against, or `None` for the
+    /// default (the index). Only the confirmation toast reads it — the gutter itself follows the
+    /// server's own refresh pushes, and the standing state reaches the status bar through
+    /// `GitBufferStatus::baseline`.
+    BaselineSet(Result<Option<aether_protocol::git::GitBaselineSource>, String>),
     SaveTried(Result<SaveTry, String>),
     ReloadTried(Result<ReloadTry, String>),
     /// A cursor-returning RPC resolved (motions, selections, clicks). Reveals as a `Follow`.
@@ -1276,6 +1281,25 @@ impl Session {
 
             // One `match` on the status, because that's what the status enum is for: every arm
             // has a different message and a different thing for the user to do next.
+            Event::BaselineSet(result) => match result {
+                Err(e) => Effects::error_detail("Couldn't change the diff baseline", e),
+                // Grouped so cycling through a few baselines leaves one toast, not a stack. The
+                // status bar carries the standing state; this is only the moment-of-change
+                // confirmation, which is why it says nothing when the picker was dismissed.
+                Ok(baseline) => Effects::toast_grouped(
+                    match &baseline {
+                        None => "Diffing against the index".to_string(),
+                        Some(aether_protocol::git::GitBaselineSource::Saved) => {
+                            "Diffing against the files on disk".to_string()
+                        }
+                        Some(aether_protocol::git::GitBaselineSource::Rev { label, .. }) => {
+                            format!("Diffing against {label}")
+                        }
+                    },
+                    ToastKind::Success,
+                    "git-baseline",
+                ),
+            },
             Event::CheckedOut { branch, result } => match result {
                 Err(e) => Effects::error_detail(format!("Couldn't switch to {branch}"), e),
                 Ok(res) => match res.status {
@@ -3760,6 +3784,9 @@ impl Session {
                             | PickerKind::GitLog
                             | PickerKind::GitLogFile
                             | PickerKind::GitStash
+                            // Likewise the baseline picker: the repo it re-baselines is the one
+                            // the buffer you are looking at lives in.
+                            | PickerKind::GitBaseline
                     ))
                 .then_some(buffer_id),
                 from_selection,
@@ -5012,6 +5039,22 @@ impl Session {
                 let hide = self.close_picker();
                 return hide.and(
                     self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
+                );
+            }
+            PickerItem::GitBaseline {
+                repo_id, choice, ..
+            } => {
+                // `choice: None` is the "back to the index" row, and `None` is exactly what the
+                // RPC takes to clear a baseline — so the row needs no special case here.
+                let params = aether_protocol::git::GitSetBaselineParams {
+                    repo_id: repo_id.clone(),
+                    source: choice.clone(),
+                };
+                let hide = self.close_picker();
+                return hide.and(
+                    self.request::<aether_protocol::git::GitSetBaseline>(params, |r| {
+                        Event::BaselineSet(r.map(|r| r.baseline).map_err(|e| e.message))
+                    }),
                 );
             }
             PickerItem::GitCommit {

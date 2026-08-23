@@ -21,7 +21,8 @@
 //! buffer edit driven by the handler.
 
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, ConflictSide, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
+    BlameInfo, CommitInfo, ConflictSide, GitBaselineChoice, GitBaselineSource, GitHead,
+    GitRepoOperation, GitStatus, GitUpstreamStatus,
 };
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
@@ -75,25 +76,23 @@ pub struct GitRepo {
     pub rel_path: PathBuf,
 }
 
-/// Which revision a repo is diffed against instead of HEAD (`git/set_baseline`), keyed by
+/// What each repo is diffed against instead of the index (`git/set_baseline`), keyed by
 /// canonicalized workdir. Threaded into [`load_baseline`] because the repo a path belongs to is
 /// only known *after* discovery, so the caller can't look the override up in advance.
-pub type BaselineRevs = HashMap<PathBuf, BaselineRev>;
-
-/// A repo's non-HEAD diff baseline: what the user asked for, and the commit it resolved to.
 ///
-/// The commit is **pinned at set time** rather than re-resolved per file. `git diff main`
+/// A revision is **pinned at set time** rather than re-resolved per file. `git diff main`
 /// re-resolves, but a gutter is ambient: having it shift under you mid-review because someone
 /// pushed to `main` is worse than it going slightly stale, and pinning also means a ref deleted
-/// while you're reading doesn't blank the comparison. `label` is kept for display so the status
-/// bar can say `main` rather than a hash the user never typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaselineRev {
-    /// What the user typed: `main`, `v1.0`, `HEAD~3`.
-    pub label: String,
-    /// The commit it resolved to, short form.
-    pub commit: String,
-}
+/// while you're reading doesn't blank the comparison. The label rides along so the status bar can
+/// say `main` rather than a hash the user never typed.
+///
+/// Repo-scoped even for [`GitBaselineSource::Saved`], which reads as per-file: one scope for one
+/// key keeps "what am I comparing against" a single answer you can hold in your head, and "show
+/// me everything I've typed and not saved" is a coherent question to ask of a whole tree.
+///
+/// In memory only — never persisted. A baseline evaporates on restart, which caps how long an
+/// unexplained gutter can outlive the intent behind it.
+pub type BaselineChoices = HashMap<PathBuf, GitBaselineSource>;
 
 /// Cached Git baseline for a buffer: where it lives in a repo (if anywhere) and the committed
 /// content to diff against — HEAD normally, or a pinned revision when one is set for the repo.
@@ -120,11 +119,15 @@ pub struct GitBaseline {
     /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
     /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
     pub staged_hunks: Vec<DiffHunk>,
-    /// Set when this repo is being diffed against something other than HEAD. The staged/unstaged
-    /// split is meaningless then — there's no index relationship to an arbitrary commit — so both
-    /// blobs hold that commit's content and the whole change set reads as unstaged. See
-    /// [`load_baseline`].
-    pub rev: Option<BaselineRev>,
+    /// Set when this repo is being diffed against something other than the index. The
+    /// staged/unstaged split is meaningless then — there's no index relationship to an arbitrary
+    /// commit, nor to the file on disk — so the whole change set reads as unstaged.
+    ///
+    /// For a revision both blobs hold that commit's content, substituted by [`load_baseline`].
+    /// [`GitBaselineSource::Saved`] leaves the blobs alone and is applied later, by
+    /// [`effective_baseline`]: the saved text lives on the *document*, which this per-buffer
+    /// cache has no access to.
+    pub choice: Option<GitBaselineSource>,
     /// A merge/rebase/cherry-pick the repo is stopped in the middle of. Cached here beside `branch`
     /// and `upstream` for the same reason: a repo-level read that changes when `.git` does, which
     /// is exactly when this baseline reloads — so a rebase started in a *terminal* reaches the
@@ -150,7 +153,7 @@ pub struct GitBaseline {
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
 /// and decompressing the committed blob — so it runs on open and on external Git changes, never
 /// per edit. Synchronous and `!Send`-clean (every libgit2 object is dropped before returning).
-pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
+pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
     // Canonicalise so `strip_prefix` against the (also canonicalised) workdir is symlink-proof,
     // and so a not-yet-on-disk file (new buffer) resolves to "no repo" rather than erroring.
     let Ok(canonical) = path.canonicalize() else {
@@ -217,8 +220,13 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
     // downstream — staged (blob → index) comes out empty, unstaged (index → buffer) is the whole
     // "changed since that commit" set, and the gutter, hunk navigation and revert all follow.
     // A file absent from that commit has no blob, so it reads as wholly added, which is true.
-    if let Some(rev) = revs.get(&workdir) {
-        let bytes = rev_blob_bytes(&repo, &rev.commit, &rel_path).map(normalize_lf);
+    //
+    // `Saved` deliberately falls through to the ordinary read below: its content is the document's
+    // own snapshot, which lives outside this cache, so the substitution happens in
+    // [`effective_baseline`] instead. The blobs loaded here go unused by the gutter but still
+    // answer everything else that asks the baseline a git question.
+    if let Some(choice @ GitBaselineSource::Rev { commit, .. }) = choices.get(&workdir) {
+        let bytes = rev_blob_bytes(&repo, commit, &rel_path).map(normalize_lf);
         return GitBaseline {
             worktree,
             repo: Some(GitRepo { workdir, rel_path }),
@@ -227,7 +235,7 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
             branch,
             upstream,
             staged_hunks: Vec::new(),
-            rev: Some(rev.clone()),
+            choice: Some(choice.clone()),
             operation,
             conflicted: false,
         };
@@ -241,6 +249,8 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         blob.as_deref().unwrap_or(b""),
         index_blob.as_deref().unwrap_or(b""),
     );
+    // Only `Saved` can still be in play here — `Rev` returned above — and it needs no blob work.
+    let choice = choices.get(&workdir).cloned();
     GitBaseline {
         worktree,
         repo: Some(GitRepo { workdir, rel_path }),
@@ -249,9 +259,66 @@ pub fn load_baseline(path: &Path, revs: &BaselineRevs) -> GitBaseline {
         branch,
         upstream,
         staged_hunks,
-        rev: None,
+        choice,
         operation,
         conflicted: false,
+    }
+}
+
+/// What a buffer is actually diffed against, resolved in one place so the gutter, the inline diff,
+/// hunk navigation and `git/apply_hunk` cannot disagree about it.
+pub struct EffectiveBaseline<'a> {
+    /// The bytes to diff the buffer against. `None` when there is nothing to compare to — a clean
+    /// file outside any repo, or a tracked path with no index entry.
+    pub blob: Option<&'a [u8]>,
+    /// The HEAD → index layer to compose underneath. Empty unless the comparison *is* the index:
+    /// nothing else has an index relationship to show.
+    pub staged: &'a [DiffHunk],
+    /// The user pinned a non-default baseline. Index writes are refused while this is set — the
+    /// hunks on screen are not index deltas, so staging them would write content the user never
+    /// asked to stage — while reverting still means "put this back to how it was there".
+    ///
+    /// Deliberately *not* set by the default baseline where it falls back to the saved file for an
+    /// untracked path: that fallback is display-only, and staging an untracked file (a hunk-wise
+    /// `git add` of the whole thing) stays as meaningful as it was before it had a gutter.
+    pub pinned: bool,
+}
+
+/// Resolve [`EffectiveBaseline`] for one buffer. `disk_blob` is the document's saved-text snapshot
+/// ([`crate::state::Document::disk_blob`]) — `Some` exactly while the document is dirty.
+///
+/// The default is the index, which is what makes the gutter agree with `git diff`. It falls back
+/// to the saved file when there is no git baseline at all — an untracked path, or a file in no
+/// repo — which is why those files have a gutter now: their unsaved edits are the only comparison
+/// available, and it is a real one. A clean file in that state has no snapshot, so the diff is
+/// empty, which is also correct.
+pub fn effective_baseline<'a>(
+    baseline: &'a GitBaseline,
+    disk_blob: Option<&'a [u8]>,
+) -> EffectiveBaseline<'a> {
+    match &baseline.choice {
+        Some(GitBaselineSource::Saved) => EffectiveBaseline {
+            blob: disk_blob,
+            staged: &[],
+            pinned: true,
+        },
+        // The pinned commit is already in both blobs; what has to come from here is the empty
+        // staged layer and `pinned`.
+        Some(GitBaselineSource::Rev { .. }) => EffectiveBaseline {
+            blob: baseline.index_blob.as_deref(),
+            staged: &[],
+            pinned: true,
+        },
+        None if baseline.blob.is_none() && baseline.index_blob.is_none() => EffectiveBaseline {
+            blob: disk_blob,
+            staged: &[],
+            pinned: false,
+        },
+        None => EffectiveBaseline {
+            blob: baseline.index_blob.as_deref(),
+            staged: &baseline.staged_hunks,
+            pinned: false,
+        },
     }
 }
 
@@ -650,6 +717,69 @@ fn checkout_rank(row: &BranchRow) -> u8 {
 ///
 /// Kept separate from `list_branches` so that function stays what its name says. Callers that want
 /// branches (the checkout pre-flight, tests) want branches; only the picker wants both.
+/// One candidate row for the baseline picker (`Space Alt-i`).
+#[derive(Debug, Clone)]
+pub struct BaselineRow {
+    /// What `Enter` sends. `None` is the "back to the default" row.
+    pub choice: Option<GitBaselineChoice>,
+    /// Row text and fuzzy haystack. Bracketed when it is not a revision.
+    pub label: String,
+}
+
+impl BaselineRow {
+    /// Whether this row names a revision — which is also which section it lands in. Derived from
+    /// `choice` rather than carried, so a row cannot be filed under a heading that contradicts what
+    /// it does.
+    pub fn is_revision(&self) -> bool {
+        matches!(self.choice, Some(GitBaselineChoice::Rev { .. }))
+    }
+}
+
+/// Rows for the baseline picker, in two sections: the working states this checkout is in right
+/// now, then the revisions it could be compared against.
+///
+/// The split is the point. "The index" and "the file on disk" are not revisions and never will be,
+/// and filing them in one list with `main` is most of what makes the baseline idea slippery. Their
+/// labels are bracketed for the same reason: unbracketed means `git rev-parse` would take it.
+///
+/// Order within the list is meaning, not score, so the picker keeps candidate order rather than
+/// re-ranking (see `PickerCandidates::rerank`) and the fixed rows stay reachable in one keystroke.
+///
+/// Branch rows come from the same listing the branch picker uses, minus the detached-worktree rows
+/// — those name a tree, not a revision, and there is nothing to diff against. Anything else
+/// `git rev-parse` accepts is reachable by typing it, which is why the query doubles as revision
+/// entry rather than this trying to enumerate tags and hashes too.
+pub fn baseline_picker_rows(workdir: &Path) -> Vec<BaselineRow> {
+    let mut rows = vec![
+        BaselineRow {
+            choice: None,
+            label: "(index)".to_string(),
+        },
+        BaselineRow {
+            choice: Some(GitBaselineChoice::Saved),
+            label: "(saved)".to_string(),
+        },
+        BaselineRow {
+            choice: Some(GitBaselineChoice::Rev {
+                rev: "HEAD".to_string(),
+            }),
+            label: "HEAD".to_string(),
+        },
+    ];
+    rows.extend(
+        list_branches(workdir)
+            .into_iter()
+            .filter(|b| b.detached_at.is_none())
+            .map(|b| BaselineRow {
+                choice: Some(GitBaselineChoice::Rev {
+                    rev: b.name.clone(),
+                }),
+                label: b.name,
+            }),
+    );
+    rows
+}
+
 pub fn branch_picker_rows(workdir: &Path) -> Vec<BranchRow> {
     let mut rows = list_branches(workdir);
     rows.extend(detached_worktrees(workdir));
@@ -3188,13 +3318,13 @@ mod tests {
     fn write_index_blob_updates_tracked_entry() {
         let dir = tempfile::tempdir().unwrap();
         let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
-        let repo = load_baseline(&file, &BaselineRevs::new())
+        let repo = load_baseline(&file, &BaselineChoices::new())
             .repo
             .expect("repo resolved");
 
         write_index_blob(&repo, b"one\nTWO\n").expect("index write");
 
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert_eq!(baseline.index_blob.as_deref(), Some(&b"one\nTWO\n"[..]));
         assert_eq!(
             baseline.blob.as_deref(),
@@ -3215,11 +3345,11 @@ mod tests {
         repo_with_committed_file(dir.path(), "other.rs", "x\n");
         let file = dir.path().join("new.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let repo = load_baseline(&file, &BaselineRevs::new())
+        let repo = load_baseline(&file, &BaselineChoices::new())
             .repo
             .expect("repo resolved");
         assert!(
-            load_baseline(&file, &BaselineRevs::new())
+            load_baseline(&file, &BaselineChoices::new())
                 .index_blob
                 .is_none(),
             "untracked → no entry yet"
@@ -3227,7 +3357,7 @@ mod tests {
 
         write_index_blob(&repo, b"hello\n").expect("index write");
 
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert_eq!(baseline.index_blob.as_deref(), Some(&b"hello\n"[..]));
         assert!(baseline.blob.is_none(), "still not in HEAD");
     }
@@ -3538,7 +3668,7 @@ mod tests {
         let repo = git2::Repository::open(dir.path()).unwrap();
         conflict_the_index(&repo, "src.rs", "mine\n", "theirs\n");
 
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert!(baseline.conflicted);
         // Both blobs hold HEAD, so the whole change set reads as unstaged against it. The
         // regression this guards is the alternative: with the index blob left absent the staged
@@ -3576,7 +3706,7 @@ mod tests {
     // ---- load_baseline + diff_hunks against a real repo -----------------------------------------
 
     fn hunks_for(file: &Path, current: &str) -> Vec<DiffHunk> {
-        let baseline = load_baseline(file, &BaselineRevs::new());
+        let baseline = load_baseline(file, &BaselineChoices::new());
         diff_hunks(baseline.blob.as_deref(), &rope(current))
     }
 
@@ -3617,7 +3747,7 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
             .unwrap();
 
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\nthree\n"[..]));
         assert!(
             diff_hunks(baseline.blob.as_deref(), &rope("one\ntwo\nthree\n")).is_empty(),
@@ -3632,7 +3762,7 @@ mod tests {
         git2::Repository::init(dir.path()).unwrap();
         let file = dir.path().join("untracked.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert!(baseline.repo.is_some(), "repo discovered");
         assert!(baseline.blob.is_none(), "untracked → no committed blob");
         assert!(diff_hunks(baseline.blob.as_deref(), &rope("hello\nworld\n")).is_empty());
@@ -3643,7 +3773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("loose.rs");
         std::fs::write(&file, "hello\n").unwrap();
-        let baseline = load_baseline(&file, &BaselineRevs::new());
+        let baseline = load_baseline(&file, &BaselineChoices::new());
         assert!(baseline.repo.is_none());
         assert!(baseline.blob.is_none());
     }
@@ -3654,7 +3784,7 @@ mod tests {
     fn blame_attributes_committed_lines_and_flags_edits() {
         let dir = tempfile::tempdir().unwrap();
         let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
-        let repo = load_baseline(&file, &BaselineRevs::new())
+        let repo = load_baseline(&file, &BaselineChoices::new())
             .repo
             .expect("repo resolved");
 
@@ -3680,7 +3810,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("loose.rs");
         std::fs::write(&file, "x\n").unwrap();
-        assert!(load_baseline(&file, &BaselineRevs::new()).repo.is_none());
+        assert!(load_baseline(&file, &BaselineChoices::new()).repo.is_none());
     }
 
     // ---- dir_statuses (explorer colouring) ------------------------------------------------------

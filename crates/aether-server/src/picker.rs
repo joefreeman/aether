@@ -536,6 +536,19 @@ pub struct GitStashCandidate {
     pub row: crate::git::StashRow,
 }
 
+/// One baseline-picker candidate: a thing the repo's gutter could be diffed against, plus the repo
+/// the row would re-baseline.
+///
+/// `current` is resolved at build time against the choice in force, and is server-side only: it
+/// picks the row a fresh open highlights (`current_state_item`) and never reaches the wire, because
+/// no client renders a marker for it.
+#[derive(Debug, Clone)]
+pub struct GitBaselineCandidate {
+    pub repo_id: String,
+    pub row: crate::git::BaselineRow,
+    pub current: bool,
+}
+
 /// Shortest query treated as a hash abbreviation — git's own floor for an abbreviated object name.
 /// Below it, a hex-looking query is far more likely to be prose ("add", "fed") than an id.
 pub const HASH_PREFIX_MIN: usize = 4;
@@ -684,6 +697,10 @@ pub enum PickerCandidates {
     /// One repo's stash entries, newest first. Rebuilt on every fresh open and after any stash
     /// mutation — like [`Self::GitBranches`], a stale list here would offer entries that are gone.
     GitStash(Vec<GitStashCandidate>),
+    /// What one repo's gutter could be diffed against: three fixed rows then its branches, in
+    /// meaning order. Rebuilt on every fresh open like [`Self::GitBranches`] — the branch list and
+    /// the `current` marker both go stale the moment HEAD or the baseline moves.
+    GitBaseline(Vec<GitBaselineCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -716,6 +733,7 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => v.len(),
             PickerCandidates::GitLog(v) => v.len(),
             PickerCandidates::GitStash(v) => v.len(),
+            PickerCandidates::GitBaseline(v) => v.len(),
         }
     }
 
@@ -744,6 +762,7 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => v.clear(),
             PickerCandidates::GitLog(v) => v.clear(),
             PickerCandidates::GitStash(v) => v.clear(),
+            PickerCandidates::GitBaseline(v) => v.clear(),
         }
     }
 
@@ -768,6 +787,7 @@ impl PickerCandidates {
             // `GitChangesFile`: same rows, different scope and its own state slot.
             PickerCandidates::GitLog(_) => PickerKind::GitLog,
             PickerCandidates::GitStash(_) => PickerKind::GitStash,
+            PickerCandidates::GitBaseline(_) => PickerKind::GitBaseline,
         }
     }
 
@@ -801,6 +821,9 @@ impl PickerCandidates {
             PickerCandidates::GitBranches(v) => &v[idx].row.name,
             PickerCandidates::GitLog(v) => &v[idx].haystack,
             PickerCandidates::GitStash(v) => &v[idx].row.message,
+            // The label alone. `detail` is prose the row shows, not something anyone types to
+            // find a baseline — matching it would make "disk" hit the `saved` row's explanation.
+            PickerCandidates::GitBaseline(v) => &v[idx].row.label,
         }
     }
 
@@ -1001,6 +1024,15 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::GitBaseline(v) => {
+                let c = &v[idx];
+                PickerItem::GitBaseline {
+                    repo_id: c.repo_id.clone(),
+                    choice: c.row.choice.clone(),
+                    label: c.row.label.clone(),
+                    match_indices,
+                }
+            }
             PickerCandidates::GitLog(v) => {
                 let c = &v[idx];
                 PickerItem::GitCommit {
@@ -1137,6 +1169,11 @@ impl PickerCandidates {
             (PickerCandidates::GitBranches(v), PickerItem::GitBranch { repo_id, name, .. }) => v
                 .iter()
                 .position(|c| c.repo_id == *repo_id && c.row.name == *name),
+            // The label is the identity — two rows can share a repo but never a label. Matched
+            // with `repo_id` for the same reason the branch arm is.
+            (PickerCandidates::GitBaseline(v), PickerItem::GitBaseline { repo_id, label, .. }) => v
+                .iter()
+                .position(|c| c.repo_id == *repo_id && c.row.label == *label),
             // A hash is unique and stable, so unlike the positional-identity kinds a commit row
             // resolves however the list has been filtered since.
             (PickerCandidates::GitLog(v), PickerItem::GitCommit { hash, .. }) => {
@@ -1170,7 +1207,8 @@ impl PickerCandidates {
             | PickerCandidates::Jumplist(_)
             | PickerCandidates::GitBranches(_)
             | PickerCandidates::GitLog(_)
-            | PickerCandidates::GitStash(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::GitStash(_)
+            | PickerCandidates::GitBaseline(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1293,6 +1331,8 @@ impl PickerCandidates {
             PickerCandidates::GitLog(_) => None,
             // A stash is the same: preview via `git/show`, mutate via the `git/stash_*` chords.
             PickerCandidates::GitStash(_) => None,
+            // Enter fires `git/set_baseline` from the client, like every other `Space g` picker.
+            PickerCandidates::GitBaseline(_) => None,
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker
@@ -1980,6 +2020,7 @@ impl PickerState {
                         | PickerCandidates::Jumplist(_)
                         | PickerCandidates::GitLog(_)
                         | PickerCandidates::GitStash(_)
+                        | PickerCandidates::GitBaseline(_)
                 ) {
                     // Grouped kinds: keep matches in document (candidate) order, not score order,
                     // so each group's rows stay a contiguous run the client can put a single
@@ -1991,6 +2032,10 @@ impl PickerState {
                     // *data*. Reordering commits by match score puts a 12-week-old commit above an
                     // hour-old one because its subject happens to score better, which reads as a
                     // bug — the list stopped being a history. Filter, don't rank.
+                    //
+                    // GitBaseline likewise: its order is *meaning*. The three fixed rows are the
+                    // answers worth one keystroke and have to stay at the top, where a branch whose
+                    // name happens to score better would otherwise displace them.
                     let mut keep: Vec<u32> = scored.into_iter().map(|(_, i)| i).collect();
                     keep.sort_unstable();
                     self.ranked = keep;
@@ -2271,6 +2316,8 @@ impl PickerState {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
             PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+            // Two sections keyed on the same fact the label's brackets show: is this a revision.
+            PickerCandidates::GitBaseline(v) => Some((v[ci].row.is_revision() as u32, "")),
             // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
             // jumplist's label groups.
             PickerCandidates::WorkspaceSymbols(v) => Some((LABEL_KEY, v[ci].display_path.as_str())),
@@ -2322,6 +2369,13 @@ impl PickerState {
                     "Definition".into()
                 } else {
                     "References".into()
+                },
+            }),
+            PickerCandidates::GitBaseline(v) => Some(GroupHeader::Label {
+                label: if v[ci].row.is_revision() {
+                    "Revisions".into()
+                } else {
+                    "Working state".into()
                 },
             }),
             PickerCandidates::Keybindings(v) => Some(GroupHeader::Label {

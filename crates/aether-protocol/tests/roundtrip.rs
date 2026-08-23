@@ -17,11 +17,11 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
-    GitApplyHunkResult, GitBaselineRef, GitBlameChanged, GitBlameChangedParams, GitBlameLine,
-    GitBlameLineParams, GitBlameLineResult, GitBufferStatus, GitChangeCounts, GitHead,
-    GitNavigateHunk, GitNavigateHunkParams, GitRefresh, GitRefreshParams, GitRefreshResult,
-    GitRepoInfo, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
-    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitStashPush,
+    GitApplyHunkResult, GitBaselineChoice, GitBaselineSource, GitBlameChanged,
+    GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
+    GitChangeCounts, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitRefresh, GitRefreshParams,
+    GitRefreshResult, GitRepoInfo, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
+    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitStashPush,
     GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
 };
 use aether_protocol::input::{
@@ -328,16 +328,25 @@ fn git_set_baseline_shapes() {
     assert_eq!(
         to_value(&GitSetBaselineParams {
             repo_id: "/src/aether".into(),
-            rev: Some("main".into()),
+            source: Some(GitBaselineChoice::Rev { rev: "main".into() }),
         })
         .unwrap(),
-        json!({"repo_id": "/src/aether", "rev": "main"})
+        json!({"repo_id": "/src/aether", "source": {"kind": "rev", "rev": "main"}})
     );
-    // Clearing back to HEAD is the absent field, not a null.
+    // The saved-file baseline carries nothing but its tag — there is no revision to name.
     assert_eq!(
         to_value(&GitSetBaselineParams {
             repo_id: "/src/aether".into(),
-            rev: None,
+            source: Some(GitBaselineChoice::Saved),
+        })
+        .unwrap(),
+        json!({"repo_id": "/src/aether", "source": {"kind": "saved"}})
+    );
+    // Clearing back to the default is the absent field, not a null.
+    assert_eq!(
+        to_value(&GitSetBaselineParams {
+            repo_id: "/src/aether".into(),
+            source: None,
         })
         .unwrap(),
         json!({"repo_id": "/src/aether"})
@@ -345,7 +354,7 @@ fn git_set_baseline_shapes() {
 
     // The label is what the user typed; the commit is what it was pinned to.
     let set = GitSetBaselineResult {
-        baseline: Some(GitBaselineRef {
+        baseline: Some(GitBaselineSource::Rev {
             label: "main".into(),
             commit: "a1b2c3d".into(),
         }),
@@ -354,9 +363,16 @@ fn git_set_baseline_shapes() {
     let v = to_value(&set).unwrap();
     assert_eq!(
         v,
-        json!({"baseline": {"label": "main", "commit": "a1b2c3d"}, "buffers": [1, 2]})
+        json!({"baseline": {"kind": "rev", "label": "main", "commit": "a1b2c3d"}, "buffers": [1, 2]})
     );
     assert_eq!(from_value::<GitSetBaselineResult>(v).unwrap(), set);
+    let saved = GitSetBaselineResult {
+        baseline: Some(GitBaselineSource::Saved),
+        buffers: vec![],
+    };
+    let v = to_value(&saved).unwrap();
+    assert_eq!(v, json!({"baseline": {"kind": "saved"}}));
+    assert_eq!(from_value::<GitSetBaselineResult>(v).unwrap(), saved);
     assert_eq!(
         to_value(&GitSetBaselineResult {
             baseline: None,
@@ -366,12 +382,12 @@ fn git_set_baseline_shapes() {
         json!({})
     );
 
-    // The status bar's copy of it: absent when diffing against HEAD, so existing clients that
-    // ignore the field keep reading the same shape they always did.
+    // The status bar's copy of it: absent while diffing against the index, so a client that
+    // ignores the field keeps reading the same shape it always did.
     let plain = GitBufferStatus::default();
     assert!(to_value(&plain).unwrap().get("baseline").is_none());
     let against_rev = GitBufferStatus {
-        baseline: Some(GitBaselineRef {
+        baseline: Some(GitBaselineSource::Rev {
             label: "v1.0".into(),
             commit: "9f8e7d6".into(),
         }),
@@ -379,7 +395,15 @@ fn git_set_baseline_shapes() {
     };
     assert_eq!(
         to_value(&against_rev).unwrap()["baseline"],
-        json!({"label": "v1.0", "commit": "9f8e7d6"})
+        json!({"kind": "rev", "label": "v1.0", "commit": "9f8e7d6"})
+    );
+    let against_saved = GitBufferStatus {
+        baseline: Some(GitBaselineSource::Saved),
+        ..Default::default()
+    };
+    assert_eq!(
+        to_value(&against_saved).unwrap()["baseline"],
+        json!({"kind": "saved"})
     );
 
     // The refusal that comes with it.

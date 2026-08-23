@@ -12167,3 +12167,84 @@ fn uncommitting_with_no_parent_shows_gits_refusal() {
             if body.contains("ambiguous argument") && *kind == ToastKind::Warning
     )));
 }
+
+/// `Space Alt-i` is the diff toggle's Alt sibling: plain toggles the inline view, Alt chooses what
+/// it compares against. The pair names one verb at two levels, and the cheap chord stays with the
+/// gesture you make many times a session.
+#[test]
+fn space_alt_i_opens_the_baseline_picker() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.workspace = "p".into();
+    s.workspace_paths = vec!["/p".into()];
+
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('i'), Mods::ALT, None, ROWS);
+    let params = find_request(&fx, "picker/view").expect("Space Alt-i opens a picker");
+    assert_eq!(params["kind"], "git_baseline");
+    assert_eq!(
+        params["buffer_id"],
+        serde_json::json!(s.buffer.buffer_id),
+        "the picker resolves its repo from the buffer you are looking at"
+    );
+    assert_eq!(
+        s.picker.as_ref().map(|p| p.kind),
+        Some(PickerKind::GitBaseline)
+    );
+}
+
+/// Enter on a baseline row fires `git/set_baseline` with the row's own `choice`, verbatim — the
+/// row and the RPC share a type so there is nothing to translate.
+#[test]
+fn baseline_picker_enter_sets_the_baseline() {
+    use aether_protocol::git::GitBaselineChoice;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let row = |label: &str, choice: Option<GitBaselineChoice>| PickerItem::GitBaseline {
+        repo_id: "/p".into(),
+        choice,
+        label: label.into(),
+        match_indices: vec![],
+    };
+    let open = |selected: u32| {
+        let mut s = session();
+        s.workspace = "p".into();
+        s.workspace_paths = vec!["/p".into()];
+        let _ = s.open_picker(PickerKind::GitBaseline, None, None, false, None);
+        {
+            let p = s.picker.as_mut().expect("picker open");
+            p.items = vec![
+                row("(index)", None),
+                row("(saved)", Some(GitBaselineChoice::Saved)),
+                row("main", Some(GitBaselineChoice::Rev { rev: "main".into() })),
+            ];
+            p.total_matches = 3;
+            p.selected = selected;
+        }
+        s
+    };
+
+    let mut s = open(1);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
+    assert_eq!(params["repo_id"], "/p");
+    assert_eq!(params["source"], serde_json::json!({"kind": "saved"}));
+    assert!(s.picker.is_none(), "the picker closes behind the choice");
+
+    let mut s = open(2);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
+    assert_eq!(
+        params["source"],
+        serde_json::json!({"kind": "rev", "rev": "main"})
+    );
+
+    // The `index` row clears the baseline: absent `source`, which is the same absent the RPC
+    // already took to mean "back to the default".
+    let mut s = open(0);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
+    assert!(
+        params.get("source").is_none(),
+        "the default row sends no source, got {params}"
+    );
+}

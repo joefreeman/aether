@@ -1344,6 +1344,10 @@ static LEADER: &[Binding] = &[
     // git sub-leader now abandons a stopped merge, which is not a key to leave a view toggle's
     // muscle memory pointing at.
     bind!(L, ch('i'), Exact(Mods::NONE), A::ToggleDiffView, "Git", "Toggle inline diff"),
+    // The Alt sibling names the same verb one level down: plain toggles the view, Alt chooses what
+    // it shows. Toggling is a many-times-a-session gesture and re-baselining a rare one, so the
+    // cheap chord stays with the toggle.
+    bind!(L, ch('i'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitBaseline), "Git", "Diff against…"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
 ];
@@ -1365,9 +1369,14 @@ static LEADER: &[Binding] = &[
 ///
 /// Still reserved, so the shape is decided once rather than key by key: `m` the full-file blame
 /// column, `y` copy commit permalink, `Alt-g` (free — the repo picker's likely home now that `r`
-/// is revert). Diffing against a revision (`git/set_baseline`, already built server-side) belongs
-/// with the diff toggle on `Space Alt-i`, not here. The reflog is a filter chip on the log picker
-/// rather than a key: it's the same rows over a different ref walk.
+/// is revert). Choosing what the gutter diffs against went where this said it would, on
+/// `Space Alt-i` beside the diff toggle, and is not a key here. The reflog is a filter chip on the
+/// log picker rather than a key: it's the same rows over a different ref walk.
+///
+/// One consequence worth naming, since it is the only place a `Space g` key does something with no
+/// git in it: while the baseline is the saved file, `r` reverts a hunk to *disk*, i.e. discards its
+/// unsaved edits. Staging and unstaging are refused there (and under a pinned revision) — see
+/// `ApplyHunkStatus::NotAgainstHead`.
 #[rustfmt::skip]
 static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('s'), Exact(Mods::NONE), A::StageChange { scope: ApplyScope::Cursor }, "Git", "Stage change (hunk/selection)"),

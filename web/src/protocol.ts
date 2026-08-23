@@ -228,7 +228,23 @@ export interface GitBufferStatus {
    *  branch alone can't say it — git allows one checkout per branch per family, so the same name
    *  reads identically either way. Absent means false. */
   worktree?: boolean;
+  /** Set when the repo is diffed against something other than the index. The gutter then means
+   *  "changed since this commit" — or "since I last saved" — and `staged` is always empty, so the
+   *  status bar has to say so. Absent for the default baseline, including the saved-file fallback
+   *  an untracked file takes: that is not a state the user chose. */
+  baseline?: GitBaselineSource | null;
 }
+
+/** What to diff against — the request form (`git/set_baseline`). */
+export type GitBaselineChoice =
+  | { kind: "saved" }
+  | { kind: "rev"; rev: string };
+
+/** A non-default diff baseline in force, resolved. A revision is pinned at set time, so `label` is
+ *  what the user asked for and `commit` is what it resolved to. */
+export type GitBaselineSource =
+  | { kind: "saved" }
+  | { kind: "rev"; label: string; commit: string };
 
 // ---- cursor -------------------------------------------------------------------------------------
 
@@ -369,7 +385,8 @@ export type PickerKind =
   | "git_branches"
   | "git_log"
   | "git_log_file"
-  | "git_stash";
+  | "git_stash"
+  | "git_baseline";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -463,6 +480,18 @@ export type PickerItem =
       message?: string;
       /** When the entry was made, Unix seconds; 0/absent when unknown. */
       timestamp?: number;
+      match_indices?: number[];
+    }
+  | {
+      kind: "git_baseline";
+      /** Which repo the row would re-baseline — echoed onto the `git/set_baseline` it fires. */
+      repo_id: string;
+      /** What Enter sends. Absent is the "back to the default" row, which is the same absent the
+       *  RPC takes to clear a baseline. */
+      choice?: GitBaselineChoice | null;
+      /** Row text and fuzzy haystack: `(index)`, `(saved)`, `HEAD`, a branch name. The bracketed
+       *  ones are not revisions, which is also the section split. */
+      label: string;
       match_indices?: number[];
     }
   | {

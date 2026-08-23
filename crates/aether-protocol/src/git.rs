@@ -123,12 +123,17 @@ pub struct GitBufferStatus {
     /// remote's current state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<GitUpstreamStatus>,
-    /// Set when the repo is diffed against something other than HEAD ([`GitSetBaseline`]). The
-    /// gutter then means "changed since this commit" and `staged` is always empty, so clients
-    /// must surface this — an unexplained gutter that disagrees with `git diff` is worse than no
-    /// gutter at all.
+    /// Set when the repo is diffed against something other than the index ([`GitSetBaseline`]).
+    /// The gutter then means "changed since this commit" — or "changed since I last saved" — and
+    /// `staged` is always empty, so clients must surface this: an unexplained gutter that
+    /// disagrees with `git diff` is worse than no gutter at all.
+    ///
+    /// Deliberately absent for the *default* baseline, including the saved-file baseline a file
+    /// falls back to when it has no git baseline of its own (untracked, or no repo). That is not
+    /// a state the user chose and has no alternative to be confused with, so a permanent token on
+    /// every untracked file would be noise — same argument as a permanent `↑0 ↓0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline: Option<GitBaselineRef>,
+    pub baseline: Option<GitBaselineSource>,
     /// How many conflict blocks this file still has, when a stopped merge or rebase left it
     /// conflicted. Zero — and omitted — for every unconflicted file.
     ///
@@ -1272,18 +1277,18 @@ pub struct GitCancelResult {
 
 // ---- git/set_baseline ---------------------------------------------------------------------------
 
-/// Diff a repo against a revision other than HEAD — "what have I changed since I branched?",
-/// "what did this file look like at v1.0?".
+/// Diff a repo against something other than the index — "what have I changed since I branched?",
+/// "what did this file look like at v1.0?", "what have I typed but not saved?".
 ///
 /// Repo-scoped rather than per-buffer: the question is about a body of work, not one file, and
 /// having the answer change as you move between files would make the gutter meaningless. Every
 /// buffer in the repo re-diffs, and the whole existing stack — gutter, hunk navigation, inline
 /// diff, revert — follows without knowing anything changed.
 ///
-/// The staged/unstaged distinction does not survive: there is no index relationship to an
-/// arbitrary commit, so the entire change set reads as unstaged and staging is refused
-/// ([`ApplyHunkStatus::NotAgainstHead`]). Reverting still means something — restore this hunk to
-/// how it was at that commit — and still works.
+/// The staged/unstaged distinction does not survive a non-default baseline: there is no index
+/// relationship to an arbitrary commit, nor to the file on disk, so the entire change set reads as
+/// unstaged and staging is refused ([`ApplyHunkStatus::NotAgainstHead`]). Reverting still means
+/// something — restore this hunk to how it was there — and still works.
 pub struct GitSetBaseline;
 impl RpcMethod for GitSetBaseline {
     const NAME: &'static str = "git/set_baseline";
@@ -1294,32 +1299,50 @@ impl RpcMethod for GitSetBaseline {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitSetBaselineParams {
     pub repo_id: RepoId,
-    /// Anything `git rev-parse` accepts: a branch, tag, hash, `HEAD~3`. `None` restores HEAD.
-    /// An unresolvable revision is an error, not a silent fallback.
+    /// What to diff against. `None` restores the default (index, with HEAD → index as the staged
+    /// layer) — which is also what the picker's first row sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
+    pub source: Option<GitBaselineChoice>,
+}
+
+/// What the caller asked to diff against — the *request* form, before resolution. The resolved
+/// form is [`GitBaselineSource`], which carries the commit a revision pinned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitBaselineChoice {
+    /// Every file as it was last written to disk. Not a git object at all — the comparison is
+    /// against the working tree's own saved state, which is why it is the one baseline that also
+    /// works for an untracked file, or a file in no repo.
+    Saved,
+    /// Anything `git rev-parse` accepts: a branch, tag, hash, `HEAD~3`. An unresolvable revision
+    /// is an error, not a silent fallback.
+    Rev { rev: String },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSetBaselineResult {
-    /// The baseline now in force, or `None` when it's back to HEAD.
+    /// The baseline now in force, or `None` when it's back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline: Option<GitBaselineRef>,
+    pub baseline: Option<GitBaselineSource>,
     /// Buffers whose diff was recomputed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buffers: Vec<BufferId>,
 }
 
-/// A pinned non-HEAD diff baseline: what the user asked for, and what it resolved to.
+/// A non-default diff baseline in force, resolved.
 ///
-/// Pinned at set time rather than re-resolved per file. `git diff main` re-resolves, but a gutter
-/// is ambient — having it shift because someone pushed to `main` while you were reading is worse
-/// than it going slightly stale. `label` is carried so the UI can say `main` rather than a hash
-/// the user never typed.
+/// A revision is pinned at set time rather than re-resolved per file. `git diff main` re-resolves,
+/// but a gutter is ambient — having it shift because someone pushed to `main` while you were
+/// reading is worse than it going slightly stale. `label` is carried so the UI can say `main`
+/// rather than a hash the user never typed.
+///
+/// `Saved` needs neither: it names the file on disk, which is not a commit and has no label worth
+/// carrying — every client renders it as the same one word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitBaselineRef {
-    pub label: String,
-    pub commit: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitBaselineSource {
+    Saved,
+    Rev { label: String, commit: String },
 }
 
 // ---- git/show ------------------------------------------------------------------------------------

@@ -4365,6 +4365,15 @@ impl App {
                 used += seg.chars().count();
                 left = left.push(t(seg, colour));
             }
+            // A pinned baseline, in its own token beside the branch: the branch says where you
+            // are, this says what you are compared against, and on a feature branch diffed against
+            // `main` both are wanted at once. Absent for the default, and for the saved-file
+            // fallback an untracked file takes — see the terminal shell for the argument.
+            if let Some(base) = &gs.baseline {
+                let seg = format!("  {}", aether_client::labels::baseline_token(base));
+                used += seg.chars().count();
+                left = left.push(t(seg, p.accent_alt));
+            }
             for (sigil, color, un, st) in classes {
                 if un == 0 && st == 0 {
                     continue;

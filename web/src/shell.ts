@@ -917,6 +917,12 @@ function describePickerItem(
         meta: item.timestamp ? time_ago(item.timestamp) : "",
       };
     }
+    case "git_baseline": {
+      // Just the label. The baseline in force is the row a fresh open highlights rather than one
+      // wearing a marker, and the two section headers ("Working state" / "Revisions") carry what a
+      // per-row description used to.
+      return { primary: item.label, matches: item.match_indices };
+    }
     case "git_commit": {
       // `abc1234  subject … author · 3w ago`. The hash leads (it identifies the commit and is what
       // you'd quote elsewhere); author and date trail dim. The subject highlights its fuzzy hits,
@@ -4946,6 +4952,22 @@ export class Shell {
         b.textContent = label;
         used += [...b.textContent].length + 2;
         gitGroup.append(b);
+      }
+      // A pinned baseline, in its own token beside the branch: the branch says where you are,
+      // this says what you are compared against, and on a feature branch diffed against `main`
+      // both are wanted at once. Absent for the default, and for the saved-file fallback an
+      // untracked file takes — a permanent token on every untracked file would be noise.
+      if (gs.baseline) {
+        const el = document.createElement("span");
+        el.className = "status-git git-base";
+        // Mirrors `labels::baseline_token` in the core, which the native shells share. Brackets
+        // mark what is not a revision; no space after the delta — one token.
+        el.textContent =
+          gs.baseline.kind === "saved"
+            ? "\u0394(saved)"
+            : `\u0394${gs.baseline.label}`;
+        used += [...el.textContent].length + 1;
+        gitGroup.append(el);
       }
       const u = gs.unstaged;
       const s = gs.staged;

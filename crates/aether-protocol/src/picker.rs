@@ -193,6 +193,31 @@ pub enum PickerKind {
     /// the client fires against the highlighted row, so there is no `PickerSelectResult` for it.
     /// `refs/stash` is shared across worktrees, so a linked worktree lists the whole repo's.
     GitStash,
+    /// What the repo's gutter and inline diff compare against (`Space Alt-i`). Rows are
+    /// [`PickerItem::GitBaseline`]; `Enter` fires [`crate::git::GitSetBaseline`], so it is not a
+    /// jump target and has no `PickerSelectResult`.
+    ///
+    /// Sits with the diff *toggle* on `Space i` rather than under `Space g`, for the reason the
+    /// toggle does: both are ways of looking at the buffer you are already in, and neither writes
+    /// anything. Plain toggles the view, Alt chooses what it shows.
+    ///
+    /// Two sections, because the rows are two different kinds of thing and conflating them is what
+    /// makes the whole idea hard to hold: **working state** — `(index)` and `(saved)`, the states
+    /// this checkout is in right now — then **revisions**, `HEAD` and the repo's branches. The
+    /// parentheses carry the same distinction down to the row: everything unbracketed is something
+    /// `git rev-parse` would accept, and everything bracketed is not.
+    ///
+    /// Rows are bare labels. The sections say what kind of answer each one is, which is what a
+    /// per-row description was doing badly.
+    ///
+    /// The query doubles as revision entry: it matches names fuzzily *and* hashes by prefix (as
+    /// [`GitLog`](Self::GitLog) does), because the set of things `git rev-parse` accepts is
+    /// unbounded and a list cannot enumerate it.
+    ///
+    /// Opens highlighting the baseline in force, the way the branch picker opens on the checkout
+    /// you are standing in — "where you are" is the selection, not a glyph on the row. So the row
+    /// carries no `current` flag: nothing renders one.
+    GitBaseline,
 }
 
 impl PickerKind {
@@ -281,6 +306,7 @@ impl PickerKind {
                 | PickerKind::References
                 | PickerKind::DiagnosticsWorkspace
                 | PickerKind::WorkspaceSymbols
+                | PickerKind::GitBaseline
                 | PickerKind::Keybindings
                 | PickerKind::Jumplist
         )
@@ -885,6 +911,22 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "is_zero_i64")]
         timestamp: i64,
         /// Char offsets into `message` covered by fuzzy matches.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One candidate diff baseline ([`PickerKind::GitBaseline`]). Identity is `choice`: two rows
+    /// can share a label (a branch named `saved`) but never a choice.
+    GitBaseline {
+        /// The repo this row would re-baseline, echoed onto the `git/set_baseline` it fires.
+        repo_id: crate::git::RepoId,
+        /// What `Enter` sends. `None` is the "back to the default" row — the same `None` the RPC
+        /// takes, so the row needs no special case at the call site.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<crate::git::GitBaselineChoice>,
+        /// The row's text and fuzzy haystack: `(index)`, `(saved)`, `HEAD`, a branch name. The
+        /// bracketed ones are not revisions — see [`PickerKind::GitBaseline`].
+        label: String,
+        /// Char offsets into `label` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },

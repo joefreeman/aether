@@ -421,7 +421,26 @@ pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
         PickerKind::GitLog => "Search history…",
         PickerKind::GitLogFile => "Search this file's history…",
         PickerKind::GitStash => "Find stash…",
+        PickerKind::GitBaseline => "Diff against…",
         PickerKind::Jumplist => "Filter the jumplist…",
+    }
+}
+
+/// The status bar's diff-baseline token: `\u{394}(saved)`, `\u{394}main`, `\u{394}v1.0`.
+///
+/// Brackets mark the things that are *not* revisions, matching the baseline picker's rows and its
+/// two sections — unbracketed means `git rev-parse` would accept it. No space after the delta: the
+/// glyph and its value are one token, and the cluster it sits in has no width to spare.
+///
+/// Only ever called for a *pinned* baseline. The default renders nothing at all, so there is no
+/// `(index)` case here — see `GitBufferStatus::baseline`.
+///
+/// One function for every shell, like [`picker_placeholder`]. The browser shell keeps its own copy
+/// in TypeScript; nothing else may.
+pub fn baseline_token(baseline: &aether_protocol::git::GitBaselineSource) -> String {
+    match baseline {
+        aether_protocol::git::GitBaselineSource::Saved => "\u{394}(saved)".to_string(),
+        aether_protocol::git::GitBaselineSource::Rev { label, .. } => format!("\u{394}{label}"),
     }
 }
 

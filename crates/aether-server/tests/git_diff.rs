@@ -1673,14 +1673,43 @@ async fn set_baseline(
     root: &std::path::Path,
     rev: Option<&str>,
 ) -> GitSetBaselineResult {
+    set_baseline_source(
+        ws,
+        root,
+        rev.map(|r| GitBaselineChoice::Rev { rev: r.to_string() }),
+    )
+    .await
+}
+
+async fn set_baseline_source(
+    ws: &mut Ws,
+    root: &std::path::Path,
+    source: Option<GitBaselineChoice>,
+) -> GitSetBaselineResult {
     send_request::<GitSetBaseline>(
         ws,
         &GitSetBaselineParams {
             repo_id: root.to_string_lossy().into(),
-            rev: rev.map(str::to_string),
+            source,
         },
     )
     .await
+}
+
+/// The label a resolved baseline shows, for assertions.
+fn baseline_label(b: &GitBaselineSource) -> &str {
+    match b {
+        GitBaselineSource::Saved => "saved",
+        GitBaselineSource::Rev { label, .. } => label,
+    }
+}
+
+/// The commit a resolved *revision* baseline pinned to.
+fn baseline_commit(b: &GitBaselineSource) -> &str {
+    match b {
+        GitBaselineSource::Rev { commit, .. } => commit,
+        GitBaselineSource::Saved => panic!("saved baseline has no commit"),
+    }
 }
 
 async fn git_status_now(ws: &mut Ws, viewport_id: u64) -> aether_protocol::git::GitBufferStatus {
@@ -1743,10 +1772,15 @@ async fn set_baseline_diffs_against_an_older_commit() {
     assert_eq!(res.buffers, vec![buffer_id]);
     let baseline = res.baseline.expect("baseline set");
     assert_eq!(
-        baseline.label, first,
+        baseline_label(&baseline),
+        first,
         "the label is what the user asked for"
     );
-    assert_eq!(baseline.commit, first[..7], "resolved and pinned");
+    assert_eq!(
+        baseline_commit(&baseline),
+        &first[..7],
+        "resolved and pinned"
+    );
 
     let gs = git_status_now(&mut ws, sub.viewport_id).await;
     assert_eq!(
@@ -1758,10 +1792,7 @@ async fn set_baseline_diffs_against_an_older_commit() {
     assert!(gs.staged.is_empty());
     // And the status says so, so the gutter disagreeing with `git diff` is explained rather than
     // mysterious.
-    assert_eq!(
-        gs.baseline.as_ref().map(|b| b.label.as_str()),
-        Some(&*first)
-    );
+    assert_eq!(gs.baseline.as_ref().map(baseline_label), Some(&*first));
 
     // The hunk is real, not just a count.
     let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
@@ -1796,8 +1827,8 @@ async fn set_baseline_resolves_and_pins_a_named_revision() {
 
     let res = set_baseline(&mut ws, &root, Some("main")).await;
     let pinned = res.baseline.expect("baseline set");
-    assert_eq!(pinned.label, "main");
-    assert_eq!(pinned.commit, first[..7]);
+    assert_eq!(baseline_label(&pinned), "main");
+    assert_eq!(baseline_commit(&pinned), &first[..7]);
 
     // `main` moves on. The pinned commit does not follow it.
     with_tree_rewrite(&server, &root, || {
@@ -1835,7 +1866,7 @@ async fn set_baseline_resolves_and_pins_a_named_revision() {
     .await;
     let gs = sub.window.git_status.expect("git status");
     assert_eq!(gs.unstaged.added, 1, "pinned baseline, got {gs:?}");
-    assert_eq!(gs.baseline.map(|b| b.commit), Some(first[..7].to_string()));
+    assert_eq!(gs.baseline.as_ref().map(baseline_commit), Some(&first[..7]));
     drop(server);
 }
 
@@ -1851,7 +1882,9 @@ async fn set_baseline_rejects_an_unknown_revision_without_clearing() {
         &mut ws,
         &GitSetBaselineParams {
             repo_id: root.to_string_lossy().into(),
-            rev: Some("no-such-ref".into()),
+            source: Some(GitBaselineChoice::Rev {
+                rev: "no-such-ref".into(),
+            }),
         },
     )
     .await;
@@ -1860,8 +1893,8 @@ async fn set_baseline_rejects_an_unknown_revision_without_clearing() {
     // The good baseline survived the bad request.
     let still = set_baseline(&mut ws, &root, Some(&first)).await;
     assert_eq!(
-        still.baseline.map(|b| b.commit),
-        Some(first[..7].to_string())
+        still.baseline.as_ref().map(baseline_commit),
+        Some(&first[..7])
     );
     drop(server);
 }
@@ -3949,6 +3982,332 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
         landed, "fn z2() {}",
         "landed on later.rs's own change, not a.rs's and not the top"
     );
+
+    drop(server);
+}
+
+// ---- the saved-file baseline ---------------------------------------------------------------------
+//
+// `git/set_baseline` with `Saved`, and the fallback a file with no git baseline takes by default.
+// The whole existing gutter/hunk stack follows it without knowing what it is comparing against —
+// which is the point, and what these pin.
+
+/// Subscribe a viewport and return the window's per-line diff markers, oldest line first.
+async fn markers(ws: &mut Ws, buffer_id: u64) -> Vec<Option<DiffMarker>> {
+    subscribe_window(ws, buffer_id)
+        .await
+        .lines
+        .iter()
+        .map(|l| l.diff_marker)
+        .collect()
+}
+
+/// Subscribe a fresh viewport and hand back its window. Each call takes a new `viewport_id`, so
+/// nothing here may assume a particular one.
+async fn subscribe_window(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewport::Window {
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        &ViewportSubscribeParams {
+            buffer_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: 0,
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    sub.window
+}
+
+/// Type `text` at the cursor.
+async fn type_at_cursor(ws: &mut Ws, buffer_id: u64, text: &str) {
+    let _e: EditResult = send_request::<InputText>(
+        ws,
+        &InputTextParams {
+            buffer_id,
+            text: text.into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+}
+
+/// The headline behaviour change: a file git knows nothing about still shows the edits you have
+/// not saved. Before this it had a blank gutter no matter what you did to it, because a `None`
+/// baseline short-circuited to an empty diff.
+#[tokio::test]
+async fn untracked_file_shows_its_unsaved_edits_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "tracked.rs", "x\n");
+    std::fs::write(dir.path().join("new.rs"), "alpha\nbeta\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "untracked-diff", "new.rs").await;
+
+    // Clean on disk: the saved-file baseline has nothing to say, and no snapshot is even taken.
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, None, None],
+        "an untracked file that matches disk shows no changes"
+    );
+
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "B").await;
+
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, Some(DiffMarker::Modified), None],
+        "the edited line is marked against the file as last saved"
+    );
+
+    drop(server);
+}
+
+/// The same fallback outside any repo at all — the case that has no git in it whatsoever.
+#[tokio::test]
+async fn file_outside_a_repo_shows_its_unsaved_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "one\ntwo\n").unwrap();
+    let (server, mut ws, buffer_id) =
+        setup_git_apply(dir.path(), "no-repo-diff", "plain.txt").await;
+
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "X").await;
+
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![Some(DiffMarker::Modified), None, None]
+    );
+
+    drop(server);
+}
+
+/// A never-saved buffer's snapshot is the empty file it started as, so everything in it is an
+/// addition. Falls out of the same rule rather than being a case.
+#[tokio::test]
+async fn a_new_file_reads_as_wholly_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id) = {
+        let server = spawn_for_test("new-file-diff", vec![dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        let mut ws = Ws::connect(&server).await;
+        let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            &mut ws,
+            &WorkspaceActivateParams {
+                worktrees: None,
+                name: "new-file-diff".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        let open: BufferOpenResult = send_request::<BufferOpen>(
+            &mut ws,
+            &BufferOpenParams {
+                transient: None,
+                buffer_id: None,
+                path_index: Some(0),
+                relative_path: Some("fresh.rs".into()),
+                language: None,
+                create_if_missing: true,
+                jump_to: None,
+                ..Default::default()
+            },
+        )
+        .await;
+        (server, ws, open.buffer_id)
+    };
+
+    type_at_cursor(&mut ws, buffer_id, "hello").await;
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![Some(DiffMarker::Added)]
+    );
+
+    drop(server);
+}
+
+/// Pinning `Saved` on a *tracked* file: the gutter stops reporting what is uncommitted and reports
+/// only what is unwritten. The two sets are deliberately different here — the committed change is
+/// on line 0 and the unsaved one on line 1 — so a stale baseline could not pass.
+#[tokio::test]
+async fn saved_baseline_shows_only_unwritten_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "s.rs", "alpha\nbeta\n");
+    // A saved-but-uncommitted change on line 0.
+    std::fs::write(dir.path().join("s.rs"), "ALPHA\nbeta\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "saved-base", "s.rs").await;
+
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![Some(DiffMarker::Modified), None, None],
+        "against the index, the saved-but-uncommitted line 0 shows"
+    );
+
+    // An unsaved change on line 1.
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "B").await;
+
+    let res = set_baseline_source(&mut ws, dir.path(), Some(GitBaselineChoice::Saved)).await;
+    assert!(matches!(res.baseline, Some(GitBaselineSource::Saved)));
+    assert_eq!(res.buffers, vec![buffer_id]);
+
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, Some(DiffMarker::Modified), None],
+        "against the saved file, only the unwritten line 1 shows"
+    );
+
+    // And the status bar is told, so a gutter that disagrees with `git diff` is explained.
+    let gs = subscribe_window(&mut ws, buffer_id)
+        .await
+        .git_status
+        .expect("tracked file has git status");
+    assert!(matches!(gs.baseline, Some(GitBaselineSource::Saved)));
+    assert!(
+        gs.staged.is_empty(),
+        "nothing but the index has an index relationship to report"
+    );
+
+    drop(server);
+}
+
+/// The snapshot's lifetime: it exists exactly while the document is dirty. Saving ends the
+/// comparison, and so does undoing back to the saved point — the same `recompute_dirty` drop.
+#[tokio::test]
+async fn the_saved_baseline_empties_when_the_buffer_goes_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.txt"), "one\ntwo\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "clean-again", "p.txt").await;
+
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "X").await;
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![Some(DiffMarker::Modified), None, None]
+    );
+
+    // Undo back to the saved point.
+    let _u: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, None, None],
+        "undoing back to the saved content leaves nothing to compare"
+    );
+
+    // Edit again and save: same outcome by the other route, and the *new* disk content becomes
+    // the baseline rather than the old one.
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "Y").await;
+    let _s: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, None, None],
+        "saving re-bases on the content just written"
+    );
+
+    drop(server);
+}
+
+/// Index writes are refused against the saved file, exactly as against a pinned revision — the
+/// hunks on screen are not index deltas. Revert still means something and still works: against the
+/// saved file it is "discard this hunk's unsaved edits".
+#[tokio::test]
+async fn saved_baseline_refuses_staging_but_allows_revert() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "r.rs", "alpha\nbeta\n");
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "saved-apply", "r.rs").await;
+
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    type_at_cursor(&mut ws, buffer_id, "B").await;
+    set_baseline_source(&mut ws, dir.path(), Some(GitBaselineChoice::Saved)).await;
+
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::NotAgainstHead);
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Unstage).await;
+    assert_eq!(r.status, ApplyHunkStatus::NotAgainstHead);
+
+    // Revert falls through and restores the line from disk.
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::Reverted);
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, &BufferContentParams { buffer_id }).await;
+    assert_eq!(content.text, "alpha\nbeta\n");
+
+    drop(server);
+}
+
+/// The distinction the `pinned` flag exists to draw: the saved-file *fallback* an untracked path
+/// takes by default is display-only, so it must not disable staging the way a pinned baseline
+/// does. Staging a *dirty* buffer is refused either way — by the long-standing clean-buffer rule,
+/// which exists so the index never holds content that isn't on disk — so the thing to pin is
+/// *which* refusal you get, and that saving makes it go through.
+#[tokio::test]
+async fn the_untracked_fallback_does_not_disable_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "other.rs", "x\n");
+    std::fs::write(dir.path().join("new.rs"), "hello\n").unwrap();
+    let (server, mut ws, buffer_id) =
+        setup_git_apply(dir.path(), "untracked-dirty", "new.rs").await;
+
+    set_cursor(&mut ws, buffer_id, 0, 5).await;
+    type_at_cursor(&mut ws, buffer_id, "!").await;
+    // The gutter is now showing the unsaved edit against the saved-file fallback.
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![Some(DiffMarker::Modified), None]
+    );
+
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;
+    assert_eq!(
+        r.status,
+        ApplyHunkStatus::DirtyBuffer,
+        "refused by the clean-buffer rule, not by the display-only fallback"
+    );
+
+    let _s: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;
+    assert_eq!(
+        r.status,
+        ApplyHunkStatus::Staged,
+        "an untracked file still stages as one whole added hunk"
+    );
+    assert_eq!(index_text(dir.path(), "new.rs").unwrap(), "hello!\n");
 
     drop(server);
 }

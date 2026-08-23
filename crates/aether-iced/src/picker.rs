@@ -1573,6 +1573,26 @@ fn render_item<'a>(
             .align_y(iced::Alignment::Center)
             .into()
         }
+        PickerItem::GitBaseline {
+            label,
+            match_indices,
+            ..
+        } => {
+            // Just the label: the baseline in force is the row a fresh open highlights, and the
+            // section headers carry what a per-row description would have.
+            row![highlighted(
+                label,
+                match_indices,
+                p.fg_bright,
+                SANS,
+                hovered,
+                ui,
+                p
+            )]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }
         PickerItem::GitStash {
             index,
             message,

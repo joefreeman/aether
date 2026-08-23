@@ -870,6 +870,10 @@ pub enum ItemKey<'a> {
     GitStash {
         oid: &'a str,
     },
+    /// A baseline row's label: two rows can share a repo but never a label.
+    GitBaseline {
+        label: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -952,6 +956,9 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             hash: hash.as_str(),
         },
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash { oid: oid.as_str() },
+        PickerItem::GitBaseline { label, .. } => ItemKey::GitBaseline {
+            label: label.as_str(),
+        },
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {
                 path_index,

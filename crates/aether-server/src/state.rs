@@ -62,7 +62,7 @@ pub struct ServerState {
     /// canonicalized workdir. In memory only: this is an inspection mode ("what have I changed
     /// since I branched?"), not a preference — coming back to a restored session still diffing
     /// against a commit you set last week would be a surprise, not a convenience.
-    pub git_baseline_revs: crate::git::BaselineRevs,
+    pub git_baseline_choices: crate::git::BaselineChoices,
     pub buffers: HashMap<BufferId, Buffer>,
     /// Document content, shared by every buffer attached to the same file. A buffer is a
     /// workspace's *view* of a document (`Buffer::document`); the rope, undo history, dirty
@@ -604,7 +604,7 @@ impl ServerState {
             git_suppressed: std::collections::HashSet::new(),
             git_operations: HashMap::new(),
             worktree_locks: HashMap::new(),
-            git_baseline_revs: crate::git::BaselineRevs::new(),
+            git_baseline_choices: crate::git::BaselineChoices::new(),
             buffers: HashMap::new(),
             documents: HashMap::new(),
             buffer_workspaces: HashMap::new(),
@@ -1880,6 +1880,14 @@ pub struct Document {
     /// content and to delete a stale backup once the buffer goes clean. Purely server-internal —
     /// never sent to clients, not part of `dirty`.
     pub backed_up_revision: Option<Revision>,
+    /// The document's text as it was at the last point it matched disk, LF-normalised — the
+    /// baseline for the saved-file diff. `Some` exactly while the document is dirty; see
+    /// [`Document::snapshot_disk_text`] for why it is captured rather than read back.
+    ///
+    /// Lives on the document rather than beside the Git baselines (which are per-`BufferId`,
+    /// because git is workspace-scoped) because being unsaved is a property of the content: two
+    /// workspaces viewing one dirty document are looking at the same unsaved edits.
+    pub disk_blob: Option<Vec<u8>>,
 
     /// Revision at the most recent successful save. `None` only for a never-saved scratch
     /// buffer in its initial empty state — see `Buffer::scratch`.
@@ -2010,6 +2018,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            disk_blob: None,
             virtual_source: None,
         })
     }
@@ -2045,6 +2054,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            disk_blob: None,
             virtual_source: None,
         }
     }
@@ -2090,6 +2100,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            disk_blob: None,
         }
     }
 
@@ -2128,6 +2139,7 @@ impl Document {
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
+            disk_blob: None,
             virtual_source: None,
         }
     }
@@ -2167,6 +2179,7 @@ impl Document {
         kind: EditKindTag,
         cursors_before_edit: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Revision {
+        self.snapshot_disk_text();
         let now = Instant::now();
 
         // Decide whether to start a new undo group.
@@ -2379,6 +2392,9 @@ impl Document {
     /// inserted into [`ServerState`] and before any buffer views it, so there's no `BufferId` to
     /// gate on — and the callers built it from a file or a scratch, never from a revision.
     pub fn restore_unsaved(&mut self, content: &str) {
+        // The caller loaded the file first, so `text` is still the disk content the backup is
+        // about to diverge from — exactly what the saved-file baseline wants.
+        self.snapshot_disk_text();
         self.text = ropey::Rope::from_str(content);
         self.revision = self.next_revision_id;
         self.next_revision_id += 1;
@@ -2392,6 +2408,9 @@ impl Document {
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
+        // Undoing away from the saved point dirties a clean document, so the snapshot has to be
+        // taken here too — `text` is still the on-disk content until the entry is swapped in.
+        self.snapshot_disk_text();
         let entry = self.undo_stack.pop()?;
         self.redo_stack.push(UndoEntry {
             rope: self.text.clone(),
@@ -2414,6 +2433,8 @@ impl Document {
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
+        // Symmetric with `undo`: redoing forward off the saved point dirties a clean document.
+        self.snapshot_disk_text();
         let entry = self.redo_stack.pop()?;
         self.undo_stack.push(UndoEntry {
             rope: self.text.clone(),
@@ -2433,6 +2454,31 @@ impl Document {
 
     fn recompute_dirty(&mut self) {
         self.dirty = self.saved_revision != Some(self.revision);
+        if !self.dirty {
+            // Back in step with disk, so the snapshot has nothing left to describe. Dropping it
+            // here rather than only on save is what makes undoing back to the saved point clear
+            // the saved-file diff too.
+            self.disk_blob = None;
+        }
+    }
+
+    /// Snapshot the on-disk text, for the saved-file diff baseline (`git/set_baseline` with
+    /// [`aether_protocol::git::GitBaselineChoice::Saved`], and the fallback an untracked file
+    /// gets by default).
+    ///
+    /// **Must be the first statement of any mutator that replaces or edits `text`.** It reads
+    /// `self.text`, which is the on-disk content only while the document is still clean — once
+    /// the mutation lands, the saved bytes are gone. Reading the file back at diff time instead
+    /// would put I/O on the keystroke path and race the watcher; this is exact and free of both.
+    ///
+    /// Idempotent and self-limiting: it captures at most once per clean→dirty transition, an
+    /// already-dirty document falls straight through, and [`Self::recompute_dirty`] drops the
+    /// snapshot the moment the document is clean again. So the cost is one materialisation of a
+    /// document you have actually started editing, and clean documents pay nothing.
+    fn snapshot_disk_text(&mut self) {
+        if self.disk_blob.is_none() && self.saved_revision == Some(self.revision) {
+            self.disk_blob = Some(self.text.chunks().collect::<String>().into_bytes());
+        }
     }
 
     /// Swap a generated document's content in place — rebuilding the working-changes patch after
