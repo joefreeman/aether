@@ -1575,7 +1575,17 @@ a.picker-row:not(.selected):hover .picker-main {
   color: var(--fg);
 }
 
-.md-read-loading {
+/* The reading view's stand-in line — "Loading…" while the first fetch is in flight, "Empty
+   document" once it lands with no blocks. Muted and italic so it never reads as document text,
+   and positioned against #buffer (the pane, which is `position: relative`) rather than laid out
+   in the document flow: a third down and centered across the pane is the view's empty state,
+   flush top-left is stray text. The `top` mirrors the core's READ_PLACEHOLDER_REST. */
+.md-read-placeholder {
+  position: absolute;
+  top: 33.3%;
+  left: 0;
+  right: 0;
+  text-align: center;
   color: var(--fg-dim);
   font-style: italic;
 }
@@ -1689,6 +1699,15 @@ a.picker-row:not(.selected):hover .picker-main {
   border-left: 3px solid var(--border-subtle);
   color: var(--fg);
 }
+/* A block holding nothing (`>`, `#`, `-` on their own) still owns a line. A DOM box exists as
+   soon as it's created, so whether it's *visible* is pure CSS: blockquote shows its border
+   through its padding, li its marker, but an empty heading or paragraph is 0px and drops off the
+   page — the reading position then marks a block nobody can see. `:empty` is the DOM's own
+   version of the core's `Block::is_content_empty`; no second predicate to drift from it. */
+.md-read :where(h1, h2, h3, h4, h5, h6, p, blockquote, li):empty {
+  min-height: 1lh;
+}
+
 .md-read blockquote > :first-child { margin-top: 0.2em; }
 .md-read blockquote > :last-child { margin-bottom: 0.2em; }
 .md-read blockquote.md-alert { border-left-width: 3px; }

@@ -108,6 +108,9 @@ fn read_view(s: &Session) -> Value {
         .map(|(min, max)| json!({ "start": min, "end": max }));
     json!({
         "loading": read.loading,
+        // The stand-in line for a document with nothing to render (loading, or genuinely empty),
+        // named by the core so all three shells say the same thing. Null when there are blocks.
+        "placeholder": read.placeholder(),
         "blocks": jv(&read.blocks),
         "focus_span": block.map(span_json),
         "target_span": target.map(span_json),

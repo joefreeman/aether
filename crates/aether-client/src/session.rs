@@ -1280,6 +1280,20 @@ impl ReadView {
         Some((a.min(b), a.max(b)))
     }
 
+    /// The stand-in line to paint when there is nothing to lay out, or `None` when the document
+    /// has blocks of its own. Both states need one: a page with nothing on it reads as a hung
+    /// editor, whether the content is still in flight or the file really is empty.
+    ///
+    /// Shared rather than re-derived per shell — three copies of "is it loading or is it empty"
+    /// plus the two strings is exactly the shape that has drifted here before.
+    pub fn placeholder(&self) -> Option<&'static str> {
+        self.blocks.is_empty().then_some(if self.loading {
+            "Loading…"
+        } else {
+            "Empty document"
+        })
+    }
+
     /// The first and last *line-grain* positions of `elements[idx]`'s span — endpoints for a
     /// whole-line block selection. Columns are byte cols on those lines; callers pass them to
     /// `cursor/set` with `Granularity::Line`, so the server snaps to the normal form

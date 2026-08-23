@@ -139,6 +139,32 @@ impl Block {
             | Block::Html { span, .. } => *span,
         }
     }
+
+    /// Whether this block's whole appearance would come from content it doesn't have — a bare
+    /// `>`, `#` or `-`, which parse to a real block holding nothing.
+    ///
+    /// A renderer that just walks the children paints *nothing* for these, so the block silently
+    /// leaves the page: the reading position lands on it with no mark on screen, and a document
+    /// made only of them looks identical to an empty one (without being empty — the placeholder
+    /// would be lying). Every shell reserves such a block a line of its own instead.
+    ///
+    /// Kinds with chrome of their own are never empty here — a fence draws its panel, a rule its
+    /// line, a table its borders, an image its placeholder, front matter its dim block, an alert
+    /// its label — whether or not they carry any text.
+    pub fn is_content_empty(&self) -> bool {
+        match self {
+            Block::Heading { content, .. } | Block::Paragraph { content, .. } => content.is_empty(),
+            Block::Quote { alert, content, .. } => alert.is_none() && content.is_empty(),
+            Block::FootnoteDef { content, .. } => content.is_empty(),
+            Block::List { items, .. } => items.is_empty(),
+            Block::Code { .. }
+            | Block::Rule { .. }
+            | Block::Table { .. }
+            | Block::Image { .. }
+            | Block::FrontMatter { .. }
+            | Block::Html { .. } => false,
+        }
+    }
 }
 
 /// One item of a [`Block::List`].
@@ -149,6 +175,14 @@ pub struct ListItem {
     pub checked: Option<bool>,
     pub blocks: Vec<Block>,
     pub span: Span,
+}
+
+impl ListItem {
+    /// The item holds nothing — a bare `-`. Its marker is still its own mark on the page; see
+    /// [`Block::is_content_empty`] for why that matters.
+    pub fn is_content_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 /// GFM blockquote alert kinds (`> [!NOTE]` …).

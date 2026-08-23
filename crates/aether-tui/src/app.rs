@@ -273,8 +273,9 @@ pub struct ReadViewState {
     /// Per-code-block horizontal offsets by element index — code rows are unchunked and the painter
     /// clips them to this window.
     pub hscroll: std::collections::HashMap<usize, u16>,
-    /// True while the first content fetch is still in flight (an empty page briefly).
-    pub loading: bool,
+    /// The stand-in line for a document with nothing to lay out — "Loading…" while the first
+    /// fetch is in flight, "Empty document" once it lands with no blocks. `None` normally.
+    pub placeholder: Option<&'static str>,
     /// The reading-width setting the rows were laid out at — the painter re-derives the same
     /// measure to place the centered column.
     pub width: aether_protocol::settings::MarkdownWidth,

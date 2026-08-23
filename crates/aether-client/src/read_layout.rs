@@ -27,6 +27,15 @@ pub const READ_MEASURE_EM: f32 = 42.5;
 /// by the same amount.
 pub const READ_MEASURE_WIDE_EM: f32 = 55.5;
 
+/// How far down the view the stand-in line ([`crate::session::ReadView::placeholder`]) rests, as a
+/// fraction of the pane's height — centered across the width at that height. Flush at the top it
+/// reads as stray document text; a third down reads as deliberate emptiness.
+///
+/// Each shell encodes it in its own units, like the measure above: the terminal multiplies the
+/// row count, iced splits the pane `FillPortion(1)` above / `(2)` below, and `theme.css` mirrors
+/// it as the placeholder's `top` percentage.
+pub const READ_PLACEHOLDER_REST: f32 = 1.0 / 3.0;
+
 /// Content columns the reading measure caps at, or `None` for [`MarkdownWidth::Full`] (the column
 /// is the viewport). The terminal shell's half of the width table; [`measure_em`] is the pixel
 /// shells' half, and the two are kept proportional so every client reads the same.
@@ -273,6 +282,23 @@ fn layout_blocks(
         let own = element_index(ctx.elements, block_span(block)).or(inherit);
         let from = out.len();
         layout_block(block, ctx, own, cols, out);
+        if out.len() == from {
+            // Every block owns at least one row. Rows here are pushed *by content* — a quote's
+            // bar and an item's marker ride rows their children produced — so a block holding
+            // nothing (`>`, `#`) otherwise leaves the page entirely: no line, and no row for the
+            // reading position to mark, so `j`/`k` move the cursor onto it with nothing to show
+            // for it. The arms below give the empty forms their own decoration; this is the
+            // backstop that keeps a *new* arm from silently vanishing the same way.
+            out.push(ReadRow {
+                spans: vec![ReadSpan {
+                    text: " ".into(),
+                    style: SpanStyle::plain(SpanKind::Text),
+                    element: None,
+                    syntax: None,
+                }],
+                element: own,
+            });
+        }
         if dim && !matches!(block, Block::List { .. }) {
             for row in &mut out[from..] {
                 for span in &mut row.spans {
@@ -473,6 +499,14 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 false,
                 &mut inner,
             );
+            // An empty quote (`>` alone) has no content rows for the bar to ride, so the bar
+            // becomes the row: one quoted line holding nothing, which is what the source says.
+            if inner.is_empty() {
+                inner.push(ReadRow {
+                    spans: Vec::new(),
+                    element: own,
+                });
+            }
             for mut row in inner {
                 let mut spans = vec![bar.clone()];
                 spans.append(&mut row.spans);
@@ -625,6 +659,21 @@ fn layout_list(
             item.checked == Some(true),
             &mut inner,
         );
+        // A bare `-` has no content rows for the marker to ride, so the marker becomes the row —
+        // an empty item still counts on the page, and can still hold the reading position. (A
+        // task marker comes along with it: `- [ ]` shows its box.)
+        if inner.is_empty() {
+            out.push(ReadRow {
+                spans: vec![ReadSpan {
+                    text: marker,
+                    style: SpanStyle::plain(SpanKind::Marker),
+                    element: None,
+                    syntax: None,
+                }],
+                element: own,
+            });
+            continue;
+        }
         let mut first_content = true;
         for mut row in inner {
             // Items are tight by default: skip the blank separators between an item's blocks
@@ -1220,6 +1269,56 @@ mod tests {
         rows.iter()
             .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
+    }
+
+    /// The presence invariant: a block that parses is a block that shows. Rows are pushed by
+    /// content, so any arm that decorates its children rather than drawing something itself
+    /// (a quote's bar, an item's marker) drops an empty block off the page — and then a document
+    /// of nothing but `>` renders identically to an empty one. Degenerate input only: these are
+    /// exactly the forms the feature corpus (`docs/test1-4.md`, all well-formed) never covers.
+    #[test]
+    fn every_block_owns_at_least_one_row() {
+        for md in [
+            ">",
+            ">\n>\n",
+            "> [!NOTE]\n",
+            "#",
+            "###### ",
+            "-",
+            "- [ ]\n",
+            "1.\n",
+            "- a\n-\n- c\n",
+            "```\n```\n",
+            "|  |  |\n| - | - |\n",
+            "[^a]:\n",
+        ] {
+            let blocks = parse(md);
+            let els = elements(&blocks);
+            let rows = layout(&blocks, &els, 20, &Default::default());
+            assert!(
+                !blocks.is_empty(),
+                "{md:?} parsed to nothing — the placeholder's case, not this one"
+            );
+            assert!(
+                rows.iter().any(|r| !r.spans.is_empty()),
+                "{md:?} parsed to {} block(s) but laid out {} visible row(s)",
+                blocks.len(),
+                rows.iter().filter(|r| !r.spans.is_empty()).count(),
+            );
+        }
+    }
+
+    /// The empty forms keep their own decoration rather than falling back to the blank row the
+    /// backstop would give them. (No task case: `- [ ]` alone isn't a task item — GFM wants text
+    /// after the box, so it parses as literal `[ ]`, which is content like any other.)
+    #[test]
+    fn empty_quote_and_item_keep_their_decoration() {
+        let blocks = parse(">\n\n-\n");
+        let els = elements(&blocks);
+        let text = rows_text(&layout(&blocks, &els, 20, &Default::default()));
+        // The bar and the marker *are* the row when there's no content to ride.
+        assert!(text.contains(&"┃ ".to_string()), "quote bar row: {text:?}");
+        assert!(text.contains(&"• ".to_string()), "item marker row: {text:?}");
     }
 
     #[test]

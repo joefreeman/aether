@@ -5134,14 +5134,33 @@ impl App {
         let sel_range = read.display_selection(&cursor_state);
         // Full-width rows: each block is a window-wide band (the selection tint fills it)
         // that centers its own measure-capped content column.
-        let mut col = column![].spacing(body * 0.8);
-        if read.loading && read.blocks.is_empty() {
-            col = col.push(
-                container(text("Loading…").size(body).color(p.fg_faint))
-                    .width(Length::Fill)
-                    .align_x(iced::alignment::Horizontal::Center),
-            );
+        // Nothing to lay out — still loading, or a document with no blocks at all. The core names
+        // the line; it rests `READ_PLACEHOLDER_REST` down the pane (one part above, two below) and
+        // centered, so it reads as the view's empty state rather than the document's first line.
+        // No scrollable — there's nothing to scroll, which is also what makes `Fill` safe here.
+        if let Some(msg) = read.placeholder() {
+            return container(
+                column![
+                    iced::widget::Space::new().height(Length::FillPortion(1)),
+                    // The reading face, italic: it belongs to the page it stands in for, and the
+                    // slant is this app's mark for "state, not literal content" (transient
+                    // buffers' status label wears the same one). The web line inherits both from
+                    // `.md-read-host`; the terminal gets the slant alone.
+                    text(msg).size(body).color(p.fg_faint).font(iced::Font {
+                        family: READ_FONT_FAMILY,
+                        style: iced::font::Style::Italic,
+                        ..iced::Font::DEFAULT
+                    }),
+                    iced::widget::Space::new().height(Length::FillPortion(2)),
+                ]
+                .align_x(iced::alignment::Horizontal::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .into();
         }
+        let mut col = column![].spacing(body * 0.8);
         for (i, b) in read.blocks.iter().enumerate() {
             // The position bar sits on the block — except lists, whose items bar individually
             // inside `read_block` (item-grain position).
@@ -5406,6 +5425,13 @@ impl App {
                             ..iced::Font::DEFAULT
                         }));
                 }
+                if content.is_empty() && alert.is_none() {
+                    // Nothing for the strip to run alongside: reserve the quoted line *inside*
+                    // the panel, so the bar stands a line tall instead of the 16px of padding a
+                    // zero-height column leaves it. (The reserve at the end of this fn sizes the
+                    // block's row; this one sizes its chrome.)
+                    inner = inner.push(text(" ").size(body).line_height(READ_LINE_HEIGHT));
+                }
                 for cb in content {
                     // A container's children are reading stops in their own right now, so each one
                     // carries its own bar/tint wrapper — the outer loop only wraps top-level
@@ -5601,6 +5627,16 @@ impl App {
             }
             // The remaining kinds read fine at hover scale.
             other => md_block(other, ui, p, ReadMsg::Link),
+        };
+        // Widgets size to their content, so a block holding none (`>`, `#`) collapses to nothing
+        // and leaves the page — see `Block::is_content_empty`. A blank text run beside it reserves
+        // the line it owns. It has to be TEXT: a `Space` sized `width(0).height(line)` measures as
+        // nothing here (verified against the running GUI — the quote's bar stayed 16px, its
+        // padding alone), and a line box from the font is what the other shells reserve too.
+        let el: Element<'static, ReadMsg> = if b.is_content_empty() {
+            row![text(" ").size(body).line_height(READ_LINE_HEIGHT), el].into()
+        } else {
+            el
         };
         // Always wrapped, only the *id* is conditional: adding a container on focus alone would
         // reflow the block as the reading position moved past it.

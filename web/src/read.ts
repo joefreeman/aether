@@ -19,6 +19,10 @@ export interface CodeHighlight {
 
 export interface ReadDoc {
   loading: boolean;
+  /** The core's stand-in line for a document with nothing to render — "Loading…" while the first
+   *  fetch is in flight, "Empty document" once it lands with no blocks. Null when there are
+   *  blocks to show. */
+  placeholder: string | null;
   blocks: MdBlock[];
   /** The reading position (block grain) — rendered as the left bar, always present for a
    *  non-empty document. */
@@ -53,11 +57,13 @@ function spanKey(s: MdSpan): string {
 export function renderReadView(container: HTMLElement, doc: ReadDoc): void {
   const root = document.createElement("div");
   root.className = "md-read";
-  if (doc.loading && doc.blocks.length === 0) {
-    const load = document.createElement("div");
-    load.className = "md-read-loading";
-    load.textContent = "Loading…";
-    root.append(load);
+  // Nothing to render — still loading, or a document with no blocks at all. The core names the
+  // line for every shell.
+  if (doc.placeholder) {
+    const msg = document.createElement("div");
+    msg.className = "md-read-placeholder";
+    msg.textContent = doc.placeholder;
+    root.append(msg);
   }
   for (const b of doc.blocks) root.append(renderBlock(b, doc));
   container.replaceChildren(root);

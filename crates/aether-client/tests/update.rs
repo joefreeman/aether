@@ -9938,6 +9938,18 @@ fn read_session() -> Session {
     s
 }
 
+/// A reading view over content the parser yields *no blocks* for — an empty file, or one
+/// holding nothing but blank lines.
+fn blockless_read_session(text: &str) -> Session {
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "buffer/content");
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": text })));
+    assert!(s.read.as_ref().expect("reading view").blocks.is_empty());
+    s
+}
+
 #[test]
 fn space_v_enters_reading_view_and_fetches_content() {
     use aether_client::session::Mode;
@@ -10415,6 +10427,40 @@ fn read_i_and_a_enter_insert_at_the_blocks_edges() {
     assert_eq!(s.mode, Mode::Insert);
     let (_t, _m, p) = the_request(&fx);
     assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 11}));
+}
+
+#[test]
+fn read_placeholder_names_the_loading_and_empty_states() {
+    // The line every shell paints when there's nothing to lay out — spelled once, in the core.
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    let (token, _method, _) = the_request(&fx);
+    assert_eq!(s.read.as_ref().unwrap().placeholder(), Some("Loading…"));
+    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "" })));
+    assert_eq!(s.read.as_ref().unwrap().placeholder(), Some("Empty document"));
+    // A document with blocks shows itself.
+    assert_eq!(read_session().read.as_ref().unwrap().placeholder(), None);
+}
+
+#[test]
+fn read_i_and_a_open_a_blockless_document_at_its_ends() {
+    use aether_client::session::Mode;
+    // No blocks means no focus to resolve: the *document* is the target, so `i` opens at its
+    // start. Without the fallback this is a silent no-op — a blank page you can't type into.
+    let mut s = blockless_read_session("");
+    let fx = key(&mut s, 'i');
+    assert_eq!(s.mode, Mode::Insert);
+    assert!(s.read.is_none());
+    let (_t, method, p) = the_request(&fx);
+    assert_eq!(method, "cursor/move");
+    assert_eq!(p["motion"]["kind"], json!("goto"));
+    assert_eq!(p["motion"]["position"], json!({"line": 0, "col": 0}));
+    // Blank lines are blockless too, and `a` still means the end — past them.
+    let mut s = blockless_read_session("\n\n");
+    let fx = key(&mut s, 'a');
+    assert_eq!(s.mode, Mode::Insert);
+    let (_t, _m, p) = the_request(&fx);
+    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 0}));
 }
 
 #[test]

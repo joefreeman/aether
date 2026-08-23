@@ -9692,6 +9692,11 @@ impl Session {
     /// server-side); a bare reading position enters at the focused block's start, or its
     /// append position — the caret gap before the block's terminating newline (buffer end
     /// when the last block has none).
+    ///
+    /// A document with no blocks at all (empty, or nothing but blank lines) has no focus to
+    /// resolve, so the *document* is the target: `i` at its start, `a` at its end. Without that
+    /// fallback the reading view is a dead end on exactly the buffer you most want to type
+    /// into — nothing on screen and every edit transition a silent no-op.
     fn read_insert(&mut self, at_end: bool) -> Effects {
         let target = {
             let Some(read) = self.read.as_ref() else {
@@ -9699,13 +9704,11 @@ impl Session {
             };
             let cursor = self.buffer.cursor;
             if cursor.is_point() {
-                let Some(f) = read.block_focus(cursor.position) else {
-                    return Effects::none();
-                };
-                let byte = if at_end {
-                    read.block_append_byte(f)
-                } else {
-                    read.elements[f].span().start
+                let byte = match read.block_focus(cursor.position) {
+                    Some(f) if at_end => read.block_append_byte(f),
+                    Some(f) => read.elements[f].span().start,
+                    None if at_end => read.text.len() as u32,
+                    None => 0,
                 };
                 Some(read.pos_of(byte))
             } else {

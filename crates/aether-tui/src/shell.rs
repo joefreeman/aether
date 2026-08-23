@@ -2050,7 +2050,7 @@ impl Shell {
                 target_focus: None,
                 scroll: 0,
                 hscroll: std::collections::HashMap::new(),
-                loading: true,
+                placeholder: read.placeholder(),
                 width: self.session.markdown_width,
             });
         }
@@ -2133,7 +2133,7 @@ impl Shell {
             }
             range
         });
-        let loading = read.loading;
+        let placeholder = read.placeholder();
         let visible = self.visible_rows().max(1) as u16;
         // Reveal on focus *changes* only, so manual scrolling isn't fought — keyed to the
         // target when the cursor is inside one (a Tab step must reveal the link, not just its
@@ -2161,7 +2161,7 @@ impl Shell {
             target_focus,
             scroll: self.read_scroll,
             hscroll: self.read_hscroll.clone(),
-            loading,
+            placeholder,
             width: self.session.markdown_width,
         })
     }

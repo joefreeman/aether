@@ -20,7 +20,7 @@ use aether_protocol::viewport::{
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -4689,12 +4689,32 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         area,
     );
     if rv.rows.is_empty() {
-        if rv.loading {
-            let msg = Paragraph::new(Line::from(Span::styled(
-                "Loading…",
-                Style::default().fg(c(th().fg_faint)).bg(c(th().bg)),
-            )));
-            f.render_widget(msg, content);
+        // Nothing to paint — still loading, or a document with no blocks at all. The core names
+        // the line; it rests across the whole pane rather than the measure column, so it reads as
+        // the view's own empty state and not as the document's first line.
+        if let Some(text) = rv.placeholder {
+            let rest = aether_client::read_layout::READ_PLACEHOLDER_REST;
+            let row = Rect {
+                x: area.x,
+                y: area.y + (f32::from(area.height) * rest) as u16,
+                width: area.width,
+                // Zero on a pane with no height — nothing to draw, and no out-of-frame rect.
+                height: area.height.min(1),
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(c(th().fg_faint))
+                        .bg(c(th().bg))
+                        // Slanted like the other shells' stand-in line, and like a transient
+                        // buffer's status label: this app's mark for state over content.
+                        // Terminals without italic support just show it upright.
+                        .add_modifier(Modifier::ITALIC),
+                )))
+                .alignment(Alignment::Center),
+                row,
+            );
         }
         return;
     }
