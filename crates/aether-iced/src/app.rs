@@ -6892,6 +6892,10 @@ enum ShellMessage {
     Window(window::Id, Message),
     /// A window has finished closing (`iced::window::close_events`).
     Closed(window::Id),
+    /// A file the desktop asked us to open (macOS "Open With"). Shell-scoped rather than
+    /// window-scoped because the subscription cannot name a window — see `subscription`.
+    #[cfg(target_os = "macos")]
+    OpenFromOs(std::path::PathBuf),
     /// The hint engine's clock ticked — one subscription for the process, fanned out in `update`.
     HintTick,
 }
@@ -6965,6 +6969,14 @@ impl Shell {
                 // A reply that outlived its window (an RPC landing after the user closed it).
                 None => Task::none(),
             },
+            // Lands in the *newest* window — the one the OS just activated or launched — resolved
+            // here rather than in the subscription (see `subscription`). None means the last window
+            // is already closing and `iced::exit` is in flight, so there is nothing to open into.
+            #[cfg(target_os = "macos")]
+            ShellMessage::OpenFromOs(path) => match self.newest_window() {
+                Some(id) => self.update(ShellMessage::Window(id, Message::OpenFromOs(path))),
+                None => Task::none(),
+            },
             ShellMessage::HintTick => {
                 let ticks: Vec<_> = self
                     .windows
@@ -7021,18 +7033,18 @@ impl Shell {
             App::input_subscription(),
             iced::window::close_events().map(ShellMessage::Closed),
         ];
-        // Files the desktop asks us to open (macOS "Open With"). Unconditional — the delegate can
-        // deliver at any moment, including during the boot connect, and this is the only listener,
-        // so iced builds the stream exactly once (see `mac_open::opened_files`).
+        // Files the desktop asks us to open (macOS "Open With"). Unconditional and window-blind —
+        // the delegate can deliver at any moment, including during the boot connect, and this is
+        // the only listener, so iced builds the stream exactly once (see `mac_open::opened_files`).
         //
-        // Goes to the *newest* window, which is the one the OS just activated or launched.
+        // The message carries no window because this closure cannot name one: `Subscription::map`
+        // const-asserts its closure is zero-sized, so it may not capture. `Subscription::with`
+        // would carry a window id, but it folds the value into the *recipe hash* — the stream
+        // would be torn down and rebuilt whenever the newest window changed, and the rebuild
+        // yields nothing (the receiver is taken once). So `Shell::update` picks the window at
+        // delivery instead, which is the more accurate moment anyway.
         #[cfg(target_os = "macos")]
-        if let Some(window) = self.newest_window() {
-            subs.push(
-                Subscription::run(crate::mac_open::opened_files)
-                    .map(move |p| ShellMessage::Window(window, Message::OpenFromOs(p))),
-            );
-        }
+        subs.push(Subscription::run(crate::mac_open::opened_files).map(ShellMessage::OpenFromOs));
         // Frame ticks drive scroll easing and the picker's search throbber. One subscription for
         // the whole process, delivered to the window whose redraw it was; subscribed while *any*
         // window is animating, and never while disconnected, where a throbber stuck mid-search
