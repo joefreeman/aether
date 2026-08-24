@@ -7084,8 +7084,9 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
     iced::daemon(
         move || {
             // The boot closure runs after iced has built the winit event loop and before it starts
-            // pumping it — the one moment the macOS delegate can be installed and still catch the
-            // launch's own "Open With" event (crate::mac_open).
+            // pumping it — the one window in which `application:openURLs:` can be grafted onto
+            // winit's delegate class and still catch the launch's own "Open With" event. Any
+            // earlier and the class does not exist yet (crate::mac_open).
             #[cfg(target_os = "macos")]
             crate::mac_open::install();
             Shell::new(bootstrap.clone())
