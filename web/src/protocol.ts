@@ -230,8 +230,7 @@ export interface GitBufferStatus {
   worktree?: boolean;
   /** Set when the repo is diffed against something other than the index. The gutter then means
    *  "changed since this commit" — or "since I last saved" — and `staged` is always empty, so the
-   *  status bar has to say so. Absent for the default baseline, including the saved-file fallback
-   *  an untracked file takes: that is not a state the user chose. */
+   *  status bar has to say so. Absent for the default baseline, which needs no explaining. */
   baseline?: GitBaselineSource | null;
 }
 

@@ -7133,10 +7133,9 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     // `HEAD...main` — that is git's merge-base notation, and this comparison is two-dot (the
     // baseline against the buffer), so borrowing the spelling would say something untrue.
     //
-    // Absent for the default baseline, and absent for the saved-file *fallback* an untracked file
-    // takes (the server only sets `baseline` for a pinned choice) — a permanent token on every
-    // untracked file would be noise in the one place on screen with no room for it, exactly like a
-    // permanent `↑0 ↓0`.
+    // Absent for the default baseline (the server only sets `baseline` for a pinned choice) — a
+    // permanent token saying "the index" would be noise in the one place on screen with no room for
+    // it, exactly like a permanent `↑0 ↓0`.
     if let Some(base) = &status.baseline {
         parts.push(Span::styled(
             format!("  {}", aether_client::labels::baseline_token(base)),

@@ -5020,8 +5020,8 @@ export class Shell {
       }
       // A pinned baseline, in its own token beside the branch: the branch says where you are,
       // this says what you are compared against, and on a feature branch diffed against `main`
-      // both are wanted at once. Absent for the default, and for the saved-file fallback an
-      // untracked file takes — a permanent token on every untracked file would be noise.
+      // both are wanted at once. Absent for the default — a permanent token saying "the index"
+      // would be noise.
       if (gs.baseline) {
         const el = document.createElement("span");
         el.className = "status-git git-base";

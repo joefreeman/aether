@@ -2502,8 +2502,7 @@ impl Document {
     }
 
     /// Snapshot the on-disk text, for the saved-file diff baseline (`git/set_baseline` with
-    /// [`aether_protocol::git::GitBaselineChoice::Saved`], and the fallback an untracked file
-    /// gets by default).
+    /// [`aether_protocol::git::GitBaselineChoice::Saved`]).
     ///
     /// **Must be the first statement of any mutator that replaces or edits `text`.** It reads
     /// `self.text`, which is the on-disk content only while the document is still clean — once

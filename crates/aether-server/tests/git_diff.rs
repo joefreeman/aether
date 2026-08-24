@@ -3988,9 +3988,9 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
 
 // ---- the saved-file baseline ---------------------------------------------------------------------
 //
-// `git/set_baseline` with `Saved`, and the fallback a file with no git baseline takes by default.
-// The whole existing gutter/hunk stack follows it without knowing what it is comparing against —
-// which is the point, and what these pin.
+// `git/set_baseline` with `Saved`. The whole existing gutter/hunk stack follows it without knowing
+// what it is comparing against — which is the point, and what these pin. It is only ever reached by
+// asking for it: a file git has nothing to say about gets no gutter, not this one silently.
 
 /// Subscribe a viewport and return the window's per-line diff markers, oldest line first.
 async fn markers(ws: &mut Ws, buffer_id: u64) -> Vec<Option<DiffMarker>> {
@@ -4041,38 +4041,86 @@ async fn type_at_cursor(ws: &mut Ws, buffer_id: u64, text: &str) {
     .await;
 }
 
-/// The headline behaviour change: a file git knows nothing about still shows the edits you have
-/// not saved. Before this it had a blank gutter no matter what you did to it, because a `None`
-/// baseline short-circuited to an empty diff.
+/// The default baseline is the index, so a file with no index entry has no baseline and no gutter
+/// — the same answer `git diff` gives about an untracked path. Asking for `Saved` is how you get
+/// the other comparison, and it then works on this file like any other.
 #[tokio::test]
-async fn untracked_file_shows_its_unsaved_edits_by_default() {
+async fn untracked_file_has_no_gutter_by_default() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "tracked.rs", "x\n");
     std::fs::write(dir.path().join("new.rs"), "alpha\nbeta\n").unwrap();
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "untracked-diff", "new.rs").await;
-
-    // Clean on disk: the saved-file baseline has nothing to say, and no snapshot is even taken.
-    assert_eq!(
-        markers(&mut ws, buffer_id).await,
-        vec![None, None, None],
-        "an untracked file that matches disk shows no changes"
-    );
 
     set_cursor(&mut ws, buffer_id, 1, 0).await;
     type_at_cursor(&mut ws, buffer_id, "B").await;
 
     assert_eq!(
         markers(&mut ws, buffer_id).await,
+        vec![None, None, None],
+        "editing a file git has no entry for marks nothing"
+    );
+
+    // Now ask for the saved-file comparison: the same edit is a real change to report.
+    set_baseline_source(&mut ws, dir.path(), Some(GitBaselineChoice::Saved)).await;
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
         vec![None, Some(DiffMarker::Modified), None],
-        "the edited line is marked against the file as last saved"
+        "against the file as last saved, the edited line shows"
     );
 
     drop(server);
 }
 
-/// The same fallback outside any repo at all — the case that has no git in it whatsoever.
+/// The sequence that made the implicit fallback untenable: undoing back past a save leaves the
+/// buffer *missing* a line the file on disk has, which read as a deletion of content git had never
+/// heard of. Against the index — which has no entry at all — there is nothing to mark at any step.
 #[tokio::test]
-async fn file_outside_a_repo_shows_its_unsaved_edits() {
+async fn undoing_past_a_save_marks_nothing_on_an_untracked_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git_commit_file(dir.path(), "tracked.rs", "x\n");
+    std::fs::write(dir.path().join("new.rs"), "alpha\nbeta\n").unwrap();
+    let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "untracked-undo", "new.rs").await;
+
+    set_cursor(&mut ws, buffer_id, 1, 4).await;
+    type_at_cursor(&mut ws, buffer_id, "\ngamma").await;
+    let _s: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let _u: UndoResult = send_request::<EditUndo>(
+        &mut ws,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "alpha\nbeta\n",
+        "the undo landed: the saved line is gone from the buffer"
+    );
+    assert_eq!(
+        markers(&mut ws, buffer_id).await,
+        vec![None, None, None],
+        "no deletion marker for a line git never tracked"
+    );
+
+    drop(server);
+}
+
+/// The same rule outside any repo at all — the case that has no git in it whatsoever, and where
+/// there is not even a repo to pin a baseline on.
+#[tokio::test]
+async fn file_outside_a_repo_has_no_gutter() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("plain.txt"), "one\ntwo\n").unwrap();
     let (server, mut ws, buffer_id) =
@@ -4081,18 +4129,15 @@ async fn file_outside_a_repo_shows_its_unsaved_edits() {
     set_cursor(&mut ws, buffer_id, 0, 0).await;
     type_at_cursor(&mut ws, buffer_id, "X").await;
 
-    assert_eq!(
-        markers(&mut ws, buffer_id).await,
-        vec![Some(DiffMarker::Modified), None, None]
-    );
+    assert_eq!(markers(&mut ws, buffer_id).await, vec![None, None, None]);
 
     drop(server);
 }
 
-/// A never-saved buffer's snapshot is the empty file it started as, so everything in it is an
-/// addition. Falls out of the same rule rather than being a case.
+/// A never-saved buffer has no index entry either, so it is the same "nothing to compare against"
+/// as any other untracked path rather than a case of its own.
 #[tokio::test]
-async fn a_new_file_reads_as_wholly_added() {
+async fn a_new_file_has_no_gutter() {
     let dir = tempfile::tempdir().unwrap();
     let (server, mut ws, buffer_id) = {
         let server = spawn_for_test("new-file-diff", vec![dir.path().to_path_buf()])
@@ -4126,10 +4171,7 @@ async fn a_new_file_reads_as_wholly_added() {
     };
 
     type_at_cursor(&mut ws, buffer_id, "hello").await;
-    assert_eq!(
-        markers(&mut ws, buffer_id).await,
-        vec![Some(DiffMarker::Added)]
-    );
+    assert_eq!(markers(&mut ws, buffer_id).await, vec![None]);
 
     drop(server);
 }
@@ -4184,8 +4226,9 @@ async fn saved_baseline_shows_only_unwritten_edits() {
 #[tokio::test]
 async fn the_saved_baseline_empties_when_the_buffer_goes_clean() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("p.txt"), "one\ntwo\n").unwrap();
+    git_commit_file(dir.path(), "p.txt", "one\ntwo\n");
     let (server, mut ws, buffer_id) = setup_git_apply(dir.path(), "clean-again", "p.txt").await;
+    set_baseline_source(&mut ws, dir.path(), Some(GitBaselineChoice::Saved)).await;
 
     set_cursor(&mut ws, buffer_id, 0, 0).await;
     type_at_cursor(&mut ws, buffer_id, "X").await;
@@ -4262,13 +4305,13 @@ async fn saved_baseline_refuses_staging_but_allows_revert() {
     drop(server);
 }
 
-/// The distinction the `pinned` flag exists to draw: the saved-file *fallback* an untracked path
-/// takes by default is display-only, so it must not disable staging the way a pinned baseline
-/// does. Staging a *dirty* buffer is refused either way — by the long-standing clean-buffer rule,
-/// which exists so the index never holds content that isn't on disk — so the thing to pin is
-/// *which* refusal you get, and that saving makes it go through.
+/// The distinction the `pinned` flag exists to draw: an untracked file's *absent* baseline is the
+/// index's own answer about it, not a pinned choice, so it must not disable staging the way a
+/// pinned baseline does. Staging a *dirty* buffer is refused anyway — by the long-standing
+/// clean-buffer rule, which exists so the index never holds content that isn't on disk — so the
+/// thing to pin is *which* refusal you get, and that saving makes it go through.
 #[tokio::test]
-async fn the_untracked_fallback_does_not_disable_staging() {
+async fn an_untracked_file_still_stages() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "other.rs", "x\n");
     std::fs::write(dir.path().join("new.rs"), "hello\n").unwrap();
@@ -4277,11 +4320,6 @@ async fn the_untracked_fallback_does_not_disable_staging() {
 
     set_cursor(&mut ws, buffer_id, 0, 5).await;
     type_at_cursor(&mut ws, buffer_id, "!").await;
-    // The gutter is now showing the unsaved edit against the saved-file fallback.
-    assert_eq!(
-        markers(&mut ws, buffer_id).await,
-        vec![Some(DiffMarker::Modified), None]
-    );
 
     set_cursor(&mut ws, buffer_id, 0, 0).await;
     let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;

@@ -268,8 +268,8 @@ pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
 /// What a buffer is actually diffed against, resolved in one place so the gutter, the inline diff,
 /// hunk navigation and `git/apply_hunk` cannot disagree about it.
 pub struct EffectiveBaseline<'a> {
-    /// The bytes to diff the buffer against. `None` when there is nothing to compare to — a clean
-    /// file outside any repo, or a tracked path with no index entry.
+    /// The bytes to diff the buffer against. `None` when there is nothing to compare to — an
+    /// untracked path, a file outside any repo, or a tracked path with no index entry.
     pub blob: Option<&'a [u8]>,
     /// The HEAD → index layer to compose underneath. Empty unless the comparison *is* the index:
     /// nothing else has an index relationship to show.
@@ -277,21 +277,18 @@ pub struct EffectiveBaseline<'a> {
     /// The user pinned a non-default baseline. Index writes are refused while this is set — the
     /// hunks on screen are not index deltas, so staging them would write content the user never
     /// asked to stage — while reverting still means "put this back to how it was there".
-    ///
-    /// Deliberately *not* set by the default baseline where it falls back to the saved file for an
-    /// untracked path: that fallback is display-only, and staging an untracked file (a hunk-wise
-    /// `git add` of the whole thing) stays as meaningful as it was before it had a gutter.
     pub pinned: bool,
 }
 
 /// Resolve [`EffectiveBaseline`] for one buffer. `disk_blob` is the document's saved-text snapshot
 /// ([`crate::state::Document::disk_blob`]) — `Some` exactly while the document is dirty.
 ///
-/// The default is the index, which is what makes the gutter agree with `git diff`. It falls back
-/// to the saved file when there is no git baseline at all — an untracked path, or a file in no
-/// repo — which is why those files have a gutter now: their unsaved edits are the only comparison
-/// available, and it is a real one. A clean file in that state has no snapshot, so the diff is
-/// empty, which is also correct.
+/// The default is the index, which is what makes the gutter agree with `git diff`. A path with no
+/// index entry — untracked, or in no repo at all — therefore has **no** baseline and no gutter,
+/// exactly as `git diff` has nothing to say about it. Diffing such a file against its own last
+/// saved text is a coherent thing to want, but it is a different question with a different answer,
+/// so it is [`GitBaselineSource::Saved`] and you ask for it: inferring it from "git knows nothing
+/// here" put an unexplained gutter on files while the picker still read `(index)`.
 pub fn effective_baseline<'a>(
     baseline: &'a GitBaseline,
     disk_blob: Option<&'a [u8]>,
@@ -308,11 +305,6 @@ pub fn effective_baseline<'a>(
             blob: baseline.index_blob.as_deref(),
             staged: &[],
             pinned: true,
-        },
-        None if baseline.blob.is_none() && baseline.index_blob.is_none() => EffectiveBaseline {
-            blob: disk_blob,
-            staged: &[],
-            pinned: false,
         },
         None => EffectiveBaseline {
             blob: baseline.index_blob.as_deref(),

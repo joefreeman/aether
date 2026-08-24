@@ -7379,8 +7379,9 @@ pub async fn git_apply_hunk(
     // all. Revert stays meaningful in both ("put this hunk back to how it was there") and falls
     // through — against the saved file that is "discard this hunk's unsaved edits".
     //
-    // Keyed on `pinned` rather than on the resolved blob, so the saved-file *fallback* an
-    // untracked path takes by default keeps its existing hunk-wise `git add`.
+    // Keyed on `pinned` rather than on the resolved blob: an untracked file's *absent* baseline is
+    // still the index's own answer about it, and staging it (a hunk-wise `git add` of the whole
+    // thing) stays meaningful.
     let pinned = crate::git::effective_baseline(
         baseline,
         s.try_doc_of(buffer_id).and_then(|d| d.disk_blob.as_deref()),
@@ -11796,9 +11797,7 @@ fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBufferSt
         staged: git_change_counts(effective.staged),
         unstaged: git_change_counts(buffer_unstaged_hunks(s, buffer_id)),
         upstream: baseline.upstream.clone(),
-        // Only a *pinned* baseline gets a status-bar token. The saved-file fallback an untracked
-        // path takes by default is not a state the user chose, and has no alternative to be
-        // confused with, so a permanent token on every untracked file would be pure noise.
+        // Only a *pinned* baseline gets a status-bar token: the default needs no explaining.
         baseline: effective.pinned.then(|| baseline.choice.clone()).flatten(),
         conflicts: buffer_conflicts(s, buffer_id).len() as u32,
         operation: baseline.operation,
