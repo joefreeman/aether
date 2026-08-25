@@ -497,6 +497,10 @@ fn git_apply_hunk_roundtrip() {
         (ApplyHunkStatus::Unstaged, "unstaged"),
         (ApplyHunkStatus::Reverted, "reverted"),
         (ApplyHunkStatus::DirtyBuffer, "dirty_buffer"),
+        // Distinct from `unavailable` on the wire as well as in meaning: the client words that one
+        // as "not in a git repository", which the patch view's own refusals must never claim.
+        (ApplyHunkStatus::NeedsFile, "needs_file"),
+        (ApplyHunkStatus::Unavailable, "unavailable"),
     ] {
         let res = GitApplyHunkResult {
             cursor: CursorState::default(),
@@ -2669,7 +2673,7 @@ fn buffer_changed_notification_shape() {
 
 #[test]
 fn git_show_target_shape() {
-    use aether_protocol::git::{GitShowParams, ShowTarget};
+    use aether_protocol::git::{GitShowParams, GitShowResult, ShowTarget};
 
     // One RPC, three targets — tagged, so the shape says which it is rather than leaving the
     // server to infer it from which fields happen to be set.
@@ -2714,6 +2718,13 @@ fn git_show_target_shape() {
         v,
         json!({ "buffer_id": 4, "target": { "kind": "working_changes" } })
     );
+
+    // A clean working tree materialises nothing, and says so by omission — same shape (and same
+    // reason) as `git/follow_patch_line` finding nothing to follow.
+    let v = to_value(GitShowResult { opened: None }).unwrap();
+    assert_eq!(v, json!({}));
+    let back: GitShowResult = from_value(v).unwrap();
+    assert!(back.opened.is_none());
 }
 
 #[test]

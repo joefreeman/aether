@@ -70,7 +70,13 @@ export interface SneakTarget {
 
 /** "deleted" is the inline diff view's phantom baseline row; the rest are a generated patch's
  *  chrome, which is deliberately not buffer text so the cursor can never land on it. */
-export type VirtualRowKind = "deleted" | "rule" | "file_header" | "hunk_header" | "spacer";
+export type VirtualRowKind =
+  | "deleted"
+  | "rule"
+  | "file_header"
+  | "hunk_header"
+  | "spacer"
+  | "summary";
 
 /** One intra-line diff emphasis range: byte offsets within the owning line's / row's text. */
 export interface EmphasisRange {

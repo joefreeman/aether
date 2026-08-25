@@ -253,10 +253,20 @@ pub enum VirtualRowKind {
     /// running straight into it. A row rather than an empty buffer line, so the breathing room
     /// costs no cursor positions.
     Spacer,
-    /// A generated patch's section heading: the enclosing signature git names for the hunk,
-    /// followed by a muted rule filling the rest of the row. Empty text where git found no
-    /// signature, leaving just the rule.
+    /// A generated patch's section heading: the enclosing signature git names for the hunk. Empty
+    /// text where git found no signature, leaving a blank row.
+    ///
+    /// Deliberately *plain* — it used to trail a muted rule to the right edge, which made a hunk
+    /// boundary look as heavy as a file boundary and flattened the one hierarchy the view has.
+    /// [`Self::Rule`] is what a file gets; a section gets a name and nothing else.
     HunkHeader,
+    /// The patch's opening line: how many files it touches and its total `+N −M`. Sits above the
+    /// first file's [`Self::Rule`] and belongs to no file, so no rail runs into it.
+    ///
+    /// Chrome rather than buffer text because it is a caption on the whole diff: nothing in it can
+    /// be staged, followed or navigated to, so a cursor position on it is one the user has to step
+    /// over to reach the first thing that can.
+    Summary,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -1193,6 +1193,19 @@ pub fn commit_file(repo: &git2::Repository, rel: &str, content: &str) {
     .unwrap();
 }
 
+/// `git/show`, unwrapping the buffer it materialised. Only a clean working tree answers with
+/// nothing, so every caller that expects a patch or a file goes through here; the empty answer has
+/// its own tests, which read `opened` directly.
+pub async fn show_buffer(
+    ws: &mut Ws,
+    params: &aether_protocol::git::GitShowParams,
+) -> aether_protocol::buffer::BufferOpenResult {
+    send_request::<aether_protocol::git::GitShow>(ws, params)
+        .await
+        .opened
+        .expect("git/show materialised a buffer")
+}
+
 pub async fn setup_repos_workspace(
     roots: Vec<std::path::PathBuf>,
 ) -> (aether_server::ServerHandle, Ws) {

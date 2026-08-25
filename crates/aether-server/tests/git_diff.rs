@@ -1970,7 +1970,7 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2074,7 +2074,7 @@ async fn a_read_only_buffer_refuses_every_mutating_method() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2382,12 +2382,12 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
         target: ShowTarget::Commit { rev: head.clone() },
         focus_path: None,
     };
-    let opened: BufferOpenResult = send_request::<GitShow>(&mut ws, &params()).await;
-    let again: BufferOpenResult = send_request::<GitShow>(&mut ws, &params()).await;
+    let opened: BufferOpenResult = show_buffer(&mut ws, &params()).await;
+    let again: BufferOpenResult = show_buffer(&mut ws, &params()).await;
     assert_eq!(opened.buffer_id, again.buffer_id);
 
     // A *different* revision is a different buffer.
-    let other: BufferOpenResult = send_request::<GitShow>(
+    let other: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2421,7 +2421,7 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
     commit_file(&repo, "src/main.rs", "fn main() { changed(); }\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2492,7 +2492,7 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2549,7 +2549,7 @@ async fn git_show_decorates_the_patch_it_generates() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2690,7 +2690,7 @@ async fn patch_chrome_counts_toward_the_scroll_extent() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2778,7 +2778,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2902,7 +2902,7 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3031,7 +3031,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3202,7 +3202,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
         },
         focus_path: None,
     };
-    let patch: BufferOpenResult = send_request::<GitShow>(&mut ws, &show(&head)).await;
+    let patch: BufferOpenResult = show_buffer(&mut ws, &show(&head)).await;
     let patch_buffer = patch.buffer_id;
     assert!(
         patch.is_patch,
@@ -3327,7 +3327,7 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
     )
     .await;
 
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3397,7 +3397,7 @@ async fn a_file_at_a_revision_blames_at_that_revision() {
     commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3465,7 +3465,7 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
     std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LOOSE() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3494,11 +3494,17 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
         "staged and unstaged compose into one view:\n{}",
         first.text
     );
-    assert!(first.text.contains("Working changes"), "and it says so");
+    // The caption is chrome, not buffer text: nothing in it can be staged, followed or navigated
+    // to, so it holds no cursor position.
+    assert!(
+        !first.text.contains("files changed"),
+        "the summary is chrome, not text:\n{}",
+        first.text
+    );
 
     // Change the tree, re-open: same buffer, rebuilt content.
     std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LATER() {}\n").unwrap();
-    let again: BufferOpenResult = send_request::<GitShow>(
+    let again: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3564,7 +3570,7 @@ async fn working_changes_mark_staged_blocks_apart_from_unstaged() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3628,7 +3634,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
         target: ShowTarget::WorkingChanges,
         focus_path: None,
     };
-    let opened: BufferOpenResult = send_request::<GitShow>(&mut ws, &show).await;
+    let opened: BufferOpenResult = show_buffer(&mut ws, &show).await;
     let buffer_id = opened.buffer_id;
 
     let content: BufferContentResult =
@@ -3718,6 +3724,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
 
     // Revert isn't offered here: it's an undoable *edit*, and delegating it would bury the undo in
     // a transient buffer the user never opened. `Enter` goes to the file, where it means something.
+    // `NeedsFile`, not `Unavailable` — the repo is right there on screen.
     let reverted: GitApplyHunkResult = send_request::<GitApplyHunk>(
         &mut ws,
         &GitApplyHunkParams {
@@ -3727,13 +3734,13 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
         },
     )
     .await;
-    assert_eq!(reverted.status, ApplyHunkStatus::Unavailable);
+    assert_eq!(reverted.status, ApplyHunkStatus::NeedsFile);
 
     // Regenerating must not make the buffer look edited. `dirty` is `revision != saved_revision`,
     // and the rebuild bumps the revision so its viewport pushes aren't discarded as stale — so the
     // save marker has to move with it, or a read-only buffer shows a dirty dot for content nobody
     // typed.
-    let reopened: BufferOpenResult = send_request::<GitShow>(&mut ws, &show).await;
+    let reopened: BufferOpenResult = show_buffer(&mut ws, &show).await;
     assert_eq!(reopened.buffer_id, buffer_id);
     assert_eq!(
         reopened.revision, reopened.saved_revision,
@@ -3763,7 +3770,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3847,7 +3854,7 @@ async fn blame_follow_pushes_a_label_in_a_file_at_a_revision() {
     commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3955,7 +3962,7 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
     );
 
     // Selecting it opens the commit's diff focused on that file's first change.
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4346,6 +4353,679 @@ async fn an_untracked_file_still_stages() {
         "an untracked file still stages as one whole added hunk"
     );
     assert_eq!(index_text(dir.path(), "new.rs").unwrap(), "hello!\n");
+
+    drop(server);
+}
+
+/// A clean tree materialises **nothing**. `Space g w` on it used to mint a buffer whose entire
+/// content was a header saying zero files changed — a view stolen to say nothing — so the emptiness
+/// is reported instead and the client toasts it.
+#[tokio::test]
+async fn working_changes_on_a_clean_tree_opens_no_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn main() {}\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    };
+    let shown = send_request::<GitShow>(&mut ws, &show).await;
+    assert!(shown.opened.is_none(), "nothing to show, so nothing opened");
+
+    // One loose edit is enough to bring the view back.
+    std::fs::write(root.join("a.rs"), "fn main() { }\n").unwrap();
+    let shown = send_request::<GitShow>(&mut ws, &show).await;
+    assert!(shown.opened.is_some(), "a dirty tree still opens");
+
+    drop(server);
+}
+
+/// The other half of the rule: a working-changes view that is **already open** regenerates even
+/// when the tree has gone clean under it. Refusing here would leave a pre-commit snapshot on
+/// screen, and a view that quietly lies is worse than one that is honestly empty.
+#[tokio::test]
+async fn an_open_working_changes_view_drains_when_the_tree_goes_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    };
+    let opened = show_buffer(&mut ws, &show).await;
+    let buffer_id = opened.buffer_id;
+
+    // Commit the change out from under the open view, then re-show it.
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    let again = show_buffer(&mut ws, &show).await;
+    assert_eq!(
+        again.buffer_id, buffer_id,
+        "the same buffer, rebuilt in place"
+    );
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, &BufferContentParams { buffer_id }).await;
+    assert!(
+        content
+            .text
+            .contains("Nothing to commit — the working tree is clean"),
+        "says so in words rather than showing 0 files changed under an empty patch:\n{}",
+        content.text
+    );
+
+    drop(server);
+}
+
+/// A patch buffer is *of* a repo without being a file in it, and the branch indicator is how the
+/// editor says a repository is active at all — so it has to survive opening the very view that is
+/// showing you that repo's diff. The buffer itself opens straight onto the diff: no metadata block,
+/// and the summary caption is chrome.
+#[tokio::test]
+async fn the_working_changes_view_shows_its_branch_and_opens_on_the_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "two\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    // One repo in the workspace: nothing to disambiguate from, so the label stays plain — which
+    // repo this is comes from the status bar's branch indicator.
+    assert_eq!(opened.title.as_deref(), Some("Working changes"));
+    let status = window_of(&mut ws, opened.buffer_id)
+        .await
+        .git_status
+        .expect("a patch buffer is *of* a repo, so the branch cluster shows");
+    assert_eq!(status.branch.as_deref(), Some("main"));
+
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    // Every line of the buffer belongs to a file: the first cursor position is a line you can act
+    // on, not a caption to step over.
+    assert_eq!(
+        content.text, "one\ntwo",
+        "the diff and nothing else:\n{}",
+        content.text
+    );
+    for gone in ["Repo:", "On:", "files changed"] {
+        assert!(
+            !content.text.contains(gone),
+            "{gone:?} is chrome or the title now, not buffer text:\n{}",
+            content.text
+        );
+    }
+
+    // The caption rides above the first line as chrome, with its counts coloured like a file
+    // separator's rather than left as a run of muted text.
+    let window = window_of(&mut ws, opened.buffer_id).await;
+    let summary = window
+        .lines
+        .first()
+        .expect("a first line")
+        .virtual_rows_above
+        .iter()
+        .find(|r| r.kind == VirtualRowKind::Summary)
+        .expect("the summary caption");
+    assert!(summary.text.starts_with("1 file changed"));
+    let kinds: Vec<&str> = summary.highlights.iter().map(|h| h.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["diff.meta", "diff.added", "diff.removed"]);
+    // The first file's rule follows it immediately — a blank between the two left the caption
+    // floating rather than sitting on the diff.
+    let kinds: Vec<VirtualRowKind> = window.lines[0]
+        .virtual_rows_above
+        .iter()
+        .map(|r| r.kind)
+        .collect();
+    assert_eq!(
+        &kinds[..2],
+        &[VirtualRowKind::Summary, VirtualRowKind::Rule]
+    );
+
+    drop(server);
+}
+
+/// Two repos in one workspace: the titles have to differ, or the buffer list holds two identical
+/// "Working changes" rows and no way to tell which tree either belongs to.
+#[tokio::test]
+async fn two_repos_get_distinct_working_changes_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = dir.path().join("one");
+    let two = dir.path().join("two");
+    for path in [&one, &two] {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = init_repo_at(path);
+        commit_file(&repo, "a.rs", "one\n");
+        std::fs::write(path.join("a.rs"), "changed\n").unwrap();
+    }
+    let (one, two) = (one.canonicalize().unwrap(), two.canonicalize().unwrap());
+
+    let (server, mut ws) = setup_repos_workspace(vec![one.clone(), two.clone()]).await;
+    for (root, want) in [
+        (&one, "Working changes — one"),
+        (&two, "Working changes — two"),
+    ] {
+        let opened = show_buffer(
+            &mut ws,
+            &GitShowParams {
+                repo_id: Some(root.to_string_lossy().into_owned()),
+                buffer_id: None,
+                target: ShowTarget::WorkingChanges,
+                focus_path: None,
+            },
+        )
+        .await;
+        assert_eq!(opened.title.as_deref(), Some(want));
+    }
+
+    drop(server);
+}
+
+/// Staging a **deleted** file from the working-changes view. There is no file to open and no
+/// sub-unit to address, so the index write is direct — and it used to fail outright, since the
+/// ordinary route tried to open a buffer on a path that no longer exists.
+#[tokio::test]
+async fn a_deletion_stages_and_unstages_from_the_working_changes_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "gone.rs", "alpha\nbeta\ngamma\n");
+    std::fs::remove_file(root.join("gone.rs")).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let buffer_id = opened.buffer_id;
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, &BufferContentParams { buffer_id }).await;
+    let line = content
+        .text
+        .lines()
+        .position(|l| l == "beta")
+        .expect("the deleted file's lines are in the patch") as u32;
+
+    // A bare cursor anywhere in the deletion addresses the whole of it — there is no smaller unit.
+    set_cursor(&mut ws, buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(
+        index_text(&root, "gone.rs"),
+        None,
+        "recording a removal *is* dropping the index entry"
+    );
+
+    // Idempotent: the same key again has nothing left to do, and says so rather than claiming a
+    // second stage.
+    set_cursor(&mut ws, buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::NoChange);
+
+    set_cursor(&mut ws, buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Unstage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unstaged);
+    assert_eq!(
+        index_text(&root, "gone.rs").as_deref(),
+        Some("alpha\nbeta\ngamma\n"),
+        "HEAD's entry is back, and the deletion is unstaged again"
+    );
+    set_cursor(&mut ws, buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, buffer_id, HunkAction::Unstage).await;
+    assert_eq!(r.status, ApplyHunkStatus::NoChange);
+
+    // The worktree is untouched throughout — unstaging a deletion is an index move, not a restore.
+    assert!(!root.join("gone.rs").exists());
+
+    drop(server);
+}
+
+/// Refusals issued *from* a patch view must never claim the workspace has no repository — the
+/// repo's own diff is what's on screen. Two views, three ways of having nothing to do, and none of
+/// them is `Unavailable`.
+#[tokio::test]
+async fn patch_view_refusals_do_not_claim_there_is_no_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=8).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f4() {}\n", "fn CHANGED() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    async fn apply_at(
+        ws: &mut Ws,
+        buffer_id: u64,
+        line: u32,
+        action: HunkAction,
+    ) -> GitApplyHunkResult {
+        set_cursor(ws, buffer_id, line, 0).await;
+        apply_hunk(ws, buffer_id, action).await
+    }
+
+    // The working-changes view, cursor on a *context* line: there is a repo, a file and a diff —
+    // just no change under the cursor.
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let context = content
+        .text
+        .lines()
+        .position(|l| l == "fn f1() {}")
+        .expect("a context line") as u32;
+    for action in [HunkAction::Stage, HunkAction::Unstage] {
+        let r = apply_at(&mut ws, patch.buffer_id, context, action).await;
+        assert_eq!(
+            r.status,
+            ApplyHunkStatus::NoChange,
+            "nothing to {action:?} on a context line — not `Unavailable`, which the client words \
+             as \"not in a git repository\""
+        );
+    }
+    // Revert has its own refusal: it *is* available, just not from a view with no undo stack of
+    // its own to put the edit in.
+    let r = apply_at(&mut ws, patch.buffer_id, context, HunkAction::Revert).await;
+    assert_eq!(r.status, ApplyHunkStatus::NeedsFile);
+
+    // A commit's diff is history: nothing to stage at any position, and nothing to point at either,
+    // so all three actions answer the same way.
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    let commit = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+    for action in [HunkAction::Stage, HunkAction::Unstage, HunkAction::Revert] {
+        let r = apply_at(&mut ws, commit.buffer_id, 0, action).await;
+        assert_eq!(
+            r.status,
+            ApplyHunkStatus::NoChange,
+            "{action:?} in history has nothing to act on, wherever the cursor is"
+        );
+    }
+
+    drop(server);
+}
+
+/// Stepping *back* onto a working-changes view whose tree has gone clean in the meantime. There is
+/// a caller expecting a buffer here, so unlike a fresh `Space g w` this has to refuse — but it
+/// refuses by naming what happened, not by claiming some buffer id went missing.
+#[tokio::test]
+async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let line = content.text.lines().position(|l| l == "two").unwrap() as u32;
+    set_cursor(&mut ws, patch.buffer_id, line, 0).await;
+
+    // `Enter` leaves the patch for the file, recording the patch as the nav origin.
+    let followed: GitFollowPatchLineResult = send_request::<GitFollowPatchLine>(
+        &mut ws,
+        &GitFollowPatchLineParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let file = followed.opened.expect("Enter opened the file").buffer_id;
+
+    // The transient patch closes behind the open, as it does the moment it's hidden for real.
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        &BufferCloseParams {
+            buffer_id: patch.buffer_id,
+            open_next: false,
+        },
+    )
+    .await;
+
+    // The tree goes clean under us, so the recorded origin no longer exists to go back to.
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    let err = send_request_expect_err::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: file,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("no working changes"),
+        "names what happened rather than blaming a buffer id, got {err:?}"
+    );
+
+    drop(server);
+}
+
+/// `Enter` in the **working-changes** view. Every other patch leads to a blob in history; this
+/// one's new side is the working tree, so it leads to the real file — the difference between a view
+/// you can only read and one you can work from. Its old side is HEAD, which is what the diff was
+/// taken against.
+#[tokio::test]
+async fn enter_in_the_working_changes_view_opens_the_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\nGONE\nthree\n");
+    std::fs::write(root.join("a.rs"), "one\nADDED\nthree\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let line_of = |want: &str| {
+        content
+            .text
+            .lines()
+            .position(|l| l == want)
+            .unwrap_or_else(|| panic!("no line {want:?} in:\n{}", content.text)) as u32
+    };
+    let params = GitFollowPatchLineParams {
+        buffer_id: patch.buffer_id,
+    };
+
+    // The new side: the file on disk, editable, at the line the `+` came from.
+    set_cursor(&mut ws, patch.buffer_id, line_of("ADDED"), 0).await;
+    let opened = send_request::<GitFollowPatchLine>(&mut ws, &params)
+        .await
+        .opened
+        .expect("the `+` side opens");
+    assert_eq!(
+        opened.path.as_deref(),
+        Some(root.join("a.rs").to_string_lossy().as_ref()),
+        "the working-tree file itself, not a blob"
+    );
+    assert!(!opened.read_only, "and it's editable — that's the point");
+    assert_eq!(opened.cursor.position.line, 1, "landed on the changed line");
+
+    // The old side: HEAD's content, read-only, as `git diff HEAD` implies.
+    set_cursor(&mut ws, patch.buffer_id, line_of("GONE"), 0).await;
+    let opened = send_request::<GitFollowPatchLine>(&mut ws, &params)
+        .await
+        .opened
+        .expect("the `-` side opens");
+    assert!(opened.read_only, "history is read-only");
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: opened.buffer_id,
+        },
+    )
+    .await;
+    assert_eq!(
+        content.text, "one\nGONE\nthree\n",
+        "HEAD's side of the diff"
+    );
+
+    drop(server);
+}
+
+/// Staging a block of a **large** file — one whose Git baseline loads off the open path — from the
+/// working-changes view.
+///
+/// The view opens the file and applies to it in the same breath, so the deferred load has had no
+/// interval to finish in and the baseline cache is empty. That absence used to be reported as
+/// `Unavailable`, which the client words as "not in a git repository" — about a file in the repo
+/// whose diff is on screen. It reads as intermittent from the outside: files under the sync limit
+/// stage fine, the big ones never do.
+#[tokio::test]
+async fn a_large_files_deferred_baseline_does_not_refuse_the_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Comfortably past GIT_BASELINE_SYNC_LIMIT_BYTES (128 KB), so the baseline load defers.
+    let base: String = (1..=20_000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    assert!(
+        base.len() > 128 * 1024,
+        "big enough to defer: {}",
+        base.len()
+    );
+    commit_file(&repo, "big.rs", &base);
+    std::fs::write(
+        root.join("big.rs"),
+        base.replace("fn f3() {}\n", "fn ONE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let line = content
+        .text
+        .lines()
+        .position(|l| l == "fn ONE() {}")
+        .expect("the changed line") as u32;
+    set_cursor(&mut ws, patch.buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, patch.buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert!(
+        index_text(&root, "big.rs").is_some_and(|t| t.contains("fn ONE() {}")),
+        "and it really reached the index"
+    );
+
+    drop(server);
+}
+
+/// The same cache miss reached directly: a large file opened and staged before its deferred
+/// baseline lands. Same refusal, same reason — so the fix belongs at the apply, not at the one
+/// caller that happened to expose it.
+#[tokio::test]
+async fn staging_a_just_opened_large_file_waits_for_its_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20_000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "big.rs", &base);
+    std::fs::write(
+        root.join("big.rs"),
+        base.replace("fn f9() {}\n", "fn TWO() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            absolute_path: Some(root.join("big.rs").to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    )
+    .await;
+    // No settling wait: staging immediately is exactly the race.
+    set_cursor(&mut ws, opened.buffer_id, 8, 0).await;
+    let r = apply_hunk(&mut ws, opened.buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert!(index_text(&root, "big.rs").is_some_and(|t| t.contains("fn TWO() {}")));
+
+    drop(server);
+}
+
+/// The other half of the rule: an on-demand load must not hand a baseline to a file the *open*
+/// path deliberately refused one. A file outside the workspace's git-eligible tree has no baseline
+/// by design, not by timing, and `Unavailable` is the honest answer there.
+#[tokio::test]
+async fn an_external_file_still_has_no_baseline_to_stage_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+
+    // A file in its own repo, entirely outside the workspace's roots.
+    let far = outside.path().canonicalize().unwrap();
+    let far_repo = init_repo_at(&far);
+    commit_file(&far_repo, "far.rs", "alpha\n");
+    std::fs::write(far.join("far.rs"), "beta\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            absolute_path: Some(far.join("far.rs").to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    )
+    .await;
+    set_cursor(&mut ws, opened.buffer_id, 0, 0).await;
+    let r = apply_hunk(&mut ws, opened.buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Unavailable);
+    assert_eq!(
+        index_text(&far, "far.rs").as_deref(),
+        Some("alpha\n"),
+        "nothing was staged"
+    );
+
+    drop(server);
+}
+
+/// The same cold cache seen by a verb that only needs to know *which repo* the buffer is in.
+/// `Space g w` on a large file opened a moment ago used to fail outright — a pinned error toast
+/// reading "Not in a git repository" about a file in the repo it was asking about.
+#[tokio::test]
+async fn repo_resolution_survives_a_large_files_deferred_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20_000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "big.rs", &base);
+    std::fs::write(
+        root.join("big.rs"),
+        base.replace("fn f3() {}\n", "fn ONE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            absolute_path: Some(root.join("big.rs").to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+    )
+    .await;
+    // `Space g w` with the repo resolved from the buffer we're on — no settling wait.
+    let shown = send_request::<GitShow>(
+        &mut ws,
+        &GitShowParams {
+            repo_id: None,
+            buffer_id: Some(opened.buffer_id),
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(
+        shown.opened.is_some(),
+        "which repo a file is in is a fact about the workspace, not about how recently it opened"
+    );
 
     drop(server);
 }

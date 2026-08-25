@@ -445,25 +445,35 @@ where
                     // file above them rather than floating in the diff.
                     let rail_x = bounds.x + cell.width * 0.25;
                     let rule_y = y + (cell.height * 0.5).floor();
-                    // A file's rule tees off the rail when one runs into it from above (the blank
-                    // closing the previous file's last section) and corners when nothing does —
-                    // the first file in the patch, where a stub above the corner would read as a
-                    // line to nowhere.
-                    let corners = v.kind == VirtualRowKind::Rule && chrome_idx == 0;
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: rail_x,
-                            y: if corners { rule_y } else { y },
-                            width: 1.0,
-                            height: if corners {
-                                cell.height - (rule_y - y)
-                            } else {
-                                cell.height
+                    // The patch's **opening** block — the one carrying the summary caption — has
+                    // no rail above its rule: the caption and its blank belong to no file, and the
+                    // rule corners, since a stub above the corner would read as a line to nowhere.
+                    // Every other block opens with the blank that closed the previous file, which
+                    // does carry the rail down into the rule, so that rule tees off it.
+                    let rows = &line.virtual_rows_above;
+                    let opening = rows.iter().any(|r| r.kind == VirtualRowKind::Summary);
+                    let above_rule = rows[..chrome_idx]
+                        .iter()
+                        .all(|r| r.kind != VirtualRowKind::Rule);
+                    let is_rule = v.kind == VirtualRowKind::Rule;
+                    let corners = is_rule && above_rule && (opening || chrome_idx == 0);
+                    let detached = !is_rule && opening && above_rule;
+                    if !detached {
+                        fill(
+                            renderer,
+                            Rectangle {
+                                x: rail_x,
+                                y: if corners { rule_y } else { y },
+                                width: 1.0,
+                                height: if corners {
+                                    cell.height - (rule_y - y)
+                                } else {
+                                    cell.height
+                                },
                             },
-                        },
-                        p.fg_faint,
-                    );
+                            p.fg_faint,
+                        );
+                    }
                     // A rule is otherwise nothing but its line, running to the right edge.
                     if v.kind == VirtualRowKind::Rule {
                         fill(
@@ -512,26 +522,9 @@ where
                         );
                     }
                     // A file boundary is the heaviest break in the buffer, so it trails a rule out
-                    // to the right edge. Hunk separators deliberately don't — that would chop the
-                    // file into equal-looking pieces and flatten the hierarchy.
-                    // A section heading trails a muted rule to the right edge; the file's own rule
-                    // is the row above it.
-                    if v.kind == VirtualRowKind::HunkHeader {
-                        let x = text_x(v.text.chars().count() as u32 + 1);
-                        let right = bounds.x + bounds.width - PAD;
-                        if right - x > cell.width {
-                            fill(
-                                renderer,
-                                Rectangle {
-                                    x,
-                                    y: y + (cell.height * 0.5).floor(),
-                                    width: right - x,
-                                    height: 1.0,
-                                },
-                                p.fg_faint,
-                            );
-                        }
-                    }
+                    // to the right edge. Section headings deliberately don't — they used to, and it
+                    // chopped the file into equal-looking pieces, flattening the one hierarchy the
+                    // view has.
                     continue;
                 }
                 let staged = v.stage == DiffStage::Staged;

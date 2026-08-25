@@ -172,6 +172,14 @@ pub struct ServerState {
     /// LF-normalized. Populated on open, refreshed when HEAD changes (the watcher), and read by
     /// the per-edit `diff_hunks` so editing never re-runs repo discovery or re-reads the blob.
     pub git_baseline: HashMap<BufferId, crate::git::GitBaseline>,
+    /// Repo-level Git status for a buffer that is *of* a repo without being a file in it: the
+    /// generated patches and revision views `git/show` mints. There is no baseline to hang it off
+    /// (no path, no blob, no index entry), but the status bar still has to say which checkout is
+    /// in front of you — the branch indicator is how the editor says a repo is active at all.
+    ///
+    /// Resolved once, when the buffer is minted or regenerated, rather than per viewport window:
+    /// these reads open the repo, and the window is built on the keystroke path.
+    pub virtual_git_status: HashMap<BufferId, aether_protocol::git::GitBufferStatus>,
     /// Per-buffer conflict blocks, for the files a stopped merge or rebase left conflicted.
     /// Rescanned from the buffer's markers on the same triggers as the hunk caches, and **only
     /// while the baseline says the file is conflicted** — so an ordinary buffer never pays for the
@@ -631,6 +639,7 @@ impl ServerState {
             git_unstaged_hunks: HashMap::new(),
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
+            virtual_git_status: HashMap::new(),
             git_conflicts: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
@@ -1298,6 +1307,7 @@ impl ServerState {
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
         self.git_baseline.remove(&id);
+        self.virtual_git_status.remove(&id);
         self.git_conflicts.remove(&id);
         self.git_blame.remove(&id);
         self.diagnostics.remove(&id);

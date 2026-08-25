@@ -495,17 +495,20 @@ function gutter(
   return g;
 }
 
-/** A generated patch's file or hunk separator, or the blank space between them.
+/** A generated patch's file or hunk separator, the patch's summary caption, or the blank space
+ *  between them.
  *
  *  Chrome, not content: it holds no cursor position (that's the whole reason it's a virtual row
  *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
  *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
  *  left. */
-function chromeRow(v: VirtualRow, opensBlock: boolean, closes = false): HTMLElement {
+function chromeRow(v: VirtualRow, opensBlock: boolean, detached = false, closes = false): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row patch-chrome " + v.kind.replace("_", "-");
   // A file's rule corners when nothing runs into it from above; otherwise it tees off the rail.
   if (v.kind === "rule" && opensBlock) rowEl.classList.add("corners");
+  // Above the block's first rule — the patch summary — so no rail: it belongs to no file.
+  if (detached) rowEl.classList.add("detached");
   // The rail runs in from above and stops here, so it reaches only as far as the rule.
   if (closes) rowEl.classList.add("closes");
   const g = document.createElement("span");
@@ -618,11 +621,22 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
 
   const frag = document.createDocumentFragment();
   for (const line of window.lines) {
-    (line.virtual_rows_above ?? []).forEach((v, i) =>
+    // The patch's *opening* block — the one carrying the summary caption — has no rail above its
+    // rule: the caption belongs to no file, and the rule corners. Every other block opens with the
+    // blank that closed the previous file, which carries the rail down into the rule (it tees).
+    const chrome = line.virtual_rows_above ?? [];
+    const opening = chrome.some((v) => v.kind === "summary");
+    const firstRule = chrome.findIndex((v) => v.kind === "rule");
+    const aboveRule = (i: number) => firstRule < 0 || i < firstRule;
+    chrome.forEach((v, i) =>
       frag.appendChild(
         v.kind === "deleted"
           ? phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? [])
-          : chromeRow(v, i === 0),
+          : chromeRow(
+              v,
+              v.kind === "rule" && i === firstRule && (opening || i === 0),
+              v.kind !== "rule" && opening && aboveRule(i),
+            ),
       ),
     );
 
@@ -666,7 +680,8 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     });
     // Closing chrome, after the line's own rows — a patch's final rule, which has no trailing line
     // to sit above.
-    for (const v of line.virtual_rows_below ?? []) frag.appendChild(chromeRow(v, false, true));
+    for (const v of line.virtual_rows_below ?? [])
+      frag.appendChild(chromeRow(v, false, false, true));
   }
   // Virtual scroll: a full-document-height spacer (so the native scrollbar reflects the whole
   // file), with the loaded window absolutely positioned at its visual-row offset. Both axes scroll

@@ -19,9 +19,19 @@ license = "MIT"
 
 [profile.dev]
 opt-level = 1
+# Line tables, not full DWARF. Full debuginfo was **85% of every binary** (a 232 MB test binary
+# carried 198 MB of it, over 24 MB of actual code), which is paid three times over: disk, link
+# time, and — the one that bites — linker memory, since a workspace-wide `cargo test` links ~29 of
+# these at once and can take the machine into swap. Panic backtraces still name our file:line,
+# and symbol tables are untouched so profilers still resolve frames; what's given up is variable
+# inspection in a debugger.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+# Dependencies get none at all: their debuginfo is the bulk of the DWARF above, and a frame inside
+# tokio or iced is not where this codebase is debugged from.
+debug = 0
 
 [workspace.dependencies]
 aether-protocol = { path = "crates/aether-protocol" }

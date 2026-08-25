@@ -5317,11 +5317,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     vrow,
                     kind,
                     viewport_cols,
-                    if chrome_idx > 0 {
-                        RailJoin::Tees
-                    } else {
-                        RailJoin::Opens
-                    },
+                    rail_join(&render.virtual_rows_above, chrome_idx),
                 ),
             };
             lines.push(Line::from(spans));
@@ -5652,7 +5648,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// reach it.
 /// What the left rail does where a `Rule` crosses it. Named rather than passed as loose booleans
 /// so an incoherent combination can't be spelled.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RailJoin {
     /// Nothing above — the first file in the patch.
     Opens,
@@ -5660,6 +5656,32 @@ enum RailJoin {
     Tees,
     /// The rail runs in from above and stops — the rule closing the patch.
     Closes,
+    /// No rail at all: chrome sitting *above* the block's first rule, which is the patch summary.
+    /// It belongs to no file, so a rail would run down from nothing.
+    Detached,
+}
+
+/// Where the rail is at chrome row `idx` of one line's block.
+///
+/// Turns on whether this is the patch's **opening** block — the one carrying the summary caption.
+/// There, the caption and its blank sit above the first rule and belong to no file, so no rail runs
+/// through them and the rule corners. Every other block opens with the blank that closed the
+/// previous file, which *does* carry the rail down into the next rule, so that one tees.
+fn rail_join(rows: &[VirtualRow], idx: usize) -> RailJoin {
+    let opening = rows.iter().any(|r| r.kind == VirtualRowKind::Summary);
+    let above_rule = rows[..idx].iter().all(|r| r.kind != VirtualRowKind::Rule);
+    if rows[idx].kind != VirtualRowKind::Rule {
+        return if opening && above_rule {
+            RailJoin::Detached
+        } else {
+            RailJoin::Tees
+        };
+    }
+    if above_rule && (opening || idx == 0) {
+        RailJoin::Opens
+    } else {
+        RailJoin::Tees
+    }
 }
 
 fn chrome_virtual_row_spans(
@@ -5680,6 +5702,7 @@ fn chrome_virtual_row_spans(
     // `width` is the *content* width, as it is for every other row: the gutter column sits outside
     // it, which is why chrome must not subtract one for it.
     let glyph = match (kind, join) {
+        (_, RailJoin::Detached) => " ",
         (VirtualRowKind::Rule, RailJoin::Closes) => "└",
         (VirtualRowKind::Rule, RailJoin::Tees) => "├",
         (VirtualRowKind::Rule, RailJoin::Opens) => "┌",
@@ -5716,22 +5739,13 @@ fn chrome_virtual_row_spans(
     }
     spans.append(&mut text_spans);
 
+    // Carry the band to the edge. Section headings used to trail a muted rule from the end of the
+    // signature; it read as heavily as the file rule above it, so a file and a hunk inside it were
+    // hard to tell apart at a glance. The rule is now the file boundary's alone.
     let used = row.text.chars().count();
     let remaining = text_width.saturating_sub(used + 1);
-    match kind {
-        // A section heading trails a muted rule from the end of the signature to the right edge,
-        // so the eye can follow it across; the file's own rule is the row that opened the block.
-        VirtualRowKind::HunkHeader if remaining > 2 => {
-            spans.push(Span::styled(
-                format!(" {} ", "─".repeat(remaining - 2)),
-                rule,
-            ));
-        }
-        // Everything else just carries the band to the edge.
-        _ if remaining > 0 => {
-            spans.push(Span::styled(" ".repeat(remaining), Style::default().bg(bg)));
-        }
-        _ => {}
+    if remaining > 0 {
+        spans.push(Span::styled(" ".repeat(remaining), Style::default().bg(bg)));
     }
     spans
 }
@@ -10258,6 +10272,58 @@ mod tests {
         assert!(
             newest > detail + 1,
             "the newest sits below it with a gap: {rows:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    fn row(kind: VirtualRowKind) -> VirtualRow {
+        VirtualRow {
+            text: String::new(),
+            kind,
+            stage: Default::default(),
+            emphasis: Vec::new(),
+            highlights: Vec::new(),
+        }
+    }
+
+    /// The rail's whole job is making a file's chrome read as belonging to that file. The patch's
+    /// summary caption belongs to no file, so it floats; every *later* file is reached down the
+    /// rail from the one before it, so its rule tees rather than cornering.
+    #[test]
+    fn the_rail_starts_at_the_first_file_not_at_the_summary() {
+        use VirtualRowKind::*;
+
+        // The opening block: caption, its blank, then the first file.
+        let opening = [
+            Summary, Spacer, Rule, FileHeader, Spacer, HunkHeader, Spacer,
+        ]
+        .map(row)
+        .to_vec();
+        assert_eq!(rail_join(&opening, 0), RailJoin::Detached, "the caption");
+        assert_eq!(rail_join(&opening, 1), RailJoin::Detached, "and its blank");
+        assert_eq!(
+            rail_join(&opening, 2),
+            RailJoin::Opens,
+            "the first file corners: nothing runs into it from above"
+        );
+        assert_eq!(rail_join(&opening, 3), RailJoin::Tees, "its path");
+
+        // Every later block opens with the blank that closed the previous file — which carries the
+        // rail down into this file's rule.
+        let later = [Spacer, Rule, FileHeader, Spacer].map(row).to_vec();
+        assert_eq!(
+            rail_join(&later, 0),
+            RailJoin::Tees,
+            "the closing blank still carries the rail"
+        );
+        assert_eq!(
+            rail_join(&later, 1),
+            RailJoin::Tees,
+            "so the next file tees off it rather than cornering"
         );
     }
 }

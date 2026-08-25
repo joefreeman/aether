@@ -21,14 +21,15 @@
 //! buffer edit driven by the handler.
 
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, CommitRef, CommitRefKind, ConflictSide, GitBaselineChoice,
-    GitBaselineSource, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
+    ApplyHunkStatus, BlameInfo, CommitInfo, CommitRef, CommitRefKind, ConflictSide,
+    GitBaselineChoice, GitBaselineSource, GitBufferStatus, GitHead, GitRepoOperation, GitStatus,
+    GitUpstreamStatus, HunkAction,
 };
-use aether_protocol::viewport::DiffStage;
+use aether_protocol::viewport::{DiffStage, VirtualRowKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::patch::{GeneratedPatch, PatchBuilder, META};
+use crate::patch::{GeneratedPatch, PatchBuilder, Span, ADDED, META, REMOVED};
 
 /// One contiguous run of changes between the baseline and the live buffer, in **0-based buffer
 /// line** coordinates.
@@ -97,18 +98,15 @@ pub type BaselineChoices = HashMap<PathBuf, GitBaselineSource>;
 /// Cached Git baseline for a buffer: where it lives in a repo (if anywhere) and the committed
 /// content to diff against — HEAD normally, or a pinned revision when one is set for the repo.
 /// Resolved on open and refreshed when HEAD changes — *not* on every edit.
-#[derive(Debug, Clone, Default)]
+///
+/// **Split along the cost line.** Everything outside [`Self::content`] is repo *identity*: a short
+/// walk up the tree plus a few ref reads, independent of file size. `content` is the O(file) half
+/// — blob decompression and a whole-file diff — and is the only part a large file's open defers.
+#[derive(Debug, Clone)]
 pub struct GitBaseline {
     /// `Some` when the file is inside a Git repo. A cached `None` means "checked, not in a repo",
     /// so editing a non-git file doesn't re-run discovery every keystroke.
     pub repo: Option<GitRepo>,
-    /// HEAD content of the file, **LF-normalized** so a CRLF-committed file doesn't read as
-    /// "every line modified". `None` when untracked / not committed / no repo.
-    pub blob: Option<Vec<u8>>,
-    /// Index (staging-area) content of the file, LF-normalized like `blob`. `None` when the file
-    /// has no index entry (untracked, or a staged whole-file deletion). The unstaged diff is the
-    /// buffer against this; the staged diff is this against `blob`.
-    pub index_blob: Option<Vec<u8>>,
     /// Current branch name (or short commit hash when detached). `None` outside a repo.
     pub branch: Option<String>,
     /// Divergence from the branch's upstream, cached here for the same reason `branch` is: it's a
@@ -116,9 +114,6 @@ pub struct GitBaseline {
     /// baseline is reloaded. A fetch writes `refs/remotes/**`, the watcher keys on `refs/`, and
     /// the refresh recomputes this — so the count follows a terminal `git fetch` too.
     pub upstream: Option<GitUpstreamStatus>,
-    /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
-    /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
-    pub staged_hunks: Vec<DiffHunk>,
     /// Set when this repo is being diffed against something other than the index. The
     /// staged/unstaged split is meaningless then — there's no index relationship to an arbitrary
     /// commit, nor to the file on disk — so the whole change set reads as unstaged.
@@ -140,7 +135,33 @@ pub struct GitBaseline {
     /// the branch alone cannot say it: git allows one checkout per branch per family, so "on
     /// `test1`" looks identical whether that is the main tree or a worktree.
     pub worktree: bool,
-    /// This *file* is left conflicted by that operation — it has index stages 1–3 and no stage 0.
+    /// The committed content, or **`None` while it is still loading** — a large file defers this
+    /// half to `handlers::finish_git_baseline`.
+    ///
+    /// The distinction is the point of the field. "Not loaded yet" and "this file has nothing in
+    /// git" used to be spelled the same way (an absent cache entry), so a large file read as
+    /// untracked for the first few milliseconds of its life: the changes picker listed it as a
+    /// whole-file addition, and staging refused it as *not in a git repository*. Nothing can
+    /// conclude anything about a file's git content from a pending baseline, and this `Option` is
+    /// what makes each reader say so rather than infer it from an absence.
+    pub content: Option<BaselineContent>,
+}
+
+/// The O(file) half of a [`GitBaseline`]: the committed bytes and the diff that needs them.
+#[derive(Debug, Clone, Default)]
+pub struct BaselineContent {
+    /// HEAD content of the file, **LF-normalized** so a CRLF-committed file doesn't read as
+    /// "every line modified". `None` when untracked / not committed / no repo.
+    pub blob: Option<Vec<u8>>,
+    /// Index (staging-area) content of the file, LF-normalized like `blob`. `None` when the file
+    /// has no index entry (untracked, or a staged whole-file deletion). The unstaged diff is the
+    /// buffer against this; the staged diff is this against `blob`.
+    pub index_blob: Option<Vec<u8>>,
+    /// Staged diff (HEAD → index), computed once here since it's independent of the live buffer and
+    /// only changes when HEAD or the index does (i.e. on the same refresh trigger as the blobs).
+    pub staged_hunks: Vec<DiffHunk>,
+    /// This *file* is left conflicted by a stopped operation — it has index stages 1–3 and no
+    /// stage 0.
     ///
     /// When true both blobs hold HEAD's content and `staged_hunks` is empty: nothing can be staged
     /// while the index holds conflict stages, and the whole change set reads as unstaged against
@@ -150,25 +171,79 @@ pub struct GitBaseline {
     pub conflicted: bool,
 }
 
+impl Default for GitBaseline {
+    /// The **resolved** "not in a repo" answer — content present and empty, because we looked.
+    /// Never the pending one: pending is only ever spelled by [`load_repo_identity`], so no
+    /// `..Default::default()` can mint a baseline that wrongly claims to still be loading.
+    fn default() -> Self {
+        Self {
+            repo: None,
+            branch: None,
+            upstream: None,
+            choice: None,
+            operation: None,
+            worktree: false,
+            content: Some(BaselineContent::default()),
+        }
+    }
+}
+
+impl GitBaseline {
+    /// The committed content, or `None` while the deferred half is still in flight.
+    pub fn content(&self) -> Option<&BaselineContent> {
+        self.content.as_ref()
+    }
+
+    /// True while the O(file) half is still loading. A caller that needs the content resolves it
+    /// (`handlers::ensure_git_baseline`) rather than reading the absence as an answer.
+    pub fn is_pending(&self) -> bool {
+        self.content.is_none()
+    }
+}
+
 /// Resolve a path's repo and read its HEAD baseline. The expensive part — discovery plus reading
 /// and decompressing the committed blob — so it runs on open and on external Git changes, never
 /// per edit. Synchronous and `!Send`-clean (every libgit2 object is dropped before returning).
 pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
+    let Some((repo, mut baseline, rel_path)) = open_for_baseline(path, choices) else {
+        return GitBaseline::default();
+    };
+    baseline.content = Some(load_baseline_content(&repo, &rel_path, &baseline.choice));
+    baseline
+}
+
+/// The **cheap half** alone: which repo the file is in and that repo's state, with the content left
+/// [pending](GitBaseline::is_pending).
+///
+/// Used where the content is about to be loaded in the background ([`crate::handlers::buffer_open`]
+/// past its size limit). Which repo a file is in is a fact about the workspace, not about how
+/// recently it was opened, so it is resolved on the open path however big the file is — every git
+/// verb resolves its repo through this, and deferring it made them all refuse a file that had just
+/// appeared on screen.
+pub fn load_repo_identity(path: &Path, choices: &BaselineChoices) -> GitBaseline {
+    match open_for_baseline(path, choices) {
+        Some((_, baseline, _)) => baseline,
+        // Resolved: not in a repo. Nothing is loading, so nothing is pending.
+        None => GitBaseline::default(),
+    }
+}
+
+/// Open the repo around `path` and read everything that isn't O(file): the repo location, HEAD's
+/// label and divergence, a stopped operation, whether this is a linked worktree, and the pinned
+/// baseline choice in force. Returns the open repo so the caller can go on to read blobs from it
+/// without a second discovery.
+///
+/// `None` means the path is in no repo at all — the resolved answer, not a missing one.
+fn open_for_baseline(
+    path: &Path,
+    choices: &BaselineChoices,
+) -> Option<(git2::Repository, GitBaseline, PathBuf)> {
     // Canonicalise so `strip_prefix` against the (also canonicalised) workdir is symlink-proof,
     // and so a not-yet-on-disk file (new buffer) resolves to "no repo" rather than erroring.
-    let Ok(canonical) = path.canonicalize() else {
-        return GitBaseline::default();
-    };
-    let Ok(repo) = git2::Repository::discover(&canonical) else {
-        return GitBaseline::default();
-    };
-    let Some(workdir) = repo.workdir().and_then(|w| w.canonicalize().ok()) else {
-        return GitBaseline::default();
-    };
-    let Ok(rel) = canonical.strip_prefix(&workdir) else {
-        return GitBaseline::default();
-    };
-    let rel_path = rel.to_path_buf();
+    let canonical = path.canonicalize().ok()?;
+    let repo = git2::Repository::discover(&canonical).ok()?;
+    let workdir = repo.workdir().and_then(|w| w.canonicalize().ok())?;
+    let rel_path = canonical.strip_prefix(&workdir).ok()?.to_path_buf();
 
     // Read HEAD once and derive both views of it: the flattened label for the status bar, and the
     // upstream divergence. Both are repo-level rather than file-level, and both are wanted whether
@@ -185,7 +260,30 @@ pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
     // Cheap (`git_repository_is_worktree` reads a flag set at open time) and asked for every
     // baseline, so it rides along rather than costing a second discovery later.
     let worktree = repo.is_worktree();
+    let choice = choices.get(&workdir).cloned();
 
+    let baseline = GitBaseline {
+        repo: Some(GitRepo {
+            workdir,
+            rel_path: rel_path.clone(),
+        }),
+        branch,
+        upstream,
+        choice,
+        operation,
+        worktree,
+        content: None,
+    };
+    Some((repo, baseline, rel_path))
+}
+
+/// The **expensive half**: the committed blobs and the staged diff between them. Blob decompression
+/// and a whole-file diff, so this is what a large file's open defers.
+fn load_baseline_content(
+    repo: &git2::Repository,
+    rel_path: &Path,
+    choice: &Option<GitBaselineSource>,
+) -> BaselineContent {
     // A conflicted file has no stage-0 entry, so the index blob reads as absent — which would make
     // the staged diff `HEAD → ""` and paint the whole file as a staged deletion. Point *both* blobs
     // at HEAD instead (the same move the pinned-revision branch below makes): the staged half comes
@@ -200,18 +298,13 @@ pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
     //
     // Checked before the pinned revision, in the rare case both apply: mid-merge, what the gutter
     // *would* have been comparing against is the least of what the user needs to know.
-    if index_has_conflict(&repo, &rel_path) {
-        let head = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
-        return GitBaseline {
-            worktree,
-            repo: Some(GitRepo { workdir, rel_path }),
+    if index_has_conflict(repo, rel_path) {
+        let head = head_blob_bytes(repo, rel_path).map(normalize_lf);
+        return BaselineContent {
             blob: head.clone(),
             index_blob: head,
-            branch,
-            upstream,
-            operation,
+            staged_hunks: Vec::new(),
             conflicted: true,
-            ..Default::default()
         };
     }
 
@@ -225,42 +318,28 @@ pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
     // own snapshot, which lives outside this cache, so the substitution happens in
     // [`effective_baseline`] instead. The blobs loaded here go unused by the gutter but still
     // answer everything else that asks the baseline a git question.
-    if let Some(choice @ GitBaselineSource::Rev { commit, .. }) = choices.get(&workdir) {
-        let bytes = rev_blob_bytes(&repo, commit, &rel_path).map(normalize_lf);
-        return GitBaseline {
-            worktree,
-            repo: Some(GitRepo { workdir, rel_path }),
+    if let Some(GitBaselineSource::Rev { commit, .. }) = choice {
+        let bytes = rev_blob_bytes(repo, commit, rel_path).map(normalize_lf);
+        return BaselineContent {
             blob: bytes.clone(),
             index_blob: bytes,
-            branch,
-            upstream,
             staged_hunks: Vec::new(),
-            choice: Some(choice.clone()),
-            operation,
             conflicted: false,
         };
     }
 
-    let blob = head_blob_bytes(&repo, &rel_path).map(normalize_lf);
-    let index_blob = index_blob_bytes(&repo, &rel_path).map(normalize_lf);
+    let blob = head_blob_bytes(repo, rel_path).map(normalize_lf);
+    let index_blob = index_blob_bytes(repo, rel_path).map(normalize_lf);
     // Staged diff is HEAD → index; absent sides count as empty (a staged add has no HEAD side, a
     // staged whole-file delete has no index side).
     let staged_hunks = hunks_from_buffers(
         blob.as_deref().unwrap_or(b""),
         index_blob.as_deref().unwrap_or(b""),
     );
-    // Only `Saved` can still be in play here — `Rev` returned above — and it needs no blob work.
-    let choice = choices.get(&workdir).cloned();
-    GitBaseline {
-        worktree,
-        repo: Some(GitRepo { workdir, rel_path }),
+    BaselineContent {
         blob,
         index_blob,
-        branch,
-        upstream,
         staged_hunks,
-        choice,
-        operation,
         conflicted: false,
     }
 }
@@ -292,8 +371,11 @@ pub struct EffectiveBaseline<'a> {
 pub fn effective_baseline<'a>(
     baseline: &'a GitBaseline,
     disk_blob: Option<&'a [u8]>,
-) -> EffectiveBaseline<'a> {
-    match &baseline.choice {
+) -> Option<EffectiveBaseline<'a>> {
+    // Still loading: there is nothing to diff against *yet*, which is not the same as nothing to
+    // diff against. Callers must say which they mean — draw no gutter, or resolve it first.
+    let content = baseline.content()?;
+    Some(match &baseline.choice {
         Some(GitBaselineSource::Saved) => EffectiveBaseline {
             blob: disk_blob,
             staged: &[],
@@ -302,16 +384,16 @@ pub fn effective_baseline<'a>(
         // The pinned commit is already in both blobs; what has to come from here is the empty
         // staged layer and `pinned`.
         Some(GitBaselineSource::Rev { .. }) => EffectiveBaseline {
-            blob: baseline.index_blob.as_deref(),
+            blob: content.index_blob.as_deref(),
             staged: &[],
             pinned: true,
         },
         None => EffectiveBaseline {
-            blob: baseline.index_blob.as_deref(),
-            staged: &baseline.staged_hunks,
+            blob: content.index_blob.as_deref(),
+            staged: &content.staged_hunks,
             pinned: false,
         },
-    }
+    })
 }
 
 /// `rel`'s content at `rev`, or `None` when the path doesn't exist there (or `rev` no longer
@@ -1892,6 +1974,85 @@ pub fn compose_both(staged: &[DiffHunk], unstaged: &[DiffHunk]) -> Vec<DiffHunk>
     out
 }
 
+/// The repo-level half of a status: branch, upstream divergence, a stopped operation, and whether
+/// this checkout is a linked worktree — for a buffer that is *of* a repo without being a file in
+/// it, which is every view `git/show` mints.
+///
+/// The file-level halves stay empty on purpose. A patch is not a file: its change counts are the
+/// diff it is already showing, and it has no index entry of its own to have staged anything into.
+/// What is left is exactly the cluster that tells you a repository is active and which checkout of
+/// it you are looking at.
+pub fn repo_status(workdir: &Path) -> Option<GitBufferStatus> {
+    let repo = git2::Repository::discover(workdir).ok()?;
+    let head = head_state(&repo);
+    Some(GitBufferStatus {
+        branch: head.as_ref().map(branch_label),
+        upstream: head
+            .as_ref()
+            .and_then(|head| upstream_divergence(&repo, head)),
+        operation: state_operation(&repo),
+        worktree: repo.is_worktree(),
+        ..Default::default()
+    })
+}
+
+/// Stage or unstage a whole **deleted** path — `git add <gone>` / `git reset -- <gone>`.
+///
+/// The deletion is the entire change, so there is no region to resolve and no buffer to resolve it
+/// against; what the index holds is the whole state. Staging drops the entry (which is what
+/// recording a removal *is*), unstaging puts HEAD's back.
+///
+/// Idempotent in both directions: asking for the state the index is already in is
+/// [`ApplyHunkStatus::NoChange`], not a second write, so a repeated key doesn't lie about having
+/// done something.
+pub fn apply_deletion(workdir: &Path, rel: &str, action: HunkAction) -> ApplyHunkStatus {
+    let rel_path = Path::new(rel);
+    let Ok(repo) = git2::Repository::open(workdir) else {
+        return ApplyHunkStatus::Unavailable;
+    };
+    let Ok(mut index) = repo.index() else {
+        return ApplyHunkStatus::Unavailable;
+    };
+    // A delete/modify conflict is a different world, exactly as it is for a hunk: there is no
+    // stage-0 entry, so "already staged" would read false and unstaging would quietly clear the
+    // conflict stages — resolving a merge the user never said to resolve.
+    if path_has_conflict(workdir, rel_path) {
+        return ApplyHunkStatus::Conflicted;
+    }
+    // Present at stage 0 = the index still has the file, so the deletion is unstaged.
+    let in_index = index.get_path(rel_path, 0).is_some();
+    match action {
+        HunkAction::Stage => {
+            if !in_index {
+                return ApplyHunkStatus::NoChange;
+            }
+            match index.remove_path(rel_path).and_then(|()| index.write()) {
+                Ok(()) => ApplyHunkStatus::Staged,
+                Err(_) => ApplyHunkStatus::Unavailable,
+            }
+        }
+        HunkAction::Unstage => {
+            if in_index {
+                return ApplyHunkStatus::NoChange;
+            }
+            // `reset_default` is libgit2's `git reset -- <paths>`: this path's index entry back to
+            // HEAD's, leaving every other entry (and the worktree) alone.
+            let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+            let Some(head) = head else {
+                // Unborn HEAD: nothing was ever committed, so there is no deletion to unstage.
+                return ApplyHunkStatus::NoChange;
+            };
+            match repo.reset_default(Some(head.as_object()), [rel_path]) {
+                Ok(()) => ApplyHunkStatus::Unstaged,
+                Err(_) => ApplyHunkStatus::Unavailable,
+            }
+        }
+        // Restoring the file is an edit with nowhere to land from the patch view; the caller
+        // refuses this before reaching here (`ApplyHunkStatus::NeedsFile`).
+        HunkAction::Revert => ApplyHunkStatus::NeedsFile,
+    }
+}
+
 /// Replace the file's index (staged) entry with `content`, creating the entry when the file is
 /// untracked. The caller is responsible for line-ending fidelity (CRLF files want CRLF content —
 /// the in-memory baselines are LF-normalized). `None` on any libgit2 failure.
@@ -2424,17 +2585,11 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
     // detected as the wrong language (or none) when its highlights are projected.
     let _ = diff.find_similar(None);
 
-    if let Ok(stats) = diff.stats() {
-        b.header_line("", &[]);
-        let text = format!(
-            "{} file{} changed, +{} −{}",
-            stats.files_changed(),
-            if stats.files_changed() == 1 { "" } else { "s" },
-            stats.insertions(),
-            stats.deletions()
-        );
-        b.header_line(&text, &[(0, text.len(), META)]);
-    }
+    // A blank between the message and the diff's caption — here and not in `emit_summary` itself,
+    // which opens the working-changes view, where a leading blank line would be a cursor position
+    // above everything.
+    b.header_line("", &[]);
+    emit_summary(&mut b, &diff);
 
     crate::patch::render_diff(&repo, &diff, &mut b, false)?;
 
@@ -2462,18 +2617,6 @@ pub fn show_working_changes(repo_path: &Path) -> Result<RevisionContent, String>
     let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
     let mut b = PatchBuilder::default();
 
-    let line = "Working changes";
-    b.header_line(line, &[(0, line.len(), "text.title")]);
-    // Where these changes sit, which is the one piece of context a commit's header gives for free.
-    if let Some(head) = head_state(&repo) {
-        let line = match &head {
-            GitHead::Branch { name, .. } => format!("On:     {name}"),
-            GitHead::Unborn { name } => format!("On:     {name} (unborn)"),
-            GitHead::Detached { oid } => format!("At:     {} (detached)", short_hash(oid)),
-        };
-        b.header_line(&line, &[(0, 7, META)]);
-    }
-
     // HEAD's tree, or the empty tree on an unborn branch so a first commit's worth of new files
     // still shows as additions rather than as nothing at all.
     let head_tree = repo
@@ -2486,27 +2629,63 @@ pub fn show_working_changes(repo_path: &Path) -> Result<RevisionContent, String>
         .map_err(|e| e.message().to_string())?;
     let _ = diff.find_similar(None);
 
-    if let Ok(stats) = diff.stats() {
-        b.header_line("", &[]);
-        let text = format!(
-            "{} file{} changed, +{} −{}",
-            stats.files_changed(),
-            if stats.files_changed() == 1 { "" } else { "s" },
-            stats.insertions(),
-            stats.deletions()
-        );
-        b.header_line(&text, &[(0, text.len(), META)]);
+    // No metadata block. A commit's header earns its lines — the message is the point of reading
+    // one — but this view's were a title repeating the buffer's own label, the repo (now in that
+    // label) and the branch (in the status bar's git cluster), and they cost the first four cursor
+    // positions in the buffer before anything you can act on.
+    if diff.deltas().len() == 0 {
+        // A clean tree says so in words, as buffer text rather than chrome: it is the only thing
+        // to show, and floating chrome over an empty buffer reads as a failure to render. Only an
+        // already-open view reaches this — `git/show` refuses to mint a buffer for a clean tree.
+        let text = "Nothing to commit — the working tree is clean";
+        b.header_line(text, &[(0, text.len(), META)]);
+    } else {
+        emit_summary(&mut b, &diff);
     }
 
     crate::patch::render_diff(&repo, &diff, &mut b, true)?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {
+        // Which repo this is comes from the status bar's branch indicator, not from the label: the
+        // branch is what says a repository is active in the editor at all. `git_show` appends the
+        // repo's name here only when the workspace holds more than one, where two identical
+        // "Working changes" rows in the buffer list would name neither.
         title: "Working changes".to_string(),
         text,
         language: None,
         generated: Some(generated),
     })
+}
+
+/// The patch's opening caption — `N files changed  +A  −B`.
+///
+/// Chrome, so it holds no cursor position: nothing in it can be staged, followed or navigated to.
+/// The counts take the same green/red as a file separator's, which is what makes the number you
+/// scan for readable at a glance instead of a run of muted text.
+///
+/// No blank below it: the first file's rule follows immediately, and a gap there left the caption
+/// floating between the top of the buffer and the diff instead of sitting on it.
+fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>) {
+    let Ok(stats) = diff.stats() else { return };
+    let mut text = String::new();
+    let mut spans: Vec<Span> = Vec::new();
+
+    let files = format!(
+        "{} file{} changed",
+        stats.files_changed(),
+        if stats.files_changed() == 1 { "" } else { "s" }
+    );
+    spans.push((0, files.len(), META));
+    text.push_str(&files);
+    let added = format!("  +{}", stats.insertions());
+    spans.push((text.len(), text.len() + added.len(), ADDED));
+    text.push_str(&added);
+    let removed = format!("  −{}", stats.deletions());
+    spans.push((text.len(), text.len() + removed.len(), REMOVED));
+    text.push_str(&removed);
+
+    b.chrome(VirtualRowKind::Summary, text, &spans);
 }
 
 /// The first parent of `rev`, as a full hash — the revision a patch's `-` lines belong to.
@@ -2936,6 +3115,14 @@ fn line_content(line: &git2::DiffLine) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolved content of a baseline the test just loaded. `load_baseline` always fills it —
+    /// only the deferred open path leaves it pending — so unwrapping here asserts that too.
+    fn content(baseline: &GitBaseline) -> &BaselineContent {
+        baseline
+            .content()
+            .expect("load_baseline resolves the content")
+    }
     use std::path::PathBuf;
 
     fn rope(s: &str) -> ropey::Rope {
@@ -3366,6 +3553,45 @@ mod tests {
         assert_eq!(both[0].stage, DiffStage::Staged);
     }
 
+    // ---- the identity / content split ----------------------------------------------------------
+
+    /// The split exists so "still loading" can never be mistaken for "nothing in git". Identity is
+    /// always resolved; content is the only half that can be pending, and a file in no repo is
+    /// *resolved* — not pending — so nothing waits on it.
+    #[test]
+    fn identity_resolves_without_content_and_absence_of_a_repo_is_not_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\n");
+        std::fs::write(&file, "one\nTWO\n").unwrap();
+
+        let identity = load_repo_identity(&file, &BaselineChoices::new());
+        assert!(identity.repo.is_some(), "which repo: resolved either way");
+        assert!(identity.branch.is_some(), "and its branch");
+        assert!(
+            identity.is_pending(),
+            "but the blobs are what a deferred open is waiting for"
+        );
+        assert!(
+            effective_baseline(&identity, None).is_none(),
+            "so there is nothing to diff against *yet* — distinct from nothing to diff against"
+        );
+
+        let full = load_baseline(&file, &BaselineChoices::new());
+        assert!(!full.is_pending());
+        assert_eq!(content(&full).blob.as_deref(), Some(&b"one\ntwo\n"[..]));
+
+        // A path in no repo at all: the answer is known, so nothing is pending and no caller waits.
+        let outside = tempfile::tempdir().unwrap();
+        let loose = outside.path().join("loose.txt");
+        std::fs::write(&loose, "x\n").unwrap();
+        let none = load_repo_identity(&loose, &BaselineChoices::new());
+        assert!(none.repo.is_none());
+        assert!(
+            !none.is_pending(),
+            "checked and not in a repo is a resolved answer, not a load in flight"
+        );
+    }
+
     // ---- write_index_blob -----------------------------------------------------------------------
 
     #[test]
@@ -3379,14 +3605,17 @@ mod tests {
         write_index_blob(&repo, b"one\nTWO\n").expect("index write");
 
         let baseline = load_baseline(&file, &BaselineChoices::new());
-        assert_eq!(baseline.index_blob.as_deref(), Some(&b"one\nTWO\n"[..]));
         assert_eq!(
-            baseline.blob.as_deref(),
+            content(&baseline).index_blob.as_deref(),
+            Some(&b"one\nTWO\n"[..])
+        );
+        assert_eq!(
+            content(&baseline).blob.as_deref(),
             Some(&b"one\ntwo\n"[..]),
             "HEAD untouched"
         );
         assert_eq!(
-            baseline.staged_hunks.len(),
+            content(&baseline).staged_hunks.len(),
             1,
             "staged diff now has the change"
         );
@@ -3403,7 +3632,7 @@ mod tests {
             .repo
             .expect("repo resolved");
         assert!(
-            load_baseline(&file, &BaselineChoices::new())
+            content(&load_baseline(&file, &BaselineChoices::new()))
                 .index_blob
                 .is_none(),
             "untracked → no entry yet"
@@ -3412,8 +3641,11 @@ mod tests {
         write_index_blob(&repo, b"hello\n").expect("index write");
 
         let baseline = load_baseline(&file, &BaselineChoices::new());
-        assert_eq!(baseline.index_blob.as_deref(), Some(&b"hello\n"[..]));
-        assert!(baseline.blob.is_none(), "still not in HEAD");
+        assert_eq!(
+            content(&baseline).index_blob.as_deref(),
+            Some(&b"hello\n"[..])
+        );
+        assert!(content(&baseline).blob.is_none(), "still not in HEAD");
     }
 
     #[test]
@@ -3723,14 +3955,18 @@ mod tests {
         conflict_the_index(&repo, "src.rs", "mine\n", "theirs\n");
 
         let baseline = load_baseline(&file, &BaselineChoices::new());
-        assert!(baseline.conflicted);
+        assert!(content(&baseline).conflicted);
         // Both blobs hold HEAD, so the whole change set reads as unstaged against it. The
         // regression this guards is the alternative: with the index blob left absent the staged
         // diff would be `HEAD → ""`, painting the file as a staged whole-file deletion.
-        assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\n"[..]));
-        assert_eq!(baseline.index_blob, baseline.blob, "nothing is staged");
+        assert_eq!(content(&baseline).blob.as_deref(), Some(&b"one\ntwo\n"[..]));
+        assert_eq!(
+            content(&baseline).index_blob,
+            content(&baseline).blob,
+            "nothing is staged"
+        );
         assert!(
-            baseline.staged_hunks.is_empty(),
+            content(&baseline).staged_hunks.is_empty(),
             "no staged deletion of the whole file"
         );
         // The repo is still resolved — the resolve verbs and mark-resolved need it.
@@ -3761,7 +3997,7 @@ mod tests {
 
     fn hunks_for(file: &Path, current: &str) -> Vec<DiffHunk> {
         let baseline = load_baseline(file, &BaselineChoices::new());
-        diff_hunks(baseline.blob.as_deref(), &rope(current))
+        diff_hunks(content(&baseline).blob.as_deref(), &rope(current))
     }
 
     #[test]
@@ -3802,9 +4038,16 @@ mod tests {
             .unwrap();
 
         let baseline = load_baseline(&file, &BaselineChoices::new());
-        assert_eq!(baseline.blob.as_deref(), Some(&b"one\ntwo\nthree\n"[..]));
+        assert_eq!(
+            content(&baseline).blob.as_deref(),
+            Some(&b"one\ntwo\nthree\n"[..])
+        );
         assert!(
-            diff_hunks(baseline.blob.as_deref(), &rope("one\ntwo\nthree\n")).is_empty(),
+            diff_hunks(
+                content(&baseline).blob.as_deref(),
+                &rope("one\ntwo\nthree\n")
+            )
+            .is_empty(),
             "LF buffer should match a CRLF-committed file after normalization"
         );
     }
@@ -3818,8 +4061,11 @@ mod tests {
         std::fs::write(&file, "hello\n").unwrap();
         let baseline = load_baseline(&file, &BaselineChoices::new());
         assert!(baseline.repo.is_some(), "repo discovered");
-        assert!(baseline.blob.is_none(), "untracked → no committed blob");
-        assert!(diff_hunks(baseline.blob.as_deref(), &rope("hello\nworld\n")).is_empty());
+        assert!(
+            content(&baseline).blob.is_none(),
+            "untracked → no committed blob"
+        );
+        assert!(diff_hunks(content(&baseline).blob.as_deref(), &rope("hello\nworld\n")).is_empty());
     }
 
     #[test]
@@ -3829,7 +4075,7 @@ mod tests {
         std::fs::write(&file, "hello\n").unwrap();
         let baseline = load_baseline(&file, &BaselineChoices::new());
         assert!(baseline.repo.is_none());
-        assert!(baseline.blob.is_none());
+        assert!(content(&baseline).blob.is_none());
     }
 
     // ---- compute_blame --------------------------------------------------------------------------

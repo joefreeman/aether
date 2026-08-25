@@ -505,6 +505,13 @@ async fn handle_event(state: &SharedState, event: Event) {
                         .is_some_and(|r| git_workdirs.contains(&r.workdir))
                 })
                 .map(|(id, _)| *id)
+                // A `git/show` view has no baseline but does belong to a repo, and its status bar
+                // shows that repo's branch — which a checkout in a terminal moves.
+                .chain(s.virtual_git_status.keys().copied().filter(|id| {
+                    s.try_doc_of(*id)
+                        .and_then(|d| d.virtual_source.as_ref())
+                        .is_some_and(|v| git_workdirs.contains(&PathBuf::from(&v.target.repo_id)))
+                }))
                 .collect();
             for id in affected {
                 pushes.extend(refresh_git_for_buffer(&mut s, id));

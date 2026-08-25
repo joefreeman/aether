@@ -177,6 +177,10 @@ pub enum Event {
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
     /// own job — so the Buffers picker closing the active buffer keeps its list up.
     Switched(Result<BufferOpenResult, String>),
+    /// A `git/show` resolved: an ordinary switch onto the materialised buffer, or — for the
+    /// working-changes view of a clean tree, the only target that can answer with nothing — a
+    /// toast, since there is no buffer and never was one.
+    Shown(Result<aether_protocol::git::GitShowResult, String>),
     /// `Enter` in a patch resolved (or didn't) to a file at a revision.
     PatchLineFollowed(Result<GitFollowPatchLineResult, String>),
     /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt. Guarded
@@ -721,17 +725,21 @@ impl Session {
                 self.paste(kind, text)
             }
 
-            Event::Switched(Ok(open)) => {
-                // A commit prepared just before this open has been waiting for its buffer id
-                // (the open is what mints it). Anything else clears the wait: the user navigated
-                // away instead, so there is no commit buffer to confirm.
-                if let Some(pending) = self.pending_commit.as_mut() {
-                    if pending.buffer_id == 0 {
-                        pending.buffer_id = open.buffer_id;
-                    }
-                }
-                self.adopt_navigation(open)
-            }
+            Event::Switched(Ok(open)) => self.adopt_open(open),
+
+            // Worded for the working tree because that is the only target that can answer nothing:
+            // a commit or a file at a revision always materialises, and one that can't be
+            // resolved is an error, not an empty answer.
+            Event::Shown(Ok(shown)) => match shown.opened {
+                Some(open) => self.adopt_open(open),
+                None => Effects::toast_detail(
+                    "No working changes",
+                    "Nothing to commit — the tree is clean",
+                    ToastKind::Info,
+                ),
+            },
+            Event::Shown(Err(e)) => self.open_failed(e),
+
             // Same landing as any other switch. `opened: None` means the cursor was on the
             // metadata block or the message — nothing to follow, and deliberately silent: `Enter`
             // is a common key and a toast for pressing it on the subject line would be noise.
@@ -741,12 +749,7 @@ impl Session {
             },
             Event::PatchLineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
 
-            Event::Switched(Err(e)) => {
-                // A failed jump-shaped open must not leave its flag armed for the next
-                // (unrelated) switch — it would wrongly land a markdown file in the editor.
-                self.open_route_jumped = false;
-                Effects::error_detail("Open failed", e)
-            }
+            Event::Switched(Err(e)) => self.open_failed(e),
 
             Event::ReadContent(Ok(c)) => {
                 let Some(read) = self.read.as_mut() else {
@@ -1761,6 +1764,13 @@ impl Session {
                         ApplyHunkStatus::Unavailable => {
                             ("Not in a git repository", "", ToastKind::Info)
                         }
+                        // Says where the action *does* live, since the answer is one key away:
+                        // `Enter` on the block opens the file it came from.
+                        ApplyHunkStatus::NeedsFile => (
+                            "Reverting needs the file itself",
+                            "Enter opens it from here",
+                            ToastKind::Info,
+                        ),
                         // Names the cause, not just the refusal: the user set this baseline, and
                         // the way out is to unset it.
                         ApplyHunkStatus::NotAgainstHead => (
@@ -3014,6 +3024,27 @@ impl Session {
         };
         fx.push(Effect::RevealCursor(RevealStyle::Jump));
         fx
+    }
+
+    /// Land on a buffer an open answered with — the common tail of every `Switched`-shaped result.
+    fn adopt_open(&mut self, open: BufferOpenResult) -> Effects {
+        // A commit prepared just before this open has been waiting for its buffer id (the open is
+        // what mints it). Anything else clears the wait: the user navigated away instead, so there
+        // is no commit buffer to confirm.
+        if let Some(pending) = self.pending_commit.as_mut() {
+            if pending.buffer_id == 0 {
+                pending.buffer_id = open.buffer_id;
+            }
+        }
+        self.adopt_navigation(open)
+    }
+
+    /// An open that failed, from whichever RPC was asked to do it.
+    fn open_failed(&mut self, e: String) -> Effects {
+        // A failed jump-shaped open must not leave its flag armed for the next (unrelated)
+        // switch — it would wrongly land a markdown file in the editor.
+        self.open_route_jumped = false;
+        Effects::error_detail("Open failed", e)
     }
 
     /// Adopt the result of a navigation that moves the cursor and *may* land in the buffer we're
@@ -5042,9 +5073,8 @@ impl Session {
                     focus_path: None, // a stash is about no file in particular
                 };
                 let hide = self.close_picker();
-                return hide.and(
-                    self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
-                );
+                return hide
+                    .and(self.request_str::<aether_protocol::git::GitShow>(params, Event::Shown));
             }
             PickerItem::GitBaseline {
                 repo_id, choice, ..
@@ -5081,9 +5111,8 @@ impl Session {
                     focus_path: path.clone(),
                 };
                 let hide = self.close_picker();
-                return hide.and(
-                    self.request_str::<aether_protocol::git::GitShow>(params, Event::Switched),
-                );
+                return hide
+                    .and(self.request_str::<aether_protocol::git::GitShow>(params, Event::Shown));
             }
             PickerItem::GitBranch {
                 repo_id,
@@ -9470,7 +9499,7 @@ impl Session {
                     target: aether_protocol::git::ShowTarget::WorkingChanges,
                     focus_path: None,
                 },
-                Event::Switched,
+                Event::Shown,
             ),
             A::GitFetch => self.request_str::<GitFetch>(
                 GitFetchParams {

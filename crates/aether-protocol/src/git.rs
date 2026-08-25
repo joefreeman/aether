@@ -333,7 +333,15 @@ pub enum ApplyHunkStatus {
     /// An index write refused because the buffer has unsaved edits — save first.
     DirtyBuffer,
     /// The buffer isn't in a Git repository (or the index write failed).
+    ///
+    /// Strictly that condition, never "this key doesn't apply here" — the client words it as *not
+    /// in a repository*, which is a lie anywhere the answer came from a repo's own patch. A view
+    /// that can't service the action answers [`Self::NeedsFile`] or [`Self::NoChange`] instead.
     Unavailable,
+    /// The action means something, but not from *this* view: a revert issued from the
+    /// working-changes patch would put its undo step in a transient buffer the user never opened
+    /// and can't see. `Enter` opens the file, where "put this back" is an ordinary undoable edit.
+    NeedsFile,
     /// Staging refused because the repo is diffed against a revision rather than HEAD
     /// ([`GitSetBaseline`]): these hunks have no index relationship to stage into. Reverting
     /// still works. Restore the HEAD baseline to stage.
@@ -1367,9 +1375,23 @@ pub struct GitShow;
 impl RpcMethod for GitShow {
     const NAME: &'static str = "git/show";
     type Params = GitShowParams;
+    type Result = GitShowResult;
+}
+
+/// What `git/show` materialised, if anything.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitShowResult {
     /// The opened buffer, in the same shape `buffer/open` returns — the client's adopt path is
     /// identical, and `title` + `read_only` are what mark it as virtual.
-    type Result = crate::buffer::BufferOpenResult;
+    ///
+    /// `None` only for [`ShowTarget::WorkingChanges`] against a **clean** tree, and only when no
+    /// buffer already holds that view: a revision always materialises, and an unresolvable one is
+    /// an error rather than an empty answer. Minting a buffer to say "nothing changed" spends the
+    /// whole view on a header and no patch, so the emptiness is reported instead and the client
+    /// says it in a toast. A working-changes buffer that is *already* open still regenerates —
+    /// leaving it on a pre-commit snapshot would make it quietly lie about the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<crate::buffer::BufferOpenResult>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

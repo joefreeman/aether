@@ -710,14 +710,11 @@ html, body, #app {
   height: 1px;
   background: var(--fg-faint);
 }
-/* A section heading trails its rule from the end of the signature to the right edge. */
-.row.patch-chrome.hunk-header .content::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  margin-left: 0.75ch;
-  background: var(--fg-faint);
-}
+/* A section heading is its name and nothing else. It used to trail a rule to the right edge, which
+   read as heavily as the file rule above it and flattened the file/hunk hierarchy. */
+/* The patch's summary caption sits above the first file's rule and belongs to no file, so the rail
+   doesn't run through it (see `.detached`). */
+.row.patch-chrome.detached .gutter { border-left-color: transparent; background-image: none; }
 .hl-diff-file { color: var(--fg); font-weight: 600; }
 .hl-diff-added { color: var(--git-added); }
 .hl-diff-removed { color: var(--git-deleted); }

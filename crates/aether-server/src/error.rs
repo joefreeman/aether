@@ -115,6 +115,15 @@ impl RpcError {
         Self::new(ErrorCode::GIT_SHOW_FAILED, format!("git show: {detail}"))
     }
 
+    /// A **re**-open of a working-changes view whose tree has since gone clean — a nav-history step
+    /// back onto it, or a session's pinned buffer. Nothing to materialise, and unlike a fresh
+    /// `Space g w` (which answers `opened: None` and toasts) there is a caller here expecting a
+    /// buffer, so it has to be an error. Worded for what actually happened: "buffer not found"
+    /// would blame the wrong thing.
+    pub fn nothing_to_show() -> Self {
+        Self::new(ErrorCode::GIT_SHOW_FAILED, "no working changes to show")
+    }
+
     pub fn read_only_buffer(buffer_id: aether_protocol::BufferId) -> Self {
         Self::new(
             ErrorCode::READ_ONLY_BUFFER,

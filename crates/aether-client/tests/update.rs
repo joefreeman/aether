@@ -12247,3 +12247,46 @@ fn baseline_picker_enter_sets_the_baseline() {
         "the default row sends no source, got {params}"
     );
 }
+
+/// A clean tree answers `git/show` with no buffer at all, and the client says so in a toast rather
+/// than landing on nothing. The one target that can answer this way is the working tree, so the
+/// wording names it.
+#[test]
+fn a_clean_tree_toasts_instead_of_switching() {
+    use aether_client::update::Event;
+    use aether_protocol::git::GitShowResult;
+
+    let mut s = session();
+    let before = s.buffer.buffer_id;
+    let fx = s.on_event(Event::Shown(Ok(GitShowResult { opened: None })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(msg.contains("No working changes"), "got {msg:?}");
+    assert_eq!(s.buffer.buffer_id, before, "nowhere to switch to");
+    assert!(
+        find_request(&fx, "viewport/subscribe").is_none(),
+        "and nothing to subscribe to"
+    );
+}
+
+/// Refusals coming *out of* the patch view must not be worded as "not in a git repository" — the
+/// repo's own diff is what's on screen. `NeedsFile` is the revert refusal, and it points at the key
+/// that does work.
+#[test]
+fn the_patch_views_revert_refusal_does_not_deny_the_repo() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{ApplyHunkStatus, ApplyScope, GitApplyHunkResult, HunkAction};
+
+    let mut s = session();
+    let msg = toast_messages(&s.on_event(Event::HunkApplied {
+        action: HunkAction::Revert,
+        scope: ApplyScope::Cursor,
+        result: Ok(GitApplyHunkResult {
+            cursor: Default::default(),
+            status: ApplyHunkStatus::NeedsFile,
+        }),
+    }))
+    .join(" ");
+    assert!(msg.contains("Revert"), "names the action, got {msg:?}");
+    assert!(msg.contains("Enter"), "and the way through, got {msg:?}");
+    assert!(!msg.contains("repository"), "got {msg:?}");
+}

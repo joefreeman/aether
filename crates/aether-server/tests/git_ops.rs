@@ -1332,7 +1332,7 @@ async fn git_log_rows_carry_what_git_show_needs() {
     assert_eq!(repo_id, &root.to_string_lossy().into_owned());
 
     // The hash the row carries is exactly what `git/show` resolves.
-    let opened: BufferOpenResult = send_request::<GitShow>(
+    let opened: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(repo_id.clone()),
@@ -1479,7 +1479,7 @@ async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
     commit_with_message(&repo, "a.rs", "third");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let shown: BufferOpenResult = send_request::<GitShow>(
+    let shown: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2113,7 +2113,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
     assert_eq!(oids.len(), 2);
     let older = oids[1].clone();
 
-    let shown: BufferOpenResult = send_request::<GitShow>(
+    let shown: BufferOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(repo_id.clone()),

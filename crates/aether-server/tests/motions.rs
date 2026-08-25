@@ -2226,11 +2226,16 @@ async fn deferred_git_baseline_pushes_hunks_when_it_lands() {
     let on_disk = committed.replacen("fn f()", "fn g()", 1);
     let (server, mut ws, _buffer_id, sub) = setup_deferred_git_buffer(&committed, &on_disk).await;
 
-    // Over the threshold the open returns before the baseline: no branch status, no gutter.
-    assert!(
-        sub.window.git_status.is_none(),
-        "expected the pre-baseline window to carry no git status"
-    );
+    // Over the threshold the open returns before the *content* half. The repo identity is not
+    // deferred, so the branch is already there — which is what makes the status bar say a
+    // repository is active from the first frame, and what every git verb resolves through.
+    let status = sub
+        .window
+        .git_status
+        .as_ref()
+        .expect("the branch half is resolved on the open path, whatever the file's size");
+    assert!(status.branch.is_some());
+    // The gutter is the deferred half, and stays empty rather than claiming the file is all-new.
     assert!(
         sub.window.lines[0].diff_marker.is_none(),
         "expected the pre-baseline window to carry no gutter markers"
@@ -2261,7 +2266,9 @@ async fn deferred_git_baseline_diffs_against_edits_landed_mid_load() {
     // edit path recomputes hunks itself — the assertions hold either way.)
     let committed = large_rust_source();
     let (server, mut ws, buffer_id, sub) = setup_deferred_git_buffer(&committed, &committed).await;
-    assert!(sub.window.git_status.is_none());
+    // Branch known already (identity isn't deferred); no gutter yet (content is).
+    assert!(sub.window.git_status.is_some());
+    assert!(sub.window.lines[0].diff_marker.is_none());
 
     let _edit: EditResult = send_request::<InputText>(
         &mut ws,
