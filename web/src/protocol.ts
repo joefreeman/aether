@@ -245,6 +245,16 @@ export type GitBaselineSource =
   | { kind: "saved" }
   | { kind: "rev"; label: string; commit: string };
 
+/** One ref pointing at a commit — an entry of the `(HEAD -> main, tag: v1.0, origin/main)`
+ *  decoration `git log --decorate` prints after the hash. `head_branch` is the checked-out branch
+ *  (`HEAD -> main`), `head` a detached HEAD; the two never appear together on one commit. */
+export interface CommitRef {
+  kind: "head" | "head_branch" | "branch" | "remote" | "tag" | "stash";
+  /** The short name git prints: `main`, `origin/main`, `v1.0`, `HEAD`. Never carries the `tag: `
+   *  marker — that's implied by the kind and added when rendering. */
+  name: string;
+}
+
 // ---- cursor -------------------------------------------------------------------------------------
 
 export interface CursorState {
@@ -501,10 +511,10 @@ export type PickerItem =
       hash: string;
       short_hash: string;
       subject?: string;
-      author?: string;
-      /** Author time, Unix seconds; 0/absent when unknown. */
-      timestamp?: number;
-      /** Offsets into `subject` covered by the fuzzy match. The author is rendered but never
+      /** The refs pointing at this commit, rendered between the hash and the subject the way
+       *  `git log --oneline --decorate` prints them. Absent for almost every commit. */
+      decorations?: CommitRef[];
+      /** Offsets into `subject` covered by the fuzzy match. The decorations are rendered but never
        *  matched; the hash is matched by prefix instead (`hash_match_len`). */
       match_indices?: number[];
       /** How many leading characters of `short_hash` the query abbreviated (0 = no hash match).

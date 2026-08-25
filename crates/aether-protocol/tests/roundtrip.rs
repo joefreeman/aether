@@ -3303,6 +3303,96 @@ fn picker_item_git_branch_is_tagged() {
 }
 
 #[test]
+fn picker_item_git_commit_carries_typed_decorations() {
+    use aether_protocol::git::{CommitRef, CommitRefKind};
+    use aether_protocol::picker::PickerItem;
+
+    // The ordinary row: nothing points at this commit, which is true of almost every one, so the
+    // decorations are omitted entirely rather than riding as an empty array on every row.
+    let plain = PickerItem::GitCommit {
+        repo_id: "/home/u/proj".into(),
+        hash: "20a3a8ae0f0e2a5a0d2b7c1e9f8a6b5c4d3e2f10".into(),
+        path: None,
+        short_hash: "20a3a8a".into(),
+        subject: "Add the thing".into(),
+        decorations: vec![],
+        match_indices: vec![4, 5],
+        hash_match_len: 0,
+    };
+    let v = to_value(&plain).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "kind": "git_commit",
+            "repo_id": "/home/u/proj",
+            "hash": "20a3a8ae0f0e2a5a0d2b7c1e9f8a6b5c4d3e2f10",
+            "short_hash": "20a3a8a",
+            "subject": "Add the thing",
+            "match_indices": [4, 5],
+        }),
+        "path/decorations/hash_match_len all omitted at their defaults"
+    );
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), plain);
+
+    // The decorated row — the tip of a released branch. Each ref travels *typed*, name only: the
+    // `HEAD -> ` and `tag: ` literals are the client's to render, and are what let it colour the
+    // kinds apart instead of printing one pre-joined string.
+    let tip = PickerItem::GitCommit {
+        repo_id: "/home/u/proj".into(),
+        hash: "20a3a8ae0f0e2a5a0d2b7c1e9f8a6b5c4d3e2f10".into(),
+        path: Some("src/main.rs".into()),
+        short_hash: "20a3a8a".into(),
+        subject: "Release".into(),
+        decorations: vec![
+            CommitRef {
+                kind: CommitRefKind::HeadBranch,
+                name: "main".into(),
+            },
+            CommitRef {
+                kind: CommitRefKind::Tag,
+                name: "v1.0".into(),
+            },
+            CommitRef {
+                kind: CommitRefKind::Remote,
+                name: "origin/main".into(),
+            },
+        ],
+        match_indices: vec![],
+        hash_match_len: 7,
+    };
+    let v = to_value(&tip).unwrap();
+    assert_eq!(
+        v["decorations"],
+        json!([
+            {"kind": "head_branch", "name": "main"},
+            {"kind": "tag", "name": "v1.0"},
+            {"kind": "remote", "name": "origin/main"},
+        ])
+    );
+    assert_eq!(v["path"], "src/main.rs");
+    assert_eq!(v["hash_match_len"], 7);
+    assert_eq!(from_value::<PickerItem>(v).unwrap(), tip);
+
+    // The text form the `git/show` header prints, which is git's own.
+    let labels: Vec<String> = match &tip {
+        PickerItem::GitCommit { decorations, .. } => {
+            decorations.iter().map(CommitRef::label).collect()
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(labels, ["HEAD -> main", "tag: v1.0", "origin/main"]);
+    assert_eq!(
+        CommitRef {
+            kind: CommitRefKind::Head,
+            name: "HEAD".into()
+        }
+        .label(),
+        "HEAD",
+        "a detached HEAD decorates its commit on its own"
+    );
+}
+
+#[test]
 fn picker_item_git_change_is_tagged() {
     use aether_protocol::picker::{PickerItem, PickerKind};
     use aether_protocol::viewport::DiffStage;

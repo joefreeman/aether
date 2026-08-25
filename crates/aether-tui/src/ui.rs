@@ -8,7 +8,7 @@ use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
 use aether_client::theme::{Rgb, Theme};
 use aether_protocol::cursor::CursorState;
-use aether_protocol::git::GitStatus;
+use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::search::SearchMatchRange;
@@ -3030,12 +3030,18 @@ fn picker_item_spans(
         // The same shape as a commit row — a positional label, the text, then a relative date —
         // because a stash entry reads as a commit with a name you didn't choose.
         return git_commit_item_spans(
-            &format!("stash@{{{index}}}"),
-            message,
-            "",
-            *timestamp,
-            match_indices,
-            0,
+            CommitRow {
+                lead: &format!("stash@{{{index}}}"),
+                lead_match_len: 0,
+                text: message,
+                match_indices,
+                decorations: &[],
+                tail: if *timestamp > 0 {
+                    aether_client::labels::time_ago(*timestamp)
+                } else {
+                    String::new()
+                },
+            },
             highlighted,
             max_width,
         );
@@ -3043,20 +3049,21 @@ fn picker_item_spans(
     if let PickerItem::GitCommit {
         short_hash,
         subject,
-        author,
-        timestamp,
+        decorations,
         match_indices,
         hash_match_len,
         ..
     } = item
     {
         return git_commit_item_spans(
-            short_hash,
-            subject,
-            author,
-            *timestamp,
-            match_indices,
-            *hash_match_len,
+            CommitRow {
+                lead: short_hash,
+                lead_match_len: *hash_match_len,
+                text: subject,
+                match_indices,
+                decorations,
+                tail: String::new(),
+            },
             highlighted,
             max_width,
         );
@@ -4400,19 +4407,32 @@ fn git_baseline_item_spans(
     match_highlighted_spans(label.to_string(), match_indices, base, match_style)
 }
 
-/// One commit row: `abc1234  subject          author · 3w ago`. The hash leads (it's the row's
-/// identity and what you'd quote elsewhere), the subject takes the space, and the author and
-/// relative date trail dim. The subject highlights where the fuzzy match landed; the hash
-/// highlights the leading `hash_match_len` characters the query abbreviated. The author is shown
-/// but never matched.
-#[allow(clippy::too_many_arguments)]
+/// The fields a commit-shaped row renders, borrowed for the duration. Shared by the log picker's
+/// commits and the stash picker's entries — a stash reads as a commit with a name you didn't
+/// choose, so the two rows are one layout.
+struct CommitRow<'a> {
+    /// The row's identity, dim and leading: a short hash, or `stash@{0}`.
+    lead: &'a str,
+    /// How many leading characters of `lead` the query abbreviated (commits only).
+    lead_match_len: u32,
+    /// The prose: a commit's subject, a stash's message.
+    text: &'a str,
+    match_indices: &'a [u32],
+    /// Refs pointing at the commit, rendered between the lead and the text. Always empty for a
+    /// stash — its commit is unreachable from HEAD, so nothing decorates it.
+    decorations: &'a [CommitRef],
+    /// Dim, right-aligned metadata: the stash row's relative date. Empty on a commit row, whose
+    /// decorations took the place the author and date used to hold.
+    tail: String,
+}
+
+/// One commit row: `abc1234  (HEAD -> main) subject`. The hash leads (it's the row's identity and
+/// what you'd quote elsewhere), the decorations follow it as `git log --oneline --decorate` prints
+/// them, and the subject takes the rest of the width. The subject highlights where the fuzzy match
+/// landed; the hash highlights the leading `lead_match_len` characters the query abbreviated. The
+/// decorations are shown but never matched.
 fn git_commit_item_spans(
-    short_hash: &str,
-    subject: &str,
-    author: &str,
-    timestamp: i64,
-    match_indices: &[u32],
-    hash_match_len: u32,
+    row: CommitRow<'_>,
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
@@ -4423,67 +4443,113 @@ fn git_commit_item_spans(
         .fg(c(th().match_highlight))
         .add_modifier(Modifier::BOLD);
 
-    // Author and date are **right-aligned at the row's edge**, matching the GUI and web clients:
-    // they are a fixed-shape annotation on every row, so a common right margin makes them a column
-    // you can scan, where flowing them behind a ragged subject does not.
-    let mut tail = String::new();
-    if !author.is_empty() {
-        tail.push_str(author);
-    }
-    if timestamp > 0 {
-        if !tail.is_empty() {
-            tail.push_str(" · ");
-        }
-        tail.push_str(&aether_client::labels::time_ago(timestamp));
-    }
-    // Two columns of breathing room so a full-width subject can't touch the metadata.
-    let subject_budget = max_width
-        .saturating_sub(short_hash.width() + 2)
-        .saturating_sub(if tail.is_empty() { 0 } else { tail.width() + 2 });
-    let truncated: String = subject
+    // The refs sit between the hash and the subject, where `git log --oneline --decorate` puts
+    // them — they label the commit, so they belong beside its id, not in a right-hand column that
+    // would stand empty on the ~99% of rows nothing points at.
+    let deco = git_ref_spans(row.decorations, base, dim);
+    let deco_width: usize = deco.iter().map(|s| s.content.width()).sum();
+
+    // Two columns of breathing room so a full-width text can't touch the trailing metadata.
+    let text_budget = max_width
+        .saturating_sub(row.lead.width() + 2)
+        .saturating_sub(deco_width)
+        .saturating_sub(if row.tail.is_empty() {
+            0
+        } else {
+            row.tail.width() + 2
+        });
+    let truncated: String = row
+        .text
         .chars()
         .scan(0usize, |w, ch| {
             let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            (*w + cw <= subject_budget).then(|| {
+            (*w + cw <= text_budget).then(|| {
                 *w += cw;
                 ch
             })
         })
         .collect();
     let kept = truncated.chars().count() as u32;
-    let kept_indices: Vec<u32> = match_indices
+    let kept_indices: Vec<u32> = row
+        .match_indices
         .iter()
         .copied()
         .filter(|&i| i < kept)
         .collect();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let hash_indices: Vec<u32> = (0..hash_match_len).collect();
+    let lead_indices: Vec<u32> = (0..row.lead_match_len).collect();
     spans.extend(match_highlighted_spans(
-        short_hash.to_string(),
-        &hash_indices,
+        row.lead.to_string(),
+        &lead_indices,
         dim,
         match_style,
     ));
     spans.push(Span::styled("  ".to_string(), base));
-    let subject_width = truncated.width();
+    spans.extend(deco);
+    let text_width = truncated.width();
     spans.extend(match_highlighted_spans(
         truncated,
         &kept_indices,
         base,
         match_style,
     ));
-    if !tail.is_empty() {
+    if !row.tail.is_empty() {
         // Pad to the right edge, the way grep's line numbers and the changes picker's `+/-`
         // summary already do.
-        let used = short_hash.width() + 2 + subject_width + tail.width();
+        let used = row.lead.width() + 2 + deco_width + text_width + row.tail.width();
         spans.push(Span::styled(
             " ".repeat(max_width.saturating_sub(used)),
             base,
         ));
-        spans.push(Span::styled(tail, dim));
+        spans.push(Span::styled(row.tail, dim));
     }
     spans
+}
+
+/// A commit's decorations as `(HEAD -> main, tag: v1.0, origin/main) ` — one span per coloured
+/// piece, with a trailing space so the subject can follow immediately. Empty for a commit no ref
+/// points at, which is almost all of them.
+fn git_ref_spans(decorations: &[CommitRef], base: Style, dim: Style) -> Vec<Span<'static>> {
+    use aether_client::labels::{
+        commit_ref_parts, REF_DECORATION_CLOSE, REF_DECORATION_OPEN, REF_DECORATION_SEP,
+    };
+    if decorations.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled(REF_DECORATION_OPEN.to_string(), dim)];
+    for (i, r) in decorations.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(REF_DECORATION_SEP.to_string(), dim));
+        }
+        let parts = commit_ref_parts(r.kind);
+        if !parts.prefix.is_empty() {
+            spans.push(Span::styled(
+                parts.prefix.to_string(),
+                base.fg(git_ref_color(parts.prefix_kind)),
+            ));
+        }
+        spans.push(Span::styled(
+            r.name.clone(),
+            base.fg(git_ref_color(parts.name_kind)),
+        ));
+    }
+    spans.push(Span::styled(REF_DECORATION_CLOSE.to_string(), dim));
+    spans.push(Span::styled(" ".to_string(), base));
+    spans
+}
+
+/// The theme colour a decoration of this kind renders in.
+fn git_ref_color(kind: CommitRefKind) -> Color {
+    match kind {
+        CommitRefKind::Head => c(th().git_ref_head),
+        CommitRefKind::HeadBranch | CommitRefKind::Branch => c(th().git_ref_branch),
+        CommitRefKind::Remote => c(th().git_ref_remote),
+        CommitRefKind::Tag => c(th().git_ref_tag),
+        // A stash commit is never an ancestor of HEAD, so no log row can carry one; it has a
+        // colour at all because the kind exists on the wire for `git/show`.
+        CommitRefKind::Stash => c(th().accent_alt),
+    }
 }
 
 /// Which checkout holds a branch, at the grain the row renders it: one glyph, one colour. The
@@ -9043,6 +9109,80 @@ mod tests {
             .iter()
             .all(|s| s.style.fg != Some(c(th().match_highlight))));
         assert!(spans_text(&spans).starts_with("x "));
+    }
+
+    /// A commit row prints its refs between the hash and the subject, as `git log --oneline
+    /// --decorate` does, with each kind in its own colour and the punctuation dim. The checked-out
+    /// branch is the two-colour case: `HEAD -> ` takes the HEAD colour, the name the branch's.
+    #[test]
+    fn commit_row_prints_its_decorations_between_the_hash_and_the_subject() {
+        use aether_protocol::git::CommitRef;
+        let commit = |decorations: Vec<CommitRef>| PickerItem::GitCommit {
+            repo_id: "/p".into(),
+            hash: "20a3a8adeadbeef".into(),
+            path: None,
+            short_hash: "20a3a8a".into(),
+            subject: "Release".into(),
+            decorations,
+            match_indices: vec![],
+            hash_match_len: 0,
+        };
+        let decorated = commit(vec![
+            CommitRef {
+                kind: CommitRefKind::HeadBranch,
+                name: "main".into(),
+            },
+            CommitRef {
+                kind: CommitRefKind::Tag,
+                name: "v1.0".into(),
+            },
+            CommitRef {
+                kind: CommitRefKind::Remote,
+                name: "origin/main".into(),
+            },
+        ]);
+        let spans = picker_item_spans(&decorated, &[], None, false, 60);
+        assert_eq!(
+            spans_text(&spans),
+            "20a3a8a  (HEAD -> main, tag: v1.0, origin/main) Release"
+        );
+        let colored = |fg| -> String {
+            spans
+                .iter()
+                .filter(|s| s.style.fg == Some(fg))
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(colored(c(th().git_ref_head)), "HEAD -> ");
+        assert_eq!(colored(c(th().git_ref_branch)), "main");
+        assert_eq!(colored(c(th().git_ref_tag)), "tag: v1.0");
+        assert_eq!(colored(c(th().git_ref_remote)), "origin/main");
+
+        // Nothing pointing here spends no width at all — no empty brackets, no reserved column.
+        let bare = picker_item_spans(&commit(vec![]), &[], None, false, 60);
+        assert_eq!(spans_text(&bare), "20a3a8a  Release");
+    }
+
+    /// The decorations are not truncatable — a shortened ref name is a different ref — so a narrow
+    /// row takes it out of the subject instead.
+    #[test]
+    fn a_narrow_commit_row_truncates_the_subject_not_the_refs() {
+        let item = PickerItem::GitCommit {
+            repo_id: "/p".into(),
+            hash: "20a3a8adeadbeef".into(),
+            path: None,
+            short_hash: "20a3a8a".into(),
+            subject: "Release the long-awaited thing".into(),
+            decorations: vec![CommitRef {
+                kind: CommitRefKind::Tag,
+                name: "v1.0".into(),
+            }],
+            match_indices: vec![],
+            hash_match_len: 0,
+        };
+        let text = spans_text(&picker_item_spans(&item, &[], None, false, 30));
+        assert!(text.starts_with("20a3a8a  (tag: v1.0) Release"), "{text:?}");
+        assert!(text.width() <= 30, "row stays inside its width: {text:?}");
     }
 
     #[test]

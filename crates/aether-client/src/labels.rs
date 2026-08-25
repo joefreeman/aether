@@ -14,6 +14,7 @@
 //! parenthesized parent component, then grandparent, etc., until every label is unique. Single-root
 //! workspaces have nothing to disambiguate, so the label is empty and the prefix is omitted.
 
+use aether_protocol::git::CommitRefKind;
 use aether_protocol::lsp::SymbolCrumb;
 use aether_protocol::picker::PickerKind;
 use std::collections::HashMap;
@@ -168,6 +169,42 @@ pub const BRANCH_MARK: &str = "⎇";
 /// Warning-coloured in every shell, matching the status bar's `⧉ branch`: same glyph, same colour,
 /// one vocabulary for "a worktree is involved" wherever it appears.
 pub const WORKTREE_HELD_MARK: &str = "⧉";
+
+/// The brackets and separator wrapping a commit row's decorations — `(HEAD -> main, tag: v1.0)`,
+/// exactly the punctuation `git log --decorate` prints. Rendered dim in every shell: they group the
+/// refs and fence them off from the subject, and the *names* are what carry colour.
+pub const REF_DECORATION_OPEN: &str = "(";
+pub const REF_DECORATION_SEP: &str = ", ";
+pub const REF_DECORATION_CLOSE: &str = ")";
+
+/// How one commit decoration splits into coloured pieces — the shared answer to "what does git
+/// print before the name, and in which colour", so the three shells can't drift on it.
+///
+/// `prefix` is the literal (`HEAD -> `, `tag: `, or nothing); the two `*_kind` fields say which ref
+/// kind's colour each half takes. They differ only for the checked-out branch, which git paints as
+/// two things at once: `HEAD` in the HEAD colour, the branch name in the branch colour.
+pub struct CommitRefParts {
+    pub prefix: &'static str,
+    pub prefix_kind: CommitRefKind,
+    pub name_kind: CommitRefKind,
+}
+
+/// Split a decoration into the pieces a row renders (see [`CommitRefParts`]).
+pub fn commit_ref_parts(kind: CommitRefKind) -> CommitRefParts {
+    let (prefix, prefix_kind, name_kind) = match kind {
+        // `HEAD -> main`: the arrow rides with `HEAD` rather than being a third, dimmer piece —
+        // git dims it, but a two-colour decoration is one fewer span per row for the same reading.
+        CommitRefKind::HeadBranch => ("HEAD -> ", CommitRefKind::Head, CommitRefKind::Branch),
+        // git colours the `tag: ` marker as part of the tag, so it stays one colour here too.
+        CommitRefKind::Tag => ("tag: ", CommitRefKind::Tag, CommitRefKind::Tag),
+        other => ("", other, other),
+    };
+    CommitRefParts {
+        prefix,
+        prefix_kind,
+        name_kind,
+    }
+}
 
 /// Whether a workspace id should be wrapped in the `[workspace]` chrome shown in the status bar and
 /// window title. False for the empty (no workspace active) state *and* for an ephemeral context —
@@ -495,6 +532,29 @@ pub fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shells render decorations from these pieces, so the literals and the two-colour split
+    /// live here rather than three times over. Composing them back gives git's own text — the same
+    /// string [`aether_protocol::git::CommitRef::label`] produces for the `git/show` header.
+    #[test]
+    fn commit_ref_parts_compose_gits_own_decoration_text() {
+        let joined = |kind, name: &str| {
+            let p = commit_ref_parts(kind);
+            format!("{}{name}", p.prefix)
+        };
+        assert_eq!(joined(CommitRefKind::HeadBranch, "main"), "HEAD -> main");
+        assert_eq!(joined(CommitRefKind::Tag, "v1.0"), "tag: v1.0");
+        assert_eq!(joined(CommitRefKind::Remote, "origin/main"), "origin/main");
+        assert_eq!(joined(CommitRefKind::Head, "HEAD"), "HEAD");
+
+        // The checked-out branch is the one two-colour decoration: `HEAD` takes the HEAD role, the
+        // name the branch's. Everything else paints both halves the same.
+        let head_branch = commit_ref_parts(CommitRefKind::HeadBranch);
+        assert_eq!(head_branch.prefix_kind, CommitRefKind::Head);
+        assert_eq!(head_branch.name_kind, CommitRefKind::Branch);
+        let tag = commit_ref_parts(CommitRefKind::Tag);
+        assert_eq!(tag.prefix_kind, tag.name_kind);
+    }
 
     /// The bucket ladder, exercised without touching the clock — which is why
     /// [`time_ago_between`] exists as a separate function at all.

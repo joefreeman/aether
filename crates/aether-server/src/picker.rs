@@ -510,10 +510,12 @@ pub struct GitBranchCandidate {
 /// - the **hash** is an identifier, matched by *prefix* ([`Self::matches_hash_prefix`]) — `git show
 ///   20a3a8a` means a prefix, and scattered fuzzy hits inside a hex string are noise.
 ///
-/// **Author is matched by neither.** It was in the fuzzy haystack briefly, and it made every query
-/// match every commit by the repo's main author: typing `j` matched "Joe" in all of them, and the
-/// surviving score differences came from where that `j` landed — i.e. from subject length, which is
-/// noise. Author is a facet, so it belongs on a filter chip (`git log --author`).
+/// **The row's other content is matched by neither.** Author was in the fuzzy haystack briefly (and
+/// is no longer rendered at all): it made every query match every commit by the repo's main author,
+/// with the surviving score differences coming from where the hit landed — i.e. from subject length,
+/// which is noise. It's a facet, so it belongs on a filter chip (`git log --author`). The
+/// decorations are excluded for the same reason a facet is: `main` and `origin/main` sit on the same
+/// commit, so matching them would rank one commit's *labels* against every other commit's prose.
 #[derive(Debug, Clone)]
 pub struct GitCommitCandidate {
     pub repo_id: String,
@@ -522,8 +524,9 @@ pub struct GitCommitCandidate {
     pub path: Option<String>,
     pub short_hash: String,
     pub subject: String,
-    pub author: String,
-    pub timestamp: i64,
+    /// Refs pointing at this commit, rendered between the hash and the subject. Empty for almost
+    /// every row.
+    pub decorations: Vec<aether_protocol::git::CommitRef>,
     pub haystack: String,
 }
 
@@ -584,8 +587,7 @@ impl GitCommitCandidate {
             hash: c.hash,
             short_hash: c.short_hash,
             subject: c.subject,
-            author: c.author,
-            timestamp: c.timestamp,
+            decorations: c.decorations,
             haystack,
         }
     }
@@ -1041,8 +1043,7 @@ impl PickerCandidates {
                     path: c.path.clone(),
                     short_hash: c.short_hash.clone(),
                     subject: c.subject.clone(),
-                    author: c.author.clone(),
-                    timestamp: c.timestamp,
+                    decorations: c.decorations.clone(),
                     match_indices,
                     // The window builder fills this in; the centring/identity callers that reach
                     // here have no query to abbreviate a hash with.
@@ -2254,8 +2255,7 @@ impl PickerState {
                 path: c.path.clone(),
                 short_hash: c.short_hash.clone(),
                 subject: c.subject.clone(),
-                author: c.author.clone(),
-                timestamp: c.timestamp,
+                decorations: c.decorations.clone(),
                 match_indices,
                 hash_match_len: c.hash_match_len(&self.query),
             };

@@ -107,6 +107,13 @@
   --git-conflict-marker: var(--nord9);
   --cursor-line-conflict-ours-bg: #2f4d52;
   --cursor-line-conflict-theirs-bg: #503664;
+  /* Commit decorations on log rows — one hue per ref kind, as `git log --decorate` colours them.
+     Git's own slots but for the remote, which it paints red: here red is error/deleted, and "this
+     branch also exists on the remote" is neither, so remotes take purple instead. */
+  --git-ref-head: var(--nord8);
+  --git-ref-branch: var(--nord14);
+  --git-ref-remote: var(--nord15);
+  --git-ref-tag: var(--nord13);
   /* Markdown reading view */
   --md-code-bg: var(--nord1); /* code spans/blocks panel */
   --md-table-stripe-bg: #323845; /* alternating table row, between bg and md-code-bg */
@@ -208,6 +215,12 @@
   --git-conflict-marker: var(--nord10);
   --cursor-line-conflict-ours-bg: #cbe0e5;
   --cursor-line-conflict-theirs-bg: #d7c6e5;
+  /* The same four hues darkened to stay legible on Snow Storm, reusing the shades the accent,
+     ok, syn-constant and warning roles already took for them. */
+  --git-ref-head: #3e7a8f;
+  --git-ref-branch: #5a7547;
+  --git-ref-remote: #8d6488;
+  --git-ref-tag: #9a7522;
   --md-code-bg: #e1e6ee;
   --md-table-stripe-bg: #e9edf3;
   --md-alert-important: #8d6488; /* = syn-constant today; free to diverge */
@@ -1385,6 +1398,22 @@ a.picker-row:not(.selected):hover .picker-main {
 .picker-bullet-modified { color: var(--git-modified); }
 .picker-bullet-deleted,
 .picker-bullet-conflicted { color: var(--git-deleted); }
+/* Commit-row decorations: `(HEAD -> main, tag: v1.0, origin/main)` between the hash and the
+   subject. The group never shrinks — the subject is what yields width, since a truncated ref name
+   is a different ref — and the brackets/separators stay dim so the names carry the colour. */
+.picker-refs {
+  flex: 0 0 auto;
+  margin-right: 0.4em;
+  white-space: pre;
+}
+.picker-ref-punct { color: var(--fg-dim); }
+.picker-ref-head { color: var(--git-ref-head); }
+.picker-ref-branch { color: var(--git-ref-branch); }
+.picker-ref-remote { color: var(--git-ref-remote); }
+.picker-ref-tag { color: var(--git-ref-tag); }
+/* A stash commit is unreachable from HEAD, so no log row can carry one; the class exists because
+   the kind does on the wire. */
+.picker-ref-stash { color: var(--accent-alt); }
 /* Branch-row meta spans. `-warn` is the "checked out in another worktree" marker, which is a
    disabled-state tell rather than decoration, so it must not read as dim. */
 .picker-meta-dim { color: var(--fg-dim); }

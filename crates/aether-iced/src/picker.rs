@@ -7,7 +7,7 @@ pub use crate::core::picker::*;
 
 use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
-use aether_protocol::git::GitStatus;
+use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::viewport::DiffStage;
 use iced::advanced::widget::Tree;
@@ -1202,6 +1202,62 @@ fn git_change_summary<'a>(
         .into()
 }
 
+/// A commit row's decorations as `(HEAD -> main, tag: v1.0, origin/main)` — the refs pointing at
+/// the commit, each kind in its own colour, with the brackets and separators dim. `None` when
+/// nothing points here, which is almost every commit; never wraps (rows are one line).
+fn git_ref_decoration<'a>(
+    decorations: &[CommitRef],
+    ui: theme::Ui,
+    p: &'static theme::Palette,
+) -> Option<Element<'a, PickerMsg>> {
+    use aether_client::labels::{
+        commit_ref_parts, REF_DECORATION_CLOSE, REF_DECORATION_OPEN, REF_DECORATION_SEP,
+    };
+    if decorations.is_empty() {
+        return None;
+    }
+    let piece = |text: String, color| {
+        iced::widget::span(text)
+            .size(ui.body())
+            .font(SANS)
+            .color(color)
+    };
+    let mut spans: Vec<iced::widget::text::Span<'a>> =
+        vec![piece(REF_DECORATION_OPEN.to_string(), p.fg_dim)];
+    for (i, r) in decorations.iter().enumerate() {
+        if i > 0 {
+            spans.push(piece(REF_DECORATION_SEP.to_string(), p.fg_dim));
+        }
+        let parts = commit_ref_parts(r.kind);
+        if !parts.prefix.is_empty() {
+            spans.push(piece(
+                parts.prefix.to_string(),
+                git_ref_color(parts.prefix_kind, p),
+            ));
+        }
+        spans.push(piece(r.name.clone(), git_ref_color(parts.name_kind, p)));
+    }
+    spans.push(piece(REF_DECORATION_CLOSE.to_string(), p.fg_dim));
+    Some(
+        iced::widget::rich_text(spans)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+    )
+}
+
+/// The palette colour a decoration of this kind renders in.
+fn git_ref_color(kind: CommitRefKind, p: &'static theme::Palette) -> iced::Color {
+    match kind {
+        CommitRefKind::Head => p.git_ref_head,
+        CommitRefKind::HeadBranch | CommitRefKind::Branch => p.git_ref_branch,
+        CommitRefKind::Remote => p.git_ref_remote,
+        CommitRefKind::Tag => p.git_ref_tag,
+        // A stash commit is never an ancestor of HEAD, so no log row can carry one; it has a
+        // colour at all because the kind exists on the wire for `git/show`.
+        CommitRefKind::Stash => p.accent_alt,
+    }
+}
+
 /// One row's content per item kind. Layout mirrors the web client's row model: optional
 /// fixed-width bullet, primary text with match tinting, right-aligned meta.
 fn render_item<'a>(
@@ -1623,38 +1679,38 @@ fn render_item<'a>(
         PickerItem::GitCommit {
             short_hash,
             subject,
-            author,
-            timestamp,
+            decorations,
             match_indices,
             hash_match_len,
             ..
         } => {
-            // `abc1234  subject … author · 3w ago`: the hash leads (it identifies the commit and
-            // is what you'd quote elsewhere), the subject takes the width, metadata trails dim.
-            // The subject highlights its fuzzy hits, the hash the leading characters the query
-            // abbreviated; the author is shown but never matched.
+            // `abc1234  (HEAD -> main, tag: v1.0) subject`: the hash leads (it identifies the
+            // commit and is what you'd quote elsewhere), the refs pointing here follow it in their
+            // per-kind colours as `git log --oneline --decorate` prints them, and the subject takes
+            // the width. The subject highlights its fuzzy hits, the hash the leading characters the
+            // query abbreviated; the decorations are shown but never matched.
             let hash_indices: Vec<u32> = (0..*hash_match_len).collect();
-            let mut m = author.clone();
-            if *timestamp > 0 {
-                if !m.is_empty() {
-                    m.push_str(" · ");
-                }
-                m.push_str(&aether_client::labels::time_ago(*timestamp));
+            let mut r = row![highlighted_owned(
+                short_hash.clone(),
+                hash_indices,
+                p.fg_dim,
+                SANS,
+                hovered,
+                ui,
+                p
+            )];
+            if let Some(refs) = git_ref_decoration(decorations, ui, p) {
+                r = r.push(refs);
             }
-            row![
-                highlighted_owned(
-                    short_hash.clone(),
-                    hash_indices,
-                    p.fg_dim,
-                    SANS,
-                    hovered,
-                    ui,
-                    p
-                ),
-                highlighted(subject, match_indices, p.fg_bright, SANS, hovered, ui, p),
-                iced::widget::Space::new().width(Length::Fill),
-                meta(m, ui, p),
-            ]
+            r.push(highlighted(
+                subject,
+                match_indices,
+                p.fg_bright,
+                SANS,
+                hovered,
+                ui,
+                p,
+            ))
             .spacing(6)
             .align_y(iced::Alignment::Center)
             .into()

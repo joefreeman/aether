@@ -21,8 +21,8 @@
 //! buffer edit driven by the handler.
 
 use aether_protocol::git::{
-    BlameInfo, CommitInfo, ConflictSide, GitBaselineChoice, GitBaselineSource, GitHead,
-    GitRepoOperation, GitStatus, GitUpstreamStatus,
+    BlameInfo, CommitInfo, CommitRef, CommitRefKind, ConflictSide, GitBaselineChoice,
+    GitBaselineSource, GitHead, GitRepoOperation, GitStatus, GitUpstreamStatus,
 };
 use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
@@ -2115,8 +2115,8 @@ pub struct LogCommit {
     pub hash: String,
     pub short_hash: String,
     pub subject: String,
-    pub author: String,
-    pub timestamp: i64,
+    /// The refs pointing here, as `git log --decorate` prints them. Empty for almost every commit.
+    pub decorations: Vec<CommitRef>,
 }
 
 /// A repo's history from HEAD, newest first — the log picker's candidate set. `path` narrows to
@@ -2151,6 +2151,10 @@ pub fn log_commits(
         return (out, false); // unborn HEAD: no history yet, not an error
     }
 
+    // Refs are resolved **once** for the whole walk, not per commit: git's own `--decorate` builds
+    // the same lookup up front, because the alternative is re-reading every ref for every row.
+    let mut decorations = ref_decorations(&repo);
+
     let mut truncated = false;
     for (examined, oid) in walk.enumerate() {
         if examined >= max_examined {
@@ -2166,7 +2170,6 @@ pub fn log_commits(
                 continue;
             }
         }
-        let sig = commit.author();
         out.push(LogCommit {
             hash: commit.id().to_string(),
             short_hash: short_hash(&commit.id().to_string()),
@@ -2176,8 +2179,8 @@ pub fn log_commits(
                 .flatten()
                 .unwrap_or_default()
                 .to_string(),
-            author: sig.name().unwrap_or("(unknown)").to_string(),
-            timestamp: sig.when().seconds(),
+            // Taken, not cloned: a ref points at one commit, and the walk visits each commit once.
+            decorations: decorations.remove(&oid).unwrap_or_default(),
         });
     }
     (out, truncated)
@@ -2220,38 +2223,97 @@ pub struct RevisionContent {
     pub generated: Option<GeneratedPatch>,
 }
 
-/// The refs pointing at `id`, in git's own `(HEAD -> main, origin/main, tag: v1.0)` order-ish, for
-/// the commit line. Empty when nothing points here, which is the common case deep in history.
+/// Every ref in the repo, grouped by the commit it decorates — the lookup behind both the log
+/// picker's rows and the `git/show` header, built once per caller because it costs one pass over
+/// the refs however many commits ask.
+///
+/// Each commit's list is ordered HEAD, local branches, tags, remotes, stash; alphabetically within
+/// a kind. Deliberately *not* git's own order, which is the reverse of ref-iteration order and so
+/// an artefact of how it builds the list rather than a reading — the one rule worth keeping is
+/// git's, that HEAD leads and merges into the branch it's attached to (`HEAD -> main`).
+fn ref_decorations(repo: &git2::Repository) -> HashMap<git2::Oid, Vec<CommitRef>> {
+    // The branch HEAD is attached to, so its own ref renders as `HEAD -> main` rather than twice.
+    // `None` for a detached HEAD, which decorates its commit as a bare `HEAD` below.
+    let head = repo.head().ok();
+    let head_branch = head
+        .as_ref()
+        .filter(|h| h.is_branch())
+        .and_then(|h| h.shorthand().ok())
+        .map(str::to_string);
+
+    let mut out: HashMap<git2::Oid, Vec<CommitRef>> = HashMap::new();
+    if head_branch.is_none() {
+        // Detached: the commit HEAD sits on gets a decoration no other ref would give it.
+        if let Some(id) = head.as_ref().and_then(|h| h.target()) {
+            out.entry(id).or_default().push(CommitRef {
+                kind: CommitRefKind::Head,
+                name: "HEAD".to_string(),
+            });
+        }
+    }
+
+    if let Ok(refs) = repo.references() {
+        for r in refs.flatten() {
+            let Ok(name) = r.shorthand().map(str::to_string) else {
+                continue;
+            };
+            // Peel rather than reading `target`: an annotated tag's ref points at the tag *object*,
+            // and the decoration belongs on the commit underneath it.
+            let Some(id) = r
+                .peel(git2::ObjectType::Commit)
+                .ok()
+                .map(|o| o.id())
+                .or_else(|| r.target())
+            else {
+                continue;
+            };
+            let kind = if r.is_tag() {
+                CommitRefKind::Tag
+            } else if r.is_remote() {
+                CommitRefKind::Remote
+            } else if r.is_branch() {
+                if head_branch.as_deref() == Some(name.as_str()) {
+                    CommitRefKind::HeadBranch
+                } else {
+                    CommitRefKind::Branch
+                }
+            } else if r.name().ok() == Some("refs/stash") {
+                CommitRefKind::Stash
+            } else {
+                // Notes, replace refs, bisect state, a remote's HEAD symref target — machinery,
+                // not somewhere you'd navigate to.
+                continue;
+            };
+            out.entry(id).or_default().push(CommitRef { kind, name });
+        }
+    }
+
+    for refs in out.values_mut() {
+        refs.sort_by(|a, b| rank(a.kind).cmp(&rank(b.kind)).then(a.name.cmp(&b.name)));
+    }
+    out
+}
+
+/// Sort position of a decoration kind within one commit's list (see [`ref_decorations`]).
+fn rank(kind: CommitRefKind) -> u8 {
+    match kind {
+        CommitRefKind::Head | CommitRefKind::HeadBranch => 0,
+        CommitRefKind::Branch => 1,
+        CommitRefKind::Tag => 2,
+        CommitRefKind::Remote => 3,
+        CommitRefKind::Stash => 4,
+    }
+}
+
+/// The refs pointing at `id`, in git's own `(HEAD -> main, tag: v1.0, origin/main)` text form, for
+/// the `git/show` header. Empty when nothing points here, which is the common case deep in history.
 fn refs_at(repo: &git2::Repository, id: git2::Oid) -> Vec<String> {
-    let head_branch = repo
-        .head()
-        .ok()
-        .filter(|h| h.target() == Some(id))
-        .and_then(|h| h.shorthand().ok().map(str::to_string));
-    let mut names = Vec::new();
-    if let Some(branch) = &head_branch {
-        names.push(format!("HEAD -> {branch}"));
-    }
-    let Ok(refs) = repo.references() else {
-        return names;
-    };
-    for r in refs.flatten() {
-        // `target_peel` as well as `target`, so an annotated tag — whose ref points at the tag
-        // object rather than the commit — is still recognised as being here.
-        if r.target() != Some(id) && r.target_peel() != Some(id) {
-            continue;
-        }
-        let Ok(name) = r.shorthand() else { continue };
-        if Some(name.to_string()) == head_branch {
-            continue;
-        }
-        if r.is_tag() {
-            names.push(format!("tag: {name}"));
-        } else if r.is_branch() || r.is_remote() {
-            names.push(name.to_string());
-        }
-    }
-    names
+    ref_decorations(repo)
+        .remove(&id)
+        .unwrap_or_default()
+        .iter()
+        .map(CommitRef::label)
+        .collect()
 }
 
 /// A commit as `git show` prints it: metadata and message, then the patch against its first parent

@@ -39,6 +39,7 @@ import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
   BufferOpenResult,
   BufferWindow,
+  CommitRef,
   CursorState,
   DiagnosticCounts,
   GitOperation,
@@ -409,6 +410,9 @@ interface RowDesc {
    *  checkout holds this branch (a destination since the merge, not a refusal) and must not read
    *  as dim metadata. */
   mark?: { text: string; cls: string };
+  /** Coloured spans between the prefix and the primary text — a commit row's
+   *  `(HEAD -> main, tag: v1.0)` decorations, where git puts them. */
+  refs?: { text: string; cls: string }[];
   prefix?: string;
   prefixClass?: string;
   /** Fuzzy-match offsets into `prefix` (code points), bolded like `matches`. */
@@ -760,6 +764,31 @@ function keybindingMatchSegments(
   return out;
 }
 
+/** A commit's decorations as coloured spans — `(HEAD -> main, tag: v1.0, origin/main)`, brackets
+ *  and separators dim, each name in its kind's colour. Mirrors the core's `commit_ref_parts` and
+ *  `REF_DECORATION_*` (aether-client/labels.rs), which the native shells render from — the three
+ *  clients print one decoration, so keep them in step. */
+function commitRefParts(refs: CommitRef[]): { text: string; cls: string }[] {
+  if (refs.length === 0) return [];
+  const punct = "picker-ref-punct";
+  const out = [{ text: "(", cls: punct }];
+  for (const [i, r] of refs.entries()) {
+    if (i > 0) out.push({ text: ", ", cls: punct });
+    if (r.kind === "head_branch") {
+      // Two colours, as git prints it: `HEAD` in the HEAD colour, the branch in the branch colour.
+      out.push({ text: "HEAD -> ", cls: "picker-ref-head" });
+      out.push({ text: r.name, cls: "picker-ref-branch" });
+    } else if (r.kind === "tag") {
+      // git colours the `tag: ` marker as part of the tag, so it stays one span here too.
+      out.push({ text: `tag: ${r.name}`, cls: "picker-ref-tag" });
+    } else {
+      out.push({ text: r.name, cls: `picker-ref-${r.kind}` });
+    }
+  }
+  out.push({ text: ")", cls: punct });
+  return out;
+}
+
 /** Distil a `PickerItem` to its row display. `labels` is the disambiguated per-root label set
  *  (`rootLabels`, "" for single-root); `budget` is the char allowance for paths (segment-elided). */
 function describePickerItem(
@@ -925,20 +954,17 @@ function describePickerItem(
       return { primary: item.label, matches: item.match_indices };
     }
     case "git_commit": {
-      // `abc1234  subject … author · 3w ago`. The hash leads (it identifies the commit and is what
-      // you'd quote elsewhere); author and date trail dim. The subject highlights its fuzzy hits,
-      // the hash the leading characters the query abbreviated; the author is never matched.
-      const author = item.author ?? "";
-      const dim: string[] = [];
-      if (author) dim.push(author);
-      if (item.timestamp) dim.push(time_ago(item.timestamp));
+      // `abc1234  (HEAD -> main, tag: v1.0) subject`. The hash leads (it identifies the commit and
+      // is what you'd quote elsewhere), the refs pointing here follow it in their per-kind colours
+      // as `git log --oneline --decorate` prints them. The subject highlights its fuzzy hits, the
+      // hash the leading characters the query abbreviated; the decorations are never matched.
       const hashLen = item.hash_match_len ?? 0;
       return {
         primary: item.subject ?? "",
         matches: item.match_indices,
         prefix: item.short_hash,
         prefixMatches: Array.from({ length: hashLen }, (_, i) => i),
-        meta: dim.join(" · "),
+        refs: commitRefParts(item.decorations ?? []),
       };
     }
     case "lsp_server": {
@@ -4800,6 +4826,19 @@ export class Shell {
         pre.className = d.prefixClass ? `picker-prefix ${d.prefixClass}` : "picker-prefix";
         pre.append(matched(d.prefix, d.prefixMatches));
         row.append(pre);
+      }
+      if (d.refs?.length) {
+        // Commit decorations, between the hash and the subject as `git log --decorate` prints
+        // them. Never shrinks — a truncated ref name is a different ref.
+        const refs = document.createElement("span");
+        refs.className = "picker-refs";
+        for (const part of d.refs) {
+          const s = document.createElement("span");
+          s.className = part.cls;
+          s.textContent = part.text;
+          refs.append(s);
+        }
+        row.append(refs);
       }
       const main = document.createElement("span");
       main.className =

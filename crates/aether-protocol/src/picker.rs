@@ -871,16 +871,15 @@ pub enum PickerItem {
         /// First line of the message. Empty when unreadable.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         subject: String,
-        /// Author name, shown dim.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        author: String,
-        /// Author time as Unix seconds, rendered as a relative date by the client (which has the
-        /// clock). `0` when unknown — same convention as the branch rows.
-        #[serde(default, skip_serializing_if = "is_zero_i64")]
-        timestamp: i64,
+        /// The refs pointing at this commit, rendered between the hash and the subject the way
+        /// `git log --oneline --decorate` prints them — `(HEAD -> main, tag: v1.0, origin/main)`,
+        /// each kind in its own colour. Empty for the overwhelming majority of commits, which is
+        /// why the row spends no fixed width on it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decorations: Vec<crate::git::CommitRef>,
         /// Char offsets into `subject` covered by fuzzy matches. The subject is the only thing
-        /// matched *fuzzily*: the author isn't matched at all (it would make every query match
-        /// every commit by the repo's main author) and the hash is matched by prefix instead
+        /// matched *fuzzily*: the decorations aren't matched at all (they're what the commit is
+        /// *labelled*, not what it says) and the hash is matched by prefix instead
         /// (`hash_match_len`).
         #[serde(default)]
         match_indices: Vec<u32>,

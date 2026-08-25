@@ -218,6 +218,16 @@ pub struct Theme {
     pub cursor_line_conflict_ours_bg: Rgb,
     pub cursor_line_conflict_theirs_bg: Rgb,
 
+    // Commit decorations — the `(HEAD -> main, tag: v1.0, origin/main)` a log row prints after its
+    // hash. One role per ref kind, so the kinds are tellable apart at a glance the way
+    // `git log --decorate` colours them. Git's own slots but for the remote, which it paints red:
+    // here red is error/deleted, and "this branch also exists on the remote" is neither, so remotes
+    // take purple instead — the one hue left that none of the four share.
+    pub git_ref_head: Rgb,
+    pub git_ref_branch: Rgb,
+    pub git_ref_remote: Rgb,
+    pub git_ref_tag: Rgb,
+
     // ---- Markdown reading view ----
     /// Code spans/blocks panel.
     pub md_code_bg: Rgb,
@@ -314,6 +324,10 @@ impl Theme {
         git_conflict_marker: NORD9,
         cursor_line_conflict_ours_bg: rgb(0x2f4d52),
         cursor_line_conflict_theirs_bg: rgb(0x503664),
+        git_ref_head: NORD8,
+        git_ref_branch: NORD14,
+        git_ref_remote: NORD15,
+        git_ref_tag: NORD13,
         md_code_bg: NORD1,
         md_table_stripe_bg: rgb(0x323845), // between NORD0 and NORD1
         md_alert_important: NORD15,
@@ -389,6 +403,12 @@ impl Theme {
         git_conflict_marker: NORD10,
         cursor_line_conflict_ours_bg: rgb(0xcbe0e5),
         cursor_line_conflict_theirs_bg: rgb(0xd7c6e5),
+        // The same four hues, darkened to stay legible on Snow Storm — reusing the shades the
+        // syntax roles already took for them (accent, ok, syn_constant, warning).
+        git_ref_head: rgb(0x3e7a8f),
+        git_ref_branch: rgb(0x5a7547),
+        git_ref_remote: rgb(0x8d6488),
+        git_ref_tag: rgb(0x9a7522),
         md_code_bg: rgb(0xe1e6ee),
         md_table_stripe_bg: rgb(0xe9edf3),
         md_alert_important: rgb(0x8d6488), // = syn_constant today; free to diverge
@@ -623,6 +643,26 @@ mod tests {
         assert_ne!(l.warning, NORD13, "aurora yellow is unreadable on light");
         // The staged-dimmer-than-unstaged ladder holds in both directions.
         assert_ne!(l.git_added, l.git_staged_added);
+    }
+
+    /// A commit row's decorations exist to be told apart at a glance, so the four ref roles must
+    /// stay mutually distinct in both tables — collapsing two onto one shade (light mode darkens
+    /// several hues toward each other) would silently make `main` and `origin/main` the same thing.
+    #[test]
+    fn commit_ref_roles_are_mutually_distinct() {
+        for t in [Theme::DARK, Theme::LIGHT] {
+            let roles = [
+                ("head", t.git_ref_head),
+                ("branch", t.git_ref_branch),
+                ("remote", t.git_ref_remote),
+                ("tag", t.git_ref_tag),
+            ];
+            for (i, (an, a)) in roles.iter().enumerate() {
+                for (bn, b) in &roles[i + 1..] {
+                    assert_ne!(a, b, "{:?}: {an} and {bn} share a shade", t.mode);
+                }
+            }
+        }
     }
 
     #[test]

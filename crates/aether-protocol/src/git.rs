@@ -1953,6 +1953,61 @@ pub struct CommitInfo {
     pub message: String,
 }
 
+// ---- commit decorations -------------------------------------------------------------------------
+
+/// One ref pointing at a commit — a single entry of the `(HEAD -> main, tag: v1.0, origin/main)`
+/// decoration `git log --decorate` prints after the hash.
+///
+/// Typed rather than pre-formatted, so a client can colour the kinds apart the way git does; the
+/// plain-text form git prints is [`CommitRef::label`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRef {
+    pub kind: CommitRefKind,
+    /// The ref's short name as git's `--decorate=short` prints it: `main`, `origin/main`, `v1.0`,
+    /// or `HEAD` for a detached checkout. Never the full `refs/…` path, and never carries the
+    /// `tag: ` marker — that's implied by [`CommitRefKind::Tag`] and added when rendering.
+    pub name: String,
+}
+
+impl CommitRef {
+    /// The decoration as git prints it in a `--decorate` log: `HEAD -> main`, `tag: v1.0`,
+    /// `origin/main`. The one place the `HEAD -> ` and `tag: ` literals are spelled out for
+    /// *plain* text (the clients render them as separately coloured spans instead).
+    pub fn label(&self) -> String {
+        match self.kind {
+            CommitRefKind::Head => "HEAD".to_string(),
+            CommitRefKind::HeadBranch => format!("HEAD -> {}", self.name),
+            CommitRefKind::Tag => format!("tag: {}", self.name),
+            CommitRefKind::Branch | CommitRefKind::Remote | CommitRefKind::Stash => {
+                self.name.clone()
+            }
+        }
+    }
+}
+
+/// What kind of ref a [`CommitRef`] is — the distinction git colours (`color.decorate.*`) and the
+/// clients follow with their own theme roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitRefKind {
+    /// A detached `HEAD` sitting on this commit. When HEAD is attached to a branch that is also
+    /// here, the two merge into one [`Self::HeadBranch`] decoration instead — git's own rule, and
+    /// why a commit never carries both.
+    Head,
+    /// The checked-out branch: `refs/heads/…` with `HEAD` attached to it. Rendered `HEAD -> main`.
+    HeadBranch,
+    /// Any other local branch (`refs/heads/…`).
+    Branch,
+    /// A remote-tracking branch (`refs/remotes/…`), name included: `origin/main`.
+    Remote,
+    /// A tag (`refs/tags/…`), lightweight or annotated — an annotated tag decorates the commit it
+    /// peels to, not the tag object.
+    Tag,
+    /// `refs/stash`. Never appears in a log walk (a stash commit isn't an ancestor of HEAD), but
+    /// `git/show` on a stash entry lands on one.
+    Stash,
+}
+
 // ---- file status (explorer colouring) -----------------------------------------------------------
 
 /// The Git status of a single file-explorer entry, used to colour it. Folded from libgit2's

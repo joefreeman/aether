@@ -1216,17 +1216,13 @@ async fn git_log_picker_lists_history_and_filters_it() {
             PickerItem::GitCommit {
                 short_hash,
                 subject,
-                author,
                 ..
-            } => Some((short_hash.clone(), format!("{subject} — {author}"))),
+            } => Some((short_hash.clone(), subject.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(rows.len(), 2);
-    assert!(
-        rows[0].1.starts_with("init — Test"),
-        "newest first, {rows:?}"
-    );
+    assert_eq!(rows[0].1, "init", "newest first, {rows:?}");
     assert_eq!(rows[0].0.len(), 7, "abbreviated hash");
 
     // The short hash is matchable, so pasting one finds its commit.
@@ -1244,7 +1240,7 @@ async fn git_log_picker_lists_history_and_filters_it() {
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.total_matches, 1, "the hash {short} names one commit");
 
-    // The author is rendered but not matched: it's a facet for a future chip, not free text.
+    // The author is neither rendered nor matched: it's a facet for a future chip, not free text.
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         &PickerQueryParams {
@@ -1348,6 +1344,70 @@ async fn git_log_rows_carry_what_git_show_needs() {
     .await;
     assert!(opened.read_only);
     assert!(opened.title.is_some_and(|t| t.ends_with("init")));
+
+    drop(server);
+}
+
+/// Every row carries the refs pointing at its commit, typed and ordered — what `git log --decorate`
+/// prints, minus the formatting, so each client can colour the kinds apart. The checked-out branch
+/// merges with HEAD into one `HeadBranch` decoration (git's own rule), and an **annotated** tag
+/// decorates the commit it peels to rather than the tag object it literally points at.
+#[tokio::test]
+async fn git_log_rows_carry_the_refs_pointing_at_them() {
+    use aether_protocol::git::CommitRefKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    let older = repo.head().unwrap().peel_to_commit().unwrap().id();
+    commit_file(&repo, "b.rs", "two\n");
+    let tip = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+    // A released older commit: an annotated tag, whose ref points at a tag *object*.
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let older_obj = repo.find_object(older, None).unwrap();
+    repo.tag("v1.0", &older_obj, &sig, "release", false)
+        .unwrap();
+    // The tip: HEAD's own branch, a second local branch, and a remote-tracking ref.
+    repo.branch("feature", &repo.find_commit(tip).unwrap(), false)
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", tip, false, "test")
+        .unwrap();
+
+    let (server, mut ws, buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let view =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::GitLog, buffer)).await;
+    let rows: Vec<Vec<(CommitRefKind, String)>> = view
+        .update
+        .expect("window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitCommit { decorations, .. } => Some(
+                decorations
+                    .iter()
+                    .map(|r| (r.kind, r.name.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        vec![
+            (CommitRefKind::HeadBranch, "main".to_string()),
+            (CommitRefKind::Branch, "feature".to_string()),
+            (CommitRefKind::Remote, "origin/main".to_string()),
+        ],
+        "HEAD leads and absorbs the branch it's on; then locals, then remotes"
+    );
+    assert_eq!(
+        rows[1],
+        vec![(CommitRefKind::Tag, "v1.0".to_string())],
+        "the annotated tag lands on the commit, not on its tag object"
+    );
 
     drop(server);
 }

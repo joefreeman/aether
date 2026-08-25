@@ -2959,8 +2959,7 @@ fn enter_on_a_log_row_shows_the_commit() {
             hash: "abc1234def5678".into(),
             short_hash: "abc1234".into(),
             subject: "Add commit grammar".into(),
-            author: "Ada".into(),
-            timestamp: 1_700_000_000,
+            decorations: Vec::new(),
             match_indices: Vec::new(),
             hash_match_len: 0,
         }];
