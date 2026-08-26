@@ -1400,7 +1400,7 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('p'), Exact(Mods::ALT), A::GitPush, "Git", "Push commits to remote"),
     bind!(LG, ch('x'), Exact(Mods::NONE), A::GitCancel, "Git", "Stop the fetch, push or pull in progress"),
     bind!(LG, ch('d'), Exact(Mods::NONE), A::GitAbortOperation, "Git", "Abandon the stopped merge/rebase"),
-    bind!(LG, ch('g'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches and worktrees"),
+    bind!(LG, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitBranches), "Git", "Branches and worktrees"),
     bind!(LG, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitLog), "Git", "History"),
     bind!(LG, ch('l'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitLogFile), "Git", "History of current file"),
     bind!(LG, ch('a'), Exact(Mods::NONE), A::OpenPicker(PickerKind::GitStash), "Git", "Stashes"),
@@ -1765,9 +1765,12 @@ mod tests {
             Some(Action::GitUncommit)
         ));
         assert!(matches!(
-            git(ch('g'), Mods::NONE),
+            git(ch('b'), Mods::NONE),
             Some(Action::OpenPicker(PickerKind::GitBranches))
         ));
+        // `g` was the branch picker's key until it moved to the letter that names it; nothing took
+        // its place, so a doubled `Space g g` does nothing rather than something else.
+        assert!(git(ch('g'), Mods::NONE).is_none());
         // Pull is plain, push is its outward Alt sibling — not the other way round, and neither is
         // a force variant.
         assert!(matches!(git(ch('p'), Mods::NONE), Some(Action::GitPull)));

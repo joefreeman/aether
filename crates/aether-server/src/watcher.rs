@@ -8,6 +8,8 @@
 //! - A buffer whose path is recreated has the deleted flag cleared and is treated as modified.
 //! - Workspace-index and explorer-picker invalidations come from create/remove anywhere under
 //!   a watched root; the picker layer chooses how to react (see `picker_refresh::*`).
+//! - An open working-changes view is rebuilt when anything under its repo changes — a save, a
+//!   stage, a commit — since a diff of the whole tree is what it *is*.
 //!
 //! Self-writes (the server's own `buffer/save`) are filtered out by comparing on-disk mtime
 //! against the buffer's recorded `last_modified_unix_ms`.
@@ -432,6 +434,8 @@ async fn handle_event(state: &SharedState, event: Event) {
     let mut affected_dirs: HashSet<PathBuf> = HashSet::new();
     let mut index_should_invalidate = false;
     let mut watcher_handle: Option<Arc<WatcherHandle>> = None;
+    // Assigned under the lock below; the early returns there exit before it is read.
+    let moved_trees: HashSet<PathBuf>;
 
     {
         let mut s = state.lock().await;
@@ -523,6 +527,18 @@ async fn handle_event(state: &SharedState, event: Event) {
                 affected_dirs.insert(dir);
             }
         }
+
+        // An open working-changes view is a picture of a whole tree, so it goes stale on far more
+        // than a `.git` write: a saved file — ours or an external editor's — is exactly what it is
+        // *of*. Match the changed paths against the repos with a view open, which is nearly always
+        // none, and rebuild those below once the lock is free (the rebuild runs a `git diff`).
+        moved_trees = crate::handlers::working_changes_repos(&s)
+            .into_iter()
+            .filter(|workdir| {
+                git_workdirs.contains(workdir) || paths.iter().any(|p| p.starts_with(workdir))
+            })
+            .collect();
+
         let picker_pushes = refresh_explorers_for_dirs(&mut s, &affected_dirs);
         pushes.extend(picker_pushes);
     }
@@ -540,6 +556,47 @@ async fn handle_event(state: &SharedState, event: Event) {
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+
+    schedule_working_changes_refresh(state, moved_trees).await;
+}
+
+/// How long the working-changes rebuild waits for the writes to stop. Short enough to read as
+/// immediate after a save, long enough that one save's several events cost one `git diff`.
+const WORKING_CHANGES_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Queue a rebuild of the open working-changes views of `workdirs`, coalescing bursts.
+///
+/// Events pile into `ServerState::working_changes_pending` and a single task drains it: sleep,
+/// take everything queued, rebuild, and go round again if more arrived while it worked. So a
+/// formatter rewriting the whole tree costs one diff, not one per file — while a lone save still
+/// lands within the debounce.
+async fn schedule_working_changes_refresh(state: &SharedState, workdirs: HashSet<PathBuf>) {
+    if workdirs.is_empty() {
+        return;
+    }
+    {
+        let mut s = state.lock().await;
+        s.working_changes_pending.extend(workdirs);
+        if s.working_changes_draining {
+            return; // the task below will pick these up on its next round
+        }
+        s.working_changes_draining = true;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WORKING_CHANGES_DEBOUNCE).await;
+            let batch = {
+                let mut s = state.lock().await;
+                if s.working_changes_pending.is_empty() {
+                    s.working_changes_draining = false;
+                    return;
+                }
+                std::mem::take(&mut s.working_changes_pending)
+            };
+            crate::handlers::refresh_working_changes_views(&state, &batch).await;
+        }
+    });
 }
 
 #[derive(Clone, Copy)]

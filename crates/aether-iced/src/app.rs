@@ -12,6 +12,7 @@ pub use crate::core::effect::{
     Effect, Effects, RevealStyle, ShellAction, ToastKind, WindowOpen, WindowTarget,
 };
 use crate::core::markdown::{AlertKind, Block as MdBlock, Inline as MdInline, Span as MdSpan};
+use crate::core::reveal::{PendingReveal, RevealTarget, Settled};
 pub use crate::core::session::*;
 use crate::core::update::Event as CoreEvent;
 use crate::editor::{self, ClickKind, EditorEvent, GUTTER_COLS, PAD};
@@ -504,12 +505,10 @@ pub struct App {
     subscribe_scroll: ScrollPosition,
     fetch_in_flight: bool,
     refetch_queued: bool,
-    /// Set when a cursor move scrolled out of the loaded window: once the fetch lands, reveal the
-    /// cursor with this style (`Follow` = minimal, `Jump` = rest near the top).
-    reveal_after_fetch: Option<RevealStyle>,
-    /// Like `reveal_after_fetch`, but places the cursor at a fixed fraction down once its
-    /// (out-of-window) line lands — for `;` / `Alt-;` when the line was scrolled out of the window.
-    place_after_fetch: Option<ViewportPlace>,
+    /// The cursor reveal owed to the viewport: armed when a cursor move lands outside the loaded
+    /// window, paid once a window carrying that line arrives. See [`aether_client::reveal`] for
+    /// why it's a debt rather than a one-shot callback.
+    pending_reveal: PendingReveal,
     /// The picker jumplist's scroll offset in px. The core tracks rows, not pixels; resets
     /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
@@ -571,6 +570,18 @@ pub struct App {
     pending_os_opens: Vec<std::path::PathBuf>,
 }
 
+/// How [`PendingReveal`] performs an owed reveal here: the shell's own pixel-based scrolling, each
+/// reporting whether the cursor's visual row was known well enough to act on.
+impl RevealTarget for App {
+    fn reveal(&mut self, style: RevealStyle) -> bool {
+        self.reveal_cursor_styled(style)
+    }
+
+    fn place(&mut self, place: ViewportPlace) -> bool {
+        self.place_cursor_in_window(place)
+    }
+}
+
 impl App {
     pub fn new(window: window::Id, b: Bootstrap) -> (Self, Task<Message>) {
         let shell = |session: Session,
@@ -605,8 +616,7 @@ impl App {
             },
             fetch_in_flight: false,
             refetch_queued: false,
-            reveal_after_fetch: None,
-            place_after_fetch: None,
+            pending_reveal: PendingReveal::default(),
             picker_scroll_y: 0.0,
             read_last_focus: None,
             read_reveal_snap: false,
@@ -1112,23 +1122,18 @@ impl App {
                     false
                 };
                 self.clamp_scroll();
-                let mut task = Task::none();
                 if anchored {
-                    self.reveal_after_fetch = None;
-                    self.place_after_fetch = None;
+                    self.pending_reveal.abandon();
                 } else {
-                    if let Some(style) = self.reveal_after_fetch.take() {
-                        self.reveal_cursor_styled(style);
-                    }
-                    if let Some(place) = self.place_after_fetch.take() {
-                        self.place_cursor_in_window(place);
-                    }
+                    self.settle_pending_reveal();
                 }
-                if self.refetch_queued {
-                    self.refetch_queued = false;
-                    task = self.maybe_fetch();
-                }
-                task
+                // Always re-check, not just when a refetch was queued: the window just adopted can
+                // be a *stale* one that doesn't cover the view at all (a cursor reveal and a
+                // scroll fetch answering out of turn), and nothing else would notice — the editor
+                // would go on rendering whichever region that window happened to hold.
+                // `maybe_fetch` no-ops when it does cover.
+                self.refetch_queued = false;
+                self.maybe_fetch()
             }
             Message::WindowUpdate(Err(e)) => {
                 self.fetch_in_flight = false;
@@ -1539,7 +1544,12 @@ impl App {
                         self.clamp_scroll();
                     } else {
                         self.clamp_scroll();
-                        self.reveal_cursor();
+                        // A pushed window can be the one that finally holds the cursor's line, so
+                        // it settles an owed reveal too — and its style outranks the plain follow
+                        // below, which would otherwise land a pending jump as a minimal scroll.
+                        if !self.settle_pending_reveal() {
+                            self.reveal_cursor();
+                        }
                     }
                 }
                 Effect::Request {
@@ -2123,7 +2133,7 @@ impl App {
         // longer resets these on switch/reconnect — they live here now.
         self.fetch_in_flight = false;
         self.refetch_queued = false;
-        self.reveal_after_fetch = None;
+        self.pending_reveal.abandon();
         let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
             // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
             // counterpart of the in-buffer jump reveal.
@@ -2514,28 +2524,66 @@ impl App {
         };
         let line = self.session.buffer.cursor.position.line;
         if line < window.first_logical_line || line >= window.last_logical_line_exclusive {
-            let Some(viewport_id) = self.session.viewport_id else {
-                return Task::none();
-            };
-            self.reveal_after_fetch = Some(style);
-            self.fetch_in_flight = true;
-            self.rpc::<ViewportScroll>(
-                ViewportScrollParams {
-                    viewport_id,
-                    scroll: ScrollPosition {
-                        logical_line: line,
-                        sub_row: 0.0,
-                    },
-                },
-                Message::WindowUpdate,
-            );
+            self.pending_reveal.owe_reveal(style);
+            self.fetch_cursor_window();
             return Task::none();
         }
-        self.reveal_cursor_styled(style);
+        // The line is already loaded, so the reveal can happen now — and going through `settle`
+        // means it also pays any debt outstanding for this same cursor, rather than leaving one
+        // owed behind a reveal that has just happened.
+        self.pending_reveal.owe_reveal(style);
+        self.settle_pending_reveal();
         self.maybe_fetch()
     }
 
-    fn reveal_cursor_styled(&mut self, style: RevealStyle) {
+    /// Pay whatever cursor reveal is owed against the window now loaded, clearing the debt only if
+    /// it could actually be paid — see [`aether_client::reveal`]. Reports whether anything was
+    /// owed, so a caller with a default reveal of its own doesn't fire on top of a pending jump.
+    fn settle_pending_reveal(&mut self) -> bool {
+        // Taken out so the reveal can borrow `self`; `PendingReveal` decides what may be cleared.
+        let mut pending = std::mem::take(&mut self.pending_reveal);
+        let settled = pending.settle(self);
+        self.pending_reveal = pending;
+        // Still owed: this window couldn't answer for the cursor, and no other path will go and
+        // ask — `maybe_fetch` chases `scroll_px`, which is exactly what hasn't caught up yet.
+        if settled == Settled::Unpaid {
+            self.fetch_cursor_window();
+        }
+        settled != Settled::Nothing
+    }
+
+    /// Pull a window around the cursor's line — the fetch an owed reveal waits on, and the
+    /// counterpart of [`Self::maybe_fetch`], which chases `scroll_px` instead.
+    ///
+    /// Coalesced against `fetch_in_flight` for the same reason `maybe_fetch` is: a held-down
+    /// motion key outside the loaded window would otherwise put one full window render per
+    /// keystroke on the wire, and the view can't follow the cursor until that backlog drains.
+    /// Skipping loses nothing — [`Self::settle_pending_reveal`] re-issues while the debt is
+    /// unpaid, and it re-reads the cursor, so the request that does go out asks about wherever
+    /// the cursor has reached by then.
+    fn fetch_cursor_window(&mut self) {
+        if self.fetch_in_flight {
+            return;
+        }
+        let Some(viewport_id) = self.session.viewport_id else {
+            return;
+        };
+        self.fetch_in_flight = true;
+        self.rpc::<ViewportScroll>(
+            ViewportScrollParams {
+                viewport_id,
+                scroll: ScrollPosition {
+                    logical_line: self.session.buffer.cursor.position.line,
+                    sub_row: 0.0,
+                },
+            },
+            Message::WindowUpdate,
+        );
+    }
+
+    /// Whether the reveal could be performed — `false` when the cursor's line isn't in the loaded
+    /// window, so its visual row is unknown and the view can't be positioned on it yet.
+    fn reveal_cursor_styled(&mut self, style: RevealStyle) -> bool {
         match style {
             RevealStyle::Follow => self.reveal_cursor(),
             RevealStyle::Jump => self.reveal_cursor_jump(),
@@ -2544,33 +2592,34 @@ impl App {
 
     /// Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
     /// `scroll_to_px` animates a short glide there and snaps when the target is far (> ~1.5 screens).
-    fn reveal_cursor_jump(&mut self) {
+    fn reveal_cursor_jump(&mut self) -> bool {
         let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
-            return;
+            return false;
         };
         let Some((row, _, _)) =
             grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
         else {
-            return;
+            return false;
         };
         let h = cell.height;
         let top = PAD + row as f32 * h;
         let view_h = self.view_size.height;
         // Already fully visible → don't disturb the view.
         if top >= self.scroll_px && top + h <= self.scroll_px + view_h {
-            return;
+            return true;
         }
         self.scroll_to_px(top - view_h * CURSOR_REST_FRACTION, true);
+        true
     }
 
-    fn reveal_cursor(&mut self) {
+    fn reveal_cursor(&mut self) -> bool {
         let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
-            return;
+            return false;
         };
         let Some((row, dcol, _)) =
             grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
         else {
-            return;
+            return false;
         };
         let h = cell.height;
         let top = PAD + row as f32 * h;
@@ -2593,6 +2642,7 @@ impl App {
             }
             self.scroll_x_px = self.scroll_x_px.clamp(0.0, self.max_scroll_x_px());
         }
+        true
     }
 
     fn place_cursor(&mut self, place: ViewportPlace) -> Task<Message> {
@@ -2609,42 +2659,36 @@ impl App {
         // unknown — pull that region from the server (scrolling the viewport to the line), then
         // place once it lands. Mirrors `ensure_cursor_visible_inner`.
         if line < first || line >= last {
-            let Some(viewport_id) = self.session.viewport_id else {
-                return Task::none();
-            };
-            self.place_after_fetch = Some(place);
-            self.fetch_in_flight = true;
-            self.rpc::<ViewportScroll>(
-                ViewportScrollParams {
-                    viewport_id,
-                    scroll: ScrollPosition {
-                        logical_line: line,
-                        sub_row: 0.0,
-                    },
-                },
-                Message::WindowUpdate,
-            );
+            self.pending_reveal.owe_place(place);
+            self.fetch_cursor_window();
             return Task::none();
         }
-        self.place_cursor_in_window(place);
+        // The line is already loaded, so placing it here is also what any older debt was waiting
+        // for — the cursor it named is this one.
+        // As in `ensure_cursor_visible`: perform it through `settle`, so an outstanding debt for
+        // this same cursor is paid rather than left owed behind a placement that has happened.
+        self.pending_reveal.owe_place(place);
+        self.settle_pending_reveal();
         Task::none()
     }
 
     /// Scroll so the cursor's line sits a fixed fraction down the viewport. Assumes the line is in
-    /// the loaded window (the caller pulls it in first otherwise); a no-op if its cell is unknown.
-    fn place_cursor_in_window(&mut self, place: ViewportPlace) {
+    /// the loaded window (the caller pulls it in first otherwise); reports `false` if its cell is
+    /// unknown, on the same terms as [`Self::reveal_cursor`].
+    fn place_cursor_in_window(&mut self, place: ViewportPlace) -> bool {
         let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
-            return;
+            return false;
         };
         let Some((row, _, _)) =
             grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
         else {
-            return;
+            return false;
         };
         self.scroll_to_px(
             PAD + row as f32 * cell.height - self.view_size.height * place.fraction(),
             true,
         );
+        true
     }
 
     // ---- notifications ------------------------------------------------------------------------

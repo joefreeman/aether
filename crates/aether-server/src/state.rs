@@ -48,6 +48,17 @@ pub struct ServerState {
     /// Keyed by canonicalized workdir (a [`aether_protocol::git::RepoId`]); a path is suppressed
     /// if it sits under any entry. Held only for the duration of one operation.
     pub git_suppressed: std::collections::HashSet<PathBuf>,
+    /// Repos whose open working-changes view the watcher has queued a rebuild for, and whether a
+    /// drain task is already running.
+    ///
+    /// The view follows the working tree live, and the watcher speaks in single files: one save is
+    /// several inotify events and a tool that rewrites the tree is hundreds, each of which would
+    /// otherwise run its own `git diff` of everything. Events accumulate here instead and one
+    /// debounced pass answers them all. Only ever non-empty while a view is actually open.
+    pub working_changes_pending: std::collections::HashSet<PathBuf>,
+    /// Whether [`crate::watcher::schedule_working_changes_refresh`]'s drain task is running; it
+    /// owns [`Self::working_changes_pending`] until it finds it empty.
+    pub working_changes_draining: bool,
     /// Long-running git operations currently in flight, keyed by canonicalized workdir — at most
     /// one per repo, since they all contend for the same refs anyway.
     ///
@@ -610,6 +621,8 @@ impl ServerState {
             workspaces: HashMap::new(),
             watcher: None,
             git_suppressed: std::collections::HashSet::new(),
+            working_changes_pending: std::collections::HashSet::new(),
+            working_changes_draining: false,
             git_operations: HashMap::new(),
             worktree_locks: HashMap::new(),
             git_baseline_choices: crate::git::BaselineChoices::new(),

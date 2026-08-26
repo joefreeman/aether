@@ -732,11 +732,7 @@ impl Session {
             // resolved is an error, not an empty answer.
             Event::Shown(Ok(shown)) => match shown.opened {
                 Some(open) => self.adopt_open(open),
-                None => Effects::toast_detail(
-                    "No working changes",
-                    "Nothing to commit — the tree is clean",
-                    ToastKind::Info,
-                ),
+                None => Effects::toast(nothing_to_commit(shown.baseline.as_ref()), ToastKind::Info),
             },
             Event::Shown(Err(e)) => self.open_failed(e),
 
@@ -10841,6 +10837,29 @@ fn has_url_scheme(s: &str) -> bool {
         }
     }
     false
+}
+
+/// The one-line toast for a working-changes view with nothing in it.
+///
+/// One line, not a title and a detail: there is exactly one fact here, and splitting it across two
+/// lines had the second saying the first again in different words.
+///
+/// The baseline is named whenever one is pinned, because "nothing to commit" is only self-evident
+/// against the default. Under a revision the tree may be thick with uncommitted work and still have
+/// nothing *since that commit*; under the saved-file baseline the view is empty by construction —
+/// it compares each file to its own content on disk — and reporting a clean tree would be wrong
+/// about a dirty one. Same vocabulary as the `git/set_baseline` confirmation toast, so the two
+/// don't describe the same setting differently.
+fn nothing_to_commit(baseline: Option<&aether_protocol::git::GitBaselineSource>) -> String {
+    match baseline {
+        None => "Nothing to commit".to_string(),
+        Some(aether_protocol::git::GitBaselineSource::Saved) => {
+            "Nothing to commit (versus the files on disk)".to_string()
+        }
+        Some(aether_protocol::git::GitBaselineSource::Rev { label, .. }) => {
+            format!("Nothing to commit (versus {label})")
+        }
+    }
 }
 
 /// What a completed fetch actually told us, phrased as the status bar would read it.

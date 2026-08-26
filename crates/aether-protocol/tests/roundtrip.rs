@@ -2721,10 +2721,33 @@ fn git_show_target_shape() {
 
     // A clean working tree materialises nothing, and says so by omission — same shape (and same
     // reason) as `git/follow_patch_line` finding nothing to follow.
-    let v = to_value(GitShowResult { opened: None }).unwrap();
+    let v = to_value(GitShowResult {
+        opened: None,
+        baseline: None,
+    })
+    .unwrap();
     assert_eq!(v, json!({}));
     let back: GitShowResult = from_value(v).unwrap();
     assert!(back.opened.is_none());
+    assert!(back.baseline.is_none());
+
+    // Empty *because of a pinned baseline* carries it: with no buffer minted, the toast is the
+    // only place the reason can be said, and "nothing changed" would be wrong about a dirty tree.
+    let v = to_value(GitShowResult {
+        opened: None,
+        baseline: Some(aether_protocol::git::GitBaselineSource::Rev {
+            label: "main".into(),
+            commit: "abc1234".into(),
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "baseline": { "kind": "rev", "label": "main", "commit": "abc1234" } })
+    );
+    let back: GitShowResult = from_value(v).unwrap();
+    assert!(back.opened.is_none());
+    assert!(back.baseline.is_some());
 }
 
 #[test]

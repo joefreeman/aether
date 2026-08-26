@@ -4426,6 +4426,660 @@ async fn an_open_working_changes_view_drains_when_the_tree_goes_clean() {
     drop(server);
 }
 
+// ---- the working-changes view is live ----------------------------------------------------------
+
+/// Read the patch's text now.
+async fn patch_text(ws: &mut Ws, buffer_id: u64) -> String {
+    let content: BufferContentResult =
+        send_request::<BufferContent>(ws, &BufferContentParams { buffer_id }).await;
+    content.text
+}
+
+/// Poll the patch until `check` accepts it, then return that text.
+///
+/// The rebuilds these tests provoke arrive over the file watcher, and the kernel's event queue is
+/// not something the server can report quiescence for — `settled` accounts for the server's own
+/// deferred work, not inotify's. So this polls, for the same reason [`eventually`] does.
+async fn patch_eventually(
+    ws: &mut Ws,
+    buffer_id: u64,
+    what: &str,
+    check: impl Fn(&str) -> bool,
+) -> String {
+    for _ in 0..400 {
+        let text = patch_text(ws, buffer_id).await;
+        if check(&text) {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let text = patch_text(ws, buffer_id).await;
+    panic!("timed out waiting for {what}; the view still reads:\n{text}");
+}
+
+/// The stage tag on the patch line whose text is `want`.
+async fn stage_of(ws: &mut Ws, buffer_id: u64, want: &str) -> DiffStage {
+    let window = window_of(ws, buffer_id).await;
+    window
+        .lines
+        .iter()
+        .find(|l| {
+            l.visual_rows
+                .iter()
+                .flat_map(|r| &r.segments)
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+                == want
+        })
+        .unwrap_or_else(|| panic!("no line {want:?}"))
+        .diff_stage
+}
+
+/// The view is a picture of the working tree, so a write to that tree — by another editor, a
+/// formatter, a script — has to move it. Nothing is re-shown here: the buffer the user is already
+/// looking at changes underneath them, which is the whole point.
+#[tokio::test]
+async fn an_external_write_rebuilds_an_open_working_changes_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    commit_file(&repo, "b.rs", "fn two() {}\n");
+    std::fs::write(root.join("a.rs"), "fn one() {}\nfn FIRST() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(patch_text(&mut ws, patch.buffer_id).await.contains("FIRST"));
+
+    // Someone else edits the file. No RPC, no re-show — just a write.
+    std::fs::write(root.join("a.rs"), "fn one() {}\nfn SECOND() {}\n").unwrap();
+    let text = patch_eventually(&mut ws, patch.buffer_id, "the new line", |t| {
+        t.contains("fn SECOND() {}")
+    })
+    .await;
+    assert!(
+        !text.contains("fn FIRST() {}"),
+        "and the superseded line is gone:\n{text}"
+    );
+
+    // A file that wasn't in the diff at all joins it.
+    std::fs::write(root.join("b.rs"), "fn two() {}\nfn SECOND_FILE() {}\n").unwrap();
+    patch_eventually(&mut ws, patch.buffer_id, "the second file", |t| {
+        t.contains("fn SECOND_FILE() {}")
+    })
+    .await;
+
+    drop(server);
+}
+
+/// Staging in a terminal moves nothing the text can show — `git diff HEAD` is byte-identical
+/// across a `git add` — so the stage tags are the only evidence the view can offer, and the rebuild
+/// has to notice a change that exists nowhere else.
+#[tokio::test]
+async fn an_external_stage_retags_an_open_working_changes_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn LOOSE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let before = patch_text(&mut ws, patch.buffer_id).await;
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "fn LOOSE() {}").await,
+        DiffStage::Unstaged
+    );
+
+    // `git add a.rs`, from outside the editor.
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+    }
+
+    for _ in 0..400 {
+        if stage_of(&mut ws, patch.buffer_id, "fn LOOSE() {}").await == DiffStage::Staged {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "fn LOOSE() {}").await,
+        DiffStage::Staged,
+        "the index moved, so the tag has to"
+    );
+    assert_eq!(
+        patch_text(&mut ws, patch.buffer_id).await,
+        before,
+        "and the text is untouched — which is why the tag is the only signal"
+    );
+
+    drop(server);
+}
+
+/// Saving in the editor is the ordinary way the tree moves, and the view has to follow it without
+/// being asked. The self-save filter that keeps the watcher from reloading our own write must not
+/// swallow the rebuild with it.
+#[tokio::test]
+async fn saving_a_buffer_rebuilds_an_open_working_changes_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    std::fs::write(root.join("a.rs"), "fn one() {}\nfn SAVED() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let file: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(patch_text(&mut ws, patch.buffer_id).await.contains("SAVED"));
+
+    // Type a third line into the file and save it — nothing else.
+    set_cursor(&mut ws, file.buffer_id, 1, 15).await;
+    let _ = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id: file.buffer_id,
+            text: "\nfn TYPED() {}".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id: file.buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+
+    patch_eventually(&mut ws, patch.buffer_id, "the saved line", |t| {
+        t.contains("fn TYPED() {}")
+    })
+    .await;
+
+    drop(server);
+}
+
+/// `Space g s` over a *file* buffer, with the view open in another pane: the index moved, so the
+/// view's tags did too. Staging from either end reaches the same rebuild.
+#[tokio::test]
+async fn staging_a_file_buffer_retags_a_working_changes_view_open_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    std::fs::write(root.join("a.rs"), "one\nCHANGED\nthree\n").unwrap();
+
+    let (server, mut ws, file_buffer) = setup_repos_workspace_on(vec![root.clone()], "a.rs").await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "CHANGED").await,
+        DiffStage::Unstaged
+    );
+
+    // Stage from the file, not from the view.
+    set_cursor(&mut ws, file_buffer, 1, 0).await;
+    let applied = apply_hunk(&mut ws, file_buffer, HunkAction::Stage).await;
+    assert_eq!(applied.status, ApplyHunkStatus::Staged);
+
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "CHANGED").await,
+        DiffStage::Staged,
+        "the view followed the index without being re-shown"
+    );
+
+    drop(server);
+}
+
+/// Committing empties the tree, so the view it was of empties with it — in place, while the user is
+/// looking at it, rather than waiting to be re-shown.
+#[tokio::test]
+async fn committing_drains_an_open_working_changes_view_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    isolate_repo_config(&repo, &root.join(".git/test-hooks"));
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(patch_text(&mut ws, patch.buffer_id).await.contains("two"));
+
+    let prepared: GitPrepareCommitResult = send_request::<GitPrepareCommit>(
+        &mut ws,
+        &GitPrepareCommitParams {
+            repo_id: Some(root.to_string_lossy().into()),
+            amend: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    std::fs::write(&prepared.path, "Add a line\n").unwrap();
+    let made = commit(&mut ws, &root, false).await;
+    assert!(made.commit.is_some(), "the commit landed: {made:?}");
+
+    assert!(
+        patch_text(&mut ws, patch.buffer_id)
+            .await
+            .contains("Nothing to commit — the working tree is clean"),
+        "the same buffer, drained where it stands"
+    );
+
+    drop(server);
+}
+
+/// A live view is only usable if it doesn't move the reader around. The cursor is re-seated on the
+/// *source line it was reading* rather than the buffer line it happened to occupy, so an edit to
+/// some other file — which shifts every line below it — leaves the reader where they were.
+#[tokio::test]
+async fn a_rebuild_keeps_the_cursor_on_the_line_it_was_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "a1\na2\na3\n");
+    commit_file(&repo, "z.rs", "z1\nz2\nz3\n");
+    std::fs::write(root.join("a.rs"), "a1\nA_CHANGED\na3\n").unwrap();
+    std::fs::write(root.join("z.rs"), "z1\nZ_CHANGED\nz3\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+
+    // Sit on the change in the *second* file — everything above it is about to move.
+    let before = patch_text(&mut ws, patch.buffer_id).await;
+    let line_of = |text: &str, want: &str| {
+        text.lines()
+            .position(|l| l == want)
+            .unwrap_or_else(|| panic!("no line {want:?} in:\n{text}")) as u32
+    };
+    set_cursor(&mut ws, patch.buffer_id, line_of(&before, "Z_CHANGED"), 0).await;
+
+    // Grow the first file's delta, pushing the second file's block further down the buffer.
+    std::fs::write(root.join("a.rs"), "a1\nA_CHANGED\nA_EXTRA\nA_MORE\na3\n").unwrap();
+    let after = patch_eventually(&mut ws, patch.buffer_id, "the wider first file", |t| {
+        t.contains("A_MORE")
+    })
+    .await;
+    assert_ne!(
+        line_of(&before, "Z_CHANGED"),
+        line_of(&after, "Z_CHANGED"),
+        "the test is vacuous unless the line actually moved"
+    );
+
+    // `Enter` still follows to the same place in the same file, which is the only thing the user
+    // can observe about where their cursor is.
+    let opened = send_request::<GitFollowPatchLine>(
+        &mut ws,
+        &GitFollowPatchLineParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await
+    .opened
+    .expect("the cursor is still on a patch line");
+    assert_eq!(
+        opened.path.as_deref(),
+        Some(root.join("z.rs").to_string_lossy().as_ref()),
+        "still reading the second file, not dragged into the first"
+    );
+    assert_eq!(opened.cursor.position.line, 1, "still on its changed line");
+
+    drop(server);
+}
+
+/// The summary caption's text, or `None` when the view has no diff to caption.
+async fn summary_caption(ws: &mut Ws, buffer_id: u64) -> Option<String> {
+    let window = window_of(ws, buffer_id).await;
+    window
+        .lines
+        .first()?
+        .virtual_rows_above
+        .iter()
+        .find(|r| r.kind == VirtualRowKind::Summary)
+        .map(|r| r.text.clone())
+}
+
+/// The view follows `Space Alt-i`, so it and the gutters of the files in it can never disagree
+/// about what "changed" means. A pinned revision widens it to everything since that commit —
+/// including work already committed, which is the whole reason to set one.
+#[tokio::test]
+async fn the_working_changes_view_follows_a_pinned_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Two changes far apart, so neither lands in the other's context lines and "is it in the
+    // view" is a question about the diff rather than about hunk padding.
+    let base: String = (1..=40).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    let committed = base.replace("fn f5() {}\n", "fn COMMITTED() {}\n");
+    commit_file(&repo, "a.rs", &committed);
+    std::fs::write(
+        root.join("a.rs"),
+        committed.replace("fn f35() {}\n", "fn LOOSE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    };
+    let patch = show_buffer(&mut ws, &show).await;
+    let text = patch_text(&mut ws, patch.buffer_id).await;
+    assert!(text.contains("LOOSE"), "the uncommitted line:\n{text}");
+    assert!(
+        !text.contains("COMMITTED"),
+        "against HEAD, a committed line is not a change:\n{text}"
+    );
+
+    // Re-baseline onto the commit before HEAD. No re-show — the open view follows.
+    let set = set_baseline(&mut ws, &root, Some("HEAD~1")).await;
+    assert!(set.baseline.is_some(), "the baseline took");
+
+    let text = patch_text(&mut ws, patch.buffer_id).await;
+    assert!(
+        text.contains("COMMITTED") && text.contains("LOOSE"),
+        "everything since HEAD~1, committed or not:\n{text}"
+    );
+    let caption = summary_caption(&mut ws, patch.buffer_id)
+        .await
+        .expect("a caption");
+    assert!(
+        caption.contains("since HEAD~1"),
+        "the caption says what it is measured against: {caption:?}"
+    );
+    // The same token every other buffer in the repo shows — the patch buffer has no file to hang
+    // a GitBaseline off, so it would otherwise be the one buffer that couldn't say.
+    let status = window_of(&mut ws, patch.buffer_id)
+        .await
+        .git_status
+        .expect("the git cluster shows on a patch buffer");
+    assert_eq!(status.baseline.as_ref().map(baseline_label), Some("HEAD~1"));
+
+    // Back to the default, still without a re-show.
+    set_baseline(&mut ws, &root, None).await;
+    let text = patch_text(&mut ws, patch.buffer_id).await;
+    assert!(
+        !text.contains("COMMITTED"),
+        "the default is HEAD again:\n{text}"
+    );
+    let status = window_of(&mut ws, patch.buffer_id)
+        .await
+        .git_status
+        .expect("still of a repo");
+    assert!(
+        status.baseline.is_none(),
+        "and the token goes with it — the default is not a state to announce"
+    );
+
+    drop(server);
+}
+
+/// Under a pinned revision there is no index relationship to resolve against, so the whole change
+/// set reads as unstaged — the same rule the gutter follows, and the reason staging is refused.
+#[tokio::test]
+async fn a_pinned_baseline_leaves_the_view_with_no_staged_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn STAGED() {}\n"),
+    )
+    .unwrap();
+    {
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.write().unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "fn STAGED() {}").await,
+        DiffStage::Staged,
+        "the default baseline resolves the staged layer"
+    );
+
+    set_baseline(&mut ws, &root, Some("HEAD")).await;
+    assert_eq!(
+        stage_of(&mut ws, patch.buffer_id, "fn STAGED() {}").await,
+        DiffStage::Unstaged,
+        "under a pinned revision there is no index to be staged against"
+    );
+
+    // And staging from the view is refused for the same reason, rather than writing an index the
+    // diff on screen has nothing to say about.
+    let content = patch_text(&mut ws, patch.buffer_id).await;
+    let line = content
+        .lines()
+        .position(|l| l == "fn STAGED() {}")
+        .expect("the changed line") as u32;
+    set_cursor(&mut ws, patch.buffer_id, line, 0).await;
+    let applied = apply_hunk(&mut ws, patch.buffer_id, HunkAction::Stage).await;
+    assert_eq!(applied.status, ApplyHunkStatus::NotAgainstHead);
+
+    drop(server);
+}
+
+/// The saved-file baseline names each file's own content *on disk* — which is this view's
+/// right-hand side. There is nothing to compare, and saying so beats reporting a clean tree it
+/// never looked at.
+#[tokio::test]
+async fn the_saved_baseline_leaves_the_working_changes_view_with_nothing_to_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let show = GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target: ShowTarget::WorkingChanges,
+        focus_path: None,
+    };
+    let patch = show_buffer(&mut ws, &show).await;
+    assert!(patch_text(&mut ws, patch.buffer_id).await.contains("two"));
+
+    set_baseline_source(&mut ws, &root, Some(GitBaselineChoice::Saved)).await;
+    let text = patch_text(&mut ws, patch.buffer_id).await;
+    assert!(
+        text.contains("the diff baseline is each file's own content on disk"),
+        "it says why it is empty rather than claiming the tree is clean:\n{text}"
+    );
+
+    // Re-showing under that baseline hands back the same buffer, still saying so — the "mint
+    // nothing" rule below is only for a view that isn't open yet.
+    let again = show_buffer(&mut ws, &show).await;
+    assert_eq!(again.buffer_id, patch.buffer_id);
+    assert!(patch_text(&mut ws, patch.buffer_id)
+        .await
+        .contains("content on disk"));
+
+    drop(server);
+}
+
+/// With **no view open** there is no buffer to hold the explanation, so the empty answer carries the
+/// baseline instead and the client's toast names it. Without this the toast would report a clean
+/// tree — about a tree that is dirty, and empty only because of the baseline the user chose.
+#[tokio::test]
+async fn an_empty_answer_carries_the_baseline_that_made_it_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    set_baseline_source(&mut ws, &root, Some(GitBaselineChoice::Saved)).await;
+
+    let shown = send_request::<GitShow>(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(
+        shown.opened.is_none(),
+        "nothing to show, so nothing is minted — even though the tree is dirty"
+    );
+    assert_eq!(
+        shown.baseline.as_ref().map(baseline_label),
+        Some("saved"),
+        "and the answer says what made it empty, since there is no buffer to say it in"
+    );
+
+    // A clean tree under the *default* baseline sends no baseline: it is the one state that needs
+    // no explaining, and a token on every ordinary empty answer would be noise.
+    set_baseline_source(&mut ws, &root, None).await;
+    std::fs::write(root.join("a.rs"), "one\n").unwrap();
+    let shown = send_request::<GitShow>(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert!(shown.opened.is_none() && shown.baseline.is_none());
+
+    drop(server);
+}
+
+/// A dirty tree that has no changes *since the pinned revision* is empty for a reason the clean-tree
+/// wording would get wrong.
+#[tokio::test]
+async fn an_empty_pinned_baseline_says_which_revision_it_found_nothing_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\n");
+    std::fs::write(root.join("a.rs"), "one\ntwo\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+
+    // Commit the loose change, then baseline onto the commit that now holds it: the tree is dirty
+    // in no way that revision can see.
+    commit_file(&repo, "a.rs", "one\ntwo\n");
+    set_baseline(&mut ws, &root, Some("HEAD")).await;
+    let text = patch_text(&mut ws, patch.buffer_id).await;
+    assert_eq!(
+        text, "No changes since HEAD",
+        "named, not the clean-tree wording"
+    );
+
+    drop(server);
+}
+
 /// A patch buffer is *of* a repo without being a file in it, and the branch indicator is how the
 /// editor says a repository is active at all — so it has to survive opening the very view that is
 /// showing you that repo's diff. The buffer itself opens straight onto the diff: no metadata block,

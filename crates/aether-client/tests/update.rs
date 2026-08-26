@@ -4619,13 +4619,13 @@ fn changes_pickers_open_fresh_and_centre_on_the_cursor() {
     }
 }
 
-/// `Space g g` opens the branch picker, carrying the active buffer as the repo-resolution hint —
+/// `Space g b` opens the branch picker, carrying the active buffer as the repo-resolution hint —
 /// the same rule `git/prepare_commit` uses, so the client never needs to know repo ids.
 #[test]
-fn space_g_g_opens_the_branch_picker() {
+fn space_g_b_opens_the_branch_picker() {
     let mut s = session();
-    let fx = git_leader(&mut s, 'g');
-    let view = find_request(&fx, "picker/view").expect("Space g g opens a picker");
+    let fx = git_leader(&mut s, 'b');
+    let view = find_request(&fx, "picker/view").expect("Space g b opens a picker");
     assert_eq!(view["kind"], json!("git_branches"));
     assert_eq!(
         view["buffer_id"],
@@ -12249,8 +12249,8 @@ fn baseline_picker_enter_sets_the_baseline() {
 }
 
 /// A clean tree answers `git/show` with no buffer at all, and the client says so in a toast rather
-/// than landing on nothing. The one target that can answer this way is the working tree, so the
-/// wording names it.
+/// than landing on nothing. One line: there is a single fact here, and the title/detail split had
+/// the second line restating the first.
 #[test]
 fn a_clean_tree_toasts_instead_of_switching() {
     use aether_client::update::Event;
@@ -12258,13 +12258,53 @@ fn a_clean_tree_toasts_instead_of_switching() {
 
     let mut s = session();
     let before = s.buffer.buffer_id;
-    let fx = s.on_event(Event::Shown(Ok(GitShowResult { opened: None })));
+    let fx = s.on_event(Event::Shown(Ok(GitShowResult {
+        opened: None,
+        baseline: None,
+    })));
     let msg = toast_messages(&fx).join(" ");
-    assert!(msg.contains("No working changes"), "got {msg:?}");
+    assert!(msg.contains("Nothing to commit"), "got {msg:?}");
+    assert!(
+        !msg.contains("versus"),
+        "the default baseline is not a state to announce, got {msg:?}"
+    );
     assert_eq!(s.buffer.buffer_id, before, "nowhere to switch to");
     assert!(
         find_request(&fx, "viewport/subscribe").is_none(),
         "and nothing to subscribe to"
+    );
+}
+
+/// With a baseline pinned, the toast has to name it. "Nothing to commit" alone is only self-evident
+/// against the default: the tree can be thick with uncommitted work and still hold nothing *since
+/// `main`*, and under the saved-file baseline the view is empty by construction.
+#[test]
+fn an_empty_view_names_the_baseline_it_found_nothing_against() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitBaselineSource, GitShowResult};
+
+    let mut s = session();
+    let fx = s.on_event(Event::Shown(Ok(GitShowResult {
+        opened: None,
+        baseline: Some(GitBaselineSource::Rev {
+            label: "main".into(),
+            commit: "abc1234".into(),
+        }),
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("Nothing to commit (versus main)"),
+        "got {msg:?}"
+    );
+
+    let fx = s.on_event(Event::Shown(Ok(GitShowResult {
+        opened: None,
+        baseline: Some(GitBaselineSource::Saved),
+    })));
+    let msg = toast_messages(&fx).join(" ");
+    assert!(
+        msg.contains("Nothing to commit (versus the files on disk)"),
+        "the same words the set_baseline confirmation uses, got {msg:?}"
     );
 }
 

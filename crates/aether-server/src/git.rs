@@ -2589,7 +2589,8 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
     // which opens the working-changes view, where a leading blank line would be a cursor position
     // above everything.
     b.header_line("", &[]);
-    emit_summary(&mut b, &diff);
+    // A commit's diff is against its own parent; no baseline applies.
+    emit_summary(&mut b, &diff, None);
 
     crate::patch::render_diff(&repo, &diff, &mut b, false)?;
 
@@ -2610,47 +2611,100 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
 /// consistent choice. A staged-only view answers a different question ("what am I about to
 /// commit?") and would be a second source, not a competing design for this one.
 ///
-/// Regenerated on every open rather than followed live: the working tree moves under you, and a
-/// buffer that silently rewrote itself mid-read would be worse than one that is honestly a
-/// snapshot.
-pub fn show_working_changes(repo_path: &Path) -> Result<RevisionContent, String> {
+/// Cheap enough to run on every write under the repo, which is what an open view costs: the whole
+/// buffer is a picture of a tree that moves, so it is *followed live* rather than snapshotted —
+/// see `handlers::refresh_working_changes_views` for who calls this and when. Untracked files are
+/// absent, exactly as `git diff HEAD` has them; the changes picker is where a new file shows up.
+///
+/// `baseline` follows [`aether_protocol::git::GitSetBaseline`], so this view and the gutters of the
+/// files in it can never disagree about what "changed" means:
+///
+/// - **default** (`None`) — HEAD → working tree, with HEAD → index resolved as the staged layer.
+/// - **a pinned revision** — that commit → working tree, every line **unstaged**. There is no index
+///   relationship to an arbitrary commit, which is the same reason the gutter drops the
+///   distinction under one and staging is refused ([`ApplyHunkStatus::NotAgainstHead`]).
+/// - **the saved file** — nothing. That baseline names each file's own content *on disk*, which is
+///   this view's right-hand side; there is no comparison to make, and saying so beats reporting a
+///   clean tree it never looked at.
+pub fn show_working_changes(
+    repo_path: &Path,
+    baseline: Option<&GitBaselineSource>,
+) -> Result<RevisionContent, String> {
     let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
     let mut b = PatchBuilder::default();
-
-    // HEAD's tree, or the empty tree on an unborn branch so a first commit's worth of new files
-    // still shows as additions rather than as nothing at all.
-    let head_tree = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_commit().ok())
-        .and_then(|c| c.tree().ok());
-    let mut diff = repo
-        .diff_tree_to_workdir_with_index(head_tree.as_ref(), None)
-        .map_err(|e| e.message().to_string())?;
-    let _ = diff.find_similar(None);
 
     // No metadata block. A commit's header earns its lines — the message is the point of reading
     // one — but this view's were a title repeating the buffer's own label, the repo (now in that
     // label) and the branch (in the status bar's git cluster), and they cost the first four cursor
-    // positions in the buffer before anything you can act on.
-    if diff.deltas().len() == 0 {
-        // A clean tree says so in words, as buffer text rather than chrome: it is the only thing
-        // to show, and floating chrome over an empty buffer reads as a failure to render. Only an
-        // already-open view reaches this — `git/show` refuses to mint a buffer for a clean tree.
-        let text = "Nothing to commit — the working tree is clean";
+    // positions in the buffer before anything you can act on. What is left is one line, and only
+    // when there is no diff to show instead: as buffer text rather than chrome, because floating
+    // chrome over an empty buffer reads as a failure to render.
+    fn nothing_to_show(b: &mut PatchBuilder, text: &str) {
         b.header_line(text, &[(0, text.len(), META)]);
-    } else {
-        emit_summary(&mut b, &diff);
     }
 
-    crate::patch::render_diff(&repo, &diff, &mut b, true)?;
+    if matches!(baseline, Some(GitBaselineSource::Saved)) {
+        nothing_to_show(
+            &mut b,
+            "Nothing to show — the diff baseline is each file's own content on disk",
+        );
+        let (text, generated) = b.finish();
+        return Ok(RevisionContent {
+            title: "Working changes".to_string(),
+            text,
+            language: None,
+            generated: Some(generated),
+        });
+    }
+
+    // The left side: the pinned baseline's commit, else HEAD — and `None` on an unborn branch (or a
+    // pinned commit that has since been rewritten away), so a first commit's worth of files still
+    // shows as additions rather than as nothing at all. The same "no blob reads as wholly added"
+    // rule `load_baseline_content` follows for the gutter.
+    let label = match baseline {
+        Some(GitBaselineSource::Rev { label, .. }) => Some(label.as_str()),
+        _ => None,
+    };
+    let left_tree = match baseline {
+        // Through `revparse_single`, not `Oid::from_str`: a pinned commit is recorded *short*
+        // (see [`resolve_rev`]), which parses as a zero-padded OID that finds nothing. Same
+        // resolution [`rev_blob_bytes`] uses for the gutter's side of this.
+        Some(GitBaselineSource::Rev { commit, .. }) => repo
+            .revparse_single(commit)
+            .ok()
+            .and_then(|o| o.peel_to_commit().ok())
+            .and_then(|c| c.tree().ok()),
+        _ => repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .and_then(|c| c.tree().ok()),
+    };
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(left_tree.as_ref(), None)
+        .map_err(|e| e.message().to_string())?;
+    let _ = diff.find_similar(None);
+
+    if diff.deltas().len() == 0 {
+        match label {
+            Some(label) => nothing_to_show(&mut b, &format!("No changes since {label}")),
+            None => nothing_to_show(&mut b, "Nothing to commit — the working tree is clean"),
+        }
+    } else {
+        emit_summary(&mut b, &diff, label);
+    }
+
+    // Only the default baseline has a staged layer to resolve — see this function's own doc.
+    crate::patch::render_diff(&repo, &diff, &mut b, label.is_none())?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {
         // Which repo this is comes from the status bar's branch indicator, not from the label: the
         // branch is what says a repository is active in the editor at all. `git_show` appends the
         // repo's name here only when the workspace holds more than one, where two identical
-        // "Working changes" rows in the buffer list would name neither.
+        // "Working changes" rows in the buffer list would name neither. The *baseline* isn't here
+        // either, and for the same reason: the status bar already carries it, on this buffer as on
+        // every other one in the repo.
         title: "Working changes".to_string(),
         text,
         language: None,
@@ -2658,15 +2712,20 @@ pub fn show_working_changes(repo_path: &Path) -> Result<RevisionContent, String>
     })
 }
 
-/// The patch's opening caption — `N files changed  +A  −B`.
+/// The patch's opening caption — `N files changed  +A  −B`, plus `since <rev>` when the working
+/// changes are being measured against something other than HEAD.
 ///
 /// Chrome, so it holds no cursor position: nothing in it can be staged, followed or navigated to.
 /// The counts take the same green/red as a file separator's, which is what makes the number you
 /// scan for readable at a glance instead of a run of muted text.
 ///
+/// The baseline rides here rather than in the buffer's title because the caption is regenerated
+/// with the content and the title isn't — a caption can't be left saying `since main` after the
+/// baseline went back to the index.
+///
 /// No blank below it: the first file's rule follows immediately, and a gap there left the caption
 /// floating between the top of the buffer and the diff instead of sitting on it.
-fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>) {
+fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>, baseline_label: Option<&str>) {
     let Ok(stats) = diff.stats() else { return };
     let mut text = String::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -2684,6 +2743,11 @@ fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>) {
     let removed = format!("  −{}", stats.deletions());
     spans.push((text.len(), text.len() + removed.len(), REMOVED));
     text.push_str(&removed);
+    if let Some(label) = baseline_label {
+        let since = format!("  since {label}");
+        spans.push((text.len(), text.len() + since.len(), META));
+        text.push_str(&since);
+    }
 
     b.chrome(VirtualRowKind::Summary, text, &spans);
 }

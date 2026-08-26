@@ -1389,9 +1389,20 @@ pub struct GitShowResult {
     /// an error rather than an empty answer. Minting a buffer to say "nothing changed" spends the
     /// whole view on a header and no patch, so the emptiness is reported instead and the client
     /// says it in a toast. A working-changes buffer that is *already* open still regenerates —
-    /// leaving it on a pre-commit snapshot would make it quietly lie about the tree.
+    /// though by then it is rarely stale, since an open one is rebuilt by every write to the tree
+    /// it is showing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened: Option<crate::buffer::BufferOpenResult>,
+    /// What the emptiness was measured against — set only alongside `opened: None`, and only when
+    /// a baseline is pinned ([`GitSetBaseline`]).
+    ///
+    /// The toast is the only thing the user gets in that case, so it has to be able to name the
+    /// reason. "Nothing changed" is self-explanatory against the default and misleading against
+    /// anything else: under [`GitBaselineChoice::Saved`] the view is empty *because of the
+    /// baseline* — it names each file's own content on disk, which is what the view is comparing —
+    /// and a toast saying the tree is clean would be flatly wrong about a dirty one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GitBaselineSource>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1436,6 +1447,11 @@ pub enum ShowTarget {
     /// and a live parse tree, so it highlights exactly like its working-tree twin.
     File { rev: String, path: String },
     /// Everything not yet committed — `git diff HEAD`.
+    ///
+    /// The one target that is **live**: while a view of it is open, saving a file, staging a hunk,
+    /// or committing — in this editor or in a terminal — rebuilds it where it stands. A revision's
+    /// diff can be a snapshot because the revision is one; this is a picture of a moving thing, and
+    /// a stale picture of it is just wrong.
     ///
     /// **Composed**, not split into staged and unstaged. The inline diff view already composes
     /// HEAD→index→buffer and tags each line with its [`crate::viewport::DiffStage`], and
@@ -1626,7 +1642,7 @@ pub enum GitStashStatus {
 
 // ---- git/worktree_* -----------------------------------------------------------------------------
 
-/// One worktree of a repo family, as the `Space g g` picker lists them.
+/// One worktree of a repo family, as the `Space g b` picker lists them.
 ///
 /// Two identities, and they are not interchangeable: `path` is the [`RepoId`] — one worktree, its
 /// own HEAD and index — while `name` is the *admin id*, the directory under `.git/worktrees/`. The

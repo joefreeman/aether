@@ -22,6 +22,7 @@ pub use aether_markdown as markdown;
 pub mod path_editor;
 pub mod picker;
 pub mod read_layout;
+pub mod reveal;
 pub mod scrollbar;
 pub mod session;
 pub mod theme;

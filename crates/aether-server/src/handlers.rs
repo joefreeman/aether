@@ -2500,7 +2500,12 @@ pub async fn git_show(
     ctx: &mut ConnectionCtx,
     params: aether_protocol::git::GitShowParams,
 ) -> Result<aether_protocol::git::GitShowResult, RpcError> {
-    let opened = |open| aether_protocol::git::GitShowResult { opened: Some(open) };
+    // A buffer answers for itself: its own status carries the baseline, so the field beside it is
+    // for the answer that has no buffer.
+    let opened = |open| aether_protocol::git::GitShowResult {
+        opened: Some(open),
+        baseline: None,
+    };
     let client_id = ctx.client_id;
     let (target, workspace, sibling_repos) = {
         let s = state.lock().await;
@@ -2556,17 +2561,35 @@ pub async fn git_show(
 
     let workdir = std::path::PathBuf::from(&target.repo_id);
     let what = target.what.clone();
+    // The working-tree diff is measured against whatever `git/set_baseline` last set for this repo,
+    // so the view and the gutters of the files in it can't disagree. Read before the spawn, since
+    // the generation runs off the lock.
+    let baseline = baseline_choice(state, &workdir).await;
     // The repo-level status rides along with the generation, off the lock and out of one repo
     // open: the buffer has no file to hang a baseline off, but the status bar still has to say
     // which checkout is in front of you.
-    let (content, repo_status) = tokio::task::spawn_blocking(move || {
-        use aether_protocol::git::ShowTarget;
-        let content = match &what {
-            ShowTarget::Commit { rev } => crate::git::show_commit(&workdir, rev),
-            ShowTarget::File { rev, path } => crate::git::show_file(&workdir, rev, path),
-            ShowTarget::WorkingChanges => crate::git::show_working_changes(&workdir),
-        };
-        (content, crate::git::repo_status(&workdir))
+    let (content, repo_status) = tokio::task::spawn_blocking({
+        let baseline = baseline.clone();
+        move || {
+            use aether_protocol::git::ShowTarget;
+            let content = match &what {
+                ShowTarget::Commit { rev } => crate::git::show_commit(&workdir, rev),
+                ShowTarget::File { rev, path } => crate::git::show_file(&workdir, rev, path),
+                ShowTarget::WorkingChanges => {
+                    crate::git::show_working_changes(&workdir, baseline.as_ref())
+                }
+            };
+            (
+                content,
+                crate::git::repo_status(&workdir).map(|mut s| {
+                    // The one buffer whose entire content is measured against the baseline has to
+                    // carry the same status-bar token every ordinary buffer in the repo does — it
+                    // has no `GitBaseline` of its own to carry it.
+                    s.baseline = baseline;
+                    s
+                }),
+            )
+        }
     })
     .await
     .map_err(|e| RpcError::internal(format!("git show: {e}")))?;
@@ -2589,7 +2612,12 @@ pub async fn git_show(
         .as_ref()
         .is_some_and(|g| g.index.files.is_empty());
     if empty && existing.is_none() {
-        return Ok(aether_protocol::git::GitShowResult { opened: None });
+        // Carry the baseline: with no buffer to hold the explanation, the toast is the only place
+        // the user can be told that "nothing" was measured against something they chose.
+        return Ok(aether_protocol::git::GitShowResult {
+            opened: None,
+            baseline,
+        });
     }
 
     // A mutable target that's already open is rewritten in place — same buffer id, so viewports,
@@ -4004,6 +4032,7 @@ pub async fn git_commit(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    reconcile_working_changes(state, &workdir).await;
 
     if !output.success() {
         // git puts "nothing to commit" on stdout and hook failures on stderr; the user needs
@@ -4215,6 +4244,7 @@ pub async fn git_reset(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    reconcile_working_changes(state, &workdir).await;
 
     if !output.success() {
         let message = if output.stderr.trim().is_empty() {
@@ -4321,6 +4351,10 @@ pub async fn git_set_baseline(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    // The working-changes view is measured against the baseline too, so it moves with the gutters
+    // rather than waiting to be re-shown. Not in `buffers` above: that list is the *file* buffers
+    // whose diff was recomputed, and a patch buffer has no `GitBaseline` to be found by.
+    refresh_working_changes_views(state, &std::iter::once(workdir).collect()).await;
     Ok(GitSetBaselineResult { baseline, buffers })
 }
 
@@ -5566,6 +5600,7 @@ pub async fn git_refresh(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    reconcile_working_changes(state, &workdir).await;
     Ok(result)
 }
 
@@ -5742,6 +5777,7 @@ async fn run_tree_git(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    reconcile_working_changes(state, workdir).await;
 
     Ok(TreeRun {
         output,
@@ -6021,6 +6057,32 @@ pub async fn git_delete_branch(
         status: GitDeleteBranchStatus::Deleted,
         message: String::new(),
     })
+}
+
+/// The diff baseline in force for `workdir`, or `None` for the default (the index).
+///
+/// A one-line lock read, given a name because it is asked from the paths that generate a
+/// working-changes view — all of which then do their work *off* the lock, and none of which should
+/// be reaching into `git_baseline_choices` by hand at the point of use.
+async fn baseline_choice(
+    state: &SharedState,
+    workdir: &std::path::Path,
+) -> Option<GitBaselineSource> {
+    state
+        .lock()
+        .await
+        .git_baseline_choices
+        .get(workdir)
+        .cloned()
+}
+
+/// The companion to [`reconcile_repo`], run once its lock is released.
+///
+/// That pass brings the repo's *file* buffers back in line with the tree it just moved; this does
+/// the same for the buffer whose entire content is a picture of that tree. Separate rather than
+/// folded in because the rebuild needs a `git diff`, which has no business under the state lock.
+async fn reconcile_working_changes(state: &SharedState, workdir: &std::path::Path) {
+    refresh_working_changes_views(state, &std::iter::once(workdir.to_path_buf()).collect()).await;
 }
 
 /// The reconciliation pass itself, separated from the RPC so an editor-driven operation that has
@@ -7389,6 +7451,7 @@ async fn apply_deletion_via_patch(
     workdir: std::path::PathBuf,
     rel: String,
 ) -> Result<GitApplyHunkResult, RpcError> {
+    let repo = workdir.clone();
     let status =
         tokio::task::spawn_blocking(move || crate::git::apply_deletion(&workdir, &rel, action))
             .await
@@ -7397,7 +7460,7 @@ async fn apply_deletion_via_patch(
     // Same rebuild as the ordinary patch-view apply: the text doesn't move (the file is gone
     // either way), but its stage tag does.
     if matches!(status, ApplyHunkStatus::Staged | ApplyHunkStatus::Unstaged) {
-        regenerate_patch_buffer(state, patch_buffer).await;
+        refresh_working_changes_views(state, &std::iter::once(repo).collect()).await;
     }
     Ok(patch_outcome(state, client_id, patch_buffer, status).await)
 }
@@ -7461,33 +7524,113 @@ async fn apply_hunk_via_patch(
     ))
     .await?;
 
-    // The patch's *text* is unchanged — staging doesn't move HEAD — but its stage tags are, so it
-    // has to be rebuilt for the change to be visible at all.
-    if matches!(
-        applied.status,
-        ApplyHunkStatus::Staged | ApplyHunkStatus::Unstaged | ApplyHunkStatus::Reverted
-    ) {
-        regenerate_patch_buffer(state, patch_buffer).await;
-    }
-
+    // The rebuild this patch needs — its text is unchanged (staging doesn't move HEAD) but its
+    // stage tags are — already happened inside the delegated call: an index write refreshes every
+    // working-changes view of the repo, and this buffer is one of them.
+    //
     // Report against the patch buffer the user is actually looking at, not the file we borrowed.
     Ok(patch_outcome(state, client_id, patch_buffer, applied.status).await)
 }
 
+/// Where a cursor sat in a patch, in terms a *rebuilt* patch can still find.
+///
+/// Buffer lines don't survive a rebuild — every change above the cursor moves them — so a live view
+/// that re-seated by line number would slide the reader around whenever an unrelated file was
+/// saved. The file and the source line within it do survive, and they are what the user was
+/// actually looking at.
+struct PatchAnchor {
+    /// Repo-relative path, from whichever side the cursor's line belongs to.
+    path: String,
+    /// The line number on that side, 1-based as libgit2 reports it. `None` on chrome and on a
+    /// placeholder line, which pin to the file and nothing finer.
+    lineno: Option<u32>,
+    /// Which side, so a `-` line doesn't re-seat onto the `+` line that replaced it.
+    side: Option<PatchLine>,
+    col: u32,
+}
+
+/// Read a client's cursor as a [`PatchAnchor`]. `None` when it sits on chrome that belongs to no
+/// file — the metadata block, the closing message — which has nothing to anchor to.
+fn patch_anchor(
+    generated: &crate::patch::GeneratedPatch,
+    cursor: CursorState,
+) -> Option<PatchAnchor> {
+    let line = cursor.position.line;
+    let info = (*generated.index.lines.get(line as usize)?)?;
+    let file = generated.index.files.get(info.file as usize)?;
+    let (path, lineno) = match info.side {
+        Some(PatchLine::Removed) => (file.old_path.as_ref(), info.old_lineno),
+        _ => (file.new_path.as_ref(), info.new_lineno),
+    };
+    Some(PatchAnchor {
+        // A deletion has no new path and an addition no old one; either way the file has one of
+        // the two, and that is the name it is listed under.
+        path: path
+            .or(file.new_path.as_ref())
+            .or(file.old_path.as_ref())?
+            .clone(),
+        lineno,
+        side: info.side,
+        col: cursor.position.col,
+    })
+}
+
+/// Find the buffer line the anchor names in a freshly generated patch: the same source line of the
+/// same file, else the nearest surviving line of it, else the file's first line. `None` once the
+/// file has no changes left at all — the caller falls back to clamping.
+fn reseat_patch_anchor(
+    generated: &crate::patch::GeneratedPatch,
+    anchor: &PatchAnchor,
+) -> Option<u32> {
+    let idx = generated.index.files.iter().position(|f| {
+        f.new_path.as_deref() == Some(anchor.path.as_str())
+            || f.old_path.as_deref() == Some(anchor.path.as_str())
+    })?;
+    let file = &generated.index.files[idx];
+    let Some(want) = anchor.lineno else {
+        return Some(file.start_line);
+    };
+    let mut best: Option<(u32, u32)> = None;
+    for line in file.start_line..file.end_line {
+        let Some(Some(info)) = generated.index.lines.get(line as usize).copied() else {
+            continue;
+        };
+        let got = match anchor.side {
+            Some(PatchLine::Removed) => info.old_lineno,
+            _ => info.new_lineno,
+        };
+        let Some(got) = got else { continue };
+        let distance = got.abs_diff(want);
+        if best.is_none_or(|(d, _)| distance < d) {
+            best = Some((distance, line));
+        }
+    }
+    Some(best.map_or(file.start_line, |(_, line)| line))
+}
+
 /// Rebuild a working-changes buffer in place and push the new content to whoever is viewing it.
+///
+/// A no-op when the rebuilt patch is the same one — which is most of the time, since this runs off
+/// every write under the repo. Both halves of "the same" are checked: the text covers content
+/// changes, and the stage tags cover staging, which moves nothing else.
 async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
-    let workdir = {
+    let (workdir, baseline) = {
         let s = state.lock().await;
-        match s
+        let Some(source) = s
             .try_doc_of(buffer_id)
             .and_then(|d| d.virtual_source.as_ref())
-        {
-            Some(source) => std::path::PathBuf::from(&source.target.repo_id),
-            None => return,
-        }
+        else {
+            return;
+        };
+        let workdir = std::path::PathBuf::from(&source.target.repo_id);
+        let baseline = s.git_baseline_choices.get(&workdir).cloned();
+        (workdir, baseline)
     };
-    let Ok(content) =
-        tokio::task::spawn_blocking(move || crate::git::show_working_changes(&workdir)).await
+    let Ok(content) = tokio::task::spawn_blocking({
+        let baseline = baseline.clone();
+        move || crate::git::show_working_changes(&workdir, baseline.as_ref())
+    })
+    .await
     else {
         return;
     };
@@ -7498,9 +7641,72 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
         let Some(doc_id) = s.buffers.get(&buffer_id).map(|b| b.document) else {
             return;
         };
+        let Some(doc) = s.documents.get(&doc_id) else {
+            return;
+        };
+        let unchanged = doc.text == content.text
+            && doc.generated.as_ref().map(|g| &g.decorations.stage)
+                == content.generated.as_ref().map(|g| &g.decorations.stage);
+        // The baseline is the third thing that can move. It usually moves the text with it, but not
+        // always — re-baselining onto `HEAD` with nothing staged produces the identical patch — and
+        // the status bar's token has to follow either way.
+        let baseline_moved =
+            s.virtual_git_status.get(&buffer_id).map(|st| &st.baseline) != Some(&baseline);
+        if unchanged && !baseline_moved {
+            return;
+        }
+        if let Some(status) = s.virtual_git_status.get_mut(&buffer_id) {
+            status.baseline = baseline;
+        }
+        let Some(doc) = s.documents.get(&doc_id) else {
+            return;
+        };
+        // Read every viewer's place *before* the swap, in the coordinates the old patch used.
+        // A selection is left to the clamp below: re-seating one endpoint of a range across a
+        // rebuild would mean something the user didn't select.
+        let anchors: Vec<(ClientId, PatchAnchor)> = s
+            .cursors
+            .iter()
+            .filter(|((_, b), cur)| *b == buffer_id && cur.is_point())
+            .filter_map(|((c, _), cur)| {
+                let anchor = doc.generated.as_ref().and_then(|g| patch_anchor(g, *cur))?;
+                Some((*c, anchor))
+            })
+            .collect();
+
         if let Some(doc) = s.documents.get_mut(&doc_id) {
             doc.replace_generated(&content.text, content.generated);
         }
+        for (client, anchor) in anchors {
+            let Some(line) = s
+                .doc_of(buffer_id)
+                .generated
+                .as_ref()
+                .and_then(|g| reseat_patch_anchor(g, &anchor))
+            else {
+                continue; // the file has no changes left; the clamp below decides
+            };
+            let position = motion::clamp_position(
+                s.doc_of(buffer_id),
+                LogicalPosition {
+                    line,
+                    col: anchor.col,
+                },
+            );
+            set_cursor(
+                &mut s,
+                (client, buffer_id),
+                CursorState {
+                    position,
+                    anchor: position,
+                    match_bracket: None,
+                    jumplist_position: None,
+                },
+            );
+        }
+        // Everything not re-seated above — selections, viewers of a sibling buffer on the same
+        // document, a cursor whose file is gone from the diff — still has to land inside the new
+        // text.
         clamp_doc_cursors(&mut s, buffer_id);
         let line_count = s.doc_of(buffer_id).line_count();
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id, line_count);
@@ -7514,6 +7720,58 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
     };
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
+    }
+}
+
+/// The repos that currently have a working-changes view open, by workdir.
+///
+/// Nearly always empty, which is what makes [`refresh_working_changes_views`] free to call from
+/// every path that moves a tree: with no view open there is nothing to rebuild and no diff to run.
+pub(crate) fn working_changes_repos(
+    s: &ServerState,
+) -> std::collections::HashSet<std::path::PathBuf> {
+    s.buffers
+        .keys()
+        .filter_map(|id| s.try_doc_of(*id).and_then(|d| d.virtual_source.as_ref()))
+        .filter(|v| v.target.what == aether_protocol::git::ShowTarget::WorkingChanges)
+        .map(|v| std::path::PathBuf::from(&v.target.repo_id))
+        .collect()
+}
+
+/// Rebuild every open working-changes view of one of `workdirs` and push the result.
+///
+/// The working tree is the one [`aether_protocol::git::ShowTarget`] that *moves*, so a view of it
+/// is live rather than a snapshot: a saved file, a stage, a commit — in the editor or in a terminal
+/// — all change what the view is *of*, and a patch left on the old answer quietly lies about the
+/// tree. Every path that moves a tree funnels through here rather than growing a rebuild of its
+/// own, and the ones that don't move anything the view can see cost a hash lookup.
+pub(crate) async fn refresh_working_changes_views(
+    state: &SharedState,
+    workdirs: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    if workdirs.is_empty() {
+        return;
+    }
+    let views: Vec<BufferId> = {
+        let s = state.lock().await;
+        let mut seen: std::collections::HashSet<crate::state::DocumentId> =
+            std::collections::HashSet::new();
+        s.buffers
+            .iter()
+            .filter(|(id, buf)| {
+                seen.insert(buf.document)
+                    && s.try_doc_of(**id)
+                        .and_then(|d| d.virtual_source.as_ref())
+                        .is_some_and(|v| {
+                            v.target.what == aether_protocol::git::ShowTarget::WorkingChanges
+                                && workdirs.contains(&std::path::PathBuf::from(&v.target.repo_id))
+                        })
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in views {
+        regenerate_patch_buffer(state, id).await;
     }
 }
 
@@ -7783,6 +8041,11 @@ pub async fn git_apply_hunk(
             for (sender, notif) in pushes {
                 let _ = sender.send(notif).await;
             }
+            // The index moved, so any working-changes view of this repo is now showing the wrong
+            // stage tags. This is the single site for it: staging *from* that view delegates here
+            // for the file it resolved, so the view is rebuilt whichever end the key was pressed
+            // at — and a view open in another shell or workspace follows too.
+            refresh_working_changes_views(state, &std::iter::once(repo.workdir).collect()).await;
             Ok(result)
         }
         HunkAction::Revert => {
@@ -9088,14 +9351,20 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
     };
     let Some(path) = buf.canonical_path.clone() else {
         // A `git/show` view has no file, but its repo-level status can still go stale — a checkout
-        // in a terminal moves the branch its status bar is showing. Its *content* is honestly a
-        // snapshot and stays one; the branch is not part of that snapshot.
+        // in a terminal moves the branch its status bar is showing. Only the branch is refreshed
+        // here: a revision's content really is a snapshot, and the working tree's is rebuilt by
+        // [`refresh_working_changes_views`], which needs a `git diff` and so can't run under this
+        // lock.
         if let Some(workdir) = buf
             .virtual_source
             .as_ref()
             .map(|v| std::path::PathBuf::from(&v.target.repo_id))
         {
-            if let Some(status) = crate::git::repo_status(&workdir) {
+            if let Some(mut status) = crate::git::repo_status(&workdir) {
+                // A pathless buffer has no `GitBaseline` to carry the baseline token, so it is
+                // read straight from the repo's choice — the same one the view's content is
+                // generated against.
+                status.baseline = s.git_baseline_choices.get(&workdir).cloned();
                 s.virtual_git_status.insert(buffer_id, status);
                 let revision = s.doc_of(buffer_id).revision;
                 return collect_doc_lines_changed_pushes(s, buffer_id, revision);
@@ -10871,8 +11140,8 @@ pub async fn buffer_save(
 ) -> Result<BufferSaveResult, RpcError> {
     let _client_id = ctx.client_id;
     {
-        // A virtual buffer has no file behind it and its content is a snapshot of something
-        // already immutable — including via save-as, which would only make a copy nobody asked
+        // A virtual buffer has no file behind it, and its content is generated from the repo
+        // rather than owned — including via save-as, which would only make a copy nobody asked
         // the editor for.
         let s = state.lock().await;
         if s.try_doc_of(params.buffer_id)

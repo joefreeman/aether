@@ -131,7 +131,7 @@ pub enum PickerKind {
     /// `FileAt`); `Ctrl-j` *re-captures* the currently-filtered subset, narrowing the list in
     /// place.
     Jumplist,
-    /// The local branches **and worktrees** of one repo (`Space g g`), fuzzy-matched on branch
+    /// The local branches **and worktrees** of one repo (`Space g b`), fuzzy-matched on branch
     /// name, checked-out branches first then most-recently-committed. The repo is resolved
     /// server-side from [`PickerViewParams::buffer_id`] by the same rule `git/prepare_commit` uses,
     /// so a single-repo workspace never sees a chooser.
