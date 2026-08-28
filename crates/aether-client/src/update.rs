@@ -6052,15 +6052,22 @@ impl Session {
     /// integration eventually sends. `path` is absolute — the OS resolved it.
     ///
     /// Deliberately the same path as the `Space Alt-w` overlay's commit, so a file arriving from the
-    /// desktop behaves exactly like one the user typed: a real (non-transient) buffer, its workspace
-    /// context resolved server-side, and a fresh ephemeral context when no workspace is active —
-    /// which is the case when the launch landed on the boot chooser.
+    /// desktop behaves exactly like one the user typed: a real (non-transient) buffer, with its
+    /// workspace context resolved server-side (the workspace that owns the path, or a temporary
+    /// context for a file outside every one).
+    ///
+    /// Closes whatever overlay was up first. That is nearly always the **boot chooser**: the
+    /// document and the connection race, and the shell can only park the document while it is still
+    /// dialing — win that race and the chooser is already open by the time the file arrives, leaving
+    /// a workspace picker sitting over the document the user asked for. Naming a file answers the
+    /// question the chooser is asking, so it dismisses rather than layers.
     ///
     /// Not [`Self::open_path_at`]: that opens a *transient preview* for result-style navigation
     /// (picker rows, goto-definition), which would evaporate the moment the buffer was hidden. A
     /// file someone deliberately opened from their file manager is not a preview.
     pub fn open_path_from_os(&mut self, path: String) -> Effects {
-        self.commit_open_path(path)
+        let fx = self.close_picker();
+        fx.and(self.commit_open_path(path))
     }
 
     /// Submit the open-from-path overlay: open `path` (absolute, or a leading `~/`) via
@@ -11402,6 +11409,9 @@ mod tests {
         s.prompt = Some(Prompt::OpenPath(Box::new(
             crate::path_editor::PathEditor::absolute("half-typed".into(), true),
         )));
+        // The boot chooser, which an "Open With" launch races: naming a file answers the question
+        // the workspace picker is asking, so it must not be left sitting over the document.
+        s.picker = Some(crate::picker::PickerState::new(PickerKind::Workspaces));
 
         let fx = s.open_path_from_os("/elsewhere/notes.md".into());
         let params =
@@ -11419,6 +11429,10 @@ mod tests {
         // The OS only hands us files that exist; a create here would mint buffers for typos.
         assert_eq!(params["create_if_missing"], serde_json::json!(false));
         assert!(s.prompt.is_none(), "the overlay gives way to the new file");
+        assert!(
+            s.picker.is_none(),
+            "the boot chooser gives way to the new file too"
+        );
     }
 
     #[test]

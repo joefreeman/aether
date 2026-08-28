@@ -1234,19 +1234,57 @@ pub async fn workspace_create(
     })
 }
 
+/// Whether this client is parked in a workspace. Its own lock, taken before the resolution block
+/// below, because the answer decides whether to run [`workspace_activate`] — which takes the lock
+/// itself and must not be called from inside one.
+async fn client_has_workspace(state: &SharedState, client_id: ClientId) -> bool {
+    state
+        .lock()
+        .await
+        .clients
+        .get(&client_id)
+        .is_some_and(|c| c.active_workspace.is_some())
+}
+
+/// The configured workspace that owns `path`, when exactly one does. `None` for a path outside every
+/// workspace (the temporary-context case) and for one that several claim with equal specificity —
+/// a file handed over by the desktop has nobody to ask, and a temporary context is a better answer
+/// than an error.
+///
+/// The rule itself is [`crate::config::infer_workspace_for_path_in`], shared with `aether-ae`'s
+/// `resolve_workspace` — which the desktop open routes never reach, since Finder passes the document
+/// by Apple event rather than in argv. Only the reading of an ambiguous answer differs between the
+/// two; see [`crate::config::WorkspaceMatch`].
+///
+/// Reads the workspace TOMLs, so it runs outside the state lock (like `activate_context`'s cold
+/// load) and via `workspaces_dir` rather than the profile default, so tests see their own tempdir.
+async fn inferred_workspace(state: &SharedState, path: &std::path::Path) -> Option<String> {
+    let dir = state.lock().await.workspaces_dir().ok()?;
+    match crate::config::infer_workspace_for_path_in(&dir, path) {
+        Ok(crate::config::WorkspaceMatch::One(name)) => Some(name),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not infer a workspace for an open-from-path");
+            None
+        }
+    }
+}
+
 /// Open a path, resolving the workspace context (see [`WorkspaceOpenPath`]). Powers `ae PATH`, the
 /// open-from-path overlay, and goto-definition into a file outside the active workspace. Internal
 /// when the active workspace's roots contain the path; external when a workspace is active but
-/// doesn't; an ephemeral workspace (activated here) when none is active.
+/// doesn't; a workspace inferred from the path — or, failing that, an ephemeral one — when none is.
 ///
 /// A **directory** is a context rather than a thing to open (`ae ~/notes`): it roots the temporary
 /// workspace at itself and lands on the landing buffer — a fresh transient scratch for a brand new
 /// context — over which the client opens its explorer. Only a temporary context can take one; a
 /// persisted workspace owns its roots, so a directory there is an error.
 ///
-/// With no workspace active we **join** a temporary context that already claims the path before
-/// minting a new one ([`ServerState::ephemeral_workspace_for`]), so two clients opening the same
-/// external path share a buffer instead of holding rival ones over the same document.
+/// With no workspace active, a file the configured workspaces contain opens in the one that owns it
+/// ([`crate::config::infer_workspace_for_path_in`], the rule `ae PATH` applies client-side). Failing
+/// that we **join** a temporary context that already claims the path before minting a new one
+/// ([`ServerState::ephemeral_workspace_for`]), so two clients opening the same external path share a
+/// buffer instead of holding rival ones over the same document.
 pub async fn workspace_open_path(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1308,10 +1346,45 @@ pub async fn workspace_open_path(
         canonical.parent().unwrap_or(&canonical).to_path_buf()
     };
 
+    // With **no workspace active at all**, a file inside a configured workspace opens *there*
+    // rather than in a throwaway temporary context. Same rule `ae PATH` applies before it ever
+    // connects, and for the opens that never pass through the CLI at all — macOS "Open With"
+    // delivering `application:openURLs:`, a drop on the Dock icon — this is the only place it can
+    // run, so a client that booted into the chooser used to land every such file in "(workspace 1)".
+    //
+    // Deliberately *only* when nothing is active. Once the client is somewhere, that is the answer:
+    // an explicit open attaches to the workspace you are in (as a guest, if external) rather than
+    // re-homing the file into some other workspace that happens to contain it.
+    //
+    // Directories keep their own rule (a temporary context rooted at the directory) — a persisted
+    // workspace has no file here to open and refuses a directory outright, so inferring one would
+    // turn `ae ~/some/repo/subdir`-shaped opens into an error.
+    if !directory && !client_has_workspace(state, client_id).await {
+        if let Some(name) = inferred_workspace(state, &canonical).await {
+            tracing::info!(%client_id, workspace = %name, path = %canonical.display(), "open-from-path inferred a configured workspace");
+            // `open_last: false` — this open has its own buffer to land on, resolved below.
+            let activated = workspace_activate(
+                state,
+                ctx,
+                WorkspaceActivateParams {
+                    name: name.clone(),
+                    // Unset, not empty: enter the context this workspace was last used in, the same
+                    // "come back where I was" rule a launch with no `--worktree` gets.
+                    worktrees: None,
+                    open_last: false,
+                },
+            )
+            .await;
+            // Inference is an *improvement* on the temporary context, never a precondition for the
+            // open. A workspace whose TOML lists a root that has since gone (so activation refuses
+            // it) must not take the file down with it — fall through and open it the old way.
+            if let Err(e) = activated {
+                tracing::warn!(workspace = %name, error = %e.message, "inferred workspace would not activate; opening in a temporary context");
+            }
+        }
+    }
+
     // Resolve the workspace this open lands in, activating an ephemeral one if the client has none.
-    // We never re-home the file into some *other* configured workspace that happens to contain it —
-    // an explicit open attaches to the active workspace (as a guest, if external) or to a fresh
-    // ephemeral context.
     let (
         workspace_id,
         workspace_paths,

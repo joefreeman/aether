@@ -410,13 +410,6 @@ fn detach(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn detach(_cmd: &mut std::process::Command) {}
 
-/// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: a path
-/// inside exactly one workspace opens there; a path inside *several* is an error the user must
-/// disambiguate. A path inside *no* configured workspace is no longer an error — we return `None`,
-/// and the client opens it in an ephemeral "(no workspace)" context: a file in a buffer
-/// (`ae /etc/hosts`), a directory as that context's root (`ae ~/notes`). With no PATH at all, we
-/// return `None` so a bare `ae` opens the workspace picker — the working directory is deliberately
-/// *not* used to guess a workspace (it only resolves relative file paths).
 /// Split a positional path of the form `PATH[:LINE[:COL]]` into the bare path and an optional 0-based
 /// `(line, col)` jump. The editor convention (`ae src/main.rs:42:10`): `LINE`/`COL` are 1-based as
 /// typed and returned 0-based (what the protocol uses). Because a filename may legitimately contain a
@@ -445,6 +438,20 @@ fn split_path_and_jump(arg: &str) -> (String, Option<(u32, u32)>) {
     }
 }
 
+/// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: a path
+/// inside exactly one workspace opens there; a path inside *several* is an error the user must
+/// disambiguate. A path inside *no* configured workspace is no longer an error — we return `None`,
+/// and the client opens it in an ephemeral "(no workspace)" context: a file in a buffer
+/// (`ae /etc/hosts`), a directory as that context's root (`ae ~/notes`). With no PATH at all, we
+/// return `None` so a bare `ae` opens the workspace picker — the working directory is deliberately
+/// *not* used to guess a workspace (it only resolves relative file paths).
+///
+/// Runs **here**, before the launcher has connected to anything, because two of its consumers can't
+/// wait for a server: `--web` needs the name to build the URL it hands the browser (and in the
+/// pure-launcher case never connects at all), and a directory launch needs it to decide whether to
+/// raise the explorer over a workspace or root a temporary context at the directory. The server
+/// applies the same rule for the opens that never pass through here at all — see
+/// [`aether_server::WorkspaceMatch`] for why the two read `Ambiguous` differently.
 fn resolve_workspace(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     use aether_server::WorkspaceMatch;
 
@@ -453,7 +460,8 @@ fn resolve_workspace(edit: &EditArgs) -> anyhow::Result<Option<String>> {
     }
 
     if let Some(path) = &edit.path {
-        return match aether_server::infer_workspace_for_path(std::path::Path::new(path))? {
+        let dir = aether_server::workspaces_dir()?;
+        return match aether_server::infer_workspace_for_path_in(&dir, std::path::Path::new(path))? {
             WorkspaceMatch::One(name) => Ok(Some(name)),
             // Outside every workspace: open workspace-lessly (the client falls back to open-from-path).
             WorkspaceMatch::None => Ok(None),

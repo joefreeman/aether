@@ -609,15 +609,12 @@ impl std::fmt::Display for LoadWorkspaceError {
     }
 }
 
-pub fn load_workspace(name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError> {
-    let dir = workspaces_dir()
-        .map_err(|e| LoadWorkspaceError::Invalid(format!("resolving config path: {e}")))?;
-    load_workspace_in(&dir, name)
-}
-
-/// Directory-parameterized core of [`load_workspace`]. Callers that hold a `ServerState` resolve
-/// the directory through it (`ServerState::workspaces_dir`), so a test can point the whole
-/// workspace store at a tempdir instead of the developer's own configured workspaces.
+/// Read one workspace's definition from `dir`. Every caller holds either a `ServerState` (which
+/// resolves the directory through `ServerState::workspaces_dir`, so a test can point the whole
+/// workspace store at a tempdir instead of the developer's own configured workspaces) or the
+/// profile's real directory via [`workspaces_dir`] — there is deliberately no
+/// resolve-the-directory-for-you wrapper, because taking it would be how a server-side caller
+/// silently bypasses the redirect.
 pub fn load_workspace_in(dir: &Path, name: &str) -> Result<WorkspaceConfig, LoadWorkspaceError> {
     let path = workspace_config_path_in(dir, name);
     let content = match std::fs::read_to_string(&path) {
@@ -1196,15 +1193,11 @@ pub fn workspaces_dir() -> anyhow::Result<PathBuf> {
     Ok(profile_config_dir()?.join("workspaces"))
 }
 
-/// Enumerate the configured workspace names by scanning `*.toml` files in `workspaces_dir`. The
-/// file *name* (without extension) is the workspace name; the body carries only `paths`.
-/// Returns an empty list (not an error) when the directory doesn't exist yet — a fresh
-/// install with no workspaces configured shouldn't be a server-side fatal.
-pub fn list_workspace_names() -> anyhow::Result<Vec<String>> {
-    list_workspace_names_in(&workspaces_dir()?)
-}
-
-/// Directory-parameterized core of [`list_workspace_names`]. See [`load_workspace_in`].
+/// Enumerate the configured workspace names by scanning `*.toml` files in `dir`. The file *name*
+/// (without extension) is the workspace name; the body carries only `roots`. Returns an empty list
+/// (not an error) when the directory doesn't exist yet — a fresh install with no workspaces
+/// configured shouldn't be a server-side fatal. See [`load_workspace_in`] on why the directory is a
+/// parameter rather than resolved here.
 pub fn list_workspace_names_in(dir: &Path) -> anyhow::Result<Vec<String>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -1230,6 +1223,21 @@ pub fn list_workspace_names_in(dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// Outcome of inferring which configured workspace owns a given path.
+///
+/// The **whole** answer, deliberately — [`infer_workspace_for_path_in`] decides which workspace
+/// owns a path and nothing else, leaving what to do about `None`/`Ambiguous` to the caller, because
+/// the two callers want opposite things and both are right:
+///
+/// - **`ae PATH`** (`aether-ae`'s `resolve_workspace`, before it has even connected) turns
+///   `Ambiguous` into a hard error naming the candidates, because there is a person at a terminal
+///   who can re-run with `--workspace NAME`.
+/// - **`workspace/open_path`** (`handlers::inferred_workspace`) treats it as no answer and falls
+///   back to a temporary context, because a file handed over by the desktop — macOS "Open With", a
+///   Dock drop — has nobody to ask, and refusing to open it would be the worse failure.
+///
+/// So: one matching rule, two policies. A third caller should pick one of those two readings rather
+/// than invent a third — and if it needs a *different* rule, that belongs in the matcher below where
+/// every caller gets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceMatch {
     /// Exactly one workspace (most-specific root wins) owns the path.
@@ -1274,17 +1282,24 @@ pub fn resolve_path_for_match(path: &Path) -> PathBuf {
     }
 }
 
-/// Infer which configured workspace owns `path` by matching it against every workspace's canonical
-/// roots. The path is resolved (and made absolute) first. Most-specific match wins: the workspace
-/// with the deepest containing root is chosen, so a workspace rooted inside another doesn't collide
-/// with its parent. A genuine tie at the deepest root is reported as [`WorkspaceMatch::Ambiguous`].
-pub fn infer_workspace_for_path(path: &Path) -> anyhow::Result<WorkspaceMatch> {
+/// Infer which configured workspace in `dir` owns `path` by matching it against every workspace's
+/// canonical roots. The path is resolved (and made absolute) first. Most-specific match wins: the
+/// workspace with the deepest containing root is chosen, so a workspace rooted inside another
+/// doesn't collide with its parent. A genuine tie at the deepest root is [`WorkspaceMatch::Ambiguous`];
+/// see that type for the two ways callers read this answer.
+///
+/// **The only inference entry point**, in-process and out. `dir` is a parameter and not resolved
+/// here for the reason given on [`load_workspace_in`]: a running server must read its workspaces
+/// through `ServerState::workspaces_dir` (redirectable by a test), and a convenience wrapper that
+/// resolved the profile directory itself would be the thing a server-side caller reached for by
+/// mistake. `aether-ae` runs outside the server and passes [`workspaces_dir`] explicitly.
+pub fn infer_workspace_for_path_in(dir: &Path, path: &Path) -> anyhow::Result<WorkspaceMatch> {
     let target = resolve_path_for_match(path);
     let mut workspaces: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    for name in list_workspace_names()? {
+    for name in list_workspace_names_in(dir)? {
         // Skip workspaces whose config won't load — one stale config shouldn't break inference for
         // everything else.
-        let Ok(config) = load_workspace(&name) else {
+        let Ok(config) = load_workspace_in(dir, &name) else {
             continue;
         };
         let roots = config

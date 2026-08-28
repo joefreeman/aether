@@ -2084,6 +2084,11 @@ async fn buffer_reload_clean_buffer_does_not_require_force() {
 
 /// A workspace rooted at one dir, plus a file in a *different* dir outside it. Returns the server, a
 /// connected (un-activated) socket, and the external file's canonical absolute path.
+///
+/// The workspace store is redirected at an **empty** tempdir. "Outside every configured workspace"
+/// is the precondition of every test below, and open-from-path now answers it by reading the store
+/// (`infer_workspace_for_path_in`) — left at the default that would be the developer's own
+/// `~/.config/aether/workspaces`, making the section's results depend on the machine it ran on.
 async fn setup_with_external_file() -> (aether_server::ServerHandle, Ws, String) {
     let proj_dir = tempfile::tempdir().unwrap();
     std::fs::write(proj_dir.path().join("inside.rs"), "fn inside() {}\n").unwrap();
@@ -2094,12 +2099,124 @@ async fn setup_with_external_file() -> (aether_server::ServerHandle, Ws, String)
         .unwrap()
         .display()
         .to_string();
+    let store = tempfile::tempdir().unwrap();
     let proj_path = proj_dir.path().to_path_buf();
     let mut server = spawn_for_test("test-proj", vec![proj_path]).await.unwrap();
+    server.state.lock().await.workspaces_dir = Some(store.path().to_path_buf());
     server.keep_alive(proj_dir);
     server.keep_alive(ext_dir);
+    server.keep_alive(store);
     let ws = Ws::connect(&server).await;
     (server, ws, ext_abs)
+}
+
+/// A desktop open (macOS "Open With", a drop on the Dock icon) of a file a **configured workspace
+/// owns**, by a client that has activated nothing — it booted onto the chooser, because Finder
+/// passes the document by Apple event rather than in `argv`, so there was no CLI path to infer a
+/// workspace from. The open has to infer it here instead: landing in a temporary "(workspace N)"
+/// context would give the file no roots, no language server and no Git.
+#[tokio::test]
+async fn open_path_with_no_workspace_infers_the_workspace_that_owns_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("workspaces");
+    let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("owned.rs"), "fn owned() {}\n").unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    // The workspace as it exists *on disk* — the only form inference can see. Registering it in
+    // memory as well (`spawn_for_test`) is what the activation then takes the hot path through.
+    std::fs::write(
+        store.join("owner.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+
+    let mut server = spawn_for_test("owner", vec![root.clone()]).await.unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    server.keep_alive(dir);
+
+    // Deliberately no `workspace/activate`: this is the chooser-boot client.
+    let mut ws = Ws::connect(&server).await;
+    let file = root.join("owned.rs").display().to_string();
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: file.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        opened.workspace.name, "owner",
+        "the workspace whose roots contain the file, not a temporary context"
+    );
+    assert_eq!(
+        opened.workspace.paths,
+        vec![root.display().to_string()],
+        "and it arrives with the workspace's real roots"
+    );
+    let buf = opened.opened.expect("open_path returns the opened buffer");
+    assert_eq!(buf.path.as_deref(), Some(file.as_str()));
+    drop(server);
+}
+
+/// The other half of the inference rule: it only applies to a client with **nothing** active. Once
+/// you are in a workspace, an explicit open attaches there — as a guest for a file another workspace
+/// owns — rather than yanking you across into that other workspace.
+#[tokio::test]
+async fn open_path_keeps_the_active_workspace_over_the_one_that_owns_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("workspaces");
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let (here, owner) = (base.join("here"), base.join("owner"));
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(owner.join("owned.rs"), "fn owned() {}\n").unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("owner.toml"),
+        format!("[[roots]]\npath = {:?}\n", owner.display().to_string()),
+    )
+    .unwrap();
+
+    let mut server = spawn_for_test_multi(vec![
+        ("here".to_string(), vec![here.clone()]),
+        ("owner".to_string(), vec![owner.clone()]),
+    ])
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    server.keep_alive(dir);
+
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "here".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: owner.join("owned.rs").display().to_string(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        opened.workspace.name, "here",
+        "an open from inside a workspace stays in it"
+    );
+    drop(server);
 }
 
 /// Names of the rows in the workspace switcher (Workspaces picker, empty query).

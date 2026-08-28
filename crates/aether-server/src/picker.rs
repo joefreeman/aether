@@ -44,7 +44,7 @@ pub struct BufferCandidate {
 }
 
 /// One workspace-picker candidate. Built fresh per `picker/view` from
-/// `config::list_workspace_names` — the configured-workspaces set changes only via the user
+/// `config::list_workspace_names_in` — the configured-workspaces set changes only via the user
 /// editing `~/.config/aether/workspaces/*.toml` and we re-list on each open anyway.
 #[derive(Debug, Clone)]
 pub struct WorkspaceCandidate {

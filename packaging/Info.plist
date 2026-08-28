@@ -47,13 +47,31 @@
       all and Finder never lists it under "Open With" — the "can't open text files from Finder"
       symptom.
 
+      Launch Services matches a file's UTI against these **by conformance**, so one umbrella type
+      does the work of a list: `public.text` is what every textual system type descends from
+      (`public.plain-text` → `public.source-code` → `public.python-script`, and sideways to
+      `public.html`, `public.xml`, `public.json`, `public.yaml`). Enumerating the leaves instead is
+      how the first attempt at this file ended up covering .py and .json but not .rs — see the
+      imported types below for the other half of that gap.
+
       Two tiers, both `Editor` (we edit what we open, we don't just view it):
       - Text and source, ranked `Alternate`: offered in "Open With", but not claiming to be the
         system default for anything — an editor that quietly steals every .txt and .json on
         install is a bad guest.
-      - `public.data` / `public.item`, ranked `None`: never offered or suggested, but selectable
-        via "Open With ▸ Other…" for any file at all. That's the CLI editor's contract — `ae` will
-        happily open a file whatever its extension, and Finder shouldn't be stricter.
+      - `public.data` + `public.item`, ranked `None`: never offered or suggested, but still declared,
+        which is what lets any file at all be dropped on the Dock icon or picked through
+        "Open With ▸ Other…". That's the CLI editor's contract — `ae` will happily open a file
+        whatever its extension, and Finder shouldn't be stricter.
+
+        Both entries are load-bearing, measured on macOS rather than reasoned about:
+        - `public.item` is what accepts a **folder** drop. A folder is `public.folder` →
+          `public.directory` → `public.item` and never conforms to `public.data`, so with
+          `public.data` alone `LSCanURLAcceptURL` says no and `ae ~/some/dir` loses its Dock route.
+        - Ranking them `None` does **not** suppress Aether from "Recommended Applications" for the
+          types the `Alternate` dict claims. A/B'd on a real bundle: the recommended lists for .rs,
+          .py, .txt and .json are identical with and without this dict, while .png stays excluded
+          either way. Launch Services resolves rank per claim, and the more specific conformance
+          match wins — so the catch-all buys Dock drops at no cost to the offered list.
 
       Declaring the types only gets Aether *listed*. Finder passes the chosen file by Apple event
       (`application:openURLs:`), never in argv — the delegate that receives it lives in
@@ -71,15 +89,19 @@
             <string>Alternate</string>
             <key>LSItemContentTypes</key>
             <array>
-                <string>public.plain-text</string>
-                <string>public.utf8-plain-text</string>
-                <string>public.source-code</string>
-                <string>public.script</string>
-                <string>public.shell-script</string>
-                <string>public.xml</string>
-                <string>public.json</string>
-                <string>public.yaml</string>
+                <string>public.text</string>
                 <string>net.daringfireball.markdown</string>
+                <string>uk.joef.aether.source-code</string>
+                <string>uk.joef.aether.plain-text-config</string>
+                <!--
+                  TypeScript. macOS types `.ts` (and `.mts`) as an MPEG-2 transport stream — a real
+                  system declaration, which a type of ours could not outrank — so the only way to be
+                  offered for TypeScript source is to claim the video type. The cost is Aether
+                  appearing in "Open With" for the rare actual transport stream; `Alternate` means it
+                  is never the *default* for one, and a dev machine has far more .ts source than
+                  broadcast captures.
+                -->
+                <string>public.mpeg-2-transport-stream</string>
             </array>
         </dict>
         <dict>
@@ -94,6 +116,98 @@
                 <string>public.data</string>
                 <string>public.item</string>
             </array>
+        </dict>
+    </array>
+    <!--
+      The extensions macOS has never heard of. An unrecognised extension gets a *dynamic* UTI
+      (`dyn.ah62d4rv4ge81g6xy`) that conforms to nothing above `public.data`, so `public.text` above
+      cannot reach it however broad it is: a .rs file is, as far as Launch Services is concerned,
+      an anonymous blob, and the only declaration of ours that matches is the rank-`None` catch-all.
+      That is the "Aether isn't in Recommended Applications for source files" symptom, and importing
+      a type for those extensions is the documented fix — it gives them a real UTI that conforms to
+      `public.source-code`, which the tier above already claims.
+
+      Confirmed on macOS, not inferred: a probe bundle that declared an imported UTI for `.rs` made
+      stock Aether appear for `.rs` immediately, with no change to Aether's own plist. The dynamic
+      UTI was the entire blocker, and importing a type is what removes it.
+
+      *Imported*, not exported: we are recognising types other people define, not defining them.
+      Deliberately no `UTTypeIconFile` on either — the declaration exists to get Aether *offered*,
+      and repainting every .rs file on the machine with our icon is not what was asked for.
+
+      The alternative, if the type-identity cost ever bites: a document-type dict carrying
+      `CFBundleTypeExtensions` instead of `LSItemContentTypes` claims extensions without declaring
+      a type at all, so nothing system-wide changes. It is the deprecated key, but shipping editors
+      still rely on it. We take the ownership because an imported declaration is the documented,
+      verified mechanism, and the only thing it actually changes for a .rs file is its Finder "Kind"
+      string — no icon, and `Alternate` still keeps us from becoming anyone's default.
+
+      Lowercase `uk.joef.aether.*`, unlike `CFBundleIdentifier` above. UTIs are case-insensitive, so
+      the capitalisation would not matter, but every system type is lowercase and `mdls` echoes them
+      back lowercased either way — matching that keeps "what we declared" and "what the tools print"
+      the same string when diagnosing a registration.
+
+      The source list is exactly the extensions Aether has a tree-sitter grammar for, minus the ones
+      macOS already types (.py, .js, .css, .sh, .json, .yml, .html, .md — all reached by conformance
+      above). Keeping the two in step is the rule: a new grammar whose extension macOS doesn't know
+      belongs here too, or Finder won't offer to open it.
+    -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>uk.joef.aether.source-code</string>
+            <key>UTTypeDescription</key>
+            <string>Source Code</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.source-code</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>rs</string>
+                    <string>toml</string>
+                    <string>go</string>
+                    <string>ex</string>
+                    <string>exs</string>
+                    <string>erl</string>
+                    <string>hrl</string>
+                    <string>jsx</string>
+                    <string>tsx</string>
+                    <string>mjs</string>
+                    <string>cjs</string>
+                    <string>sql</string>
+                    <string>tf</string>
+                    <string>tfvars</string>
+                    <string>hcl</string>
+                    <string>dockerfile</string>
+                    <string>containerfile</string>
+                    <string>qv</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>uk.joef.aether.plain-text-config</string>
+            <key>UTTypeDescription</key>
+            <string>Configuration Text</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.plain-text</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>conf</string>
+                    <string>cfg</string>
+                    <string>ini</string>
+                    <string>env</string>
+                    <string>properties</string>
+                </array>
+            </dict>
         </dict>
     </array>
 </dict>
