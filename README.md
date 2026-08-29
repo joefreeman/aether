@@ -11,8 +11,8 @@ A modal text editor with a client–server architecture for Linux and macOS. Nat
 - Selection-first motions, sneak, surround, transforms, motion undo/redo
 - Tree-sitter integration (highlighting, indentation, selection expand/contract)
 - LSP support (diagnostics, hover, go-to-definition, references, document/workspace symbols, formatting)
-- Git integration (gutter, inline diff, blame, hunk staging)
-- Markdown rendering
+- Git integration (gutter, inline diff, blame, hunk staging, remotes, commit, branch switching, worktrees, history, stashes)
+- Markdown reader mode
 - Fuzzy pickers (files, buffers, symbols, diagnostics, git changes), workspace grep
 - File explorer, cross-file jump history, workspace switching
 - Native, terminal and web clients with consistent keymaps and behaviour
@@ -92,8 +92,9 @@ at the cursor.
 | `n`/`Alt-n` | Next/previous match |
 | `Esc` | Clear the active search |
 
-`Alt-c`/`Alt-w`/`Alt-e` toggle case sensitivity, whole-word and regex matching from the prompt.
-`Up`/`Down` recall earlier queries — here and in every other overlay input (grep, globs, paths).
+`Alt-c`/`Alt-w`/`Alt-e` toggle case sensitivity, whole-word and regex matching from the prompt, and
+`Alt-Backspace` drops the query's last word. `Up`/`Down` recall earlier queries — here and in every
+other overlay input (grep, globs, paths).
 
 ### Editing (Ctrl — shared by normal and insert)
 
@@ -116,6 +117,7 @@ identical in both.
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo/redo | Undo/redo |
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
+| `Ctrl-Alt-j`/`Ctrl-Alt-k` | Move paragraph down/up | Move paragraph down/up |
 | `Ctrl-g` | Join lines | Join lines |
 | `Ctrl-Alt-g` | Un-join lines (cursor stays before the break) | Line break at caret, caret stays |
 | `Ctrl-a`/`Ctrl-Alt-a` | Increment/decrement number | Increment/decrement number |
@@ -124,7 +126,8 @@ identical in both.
 | `Ctrl-o`/`Ctrl-Alt-o` | Open line below/above | Open line below/above |
 
 In insert mode, `Tab` indents to the next tab stop and `Backspace` steps back to the previous one,
-both following the file's own indent style.
+both following the file's own indent style. `Alt-←`/`Alt-→` move by word, and
+`Alt-Backspace`/`Alt-Delete` delete the word before/after the caret.
 
 ### Mode transitions
 
@@ -147,13 +150,16 @@ toggling back lands where you were reading.
 | `l`/`h` | Focus next/previous link in the block |
 | `o`/`Alt-o` | Next/previous heading |
 | `g`/`Alt-g` | First/last element |
+| `z`/`Alt-z` | Undo/redo the reading-position move |
 | `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
 | `Ctrl-Enter` | Follow a relative link in a new window |
 | `Tab` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
 | `r`/`Alt-r` | Reverse the selection / orient it forward |
+| `%`/`,` | Select every block / collapse the selection to the cursor's block |
 | `Ctrl-c` | Copy the selection, the link URL, or the element's Markdown source |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo / redo |
+| `Ctrl-a`/`Ctrl-Alt-a` | Check / uncheck the focused task item |
 | `i`/`a` | Edit: insert at block/selection start / end |
 | `Ctrl-e` | Edit: rewrite the selected block(s) |
 | `Ctrl-o`/`Ctrl-Alt-o` | Edit: open a new block below / above — a list item inside a list, a paragraph elsewhere |
@@ -173,12 +179,12 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space /`/`Space Alt-/` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
-| `Space j` | Jumplist (`Ctrl-j` in any picker captures its results into it) |
+| `Space j`/`Space Alt-j` | Jumplist (`Ctrl-j` in any picker captures its results into it) / clear it |
 | `Space p`/`Space Alt-p` | Copy relative/absolute path |
 | `Space s`/`Space Alt-s` | Save / save as |
 | `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
 | `Space x`/`Space Alt-x` | Close buffer / save and close it |
-| `Space z` | Open another window |
+| `Space z`/`Space Alt-z` | Open another window / copy this buffer's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save current buffer and quit |
@@ -186,25 +192,31 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 
 ### Git
 
-Navigation and reveals sit on the plain leader, beside their diagnostics counterparts; the
-operations live behind the `Space g` sub-leader.
+Navigation, reveals and views sit on the plain leader, beside their diagnostics counterparts; the
+operations live behind the `Space g` sub-leader. There, a plain/Alt pair names one verb at two
+scopes — plain takes the change under the cursor (or the selected lines), Alt the whole file.
 
 | Chord | Action |
 | --- | --- |
 | `c`/`Alt-c` | Next/previous change (hunk) |
 | `Space c`/`Space Alt-c` | Git changes in current file / across the workspace (hunks) |
 | `Space m` | Blame commit details for the cursor line |
-| `Space g s`/`Space g Alt-s` | Stage-unstage / revert the change under the cursor (or selected lines) |
-| `Space g a`/`Space g Alt-a` | Stage-unstage / revert the whole file |
-| `Space g l`/`Space g Alt-l` | History / this file's history |
+| `Space i`/`Space Alt-i` | Toggle inline diff / choose what it diffs against |
+| `Space g s`/`Space g Alt-s` | Stage the change / the whole file (also marks a conflict resolved) |
+| `Space g u`/`Space g Alt-u` | Unstage the change / the whole file |
+| `Space g r`/`Space g Alt-r` | Revert the change / the whole file |
+| `Space g <`/`Space g >`/`Space g =` | Resolve a conflict: keep the top (`<<<<<<<`), the bottom (`>>>>>>>`), or both sections |
 | `Space g c`/`Space g Alt-c` | Commit staged changes / amend the previous commit |
-| `Space g u` | Uncommit (keep the changes staged) |
-| `Space g b` | Branches: switch, create, delete |
-| `Space g f`/`Space g Alt-f` | Fetch / pull from the remote |
-| `Space g p` | Push commits to the remote |
+| `Space g z` | Uncommit (keep the changes staged) |
+| `Space g w` | Working changes — everything uncommitted, as one patch |
+| `Space g l`/`Space g Alt-l` | History / this file's history |
+| `Space g b` | Branches and worktrees |
+| `Space g f` | Fetch from the remote |
+| `Space g p`/`Space g Alt-p` | Pull from / push to the remote |
 | `Space g x` | Stop the fetch, push or pull in progress |
-| `Space g z`/`Space g Alt-z` | Stashes (preview, pop, apply, drop) / stash the working tree |
-| `Space g d` | Toggle inline diff |
+| `Space g t`/`Space g Alt-t` | Stash the working tree / just the staged changes |
+| `Space g a` | Stashes (preview, pop, apply, drop) |
+| `Space g d` | Abandon a stopped merge or rebase (asks first) |
 
 ### Code / LSP
 
