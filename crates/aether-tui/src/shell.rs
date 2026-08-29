@@ -412,9 +412,24 @@ fn now_unix_ms() -> u64 {
 }
 
 impl Shell {
-    /// The text viewport's grid: full width, terminal rows minus the status row.
+    /// Columns available for buffer *text*: the terminal width less the change-bar gutter
+    /// [`ui::GUTTER_WIDTH`] that `prepend_gutter` puts in front of every rendered line.
+    ///
+    /// Distinct from `AppState::viewport_cols`, which is the full terminal width — that one sizes
+    /// the overlays (hover, app-info, picker box), which are painted over the whole screen and
+    /// know nothing about the gutter.
+    fn text_cols(&self) -> u32 {
+        crate::ui::text_cols(self.term.0) as u32
+    }
+
+    /// The text viewport's grid: [`Self::text_cols`] by terminal rows minus the status row.
+    ///
+    /// The width is the gutter-reduced one because this is what the server wraps to — sending the
+    /// full terminal width made it wrap one column wider than the renderer paints, clipping the
+    /// last cell of any row that filled the line. The other two shells already subtract their
+    /// gutter here (`aether-iced`'s `GUTTER_COLS`, the web shell's `GUTTER_COLS`).
     fn grid(&self) -> (u32, u32) {
-        (self.term.0 as u32, (self.term.1 as u32).saturating_sub(1))
+        (self.text_cols(), (self.term.1 as u32).saturating_sub(1))
     }
 
     fn visible_rows(&self) -> u32 {
@@ -1431,7 +1446,7 @@ impl Shell {
                         // Horizontal scroll only bites when soft wrap is off (wrapped text never
                         // overflows right). A `Half` unit pans half a screen; a line pans one col.
                         if self.session.wrap == WrapMode::None {
-                            let cols = self.state.viewport_cols as i64;
+                            let cols = self.text_cols() as i64;
                             let mag = match unit {
                                 ScrollUnit::Half => (cols / 2).max(1),
                                 _ => 1,
@@ -1711,7 +1726,7 @@ impl Shell {
             self.scroll_col = 0;
             return;
         }
-        let cols = self.state.viewport_cols;
+        let cols = self.text_cols();
         if cols == 0 {
             return;
         }

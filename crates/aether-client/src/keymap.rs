@@ -124,9 +124,17 @@ pub enum KeyContext {
     Normal,
     Insert,
     Search,
-    /// The markdown reading view. Read-only by construction: this table contains no editing action,
-    /// and the `Global` edit chords are not consulted in Read mode — the read-only invariant is the
-    /// table itself.
+    /// The markdown reading view.
+    ///
+    /// Editing here is **block-grain**: the table binds block delete / change / open / paste, block
+    /// depth, task toggle and undo/redo, all of which resolve against the markdown parse rather
+    /// than against lines. What it deliberately has no way to do is edit *characters* — `i`/`a`
+    /// leave the reading view for the source editor (`read_exit_for_edit`) rather than inserting
+    /// in place.
+    ///
+    /// That is also why `Global` is not consulted in Read mode: its edit chords are line-grain
+    /// (join, indent, move lines) and the reading view acts on blocks, so this table opts in
+    /// binding by binding instead of inheriting a keymap written for the editor.
     Read,
     Leader,
     /// The `Space g` sub-leader: git verbs and the repo-wide git pickers. A second table rather

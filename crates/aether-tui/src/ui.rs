@@ -39,6 +39,18 @@ pub const CONTINUATION_MARKER_WIDTH: u32 = 2;
 /// gutter in the reclaimed column.
 pub const GUTTER_WIDTH: u16 = 1;
 
+/// Columns left for buffer *text* in a content area `total` wide — everything the gutter doesn't
+/// take.
+///
+/// The one definition, shared by the renderer and by `Shell::grid` (which reports it to the server
+/// as the wrap width). It exists as a function rather than two `saturating_sub`s because those two
+/// sites had already drifted: the shell reported the full terminal width while the renderer painted
+/// into `width - GUTTER_WIDTH`, so the server wrapped one column wider than there was room for and
+/// a row that filled the line lost its last cell.
+pub fn text_cols(total: u16) -> u16 {
+    total.saturating_sub(GUTTER_WIDTH)
+}
+
 /// Display width of a tab character. Tabs render as spaces aligned to the next multiple of
 /// this — i.e. proper tab stops, not a fixed-width substitution. Hardcoded for v1; making it
 /// per-buffer (driven by `IndentStyle::Tab(width)`) is the obvious follow-up.
@@ -5232,7 +5244,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let viewport_rows = area.height as usize;
     // The leftmost `GUTTER_WIDTH` cols are the change-bar gutter; content fills the rest. The
     // server already wrapped to this reduced width (the client reports it as `cols`).
-    let viewport_cols = area.width.saturating_sub(GUTTER_WIDTH);
+    let viewport_cols = text_cols(area.width);
     let diff_view = state.ed().diff_view;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
