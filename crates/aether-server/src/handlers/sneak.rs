@@ -1,6 +1,7 @@
 //! `sneak/*` — the `s`/`S` word-jump: candidate collection, label assignment, and selection.
 
 use super::*;
+use aether_protocol::coords::ViewLine;
 
 /// `sneak/update` — set or refine the sneak query. Recomputes the matching word-starts within the
 /// named viewport's visible range, (re)assigns labels (keeping survivors' labels stable), stores
@@ -13,17 +14,21 @@ pub async fn sneak_update(
 ) -> Result<SneakUpdateResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
+    let buf = scope.doc();
     let key = (client_id, params.buffer_id);
 
-    // Scope to the client-reported visible range (clamped to the buffer). The viewport's own range
-    // carries a screen of overscan and the native clients pixel-scroll within it, so only the client
-    // knows what's actually on screen.
-    let line_count = buf.line_count();
-    let first = params.first_line.min(line_count);
-    let last_excl = params.last_line.min(line_count).max(first);
+    // Scope to the client-reported visible range, intersected with the focused element's window.
+    // The client's range says what is on screen — the viewport's own carries a screen of overscan
+    // and the native clients pixel-scroll within it — and the element says which of that the cursor
+    // may go to: a label on a line of the hunk *below* would jump into another element's lines
+    // without focus following, which is the one thing a jump must not do silently.
+    let first = params
+        .first_line
+        .clamp(scope.first_line(), scope.last_line());
+    let last_excl = params
+        .last_line
+        .clamp(first, scope.last_line().saturating_add(1));
 
     let raw = crate::sneak::compute_candidates(
         &buf.text,
@@ -454,51 +459,47 @@ pub fn collect_viewport_refresh(
         None => return pushes,
     };
     let revision = buf.revision;
-    let search_entry = render_matches(s, client_id, buffer_id);
-    let sneak_entry = s.sneaks.get(&(client_id, buffer_id));
-    let diagnostics = buffer_diagnostics(s, buffer_id);
     for vp in s.viewports.values() {
-        if vp.client_id != client_id || vp.buffer_id != buffer_id {
+        if vp.client_id != client_id || !vp.binds(buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let line_count = buf.line_count();
-        let new_first = vp.first_logical_line.min(line_count);
+        // The **view's** length, not the buffer's — see `build_lines_changed_notif`.
+        let view_lines = ViewLayout::of(&vp.elements, |id| s.doc_of(id).line_count()).line_count();
+        let new_first = vp.first_view_line.min(ViewLine(view_lines));
         let new_last_excl = vp
-            .last_logical_line_exclusive
-            .min(line_count)
+            .last_view_line_exclusive
+            .min(ViewLine(view_lines))
             .max(new_first);
         let window = render_window(
-            buf,
+            s,
+            client_id,
+            vp.view_id,
+            &vp.elements,
+            vp.focused,
             new_first,
             new_last_excl,
             vp.wrap_geometry(),
             vp.rows,
-            WindowDecorations {
-                search: search_entry,
-                sneak: sneak_entry,
-                diff_view: vp.diff_view,
-                hunks: buffer_both_hunks(s, buffer_id),
-                conflicts: buffer_conflicts(s, buffer_id),
-                diagnostics,
-                git_status: buffer_git_status(s, buffer_id),
-            },
+            vp.diff_view,
+            SneakLabels::Shown,
         );
         let params = ViewportLinesChangedParams {
             viewport_id: vp.id,
+            buffer: buffer_id,
             revision,
             range: LogicalLineRange {
-                start_logical_line: vp.first_logical_line,
-                end_logical_line_exclusive: vp.last_logical_line_exclusive,
+                start_view_line: vp.first_view_line,
+                end_view_line_exclusive: vp.last_view_line_exclusive,
             },
             total_visual_rows: window.total_visual_rows,
             first_visual_row: window.first_visual_row,
             max_line_width: window.max_line_width,
-            replacement_lines: window.lines,
-            line_count,
-            max_scroll_logical_line: window.max_scroll_logical_line,
+            root: window.root,
+            view_line_count: window.view_line_count,
+            max_scroll_view_line: window.max_scroll_view_line,
             git_status: window.git_status,
             cursor: lines_changed_cursor(s, vp),
         };
@@ -584,7 +585,7 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
         let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
         let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
         for vp in s.viewports.values() {
-            if vp.buffer_id == id {
+            if vp.shows(id) {
                 clients.insert(vp.client_id);
             }
         }
@@ -661,8 +662,13 @@ pub fn refresh_searches_for_buffer(s: &mut ServerState, buffer_id: BufferId) -> 
     for key in keys {
         let query = s.searches[&key].query.clone();
         let options = s.searches[&key].options;
-        let buf = s.doc_of(key.1);
-        let mut entry = match compute_search_entry(buf, &query, &options) {
+        // Per key, because the scope is per *client*: two clients on one buffer can have focus in
+        // different elements, and each one's matches are its own element's.
+        let Ok(scope) = s.motion_scope(key.0, key.1) else {
+            continue;
+        };
+        let buf = scope.doc();
+        let mut entry = match compute_search_entry(&scope, &query, &options) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -742,10 +748,10 @@ pub fn clients_affected_by_close(
     let mut out = Vec::new();
     for vp in s.viewports.values() {
         if vp.client_id != except
-            && targets.contains(&vp.buffer_id)
-            && seen.insert((vp.client_id, vp.buffer_id))
+            && targets.contains(&vp.buffer_id())
+            && seen.insert((vp.client_id, vp.buffer_id()))
         {
-            out.push((vp.client_id, vp.buffer_id));
+            out.push((vp.client_id, vp.buffer_id()));
         }
     }
     for (&client_id, session) in &s.clients {

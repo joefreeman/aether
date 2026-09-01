@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- cursor + input ----------------------------------------------------------------------------
@@ -333,7 +334,7 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
     let closed: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: second.buffer_id,
+            buffer_id: aether_protocol::ViewId(second.buffer_id),
             open_next: true,
         },
     )
@@ -346,7 +347,7 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
     let closed: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: first,
+            buffer_id: aether_protocol::ViewId(first),
             open_next: true,
         },
     )
@@ -383,7 +384,7 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
     send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             open_next: false,
         },
     )
@@ -448,7 +449,7 @@ async fn workspace_activate_lands_back_on_a_scratch_you_were_editing() {
     send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: scratch.buffer_id,
+            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
             open_next: false,
         },
     )
@@ -1508,12 +1509,12 @@ async fn input_text_inserts_and_pushes_notification() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1524,7 +1525,10 @@ async fn input_text_inserts_and_pushes_notification() {
         },
     )
     .await;
-    assert_eq!(sub.window.lines[0].visual_rows[0].segments[0].text, "abc");
+    assert_eq!(
+        sub.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
 
     // Move cursor to col 1 (between 'a' and 'b'), then insert "XY".
     send_request::<CursorSet>(
@@ -1555,7 +1559,7 @@ async fn input_text_inserts_and_pushes_notification() {
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.viewport_id, sub.viewport_id);
     assert_eq!(notif.revision, 1);
-    let first_line = &notif.replacement_lines[0];
+    let first_line = &notif.root.lines()[0];
     assert_eq!(first_line.visual_rows[0].segments[0].text, "aXYbc");
 
     drop(server);
@@ -1579,12 +1583,12 @@ async fn input_delete_backspace_removes_char_before_cursor() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1604,7 +1608,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "hell"
     );
 
@@ -1942,12 +1946,12 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -1959,7 +1963,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     )
     .await;
 
-    let line0 = &sub.window.lines[0];
+    let line0 = &sub.window.root.lines()[0];
     let segs = &line0.visual_rows[0].segments;
     let highlights = &segs[0].highlights;
     assert!(
@@ -2027,12 +2031,12 @@ async fn setup_deferred_parse_buffer() -> (
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2071,7 +2075,8 @@ async fn expect_lines_changed_where(
 /// restyle.
 async fn expect_highlighted_lines_changed(ws: &mut Ws) -> ViewportLinesChangedParams {
     expect_lines_changed_where(ws, "line 0 is highlighted", |push| {
-        push.replacement_lines
+        push.root
+            .lines()
             .first()
             .and_then(|l| l.visual_rows.first())
             .and_then(|r| r.segments.first())
@@ -2085,7 +2090,7 @@ async fn deferred_parse_restyles_the_viewport_when_it_lands() {
     let (server, mut ws, _buffer_id, sub) = setup_deferred_parse_buffer().await;
 
     // Over the threshold, the open returns before the parse: the first window is unhighlighted.
-    let first_segs = &sub.window.lines[0].visual_rows[0].segments;
+    let first_segs = &sub.window.root.lines()[0].visual_rows[0].segments;
     assert!(
         first_segs.iter().all(|s| s.highlights.is_empty()),
         "expected the pre-parse window to carry no highlight spans"
@@ -2097,7 +2102,7 @@ async fn deferred_parse_restyles_the_viewport_when_it_lands() {
         push.revision, 0,
         "content didn't change — revision rides through"
     );
-    let highlights = &push.replacement_lines[0].visual_rows[0].segments[0].highlights;
+    let highlights = &push.root.lines()[0].visual_rows[0].segments[0].highlights;
     let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
     assert!(
         fn_kw.is_some_and(|h| h.kind.contains("keyword")),
@@ -2135,7 +2140,7 @@ async fn deferred_parse_tracks_edits_landed_mid_parse() {
     );
     // Line 0 is now `struct Zz; fn f() ...` — the parse the highlights came from must have seen
     // the edited text, so `struct` (bytes 0..6) is tagged keyword.
-    let highlights = &push.replacement_lines[0].visual_rows[0].segments[0].highlights;
+    let highlights = &push.root.lines()[0].visual_rows[0].segments[0].highlights;
     let struct_kw = highlights.iter().find(|h| h.start == 0 && h.end == 6);
     assert!(
         struct_kw.is_some_and(|h| h.kind.contains("keyword")),
@@ -2200,12 +2205,12 @@ async fn setup_deferred_git_buffer(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2237,17 +2242,17 @@ async fn deferred_git_baseline_pushes_hunks_when_it_lands() {
     assert!(status.branch.is_some());
     // The gutter is the deferred half, and stays empty rather than claiming the file is all-new.
     assert!(
-        sub.window.lines[0].diff_marker.is_none(),
+        sub.window.root.lines()[0].change.marker().is_none(),
         "expected the pre-baseline window to carry no gutter markers"
     );
 
     // The background load lands and re-pushes the window with hunks and branch status.
     let push = expect_lines_changed_where(&mut ws, "git decorations arrived", |p| {
-        p.replacement_lines[0].diff_marker.is_some()
+        p.root.lines()[0].change.marker().is_some()
     })
     .await;
     assert_eq!(
-        push.replacement_lines[0].diff_marker,
+        push.root.lines()[0].change.marker(),
         Some(DiffMarker::Modified)
     );
     assert!(
@@ -2268,7 +2273,7 @@ async fn deferred_git_baseline_diffs_against_edits_landed_mid_load() {
     let (server, mut ws, buffer_id, sub) = setup_deferred_git_buffer(&committed, &committed).await;
     // Branch known already (identity isn't deferred); no gutter yet (content is).
     assert!(sub.window.git_status.is_some());
-    assert!(sub.window.lines[0].diff_marker.is_none());
+    assert!(sub.window.root.lines()[0].change.marker().is_none());
 
     let _edit: EditResult = send_request::<InputText>(
         &mut ws,
@@ -2283,11 +2288,11 @@ async fn deferred_git_baseline_diffs_against_edits_landed_mid_load() {
     .await;
 
     let push = expect_lines_changed_where(&mut ws, "the live edit's hunk arrived", |p| {
-        p.replacement_lines[0].diff_marker.is_some()
+        p.root.lines()[0].change.marker().is_some()
     })
     .await;
     assert_eq!(
-        push.replacement_lines[0].diff_marker,
+        push.root.lines()[0].change.marker(),
         Some(DiffMarker::Added),
         "line 0 is the inserted line — an Added hunk against the loaded baseline"
     );
@@ -2723,12 +2728,12 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2740,7 +2745,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     .await;
 
     // Logical line 3 is `fn main() {}` — must inherit rust highlights from the injection layer.
-    let fence_body = &sub.window.lines[3];
+    let fence_body = &sub.window.root.lines()[3];
     let segs = &fence_body.visual_rows[0].segments;
     let highlights: Vec<&aether_protocol::viewport::Highlight> =
         segs.iter().flat_map(|s| s.highlights.iter()).collect();
@@ -2792,12 +2797,12 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3125,12 +3130,12 @@ async fn cut_selection_deletes_and_returns_text() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3178,7 +3183,7 @@ async fn cut_selection_deletes_and_returns_text() {
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "alpha  gamma"
     );
     drop(server);
@@ -3200,12 +3205,12 @@ async fn input_text_with_select_pasted_makes_selection() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3251,12 +3256,12 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3297,10 +3302,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     assert_eq!(undo.revision, 0, "undo back to saved revision");
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "abc"
-    );
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
 
     // Redo: re-applies "XY", revision advances past saved.
     let redo: UndoResult = send_request::<EditRedo>(
@@ -3317,7 +3319,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "abcXY"
     );
 
@@ -3429,12 +3431,12 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3621,12 +3623,12 @@ async fn join_lines_deletes_break_and_indent() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3651,7 +3653,7 @@ async fn join_lines_deletes_break_and_indent() {
     // After join: "hello world\n" — the newline and line 1's leading whitespace are deleted,
     // nothing is inserted; line 0's own trailing space is kept and is the separator here.
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "hello world"
     );
     drop(server);
@@ -3794,12 +3796,12 @@ async fn unjoin_parked_cursor_agrees_across_push_and_response() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3885,12 +3887,12 @@ async fn input_text_with_selection_replaces_it() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3919,7 +3921,7 @@ async fn input_text_with_selection_replaces_it() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "alpha DELTA gamma"
     );
 
@@ -5011,12 +5013,12 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5054,12 +5056,12 @@ async fn visual_line_preserves_visual_column() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5124,12 +5126,12 @@ async fn visual_line_crosses_logical_line_boundary() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 20,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5181,12 +5183,12 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5232,12 +5234,12 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -5287,12 +5289,12 @@ async fn viewport_set_wrap_changes_visible_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5304,7 +5306,7 @@ async fn viewport_set_wrap_changes_visible_rows() {
     )
     .await;
     // Soft: line 0 wraps to 2 visual rows at cols=10.
-    assert_eq!(sub.window.lines[0].visual_rows.len(), 2);
+    assert_eq!(sub.window.root.lines()[0].visual_rows.len(), 2);
 
     let r: ViewportWindowResult = send_request::<ViewportSetWrap>(
         &mut ws,
@@ -5315,9 +5317,9 @@ async fn viewport_set_wrap_changes_visible_rows() {
     )
     .await;
     // None: one row, full line content.
-    assert_eq!(r.window.lines[0].visual_rows.len(), 1);
+    assert_eq!(r.window.root.lines()[0].visual_rows.len(), 1);
     assert_eq!(
-        r.window.lines[0].visual_rows[0].segments[0].text,
+        r.window.root.lines()[0].visual_rows[0].segments[0].text,
         "the quick brown fox"
     );
 
@@ -5336,12 +5338,12 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5410,12 +5412,12 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5479,12 +5481,12 @@ async fn virtual_col_cleared_by_horizontal_motion() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5560,12 +5562,12 @@ async fn virtual_col_cleared_by_mutation() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5643,12 +5645,12 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -5658,8 +5660,8 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
         },
     )
     .await;
-    assert_eq!(sub.window.lines[0].visual_rows.len(), 3);
-    let texts: Vec<&str> = sub.window.lines[0]
+    assert_eq!(sub.window.root.lines()[0].visual_rows.len(), 3);
+    let texts: Vec<&str> = sub.window.root.lines()[0]
         .visual_rows
         .iter()
         .map(|r| r.segments[0].text.as_str())
@@ -5864,6 +5866,1835 @@ async fn a_plain_motion_clears_the_expand_history() {
         tree_select(&mut ws, b, TreeSelectDirection::Contract, 1).await,
         after_move,
         "contract after an unrelated motion must not restore the pre-move selection"
+    );
+    drop(server);
+}
+
+// ---- element-local motion ----------------------------------------------------------------------
+
+/// A working-changes view over a long file, focused on its one hunk: the element windows a slice of
+/// a real file, so the lines above and below it are in the buffer but not in the view.
+///
+/// Returns `(server, ws, element buffer id, the element's line range, viewport id)`.
+async fn hunk_view(
+    dir: &std::path::Path,
+) -> (
+    aether_server::ServerHandle,
+    Ws,
+    u64,
+    std::ops::Range<u32>,
+    aether_protocol::ViewportId,
+) {
+    let root = dir.canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Distinctive letters far outside the hunk, so a motion that escapes lands somewhere the
+    // assertions can name: `Z` only on line 0, `Q` only on line 39.
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    lines[0] = "fn ZEBRA() {}".into();
+    lines[39] = "fn QUAGGA() {}".into();
+    let committed = format!("{}\n", lines.join("\n"));
+    commit_file(&repo, "a.rs", &committed);
+    lines[20] = "fn CHANGED() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // The extent comes from the window the server actually sent, not from arithmetic on the diff:
+    // the test is about staying inside whatever the view says the element is.
+    // From the element's *lines*, not from its `rows`: an element's height counts visual rows —
+    // wrapped rows and the phantom "deleted" rows above them — while an extent is a range of lines.
+    let extent = sub
+        .window
+        .root
+        .editors()
+        .iter()
+        .find_map(|n| match n {
+            aether_protocol::viewport::Element::Editor { lines, .. } if !lines.is_empty() => {
+                Some(lines[0].logical_line..lines[lines.len() - 1].logical_line + 1)
+            }
+            _ => None,
+        })
+        .expect("the patch has an editor element with lines");
+    assert!(
+        extent.start > 0 && extent.end < 40,
+        "the hunk must sit strictly inside the file for this to prove anything: {extent:?}"
+    );
+
+    // Focus that element — which is also how the client learns the buffer it windows.
+    let focused: aether_protocol::viewport::ViewportFocusElementResult =
+        send_request::<aether_protocol::viewport::ViewportFocusElement>(
+            &mut ws,
+            &aether_protocol::viewport::ViewportFocusElementParams {
+                viewport_id: sub.viewport_id,
+                target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+            },
+        )
+        .await;
+    (
+        server,
+        ws,
+        focused.buffer.buffer_id,
+        extent,
+        sub.viewport_id,
+    )
+}
+
+/// Every motion is element-local — not just the two whose handlers remembered to clamp.
+///
+/// A patch's element windows one hunk of a file. `j`/`k` stopped at its edges because `cursor/move`
+/// clamped its result by hand; `w` went through its own handler and never asked, and `f` was worse
+/// than unbounded — it scanned the whole file, found its char twenty lines outside the hunk, and the
+/// clamp pinned the line back while keeping the column it found down there. Now every motion
+/// resolves against the element's window, so none of them can see the text in the first place.
+#[tokio::test]
+async fn every_motion_stays_inside_the_focused_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+    let inside = |p: LogicalPosition| extent.contains(&p.line);
+
+    async fn mv(ws: &mut Ws, buffer_id: u64, motion: Motion) -> CursorState {
+        send_request::<CursorMove>(
+            ws,
+            &CursorMoveParams {
+                buffer_id,
+                motion,
+                extend_selection: false,
+            },
+        )
+        .await
+    }
+
+    // `G` and `gg` are the hunk's ends, not the file's.
+    let end = mv(&mut ws, buffer_id, Motion::BufferEnd).await;
+    assert_eq!(
+        end.position.line,
+        extent.end - 1,
+        "`G` lands on the hunk's last line, not the file's"
+    );
+    let start = mv(&mut ws, buffer_id, Motion::BufferStart).await;
+    assert_eq!(start.position.line, extent.start, "and `gg` on its first");
+
+    // `f` for a char that exists only outside the hunk finds nothing, so nothing moves.
+    for (ch, direction) in [('Q', Direction::Forward), ('Z', Direction::Backward)] {
+        let st = mv(
+            &mut ws,
+            buffer_id,
+            Motion::FindChar {
+                ch,
+                direction,
+                count: 1,
+                till: false,
+            },
+        )
+        .await;
+        assert_eq!(
+            st.position, start.position,
+            "`{ch}` is outside the hunk, so `f` must not move at all"
+        );
+    }
+
+    // Word motions run out of text at the edges rather than walking into the rest of the file.
+    for direction in [Direction::Forward, Direction::Backward] {
+        let st = mv(
+            &mut ws,
+            buffer_id,
+            Motion::Word {
+                direction,
+                count: 200,
+                boundary: WordBoundary::Word,
+            },
+        )
+        .await;
+        assert!(inside(st.position), "word motion left the hunk: {st:?}");
+    }
+
+    // `w` — select word — is a different RPC, and never had the old clamp at all.
+    let mut last = CursorState::default();
+    for _ in 0..40 {
+        last = send_request::<CursorSelectWord>(
+            &mut ws,
+            &CursorSelectWordParams {
+                buffer_id,
+                boundary: WordBoundary::Word,
+                extend: false,
+                count: 1,
+            },
+        )
+        .await;
+        assert!(
+            inside(last.position) && inside(last.anchor),
+            "`w` left the hunk: {last:?}"
+        );
+    }
+    assert_eq!(
+        last.position.line,
+        extent.end - 1,
+        "…and settles on its last line"
+    );
+
+    // `x` — select line — does its own line arithmetic and never went through the old clamp either.
+    let mut line_sel = CursorState::default();
+    for _ in 0..30 {
+        line_sel = send_request::<CursorSelectLine>(
+            &mut ws,
+            &CursorSelectLineParams {
+                buffer_id,
+                direction: Direction::Forward,
+                extend: false,
+                count: 1,
+            },
+        )
+        .await;
+        assert!(
+            inside(line_sel.position) && inside(line_sel.anchor),
+            "`x` left the hunk: {line_sel:?}"
+        );
+    }
+    assert_eq!(line_sel.position.line, extent.end - 1);
+
+    // `%` — select all — means the element, so it can't select the file's other thirty lines.
+    let all: CursorState =
+        send_request::<CursorSelectAll>(&mut ws, &CursorSelectAllParams { buffer_id }).await;
+    assert_eq!(all.anchor.line, extent.start);
+    assert_eq!(all.position.line, extent.end - 1);
+
+    drop(server);
+}
+
+/// `/` is scoped like a motion: it matches the focused element's text, so `n` cannot step the cursor
+/// onto a line the view doesn't show — and the count in the status bar is a count of what's there.
+#[tokio::test]
+async fn search_matches_only_the_focused_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+
+    // `fn ` is on all forty lines of the file, and on every line of the hunk.
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            buffer_id,
+            query: "fn ".into(),
+            options: Default::default(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        set.summary.total,
+        extent.len() as u32,
+        "the hunk's lines are the matches; the file's other thirty are not in view"
+    );
+
+    // Stepping can't leave the element either — thirty `n` presses over a handful of matches.
+    for _ in 0..30 {
+        let nav: SearchNavResult = send_request::<aether_protocol::search::SearchStep>(
+            &mut ws,
+            &aether_protocol::search::SearchStepParams {
+                buffer_id,
+                direction: Direction::Forward,
+                extend: false,
+                count: 1,
+                set_query: None,
+                options: Default::default(),
+            },
+        )
+        .await;
+        assert!(
+            extent.contains(&nav.cursor.position.line),
+            "`n` stepped outside the hunk: {:?}",
+            nav.cursor.position
+        );
+    }
+
+    drop(server);
+}
+
+/// `s` labels words in the focused element only.
+///
+/// Sneak scopes its candidates to the range the *client* says is on screen — which is the right
+/// question for overscan, and the wrong one for a view of several elements: a label on a line the
+/// cursor may not go to is an invitation to land there, and selecting it moved the cursor into
+/// another element's lines without focus following.
+#[tokio::test]
+async fn sneak_labels_only_the_focused_element() {
+    use aether_protocol::sneak::{
+        SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams, SneakUpdateResult,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, viewport_id) = hunk_view(dir.path()).await;
+
+    async fn update(
+        ws: &mut Ws,
+        buffer_id: u64,
+        viewport_id: aether_protocol::ViewportId,
+        query: &str,
+    ) -> SneakUpdateResult {
+        send_request::<SneakUpdate>(
+            ws,
+            &SneakUpdateParams {
+                buffer_id,
+                viewport_id,
+                query: query.into(),
+                // The whole file, as a client scrolled to the top of a long view would report.
+                first_line: 0,
+                last_line: 40,
+                big: false,
+            },
+        )
+        .await
+    }
+
+    // `QUAGGA` is on the file's last line, which this element doesn't window.
+    let outside: SneakUpdateResult = update(&mut ws, buffer_id, viewport_id, "QUAGGA").await;
+    assert_eq!(
+        outside.match_count, 0,
+        "a word outside the element is not a target"
+    );
+
+    // Words inside are still labelled, and jumping to one lands inside.
+    let inside: SneakUpdateResult = update(&mut ws, buffer_id, viewport_id, "line").await;
+    assert!(inside.match_count > 0, "the element's own words label");
+    assert!(
+        inside.match_count as usize <= extent.len(),
+        "at most one per line of the element: {}",
+        inside.match_count
+    );
+    let last = *inside.labels.last().expect("labelled candidates");
+    let jumped: CursorState = send_request::<SneakSelect>(
+        &mut ws,
+        &SneakSelectParams {
+            buffer_id,
+            label: last,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(
+        extent.contains(&jumped.position.line) && extent.contains(&jumped.anchor.line),
+        "the jump left the element: {jumped:?}"
+    );
+
+    drop(server);
+}
+
+/// Moving focus re-runs the active search where the cursor now is.
+///
+/// Two hunks of one file are two elements over one buffer, and a search is stored per
+/// `(client, buffer)` — so without this the matches of the hunk you left stay live, and `n` steps
+/// the cursor back into it. Focus is the one thing that changes a scoped search's answer without
+/// touching a character of text.
+#[tokio::test]
+async fn moving_focus_rescopes_the_active_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    commit_file(&repo, "a.rs", &format!("{}\n", lines.join("\n")));
+    // Two changes far enough apart to be two hunks of the same file.
+    lines[5] = "fn FIRST() {}".into();
+    lines[30] = "fn SECOND() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 80,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    // Line extents, so from the lines — `rows` is a height in visual rows (phantoms included).
+    let extents: Vec<std::ops::Range<u32>> = sub
+        .window
+        .root
+        .editors()
+        .iter()
+        .filter_map(|n| match n {
+            aether_protocol::viewport::Element::Editor { lines, .. } if !lines.is_empty() => {
+                Some(lines[0].logical_line..lines[lines.len() - 1].logical_line + 1)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(extents.len(), 2, "two hunks, two elements: {extents:?}");
+
+    async fn focus(
+        ws: &mut Ws,
+        viewport_id: aether_protocol::ViewportId,
+        element: u32,
+    ) -> aether_protocol::viewport::ViewportFocusElementResult {
+        send_request::<aether_protocol::viewport::ViewportFocusElement>(
+            ws,
+            &aether_protocol::viewport::ViewportFocusElementParams {
+                viewport_id,
+                target: aether_protocol::viewport::FocusTarget::Element { element },
+            },
+        )
+        .await
+    }
+
+    let first = focus(&mut ws, sub.viewport_id, 0).await;
+    let buffer_id = first.buffer.buffer_id;
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            buffer_id,
+            query: "fn ".into(),
+            options: Default::default(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(set.summary.total, extents[0].len() as u32);
+
+    // `Tab` to the second hunk — same buffer, different element.
+    let second = focus(&mut ws, sub.viewport_id, 1).await;
+    assert_eq!(
+        second.buffer.buffer_id, buffer_id,
+        "both hunks window the same file"
+    );
+    let nav: SearchNavResult = send_request::<aether_protocol::search::SearchStep>(
+        &mut ws,
+        &aether_protocol::search::SearchStepParams {
+            buffer_id,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+            set_query: None,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        nav.summary.total,
+        extents[1].len() as u32,
+        "the search re-ran in the element focus moved to"
+    );
+    assert!(
+        extents[1].contains(&nav.cursor.position.line),
+        "`n` stepped into the hunk we left: {:?}",
+        nav.cursor.position
+    );
+
+    drop(server);
+}
+
+/// Focusing an element the cursor is already inside leaves the cursor alone.
+///
+/// Focus is idempotent because a client establishes it on *subscribe* — a composed view binds to
+/// the buffer its focused element windows — and a subscribe happens on every resize. Re-seating the
+/// cursor there would make it hop each time the terminal was resized; worse, cursors are shared per
+/// `(client, buffer)`, so it would also yank any ordinary view of the same file.
+#[tokio::test]
+async fn focusing_an_element_the_cursor_is_in_keeps_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, viewport_id) = hunk_view(dir.path()).await;
+
+    // Move to the hunk's last line — a position inside the element that isn't its first line.
+    let moved: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::BufferEnd,
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(moved.position.line, extent.end - 1);
+
+    // Focusing the element it's already in is a no-op for the cursor…
+    let refocus: aether_protocol::viewport::ViewportFocusElementResult =
+        send_request::<aether_protocol::viewport::ViewportFocusElement>(
+            &mut ws,
+            &aether_protocol::viewport::ViewportFocusElementParams {
+                viewport_id,
+                target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+            },
+        )
+        .await;
+    assert_eq!(
+        refocus.buffer.cursor.position, moved.position,
+        "re-focusing the element the cursor is in must not move it"
+    );
+
+    drop(server);
+}
+
+/// Focusing a patch's element leaves the cursor somewhere the view actually shows.
+///
+/// The server half of the handshake a client now performs on subscribe, pinned because the client
+/// depends on it: a composed view holds two line spaces — `git/show` hands back the *view's*
+/// document, whose cursor is a line of the generated patch, while every element windows a real file
+/// at its hunk's lines. Until focus reconciles them the cursor has no row on screen at all, which is
+/// what the terminal reported as a viewport that flickered, refused to scroll and drew no cursor.
+#[tokio::test]
+async fn focusing_a_patchs_element_lands_the_cursor_in_what_it_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+    let cursor: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id,
+            // A no-op motion, purely to read the cursor the focus handshake left behind.
+            motion: Motion::LineStart,
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert!(
+        extent.contains(&cursor.position.line),
+        "the cursor must sit in the element the view is showing: {:?} not in {extent:?}",
+        cursor.position
+    );
+    drop(server);
+}
+
+/// Subscribing to a composed view answers with the element the cursor is in and the buffer it
+/// windows — and seats the cursor inside it.
+///
+/// Reported from the terminal as a viewport that flickered, refused to scroll and drew no cursor.
+/// The cause was two line spaces held at once: `git/show` hands back the *view's* document, whose
+/// cursor is a line of the generated patch, while every element windows a real file at its hunk's
+/// lines. The cursor therefore had no row on screen, and the reveal the client owed for it could
+/// never be paid — so the client re-fetched a window around the cursor forever, re-seating the
+/// scroll on every reply.
+#[tokio::test]
+async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    commit_file(&repo, "a.rs", &format!("{}\n", lines.join("\n")));
+    lines[20] = "fn CHANGED() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let focus = sub
+        .focus
+        .expect("a composed view says which element holds the cursor");
+    assert_ne!(
+        focus.buffer.buffer_id, opened.buffer_id,
+        "the element windows the file, not the patch document the view was opened as"
+    );
+    // The cursor it reports must be a line the view actually renders.
+    let renders = sub.window.root.editors().iter().any(|n| match n {
+        aether_protocol::viewport::Element::Editor { element, lines, .. } => {
+            *element == focus.element
+                && lines
+                    .iter()
+                    .any(|l| l.logical_line == focus.buffer.cursor.position.line)
+        }
+        _ => false,
+    });
+    assert!(
+        renders,
+        "the cursor at {:?} must be on a line the view shows",
+        focus.buffer.cursor.position
+    );
+
+    drop(server);
+}
+
+/// A patch opened *on a file* focuses that file's element, not the first one.
+///
+/// `focus_path` says "I came here for this file" — the changes picker opening one of thirty. The
+/// view opens scrolled to it, and the element under that scroll is the one the cursor belongs in;
+/// deriving focus from the scroll is what keeps the two from disagreeing.
+#[tokio::test]
+async fn a_patch_opened_on_a_file_focuses_that_files_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Four files, so any drift between the generated document's line numbers (which `focus_path`
+    // answers in) and the view's own accumulates enough to land in the wrong element if it exists.
+    for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+        let lines: Vec<String> = (0..40).map(|n| format!("fn {name}_l{n}() {{}}")).collect();
+        commit_file(&repo, name, &format!("{}\n", lines.join("\n")));
+        let mut changed = lines.clone();
+        changed[20] = format!("fn {name}_CHANGED() {{}}");
+        std::fs::write(root.join(name), format!("{}\n", changed.join("\n"))).unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: Some("d.rs".into()),
+        },
+    )
+    .await;
+    // The client opens at the position the show reported — that is the whole point of `focus_path`.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(opened.cursor.position.line),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let focus = sub.focus.expect("a composed view reports its focus");
+    assert!(
+        focus
+            .buffer
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("d.rs")),
+        "the element focused must window the file asked for, not {:?}",
+        focus.buffer.path
+    );
+    drop(server);
+}
+
+/// `view/window_at_cursor` sends the window the cursor is actually in, however deep into a tall
+/// element it sits.
+///
+/// The question a client cannot phrase for itself: a view line indexes the elements' concatenated
+/// extents and a visual row depends on wrapping, and when the cursor's line has scrolled out of the
+/// loaded window it knows neither. It used to fetch around the focused element's *start* instead —
+/// the same place only while the cursor is within a screen of it — so a reveal or placement waiting
+/// on that window still couldn't be performed. That is what made `;` need a second press.
+#[tokio::test]
+async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
+    use aether_protocol::viewport::{ViewportWindowAtCursor, ViewportWindowAtCursorParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    // A file with a change big enough that its hunk is many screens tall.
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: Vec<String> = (0..400).map(|n| format!("fn line{n}() {{}}")).collect();
+    commit_file(&repo, "a.rs", &format!("{}\n", base.join("\n")));
+    let changed: Vec<String> = base
+        .iter()
+        .enumerate()
+        .map(|(n, l)| {
+            if (100..300).contains(&n) {
+                format!("fn CHANGED{n}() {{}}")
+            } else {
+                l.clone()
+            }
+        })
+        .collect();
+    std::fs::write(root.join("a.rs"), format!("{}\n", changed.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let buffer_id = sub
+        .focus
+        .expect("a composed view reports its focus")
+        .buffer
+        .buffer_id;
+
+    // Put the cursor deep inside the hunk — far past the screenful the element's start would carry.
+    let deep: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::LogicalLine {
+                direction: Direction::Forward,
+                count: 150,
+                preserve_col: false,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+
+    let res: ViewportWindowResult = send_request::<ViewportWindowAtCursor>(
+        &mut ws,
+        &ViewportWindowAtCursorParams {
+            viewport_id: sub.viewport_id,
+        },
+    )
+    .await;
+    let carries = res.window.root.editors().iter().any(|n| match n {
+        aether_protocol::viewport::Element::Editor { lines, .. } => {
+            lines.iter().any(|l| l.logical_line == deep.position.line)
+        }
+        _ => false,
+    });
+    assert!(
+        carries,
+        "the window fetched for the cursor must contain the cursor's line ({:?})",
+        deep.position
+    );
+    drop(server);
+}
+
+/// **A view's reported height is the number of rows it actually has.**
+///
+/// `total_visual_rows` is what a client scrolls against and what its scrollbar is drawn from, while
+/// every row it paints comes from the window: lines with their wrapped rows and their phantom
+/// "deleted" rows, and chrome. If the count is short, the last rows are unreachable — the scroll
+/// bound stops before the content does — and worse, the fetch that keeps the viewport full compares
+/// what it has loaded against the same number, decides it has already reached the end, and stops:
+/// the bottom of the screen goes blank.
+///
+/// It was short by exactly the patch's phantom rows: those come from the **view's** decorations,
+/// which is where `render_element_lines` reads them, while the height counted only the primary
+/// buffer's own inline diff — nothing at all for a bound patch.
+///
+/// Stated end-to-end, over a *fully loaded* window, so it holds for anything that contributes a row:
+/// chrome, phantoms, wrapping. Three earlier bugs in this family were each one of those.
+#[tokio::test]
+async fn a_views_reported_height_is_the_rows_it_ships() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Three files, two hunks each, every hunk both adding and removing — so the view has chrome,
+    // real lines and phantom rows, and a height that counts only some of them is visibly wrong.
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        let lines: Vec<String> = (0..60).map(|n| format!("fn {name}_l{n}() {{}}")).collect();
+        commit_file(&repo, name, &format!("{}\n", lines.join("\n")));
+        let mut changed = lines.clone();
+        changed[10] = format!("fn {name}_A() {{}}");
+        changed[40] = format!("fn {name}_B() {{}}");
+        std::fs::write(root.join(name), format!("{}\n", changed.join("\n"))).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    // A viewport tall enough to hold the whole view, so the window carries every row it has. With
+    // the inline diff on, so the phantom rows are part of what is being counted — they are the row
+    // source a height is most likely to miss, and the reason this test exists.
+    let all: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 400,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+
+    let phantoms = |w: &aether_protocol::viewport::Window| -> usize {
+        w.root
+            .editors()
+            .iter()
+            .map(|n| match n {
+                aether_protocol::viewport::Element::Editor { lines, .. } => {
+                    lines.iter().map(|l| l.baseline_above.len()).sum::<usize>()
+                }
+                _ => 0,
+            })
+            .sum()
+    };
+    assert!(
+        phantoms(&all.window) > 0,
+        "the fixture must have phantom rows for this to prove anything"
+    );
+    assert_eq!(
+        client_row_items(&all.window),
+        all.window.total_visual_rows,
+        "the view ships more rows than the height it reports, so its end is out of reach"
+    );
+
+    // And with the diff off, where the phantoms collapse: the same rule, over a view whose height
+    // just changed underneath it. Dropping rows from one of the two functions and not the other is
+    // the same bug in the other direction.
+    let off: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        &GitSetDiffViewParams {
+            viewport_id: all.viewport_id,
+            enabled: false,
+        },
+    )
+    .await;
+    assert_eq!(phantoms(&off.window), 0, "the removed lines collapsed");
+    assert!(
+        off.window.total_visual_rows < all.window.total_visual_rows,
+        "and the view got shorter for it"
+    );
+    assert_eq!(
+        client_row_items(&off.window),
+        off.window.total_visual_rows,
+        "the collapsed view's height is the rows it ships, too"
+    );
+
+    drop(server);
+}
+
+/// **Every row you can scroll to comes back in the window you asked for.**
+///
+/// `view/scroll_to_row` is how a client fetches while scrolling, and what it does with the answer is
+/// resolve its own top row against the window's rows. A window that doesn't contain that row leaves
+/// it with nothing to draw from: the terminal falls back to the last line it has, paints that one
+/// row, and the rest of the screen is blank. Which is what it did — the row→line resolution counted
+/// phantom rows from the *view's own generated document*, whose line numbers mean nothing to
+/// elements windowing real files, so the window came back somewhere else entirely.
+///
+/// Run with the inline diff **on**: phantoms are what makes a visual row stop being a line, and
+/// with them collapsed this walks the same maths an ordinary editor already covers.
+#[tokio::test]
+async fn every_scrollable_row_comes_back_in_its_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Ten files, each with two hunks: the view is far taller than any one window, so the client
+    // walks it in slices exactly as it does in a real repo's working changes.
+    for i in 0..10 {
+        let name = format!("f{i}.rs");
+        let lines: Vec<String> = (0..60).map(|n| format!("fn {name}_l{n}() {{}}")).collect();
+        commit_file(&repo, &name, &format!("{}\n", lines.join("\n")));
+        let mut changed = lines.clone();
+        changed[10] = format!("fn {name}_A() {{}}");
+        changed[40] = format!("fn {name}_B() {{}}");
+        std::fs::write(root.join(&name), format!("{}\n", changed.join("\n"))).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let rows = 10u32;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows,
+            // What the real client sends: a screenful of overscan either side.
+            overscan_rows: rows,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+    let total = sub.window.total_visual_rows;
+    assert!(total > rows, "the view must be taller than the viewport");
+
+    // Every row a client may put at the top of its viewport — which is exactly `0..=max_scroll`.
+    for top in 0..=total.saturating_sub(rows) {
+        let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
+            &mut ws,
+            &ViewportScrollToRowParams {
+                viewport_id: sub.viewport_id,
+                top_visual_row: VisualRow(top),
+            },
+        )
+        .await;
+        let first = res.window.first_visual_row.get();
+        let painted = client_row_items(&res.window);
+        assert!(
+            top >= first && top < first + painted,
+            "asked for row {top}; got a window covering {first}..{}",
+            first + painted
+        );
+        // …and enough of it to fill the screen, or the bottom goes blank.
+        assert!(
+            first + painted >= (top + rows).min(total),
+            "row {top}: the window ends at {} but the viewport reaches {}",
+            first + painted,
+            top + rows
+        );
+    }
+    drop(server);
+}
+
+/// The rows a client counts in a window: chrome is one, a line is its wrapped rows plus phantoms.
+fn client_row_items(w: &aether_protocol::viewport::Window) -> u32 {
+    fn walk(n: &aether_protocol::viewport::Element) -> u32 {
+        match n {
+            aether_protocol::viewport::Element::Stack { children } => {
+                children.iter().map(walk).sum()
+            }
+            aether_protocol::viewport::Element::Editor { lines, .. } => lines
+                .iter()
+                .map(|l| (l.visual_rows.len() + l.baseline_above.len()) as u32)
+                .sum(),
+            _ => 1,
+        }
+    }
+    walk(&w.root)
+}
+
+/// The client's own scroll loop reaches the bottom: scrolling a row at a time, fetching only when
+/// its own rule says to, every position has content to paint.
+///
+/// The per-row test above asks the server one question at a time. This asks the *stateful* one — a
+/// client only refetches when the scroll nears the edge of what it has, so a view whose reported
+/// height disagrees with the rows it ships strands it: the fetch rule concludes it has reached the
+/// end, and the scroll runs on into rows nothing can draw.
+///
+/// Diff on, for the reason the per-row test above gives.
+#[tokio::test]
+async fn the_clients_scroll_loop_reaches_the_bottom() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for i in 0..10 {
+        let name = format!("f{i}.rs");
+        // Long lines, so soft wrap actually wraps them.
+        let lines: Vec<String> = (0..60)
+            .map(|n| format!("fn {name}_l{n}() {{ /* {} */ }}", "x".repeat(80)))
+            .collect();
+        commit_file(&repo, &name, &format!("{}\n", lines.join("\n")));
+        let mut changed = lines.clone();
+        changed[10] = format!("fn {name}_A() {{ /* {} */ }}", "y".repeat(80));
+        changed[40] = format!("fn {name}_B() {{ /* {} */ }}", "z".repeat(80));
+        std::fs::write(root.join(&name), format!("{}\n", changed.join("\n"))).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let rows = 10u32;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            // Narrow + soft wrap: what the real client actually runs with.
+            cols: 24,
+            rows,
+            overscan_rows: rows,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::Soft,
+            continuation_marker_width: 2,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+    let mut window = sub.window;
+    let total = window.total_visual_rows;
+    let max_top = total.saturating_sub(rows);
+    assert!(max_top > 0, "the view must be taller than the viewport");
+    let mut top = 0u32;
+    let mut fetches = 0;
+    let mut stuck = None;
+    while top < max_top {
+        top += 1;
+        // `maybe_fetch`: chase the scroll when it nears the loaded edge.
+        let first = window.first_visual_row.get();
+        let loaded_end = first + client_row_items(&window);
+        let margin = rows;
+        let need_above = first > 0 && top < first + margin;
+        let need_below = loaded_end < total && top + rows > loaded_end.saturating_sub(margin);
+        if need_above || need_below {
+            fetches += 1;
+            let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
+                &mut ws,
+                &ViewportScrollToRowParams {
+                    viewport_id: sub.viewport_id,
+                    top_visual_row: VisualRow(top),
+                },
+            )
+            .await;
+            window = res.window;
+        }
+        let first = window.first_visual_row.get();
+        let loaded_end = first + client_row_items(&window);
+        if top < first || top >= loaded_end {
+            stuck = Some((top, first, loaded_end));
+            break;
+        }
+    }
+    assert_eq!(
+        stuck, None,
+        "the scroll reached a row no window can answer for (after {fetches} fetches)"
+    );
+    assert_eq!(top, max_top, "the loop must reach the last scroll position");
+    // The last scroll position really is the view's last: the window it ends on runs out exactly
+    // where the view does, rather than a few rows short of it.
+    let first = window.first_visual_row.get();
+    assert_eq!(
+        first + client_row_items(&window),
+        total,
+        "the final window ends somewhere other than the view's last row"
+    );
+    drop(server);
+}
+
+/// A patch closes with its rule — including a **bound** one, whose elements window real files.
+///
+/// The rule belongs to the *view*: it closes the whole patch, sits below the last line and has no
+/// element to introduce. Rendering looked for it on the primary *element's* buffer, which for a
+/// bound patch is an ordinary file with no generated patch behind it — so the answer was "no
+/// trailing chrome" and the view simply ended on its last line of text, with nothing to say it had
+/// ended. `PatchBuilder::finish` has always emitted it; nothing downstream was asking the view.
+#[tokio::test]
+async fn a_patch_ends_with_its_closing_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for name in ["a.rs", "b.rs"] {
+        let lines: Vec<String> = (0..40).map(|n| format!("fn {name}_l{n}() {{}}")).collect();
+        commit_file(&repo, name, &format!("{}\n", lines.join("\n")));
+        let mut changed = lines.clone();
+        changed[20] = format!("fn {name}_CHANGED() {{}}");
+        std::fs::write(root.join(name), format!("{}\n", changed.join("\n"))).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 400, // the whole view, so the last row is in this window
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let aether_protocol::viewport::Element::Stack { children } = &sub.window.root else {
+        panic!("a patch composes into a stack");
+    };
+    let last = children.last().expect("the view has children");
+    assert!(
+        matches!(
+            last,
+            aether_protocol::viewport::Element::Chrome {
+                kind: aether_protocol::viewport::ChromeKind::Rule,
+                ..
+            }
+        ),
+        "the last thing in the view should be the rule that closes it, not {}",
+        match last {
+            aether_protocol::viewport::Element::Editor { element, .. } =>
+                format!("editor {element}"),
+            aether_protocol::viewport::Element::Chrome { kind, .. } => format!("chrome {kind:?}"),
+            _ => "something else".into(),
+        }
+    );
+    // And it is a row like any other, so the height counts it — otherwise the view is a row taller
+    // than it says and its last row is unreachable.
+    assert_eq!(
+        client_row_items(&sub.window),
+        sub.window.total_visual_rows,
+        "the closing rule must be counted in the view's height"
+    );
+
+    // A window that doesn't reach the view's end doesn't carry it: the rule closes the *view*, and
+    // a client draws it after the last line it was sent. Shipped with a window that stops halfway,
+    // it would be drawn halfway — the same rule an element's own chrome follows.
+    let partial: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 4,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let aether_protocol::viewport::Element::Stack { children } = &partial.window.root else {
+        panic!("a patch composes into a stack");
+    };
+    assert!(
+        !matches!(
+            children.last(),
+            Some(aether_protocol::viewport::Element::Chrome {
+                kind: aether_protocol::viewport::ChromeKind::Rule,
+                rail: aether_protocol::ui::RailJoin::Closes,
+                ..
+            })
+        ),
+        "a window that stops short of the view's end must not carry the rule that closes it"
+    );
+    drop(server);
+}
+
+/// `Ctrl-j`/`Ctrl-k` and `Ctrl-g` stop at the element's edge, exactly as they do at the file's.
+///
+/// Moving a line "down" from a hunk's last line would swap it with a line the view doesn't show —
+/// editing text you can't see, and carrying the cursor out of the element on the way. Joining from
+/// there would pull that invisible line up into one you can. Both already refuse at the end of a
+/// *file*; the element's edge is the same boundary for a view that windows one.
+#[tokio::test]
+async fn line_edits_stop_at_the_elements_edge() {
+    use aether_protocol::cursor::VerticalDirection;
+    use aether_protocol::input::{InputJoinLines, InputMoveLines, InputMoveLinesParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+    // `buffer/content`, not the `buffer_text` helper: that one subscribes, and a subscribe
+    // supersedes the client's viewport — it would replace the patch view under the test.
+    async fn content(ws: &mut Ws, buffer_id: u64) -> String {
+        send_request::<BufferContent>(ws, &BufferContentParams { buffer_id })
+            .await
+            .text
+    }
+    let before = content(&mut ws, buffer_id).await;
+
+    // On the hunk's last line: moving down would reach the line below it, which isn't in the view.
+    set_point_cursor(
+        &mut ws,
+        buffer_id,
+        LogicalPosition {
+            line: extent.end - 1,
+            col: 0,
+        },
+    )
+    .await;
+    let moved: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        content(&mut ws, buffer_id).await,
+        before,
+        "moving down from the hunk's last line must not touch the file"
+    );
+    assert_eq!(
+        moved.cursor.position.line,
+        extent.end - 1,
+        "and the cursor stays where it was"
+    );
+
+    // Likewise a join from there: there is nothing below it *in this view* to pull up.
+    let joined: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        content(&mut ws, buffer_id).await,
+        before,
+        "joining at the hunk's last line must not pull up the line below it"
+    );
+    assert_eq!(joined.cursor.position.line, extent.end - 1);
+
+    // On the hunk's first line, moving *up* is the mirror.
+    set_point_cursor(
+        &mut ws,
+        buffer_id,
+        LogicalPosition {
+            line: extent.start,
+            col: 0,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Up,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        content(&mut ws, buffer_id).await,
+        before,
+        "moving up from the hunk's first line must not touch the file"
+    );
+
+    // But *inside* the element they work as always: move the middle line down.
+    set_point_cursor(
+        &mut ws,
+        buffer_id,
+        LogicalPosition {
+            line: extent.start + 1,
+            col: 0,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputMoveLines>(
+        &mut ws,
+        &InputMoveLinesParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+        },
+    )
+    .await;
+    assert_ne!(
+        content(&mut ws, buffer_id).await,
+        before,
+        "a move with room inside the element still edits"
+    );
+
+    drop(server);
+}
+
+/// `N g` refuses a line outside the focused element instead of clamping onto its edge.
+///
+/// The gutter prints buffer line numbers, so the number typed and the number on screen are the same
+/// one — which is exactly why landing somewhere else is a lie rather than a convenience. A hunk view
+/// over lines ~18..23 of a 40-line file gives three cases: a line inside (moves), a line above, and
+/// a line below (both refuse, cursor untouched).
+///
+/// The uncounted `g`/`Alt-g` are a different motion — `BufferStart`/`BufferEnd`, the field's own
+/// edges — and are covered by `every_motion_stays_inside_the_focused_element`.
+#[tokio::test]
+async fn a_counted_goto_refuses_a_line_outside_the_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+
+    async fn goto(ws: &mut Ws, buffer_id: u64, line: u32) -> CursorState {
+        send_request::<CursorMove>(
+            ws,
+            &CursorMoveParams {
+                buffer_id,
+                motion: Motion::Goto {
+                    position: LogicalPosition { line, col: 0 },
+                },
+                extend_selection: false,
+            },
+        )
+        .await
+    }
+
+    // A line the element really contains: the jump lands on it.
+    let inside_line = extent.start + (extent.end - extent.start) / 2;
+    let landed = goto(&mut ws, buffer_id, inside_line).await;
+    assert_eq!(
+        landed.position.line, inside_line,
+        "a line inside the element is a destination"
+    );
+
+    // Above the element — line 0 carries `ZEBRA`, so an escape would be nameable.
+    let above = goto(&mut ws, buffer_id, 0).await;
+    assert_eq!(
+        above.position.line, inside_line,
+        "a line above the element refuses; the cursor does not move"
+    );
+
+    // Below the element — line 39 carries `QUAGGA`.
+    let below = goto(&mut ws, buffer_id, 39).await;
+    assert_eq!(
+        below.position.line, inside_line,
+        "a line below the element refuses too"
+    );
+
+    // Non-vacuity: both refused lines are genuinely outside the extent the view reported.
+    assert!(
+        !extent.contains(&0) && !extent.contains(&39),
+        "the fixture must actually put those lines outside the hunk (extent {extent:?})"
+    );
+    drop(server);
+}
+
+/// `100j` in a hunk that has no room for 100 lines does **nothing** — driven through the real
+/// `element/move` RPC, in a real composed view.
+///
+/// This is the shape the previous attempt got wrong. `Motion::LogicalLine` never reaches
+/// `resolve_motion`: `cursor_move` intercepts it and calls `resolve_logical_line`, which needs the
+/// virtual column and tab width. A unit test against `resolve_motion` therefore passes while `j`
+/// keeps clamping, which is exactly what happened — the cursor slid to the element's last line.
+/// Going through the RPC is what makes this test able to fail.
+#[tokio::test]
+async fn a_counted_step_past_the_hunks_end_does_not_move_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+
+    async fn step(ws: &mut Ws, buffer_id: u64, count: u32) -> CursorState {
+        send_request::<CursorMove>(
+            ws,
+            &CursorMoveParams {
+                buffer_id,
+                motion: Motion::LogicalLine {
+                    direction: Direction::Forward,
+                    count,
+                    preserve_col: true,
+                },
+                extend_selection: false,
+            },
+        )
+        .await
+    }
+
+    // Start at the hunk's first line. The hunk is a handful of lines, so 100 cannot be honoured.
+    set_cursor(&mut ws, buffer_id, extent.start, 0).await;
+    let after = step(&mut ws, buffer_id, 100).await;
+    assert_eq!(
+        after.position.line, extent.start,
+        "no room for 100 lines, so the cursor must not move — landing on the element's last line \
+         is the clamp this rule replaces (extent {extent:?})"
+    );
+
+    // Non-vacuity, two ways. A single step still walks…
+    let one = step(&mut ws, buffer_id, 1).await;
+    assert_eq!(
+        one.position.line,
+        extent.start + 1,
+        "a bare `j` still moves"
+    );
+    // …and a count the hunk *can* honour moves the whole way, so this is not "counts never work".
+    set_cursor(&mut ws, buffer_id, extent.start, 0).await;
+    let two = step(&mut ws, buffer_id, 2).await;
+    assert_eq!(
+        two.position.line,
+        extent.start + 2,
+        "a count that fits is honoured in full"
+    );
+    drop(server);
+}
+
+/// Every counted motion and selection obeys the same rule: `count` steps, or none.
+///
+/// Written as a table on purpose. The per-motion approach did not converge — `100j` was fixed while
+/// `100l`, `100w` and `100x` went on clamping, because each had its own way of running out
+/// (`.min(len)`, `.clamp(first, last)`, a loop that stopped early). A new counted motion that
+/// forgets the rule should fail *here*, not in the editor.
+#[tokio::test]
+async fn every_counted_motion_is_all_or_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+
+    async fn mv(ws: &mut Ws, buffer_id: u64, motion: Motion) -> CursorState {
+        send_request::<CursorMove>(
+            ws,
+            &CursorMoveParams {
+                buffer_id,
+                motion,
+                extend_selection: false,
+            },
+        )
+        .await
+    }
+
+    let start = extent.start;
+    // Line-grain: `100j`.
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let j = mv(
+        &mut ws,
+        buffer_id,
+        Motion::LogicalLine {
+            direction: Direction::Forward,
+            count: 100,
+            preserve_col: true,
+        },
+    )
+    .await;
+    assert_eq!(j.position.line, start, "100j");
+
+    // Char-grain. `l` crosses lines, so the count has to exceed the hunk's whole character span —
+    // 100 of them genuinely fit in a seven-line hunk, which is why this reads 10_000.
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let l = mv(
+        &mut ws,
+        buffer_id,
+        Motion::Char {
+            direction: Direction::Forward,
+            count: 10_000,
+        },
+    )
+    .await;
+    assert_eq!((l.position.line, l.position.col), (start, 0), "10000l");
+
+    // Word-grain: `100b` backwards from the hunk's start has nowhere to go at all.
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let b = mv(
+        &mut ws,
+        buffer_id,
+        Motion::Word {
+            direction: Direction::Backward,
+            boundary: WordBoundary::Word,
+            count: 100,
+        },
+    )
+    .await;
+    assert_eq!((b.position.line, b.position.col), (start, 0), "100b");
+
+    // Selection-grain: `100w` and `100x`, which are server-side repeat loops rather than motions.
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let w: CursorState = send_request::<CursorSelectWord>(
+        &mut ws,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            extend: false,
+            count: 100,
+        },
+    )
+    .await;
+    assert_eq!(
+        w.position.line, start,
+        "100w must not walk to the hunk's end"
+    );
+
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let x: CursorState = send_request::<CursorSelectLine>(
+        &mut ws,
+        &CursorSelectLineParams {
+            buffer_id,
+            direction: Direction::Forward,
+            count: 100,
+            extend: false,
+        },
+    )
+    .await;
+    assert!(
+        x.position.line <= extent.start,
+        "100x must not select down to the hunk's end (landed {})",
+        x.position.line
+    );
+
+    // Non-vacuity: counts the hunk *can* honour still work, so this is not "counts never move".
+    set_cursor(&mut ws, buffer_id, start, 0).await;
+    let ok = mv(
+        &mut ws,
+        buffer_id,
+        Motion::LogicalLine {
+            direction: Direction::Forward,
+            count: 2,
+            preserve_col: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        ok.position.line,
+        start + 2,
+        "an honourable count still moves"
+    );
+    drop(server);
+}
+
+/// `q` cannot expand the selection outside the hunk it is in.
+///
+/// The syntax tree spans the whole file, so this is the one motion that can select text the view
+/// does not render — and `Ctrl-x` on that selection would cut it. Worst finding of the keybinding
+/// census, because it is a *data-loss* path rather than a navigation annoyance.
+#[tokio::test]
+async fn tree_expand_cannot_select_outside_the_hunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
+
+    // Sit on the changed line and expand as far as it will go.
+    set_cursor(&mut ws, buffer_id, extent.start, 0).await;
+    for _ in 0..8 {
+        let st: CursorState = send_request::<CursorTreeSelect>(
+            &mut ws,
+            &CursorTreeSelectParams {
+                buffer_id,
+                direction: TreeSelectDirection::Expand,
+                count: 1,
+            },
+        )
+        .await;
+        let (lo, hi) = (
+            st.anchor.line.min(st.position.line),
+            st.anchor.line.max(st.position.line),
+        );
+        assert!(
+            lo >= extent.start && hi < extent.end,
+            "expansion escaped the hunk: selected {lo}..={hi}, hunk is {extent:?} — \
+             a `Ctrl-x` here would cut lines the view never showed"
+        );
+    }
+    drop(server);
+}
+
+/// A `Shift`-motion cannot leave the selection's *anchor* outside the focused element.
+///
+/// Reproduces the real path rather than poking state: cursors are keyed `(client, buffer)`, so a
+/// plain view of a file and a hunk element over that same file share one. Park a selection whose
+/// head is inside the future hunk but whose anchor is at line 0, then open the working-changes
+/// view — `seat_cursor_in_element` re-seats only when the *position* is out of scope, so the stale
+/// anchor survives. One `Shift-j` then yields a selection spanning everything the view never drew,
+/// and `Ctrl-x` on it cuts the lot.
+#[tokio::test]
+async fn extending_a_selection_cannot_anchor_outside_the_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    commit_file(&repo, "a.rs", &format!("{}\n", lines.join("\n")));
+    lines[20] = "fn CHANGED() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let file: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("a.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A selection anchored at the top of the file, head on the line that will become the hunk.
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: file.buffer_id,
+            position: LogicalPosition { line: 20, col: 0 },
+            anchor: LogicalPosition { line: 0, col: 0 },
+        },
+    )
+    .await;
+
+    // Now show the hunk. The head is inside it, so the cursor is kept — anchor and all.
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let extent = sub
+        .window
+        .root
+        .editors()
+        .iter()
+        .find_map(|n| match n {
+            aether_protocol::viewport::Element::Editor { lines, .. } if !lines.is_empty() => {
+                let first = lines.first()?.logical_line;
+                let last = lines.last()?.logical_line;
+                Some(first..last + 1)
+            }
+            _ => None,
+        })
+        .expect("the view windows the changed file");
+
+    // Extend downward. The head moves within the hunk; the anchor must be dragged in with it.
+    let extended: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id: file.buffer_id,
+            motion: Motion::LogicalLine {
+                direction: Direction::Forward,
+                count: 1,
+                preserve_col: true,
+            },
+            extend_selection: true,
+        },
+    )
+    .await;
+    assert!(
+        extent.contains(&extended.anchor.line),
+        "the anchor escaped the element: anchored at line {} with the hunk at {extent:?} — a \
+         `Ctrl-x` here would cut every line between",
+        extended.anchor.line
+    );
+    drop(server);
+}
+
+/// `Ctrl-Alt-j` cannot swap the cursor's paragraph with one outside the hunk.
+///
+/// The census ranked this second: unlike a motion landing somewhere surprising, it is a *mutation*
+/// resolved against the whole file (`buf.text.to_string()`), so it rewrites lines the view never
+/// drew. The guard lives in `resolve_block_edit`, which takes a `Scope` rather than a `Document` —
+/// so every block op is bounded, not just this one.
+#[tokio::test]
+async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Ten paragraphs of *eight* lines each. Both dimensions matter, and each cost a wrong run:
+    //  - enough paragraphs that the diff's context does not span the file (with four, the hunk *is*
+    //    the file and there is nothing outside to reach for);
+    //  - paragraphs taller than git's three lines of context, so the hunk around one changed line
+    //    stays inside its own paragraph and the neighbours are genuinely out of the window. With
+    //    two-line paragraphs the context reached the next one, and moving into it was legitimate.
+    let para = |n: usize, changed: bool| {
+        (0..8)
+            .map(|i| {
+                if changed && i == 4 {
+                    format!("para{n} line{i} CHANGED")
+                } else {
+                    format!("para{n} line{i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let build = |changed_at: Option<usize>| -> String {
+        (0..10)
+            .map(|n| para(n, changed_at == Some(n)))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            + "\n"
+    };
+    commit_file(&repo, "a.md", &build(None));
+    std::fs::write(root.join("a.md"), build(Some(5))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let file = sub
+        .focus
+        .expect("the view windows the file")
+        .buffer
+        .buffer_id;
+    // `buffer/content` rather than a helper that subscribes — a subscribe would supersede the
+    // patch viewport and dissolve the very scope under test.
+    async fn content(ws: &mut Ws, buffer_id: u64) -> String {
+        send_request::<BufferContent>(ws, &BufferContentParams { buffer_id })
+            .await
+            .text
+    }
+    let before = content(&mut ws, file).await;
+    // Seat the cursor on the changed paragraph — the focus reply seats it in the element, but the
+    // paragraph geometry needs it inside the paragraph itself, not merely inside the hunk.
+    let changed = before
+        .lines()
+        .position(|l| l.contains("CHANGED"))
+        .expect("the changed line is in the file") as u32;
+    set_cursor(&mut ws, file, changed, 0).await;
+
+    // Try to move the focused paragraph both ways. Its neighbours are outside the hunk, so both
+    // must refuse and leave the file byte-identical.
+    // ONE direction only. Moving down and then up swaps the paragraph away and back, so the file
+    // is byte-identical either way and the assertion proves nothing — the first cut of this test
+    // did exactly that and passed with the guard removed.
+    let moved: aether_protocol::input::BlockEditResult = send_request::<InputMoveBlock>(
+        &mut ws,
+        &MoveBlockParams {
+            buffer_id: file,
+            direction: VerticalDirection::Down,
+            unit: BlockUnit::Paragraph,
+        },
+    )
+    .await;
+    let after = content(&mut ws, file).await;
+    assert!(
+        !moved.applied,
+        "the move must be refused, not merely undone: its neighbour is outside the hunk"
+    );
+    assert_eq!(
+        before, after,
+        "a paragraph move reached outside the hunk and rewrote text the view never drew"
     );
     drop(server);
 }

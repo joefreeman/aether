@@ -6,7 +6,7 @@
 //! Coordinates are character cells (`unicode-width`), matching the editor grid. The layout is a
 //! pure function of `(blocks, elements, cols)` — shells cache it by `(buffer, revision, cols)`.
 
-use crate::markdown::{AlertKind, Block, ColAlign, Element, Inline, ListItem, Span};
+use crate::markdown::{AlertKind, Block, ColAlign, Inline, ListItem, Span, Stop};
 use aether_protocol::settings::MarkdownWidth;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -166,11 +166,11 @@ impl SpanStyle {
 pub type CodeHighlights = std::collections::HashMap<u32, Vec<aether_protocol::viewport::Highlight>>;
 
 /// Lay the document out at `cols` content columns. `elements` must be the
-/// [`crate::markdown::elements`] list of the same `blocks` — rows carry indices into it;
+/// [`crate::markdown::stops`] list of the same `blocks` — rows carry indices into it;
 /// `code_highlights` colours fenced code (pass an empty map for monochrome fences).
 pub fn layout(
     blocks: &[Block],
-    elements: &[Element],
+    elements: &[Stop],
     cols: u16,
     code_highlights: &CodeHighlights,
 ) -> Vec<ReadRow> {
@@ -195,7 +195,7 @@ pub fn layout(
 /// bearing the container's own are the blank separators between its children. Equality found one
 /// of those — a row in the middle — and revealed the block from there, leaving its opening rows
 /// off the top of the viewport. Containment is also how the bar rows resolve, so the two agree.
-pub fn first_row_of_element(rows: &[ReadRow], elements: &[Element], idx: usize) -> Option<usize> {
+pub fn first_row_of_element(rows: &[ReadRow], elements: &[Stop], idx: usize) -> Option<usize> {
     let span = elements.get(idx)?.span();
     let inside = |e: Option<usize>| {
         e.and_then(|i| elements.get(i))
@@ -249,13 +249,13 @@ pub fn is_table_element(rows: &[ReadRow], element: usize) -> bool {
 /// index into, and the fenced-code highlights.
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
-    elements: &'a [Element],
+    elements: &'a [Stop],
     code_hl: &'a CodeHighlights,
 }
 
 /// Exact-span lookup into the element list (both lists derive from the same parse, so a block
 /// that *is* an element matches exactly).
-fn element_index(elements: &[Element], span: Span) -> Option<usize> {
+fn element_index(elements: &[Stop], span: Span) -> Option<usize> {
     elements.iter().position(|e| e.span() == span)
 }
 
@@ -706,7 +706,7 @@ fn layout_table(
     alignments: &[ColAlign],
     head: &[Vec<Inline>],
     rows: &[Vec<Vec<Inline>>],
-    elements: &[Element],
+    elements: &[Stop],
     own: Option<usize>,
     cols: usize,
     out: &mut Vec<ReadRow>,
@@ -925,7 +925,7 @@ fn segments_min_width(segs: &[Segment]) -> usize {
 }
 
 /// Flatten inline nodes to styled segments, resolving interactive spans to element indices.
-fn flatten(inlines: &[Inline], base: SpanStyle, elements: &[Element]) -> Vec<Segment> {
+fn flatten(inlines: &[Inline], base: SpanStyle, elements: &[Stop]) -> Vec<Segment> {
     let mut out = Vec::new();
     collect(inlines, base, None, elements, &mut out);
     out
@@ -935,7 +935,7 @@ fn collect(
     inlines: &[Inline],
     base: SpanStyle,
     element: Option<usize>,
-    elements: &[Element],
+    elements: &[Stop],
     out: &mut Vec<Segment>,
 ) {
     for inl in inlines {
@@ -1263,7 +1263,7 @@ fn chunk_width(line: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::{elements, parse};
+    use crate::markdown::{parse, stops};
 
     fn rows_text(rows: &[ReadRow]) -> Vec<String> {
         rows.iter()
@@ -1275,7 +1275,8 @@ mod tests {
     /// content, so any arm that decorates its children rather than drawing something itself
     /// (a quote's bar, an item's marker) drops an empty block off the page — and then a document
     /// of nothing but `>` renders identically to an empty one. Degenerate input only: these are
-    /// exactly the forms the feature corpus (`docs/test1-4.md`, all well-formed) never covers.
+    /// exactly the forms a well-formed document never contains, and so the ones hand-testing on
+    /// real prose never reaches.
     #[test]
     fn every_block_owns_at_least_one_row() {
         for md in [
@@ -1293,7 +1294,7 @@ mod tests {
             "[^a]:\n",
         ] {
             let blocks = parse(md);
-            let els = elements(&blocks);
+            let els = stops(&blocks);
             let rows = layout(&blocks, &els, 20, &Default::default());
             assert!(
                 !blocks.is_empty(),
@@ -1314,7 +1315,7 @@ mod tests {
     #[test]
     fn empty_quote_and_item_keep_their_decoration() {
         let blocks = parse(">\n\n-\n");
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let text = rows_text(&layout(&blocks, &els, 20, &Default::default()));
         // The bar and the marker *are* the row when there's no content to ride.
         assert!(text.contains(&"┃ ".to_string()), "quote bar row: {text:?}");
@@ -1328,7 +1329,7 @@ mod tests {
     fn heading_gets_underline_and_paragraph_wraps() {
         let md = "# Title\n\naaa bbb ccc ddd eee\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 11, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text[0], "Title");
@@ -1346,7 +1347,7 @@ mod tests {
     fn front_matter_renders_thin_rule_and_dim_lines() {
         let md = "---\ntitle: X\ntags: [a, b]\n---\n\n# H\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text[0], "│ title: X");
@@ -1365,7 +1366,7 @@ mod tests {
     fn list_markers_and_hanging_indent() {
         let md = "- first item wraps here\n- [x] done\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 14, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text[0], "• first item");
@@ -1380,7 +1381,7 @@ mod tests {
     fn table_draws_box_borders_and_aligns() {
         let md = "| Name | N |\n|:-----|--:|\n| Ada | 36 |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text[0], "┌──────┬────┐");
@@ -1396,7 +1397,7 @@ mod tests {
         // the cell wraps, so the table fits the window instead of panning.
         let md = "| words |\n|---|\n| several words stay on one line |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 16, &Default::default());
         let text = rows_text(&rows);
         let widest = text.iter().map(|t| t.width()).max().unwrap_or(0);
@@ -1413,7 +1414,7 @@ mod tests {
         let long = "x".repeat(60);
         let md = format!("| head |\n|---|\n| {long} |\n");
         let blocks = parse(&md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 30, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text.len(), 5, "no wrapping: {text:?}");
@@ -1433,7 +1434,7 @@ mod tests {
         let long = "x".repeat(60);
         let md = format!("| words | n |\n|---|---|\n| {long} | 1 |\n");
         let blocks = parse(&md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 92, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text.len(), 5, "no cell wrapped: {text:?}");
@@ -1454,7 +1455,7 @@ mod tests {
         let b = ["xy"; 10].join(" "); // 29 columns
         let md = format!("| one | two |\n|---|---|\n| {a} | {b} |\n");
         let blocks = parse(&md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 60, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(
@@ -1472,7 +1473,7 @@ mod tests {
         // spreading itself across the measure.
         let md = "| Name | N |\n|---|---|\n| Ada | 36 |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 92, &Default::default());
         assert_eq!(rows_text(&rows)[0], "┌──────┬────┐");
     }
@@ -1481,7 +1482,7 @@ mod tests {
     fn table_stripes_alternate_body_rows() {
         let md = "| h |\n|---|\n| one |\n| two |\n| three |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let striped = |r: &ReadRow| {
             r.spans
@@ -1513,7 +1514,7 @@ mod tests {
         // the divider between the cells is `TableDivider`.
         let md = "| a | b |\n|---|---|\n| one | two |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let kinds: Vec<SpanKind> = rows[3]
             .spans
@@ -1537,7 +1538,7 @@ mod tests {
         // would break mid-row.
         let md = "| h |\n|---|\n| one |\n| two words wrap here |\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 18, &Default::default());
         let striped: Vec<bool> = rows
             .iter()
@@ -1559,7 +1560,7 @@ mod tests {
     fn quote_bar_and_alert_label() {
         let md = "> [!WARNING]\n> Careful now.\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 30, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text[0], "┃ Warning");
@@ -1574,7 +1575,7 @@ mod tests {
     fn code_block_tag_rides_the_top_pad_row() {
         let md = "```rust\nfn x() {}\n```\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 20, &Default::default());
         let text = rows_text(&rows);
         // No header rule: the panel opens on its top pad row, which pins the language tag
@@ -1604,7 +1605,7 @@ mod tests {
         let line = "x".repeat(60);
         let md = format!("```\n{line}\nshort\n```\n");
         let blocks = parse(&md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 20, &Default::default());
         let text = rows_text(&rows);
         // Overflowing block: pad, the two code lines, a breathing row above the scrollbar,
@@ -1644,7 +1645,7 @@ mod tests {
     fn link_spans_carry_their_element_for_focus_painting() {
         let md = "See [docs](https://x.y) now.\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let link_span = rows[0]
             .spans
@@ -1653,7 +1654,7 @@ mod tests {
             .expect("link text present");
         assert_eq!(link_span.style.kind, SpanKind::Link);
         assert!(link_span.style.underline);
-        // Element 1 is the link (0 = the paragraph).
+        // Stop 1 is the link (0 = the paragraph).
         assert_eq!(link_span.element, Some(1));
         assert_eq!(first_row_of_element(&rows, &els, 1), Some(0));
     }
@@ -1665,7 +1666,7 @@ mod tests {
         // the box column stays even and a link still reads as a link.
         let md = "- [x] Done, with a [link](https://example.com) inside\n- [ ] Open task\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 60, &Default::default());
         let kinds =
             |row: &ReadRow| -> Vec<SpanKind> { row.spans.iter().map(|s| s.style.kind).collect() };
@@ -1697,7 +1698,7 @@ mod tests {
         // its own done-ness rather than inheriting its parent's.
         let md = "- [x] Done parent\n  - [ ] Open child\n  - [x] Done child\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 60, &Default::default());
         let text = rows_text(&rows);
         let row_of = |needle: &str| {
@@ -1726,7 +1727,7 @@ mod tests {
         // also how the bar rows resolve.
         let md = "Intro.\n\n> Quoted one.\n>\n> Quoted two.\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let qi = els
             .iter()
@@ -1747,7 +1748,7 @@ mod tests {
     fn hard_break_forces_a_line_break() {
         let md = "one two  \nthree\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let text = rows_text(&rows);
         assert_eq!(text, vec!["one two", "three"]);
@@ -1759,7 +1760,7 @@ mod tests {
         // the whole word, not wrap at the style seam when only the styled half fits.
         let md = "aaaaaa **bb**cc\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 10, &Default::default());
         assert_eq!(rows_text(&rows), vec!["aaaaaa", "bbcc"]);
         // Both styles survive on the wrapped line.
@@ -1775,7 +1776,7 @@ mod tests {
         // wrap along with the link, not orphan onto the next line.
         let md = "one two three [link](https://x.example). four\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 18, &Default::default());
         assert_eq!(rows_text(&rows), vec!["one two three", "link. four"]);
     }
@@ -1786,7 +1787,7 @@ mod tests {
         // style of the segment it came from.
         let md = "**aaaaaa**bbbbbb\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 10, &Default::default());
         assert_eq!(rows_text(&rows), vec!["aaaaaabbbb", "bb"]);
         assert!(rows[0].spans[0].style.bold);
@@ -1797,7 +1798,7 @@ mod tests {
     fn fence_highlights_split_code_rows_into_tokens() {
         let md = "```rust\nfn x() {}\n```\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let mut hl = CodeHighlights::default();
         // The fence starts at byte 0; "fn" is a keyword in its `code` string.
         hl.insert(
@@ -1861,7 +1862,7 @@ mod tests {
     fn h2_gets_extra_blank_above_and_image_span_carries_element() {
         let md = "Intro.\n\n## Section\n\n![d](i.png)\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         let text = rows_text(&rows);
         // Intro, ordinary separator, the heading's extra blank, then the heading.
@@ -1888,7 +1889,7 @@ mod tests {
     fn nested_list_hugs_its_parent_item() {
         let md = "- parent intro\n  - child one\n  - child two\n- next\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 40, &Default::default());
         assert_eq!(
             rows_text(&rows),
@@ -1898,7 +1899,7 @@ mod tests {
         // A loose item's paragraphs keep their separation.
         let md2 = "- first\n\n  second para\n- next\n";
         let blocks2 = parse(md2);
-        let els2 = elements(&blocks2);
+        let els2 = stops(&blocks2);
         let rows2 = layout(&blocks2, &els2, 40, &Default::default());
         let text2 = rows_text(&rows2);
         assert_eq!(text2[0], "• first");
@@ -1913,7 +1914,7 @@ mod tests {
     fn untagged_code_block_has_no_header_rule() {
         let md = "```\nplain text\n```\n";
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         let rows = layout(&blocks, &els, 20, &Default::default());
         let text = rows_text(&rows);
         // No header row without a language tag — the panel opens on its top pad row.

@@ -3,6 +3,7 @@
 //! doc.
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
+use aether_protocol::coords::{ViewLine, VisualRow};
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
     CursorSetParams, CursorState, Direction, Granularity, Motion, SelectionEdge, WordBoundary,
@@ -42,10 +43,12 @@ use aether_protocol::sneak::{
     SneakCancel, SneakSelect, SneakSelectParams, SneakTarget, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
+use aether_protocol::ui::{Element, RailJoin};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
-    LogicalLineRange, LogicalLineRender, ViewportLinesChangedParams, VirtualRow, VirtualRowKind,
+    BaselineRow, BufferStatusSnapshot, ChromeKind, DiagnosticSeverity, DiagnosticSpan, DiffMarker,
+    DiffStage, EmphasisRange, LineChange, LogicalLineRange, LogicalLineRender,
+    ViewportLinesChangedParams,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -566,42 +569,26 @@ fn git_set_diff_view_params_shape() {
 }
 
 #[test]
-fn logical_line_render_virtual_rows_shape() {
-    // `virtual_rows_above` is omitted when empty (back-compat) and uses snake_case kinds.
+fn logical_line_render_baseline_rows_shape() {
+    // `baseline_above` is omitted when empty — it rides every rendered line.
     let bare = LogicalLineRender {
         logical_line: 0,
         visual_rows: vec![],
         search_matches: vec![],
-        virtual_rows_below: vec![],
-        virtual_rows_above: vec![],
-        diff_marker: None,
-        diff_stage: DiffStage::Unstaged,
-        diff_emphasis: vec![],
-        conflict: None,
+        baseline_above: vec![],
+        change: Default::default(),
         diagnostics: vec![],
         sneak_targets: vec![],
-        patch: None,
     };
     let v = to_value(&bare).unwrap();
-    assert!(
-        v.get("virtual_rows_above").is_none(),
-        "empty omitted from wire"
-    );
-    assert!(
-        v.get("diff_emphasis").is_none(),
-        "empty diff_emphasis omitted from wire"
-    );
+    assert!(v.get("baseline_above").is_none(), "empty omitted from wire");
     assert!(
         v.get("sneak_targets").is_none(),
         "empty sneak_targets omitted from wire"
     );
     assert!(
-        v.get("diff_marker").is_none(),
-        "None marker omitted from wire"
-    );
-    assert!(
-        v.get("diff_stage").is_none(),
-        "unstaged stage omitted from wire"
+        v.get("change").is_none(),
+        "an unchanged line omits its change-state entirely — one absent field where there were five"
     );
     assert!(
         v.get("diagnostics").is_none(),
@@ -620,18 +607,16 @@ fn logical_line_render_virtual_rows_shape() {
         logical_line: 4,
         visual_rows: vec![],
         search_matches: vec![],
-        virtual_rows_below: vec![],
-        virtual_rows_above: vec![VirtualRow {
+        baseline_above: vec![BaselineRow {
             text: "old line".into(),
-            kind: VirtualRowKind::Deleted,
             stage: DiffStage::Staged,
             emphasis: vec![EmphasisRange { start: 4, end: 8 }],
-            highlights: vec![],
         }],
-        diff_marker: Some(DiffMarker::Modified),
-        diff_stage: DiffStage::Staged,
-        diff_emphasis: vec![EmphasisRange { start: 0, end: 3 }],
-        conflict: None,
+        change: LineChange::Changed {
+            marker: DiffMarker::Modified,
+            stage: DiffStage::Staged,
+            emphasis: vec![EmphasisRange { start: 0, end: 3 }],
+        },
         diagnostics: vec![DiagnosticSpan {
             start: 4,
             end: 9,
@@ -639,58 +624,61 @@ fn logical_line_render_virtual_rows_shape() {
             message: "unused variable".into(),
         }],
         sneak_targets: vec![],
-        patch: None,
     };
     let v = to_value(&with_del).unwrap();
-    assert_eq!(v["virtual_rows_above"][0]["text"], "old line");
-    assert_eq!(v["virtual_rows_above"][0]["kind"], "deleted");
-    assert_eq!(v["virtual_rows_above"][0]["stage"], "staged");
-    assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["start"], 4);
-    assert_eq!(v["virtual_rows_above"][0]["emphasis"][0]["end"], 8);
+    assert_eq!(v["baseline_above"][0]["text"], "old line");
+    assert_eq!(v["baseline_above"][0]["stage"], "staged");
+    assert_eq!(v["baseline_above"][0]["emphasis"][0]["start"], 4);
+    assert_eq!(v["baseline_above"][0]["emphasis"][0]["end"], 8);
     assert!(
-        v["virtual_rows_above"][0].get("highlights").is_none(),
-        "a deleted row carries no spans — omitted rather than sent empty"
+        v["baseline_above"][0].get("highlights").is_none(),
+        "a baseline row carries no spans — omitted rather than sent empty"
     );
-    assert_eq!(v["diff_marker"], "modified");
-    assert_eq!(v["diff_stage"], "staged");
-    assert_eq!(v["diff_emphasis"][0]["start"], 0);
-    assert_eq!(v["diff_emphasis"][0]["end"], 3);
+    // The five fields that used to sit side by side here are one tagged value now.
+    assert_eq!(v["change"]["kind"], "changed");
+    assert_eq!(v["change"]["marker"], "modified");
+    assert_eq!(v["change"]["stage"], "staged");
+    assert_eq!(v["change"]["emphasis"][0]["start"], 0);
+    assert_eq!(v["change"]["emphasis"][0]["end"], 3);
     assert_eq!(v["diagnostics"][0]["start"], 4);
     assert_eq!(v["diagnostics"][0]["end"], 9);
     assert_eq!(v["diagnostics"][0]["severity"], "error");
     assert_eq!(v["diagnostics"][0]["message"], "unused variable");
     let back: LogicalLineRender = from_value(v).unwrap();
-    assert_eq!(back.virtual_rows_above.len(), 1);
-    assert_eq!(back.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
-    assert_eq!(back.virtual_rows_above[0].stage, DiffStage::Staged);
+    assert_eq!(back.baseline_above.len(), 1);
     assert_eq!(
-        back.virtual_rows_above[0].emphasis,
-        vec![EmphasisRange { start: 4, end: 8 }]
+        back.baseline_above[0],
+        BaselineRow {
+            text: "old line".into(),
+            stage: DiffStage::Staged,
+            emphasis: vec![EmphasisRange { start: 4, end: 8 }],
+        }
     );
-    assert_eq!(back.diff_marker, Some(DiffMarker::Modified));
-    assert_eq!(back.diff_stage, DiffStage::Staged);
-    assert_eq!(back.diff_emphasis, vec![EmphasisRange { start: 0, end: 3 }]);
+    assert_eq!(
+        back.change,
+        LineChange::Changed {
+            marker: DiffMarker::Modified,
+            stage: DiffStage::Staged,
+            emphasis: vec![EmphasisRange { start: 0, end: 3 }],
+        }
+    );
     assert_eq!(back.diagnostics[0].severity, DiagnosticSeverity::Error);
 }
 
 #[test]
 fn logical_line_render_conflict_shape() {
     use aether_protocol::viewport::ConflictLine;
-    // The four sides are snake_case on the wire, and a conflicted line carries no diff marker:
-    // the blocks are masked out of the file's diff, so the two decorations never share a line.
-    let line = |conflict| LogicalLineRender {
+    // The four sides are snake_case on the wire. A conflicted line carrying no diff marker is no
+    // longer something to assert — the blocks are masked out of the file's diff, and `LineChange`
+    // now makes that structural rather than a rule two fields had to be trusted to obey.
+    let line = |side| LogicalLineRender {
         logical_line: 3,
         visual_rows: vec![],
         search_matches: vec![],
-        virtual_rows_below: vec![],
-        virtual_rows_above: vec![],
-        diff_marker: None,
-        diff_stage: DiffStage::Unstaged,
-        diff_emphasis: vec![],
-        conflict: Some(conflict),
+        baseline_above: vec![],
+        change: LineChange::Conflict { side },
         diagnostics: vec![],
         sneak_targets: vec![],
-        patch: None,
     };
     for (side, wire) in [
         (ConflictLine::Marker, "marker"),
@@ -699,38 +687,41 @@ fn logical_line_render_conflict_shape() {
         (ConflictLine::Theirs, "theirs"),
     ] {
         let v = to_value(line(side)).unwrap();
-        assert_eq!(v["conflict"], wire);
-        assert!(v.get("diff_marker").is_none());
+        assert_eq!(v["change"]["kind"], "conflict");
+        assert_eq!(v["change"]["side"], wire);
+        // The variants are exclusive by construction, so there is no marker to omit.
+        assert!(v["change"].get("marker").is_none());
         let back: LogicalLineRender = from_value(v).unwrap();
-        assert_eq!(back.conflict, Some(side));
+        assert_eq!(back.change.conflict(), Some(side));
     }
 }
 
 #[test]
 fn logical_line_render_patch_shape() {
     use aether_protocol::viewport::PatchLine;
-    // The two sides are snake_case on the wire, and a patch line carries no diff marker: a
-    // generated patch has no baseline of its own, so the two decorations never share a buffer.
-    let line = |patch| LogicalLineRender {
+    // The two sides are snake_case on the wire. That a patch line carries no diff marker is now a
+    // property of the type rather than an assertion: a generated patch has no baseline of its own,
+    // and `LineChange` has no variant that could express both.
+    let line = |side| LogicalLineRender {
         logical_line: 7,
         visual_rows: vec![],
         search_matches: vec![],
-        virtual_rows_below: vec![],
-        virtual_rows_above: vec![],
-        diff_marker: None,
-        diff_stage: DiffStage::Unstaged,
-        diff_emphasis: vec![],
-        conflict: None,
+        baseline_above: vec![],
+        change: LineChange::Patch {
+            side,
+            stage: DiffStage::Unstaged,
+            emphasis: vec![],
+        },
         diagnostics: vec![],
         sneak_targets: vec![],
-        patch: Some(patch),
     };
     for (side, wire) in [(PatchLine::Added, "added"), (PatchLine::Removed, "removed")] {
         let v = to_value(line(side)).unwrap();
-        assert_eq!(v["patch"], wire);
-        assert!(v.get("diff_marker").is_none());
+        assert_eq!(v["change"]["kind"], "patch");
+        assert_eq!(v["change"]["side"], wire);
+        assert!(v["change"].get("marker").is_none());
         let back: LogicalLineRender = from_value(v).unwrap();
-        assert_eq!(back.patch, Some(side));
+        assert_eq!(back.change.patch_side(), Some(side));
     }
 }
 
@@ -743,46 +734,95 @@ fn patch_chrome_virtual_row_shape() {
     //
     // A section heading is the enclosing signature alone — git's `@@ -a,b +c,d @@` ranges are
     // dropped, so a patch shows no line numbers anywhere.
-    let row = VirtualRow {
-        text: "fn render_window(".into(),
-        kind: VirtualRowKind::HunkHeader,
-        stage: DiffStage::Unstaged,
-        emphasis: vec![],
-        highlights: vec![Highlight {
-            start: 0,
-            end: 17,
-            kind: "diff.hunk".into(),
-        }],
+    let row = Element::Chrome {
+        kind: ChromeKind::HunkHeader,
+        rail: RailJoin::Tees,
+        children: vec![
+            Element::space(1),
+            Element::text(
+                "fn render_window(",
+                vec![Highlight {
+                    start: 0,
+                    end: 17,
+                    kind: "diff.hunk".into(),
+                }],
+            ),
+        ],
     };
     let v = to_value(&row).unwrap();
+    assert_eq!(v["node"], "chrome", "the variant tag");
     assert_eq!(v["kind"], "hunk_header");
+    assert_eq!(v["rail"], "tees");
     assert!(
         v.get("stage").is_none(),
-        "stage is meaningless on chrome — left at its default and omitted"
+        "stage is a deletion's business; chrome has no field for it to be meaningless in"
     );
-    assert_eq!(v["highlights"][0]["kind"], "diff.hunk");
-    let back: VirtualRow = from_value(v).unwrap();
-    assert_eq!(back.kind, VirtualRowKind::HunkHeader);
-    assert_eq!(back.highlights.len(), 1);
+    // The content: chrome's children, laid out left to right, each self-describing under the one
+    // `node` tag the whole vocabulary shares. It used to nest a `layout`/`widget` pair inside a
+    // `content` object — two enums for one idea, and an editor could not appear among them.
+    let children = v["children"].as_array().unwrap();
+    assert_eq!(children[0]["node"], "space");
+    assert_eq!(children[0]["cols"], 1);
+    assert_eq!(children[1]["node"], "text");
+    assert_eq!(children[1]["highlights"][0]["kind"], "diff.hunk");
+    assert!(
+        v.get("content").is_none(),
+        "no wrapper object between chrome and what it draws"
+    );
+    let back: Element = from_value(v).unwrap();
+    assert!(matches!(
+        back,
+        Element::Chrome {
+            kind: ChromeKind::HunkHeader,
+            ..
+        }
+    ));
+    assert_eq!(back, row);
+
+    // A baseline row is a different type entirely, not a sibling variant: chrome belongs to the
+    // view's tree, a phantom deletion belongs to the line it stands above.
+    let del = BaselineRow {
+        text: "gone".into(),
+        stage: DiffStage::Unstaged,
+        emphasis: vec![],
+    };
+    let v = to_value(&del).unwrap();
+    assert_eq!(v["text"], "gone");
+    assert!(v.get("kind").is_none() && v.get("rail").is_none());
+    assert_eq!(from_value::<BaselineRow>(v).unwrap(), del);
 
     for (kind, wire) in [
-        (VirtualRowKind::Deleted, "deleted"),
-        (VirtualRowKind::FileHeader, "file_header"),
-        (VirtualRowKind::HunkHeader, "hunk_header"),
-        (VirtualRowKind::Rule, "rule"),
-        (VirtualRowKind::Spacer, "spacer"),
+        (ChromeKind::FileHeader, "file_header"),
+        (ChromeKind::HunkHeader, "hunk_header"),
+        (ChromeKind::Rule, "rule"),
+        (ChromeKind::Spacer, "spacer"),
+        (ChromeKind::Summary, "summary"),
     ] {
-        let v = to_value(VirtualRow {
-            text: String::new(),
+        let v = to_value(Element::Chrome {
             kind,
-            stage: DiffStage::Unstaged,
-            emphasis: vec![],
-            highlights: vec![],
+            rail: RailJoin::Opens,
+            children: vec![Element::fill('─')],
         })
         .unwrap();
         assert_eq!(v["kind"], wire);
-        let back: VirtualRow = from_value(v).unwrap();
-        assert_eq!(back.kind, kind);
+        assert_eq!(v["children"][0]["node"], "fill");
+        let back: Element = from_value(v).unwrap();
+        assert!(matches!(back, Element::Chrome { kind: k, .. } if k == kind));
+    }
+
+    for (rail, wire) in [
+        (RailJoin::Opens, "opens"),
+        (RailJoin::Tees, "tees"),
+        (RailJoin::Closes, "closes"),
+        (RailJoin::Detached, "detached"),
+    ] {
+        let v = to_value(Element::Chrome {
+            kind: ChromeKind::Rule,
+            rail,
+            children: vec![],
+        })
+        .unwrap();
+        assert_eq!(v["rail"], wire);
     }
 }
 
@@ -1149,7 +1189,7 @@ fn cursor_move_params_use_motion() {
 #[test]
 fn cursor_select_word_params_shape() {
     use aether_protocol::envelope::RpcMethod;
-    assert_eq!(CursorSelectWord::NAME, "cursor/select_word");
+    assert_eq!(CursorSelectWord::NAME, "element/select_word");
 
     // count == 1 (the default) is omitted on the wire.
     let v = to_value(CursorSelectWordParams {
@@ -1190,7 +1230,7 @@ fn cursor_select_word_params_shape() {
 #[test]
 fn cursor_set_params_granularity() {
     use aether_protocol::envelope::RpcMethod;
-    assert_eq!(CursorSet::NAME, "cursor/set");
+    assert_eq!(CursorSet::NAME, "element/set");
 
     // Char granularity (the default) is omitted on the wire.
     let v = to_value(CursorSetParams {
@@ -1455,7 +1495,7 @@ fn input_newline_and_indent_params_shape() {
 fn input_surround_params() {
     use aether_protocol::envelope::RpcMethod;
     use aether_protocol::input::SurroundTarget;
-    assert_eq!(InputSurround::NAME, "input/surround");
+    assert_eq!(InputSurround::NAME, "element/surround");
 
     // `delimiter` is a char — serialises as a one-char JSON string; `target` is snake_case.
     let v = to_value(InputSurroundParams {
@@ -1485,7 +1525,7 @@ fn input_surround_params() {
 fn input_transform_case_params() {
     use aether_protocol::envelope::RpcMethod;
     use aether_protocol::input::{CaseKind, InputTransformCase, InputTransformCaseParams};
-    assert_eq!(InputTransformCase::NAME, "input/transform_case");
+    assert_eq!(InputTransformCase::NAME, "element/transform_case");
 
     // `kind` serialises snake_case; `scan_at_cursor` is omitted when false (Normal mode),
     // matching `input/adjust_number`.
@@ -1530,7 +1570,7 @@ fn toggle_comment_params() {
     use aether_protocol::input::{
         CommentStyle, InputToggleComment, SurroundTarget, ToggleCommentParams,
     };
-    assert_eq!(InputToggleComment::NAME, "input/toggle_comment");
+    assert_eq!(InputToggleComment::NAME, "element/toggle_comment");
 
     // `style` is required and snake_case; `target` defaults to `selection` and is emitted
     // when set (Insert mode sends `line`).
@@ -1571,8 +1611,8 @@ fn toggle_comment_params() {
 #[test]
 fn input_tab_method() {
     use aether_protocol::envelope::RpcMethod;
-    assert_eq!(InputTab::NAME, "input/tab");
-    assert_eq!(InputBackspace::NAME, "input/backspace");
+    assert_eq!(InputTab::NAME, "element/tab");
+    assert_eq!(InputBackspace::NAME, "element/backspace");
 
     let params = to_value(BufferOnlyParams { buffer_id: 7 }).unwrap();
     assert_eq!(params, json!({"buffer_id": 7}));
@@ -1587,7 +1627,7 @@ fn input_tab_method() {
 fn input_delete_word_method() {
     use aether_protocol::envelope::RpcMethod;
     use aether_protocol::input::{InputDeleteWord, InputDeleteWordParams};
-    assert_eq!(InputDeleteWord::NAME, "input/delete_word");
+    assert_eq!(InputDeleteWord::NAME, "element/delete_word");
 
     let back = to_value(InputDeleteWordParams {
         buffer_id: 5,
@@ -1623,7 +1663,7 @@ fn input_delete_word_method() {
 #[test]
 fn input_adjust_number_methods() {
     use aether_protocol::envelope::RpcMethod;
-    assert_eq!(InputAdjustNumber::NAME, "input/adjust_number");
+    assert_eq!(InputAdjustNumber::NAME, "element/adjust_number");
 
     // Signed delta rides on the wire both ways (increment is `+count`, decrement `-count`).
     // `scan_at_cursor` is omitted when false (Normal mode) and present in Insert mode.
@@ -1747,7 +1787,7 @@ fn buffer_open_result_restored_scroll() {
         scratch_number: None,
         cursor: Default::default(),
         scroll: Some(ScrollPosition {
-            logical_line: 7,
+            logical_line: ViewLine(7),
             sub_row: 0.5,
         }),
         lsp_server: None,
@@ -1791,9 +1831,9 @@ fn method_name_constants() {
     assert_eq!(WorkspaceList::NAME, "workspace/list");
     assert_eq!(WorkspaceActivate::NAME, "workspace/activate");
     assert_eq!(BufferOpen::NAME, "buffer/open");
-    assert_eq!(CursorMove::NAME, "cursor/move");
-    assert_eq!(InputText::NAME, "input/text");
-    assert_eq!(ViewportLinesChanged::NAME, "viewport/lines_changed");
+    assert_eq!(CursorMove::NAME, "element/move");
+    assert_eq!(InputText::NAME, "element/text");
+    assert_eq!(ViewportLinesChanged::NAME, "view/lines_changed");
     assert_eq!(DirectoryList::NAME, "directory/list");
 }
 
@@ -1878,17 +1918,24 @@ fn directory_list_result_skips_none_parent() {
 #[test]
 fn viewport_lines_changed_params_cursor_shape() {
     let base = ViewportLinesChangedParams {
+        buffer: 7,
         viewport_id: 7,
         revision: 42,
         range: LogicalLineRange {
-            start_logical_line: 10,
-            end_logical_line_exclusive: 20,
+            start_view_line: ViewLine(10),
+            end_view_line_exclusive: ViewLine(20),
         },
-        replacement_lines: Vec::new(),
-        line_count: 100,
-        max_scroll_logical_line: 90,
+        root: Element::Editor {
+            element: 0,
+            buffer: 0,
+            rows: 0,
+            first_buffer_line: 0,
+            lines: Vec::new(),
+        },
+        view_line_count: 100,
+        max_scroll_view_line: ViewLine(90),
         total_visual_rows: 100,
-        first_visual_row: 10,
+        first_visual_row: VisualRow(10),
         max_line_width: 0,
         git_status: None,
         cursor: None,
@@ -1932,11 +1979,11 @@ fn notification_roundtrip() {
     let n = Notification {
         jsonrpc: JsonRpc,
         method: ViewportLinesChanged::NAME.into(),
-        params: json!({"viewport_id": 1, "revision": 5, "range": {}, "replacement_lines": []}),
+        params: json!({"viewport_id": 1, "revision": 5, "range": {}, "root": {"node": "editor", "element": 0, "buffer": 3, "rows": 0, "first_buffer_line": 0, "lines": []}}),
     };
     let s = serde_json::to_string(&n).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
-    assert_eq!(v["method"], "viewport/lines_changed");
+    assert_eq!(v["method"], "view/lines_changed");
     assert!(v.get("id").is_none(), "notifications carry no id");
 }
 
@@ -2062,14 +2109,14 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
     use aether_protocol::viewport::{
         ScrollPosition, ViewportSubscribe, ViewportSubscribeParams, WrapMode,
     };
-    assert_eq!(ViewportSubscribe::NAME, "viewport/subscribe");
+    assert_eq!(ViewportSubscribe::NAME, "view/subscribe");
     let p = ViewportSubscribeParams {
-        buffer_id: 1,
+        buffer_id: aether_protocol::ViewId(1),
         cols: 80,
         rows: 24,
         overscan_rows: 0,
         scroll: ScrollPosition {
-            logical_line: 0,
+            logical_line: ViewLine(0),
             sub_row: 0.0,
         },
         wrap: WrapMode::None,
@@ -4980,7 +5027,7 @@ fn external_change_error_codes_distinct() {
 #[test]
 fn cursor_select_all_params_wire_shape() {
     use aether_protocol::cursor::{CursorSelectAll, CursorSelectAllParams};
-    assert_eq!(CursorSelectAll::NAME, "cursor/select_all");
+    assert_eq!(CursorSelectAll::NAME, "element/select_all");
     let p = CursorSelectAllParams { buffer_id: 7 };
     assert_eq!(to_value(&p).unwrap(), json!({ "buffer_id": 7 }));
     let back: CursorSelectAllParams = from_value(json!({ "buffer_id": 7 })).unwrap();
@@ -4990,7 +5037,7 @@ fn cursor_select_all_params_wire_shape() {
 #[test]
 fn cursor_swap_anchor_params_wire_shape() {
     use aether_protocol::cursor::{CursorSwapAnchor, CursorSwapAnchorParams};
-    assert_eq!(CursorSwapAnchor::NAME, "cursor/swap_anchor");
+    assert_eq!(CursorSwapAnchor::NAME, "element/swap_anchor");
 
     // `forward_only == false` is the default and stays off the wire, so pre-flag params still
     // parse and the plain swap's wire shape is unchanged.
@@ -5532,6 +5579,7 @@ fn block_edit_wire_shapes() {
 
     // The shared result: reason and text (delete's clipboard) skip when absent.
     let v = to_value(BlockEditResult {
+        buffer: 3,
         applied: false,
         reason: None,
         revision: 7,
@@ -5542,6 +5590,7 @@ fn block_edit_wire_shapes() {
     assert!(v.get("reason").is_none(), "quiet refusal has no reason");
     assert!(v.get("text").is_none());
     let v = to_value(BlockEditResult {
+        buffer: 3,
         applied: false,
         reason: Some("Front matter stays at the top".into()),
         revision: 7,
@@ -5787,41 +5836,42 @@ fn round_trips<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) {
 // ---- viewport/* results (the highest-bandwidth type on the wire) --------------------------------
 
 fn sample_window() -> aether_protocol::viewport::Window {
-    use aether_protocol::viewport::{Highlight, Segment, VisualRow, Window};
+    use aether_protocol::viewport::{Highlight, Segment, Window, WrappedRow};
     Window {
-        first_logical_line: 4,
-        last_logical_line_exclusive: 6,
-        line_count: 120,
-        max_scroll_logical_line: 110,
+        first_view_line: ViewLine(4),
+        last_view_line_exclusive: ViewLine(6),
+        view_line_count: 120,
+        max_scroll_view_line: ViewLine(110),
         total_visual_rows: 130,
-        first_visual_row: 5,
+        first_visual_row: VisualRow(5),
         max_line_width: 88,
         git_status: None,
-        lines: vec![LogicalLineRender {
-            logical_line: 4,
-            visual_rows: vec![VisualRow {
-                byte_offset: 0,
-                continuation_indent: 0,
-                segments: vec![Segment {
-                    text: "fn main() {".into(),
-                    highlights: vec![Highlight {
-                        start: 0,
-                        end: 2,
-                        kind: "keyword".into(),
+        root: Element::Editor {
+            element: 0,
+            buffer: 7,
+            rows: 130,
+            first_buffer_line: 4,
+            lines: vec![LogicalLineRender {
+                logical_line: 4,
+                visual_rows: vec![WrappedRow {
+                    byte_offset: 0,
+                    continuation_indent: 0,
+                    segments: vec![Segment {
+                        text: "fn main() {".into(),
+                        highlights: vec![Highlight {
+                            start: 0,
+                            end: 2,
+                            kind: "keyword".into(),
+                        }],
                     }],
                 }],
+                search_matches: Vec::new(),
+                baseline_above: Vec::new(),
+                change: Default::default(),
+                diagnostics: Vec::new(),
+                sneak_targets: Vec::new(),
             }],
-            search_matches: Vec::new(),
-            virtual_rows_above: Vec::new(),
-            virtual_rows_below: Vec::new(),
-            diff_marker: None,
-            diff_stage: DiffStage::default(),
-            diff_emphasis: Vec::new(),
-            conflict: None,
-            diagnostics: Vec::new(),
-            sneak_targets: Vec::new(),
-            patch: None,
-        }],
+        },
     }
 }
 
@@ -5834,10 +5884,10 @@ fn viewport_window_result_wire_shape() {
         window: sample_window(),
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v["window"]["first_logical_line"], 4);
-    assert_eq!(v["window"]["last_logical_line_exclusive"], 6);
-    assert_eq!(v["window"]["line_count"], 120);
-    assert_eq!(v["window"]["max_scroll_logical_line"], 110);
+    assert_eq!(v["window"]["first_view_line"], 4);
+    assert_eq!(v["window"]["last_view_line_exclusive"], 6);
+    assert_eq!(v["window"]["view_line_count"], 120);
+    assert_eq!(v["window"]["max_scroll_view_line"], 110);
     assert_eq!(v["window"]["total_visual_rows"], 130);
     assert_eq!(v["window"]["first_visual_row"], 5);
     assert_eq!(v["window"]["max_line_width"], 88);
@@ -5845,23 +5895,23 @@ fn viewport_window_result_wire_shape() {
         v["window"].get("git_status").is_none(),
         "absent outside a repo rather than null"
     );
-    let row = &v["window"]["lines"][0]["visual_rows"][0];
+    assert_eq!(
+        v["window"]["root"]["node"], "editor",
+        "an ordinary buffer is one element"
+    );
+    let row = &v["window"]["root"]["lines"][0]["visual_rows"][0];
     assert_eq!(row["byte_offset"], 0);
     assert_eq!(row["segments"][0]["text"], "fn main() {");
     assert_eq!(row["segments"][0]["highlights"][0]["kind"], "keyword");
     // Empty per-line extras stay off the wire — they ride every rendered line, so this is the
     // difference between a compact frame and a bloated one.
-    let line = &v["window"]["lines"][0];
+    let line = &v["window"]["root"]["lines"][0];
     for absent in [
         "search_matches",
-        "virtual_rows_above",
-        "virtual_rows_below",
-        "diff_marker",
-        "diff_emphasis",
-        "conflict",
+        "baseline_above",
+        "change",
         "diagnostics",
         "sneak_targets",
-        "patch",
     ] {
         assert!(
             line.get(absent).is_none(),
@@ -5890,7 +5940,7 @@ fn viewport_params_round_trip() {
         &ViewportScrollParams {
             viewport_id: 3,
             scroll: aether_protocol::viewport::ScrollPosition {
-                logical_line: 12,
+                logical_line: ViewLine(12),
                 sub_row: 0.5,
             },
         },
@@ -5899,7 +5949,7 @@ fn viewport_params_round_trip() {
     wire_keys(
         &ViewportScrollToRowParams {
             viewport_id: 3,
-            top_visual_row: 42,
+            top_visual_row: VisualRow(42),
         },
         &["viewport_id", "top_visual_row"],
     );
@@ -5943,7 +5993,7 @@ fn previously_unpinned_params_round_trip() {
         round_trips(&plain);
         wire_keys(
             &BufferCloseParams {
-                buffer_id: 7,
+                buffer_id: aether_protocol::ViewId(7),
                 open_next: true,
             },
             &["buffer_id", "open_next"],
@@ -6012,4 +6062,150 @@ fn previously_unpinned_params_round_trip() {
         },
         &["buffer_id", "direction", "extend", "options"],
     );
+}
+
+/// The browser shell hand-mirrors the wire types in TypeScript, and `tsc` cannot know when the Rust
+/// side renames a field — it only checks the mirror against itself. So a rename lands, the bundle
+/// builds, the types check, and the web client silently reads `undefined` for a field that moved.
+///
+/// That is not hypothetical: `Window` gained view-space names (`first_view_line`, `view_line_count`,
+/// `max_scroll_view_line`) and `Element::Editor`'s line became `first_buffer_line`, while
+/// `web/src/protocol.ts` still declared every old name and type-checked clean.
+///
+/// One-directional, like the theme's CSS check: the mirror may carry extra fields (it declares
+/// client-only shapes too), but every key Rust actually *serialises* must appear in it.
+#[test]
+fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
+    use aether_protocol::coords::{ViewLine, VisualRow};
+    use aether_protocol::viewport::{Element, Window};
+
+    let ts = include_str!("../../../web/src/protocol.ts");
+    let window = Window {
+        first_view_line: ViewLine(0),
+        last_view_line_exclusive: ViewLine(1),
+        view_line_count: 1,
+        max_scroll_view_line: ViewLine(0),
+        total_visual_rows: 1,
+        first_visual_row: VisualRow(0),
+        max_line_width: 0,
+        // `None` would be skipped, and a field that never serialises cannot be checked.
+        git_status: Some(Default::default()),
+        root: Element::Editor {
+            element: 0,
+            buffer: 1,
+            rows: 1,
+            first_buffer_line: 0,
+            lines: Vec::new(),
+        },
+    };
+    let value = to_value(&window).unwrap();
+    let mut keys: Vec<String> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| *k != "root")
+        .cloned()
+        .collect();
+    // The editor node's own keys travel inside `root`, and are just as easy to miss.
+    keys.extend(
+        value["root"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| *k != "node")
+            .cloned(),
+    );
+
+    let missing: Vec<&String> = keys
+        .iter()
+        .filter(|k| !ts.contains(&format!("{k}:")) && !ts.contains(&format!("{k}?:")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "wire fields with no declaration in web/src/protocol.ts: {missing:?}"
+    );
+}
+
+/// A composed view's subscribe carries the focus; an ordinary one omits it entirely.
+///
+/// The field is what stops a client holding two line spaces at once — its cursor in the view's own
+/// document while every rendered line belongs to a file — so its absence has to mean "nothing to
+/// reconcile" rather than "unknown". Pinned here because the browser shell hand-mirrors these types
+/// and `tsc` cannot see a Rust rename.
+#[test]
+fn a_composed_views_subscribe_carries_the_focus_it_resolved() {
+    use aether_protocol::viewport::{ViewportFocusElementResult, ViewportSubscribeResult, Window};
+    let window = || Window {
+        first_view_line: ViewLine(0),
+        last_view_line_exclusive: ViewLine(1),
+        view_line_count: 1,
+        max_scroll_view_line: ViewLine(0),
+        total_visual_rows: 1,
+        first_visual_row: aether_protocol::coords::VisualRow(0),
+        max_line_width: 0,
+        git_status: None,
+        root: aether_protocol::viewport::Element::Editor {
+            element: 0,
+            buffer: 9,
+            rows: 1,
+            first_buffer_line: 17,
+            lines: vec![],
+        },
+    };
+
+    let ordinary = ViewportSubscribeResult {
+        viewport_id: 1,
+        window: window(),
+        buffer_status: Default::default(),
+        focus: None,
+    };
+    let v = to_value(&ordinary).unwrap();
+    assert!(
+        v.get("focus").is_none(),
+        "an ordinary view says nothing about focus: {v}"
+    );
+
+    let composed = ViewportSubscribeResult {
+        viewport_id: 1,
+        window: window(),
+        buffer_status: Default::default(),
+        focus: Some(ViewportFocusElementResult {
+            element: 2,
+            buffer: aether_protocol::buffer::BufferOpenResult {
+                buffer_id: 9,
+                language: None,
+                line_count: 40,
+                byte_count: 400,
+                revision: 1,
+                saved_revision: 1,
+                path: Some("/repo/a.rs".into()),
+                scratch_number: None,
+                cursor: Default::default(),
+                scroll: None,
+                lsp_server: None,
+                transient: false,
+                title: None,
+                read_only: false,
+                is_patch: false,
+            },
+        }),
+    };
+    let v = to_value(&composed).unwrap();
+    assert_eq!(v["focus"]["element"], 2);
+    assert_eq!(v["focus"]["buffer"]["buffer_id"], 9);
+    let back: ViewportSubscribeResult = from_value(v).unwrap();
+    assert_eq!(
+        back.focus.expect("focus survives the round trip").element,
+        2
+    );
+}
+
+/// `view/window_at_cursor` takes nothing but the viewport: both halves of the question — where the
+/// cursor is and how the view is laid out — live on the server, so no coordinate crosses the wire.
+#[test]
+fn window_at_cursor_names_no_coordinates() {
+    use aether_protocol::viewport::{ViewportWindowAtCursor, ViewportWindowAtCursorParams};
+    assert_eq!(ViewportWindowAtCursor::NAME, "view/window_at_cursor");
+    let v = to_value(ViewportWindowAtCursorParams { viewport_id: 3 }).unwrap();
+    assert_eq!(v, json!({ "viewport_id": 3 }));
 }

@@ -226,7 +226,8 @@ async fn wait_for_close(
             },
             _ = tokio::signal::ctrl_c() => {
                 let close = handle.rpc::<BufferClose>(BufferCloseParams {
-                    buffer_id,
+                    // The `--web` waiter tethers to one file, whose view is that file.
+                    buffer_id: aether_protocol::ViewId(buffer_id),
                     open_next: false,
                 });
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), close).await;

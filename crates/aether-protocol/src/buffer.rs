@@ -174,7 +174,10 @@ impl RpcMethod for BufferClose {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferCloseParams {
-    pub buffer_id: BufferId,
+    /// The **view** to close. Closing has always addressed the view rather than the text — a patch
+    /// closes as a patch, not as one of the files it happens to window — and the type now says so.
+    /// `#[serde(transparent)]`, so the wire is unchanged.
+    pub buffer_id: crate::ViewId,
     /// Also open the next buffer (the MRU successor, or a fresh scratch when none remain) and
     /// return it in `opened` — the close-then-attach client chain folded into one round-trip.
     #[serde(default)]

@@ -26,8 +26,8 @@ use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, strip_longest_root,
     AfterSave, AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind,
     ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView,
-    ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, SearchState, Session, SettingsRow,
-    SneakState, TextField, WorkspaceSettings,
+    ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, Session, SettingsRow, SneakState, TextField,
+    ViewState, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -38,6 +38,7 @@ use aether_protocol::buffer::{
     BufferOpenResult, BufferReload, BufferReloadParams, BufferSave, BufferSaveParams,
     BufferSetTransient, BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
 };
+use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
     CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
@@ -99,7 +100,7 @@ use aether_protocol::jumplist::{
     JumplistStepScope,
 };
 use aether_protocol::lsp::{
-    DiagnosticCounts, DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
+    DiagnosticDirection, FormatStatus, LspBufferParams, LspDiagnosticsChanged,
     LspDiagnosticsChangedParams, LspDocumentHighlight, LspDocumentHighlightParams, LspFormat,
     LspFormatResult, LspGotoDefinition, LspGotoDefinitionResult, LspHover, LspHoverResult,
     LspNavigateDiagnostic, LspNavigateDiagnosticParams, LspNavigateDiagnosticResult, LspReadiness,
@@ -130,7 +131,9 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::viewport::{
-    DiagnosticSeverity, ViewportLinesChanged, ViewportLinesChangedParams, ViewportSubscribeResult,
+    DiagnosticSeverity, FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+    ViewportFocusElementResult, ViewportLinesChanged, ViewportLinesChangedParams,
+    ViewportNavigateChange, ViewportNavigateChangeParams, ViewportSubscribeResult,
     ViewportWindowResult, Window, WrapMode,
 };
 use aether_protocol::workspace::{
@@ -143,7 +146,7 @@ use aether_protocol::workspace::{
     WorkspaceRemoveRootResult, WorkspaceRename, WorkspaceRenameParams, WorkspaceRenamed,
     WorkspaceRenamedParams,
 };
-use aether_protocol::{BufferId, LogicalPosition};
+use aether_protocol::{BufferId, LogicalPosition, ViewId};
 
 /// A core event: an async result (or shell-forwarded input) the core's update consumes.
 #[derive(Debug)]
@@ -162,6 +165,14 @@ pub enum Event {
     CursorJump(Result<CursorState, String>),
     /// An edit resolved: adopt the new revision + cursor.
     EditDone(Result<EditResult, String>),
+    /// Focus moved to another editor element by *navigation* — `Tab`, `c` — where the element being
+    /// moved to is not necessarily on screen: adopt its cursor and buffer, and frame it.
+    ElementFocused(Result<ViewportFocusElementResult, String>),
+    /// Focus moved because the user **clicked** an element: adopt its cursor and buffer, and frame
+    /// nothing. A click is not blind navigation — the user is looking at what they clicked — so
+    /// scrolling it to a rest position moves the text out from under the pointer, and a press whose
+    /// content then moves turns the next drag event into a selection nobody asked for.
+    ElementClicked(Result<ViewportFocusElementResult, String>),
     UndoRedoDone(Result<UndoResult, String>),
     /// A structural block edit resolved: adopt revision + cursor, clipboard the cut payload, toast
     /// a reasoned refusal, refresh the reading view's parse.
@@ -377,7 +388,7 @@ pub enum Event {
         result: Result<PathDeleteResult, String>,
     },
     /// `buffer/set_transient` (the `Space k` keep toggle) resolved. The bool is the buffer's new
-    /// transient flag; the toast confirms it (`self.buffer.transient` itself rides the `buffer/state`
+    /// transient flag; the toast confirms it (`self.view.buffer.transient` itself rides the `buffer/state`
     /// push). Errors surface as an error toast.
     KeepToggled(Result<bool, String>),
     /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
@@ -539,15 +550,15 @@ impl Session {
     /// server-side, so entering Normal mode (or landing in a buffer) paints without waiting for
     /// a move. Run by both reducer entry points so every transition is covered exactly once.
     fn sync_decoration_follow(&mut self) -> Effects {
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         let mut fx = Effects::none();
 
         // Blame label: Normal mode on anything with a history to attribute — a file-backed buffer,
         // or a file at a revision (which has no path but blames at its own revision). Insert mode
         // unfollows so typing never has the server recomputing whole-file blame in the pauses.
-        let want_blame = (self.mode == Mode::Normal
+        let want_blame = (self.view.mode == Mode::Normal
             && buffer_id != 0
-            && (self.buffer.path.is_some() || self.buffer.is_revision_file()))
+            && (self.view.buffer.path.is_some() || self.view.buffer.is_revision_file()))
         .then_some(buffer_id);
         if self.blame_follow_on != want_blame {
             if let Some(old) = self.blame_follow_on {
@@ -573,10 +584,10 @@ impl Session {
 
         // Symbol highlights: Normal mode, no active search (a search owns the highlight layer),
         // and only for buffers with a language server, so plain-text buffers never round-trip.
-        let want_hl = (self.mode == Mode::Normal
-            && !self.search.active
+        let want_hl = (self.view.mode == Mode::Normal
+            && !self.view.search.active
             && buffer_id != 0
-            && self.buffer.lsp_server.is_some())
+            && self.view.buffer.lsp_server.is_some())
         .then_some(buffer_id);
         if self.highlight_follow_on != want_hl {
             if let Some(old) = self.highlight_follow_on {
@@ -605,7 +616,7 @@ impl Session {
     fn dispatch_event(&mut self, event: Event) -> Effects {
         match event {
             Event::CursorMsg(Ok(cursor)) => {
-                self.buffer.cursor = cursor;
+                self.view.buffer.cursor = cursor;
                 // A staged cross-file-anchor parse installs now — the cursor is on the
                 // heading, so the first paint lands in place.
                 self.install_staged_read()
@@ -620,15 +631,43 @@ impl Session {
             Event::CursorJump(Err(e)) => Effects::error_detail("Jump failed", e),
 
             Event::EditDone(Ok(r)) => {
-                self.buffer.revision = r.revision;
-                self.buffer.cursor = r.cursor;
+                self.adopt_edit(r.buffer, r.revision, r.cursor);
                 Effects::one(Effect::RevealCursor(RevealStyle::Follow))
             }
             Event::EditDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
+            Event::ElementFocused(Ok(r)) => {
+                // Navigating to another element is a **jump**, and reveals like every other one
+                // (goto-definition, a search hit, a grep result): off screen, it rests near the top
+                // with context below; already on screen, it leaves the view exactly where it is.
+                //
+                // Not a *minimal* reveal, which is what this used to be: that scrolls the target
+                // just far enough to touch the bottom row, so moving to a tall hunk showed one line
+                // of it — "Tab didn't scroll". And not an unconditional re-frame either, which
+                // scrolls when the thing you asked for is already in front of you.
+                //
+                // Focus that didn't move (`Tab` at the last element) still reveals rather than
+                // jumps: nothing was navigated to, so there is nothing to rest.
+                let style = if self.adopt_focus(r) {
+                    RevealStyle::Jump
+                } else {
+                    RevealStyle::Follow
+                };
+                Effects::one(Effect::RevealCursor(style))
+            }
+            Event::ElementFocused(Err(e)) => Effects::error_detail("Focus failed", e),
+
+            // A click frames nothing — see [`Event::ElementClicked`]. The `cursor/set` the press
+            // sends next is what moves the cursor, and its own reveal keeps it on screen if the
+            // click landed at the very edge.
+            Event::ElementClicked(Ok(r)) => {
+                self.adopt_focus(r);
+                Effects::none()
+            }
+            Event::ElementClicked(Err(e)) => Effects::error_detail("Focus failed", e),
+
             Event::UndoRedoDone(Ok(r)) => {
-                self.buffer.revision = r.revision;
-                self.buffer.cursor = r.cursor;
+                self.adopt_edit(r.buffer, r.revision, r.cursor);
                 let mut fx = if r.applied {
                     Effects::none()
                 } else {
@@ -641,13 +680,12 @@ impl Session {
                 // straight off our own response rather than relying on the server's change
                 // push alone (idempotent — the in-flight guard drops the duplicate when the
                 // push arrives too).
-                fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
+                fx.and(self.maybe_refresh_read(self.view.buffer.buffer_id, r.revision))
             }
             Event::UndoRedoDone(Err(e)) => Effects::error_detail("Undo/redo failed", e),
 
             Event::BlockEditDone(Ok(r)) => {
-                self.buffer.revision = r.revision;
-                self.buffer.cursor = r.cursor;
+                self.adopt_edit(r.buffer, r.revision, r.cursor);
                 let mut fx = Effects::none();
                 if let Some(text) = r.text {
                     // The cut payload.
@@ -664,13 +702,13 @@ impl Session {
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
                 // The edit changed the text under the reading view's parse — refresh off our
                 // own response, exactly like undo (revisions identify states, `!=` guard).
-                fx.and(self.maybe_refresh_read(self.buffer.buffer_id, r.revision))
+                fx.and(self.maybe_refresh_read(self.view.buffer.buffer_id, r.revision))
             }
             Event::BlockEditDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
             Event::OpenBlockDone(Ok(r)) => {
-                self.buffer.revision = r.revision;
-                self.buffer.cursor = r.cursor;
+                self.view.buffer.revision = r.revision;
+                self.view.buffer.cursor = r.cursor;
                 let mut fx = Effects::none();
                 if r.applied {
                     // The caret is already parked in the block the server opened (its landing is
@@ -678,7 +716,7 @@ impl Session {
                     // nothing to correct for. A refusal leaves the reading view exactly as it
                     // was — the transition is the *edit's* to make, not the keypress's.
                     self.read_exit_for_edit();
-                    self.mode = Mode::Insert;
+                    self.view.mode = Mode::Insert;
                 } else if let Some(reason) = r.reason {
                     fx = fx.and(Effects::toast_grouped(
                         reason,
@@ -708,8 +746,8 @@ impl Session {
             Event::CopyDone(Err(e)) => Effects::error_detail("Copy failed", e),
 
             Event::CutDone(Ok(r)) => {
-                self.buffer.revision = r.revision;
-                self.buffer.cursor = r.cursor;
+                self.view.buffer.revision = r.revision;
+                self.view.buffer.cursor = r.cursor;
                 let mut fx =
                     Effects::toast(format!("Cut {} bytes", r.text.len()), ToastKind::Success);
                 fx.push(Effect::WriteClipboard(r.text));
@@ -748,10 +786,10 @@ impl Session {
             Event::Switched(Err(e)) => self.open_failed(e),
 
             Event::ReadContent(Ok(c)) => {
-                let Some(read) = self.read.as_mut() else {
+                let Some(read) = self.view.read.as_mut() else {
                     return Effects::none(); // reading view was left while the fetch was in flight
                 };
-                if read.buffer_id != self.buffer.buffer_id {
+                if read.buffer_id != self.view.buffer.buffer_id {
                     return Effects::none(); // buffer switched under the fetch
                 }
                 // The buffer moved on while the fetch was in flight — chase the newer
@@ -764,7 +802,7 @@ impl Session {
                 // later, so the stale adopt is transient. A pending anchor stays armed for
                 // the fresh fetch, and the view stays loading meanwhile (the anchor-hold
                 // invariant: no paint before place).
-                if self.buffer.revision > c.revision {
+                if self.view.buffer.revision > c.revision {
                     if self.pending_read_anchor.is_none() {
                         read.adopt(c.revision, c.text);
                     }
@@ -773,7 +811,7 @@ impl Session {
                 // A followed cross-file anchor is pending: stage the parse instead of
                 // installing it — the document paints once, already in place.
                 if self.pending_read_anchor.is_some() {
-                    let mut staged = ReadView::loading(self.buffer.buffer_id);
+                    let mut staged = ReadView::loading(self.view.buffer.buffer_id);
                     staged.adopt(c.revision, c.text);
                     return self.stage_read_place(staged);
                 }
@@ -783,8 +821,8 @@ impl Session {
             Event::ReadContent(Err(e)) => {
                 self.pending_read_anchor = None;
                 // Fall back to the editor rather than showing an empty page.
-                if self.read.take().is_some() && self.mode == Mode::Read {
-                    self.mode = Mode::Normal;
+                if self.view.read.take().is_some() && self.view.mode == Mode::Read {
+                    self.view.mode = Mode::Normal;
                 }
                 Effects::error_detail("Reading view failed to load", e)
             }
@@ -799,7 +837,7 @@ impl Session {
                 let Ok(r) = result else {
                     return Effects::none();
                 };
-                let Some(read) = self.read.as_mut() else {
+                let Some(read) = self.view.read.as_mut() else {
                     return Effects::none();
                 };
                 if read.buffer_id != buffer_id
@@ -918,7 +956,7 @@ impl Session {
             // with the list rather than lingering until the next keystroke.
             Event::JumplistCleared(Ok(r)) => {
                 if let Some(cursor) = r.cursor {
-                    self.buffer.cursor = cursor;
+                    self.view.buffer.cursor = cursor;
                 }
                 let msg = if r.cleared == 0 {
                     "Jumplist is already empty".to_string()
@@ -939,9 +977,9 @@ impl Session {
             Event::PromptCancel => self.decline_prompt(),
 
             Event::SearchApplied(Ok(r)) => {
-                self.buffer.cursor = r.cursor;
+                self.view.buffer.cursor = r.cursor;
                 let zero = r.summary.total == 0;
-                self.search.summary = Some(r.summary);
+                self.view.search.summary = Some(r.summary);
                 if zero {
                     // A failed keystroke shouldn't strand the user wherever the previous
                     // query had jumped them.
@@ -953,8 +991,8 @@ impl Session {
             Event::SearchApplied(Err(_)) => {
                 // Most commonly an invalid regex mid-type (e.g. a trailing `\`): treat as a
                 // transient zero-match state.
-                self.search.summary = Some(SearchSummary {
-                    buffer_id: self.buffer.buffer_id,
+                self.view.search.summary = Some(SearchSummary {
+                    buffer_id: self.view.buffer.buffer_id,
                     total: 0,
                     truncated: false,
                     current_index: 0,
@@ -966,13 +1004,13 @@ impl Session {
             }
 
             Event::SearchRestored(Ok(r)) => {
-                self.search.summary = Some(r.summary);
+                self.view.search.summary = Some(r.summary);
                 Effects::none()
             }
             Event::SearchRestored(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::SearchNav(Ok(r)) => {
-                self.search.summary = Some(r.summary);
+                self.view.search.summary = Some(r.summary);
                 self.jump_to_cursor(r.cursor)
             }
             Event::SearchNav(Err(e)) => Effects::error_detail("Search failed", e),
@@ -980,7 +1018,7 @@ impl Session {
             Event::SneakUpdated(Ok(result)) => {
                 // The session may have ended (label pressed, Esc) before this result landed; only
                 // adopt labels while still sneaking.
-                if let Some(sneak) = self.sneak.as_mut() {
+                if let Some(sneak) = self.view.sneak.as_mut() {
                     sneak.labels = result.labels;
                 }
                 Effects::none()
@@ -988,13 +1026,13 @@ impl Session {
             Event::SneakUpdated(Err(e)) => Effects::error_detail("Sneak failed", e),
 
             Event::SearchFromSel(Ok(Some((query, r)))) => {
-                self.search.query = query.clone();
+                self.view.search.query = query.clone();
                 // Mirror the defaults the request went out with, so the committed search's state
                 // matches how the server is actually matching it.
-                self.search.options = MatchOptions::default();
-                self.search.active = true;
-                self.search.summary = Some(r.summary);
-                let entry = HistoryEntry::with_options(query, self.search.options);
+                self.view.search.options = MatchOptions::default();
+                self.view.search.active = true;
+                self.view.search.summary = Some(r.summary);
+                let entry = HistoryEntry::with_options(query, self.view.search.options);
                 self.record_history(HistoryKind::Search, entry)
             }
             Event::SearchFromSel(Ok(None)) => Effects::none(), // empty selection
@@ -1065,14 +1103,14 @@ impl Session {
             Event::HoverInfo(Err(e)) => Effects::error_detail("Hover failed", e),
 
             Event::FormatDone(Ok(r)) => {
-                self.buffer.cursor = r.cursor;
+                self.view.buffer.cursor = r.cursor;
                 // Specific feedback per outcome — "nothing happened" has several causes.
                 let note = match r.status {
                     FormatStatus::Applied => None,
                     FormatStatus::NoChange => Some("Already formatted".to_string()),
                     FormatStatus::NotReady => Some("Language server still starting".to_string()),
                     FormatStatus::Unavailable => Some("Language server unavailable".to_string()),
-                    FormatStatus::Unsupported => Some(match self.buffer.language.as_deref() {
+                    FormatStatus::Unsupported => Some(match self.view.buffer.language.as_deref() {
                         Some(lang) => format!("No formatter for {lang}"),
                         None => "No formatter for this file".to_string(),
                     }),
@@ -1138,7 +1176,7 @@ impl Session {
                         BufferOpenParams {
                             absolute_path: Some(prepared.path),
                             transient: Some(false),
-                            record_nav_from: Some(self.buffer.buffer_id),
+                            record_nav_from: Some(self.view.buffer.buffer_id),
                             ..Default::default()
                         },
                         Event::Switched,
@@ -1717,7 +1755,7 @@ impl Session {
                 result,
             } => match result {
                 Ok(r) => {
-                    self.buffer.cursor = r.cursor;
+                    self.view.buffer.cursor = r.cursor;
                     // The wording names what was acted on — "Staged file" after `Space g Alt-s`
                     // and "Staged change" after `Space g s` — because at a glance the toast is the
                     // only confirmation of *how much* just moved into the index.
@@ -1801,7 +1839,7 @@ impl Session {
 
             Event::ConflictResolved { side, result } => match result {
                 Ok(r) => {
-                    self.buffer.cursor = r.cursor;
+                    self.view.buffer.cursor = r.cursor;
                     match r.status {
                         // The side kept and how many are left — the buffer just changed under the
                         // user, and reaching zero is what says the file is done. No instructions:
@@ -1841,7 +1879,7 @@ impl Session {
             Event::DiffViewSet { enabled, result } => match result {
                 Ok(r) => {
                     self.diff_view = enabled;
-                    self.window = Some(r.window);
+                    self.view.window = Some(r.window);
                     let mut fx = Effects::one(Effect::WindowAdopted);
                     // Grouped so repeated toggling updates one toast in place rather than stacking.
                     fx.push(Effect::Toast {
@@ -1964,13 +2002,13 @@ impl Session {
                     anchor,
                 } => self.open_path_at(path, Some(position), anchor),
                 PickerSelectResult::Buffer { buffer_id } => {
-                    if buffer_id == self.buffer.buffer_id {
+                    if buffer_id == self.view.buffer.buffer_id {
                         return Effects::none(); // already showing it
                     }
                     self.request_str::<BufferOpen>(
                         BufferOpenParams {
                             buffer_id: Some(buffer_id),
-                            record_nav_from: Some(self.buffer.buffer_id),
+                            record_nav_from: Some(self.view.buffer.buffer_id),
                             ..Default::default()
                         },
                         Event::Switched,
@@ -1989,8 +2027,8 @@ impl Session {
                     BufferOpenParams {
                         buffer_id: Some(buffer_id),
                         jump_to: Some(position),
-                        record_nav_from: (buffer_id != self.buffer.buffer_id)
-                            .then_some(self.buffer.buffer_id),
+                        record_nav_from: (buffer_id != self.view.buffer.buffer_id)
+                            .then_some(self.view.buffer.buffer_id),
                         ..Default::default()
                     },
                     Event::Switched,
@@ -2212,7 +2250,7 @@ impl Session {
                     );
                     // If our current buffer was one of the closed ones, switch to the server-
                     // indicated next buffer (or a fresh scratch).
-                    if closed.contains(&self.buffer.buffer_id) {
+                    if closed.contains(&self.view.buffer.buffer_id) {
                         fx = fx.and(self.request::<BufferOpen>(
                             BufferOpenParams {
                                 buffer_id: r.next_buffer_id,
@@ -2496,15 +2534,15 @@ impl Session {
                 self.pending_rpcs.clear();
                 self.conn = ConnState::Reconnecting {
                     attempt: 0,
-                    had_unsaved: self.buffer.revision != self.buffer.saved_revision,
+                    had_unsaved: self.view.buffer.revision != self.view.buffer.saved_revision,
                 };
                 // Drop out of Insert: edits can't reach the server while down, and a live insert
                 // cursor with vanishing keystrokes reads as a freeze. We don't restore it on
                 // reconnect (the buffer may have changed under us, or the daemon restarted and lost
                 // it) — the user re-enters insert deliberately. A reading view stays a reading
                 // view (it's client-rendered; only its refreshes need the server).
-                self.mode = self.search_return_mode();
-                tracing::warn!(buffer = %self.buffer.label, "connection lost; reconnecting");
+                self.view.mode = self.search_return_mode();
+                tracing::warn!(buffer = %self.view.buffer.label, "connection lost; reconnecting");
                 // Grouped "connection": the matching "Reconnected" toast replaces this one in place.
                 let mut fx = Effects::toast_grouped_detail(
                     "Server disconnected",
@@ -2540,34 +2578,34 @@ impl Session {
                     }
                 );
                 tracing::info!(restarted, "reconnected");
-                let old_cursor = self.buffer.cursor;
-                let old_buffer_id = self.buffer.buffer_id;
+                let old_cursor = self.view.buffer.cursor;
+                let old_buffer_id = self.view.buffer.buffer_id;
                 self.workspace = workspace.name;
                 self.workspace_paths = workspace.paths;
                 self.workspace_worktrees = workspace.worktrees;
                 self.workspace_projects = workspace.projects;
-                let same_file = open.path == self.buffer.path;
-                self.buffer = buffer_info(open, &self.workspace_paths);
+                let same_file = open.path == self.view.buffer.path;
+                self.view.rebind(buffer_info(open, &self.workspace_paths));
                 // Buffer ids don't survive a daemon restart: remap the tether onto the reopened
                 // buffer when it's the same file we were tethered to, else drop it — a stale id
                 // could collide with an unrelated new buffer and exit under the user.
                 if restarted {
                     self.tether = (same_file && self.tether == Some(old_buffer_id))
-                        .then_some(self.buffer.buffer_id);
+                        .then_some(self.view.buffer.buffer_id);
                 }
                 self.conn = ConnState::Connected;
                 // Server-side per-client state died with the old connection; drop the client
                 // overlays that fronted it. The frozen window stays rendered until the
                 // resubscribe replaces it.
-                self.viewport_id = None;
-                self.blame = None;
+                self.view.viewport_id = None;
+                self.view.blame = None;
                 // Server-side follow state died with the old connection; forget ours so the
                 // post-reconnect sync re-subscribes from scratch.
                 self.blame_follow_on = None;
                 self.highlight_follow_on = None;
                 self.prompt = None;
                 self.picker = None;
-                let buffer_id = self.buffer.buffer_id;
+                let buffer_id = self.view.buffer.buffer_id;
                 let mut fx = Effects::one(Effect::Resubscribe);
                 // Restore a selection (jump_to only carried the cursor): same buffer only,
                 // and a failure (the file shrank on disk) keeps the server's default.
@@ -2586,15 +2624,15 @@ impl Session {
                     ));
                 }
                 // Re-prime a committed search so highlights and `n` survive the drop.
-                if same_file && self.search.active && !self.search.query.is_empty() {
+                if same_file && self.view.search.active && !self.view.search.query.is_empty() {
                     fx = fx.and(self.request::<SearchSet>(
                         SearchSetParams {
                             buffer_id,
-                            query: self.search.query.clone(),
+                            query: self.view.search.query.clone(),
                             anchor: None,
                             extend: false,
                             from_selection: false,
-                            options: self.search.options,
+                            options: self.view.search.options,
                         },
                         move |__r| Event::SearchRestored(__r.map_err(|e| e.message)),
                     ));
@@ -2623,20 +2661,20 @@ impl Session {
                 target,
                 after,
             })) => {
-                self.buffer.revision = result.revision;
-                self.buffer.saved_revision = result.revision;
-                self.buffer.transient = false; // saving promotes a transient buffer
-                self.externally_modified = false;
-                self.externally_deleted = false;
+                self.view.buffer.revision = result.revision;
+                self.view.buffer.saved_revision = result.revision;
+                self.view.buffer.transient = false; // saving promotes a transient buffer
+                self.view.externally_modified = false;
+                self.view.externally_deleted = false;
                 let note = match target {
                     Some((path_index, rel)) => {
                         // Save-as: the buffer's identity changed — adopt the new path/label. The
                         // label takes the same canonical `"[root]: [path]"` form as buffer-open, so
                         // a renamed buffer reads identically in the status bar, title, and picker.
                         let root = self.workspace_paths.get(path_index as usize);
-                        self.buffer.path =
+                        self.view.buffer.path =
                             root.map(|r| format!("{}/{rel}", r.trim_end_matches('/')));
-                        self.buffer.label = crate::labels::root_relative_display(
+                        self.view.buffer.label = crate::labels::root_relative_display(
                             &self.workspace_paths,
                             path_index,
                             &rel,
@@ -2651,7 +2689,7 @@ impl Session {
                     && self
                         .pending_commit
                         .as_ref()
-                        .is_some_and(|p| p.buffer_id == self.buffer.buffer_id);
+                        .is_some_and(|p| p.buffer_id == self.view.buffer.buffer_id);
                 let mut fx = if feeds_commit {
                     Effects::none()
                 } else {
@@ -2675,11 +2713,11 @@ impl Session {
             Event::SaveTried(Err(e)) => Effects::error_detail("Save failed", e),
 
             Event::ReloadTried(Ok(ReloadTry::Reloaded(r))) => {
-                self.buffer.revision = r.revision;
-                self.buffer.saved_revision = r.revision;
-                self.buffer.transient = false; // reloading promotes, like save
-                self.externally_modified = false;
-                self.externally_deleted = false;
+                self.view.buffer.revision = r.revision;
+                self.view.buffer.saved_revision = r.revision;
+                self.view.buffer.transient = false; // reloading promotes, like save
+                self.view.externally_modified = false;
+                self.view.externally_deleted = false;
                 Effects::toast(format!("Reloaded (rev {})", r.revision), ToastKind::Success)
             }
             Event::ReloadTried(Ok(ReloadTry::NeedsConfirm)) => {
@@ -2701,7 +2739,7 @@ impl Session {
         overwrite: bool,
         after: AfterSave,
     ) -> Effects {
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         let (path_index, relative_path) = match &target {
             Some((i, p)) => (Some(*i), Some(p.clone())),
             None => (None, None),
@@ -2764,7 +2802,7 @@ impl Session {
         // each call site, so a method added later is covered by the funnel it already goes
         // through. The server is still the authority: `ServerState::editable_doc` refuses these
         // for real, whatever a client believes.
-        if M::MUTATES_TEXT && self.buffer.read_only {
+        if M::MUTATES_TEXT && self.view.buffer.read_only {
             return crate::session::read_only_toast();
         }
         // The socket is down: drop the request rather than parking a mapping that can never
@@ -2892,7 +2930,7 @@ impl Session {
     /// Insert clipboard text per the paste gesture (each one server-side edit; `Before`
     /// collapses to the selection start via `at` on the way in).
     pub fn paste(&mut self, kind: PasteKind, text: String) -> Effects {
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         match kind {
             PasteKind::Before { count } => self.edit::<InputText>(InputTextParams {
                 buffer_id,
@@ -2955,11 +2993,11 @@ impl Session {
             || self.picker.is_some()
             || self.workspace_settings.is_some()
             || self.app_settings.is_some()
-            || self.sneak.is_some()
+            || self.view.sneak.is_some()
         {
             return Effects::none();
         }
-        match self.mode {
+        match self.view.mode {
             Mode::Insert => self.paste(PasteKind::AtCursor, text),
             Mode::Normal => self.paste(PasteKind::Before { count: 1 }, text),
             Mode::Search | Mode::Read => Effects::none(),
@@ -2974,11 +3012,11 @@ impl Session {
             .chars()
             .filter(|c| !c.is_control() || *c == '\t')
             .collect();
-        if self.mode != Mode::Insert || text.is_empty() {
+        if self.view.mode != Mode::Insert || text.is_empty() {
             return Effects::none();
         }
         self.edit::<InputText>(InputTextParams {
-            buffer_id: self.buffer.buffer_id,
+            buffer_id: self.view.buffer.buffer_id,
             text,
             select_pasted: false,
             replace_selection: false,
@@ -3003,7 +3041,7 @@ impl Session {
     /// glide, far ones snap (the shell decides which). The one primitive for *how* an in-file jump
     /// scrolls into view, so every jump-style motion frames its target identically.
     pub fn jump_to_cursor(&mut self, cursor: CursorState) -> Effects {
-        self.buffer.cursor = cursor;
+        self.view.buffer.cursor = cursor;
         Effects::one(Effect::RevealCursor(RevealStyle::Jump))
     }
 
@@ -3011,7 +3049,7 @@ impl Session {
     /// run out of places to go: reveal the cursor as a jump, but when the step found nowhere new
     /// (`moved == false`) toast `exhausted` instead of silently re-revealing the same spot.
     pub fn step_to_cursor(&mut self, cursor: CursorState, moved: bool, exhausted: &str) -> Effects {
-        self.buffer.cursor = cursor;
+        self.view.buffer.cursor = cursor;
         let mut fx = if moved {
             Effects::none()
         } else {
@@ -3055,11 +3093,11 @@ impl Session {
     /// target into view the same way; genuine buffer switches (close, new-scratch, workspace change)
     /// always land on a different `buffer_id`, so routing them here is just a switch.
     pub fn adopt_navigation(&mut self, open: BufferOpenResult) -> Effects {
-        if open.buffer_id == self.buffer.buffer_id {
+        if open.buffer_id == self.view.buffer.buffer_id {
             // Same buffer — the open-route flag (a cross-buffer concern) must not leak into the
             // next genuine switch.
             self.open_route_jumped = false;
-            if self.pending_read_anchor.is_some() && self.read.is_some() {
+            if self.pending_read_anchor.is_some() && self.view.read.is_some() {
                 // `[x](./this-file.md#section)`: the target is the document already on
                 // screen, so the anchor resolves against the live parse — no refetch fires.
                 return self.consume_read_anchor();
@@ -3082,25 +3120,32 @@ impl Session {
     /// picker (outline, diagnostics) that should dismiss on a buffer change is the picker's own call,
     /// not a side effect of the switch.
     pub fn adopt_switch(&mut self, open: BufferOpenResult) -> Effects {
-        self.mode = Mode::Normal;
-        self.pending = Pending::None;
-        self.count = None;
-        self.diagnostics = DiagnosticCounts::default();
-        self.lsp = None;
-        // Cleared, not carried: the resubscribe answers with the new buffer's path, and showing
-        // the old file's `fn foo` against the new file's name for that round trip would be a lie.
-        self.symbol_path = Vec::new();
-        self.externally_modified = false;
-        self.externally_deleted = false;
-        self.window = None;
-        self.viewport_id = None;
-        self.drag = None;
-        self.blame = None;
+        // A sneak session is keyed `(client, buffer)` *server-side*, so dropping this side of it
+        // would leave the outgoing buffer's labels live: switch away mid-sneak and back, and they
+        // render again with nothing here thinking it is sneaking. Cancel before the swap, while the
+        // buffer they belong to is still the one we can name.
+        let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
+        // One assignment, where this was sixteen hand-written resets that nothing checked. Anything
+        // that must *survive* a switch — the sticky presentation preferences, the mirrors of
+        // server-side follows — lives on the session and is untouched here by construction.
+        self.view = ViewState::new(buffer_info(open, &self.workspace_paths));
+        // Not view state, but bound to whatever was on screen when it opened, so a switch dismisses
+        // it: a modal prompt is the session's, and it has nowhere to return to.
         self.prompt = None;
-        self.search = SearchState::default();
-        self.buffer = buffer_info(open, &self.workspace_paths);
         let read_fx = self.sync_read_on_switch();
-        Effects::one(Effect::Resubscribe).and(read_fx)
+        sneak_fx.and(Effects::one(Effect::Resubscribe)).and(read_fx)
+    }
+
+    /// Clear an active sneak session on `buffer_id`, both halves. No-op when not sneaking.
+    ///
+    /// Split out because three paths leave a session behind — a buffer switch, entering the reading
+    /// view, and `Esc` — and only the last of them used to tell the server, which is what left
+    /// labels rendering on a buffer nothing was sneaking in.
+    fn cancel_sneak_on(&mut self, buffer_id: BufferId) -> Effects {
+        if self.view.sneak.take().is_none() {
+            return Effects::none();
+        }
+        self.request::<SneakCancel>(SneakCancelParams { buffer_id }, |_r| Event::Noop)
     }
 
     /// Decide the freshly adopted buffer's read/edit presentation: markdown buffers follow this
@@ -3117,8 +3162,8 @@ impl Session {
     /// buffers open in the editor as always.
     fn sync_read_on_switch(&mut self) -> Effects {
         let jumped = std::mem::replace(&mut self.open_route_jumped, false);
-        self.read = None;
-        let is_md = self.buffer.language.as_deref() == Some("markdown");
+        self.view.read = None;
+        let is_md = self.view.buffer.language.as_deref() == Some("markdown");
         let want = is_md && (self.pending_read_anchor.is_some() || (self.read_on && !jumped));
         if want {
             self.begin_read()
@@ -3151,13 +3196,18 @@ impl Session {
     /// Enter the reading view on the current buffer: flip the mode and fetch the full content
     /// (the parse adopts via [`Event::ReadContent`]).
     fn begin_read(&mut self) -> Effects {
-        self.mode = Mode::Read;
-        self.pending = Pending::None;
-        self.count = None;
-        self.sneak = None;
-        self.read = Some(ReadView::loading(self.buffer.buffer_id));
-        let buffer_id = self.buffer.buffer_id;
-        self.request_str::<BufferContent>(BufferContentParams { buffer_id }, Event::ReadContent)
+        self.view.mode = Mode::Read;
+        self.view.pending = Pending::None;
+        self.view.count = None;
+        let buffer_id = self.view.buffer.buffer_id;
+        let sneak_fx = self.cancel_sneak_on(buffer_id);
+        self.view.read = Some(ReadView::loading(buffer_id));
+        sneak_fx.and(
+            self.request_str::<BufferContent>(
+                BufferContentParams { buffer_id },
+                Event::ReadContent,
+            ),
+        )
     }
 
     /// Ask the server to highlight every fenced code block of the freshly parsed document —
@@ -3166,7 +3216,7 @@ impl Session {
     /// they land.
     fn read_fence_requests(&mut self) -> Effects {
         let fences = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
             let mut fences = crate::markdown::fenced_code_blocks(&read.blocks);
@@ -3176,7 +3226,7 @@ impl Session {
             fences
         };
         let (buffer_id, revision) = {
-            let read = self.read.as_ref().expect("checked above");
+            let read = self.view.read.as_ref().expect("checked above");
             (read.buffer_id, read.revision)
         };
         let mut fx = Effects::none();
@@ -3199,7 +3249,7 @@ impl Session {
     /// `loading` flag debounces: a fetch already in flight will chase the newest revision itself
     /// when it adopts.
     fn refetch_read_content(&mut self) -> Effects {
-        let Some(read) = self.read.as_mut() else {
+        let Some(read) = self.view.read.as_mut() else {
             return Effects::none();
         };
         if read.loading {
@@ -3212,12 +3262,83 @@ impl Session {
 
     /// React to a change signal for `buffer_id` at `revision`: when the reading view shows that
     /// buffer at an older revision, re-fetch.
+    /// Move the live cursor to another editor element of this view.
+    ///
+    /// A no-op without a viewport: focus is a property of a *presentation*, and there is nothing to
+    /// step through before the first window arrives.
+    fn focus_element(&mut self, target: FocusTarget) -> Effects {
+        let Some(viewport_id) = self.view.viewport_id else {
+            return Effects::none();
+        };
+        self.request_str::<ViewportFocusElement>(
+            ViewportFocusElementParams {
+                viewport_id,
+                target,
+            },
+            Event::ElementFocused,
+        )
+    }
+
+    /// Adopt a focus reply: which element holds the cursor, and the buffer it windows. Reports
+    /// whether focus actually *moved*, which is what decides whether the view is re-framed.
+    ///
+    /// Crossing into another buffer changes everything the view says about what it is showing —
+    /// path, label, read-only, revision — so the whole `BufferInfo` is rebuilt through the same path
+    /// an open uses. `view_id` deliberately does *not* move: the view is still the patch, and it is
+    /// what `buffer/close` and `viewport/subscribe` go on addressing.
+    fn adopt_focus(&mut self, r: ViewportFocusElementResult) -> bool {
+        let moved = r.element != self.view.focused_element;
+        self.view.focused_element = r.element;
+        self.view.buffer = buffer_info(r.buffer, &self.workspace_paths);
+        moved
+    }
+
+    /// Focus the element a click landed in, if it isn't already focused.
+    ///
+    /// A click names an element, and setting the cursor without moving focus first would apply the
+    /// clicked *line number* to whatever buffer is focused — in a patch, a different file.
+    pub fn focus_clicked_element(
+        &mut self,
+        element: aether_protocol::viewport::FieldId,
+    ) -> Effects {
+        if element == self.view.focused_element {
+            return Effects::none();
+        }
+        let Some(viewport_id) = self.view.viewport_id else {
+            return Effects::none();
+        };
+        self.request_str::<ViewportFocusElement>(
+            ViewportFocusElementParams {
+                viewport_id,
+                target: FocusTarget::Element { element },
+            },
+            Event::ElementClicked,
+        )
+    }
+
+    /// Adopt the revision and cursor an edit response reports — but only if it is about the buffer
+    /// this view currently holds.
+    ///
+    /// Two ways it can be about another one. The view can switch while an edit is in flight, and a
+    /// view can be several editors over several buffers, where the server resolves which element —
+    /// hence which buffer — an edit lands in. Adopting regardless would file one buffer's revision
+    /// against another, and every later push for that buffer would then look stale and be dropped:
+    /// a silent failure where the window simply stops updating.
+    fn adopt_edit(&mut self, buffer: BufferId, revision: u64, cursor: CursorState) {
+        if buffer != self.view.buffer.buffer_id {
+            return;
+        }
+        self.view.buffer.revision = revision;
+        self.view.buffer.cursor = cursor;
+    }
+
     fn maybe_refresh_read(&mut self, buffer_id: BufferId, revision: u64) -> Effects {
         // `!=`, not `>`: revisions identify buffer states, they don't order them — undo
         // *restores* the undone entry's older revision number (dirty-tracking relies on
         // that), so a `Ctrl-z` in the reading view signals a change with a revision that
         // went backwards. Any revision other than the parsed one means the text moved.
         let stale = self
+            .view
             .read
             .as_ref()
             .is_some_and(|r| r.buffer_id == buffer_id && revision != r.revision);
@@ -3235,30 +3356,42 @@ impl Session {
     /// shared by every shell: the native shells pass the typed result; the wasm shell deserialises
     /// the same struct. Shells must never write these fields directly.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) {
-        self.viewport_id = Some(res.viewport_id);
-        self.diagnostics = res.buffer_status.diagnostics;
-        self.lsp = res.buffer_status.lsp_status;
-        self.symbol_path = res.buffer_status.symbol_path;
-        self.externally_modified = res.buffer_status.externally_modified;
-        self.externally_deleted = res.buffer_status.externally_deleted;
-        self.window = Some(res.window);
+        self.view.viewport_id = Some(res.viewport_id);
+        self.view.diagnostics = res.buffer_status.diagnostics;
+        self.view.lsp = res.buffer_status.lsp_status;
+        self.view.symbol_path = res.buffer_status.symbol_path;
+        self.view.externally_modified = res.buffer_status.externally_modified;
+        self.view.externally_deleted = res.buffer_status.externally_deleted;
+        self.view.window = Some(res.window);
+        // A composed view acts on the buffer its focused element windows, not on the buffer it was
+        // opened as: a patch's elements window real files while the view's own document is the
+        // generated patch text. Holding the latter while looking at the former is two line spaces at
+        // once — the cursor is a position in a document nothing on screen belongs to, so nothing
+        // draws it, motions act where no one is looking, and a reveal is owed that no window can
+        // ever pay. The server says which element and which buffer, because the server is what
+        // decided (a `focus_path` open lands on the file you asked for), and it says nothing at all
+        // for an ordinary view whose one element windows the buffer it is.
+        if let Some(focus) = res.focus {
+            self.view.focused_element = focus.element;
+            self.view.buffer = buffer_info(focus.buffer, &self.workspace_paths);
+        }
     }
 
     /// Adopt the window from a geometry RPC the shell issued (`viewport/scroll`, `scroll_to_row`,
     /// `resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
     pub fn adopt_window(&mut self, res: ViewportWindowResult) {
-        self.window = Some(res.window);
+        self.view.window = Some(res.window);
     }
 
     /// Report the viewport's current scroll position so the core knows what's actually on screen
     /// (the shell owns the pixel scroll). `top_visual_row` is absolute (whole-buffer); the core maps
     /// it through the loaded window to a logical-line range that scopes sneak candidates. Cheap —
     /// safe to call every render/scroll.
-    pub fn set_visible_lines(&mut self, top_visual_row: u32, viewport_rows: u32) {
-        self.visible_lines = self.window.as_ref().map(|w| {
-            let (first, _) = crate::grid::line_at_row(w, top_visual_row);
+    pub fn set_visible_lines(&mut self, top_visual_row: VisualRow, viewport_rows: u32) {
+        self.view.visible_lines = self.view.window.as_ref().map(|w| {
+            let (_, first, _) = crate::grid::line_at_row(w, top_visual_row);
             let bottom = top_visual_row.saturating_add(viewport_rows.saturating_sub(1));
-            let (last, _) = crate::grid::line_at_row(w, bottom);
+            let (_, last, _) = crate::grid::line_at_row(w, bottom);
             (first, last.saturating_add(1))
         });
     }
@@ -3292,7 +3425,7 @@ impl Session {
         if let Some(pending) = self
             .pending_commit
             .clone()
-            .filter(|p| p.buffer_id == self.buffer.buffer_id)
+            .filter(|p| p.buffer_id == self.view.view_id.presenting_buffer())
         {
             return self.request_str::<GitCommit>(
                 GitCommitParams {
@@ -3302,11 +3435,11 @@ impl Session {
                 Event::Committed,
             );
         }
-        self.forget_commit_buffer(self.buffer.buffer_id);
-        if self.tethered() {
+        self.forget_commit_buffer(self.view.view_id.presenting_buffer());
+        if self.tethered_view() {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.view_id,
                     open_next: false,
                 },
                 |r| Event::TetherClosed(r.map(|_| ())),
@@ -3315,7 +3448,7 @@ impl Session {
         if aether_protocol::is_ephemeral_workspace_id(&self.workspace) {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.view_id,
                     open_next: false,
                 },
                 |r| Event::EphemeralClosed(r.map(|closed| closed.next_buffer_id)),
@@ -3323,7 +3456,7 @@ impl Session {
         }
         self.request_str::<BufferClose>(
             BufferCloseParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.view_id,
                 open_next: true,
             },
             |r| {
@@ -3354,7 +3487,7 @@ impl Session {
     /// on-disk path (`Space Alt-p`), otherwise the workspace-relative path (`Space p`). Scratch
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
-        let Some(path) = self.buffer.path.as_deref() else {
+        let Some(path) = self.view.buffer.path.as_deref() else {
             return Effects::toast("Scratch buffer has no path", ToastKind::Warning);
         };
         let text = if absolute {
@@ -3391,10 +3524,10 @@ impl Session {
     /// clipboard ([`ShellAction::CopyWebUrl`]); the toast is emitted here, like every copy gesture.
     fn copy_web_url(&mut self) -> Effects {
         use crate::web_link::{web_link, WebLinkTarget};
-        let at = self.buffer.cursor.position;
+        let at = self.view.buffer.cursor.position;
         let named = !self.workspace.is_empty()
             && !aether_protocol::is_ephemeral_workspace_id(&self.workspace);
-        let path_query = match self.buffer.path.as_deref() {
+        let path_query = match self.view.buffer.path.as_deref() {
             // In a named workspace, a file under one of its roots is addressed relative to it: the
             // link survives the workspace moving on disk, and reads as what it is.
             Some(path) => match strip_longest_root(path, &self.workspace_paths).filter(|_| named) {
@@ -3426,7 +3559,7 @@ impl Session {
             }
             None => web_link(
                 Some(&self.workspace),
-                WebLinkTarget::Buffer(self.buffer.buffer_id),
+                WebLinkTarget::Buffer(self.view.buffer.buffer_id),
             ),
         };
         // Grouped with the path copies: the copy gestures update one toast rather than stacking.
@@ -3468,7 +3601,7 @@ impl Session {
                 jump_to,
                 jump_to_anchor,
                 transient: Some(true),
-                record_nav_from: Some(self.buffer.buffer_id),
+                record_nav_from: Some(self.view.buffer.buffer_id),
                 ..Default::default()
             },
             Event::Switched,
@@ -3610,12 +3743,18 @@ impl Session {
     /// diagnostics under the cursor column (zero-width points widened to one cell), falling
     /// back to all on the line. Reads the cached window render — no round-trip.
     pub fn show_diagnostic(&self) -> Effects {
-        let cursor = self.buffer.cursor.position;
+        let cursor = self.view.buffer.cursor.position;
         let diags: Vec<(DiagnosticSeverity, String)> = self
+            .view
             .window
             .as_ref()
-            .and_then(|w| w.lines.iter().find(|l| l.logical_line == cursor.line))
-            .map(|line| {
+            .and_then(|w| {
+                let at = self.view.cursor_at();
+                crate::grid::window_lines(w)
+                    .into_iter()
+                    .find(|(there, _)| *there == at)
+            })
+            .map(|(_, line)| {
                 let under: Vec<_> = line
                     .diagnostics
                     .iter()
@@ -3661,7 +3800,7 @@ impl Session {
     /// `None` covers both "nothing is stopped" and "we have no window yet to say so"; the caller
     /// treats them alike, because the server re-checks before doing anything either way.
     fn stopped_operation(&self) -> Option<GitRepoOperation> {
-        self.window.as_ref()?.git_status.as_ref()?.operation
+        self.view.window.as_ref()?.git_status.as_ref()?.operation
     }
 
     /// `git/abort_operation` for the buffer's repo — reached from `Space g d` once its confirm is
@@ -3680,8 +3819,8 @@ impl Session {
     pub fn show_commit_info(&mut self) -> Effects {
         self.request_str::<GitBlameLine>(
             GitBlameLineParams {
-                buffer_id: self.buffer.buffer_id,
-                line: self.buffer.cursor.position.line,
+                buffer_id: self.view.buffer.buffer_id,
+                line: self.view.buffer.cursor.position.line,
                 include_commit_info: true,
             },
             |r| {
@@ -3728,18 +3867,21 @@ impl Session {
         self.picker = Some(fresh);
         // A fresh input owns the keyboard now; anything the last one was recalling is over.
         self.history.reset();
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         let has_center_override = center_on_override.is_some();
         // Buffers / Workspaces / Explorer / LspServers all open with the highlight on "where you
         // are" — the active buffer/workspace/file/language-server — matched by item key via the
         // `effective_center_on` echo (the display-only fields below are ignored by the match).
-        // Buffers: the active buffer (key is `buffer_id`).
+        // Buffers: the active *view* (key is `buffer_id`) — `view_id`, not the focused element's
+        // buffer. The picker lists views, so in a composed one the row to land on is the patch
+        // itself; centring on `view.buffer` highlighted whichever file the cursor happened to be
+        // in, or nothing at all when that file had no row of its own.
         // Workspaces: the active workspace (key is `name`).
         // Explorer: the active buffer's filename, so the listing lands on the current file.
         // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
         let center_on = center_on_override.or(match kind {
             PickerKind::Buffers => Some(PickerItem::Buffer {
-                buffer_id,
+                buffer_id: self.view.view_id.presenting_buffer(),
                 display: String::new(),
                 status: Default::default(),
                 path_index: None,
@@ -3752,7 +3894,7 @@ impl Session {
                 unsaved_buffers: 0,
                 match_indices: Vec::new(),
             }),
-            PickerKind::Explorer => self.buffer.path.as_deref().and_then(|path| {
+            PickerKind::Explorer => self.view.buffer.path.as_deref().and_then(|path| {
                 let name = std::path::Path::new(path)
                     .file_name()?
                     .to_str()?
@@ -3765,7 +3907,8 @@ impl Session {
                 })
             }),
             PickerKind::LspServers => {
-                self.buffer
+                self.view
+                    .buffer
                     .lsp_server
                     .as_ref()
                     .map(|r| PickerItem::LspServer {
@@ -3845,6 +3988,7 @@ impl Session {
     /// [`Session::open_grep_from_selection`].)
     pub fn open_files_in_buffer_dir(&mut self) -> Effects {
         let seed = self
+            .view
             .buffer
             .path
             .as_deref()
@@ -3899,7 +4043,7 @@ impl Session {
     /// `Space e` / `Space Alt-e`: Explorer at the buffer's directory, or at its workspace root.
     /// Scratch buffers fall through to the server default (last listing / first root).
     pub fn open_explorer(&mut self, at_root: bool) -> Effects {
-        let dir = self.buffer.path.as_deref().and_then(|path| {
+        let dir = self.view.buffer.path.as_deref().and_then(|path| {
             if at_root {
                 let (i, _) = strip_longest_root(path, &self.workspace_paths)?;
                 self.workspace_paths.get(i as usize).cloned()
@@ -4167,10 +4311,10 @@ impl Session {
     /// search `<input>` owns text editing and syncs the value here). No-op outside Search mode or if
     /// unchanged.
     pub fn search_set_query(&mut self, query: String) -> Effects {
-        if self.mode != Mode::Search || self.search.query == query {
+        if self.view.mode != Mode::Search || self.view.search.query == query {
             return Effects::none();
         }
-        self.search.query = query;
+        self.view.search.query = query;
         // Typing abandons any history walk in progress — the stashed draft is stale now.
         self.history.reset();
         self.incremental_search()
@@ -4847,7 +4991,7 @@ impl Session {
     fn current_view_target(&self) -> WindowTarget {
         let workspace = (!aether_protocol::is_ephemeral_workspace_id(&self.workspace))
             .then(|| self.workspace.clone());
-        let open = match (&workspace, self.buffer.path.as_deref()) {
+        let open = match (&workspace, self.view.buffer.path.as_deref()) {
             (Some(_), _) | (None, None) => WindowOpen::Workspace,
             (None, Some(path)) => WindowOpen::Path {
                 path: path.to_string(),
@@ -6218,33 +6362,40 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<ViewportLinesChangedParams>(n.params) else {
                     return Effects::none();
                 };
-                if Some(p.viewport_id) != self.viewport_id {
+                if Some(p.viewport_id) != self.view.viewport_id {
                     return Effects::none();
                 }
                 // The notification carries the freshly rendered window for the loaded range
                 // — apply it directly, keep the revision fresh (edits that only arrive this
                 // way, e.g. another client's), and keep the cursor in view under the new
                 // geometry (the shell clamps + reveals).
-                self.buffer.revision = p.revision;
+                //
+                // The revision belongs to `p.buffer`, which is not always the view's: a view is
+                // several editors over several buffers, and only the one this push rendered has
+                // moved. Filing another buffer's revision here would make the *next* push for the
+                // view's own buffer look stale and be dropped.
+                if p.buffer == self.view.buffer.buffer_id {
+                    self.view.buffer.revision = p.revision;
+                }
                 // Server-side cursor moves with no request in flight (e.g. the clamp a watcher
                 // reload applies when the file shrank under the cursor) ride the push; adopt
                 // before the shells reveal against the new window.
                 if let Some(cursor) = p.cursor {
-                    self.buffer.cursor = cursor;
+                    self.view.buffer.cursor = cursor;
                 }
-                self.window = Some(Window {
-                    first_logical_line: p.range.start_logical_line,
-                    last_logical_line_exclusive: p.range.end_logical_line_exclusive,
-                    line_count: p.line_count,
-                    max_scroll_logical_line: p.max_scroll_logical_line,
+                self.view.window = Some(Window {
+                    first_view_line: p.range.start_view_line,
+                    last_view_line_exclusive: p.range.end_view_line_exclusive,
+                    view_line_count: p.view_line_count,
+                    max_scroll_view_line: p.max_scroll_view_line,
                     total_visual_rows: p.total_visual_rows,
                     first_visual_row: p.first_visual_row,
                     max_line_width: p.max_line_width,
                     git_status: p.git_status,
-                    lines: p.replacement_lines,
+                    root: p.root,
                 });
                 // An in-window edit is also a change signal for the reading view.
-                let read_fx = self.maybe_refresh_read(self.buffer.buffer_id, p.revision);
+                let read_fx = self.maybe_refresh_read(self.view.buffer.buffer_id, p.revision);
                 Effects::one(Effect::WindowAdopted).and(read_fx)
             }
             GitBlameChanged::NAME => {
@@ -6254,8 +6405,8 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<GitBlameChangedParams>(n.params) else {
                     return Effects::none();
                 };
-                if p.buffer_id == self.buffer.buffer_id {
-                    self.blame = p.blame.map(|b| (p.line, b));
+                if p.buffer_id == self.view.buffer.buffer_id {
+                    self.view.blame = p.blame.map(|b| (p.line, b));
                 }
                 Effects::none()
             }
@@ -6276,8 +6427,8 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<BufferChangedParams>(n.params) else {
                     return Effects::none();
                 };
-                if p.buffer_id == self.buffer.buffer_id {
-                    self.buffer.revision = p.revision;
+                if p.buffer_id == self.view.buffer.buffer_id {
+                    self.view.buffer.revision = p.revision;
                 }
                 self.maybe_refresh_read(p.buffer_id, p.revision)
             }
@@ -6285,27 +6436,27 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<BufferStateParams>(n.params) else {
                     return Effects::none();
                 };
-                if p.buffer_id != self.buffer.buffer_id {
+                if p.buffer_id != self.view.buffer.buffer_id {
                     return Effects::none();
                 }
-                self.buffer.saved_revision = p.saved_revision;
-                self.buffer.transient = p.transient;
+                self.view.buffer.saved_revision = p.saved_revision;
+                self.view.buffer.transient = p.transient;
                 // A save-as renames the shared buffer; follow it — adopt the new path and re-derive
                 // the label. Only on an actual change, so in-place save/reload pushes are no-ops
                 // (and a legacy server omitting `path` never clobbers our label).
                 if let Some(new_path) = p.path {
-                    if self.buffer.path.as_deref() != Some(new_path.as_str()) {
-                        self.buffer.label =
+                    if self.view.buffer.path.as_deref() != Some(new_path.as_str()) {
+                        self.view.buffer.label =
                             super::session::label_for_path(&new_path, &self.workspace_paths);
-                        self.buffer.path = Some(new_path);
+                        self.view.buffer.path = Some(new_path);
                     }
                 }
-                let was_external = self.externally_modified || self.externally_deleted;
-                self.externally_modified = p.externally_modified;
-                self.externally_deleted = p.externally_deleted;
+                let was_external = self.view.externally_modified || self.view.externally_deleted;
+                self.view.externally_modified = p.externally_modified;
+                self.view.externally_deleted = p.externally_deleted;
                 // Grouped per buffer: a deleted-then-modified (or repeated) disk event updates the
                 // one external-change toast rather than stacking.
-                let group = format!("external-change:{}", self.buffer.buffer_id);
+                let group = format!("external-change:{}", self.view.buffer.buffer_id);
                 if !was_external && p.externally_deleted {
                     Effects::toast_grouped_detail(
                         "File removed on disk",
@@ -6326,8 +6477,8 @@ impl Session {
             }
             LspDiagnosticsChanged::NAME => {
                 if let Ok(p) = serde_json::from_value::<LspDiagnosticsChangedParams>(n.params) {
-                    if p.buffer_id == self.buffer.buffer_id {
-                        self.diagnostics = p.counts;
+                    if p.buffer_id == self.view.buffer.buffer_id {
+                        self.view.diagnostics = p.counts;
                     }
                 }
                 Effects::none()
@@ -6336,8 +6487,8 @@ impl Session {
                 if let Ok(p) = serde_json::from_value::<LspSymbolPathChangedParams>(n.params) {
                     // Buffer-guarded like the diagnostics push: a path for the buffer we just
                     // switched away from would otherwise label the new one.
-                    if p.buffer_id == self.buffer.buffer_id {
-                        self.symbol_path = p.path;
+                    if p.buffer_id == self.view.buffer.buffer_id {
+                        self.view.symbol_path = p.path;
                     }
                 }
                 Effects::none()
@@ -6383,10 +6534,10 @@ impl Session {
             SearchStateChanged::NAME => {
                 // Matches recomputed (buffer edit) or the cursor crossed a match boundary.
                 if let Ok(s) = serde_json::from_value::<SearchSummary>(n.params) {
-                    if s.buffer_id == self.buffer.buffer_id
-                        && (self.search.active || self.mode == Mode::Search)
+                    if s.buffer_id == self.view.buffer.buffer_id
+                        && (self.view.search.active || self.view.mode == Mode::Search)
                     {
-                        self.search.summary = Some(s);
+                        self.view.search.summary = Some(s);
                     }
                 }
                 Effects::none()
@@ -6395,7 +6546,7 @@ impl Session {
                 let Ok(s) = serde_json::from_value::<LspServerStatus>(n.params) else {
                     return Effects::none();
                 };
-                let matches_current = self.buffer.lsp_server.as_ref().is_some_and(|r| {
+                let matches_current = self.view.buffer.lsp_server.as_ref().is_some_and(|r| {
                     r.language == s.language && r.workspace_root == s.workspace_root
                 });
                 // Live-update an open LSP info dialog for the same server, so a restart's
@@ -6441,7 +6592,7 @@ impl Session {
                     None
                 };
                 if matches_current {
-                    self.lsp = Some(s);
+                    self.view.lsp = Some(s);
                 }
                 restart_toast.map_or_else(Effects::none, Effects::one)
             }
@@ -6458,7 +6609,7 @@ impl Session {
                 }
                 // However it went, the message buffer is gone — so is the commit it was for.
                 self.forget_commit_buffer(p.buffer_id);
-                if p.buffer_id != self.buffer.buffer_id {
+                if p.buffer_id != self.view.buffer.buffer_id {
                     return Effects::none();
                 }
                 let moved = std::mem::take(&mut self.workspace_moved_under_us);
@@ -6573,24 +6724,24 @@ impl Session {
     /// when you do want the old configuration back. The snapshot is
     /// taken *before* the reset, so Esc still restores a committed search exactly as it was.
     pub fn enter_search(&mut self, extend_to_cursor: bool) -> Effects {
-        self.search.snapshot = Some(SearchSnapshot {
-            cursor: self.buffer.cursor,
-            query: std::mem::take(&mut self.search.query),
-            active: self.search.active,
-            options: self.search.options,
+        self.view.search.snapshot = Some(SearchSnapshot {
+            cursor: self.view.buffer.cursor,
+            query: std::mem::take(&mut self.view.search.query),
+            active: self.view.search.active,
+            options: self.view.search.options,
         });
-        self.search.options = MatchOptions::default();
-        self.search.active = false;
-        self.search.summary = None;
+        self.view.search.options = MatchOptions::default();
+        self.view.search.active = false;
+        self.view.search.summary = None;
         self.history.reset();
-        self.search.chip_selected = None;
-        self.search.extend_to_cursor = extend_to_cursor;
-        self.mode = Mode::Search;
+        self.view.search.chip_selected = None;
+        self.view.search.extend_to_cursor = extend_to_cursor;
+        self.view.mode = Mode::Search;
 
         let mut fx = Effects::one(Effect::SaveScrollAnchor);
         fx = fx.and(self.request::<SearchClear>(
             SearchClearParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
             },
             move |__r| {
                 let _ = __r;
@@ -6603,9 +6754,9 @@ impl Session {
     /// One incremental step: hand the server the latest query; it jumps the cursor to the
     /// first match at-or-after the prompt's entry point. An emptied query clears instead.
     fn incremental_search(&mut self) -> Effects {
-        let buffer_id = self.buffer.buffer_id;
-        if self.search.query.is_empty() {
-            self.search.summary = None;
+        let buffer_id = self.view.buffer.buffer_id;
+        if self.view.search.query.is_empty() {
+            self.view.search.summary = None;
 
             let fx = self.request::<SearchClear>(SearchClearParams { buffer_id }, move |__r| {
                 let _ = __r;
@@ -6618,15 +6769,16 @@ impl Session {
         self.request::<SearchSet>(
             SearchSetParams {
                 buffer_id,
-                query: self.search.query.clone(),
+                query: self.view.search.query.clone(),
                 anchor: self
+                    .view
                     .search
                     .snapshot
                     .as_ref()
                     .map(|s| min_pos(s.cursor.position, s.cursor.anchor)),
-                extend: self.search.extend_to_cursor,
+                extend: self.view.search.extend_to_cursor,
                 from_selection: false,
-                options: self.search.options,
+                options: self.view.search.options,
             },
             move |__r| Event::SearchApplied(__r.map_err(|e| e.message)),
         )
@@ -6635,18 +6787,18 @@ impl Session {
     /// Move the cursor back to where the prompt opened (no-op outside incremental search or
     /// when it hasn't moved).
     fn revert_to_snapshot_cursor(&mut self) -> Effects {
-        let Some(snap) = self.search.snapshot.as_ref() else {
+        let Some(snap) = self.view.search.snapshot.as_ref() else {
             return Effects::none();
         };
-        if self.buffer.cursor.position == snap.cursor.position
-            && self.buffer.cursor.anchor == snap.cursor.anchor
+        if self.view.buffer.cursor.position == snap.cursor.position
+            && self.view.buffer.cursor.anchor == snap.cursor.anchor
         {
             return Effects::none();
         }
 
         self.request::<CursorSet>(
             CursorSetParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 position: snap.cursor.position,
                 anchor: snap.cursor.anchor,
                 granularity: Granularity::Char,
@@ -6669,52 +6821,92 @@ impl Session {
     /// [`pointer_drag`](Self::pointer_drag) extends from here.
     pub fn pointer_press(
         &mut self,
+        element: aether_protocol::viewport::FieldId,
         pos: LogicalPosition,
         granularity: Granularity,
         extend: bool,
     ) -> Effects {
+        // A click names an element, and everything that follows from the press — the cursor it
+        // sets, the drag it anchors, the buffer both act on — belongs to *that* element. Focusing it
+        // is therefore part of the press rather than something each shell remembers to do first: the
+        // terminal did and the GUI didn't, so in the GUI a click outside the focused element set a
+        // cursor the server then bounded back into the element that still had focus, and clicking
+        // only ever worked in one of them. A no-op when the element is already focused.
+        //
+        // Emitted before the cursor's own request, and the shells send requests in emission order,
+        // so the server has moved focus by the time the `element/set` runs.
+        let focus = self.focus_clicked_element(element);
         let anchor = if extend {
-            self.buffer.cursor.anchor
+            self.view.buffer.cursor.anchor
         } else {
             pos
         };
-        self.drag = Some((anchor, granularity));
+        self.view.drag = Some((element, anchor, granularity));
         // A pointer selection is a Normal-mode concept. Double/triple-click (Word/Line) and
         // shift-click create a selection immediately, and a selection can't coexist with the
         // insert-mode bar caret: the selection's endpoint is an inclusive char, the caret is the
         // gap before it, so the two render in different places. Drop to Normal so the block cursor
         // sits on the endpoint. A plain single click stays in Insert — it only repositions the
         // caret (a point cursor, no selection).
-        if self.mode == Mode::Insert && (extend || granularity != Granularity::Char) {
-            self.mode = Mode::Normal;
+        if self.view.mode == Mode::Insert && (extend || granularity != Granularity::Char) {
+            self.view.mode = Mode::Normal;
         }
-        self.request_str::<CursorSet>(
+        focus.and(self.request_str::<CursorSet>(
             CursorSetParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.element_buffer(element),
                 position: pos,
                 anchor,
                 granularity,
             },
             Event::CursorMsg,
-        )
+        ))
+    }
+
+    /// The buffer an element of this view windows, falling back to the buffer the view is bound to
+    /// when the element isn't in the tree (a rebuild between the click and its handling).
+    ///
+    /// A click names an element, and the position it resolved to is a line of **that element's**
+    /// buffer. Sending it to whichever buffer the view happened to be bound to is a line number
+    /// applied to a different file: it lands the cursor somewhere arbitrary in the buffer being left,
+    /// while the one just clicked keeps the position focus had seated. Focus reconciles a beat later
+    /// — the reply is a round trip behind — so the press cannot wait for it and must name the buffer
+    /// itself. The requests are ordered, so the server has already moved focus by the time this one
+    /// runs.
+    fn element_buffer(&self, element: aether_protocol::viewport::FieldId) -> BufferId {
+        self.view
+            .window
+            .as_ref()
+            .and_then(|w| {
+                w.root.editors().iter().find_map(|node| match node {
+                    aether_protocol::viewport::Element::Editor {
+                        element: id,
+                        buffer,
+                        ..
+                    } if *id == element => Some(*buffer),
+                    _ => None,
+                })
+            })
+            .unwrap_or(self.view.buffer.buffer_id)
     }
 
     /// Pointer drag to a new position while the button is held: extend the selection from the
     /// recorded anchor, preserving the press's granularity. A no-op when no press is active (the
     /// drag began outside the text, or the press was suppressed).
     pub fn pointer_drag(&mut self, pos: LogicalPosition) -> Effects {
-        let Some((anchor, granularity)) = self.drag else {
+        let Some((element, anchor, granularity)) = self.view.drag else {
             return Effects::none();
         };
         // Dragging is a selection gesture: once it covers more than the press anchor it's a real
         // selection, so leave Insert for the same reason as `pointer_press`. (Word/Line drags
         // already switched at press time; this catches the Char-granularity drag.)
-        if self.mode == Mode::Insert && pos != anchor {
-            self.mode = Mode::Normal;
+        if self.view.mode == Mode::Insert && pos != anchor {
+            self.view.mode = Mode::Normal;
         }
         self.request_str::<CursorSet>(
             CursorSetParams {
-                buffer_id: self.buffer.buffer_id,
+                // The element the *press* landed in: a drag belongs to the selection it started,
+                // and the focus reply for that press may still be in flight.
+                buffer_id: self.element_buffer(element),
                 position: pos,
                 anchor,
                 granularity,
@@ -6725,20 +6917,20 @@ impl Session {
 
     /// Pointer release — ends the drag. The selection stays as last set.
     pub fn pointer_release(&mut self) {
-        self.drag = None;
+        self.view.drag = None;
     }
 
     /// Esc in the prompt: restore the pre-prompt search (query + server state), cursor, and
     /// (via the effect) the shell's scroll anchor.
     pub fn abort_search(&mut self) -> Effects {
-        self.mode = self.search_return_mode();
-        self.search.extend_to_cursor = false;
+        self.view.mode = self.search_return_mode();
+        self.view.search.extend_to_cursor = false;
         self.history.reset();
-        self.search.chip_selected = None;
-        let Some(snap) = self.search.snapshot.take() else {
+        self.view.search.chip_selected = None;
+        let Some(snap) = self.view.search.snapshot.take() else {
             return Effects::none();
         };
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         let mut fx = if snap.active && !snap.query.is_empty() {
             self.request::<SearchSet>(
                 SearchSetParams {
@@ -6752,16 +6944,16 @@ impl Session {
                 move |__r| Event::SearchRestored(__r.map_err(|e| e.message)),
             )
         } else {
-            self.search.summary = None;
+            self.view.search.summary = None;
 
             self.request::<SearchClear>(SearchClearParams { buffer_id }, move |__r| {
                 let _ = __r;
                 Event::Noop
             })
         };
-        self.search.query = snap.query;
-        self.search.active = snap.active;
-        self.search.options = snap.options;
+        self.view.search.query = snap.query;
+        self.view.search.active = snap.active;
+        self.view.search.options = snap.options;
 
         fx = fx.and(self.request::<CursorSet>(
             CursorSetParams {
@@ -6780,27 +6972,30 @@ impl Session {
     /// query recallable — the incremental preview types a new query on every keystroke, so
     /// recording anything earlier would fill the history with prefixes.
     pub fn commit_search(&mut self) -> Effects {
-        self.search.snapshot = None;
+        self.view.search.snapshot = None;
         let mut fx = Effects::none();
-        if self.search.query.is_empty() {
-            self.search.active = false;
-            self.search.summary = None;
+        if self.view.search.query.is_empty() {
+            self.view.search.active = false;
+            self.view.search.summary = None;
         } else {
-            self.search.active = true;
-            let entry = HistoryEntry::with_options(self.search.query.clone(), self.search.options);
+            self.view.search.active = true;
+            let entry = HistoryEntry::with_options(
+                self.view.search.query.clone(),
+                self.view.search.options,
+            );
             fx = self.record_history(HistoryKind::Search, entry);
         }
         self.history.reset();
-        self.search.extend_to_cursor = false;
-        self.search.chip_selected = None;
-        self.mode = self.search_return_mode();
+        self.view.search.extend_to_cursor = false;
+        self.view.search.chip_selected = None;
+        self.view.mode = self.search_return_mode();
         fx
     }
 
     /// The mode leaving the search prompt returns to: Read when the buffer is displayed as a
     /// reading view (search entered from Read returns to Read), Normal otherwise.
     fn search_return_mode(&self) -> Mode {
-        if self.read.is_some() {
+        if self.view.read.is_some() {
             Mode::Read
         } else {
             Mode::Normal
@@ -6810,17 +7005,17 @@ impl Session {
     /// `n`/`Alt-n`: step match-to-match; with no active search, revive the most recent
     /// history entry first. Steps run sequentially in one future.
     pub fn search_cycle(&mut self, direction: Direction, count: u32, extend: bool) -> Effects {
-        let revive = if self.search.active {
+        let revive = if self.view.search.active {
             None
         } else {
             // Revive the newest entry *with its match options* — the revived query rides the nav
-            // RPC below alongside `self.search.options`, and a regex revived as a literal would
+            // RPC below alongside `self.view.search.options`, and a regex revived as a literal would
             // quietly match nothing.
             match self.history.list(HistoryKind::Search).last().cloned() {
                 Some(entry) => {
-                    self.search.query = entry.value.clone();
-                    self.search.options = entry.filters.match_options();
-                    self.search.active = true;
+                    self.view.search.query = entry.value.clone();
+                    self.view.search.options = entry.filters.match_options();
+                    self.view.search.active = true;
                     Some(entry.value)
                 }
                 None => return Effects::none(),
@@ -6830,12 +7025,12 @@ impl Session {
         // step when it has no matches), then steps `count` times.
         self.request_str::<SearchStep>(
             SearchStepParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 direction,
                 extend,
                 count,
                 set_query: revive,
-                options: self.search.options,
+                options: self.view.search.options,
             },
             Event::SearchNav,
         )
@@ -6846,7 +7041,7 @@ impl Session {
     pub fn search_from_selection(&mut self) -> Effects {
         self.request_str::<SearchSet>(
             SearchSetParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 query: String::new(),
                 anchor: None,
                 extend: false,
@@ -6867,15 +7062,15 @@ impl Session {
 
     /// `Esc` in Normal — drop the active search (clear highlights).
     pub fn drop_search(&mut self) -> Effects {
-        if !(self.search.active || self.search.summary.is_some()) {
+        if !(self.view.search.active || self.view.search.summary.is_some()) {
             return Effects::none();
         }
-        self.search.active = false;
-        self.search.summary = None;
+        self.view.search.active = false;
+        self.view.search.summary = None;
 
         self.request::<SearchClear>(
             SearchClearParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
             },
             move |__r| {
                 let _ = __r;
@@ -6896,7 +7091,7 @@ impl Session {
     ) -> Effects {
         self.request_str::<JumplistStep>(
             JumplistStepParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 direction,
                 count,
                 scope,
@@ -6911,7 +7106,7 @@ impl Session {
     fn clear_jumplist(&mut self) -> Effects {
         self.request_str::<JumplistClear>(
             JumplistClearParams {
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
             },
             Event::JumplistCleared,
         )
@@ -7054,19 +7249,23 @@ impl Session {
     /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
     /// other close path.
     fn close_picker_buffer(&mut self, buffer_id: BufferId) -> Effects {
+        // The row came from the Buffers picker, which lists views — so this id names a view. It
+        // arrives as a raw `BufferId` because `ConfirmAction` carries it through a round trip; the
+        // crossing is spelled at each use rather than retyping that enum here.
+        let view_id = ViewId(buffer_id);
         if self.tether == Some(buffer_id) {
             return self.request_str::<BufferClose>(
                 BufferCloseParams {
-                    buffer_id,
+                    buffer_id: view_id,
                     open_next: false,
                 },
                 |r| Event::TetherClosed(r.map(|_| ())),
             );
         }
-        let closing_active = buffer_id == self.buffer.buffer_id;
+        let closing_active = view_id == self.view.view_id;
         self.request_str::<BufferClose>(
             BufferCloseParams {
-                buffer_id,
+                buffer_id: view_id,
                 open_next: closing_active,
             },
             move |r| {
@@ -7136,7 +7335,7 @@ impl Session {
                 "That path isn't under any of this workspace's roots",
             );
         };
-        let from = self.buffer.buffer_id;
+        let from = self.view.buffer.buffer_id;
         let hide = self.close_picker();
         hide.and(self.request_str::<BufferOpen>(
             BufferOpenParams {
@@ -7744,10 +7943,10 @@ impl Session {
         if self.app_settings.is_some() {
             return Some(HintCtx::Settings);
         }
-        if self.sneak.is_some() {
+        if self.view.sneak.is_some() {
             return None;
         }
-        match self.mode {
+        match self.view.mode {
             Mode::Normal => Some(HintCtx::Normal),
             Mode::Insert => Some(HintCtx::Insert),
             Mode::Search => Some(HintCtx::Search),
@@ -7761,7 +7960,7 @@ impl Session {
         HintFacts {
             workspaces_listed: self.picker.as_ref().and_then(|p| p.listed_workspaces()),
             mandatory_chooser: self.is_placeholder(),
-            markdown_buffer: self.buffer.language.as_deref() == Some("markdown"),
+            markdown_buffer: self.view.buffer.language.as_deref() == Some("markdown"),
             read_block_has_targets: self.read_block_has_targets(),
         }
     }
@@ -7769,10 +7968,10 @@ impl Session {
     /// Whether the reading view's focused block contains interactive elements — the fact
     /// gating the link-selection hints (`l/h`, Enter, Tab) to moments they can act.
     fn read_block_has_targets(&self) -> bool {
-        let Some(read) = self.read.as_ref() else {
+        let Some(read) = self.view.read.as_ref() else {
             return false;
         };
-        let Some(idx) = read.block_focus(self.buffer.cursor.position) else {
+        let Some(idx) = read.block_focus(self.view.buffer.cursor.position) else {
             return false;
         };
         let span = read.elements[idx].span();
@@ -8142,23 +8341,23 @@ impl Session {
     /// start" gesture each shell sends when the caret sits at column 0.
     pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, _text: Option<String>) -> Effects {
         let no_chord = !mods.ctrl && !mods.alt;
-        if let Some(sel) = self.search.chip_selected {
-            let chips = self.search.option_chips();
+        if let Some(sel) = self.view.search.chip_selected {
+            let chips = self.view.search.option_chips();
             if chips.is_empty() {
-                self.search.chip_selected = None;
+                self.view.search.chip_selected = None;
             } else {
                 let sel = sel.min(chips.len() - 1);
                 match code {
                     KeyCode::Left if no_chord => {
-                        self.search.chip_selected = Some(sel.saturating_sub(1));
+                        self.view.search.chip_selected = Some(sel.saturating_sub(1));
                         return Effects::none();
                     }
                     KeyCode::Right if no_chord => {
-                        self.search.chip_selected = (sel + 1 < chips.len()).then_some(sel + 1);
+                        self.view.search.chip_selected = (sel + 1 < chips.len()).then_some(sel + 1);
                         return Effects::none();
                     }
                     KeyCode::Esc => {
-                        self.search.chip_selected = None;
+                        self.view.search.chip_selected = None;
                         return Effects::none();
                     }
                     KeyCode::Backspace | KeyCode::Delete if no_chord => {
@@ -8169,14 +8368,14 @@ impl Session {
                     }
                     KeyCode::Char(_) if no_chord => {
                         // Typing returns to the query (the shell's input takes the char).
-                        self.search.chip_selected = None;
+                        self.view.search.chip_selected = None;
                     }
                     _ => {}
                 }
             }
         } else if no_chord
             && matches!(code, KeyCode::Left | KeyCode::Backspace)
-            && !self.search.option_chips().is_empty()
+            && !self.view.search.option_chips().is_empty()
         {
             // Forwarded from the query start: step into the chip row, selecting the rightmost.
             return self.search_select_last_chip();
@@ -8201,9 +8400,9 @@ impl Session {
     /// rich shells (native `<input>` / `text_input`) and reached via [`Self::on_search_key`] from
     /// the TUI's forwarded boundary key.
     pub fn search_select_last_chip(&mut self) -> Effects {
-        let n = self.search.option_chips().len();
+        let n = self.view.search.option_chips().len();
         if n > 0 {
-            self.search.chip_selected = Some(n - 1);
+            self.view.search.chip_selected = Some(n - 1);
         }
         Effects::none()
     }
@@ -8211,17 +8410,17 @@ impl Session {
     /// Remove the selected option chip — reset the option it stands for to its default — and keep
     /// the selection on a neighbouring chip (or clear it when the row empties), then re-run search.
     fn remove_search_chip(&mut self, sel: usize) -> Effects {
-        let Some(chip) = self.search.option_chips().get(sel).map(|c| c.id) else {
+        let Some(chip) = self.view.search.option_chips().get(sel).map(|c| c.id) else {
             return Effects::none();
         };
         match chip {
-            ChipId::Case => self.search.options.case = CaseMode::Smart,
-            ChipId::Word => self.search.options.whole_word = false,
-            ChipId::Regex => self.search.options.regex = false,
+            ChipId::Case => self.view.search.options.case = CaseMode::Smart,
+            ChipId::Word => self.view.search.options.whole_word = false,
+            ChipId::Regex => self.view.search.options.regex = false,
             _ => {}
         }
-        let remaining = self.search.option_chips().len();
-        self.search.chip_selected = (remaining > 0).then(|| sel.min(remaining - 1));
+        let remaining = self.view.search.option_chips().len();
+        self.view.search.chip_selected = (remaining > 0).then(|| sel.min(remaining - 1));
         self.incremental_search()
     }
 
@@ -8229,17 +8428,19 @@ impl Session {
     /// smart → sensitive → insensitive → smart; word / regex flip). Keeps the selection on the
     /// same option while its chip is still present, else clamps into the row, then re-runs search.
     fn cycle_search_chip(&mut self, sel: usize) -> Effects {
-        let Some(id) = self.search.option_chips().get(sel).map(|c| c.id) else {
+        let Some(id) = self.view.search.option_chips().get(sel).map(|c| c.id) else {
             return Effects::none();
         };
         match id {
             ChipId::Case => self.cycle_search_case(),
-            ChipId::Word => self.search.options.whole_word = !self.search.options.whole_word,
-            ChipId::Regex => self.search.options.regex = !self.search.options.regex,
+            ChipId::Word => {
+                self.view.search.options.whole_word = !self.view.search.options.whole_word
+            }
+            ChipId::Regex => self.view.search.options.regex = !self.view.search.options.regex,
             _ => {}
         }
-        let chips = self.search.option_chips();
-        self.search.chip_selected = chips
+        let chips = self.view.search.option_chips();
+        self.view.search.chip_selected = chips
             .iter()
             .position(|c| c.id == id)
             .or_else(|| (!chips.is_empty()).then(|| sel.min(chips.len() - 1)));
@@ -8247,7 +8448,7 @@ impl Session {
     }
 
     fn cycle_search_case(&mut self) {
-        self.search.options.case = match self.search.options.case {
+        self.view.search.options.case = match self.view.search.options.case {
             CaseMode::Smart => CaseMode::Sensitive,
             CaseMode::Sensitive => CaseMode::Insensitive,
             CaseMode::Insensitive => CaseMode::Smart,
@@ -8262,7 +8463,7 @@ impl Session {
             Action::SearchHistoryPrev => self.search_history_step(VerticalDirection::Up),
             Action::SearchHistoryNext => self.search_history_step(VerticalDirection::Down),
             Action::SearchDeleteWord => {
-                let shortened = chips::pop_word(&self.search.query);
+                let shortened = chips::pop_word(&self.view.search.query);
                 // Goes through the setter so the history walk is abandoned and the search re-runs,
                 // exactly as typing into the field would.
                 self.search_set_query(shortened)
@@ -8270,18 +8471,18 @@ impl Session {
             // The Alt-chord toggles deselect any chip — they're the "chord" interaction, distinct
             // from chip-row editing.
             Action::SearchToggleCase => {
-                self.search.chip_selected = None;
+                self.view.search.chip_selected = None;
                 self.cycle_search_case();
                 self.incremental_search()
             }
             Action::SearchToggleWord => {
-                self.search.chip_selected = None;
-                self.search.options.whole_word = !self.search.options.whole_word;
+                self.view.search.chip_selected = None;
+                self.view.search.options.whole_word = !self.view.search.options.whole_word;
                 self.incremental_search()
             }
             Action::SearchToggleRegex => {
-                self.search.chip_selected = None;
-                self.search.options.regex = !self.search.options.regex;
+                self.view.search.chip_selected = None;
+                self.view.search.options.regex = !self.view.search.options.regex;
                 self.incremental_search()
             }
             _ => Effects::none(),
@@ -8294,11 +8495,12 @@ impl Session {
     /// literal matching silently finds nothing. A step with nothing to recall leaves the prompt
     /// untouched.
     fn search_history_step(&mut self, dir: VerticalDirection) -> Effects {
-        let current = HistoryEntry::with_options(self.search.query.clone(), self.search.options);
+        let current =
+            HistoryEntry::with_options(self.view.search.query.clone(), self.view.search.options);
         match self.history_step(HistoryKind::Search, dir, current) {
             Some(entry) => {
-                self.search.query = entry.value;
-                self.search.options = entry.filters.match_options();
+                self.view.search.query = entry.value;
+                self.view.search.options = entry.filters.match_options();
                 self.incremental_search()
             }
             None => Effects::none(),
@@ -8377,7 +8579,7 @@ impl Session {
         self.request::<GitCheckout>(
             GitCheckoutParams {
                 repo_id: Some(repo_id),
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
                 branch,
                 create,
             },
@@ -8403,7 +8605,7 @@ impl Session {
                 // What we are looking at, so the rebind lands us on the same file on the new tree
                 // rather than on whatever heads the workspace's MRU. The server can't infer it: a
                 // client may hold several viewports.
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
                 ..Default::default()
             },
             |r| Event::WorktreeBound(r.map_err(|e| e.to_string())),
@@ -8426,7 +8628,7 @@ impl Session {
         self.request::<GitWorktreeAdd>(
             GitWorktreeAddParams {
                 repo_id: Some(repo_id),
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
                 branch,
                 create_branch,
             },
@@ -8444,7 +8646,7 @@ impl Session {
         self.request::<GitWorktreeRemove>(
             GitWorktreeRemoveParams {
                 repo_id: Some(repo_id),
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
                 name,
                 force,
             },
@@ -8464,7 +8666,7 @@ impl Session {
         self.request::<GitDeleteBranch>(
             GitDeleteBranchParams {
                 repo_id: Some(repo_id),
-                buffer_id: Some(self.buffer.buffer_id),
+                buffer_id: Some(self.view.buffer.buffer_id),
                 branch,
                 force,
             },
@@ -8516,7 +8718,7 @@ impl Session {
             self.request::<GitCheckout>(
                 GitCheckoutParams {
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                     branch: name,
                     create: true,
                 },
@@ -8591,7 +8793,7 @@ impl Session {
     pub fn reload(&mut self, force: bool) -> Effects {
         self.request::<BufferReload>(
             BufferReloadParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 force,
             },
             move |__r| {
@@ -8657,25 +8859,25 @@ impl Session {
 
         // Search mode owns the keyboard: control keys via its table, anything printable is
         // query text (case-preserved — no normalisation of the literal query).
-        if self.mode == Mode::Search {
+        if self.view.mode == Mode::Search {
             let fx = self.on_search_key(code, mods, text);
             return fx;
         }
 
         // An active sneak session owns the keyboard: keystrokes refine the query or pick a label.
-        if self.sneak.is_some() {
+        if self.view.sneak.is_some() {
             return self.on_sneak_key(code, mods, text);
         }
 
         // Stateful captures run before table lookup, like the TUI.
-        match self.pending {
+        match self.view.pending {
             Pending::Find {
                 dir,
                 till,
                 extend,
                 count,
             } => {
-                self.pending = Pending::None;
+                self.view.pending = Pending::None;
                 if code == KeyCode::Esc {
                     return Effects::none();
                 }
@@ -8695,19 +8897,19 @@ impl Session {
                 return self.move_motion(motion, extend);
             }
             Pending::Surround(target) => {
-                self.pending = Pending::None;
+                self.view.pending = Pending::None;
                 let ch = text.as_deref().and_then(|t| t.chars().next());
                 let Some(delimiter) = ch.filter(|c| !c.is_control()) else {
                     return Effects::none(); // Esc / non-char cancels
                 };
                 return self.edit::<InputSurround>(InputSurroundParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.buffer.buffer_id,
                     delimiter,
                     target,
                 });
             }
             Pending::Transform => {
-                self.pending = Pending::None;
+                self.view.pending = Pending::None;
                 // The next key picks the transform; an unmapped key (or Esc) just cancels.
                 let kind = text
                     .as_deref()
@@ -8717,27 +8919,27 @@ impl Session {
                     return Effects::none();
                 };
                 return self.edit::<InputTransformCase>(InputTransformCaseParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.buffer.buffer_id,
                     kind,
                     // Insert mode has no selection, so the server scans for the identifier
                     // under the caret; Normal mode recases exactly the selection (a point
                     // being the single char under the block).
-                    scan_at_cursor: self.mode == Mode::Insert,
+                    scan_at_cursor: self.view.mode == Mode::Insert,
                 });
             }
             Pending::Leader => {
-                self.pending = Pending::None;
+                self.view.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::Leader, code, mods) {
                     // `Space g` re-arms into the git sub-leader from inside `run_action`, which is
                     // why the clear above happens first.
-                    return self.run_action(b.action, 1, mods.shift, visible_rows);
+                    return self.run_action(b.action, 1, false, mods.shift, visible_rows);
                 }
                 return Effects::none();
             }
             Pending::LeaderGit => {
-                self.pending = Pending::None;
+                self.view.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::LeaderGit, code, mods) {
-                    return self.run_action(b.action, 1, mods.shift, visible_rows);
+                    return self.run_action(b.action, 1, false, mods.shift, visible_rows);
                 }
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
@@ -8747,19 +8949,24 @@ impl Session {
 
         // Count lexer (Normal and Read modes): digits accumulate; `0` only continues a count
         // (it's line-start otherwise).
-        if matches!(self.mode, Mode::Normal | Mode::Read) && !mods.ctrl && !mods.alt {
+        if matches!(self.view.mode, Mode::Normal | Mode::Read) && !mods.ctrl && !mods.alt {
             if let KeyCode::Char(c) = code {
-                if c.is_ascii_digit() && (c != '0' || self.count.is_some()) {
+                if c.is_ascii_digit() && (c != '0' || self.view.count.is_some()) {
                     let d = c.to_digit(10).unwrap();
-                    self.count = Some(self.count.unwrap_or(0).saturating_mul(10) + d);
+                    self.view.count = Some(self.view.count.unwrap_or(0).saturating_mul(10) + d);
                     return Effects::none();
                 }
             }
         }
-        let count = self.count.take().unwrap_or(1).max(1);
+        // Whether a count was *typed*, captured before it is consumed. Almost every motion treats
+        // "no count" and "count 1" identically — but not the absolute jumps: bare `g` means the
+        // field's top, while `1g` means buffer line 1, which in a composed view may not be in the
+        // field at all. One is a destination, the other is a request that can be refused.
+        let counted = self.view.count.is_some();
+        let count = self.view.count.take().unwrap_or(1).max(1);
         // Insert mode never holds a selection, so Shift+motion must not extend one (the arrow
         // bindings match any modifier). It just moves the caret.
-        let extend = mods.shift && self.mode != Mode::Insert;
+        let extend = mods.shift && self.view.mode != Mode::Insert;
 
         // Global table first (mode-identical Ctrl shortcuts), then the mode's own. Read mode skips
         // Global entirely and re-declares what it wants: Global's edit chords are *line*-grain
@@ -8767,23 +8974,23 @@ impl Session {
         // binding — `Ctrl-z`, `Ctrl-a` — rather than inheriting a keymap written for the editor.
         // (It was once simply read-only; block editing came later, and the opt-in list is what
         // that blanket exclusion.)
-        let ctx = match self.mode {
+        let ctx = match self.view.mode {
             Mode::Normal => KeyContext::Normal,
             Mode::Insert => KeyContext::Insert,
             Mode::Read => KeyContext::Read,
             Mode::Search => return Effects::none(), // handled above
         };
-        let global = if self.mode == Mode::Read {
+        let global = if self.view.mode == Mode::Read {
             None
         } else {
             lookup(KeyContext::Global, code, mods)
         };
         if let Some(b) = global.or_else(|| lookup(ctx, code, mods)) {
-            return self.run_action(b.action, count, extend, visible_rows);
+            return self.run_action(b.action, count, counted, extend, visible_rows);
         }
 
         // Insert mode: unmatched printable input is text.
-        if self.mode == Mode::Insert && !mods.ctrl && !mods.alt {
+        if self.view.mode == Mode::Insert && !mods.ctrl && !mods.alt {
             if let Some(typed) = text {
                 let typed: String = typed
                     .chars()
@@ -8791,7 +8998,7 @@ impl Session {
                     .collect();
                 if !typed.is_empty() {
                     return self.edit::<InputText>(InputTextParams {
-                        buffer_id: self.buffer.buffer_id,
+                        buffer_id: self.view.buffer.buffer_id,
                         text: typed,
                         select_pasted: false,
                         replace_selection: false,
@@ -8807,6 +9014,9 @@ impl Session {
         &mut self,
         action: Action,
         count: u32,
+        // Whether the user actually typed a count. See the capture site — the absolute jumps are
+        // the one family for which "no count" and "count 1" are different requests.
+        counted: bool,
         extend: bool,
         visible_rows: u32,
     ) -> Effects {
@@ -8826,13 +9036,17 @@ impl Session {
             self.hints.observe_action(&action, hint_ctx, enabled)
         };
         let hint_fx = self.emit_hint_events(evs);
-        let task = self.dispatch_action(action, count, extend, visible_rows);
+        let task = self.dispatch_action(action, count, counted, extend, visible_rows);
         // Remember the action for `.` to replay. Recorded at dispatch (the RPC is still in flight —
         // a failed motion just leaves a harmless no-op target). `RepeatMotion` itself isn't
         // repeatable, so it never overwrites the target with itself; find records its resolved
         // motion at the capture site instead.
         if action.is_repeatable() {
-            self.last_repeat = Some(RepeatTarget::Action { action, count });
+            self.last_repeat = Some(RepeatTarget::Action {
+                action,
+                count,
+                counted,
+            });
         }
         hint_fx.and(task)
     }
@@ -8841,11 +9055,13 @@ impl Session {
         &mut self,
         action: Action,
         count: u32,
+        // See `run_action`: distinguishes bare `g` (the field's top) from `1g` (buffer line 1).
+        counted: bool,
         extend: bool,
         visible_rows: u32,
     ) -> Effects {
         use Action as A;
-        let buffer_id = self.buffer.buffer_id;
+        let buffer_id = self.view.buffer.buffer_id;
         // While disconnected (boot `Connecting` or a mid-session `Reconnecting`) the buffer is
         // read-only: the server can't accept edits, so the RPCs are dropped anyway. Entering Insert
         // would leave the user in a mode where typing silently vanishes — it reads as a hang. Refuse
@@ -8893,7 +9109,7 @@ impl Session {
                 extend,
             ),
             A::MoveVisualLine(direction) => {
-                let Some(viewport_id) = self.viewport_id else {
+                let Some(viewport_id) = self.view.viewport_id else {
                     return Effects::none();
                 };
                 self.move_motion(
@@ -8921,12 +9137,34 @@ impl Session {
                 extend,
             ),
             A::GotoLine { last } => {
+                // Uncounted, these are the field's own edges, and the server is the only side that
+                // knows where those are: `BufferStart`/`BufferEnd` resolve against the motion
+                // scope, so in a composed view `g` lands on the focused hunk's first line rather
+                // than the file's.
+                //
+                // This also retires a real bug on bare `Alt-g`, which used to synthesise an
+                // absolute line from `window.view_line_count` — a **view** line count standing in
+                // for a **buffer** line. Its own comment admitted the consequence ("`Alt-g` lands
+                // on a clamped line rather than the file's true last"); the two spaces differ for
+                // exactly the views this work is about.
+                //
+                // Counted, they stay absolute jumps: `N g` is buffer line N, 1-based, matching the
+                // gutter. `N Alt-g` still counts back from the view's end and is still wrong in a
+                // composed view — it needs the server to resolve "N-th from the field's end", which
+                // the protocol cannot yet say.
+                if !counted {
+                    let motion = if last {
+                        Motion::BufferEnd
+                    } else {
+                        Motion::BufferStart
+                    };
+                    return self.move_jump(motion, extend);
+                }
                 let line = if last {
-                    // `Alt-g` counts from the bottom: bare (count 1) → last line, `N Alt-g` → the
-                    // N-th line up from the end. `g`/`Alt-g` are thus mirror absolute jumps.
-                    self.window
+                    self.view
+                        .window
                         .as_ref()
-                        .map(|w| w.line_count.saturating_sub(count))
+                        .map(|w| w.view_line_count.saturating_sub(count))
                         .unwrap_or(0)
                 } else {
                     count.saturating_sub(1)
@@ -8940,7 +9178,7 @@ impl Session {
             }
             A::MatchBracket { inner } => self.move_motion(Motion::MatchBracket { inner }, extend),
             A::PageMotion { dir, half } => {
-                let Some(viewport_id) = self.viewport_id else {
+                let Some(viewport_id) = self.view.viewport_id else {
                     return Effects::none();
                 };
                 let rows = visible_rows;
@@ -8961,7 +9199,7 @@ impl Session {
                 self.move_motion(Motion::PrevNavigationUnit { count }, extend)
             }
             A::BeginFind { dir, till } => {
-                self.pending = Pending::Find {
+                self.view.pending = Pending::Find {
                     dir,
                     till,
                     extend,
@@ -8972,7 +9210,7 @@ impl Session {
             A::BeginSneak { big } => {
                 // Arm the session; the first typed char triggers the first `sneak/update`. `extend`
                 // (Shift) and `big` (`Alt-s`) are fixed for the whole session.
-                self.sneak = Some(SneakState {
+                self.view.sneak = Some(SneakState {
                     extend,
                     big,
                     ..SneakState::default()
@@ -9011,10 +9249,10 @@ impl Session {
                 Event::CursorMsg,
             ),
             A::CollapseSelection => {
-                if self.buffer.cursor.is_point() {
+                if self.view.buffer.cursor.is_point() {
                     return Effects::none();
                 }
-                let pos = self.buffer.cursor.position;
+                let pos = self.view.buffer.cursor.position;
                 self.request_str::<CursorSet>(
                     CursorSetParams {
                         buffer_id,
@@ -9040,9 +9278,11 @@ impl Session {
                 let mut fx = Effects::none();
                 for _ in 0..count.max(1) {
                     let step = match &target {
-                        RepeatTarget::Action { action, count } => {
-                            self.dispatch_action(*action, *count, extend, visible_rows)
-                        }
+                        RepeatTarget::Action {
+                            action,
+                            count,
+                            counted,
+                        } => self.dispatch_action(*action, *count, *counted, extend, visible_rows),
                         RepeatTarget::Find(motion) => self.move_motion(motion.clone(), extend),
                     };
                     fx = fx.and(step);
@@ -9131,22 +9371,22 @@ impl Session {
             A::EnterInsert(where_) => {
                 // Refused up front rather than letting the mode change and toasting per keystroke:
                 // a read-only buffer has nothing Insert mode could do.
-                if self.buffer.read_only {
+                if self.view.buffer.read_only {
                     return crate::session::read_only_toast();
                 }
-                self.mode = Mode::Insert;
+                self.view.mode = Mode::Insert;
                 self.enter_insert_at(where_)
             }
             A::LeaveInsert => {
-                self.mode = Mode::Normal;
+                self.view.mode = Mode::Normal;
                 Effects::none()
             }
             A::BeginLeader => {
-                self.pending = Pending::Leader;
+                self.view.pending = Pending::Leader;
                 Effects::none()
             }
             A::BeginGitLeader => {
-                self.pending = Pending::LeaderGit;
+                self.view.pending = Pending::LeaderGit;
                 Effects::none()
             }
 
@@ -9210,7 +9450,7 @@ impl Session {
             A::OpenLineBelow | A::OpenLineAbove => {
                 // Vim's `o`/`O` as one server-side edit (park, open, land — smart indent
                 // below, unindented above); stay in Insert (TUI semantics).
-                self.mode = Mode::Insert;
+                self.view.mode = Mode::Insert;
                 let side = if matches!(action, A::OpenLineBelow) {
                     LineSide::Below
                 } else {
@@ -9226,7 +9466,7 @@ impl Session {
             // Cut to the clipboard, then drop into Insert at the resulting gap — the server's cut
             // collapses the selection and parks the cursor there, so all that's left is the mode flip.
             A::CutChange => {
-                self.mode = Mode::Insert;
+                self.view.mode = Mode::Insert;
                 self.cut(CopyScope::Selection)
             }
             A::CutLine => self.cut(CopyScope::Line),
@@ -9235,7 +9475,7 @@ impl Session {
             A::PasteAtCursor => read_clipboard_fx(PasteKind::AtCursor),
             A::ReplaceLineClipboard => read_clipboard_fx(PasteKind::Line),
             A::Change => {
-                self.mode = Mode::Insert;
+                self.view.mode = Mode::Insert;
                 self.edit::<InputChange>(CountedEditParams {
                     buffer_id,
                     count: 1,
@@ -9243,14 +9483,14 @@ impl Session {
             }
             A::ChangeLine => self.edit::<InputChangeLine>(BufferOnlyParams { buffer_id }),
             A::BeginSurround(target) => {
-                self.pending = Pending::Surround(target);
+                self.view.pending = Pending::Surround(target);
                 Effects::none()
             }
             A::Unsurround(target) => {
                 self.edit::<InputUnsurround>(InputUnsurroundParams { buffer_id, target })
             }
             A::BeginTransform => {
-                self.pending = Pending::Transform;
+                self.view.pending = Pending::Transform;
                 Effects::none()
             }
 
@@ -9289,6 +9529,7 @@ impl Session {
             A::SaveAs => {
                 // Prefill with the buffer's current workspace-relative path, like the web dialog.
                 let (path_index, input) = self
+                    .view
                     .buffer
                     .path
                     .as_deref()
@@ -9307,7 +9548,7 @@ impl Session {
                 self.refresh_open_path_listing()
             }
             A::Reload => {
-                if self.buffer.path.is_none() {
+                if self.view.buffer.path.is_none() {
                     return Effects::toast_detail(
                         "Scratch buffer has no path",
                         "There's nothing on disk to reload",
@@ -9322,7 +9563,7 @@ impl Session {
                 // keep. Atomic with the demotion, so it inherits the dirty guard — but audibly,
                 // since the user asked for a release.
                 if self.tethered() {
-                    if self.buffer.revision != self.buffer.saved_revision {
+                    if self.view.buffer.revision != self.view.buffer.saved_revision {
                         return Effects::toast_detail(
                             "Unsaved changes",
                             "Save before releasing the tether",
@@ -9337,11 +9578,11 @@ impl Session {
                         |r| Event::TetherReleased(r.map(|res| res.transient)),
                     );
                 }
-                let target = !self.buffer.transient;
+                let target = !self.view.buffer.transient;
                 // Refuse to make a buffer with unsaved edits transient — it would auto-close (and
                 // discard them) once hidden. Silent no-op; pinning permanent, or toggling a clean
                 // buffer, is fine.
-                if target && self.buffer.revision != self.buffer.saved_revision {
+                if target && self.view.buffer.revision != self.view.buffer.saved_revision {
                     return Effects::none();
                 }
                 self.request_str::<BufferSetTransient>(
@@ -9367,10 +9608,10 @@ impl Session {
                 )
             }
             A::CloseBuffer => {
-                if self.buffer.revision != self.buffer.saved_revision {
+                if self.view.buffer.revision != self.view.buffer.saved_revision {
                     self.prompt = Some(Prompt::Confirm {
                         kind: ConfirmKind::DiscardOnClose {
-                            label: self.buffer.label.clone(),
+                            label: self.view.buffer.label.clone(),
                         },
                         action: ConfirmAction::CloseDiscard,
                     });
@@ -9388,7 +9629,7 @@ impl Session {
 
             // ---- git ----
             A::ToggleDiffView => {
-                let Some(viewport_id) = self.viewport_id else {
+                let Some(viewport_id) = self.view.viewport_id else {
                     return Effects::none();
                 };
                 let enabled = !self.diff_view;
@@ -9406,7 +9647,28 @@ impl Session {
                 fx
             }
             A::NextHunk | A::PrevHunk => {
-                let direction = if matches!(action, A::NextHunk) {
+                let forward = matches!(action, A::NextHunk);
+                // A patch's changes live across its elements, each a window onto a different file.
+                // Asking one of those files what changed in it answers a different question — and
+                // for a commit, none at all: a blob at a revision has no baseline. The view knows.
+                if self.view.view_is_patch {
+                    let Some(viewport_id) = self.view.viewport_id else {
+                        return Effects::none();
+                    };
+                    return self.request_str::<ViewportNavigateChange>(
+                        ViewportNavigateChangeParams {
+                            viewport_id,
+                            direction: if forward {
+                                FocusStep::Next
+                            } else {
+                                FocusStep::Previous
+                            },
+                            count: Some(count),
+                        },
+                        Event::ElementFocused,
+                    );
+                }
+                let direction = if forward {
                     HunkDirection::Next
                 } else {
                     HunkDirection::Prev
@@ -9414,7 +9676,7 @@ impl Session {
                 self.request_str::<GitNavigateHunk>(
                     GitNavigateHunkParams {
                         buffer_id,
-                        from_line: self.buffer.cursor.position.line,
+                        from_line: self.view.buffer.cursor.position.line,
                         direction,
                         count,
                         extend,
@@ -9471,7 +9733,7 @@ impl Session {
                 GitStashPushParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                     // No prompt: `git stash` with no message is the common gesture, and git's own
                     // `WIP on <branch>` names the entry well enough to recognise in the picker.
                     message: None,
@@ -9498,7 +9760,7 @@ impl Session {
             A::ShowWorkingChanges => self.request_str::<aether_protocol::git::GitShow>(
                 aether_protocol::git::GitShowParams {
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                     target: aether_protocol::git::ShowTarget::WorkingChanges,
                     focus_path: None,
                 },
@@ -9508,7 +9770,7 @@ impl Session {
                 GitFetchParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                 },
                 Event::FetchDone,
             ),
@@ -9516,7 +9778,7 @@ impl Session {
             A::GitPush => self.request_str::<GitPush>(
                 GitPushParams {
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                 },
                 Event::PushDone,
             ),
@@ -9524,7 +9786,7 @@ impl Session {
             A::GitPull => self.request_str::<GitPull>(
                 GitPullParams {
                     repo_id: None,
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                 },
                 Event::PullDone,
             ),
@@ -9546,7 +9808,7 @@ impl Session {
                 GitResetParams {
                     // Resolved server-side from the buffer we're on, the same rule
                     // `git/prepare_commit` uses — the client never needs to know repo ids.
-                    buffer_id: Some(self.buffer.buffer_id),
+                    buffer_id: Some(self.view.buffer.buffer_id),
                     repo_id: None,
                     rev: "HEAD^".to_string(),
                 },
@@ -9559,7 +9821,7 @@ impl Session {
                 // would flag it externally-modified, and the save on the way to the commit would
                 // then *refuse* — losing the message to a keystroke meant to resume it.
                 if let Some(pending) = self.pending_commit.clone() {
-                    if pending.buffer_id == self.buffer.buffer_id {
+                    if pending.buffer_id == self.view.buffer.buffer_id {
                         return Effects::toast_detail(
                             "Already writing this commit",
                             "Close the buffer to commit",
@@ -9569,7 +9831,7 @@ impl Session {
                     let mut fx = self.request_str::<BufferOpen>(
                         BufferOpenParams {
                             buffer_id: Some(pending.buffer_id),
-                            record_nav_from: Some(self.buffer.buffer_id),
+                            record_nav_from: Some(self.view.buffer.buffer_id),
                             ..Default::default()
                         },
                         Event::Switched,
@@ -9587,7 +9849,7 @@ impl Session {
                 // resolved from, so a scratch buffer is refused rather than guessed at.
                 self.request_str::<GitPrepareCommit>(
                     GitPrepareCommitParams {
-                        buffer_id: Some(self.buffer.buffer_id),
+                        buffer_id: Some(self.view.buffer.buffer_id),
                         amend,
                         ..Default::default()
                     },
@@ -9606,12 +9868,25 @@ impl Session {
             // `Enter` means "follow what's under the cursor". In a generated patch that's the file
             // the line came from, resolved through the patch index rather than a language server —
             // the same gesture, a different resolver, exactly as it is in the reading view.
-            A::GotoDefinition if self.buffer.is_patch => self.request_str::<GitFollowPatchLine>(
-                GitFollowPatchLineParams { buffer_id },
-                Event::PatchLineFollowed,
-            ),
+            A::GotoDefinition if self.view.buffer.is_patch => self
+                .request_str::<GitFollowPatchLine>(
+                    GitFollowPatchLineParams { buffer_id },
+                    Event::PatchLineFollowed,
+                ),
             A::GotoDefinition => self
                 .request_str::<LspGotoDefinition>(LspBufferParams { buffer_id }, Event::Definition),
+            // One verb, "tell me about the thing under the cursor", resolved against the mode:
+            // over source that's the language server's hover, over the reading view it's the target
+            // of the focused link or image. They were separate bindings on `Tab` until `Tab` was
+            // needed for moving between a view's editors.
+            A::FocusNextElement => self.focus_element(FocusTarget::Step {
+                direction: FocusStep::Next,
+            }),
+            A::FocusPrevElement => self.focus_element(FocusTarget::Step {
+                direction: FocusStep::Previous,
+            }),
+
+            A::Hover if self.view.mode == Mode::Read => self.read_show_target(),
             A::Hover => {
                 self.request_str::<LspHover>(LspBufferParams { buffer_id }, Event::HoverInfo)
             }
@@ -9643,13 +9918,13 @@ impl Session {
                 dir == Direction::Forward,
                 count,
                 extend,
-                crate::markdown::Element::is_block,
+                crate::markdown::Stop::is_block,
             ),
             A::ReadStepLink(dir) => self.read_step_link_in_block(dir == Direction::Forward, count),
             A::ReadShowTarget => self.read_show_target(),
             A::ReadStepHeading(dir) => {
                 self.read_step(dir == Direction::Forward, count, extend, |e| {
-                    matches!(e, crate::markdown::Element::Heading { .. })
+                    matches!(e, crate::markdown::Stop::Heading { .. })
                 })
             }
             A::ReadSelectBlock(dir) => {
@@ -9702,18 +9977,18 @@ impl Session {
     /// Toggle the reading view on the current buffer (`Space v`). The choice is remembered per
     /// buffer for the session; non-markdown buffers toast instead.
     fn toggle_read_view(&mut self) -> Effects {
-        if self.read.is_some() {
+        if self.view.read.is_some() {
             self.read_on = false;
-            self.read = None;
-            if self.mode == Mode::Read {
-                self.mode = Mode::Normal;
+            self.view.read = None;
+            if self.view.mode == Mode::Read {
+                self.view.mode = Mode::Normal;
             }
             // The editor window stayed subscribed throughout — just frame the reading position.
             return Effects::one(Effect::RevealCursor(RevealStyle::Jump));
         }
         // A buffer with no reading view to show leaves the session choice alone: flipping global
         // state from a buffer where you can't see it change is worse than doing nothing.
-        if self.buffer.language.as_deref() != Some("markdown") {
+        if self.view.buffer.language.as_deref() != Some("markdown") {
             return Effects::toast_grouped(
                 "No reader view available",
                 ToastKind::Info,
@@ -9736,7 +10011,7 @@ impl Session {
         forward: bool,
         count: u32,
         extend: bool,
-        pred: impl Fn(&crate::markdown::Element) -> bool,
+        pred: impl Fn(&crate::markdown::Stop) -> bool,
     ) -> Effects {
         enum Landing {
             Goto(LogicalPosition),
@@ -9746,10 +10021,10 @@ impl Session {
             },
         }
         let landing = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor;
+            let cursor = self.view.buffer.cursor;
             // Step from the byte the bar is drawn at, not the raw cursor. A block selection parks
             // the cursor on its last line's terminating newline, and only some block spans reach
             // that far — a fence stops at its closing backtick — so the raw byte resolved forward
@@ -9808,7 +10083,7 @@ impl Session {
             Landing::Goto(position) => self.move_motion(Motion::Goto { position }, false),
             Landing::Select { position, anchor } => self.request_str::<CursorSet>(
                 CursorSetParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.buffer.buffer_id,
                     position,
                     anchor,
                     granularity: Granularity::Line,
@@ -9831,11 +10106,11 @@ impl Session {
     /// `Granularity::Line` lands the result in whole-line normal form.
     fn read_select_block(&mut self, forward: bool, count: u32, extend: bool) -> Effects {
         let (position, anchor) = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor;
-            let is_block = crate::markdown::Element::is_block;
+            let cursor = self.view.buffer.cursor;
+            let is_block = crate::markdown::Stop::is_block;
             let step = |idx: usize, fwd: bool| {
                 crate::markdown::step_element(&read.elements, idx, fwd, is_block)
             };
@@ -9895,7 +10170,7 @@ impl Session {
         };
         self.request_str::<CursorSet>(
             CursorSetParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 position,
                 anchor,
                 granularity: Granularity::Line,
@@ -9908,9 +10183,9 @@ impl Session {
     /// record a presentation preference — ducking out to type is not "I prefer source". The caller
     /// sets the destination mode.
     fn read_exit_for_edit(&mut self) {
-        self.read = None;
-        if self.mode == Mode::Read {
-            self.mode = Mode::Normal;
+        self.view.read = None;
+        if self.view.mode == Mode::Read {
+            self.view.mode = Mode::Normal;
         }
     }
 
@@ -9926,10 +10201,10 @@ impl Session {
     /// into — nothing on screen and every edit transition a silent no-op.
     fn read_insert(&mut self, at_end: bool) -> Effects {
         let target = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor;
+            let cursor = self.view.buffer.cursor;
             if cursor.is_point() {
                 let byte = match read.block_focus(cursor.position) {
                     Some(f) if at_end => read.block_append_byte(f),
@@ -9943,7 +10218,7 @@ impl Session {
             }
         };
         self.read_exit_for_edit();
-        self.mode = Mode::Insert;
+        self.view.mode = Mode::Insert;
         match target {
             Some(position) => self.move_motion(Motion::Goto { position }, false),
             None => self.enter_insert_at(if at_end {
@@ -9967,10 +10242,10 @@ impl Session {
     /// block up). A multi-block selection collapses to one new block the same way.
     fn read_change(&mut self) -> Effects {
         let (anchor, position) = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let Some((top, bottom, _)) = read.selection_blocks(&self.buffer.cursor) else {
+            let Some((top, bottom, _)) = read.selection_blocks(&self.view.buffer.cursor) else {
                 return Effects::none();
             };
             let start = read.elements[top].span().start;
@@ -9980,8 +10255,8 @@ impl Session {
             )
         };
         self.read_exit_for_edit();
-        self.mode = Mode::Insert;
-        let buffer_id = self.buffer.buffer_id;
+        self.view.mode = Mode::Insert;
+        let buffer_id = self.view.buffer.buffer_id;
         self.request_str::<CursorSet>(
             CursorSetParams {
                 buffer_id,
@@ -10004,10 +10279,10 @@ impl Session {
     /// ends.
     fn read_step_link_in_block(&mut self, forward: bool, count: u32) -> Effects {
         let target = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor.position;
+            let cursor = self.view.buffer.cursor.position;
             let Some(block) = read.block_focus(cursor) else {
                 return Effects::none();
             };
@@ -10050,16 +10325,16 @@ impl Session {
     /// `Enter`.
     fn read_show_target(&mut self) -> Effects {
         let text = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+            let Some(idx) = read.focus(self.view.buffer.cursor.position) else {
                 return Effects::none();
             };
             match &read.elements[idx] {
-                crate::markdown::Element::Link { href, .. } => href.clone(),
-                crate::markdown::Element::Image { src, .. } => src.clone(),
-                crate::markdown::Element::FootnoteRef { label, .. } => {
+                crate::markdown::Stop::Link { href, .. } => href.clone(),
+                crate::markdown::Stop::Image { src, .. } => src.clone(),
+                crate::markdown::Stop::FootnoteRef { label, .. } => {
                     match crate::markdown::footnote_def_span(&read.blocks, label) {
                         Some(span) => read.slice(span).trim_end().to_string(),
                         None => format!("No definition for footnote [{label}]"),
@@ -10080,7 +10355,7 @@ impl Session {
     /// in every shell through one path.
     pub fn read_click(&mut self, byte: u32) -> Effects {
         let target = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
             if read.loading && read.text.is_empty() {
@@ -10097,13 +10372,13 @@ impl Session {
     /// `Enter` — pointing at a target and clicking should act. Images stay arm-only (`Enter`
     /// opens them externally, which a stray click shouldn't).
     pub fn read_click_activate(&mut self, byte: u32) -> Effects {
-        let follow = self.read.as_ref().and_then(|read| {
+        let follow = self.view.read.as_ref().and_then(|read| {
             read.elements.iter().position(|e| {
                 e.span().start == byte
                     && matches!(
                         e,
-                        crate::markdown::Element::Link { .. }
-                            | crate::markdown::Element::FootnoteRef { .. }
+                        crate::markdown::Stop::Link { .. }
+                            | crate::markdown::Stop::FootnoteRef { .. }
                     )
             })
         });
@@ -10118,9 +10393,9 @@ impl Session {
     /// opens in a new window (GUI) / app tab (web); anything else falls back to the plain
     /// click-follow.
     pub fn read_click_new_window(&mut self, byte: u32) -> Effects {
-        let href = self.read.as_ref().and_then(|read| {
+        let href = self.view.read.as_ref().and_then(|read| {
             read.elements.iter().find_map(|e| match e {
-                crate::markdown::Element::Link { span, href }
+                crate::markdown::Stop::Link { span, href }
                     if span.start == byte && !href.starts_with('#') && !has_url_scheme(href) =>
                 {
                     Some(href.clone())
@@ -10140,7 +10415,7 @@ impl Session {
     /// `g` / `Alt-g`: the first / last block-grain element.
     fn read_ends(&mut self, last: bool) -> Effects {
         let target = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
             let mut blocks = read
@@ -10172,8 +10447,8 @@ impl Session {
     /// read-only chord. Markdown gives up number adjustment for it: an ordered list's markers are
     /// positions a renderer assigns, not values worth nudging by hand.
     fn adjust_value(&mut self, up: bool, count: u32) -> Effects {
-        let buffer_id = self.buffer.buffer_id;
-        if self.buffer.language.as_deref() == Some("markdown") {
+        let buffer_id = self.view.buffer.buffer_id;
+        if self.view.buffer.language.as_deref() == Some("markdown") {
             return self.request_str::<InputToggleTask>(
                 ToggleTaskParams {
                     buffer_id,
@@ -10188,16 +10463,16 @@ impl Session {
             delta: if up { count } else { -count },
             // Insert mode has no selection: scan for the number at the caret rather than acting on
             // the (nonexistent) selection, and collapse afterwards.
-            scan_at_cursor: self.mode == Mode::Insert,
+            scan_at_cursor: self.view.mode == Mode::Insert,
         })
     }
 
     fn read_activate(&mut self) -> Effects {
         let idx = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor;
+            let cursor = self.view.buffer.cursor;
             // A link is followable only while it is *shown* as armed. With the selection extended
             // the shells suppress the target pill (`display_target`), so resolving innermost-any
             // here would follow a link nothing on screen marks — `Alt-x` up a paragraph that
@@ -10227,13 +10502,13 @@ impl Session {
             ToggleTask,
         }
         let act = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
             match &read.elements[idx] {
-                crate::markdown::Element::Link { href, .. } => Act::Link(href.clone()),
-                crate::markdown::Element::Image { src, .. } => Act::Image(src.clone()),
-                crate::markdown::Element::FootnoteRef { label, .. } => {
+                crate::markdown::Stop::Link { href, .. } => Act::Link(href.clone()),
+                crate::markdown::Stop::Image { src, .. } => Act::Image(src.clone()),
+                crate::markdown::Stop::FootnoteRef { label, .. } => {
                     let Some(span) = crate::markdown::footnote_def_span(&read.blocks, label) else {
                         return Effects::toast_grouped(
                             format!("No definition for footnote [{label}]"),
@@ -10246,7 +10521,7 @@ impl Session {
                 // A task item's activation IS toggling its checkbox — the armed-link pill keeps
                 // precedence via `focus`'s innermost-any resolution, and clicks never route here
                 // (`read_click_activate` filters to links/footnote refs).
-                crate::markdown::Element::Item {
+                crate::markdown::Stop::Item {
                     checked: Some(_), ..
                 } => Act::ToggleTask,
                 _ => return Effects::none(),
@@ -10257,7 +10532,7 @@ impl Session {
             // which way it is pointing. `Ctrl-a`/`Ctrl-Alt-a` are the directional pair.
             Act::ToggleTask => self.request_str::<InputToggleTask>(
                 ToggleTaskParams {
-                    buffer_id: self.buffer.buffer_id,
+                    buffer_id: self.view.buffer.buffer_id,
                     set: None,
                 },
                 Event::BlockEditDone,
@@ -10292,7 +10567,7 @@ impl Session {
                         Some(abs) if abs != src => {
                             Effects::one(Effect::ShellAction(ShellAction::OpenBufferFile {
                                 absolute: abs,
-                                buffer_id: self.buffer.buffer_id,
+                                buffer_id: self.view.buffer.buffer_id,
                                 relative: src,
                             }))
                         }
@@ -10303,7 +10578,7 @@ impl Session {
                     Some(absolute) => {
                         Effects::one(Effect::ShellAction(ShellAction::OpenBufferFile {
                             absolute,
-                            buffer_id: self.buffer.buffer_id,
+                            buffer_id: self.view.buffer.buffer_id,
                             relative: src,
                         }))
                     }
@@ -10327,7 +10602,7 @@ impl Session {
     /// (j/k/o/g/v/search), `Backspace` the way back from *jumps*, in both modes. A pathless
     /// (scratch) buffer can't re-open itself: plain Goto, unrecorded.
     fn read_jump_recorded(&mut self, target: LogicalPosition) -> Effects {
-        match self.buffer.path.clone() {
+        match self.view.buffer.path.clone() {
             Some(path) => self.open_path_at(path, Some(target), None),
             None => self.move_motion(Motion::Goto { position: target }, false),
         }
@@ -10338,14 +10613,14 @@ impl Session {
     /// everything else (external links, anchors, images, plain blocks) behaves like `Enter`.
     fn read_activate_new_window(&mut self) -> Effects {
         let href = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let Some(idx) = read.focus(self.buffer.cursor.position) else {
+            let Some(idx) = read.focus(self.view.buffer.cursor.position) else {
                 return Effects::none();
             };
             match &read.elements[idx] {
-                crate::markdown::Element::Link { href, .. }
+                crate::markdown::Stop::Link { href, .. }
                     if !href.starts_with('#') && !has_url_scheme(href) =>
                 {
                     href.clone()
@@ -10390,7 +10665,7 @@ impl Session {
         if let Some(slug) = href.strip_prefix('#') {
             // In-document anchor: focus the heading (GitHub slug rules).
             let target = {
-                let Some(read) = self.read.as_ref() else {
+                let Some(read) = self.view.read.as_ref() else {
                     return Effects::none();
                 };
                 let Some(idx) = crate::markdown::heading_by_slug(&read.elements, slug) else {
@@ -10457,7 +10732,7 @@ impl Session {
         let Some(slug) = self.pending_read_anchor.take() else {
             return Effects::none();
         };
-        let Some(read) = self.read.as_mut() else {
+        let Some(read) = self.view.read.as_mut() else {
             return Effects::none();
         };
         match crate::markdown::heading_by_slug(&staged.elements, &slug) {
@@ -10480,7 +10755,7 @@ impl Session {
     /// Install a staged reading-view parse once its anchor's cursor has landed — or failed:
     /// the hold must never wedge the view in "Loading…". No-op when nothing is staged.
     fn install_staged_read(&mut self) -> Effects {
-        let Some(read) = self.read.as_mut() else {
+        let Some(read) = self.view.read.as_mut() else {
             return Effects::none();
         };
         match read.staged.take() {
@@ -10501,7 +10776,7 @@ impl Session {
             return Effects::none();
         };
         let target = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
             let Some(idx) = crate::markdown::heading_by_slug(&read.elements, &slug) else {
@@ -10526,6 +10801,7 @@ impl Session {
     pub fn read_resolve_path(&self, target: &str) -> Option<String> {
         if target.starts_with('/') {
             let root = self
+                .view
                 .buffer
                 .path
                 .as_deref()
@@ -10541,7 +10817,7 @@ impl Session {
                 None => target.to_string(),
             });
         }
-        let parent = std::path::Path::new(self.buffer.path.as_deref()?).parent()?;
+        let parent = std::path::Path::new(self.view.buffer.path.as_deref()?).parent()?;
         Some(parent.join(target).to_string_lossy().into_owned())
     }
 
@@ -10549,10 +10825,10 @@ impl Session {
     /// else the focused element: a link's URL, otherwise its markdown source.
     fn read_copy(&mut self) -> Effects {
         let (text, what) = {
-            let Some(read) = self.read.as_ref() else {
+            let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            let cursor = self.buffer.cursor;
+            let cursor = self.view.buffer.cursor;
             if !cursor.is_point() {
                 // Inclusive selection: the end cursor's char (the newline, in whole-line
                 // normal form) is part of the range.
@@ -10573,7 +10849,7 @@ impl Session {
                     return Effects::none();
                 };
                 match &read.elements[idx] {
-                    crate::markdown::Element::Link { href, .. } => (href.clone(), "link URL"),
+                    crate::markdown::Stop::Link { href, .. } => (href.clone(), "link URL"),
                     el => (
                         read.slice(el.span()).trim_end().to_string(),
                         "element source",
@@ -10593,7 +10869,7 @@ impl Session {
     fn move_motion(&mut self, motion: Motion, extend: bool) -> Effects {
         self.request_str::<CursorMove>(
             CursorMoveParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 motion,
                 extend_selection: extend,
             },
@@ -10608,7 +10884,7 @@ impl Session {
             return self.sneak_cancel();
         }
         if code == KeyCode::Backspace {
-            let Some(sneak) = self.sneak.as_mut() else {
+            let Some(sneak) = self.view.sneak.as_mut() else {
                 return Effects::none();
             };
             sneak.query.pop();
@@ -10627,10 +10903,15 @@ impl Session {
         else {
             return Effects::none();
         };
-        if self.sneak.as_ref().is_some_and(|s| s.labels.contains(&ch)) {
+        if self
+            .view
+            .sneak
+            .as_ref()
+            .is_some_and(|s| s.labels.contains(&ch))
+        {
             return self.sneak_select(ch);
         }
-        let Some(sneak) = self.sneak.as_mut() else {
+        let Some(sneak) = self.view.sneak.as_mut() else {
             return Effects::none();
         };
         sneak.query.push(ch);
@@ -10640,23 +10921,27 @@ impl Session {
 
     /// Push the current query to the server, which recomputes labels and refreshes the viewport.
     fn sneak_update(&mut self, query: String) -> Effects {
-        let Some(viewport_id) = self.viewport_id else {
+        let Some(viewport_id) = self.view.viewport_id else {
             return Effects::none();
         };
-        let big = self.sneak.as_ref().is_some_and(|s| s.big);
+        let big = self.view.sneak.as_ref().is_some_and(|s| s.big);
         // Scope to what's actually on screen (reported by the shell). Fall back to the loaded
         // window's range until the shell has reported a scroll position.
         let (first_line, last_line) = self
+            .view
             .visible_lines
             .or_else(|| {
-                self.window
-                    .as_ref()
-                    .map(|w| (w.first_logical_line, w.last_logical_line_exclusive))
+                // The focused element's loaded **buffer** lines. The window's own range is in view
+                // coordinates, which name no file's lines once a view spans several.
+                self.view.window.as_ref().and_then(|w| {
+                    crate::grid::loaded_line_range(w, self.view.focused_element)
+                        .map(|(first, last)| (first, last.saturating_add(1)))
+                })
             })
             .unwrap_or((0, 0));
         self.request_str::<SneakUpdate>(
             SneakUpdateParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 viewport_id,
                 query,
                 first_line,
@@ -10670,11 +10955,11 @@ impl Session {
     /// Jump to the labelled word (the server selects it / extends to the hull). Ends the session
     /// locally now; the cursor arrives via [`Event::CursorMsg`].
     fn sneak_select(&mut self, label: char) -> Effects {
-        let extend = self.sneak.as_ref().is_some_and(|s| s.extend);
-        self.sneak = None;
+        let extend = self.view.sneak.as_ref().is_some_and(|s| s.extend);
+        self.view.sneak = None;
         self.request_str::<SneakSelect>(
             SneakSelectParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 label,
                 extend,
             },
@@ -10684,13 +10969,7 @@ impl Session {
 
     /// Abandon the session (Esc). The cursor never moved; just clear the labels server-side.
     fn sneak_cancel(&mut self) -> Effects {
-        self.sneak = None;
-        self.request::<SneakCancel>(
-            SneakCancelParams {
-                buffer_id: self.buffer.buffer_id,
-            },
-            |_r| Event::Noop,
-        )
+        self.cancel_sneak_on(self.view.buffer.buffer_id)
     }
 
     /// Like [`move_motion`](Self::move_motion) but reveals the landing as a jump (go-to-line) —
@@ -10698,7 +10977,7 @@ impl Session {
     fn move_jump(&mut self, motion: Motion, extend: bool) -> Effects {
         self.request_str::<CursorMove>(
             CursorMoveParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 motion,
                 extend_selection: extend,
             },
@@ -10712,7 +10991,7 @@ impl Session {
         M: RpcMethod<Params = CountedEditParams, Result = EditResult> + 'static,
     {
         self.edit::<M>(CountedEditParams {
-            buffer_id: self.buffer.buffer_id,
+            buffer_id: self.view.buffer.buffer_id,
             count,
         })
     }
@@ -10722,7 +11001,7 @@ impl Session {
     fn tree_select(&mut self, direction: TreeSelectDirection, count: u32) -> Effects {
         self.request_str::<CursorTreeSelect>(
             CursorTreeSelectParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 direction,
                 count,
             },
@@ -10738,7 +11017,7 @@ impl Session {
     {
         self.request_str::<M>(
             CursorUndoParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 count,
             },
             |r| Event::CursorMsg(r.map(|r| r.cursor)),
@@ -10752,10 +11031,10 @@ impl Session {
     {
         self.request_str::<M>(
             UndoRedoParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 count,
                 // Insert mode forbids selections — drop the one undo would otherwise restore.
-                collapse_selection: self.mode == Mode::Insert,
+                collapse_selection: self.view.mode == Mode::Insert,
             },
             Event::UndoRedoDone,
         )
@@ -10773,7 +11052,7 @@ impl Session {
         };
         self.request_str::<CursorMove>(
             CursorMoveParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 motion: Motion::SelectionEdge { edge },
                 extend_selection: false,
             },
@@ -10784,7 +11063,7 @@ impl Session {
     fn copy(&mut self, scope: CopyScope) -> Effects {
         self.request_str::<BufferCopy>(
             BufferCopyParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 scope,
             },
             Event::CopyDone,
@@ -10794,7 +11073,7 @@ impl Session {
     fn cut(&mut self, scope: CopyScope) -> Effects {
         self.request_str::<BufferCut>(
             BufferCopyParams {
-                buffer_id: self.buffer.buffer_id,
+                buffer_id: self.view.buffer.buffer_id,
                 scope,
             },
             Event::CutDone,
@@ -10998,9 +11277,9 @@ mod tests {
         let mut s = Session::placeholder();
         s.workspace = "proj".into();
         s.workspace_paths = vec!["/proj".into()];
-        s.buffer.path = Some("/proj/docs/a.md".into());
-        s.mode = Mode::Read;
-        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        s.view.buffer.path = Some("/proj/docs/a.md".into());
+        s.view.mode = Mode::Read;
+        s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
         s
     }
 
@@ -11016,10 +11295,10 @@ mod tests {
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
         // The open lands on a markdown buffer: the armed anchor forces the reading view.
-        s.buffer.buffer_id += 1;
-        s.buffer.language = Some("markdown".into());
+        s.view.buffer.buffer_id += 1;
+        s.view.buffer.language = Some("markdown".into());
         let fx = s.sync_read_on_switch();
-        assert!(s.read.is_some(), "the anchor forced the reading view");
+        assert!(s.view.read.is_some(), "the anchor forced the reading view");
         assert!(!s.read_on, "without flipping the session's choice");
         assert!(fx.0.iter().any(|e| matches!(
             e,
@@ -11029,9 +11308,12 @@ mod tests {
         // Without an anchor, the same switch honours the source choice.
         let mut s = reading_session();
         s.read_on = false;
-        s.buffer.language = Some("markdown".into());
+        s.view.buffer.language = Some("markdown".into());
         let _ = s.sync_read_on_switch();
-        assert!(s.read.is_none(), "no anchor → the session choice stands");
+        assert!(
+            s.view.read.is_none(),
+            "no anchor → the session choice stands"
+        );
     }
 
     /// Cross-file anchors: following `[x](./other.md#section)` opens the file and arms the
@@ -11049,8 +11331,8 @@ mod tests {
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
         // The switch lands: the new buffer's reading view fetches and adopts its content.
-        s.buffer.buffer_id += 1;
-        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        s.view.buffer.buffer_id += 1;
+        s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
         let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
             revision: 0,
             text: "# One\n\ntext\n\n## Section Two\n\nbody\n".into(),
@@ -11058,7 +11340,7 @@ mod tests {
         assert_eq!(s.pending_read_anchor, None, "the anchor is consumed");
         // The parse is *staged*, not installed: the visible view stays "Loading…" for the
         // cursor round-trip, so the document paints exactly once, already in place.
-        let read = s.read.as_ref().unwrap();
+        let read = s.view.read.as_ref().unwrap();
         assert!(
             read.loading && read.blocks.is_empty(),
             "held back while the Goto flies"
@@ -11072,7 +11354,7 @@ mod tests {
         let goto =
             fx.0.iter()
                 .find_map(|e| match e {
-                    Effect::Request { method, params, .. } if *method == "cursor/move" => {
+                    Effect::Request { method, params, .. } if *method == "element/move" => {
                         Some(params.clone())
                     }
                     _ => None,
@@ -11091,13 +11373,13 @@ mod tests {
             match_bracket: None,
             jumplist_position: None,
         })));
-        let read = s.read.as_ref().unwrap();
+        let read = s.view.read.as_ref().unwrap();
         assert!(
             !read.loading && !read.blocks.is_empty(),
             "installed on landing"
         );
         assert!(read.staged.is_none());
-        assert_eq!(s.buffer.cursor.position, expected);
+        assert_eq!(s.view.buffer.cursor.position, expected);
     }
 
     /// A fragment naming no heading in the target document warns (same toast as the
@@ -11107,8 +11389,8 @@ mod tests {
         let mut s = reading_session();
         s.read_follow_link("./other.md#nope");
         assert_eq!(s.pending_read_anchor.as_deref(), Some("nope"));
-        s.buffer.buffer_id += 1;
-        s.read = Some(ReadView::loading(s.buffer.buffer_id));
+        s.view.buffer.buffer_id += 1;
+        s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
         let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
             revision: 0,
             text: "# Only Heading\n".into(),
@@ -11127,11 +11409,11 @@ mod tests {
         assert!(
             !fx.0
                 .iter()
-                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "cursor/move")),
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "element/move")),
             "…and moves nothing"
         );
         // Nothing to place, so no hold: the document installs immediately.
-        let read = s.read.as_ref().unwrap();
+        let read = s.view.read.as_ref().unwrap();
         assert!(!read.loading && !read.blocks.is_empty() && read.staged.is_none());
     }
 
@@ -11141,7 +11423,8 @@ mod tests {
     #[test]
     fn in_document_anchor_follow_is_nav_recorded() {
         let mut s = reading_session();
-        s.read
+        s.view
+            .read
             .as_mut()
             .unwrap()
             .adopt(0, "# One\n\ntext\n\n## Section Two\n\nbody\n".into());
@@ -11157,10 +11440,10 @@ mod tests {
                 .expect("an in-document anchor rides buffer/open");
         assert_eq!(
             open["record_nav_from"],
-            serde_json::json!(s.buffer.buffer_id),
+            serde_json::json!(s.view.buffer.buffer_id),
             "the origin is recorded"
         );
-        let read = s.read.as_ref().unwrap();
+        let read = s.view.read.as_ref().unwrap();
         let idx = crate::markdown::heading_by_slug(&read.elements, "section-two").unwrap();
         let expected = read.pos_of(read.elements[idx].span().start);
         assert_eq!(
@@ -11205,7 +11488,7 @@ mod tests {
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
         // Outside every root there is no anchor — the filesystem-absolute reading stands.
-        s.buffer.path = Some("/elsewhere/notes.md".into());
+        s.view.buffer.path = Some("/elsewhere/notes.md".into());
         assert_eq!(
             s.read_resolve_path("/etc/hosts").as_deref(),
             Some("/etc/hosts")
@@ -11508,7 +11791,7 @@ mod tests {
         let mut s = Session::placeholder();
         s.workspace = "proj".into();
         s.workspace_paths = vec!["/proj".into()];
-        s.buffer.path = Some("/proj/src/a.rs".into());
+        s.view.buffer.path = Some("/proj/src/a.rs".into());
         s
     }
 
@@ -11526,7 +11809,7 @@ mod tests {
     #[test]
     fn copy_web_url_emits_a_file_link_with_cursor_fragment() {
         let mut s = web_url_session();
-        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
         let fx = s.copy_web_url();
         assert_eq!(
             copied_web_url(&fx).as_deref(),
@@ -11546,8 +11829,8 @@ mod tests {
     #[test]
     fn copy_web_url_links_a_scratch_by_buffer_id() {
         let mut s = web_url_session();
-        s.buffer.path = None;
-        s.buffer.buffer_id = 7;
+        s.view.buffer.path = None;
+        s.view.buffer.buffer_id = 7;
         let fx = s.copy_web_url();
         assert_eq!(
             copied_web_url(&fx).as_deref(),
@@ -11563,8 +11846,8 @@ mod tests {
     fn copy_web_url_addresses_unrooted_files_by_absolute_path() {
         // An external file, hosted as a guest by a named workspace.
         let mut s = web_url_session();
-        s.buffer.path = Some("/elsewhere/b.rs".into());
-        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        s.view.buffer.path = Some("/elsewhere/b.rs".into());
+        s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
         assert_eq!(
             copied_web_url(&s.copy_web_url()).as_deref(),
             Some("?path=/elsewhere/b.rs#42:10")
@@ -11572,7 +11855,7 @@ mod tests {
         // A file in a temporary context, even one under the root that context adopted.
         let mut s = web_url_session();
         s.workspace = format!("{}1", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
-        s.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
+        s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 41, col: 9 };
         assert_eq!(
             copied_web_url(&s.copy_web_url()).as_deref(),
             Some("?path=/proj/src/a.rs#42:10")
@@ -11586,7 +11869,7 @@ mod tests {
     fn copy_web_url_warns_for_a_scratch_with_no_workspace() {
         let mut s = web_url_session();
         s.workspace = format!("{}1", aether_protocol::EPHEMERAL_WORKSPACE_PREFIX);
-        s.buffer.path = None;
+        s.view.buffer.path = None;
         let fx = s.copy_web_url();
         assert_eq!(copied_web_url(&fx), None, "nothing lands on the clipboard");
         assert!(

@@ -452,7 +452,7 @@ pub fn collect_symbol_path_pushes(s: &mut ServerState, buffer_id: BufferId) -> P
     let mut clients: Vec<ClientId> = s
         .viewports
         .values()
-        .filter(|vp| vp.buffer_id == buffer_id)
+        .filter(|vp| vp.binds(buffer_id))
         .map(|vp| vp.client_id)
         .collect();
     clients.sort_unstable();
@@ -849,7 +849,7 @@ pub fn set_diagnostics_and_refresh(
     // plus the per-viewport `viewport/lines_changed` re-render (squiggles + gutter).
     let mut counted_clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
     for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
+        if !vp.shows(buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -858,20 +858,9 @@ pub fn set_diagnostics_and_refresh(
         if counted_clients.insert(vp.client_id) {
             pushes.push((sender.clone(), diagnostics_changed_notif(buffer_id, counts)));
         }
-        let search = s.searches.get(&(vp.client_id, buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(
-                buf,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(s, buffer_id),
-                buffer_conflicts(s, buffer_id),
-                diags,
-                buffer_git_status(s, buffer_id),
-                lines_changed_cursor(s, vp),
-            ),
+            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
         ));
     }
     pushes
@@ -1331,11 +1320,20 @@ pub async fn lsp_navigate_diagnostic(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
+    // The field's bounds, taken before the mutable borrows below. `d` is a *target* motion: it
+    // seeks a specific destination, so a diagnostic outside the element the cursor is in is not a
+    // destination at all — landing on the element's edge instead would claim you had arrived
+    // somewhere you had not.
+    let bounds = {
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
     let target = navigate_diagnostic_target(
         buffer_diagnostics(&s, params.buffer_id),
         current.position,
         params.direction,
         params.count,
+        bounds,
     );
     let Some(target) = target else {
         let response = wrap_for_response(&s, client_id, params.buffer_id, current);
@@ -1375,36 +1373,54 @@ pub async fn lsp_navigate_diagnostic(
     })
 }
 
-/// The position of the `count`-th diagnostic strictly beyond `from` in `direction`, or `None` if
-/// there's none that way. Diagnostics are compared by their start position (line then byte column),
-/// so the jump is *position*-granular: a second diagnostic further along the cursor's own line is a
-/// distinct stop, and navigation moves off the exact cursor position rather than off its whole line.
-/// An over-large `count` clamps to the furthest reachable diagnostic rather than refusing to move.
+/// The position of the `count`-th diagnostic strictly beyond `from` in `direction` **and inside
+/// `bounds`**, or `None` when there is no such diagnostic — which the caller reports as
+/// `moved: false`, and the client turns into "No more diagnostics".
+///
+/// Diagnostics are compared by their start position (line then byte column), so the jump is
+/// *position*-granular: a second diagnostic further along the cursor's own line is a distinct stop,
+/// and navigation moves off the exact cursor position rather than off its whole line.
+///
+/// Two refusals, both deliberate:
+///
+/// - **Outside the field is not a destination.** `bounds` is the focused element's line extent, so
+///   in a composed view a diagnostic in another hunk — or elsewhere in the same file, outside the
+///   window this view shows of it — is invisible to `d`. It used to be found and then whole-document
+///   clamped, which put the cursor on the element's edge and called that arriving.
+/// - **An over-large count refuses rather than clamping.** `5d` with three diagnostics ahead does
+///   nothing. The count says "the fifth one"; there isn't one. Note this cannot change the uncounted
+///   case: at `count == 1` the old fallback was already unreachable, since `nth(0)` returning `None`
+///   means the filter matched nothing for the fallback to find either.
 fn navigate_diagnostic_target(
     diags: &[crate::lsp::diagnostics::BufferDiagnostic],
     from: LogicalPosition,
     direction: DiagnosticDirection,
     count: u32,
+    bounds: (u32, u32),
 ) -> Option<LogicalPosition> {
     let key = |p: &LogicalPosition| (p.line, p.col);
     let from_key = key(&from);
-    let mut anchors: Vec<LogicalPosition> = diags.iter().map(|d| d.start).collect();
+    let (first_line, last_line) = bounds;
+    let mut anchors: Vec<LogicalPosition> = diags
+        .iter()
+        .map(|d| d.start)
+        .filter(|p| p.line >= first_line && p.line <= last_line)
+        .collect();
     anchors.sort_by_key(key);
     anchors.dedup();
     let skip = (count.max(1) - 1) as usize;
     match direction {
-        DiagnosticDirection::Next => {
-            let mut it = anchors.iter().filter(|p| key(p) > from_key);
-            it.nth(skip)
-                .or_else(|| anchors.iter().rfind(|p| key(p) > from_key))
-                .copied()
-        }
-        DiagnosticDirection::Prev => {
-            let mut it = anchors.iter().rev().filter(|p| key(p) < from_key);
-            it.nth(skip)
-                .or_else(|| anchors.iter().find(|p| key(p) < from_key))
-                .copied()
-        }
+        DiagnosticDirection::Next => anchors
+            .iter()
+            .filter(|p| key(p) > from_key)
+            .nth(skip)
+            .copied(),
+        DiagnosticDirection::Prev => anchors
+            .iter()
+            .rev()
+            .filter(|p| key(p) < from_key)
+            .nth(skip)
+            .copied(),
     }
 }
 
@@ -1565,8 +1581,7 @@ pub async fn lsp_format(
 
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     notify_lsp_change(&mut s, buffer_id);
 
     let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
@@ -2275,6 +2290,10 @@ mod diagnostic_span_tests {
         assert_eq!((on[0].start, on[0].end), (2, 2));
     }
 
+    /// Bounds covering every line — the ordinary editor case, where the field *is* the buffer.
+    /// Scoping is exercised separately by `navigate_diagnostic_ignores_diagnostics_outside_the_field`.
+    const WHOLE_DOC: (u32, u32) = (0, u32::MAX);
+
     #[test]
     fn navigate_diagnostic_finds_next_and_prev() {
         use DiagnosticDirection::{Next, Prev};
@@ -2283,36 +2302,83 @@ mod diagnostic_span_tests {
         let diags = [diag(5, 0, 5, 1), diag(2, 4, 2, 6), diag(9, 0, 9, 3)];
         // From (3, 0): next is line 5, prev is line 2 (at its column).
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(3, 0), Next, 1),
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 1, WHOLE_DOC),
             Some(pos(5, 0))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(3, 0), Prev, 1),
+            navigate_diagnostic_target(&diags, pos(3, 0), Prev, 1, WHOLE_DOC),
             Some(pos(2, 4))
         );
         // Strictly beyond the cursor *position*: standing exactly on a diagnostic skips it.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1, WHOLE_DOC),
             Some(pos(9, 0))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 0), Prev, 1),
+            navigate_diagnostic_target(&diags, pos(5, 0), Prev, 1, WHOLE_DOC),
             Some(pos(2, 4))
         );
         // Count walks the list: from (3, 0), count 2 forward skips line 5 to land on line 9.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(3, 0), Next, 2),
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 2, WHOLE_DOC),
             Some(pos(9, 0))
         );
-        // An over-large count clamps to the furthest diagnostic rather than returning None.
+        // An over-large count REFUSES rather than clamping to the furthest diagnostic: the count
+        // names "the ninth one", and there is no ninth one. Landing on the third and calling it
+        // done is the clamp this design replaces.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(3, 0), Next, 9),
-            Some(pos(9, 0))
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 9, WHOLE_DOC),
+            None
         );
         // count 0 behaves as 1.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(3, 0), Next, 0),
+            navigate_diagnostic_target(&diags, pos(3, 0), Next, 0, WHOLE_DOC),
             Some(pos(5, 0))
+        );
+    }
+
+    /// `d` is a target motion: a diagnostic outside the focused field is not a destination, so the
+    /// motion refuses rather than finding it and clamping onto the field's edge.
+    ///
+    /// This is the case Joe described — "if the diagnostic isn't visible, we wouldn't move the
+    /// cursor, rather than sometimes moving to the end of the editor block if there happens to be a
+    /// diagnostic later in the buffer". `None` here is what becomes `moved: false`, which the client
+    /// turns into a grouped "No more diagnostics" toast.
+    #[test]
+    fn navigate_diagnostic_ignores_diagnostics_outside_the_field() {
+        use DiagnosticDirection::{Next, Prev};
+        let pos = |line, col| LogicalPosition { line, col };
+        // A hunk covering lines 10..=14, with diagnostics above it, inside it, and below it.
+        let diags = [diag(2, 0, 2, 1), diag(12, 3, 12, 5), diag(40, 0, 40, 1)];
+        let field = (10u32, 14u32);
+
+        // Inside the field, the in-field diagnostic is reachable in both directions.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(10, 0), Next, 1, field),
+            Some(pos(12, 3))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(14, 0), Prev, 1, field),
+            Some(pos(12, 3))
+        );
+        // Past it, the one 26 lines below is invisible — no move, rather than a jump or an edge.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(12, 3), Next, 1, field),
+            None
+        );
+        // And the one above the field is equally out of reach going backwards.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(12, 3), Prev, 1, field),
+            None
+        );
+        // Non-vacuity: the very same diagnostics, unscoped, DO find both.
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(12, 3), Next, 1, WHOLE_DOC),
+            Some(pos(40, 0))
+        );
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(12, 3), Prev, 1, WHOLE_DOC),
+            Some(pos(2, 0))
         );
     }
 
@@ -2329,43 +2395,43 @@ mod diagnostic_span_tests {
         ];
         // From the line start, Next steps through each same-line diagnostic by column…
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 1, WHOLE_DOC),
             Some(pos(5, 2))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 2), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 2), Next, 1, WHOLE_DOC),
             Some(pos(5, 8))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 8), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 8), Next, 1, WHOLE_DOC),
             Some(pos(5, 14))
         );
         // …then crosses to the next line once the line's diagnostics are exhausted.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 14), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 14), Next, 1, WHOLE_DOC),
             Some(pos(9, 0))
         );
         // A count jumps multiple same-line diagnostics at once.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 0), Next, 3),
+            navigate_diagnostic_target(&diags, pos(5, 0), Next, 3, WHOLE_DOC),
             Some(pos(5, 14))
         );
         // Prev is the column-aware mirror.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 14), Prev, 1),
+            navigate_diagnostic_target(&diags, pos(5, 14), Prev, 1, WHOLE_DOC),
             Some(pos(5, 8))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 8), Prev, 1),
+            navigate_diagnostic_target(&diags, pos(5, 8), Prev, 1, WHOLE_DOC),
             Some(pos(5, 2))
         );
         // A cursor mid-span (col 10, between the col-8 and col-14 diagnostics) resolves by position.
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 10), Next, 1),
+            navigate_diagnostic_target(&diags, pos(5, 10), Next, 1, WHOLE_DOC),
             Some(pos(5, 14))
         );
         assert_eq!(
-            navigate_diagnostic_target(&diags, pos(5, 10), Prev, 1),
+            navigate_diagnostic_target(&diags, pos(5, 10), Prev, 1, WHOLE_DOC),
             Some(pos(5, 8))
         );
     }
@@ -2375,9 +2441,18 @@ mod diagnostic_span_tests {
         use DiagnosticDirection::{Next, Prev};
         let pos = |line, col| LogicalPosition { line, col };
         let diags = [diag(2, 0, 2, 1), diag(7, 0, 7, 1)];
-        assert_eq!(navigate_diagnostic_target(&diags, pos(7, 0), Next, 1), None); // past the last
-        assert_eq!(navigate_diagnostic_target(&diags, pos(2, 0), Prev, 1), None); // before the first
-        assert_eq!(navigate_diagnostic_target(&[], pos(0, 0), Next, 1), None); // none at all
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(7, 0), Next, 1, WHOLE_DOC),
+            None
+        ); // past the last
+        assert_eq!(
+            navigate_diagnostic_target(&diags, pos(2, 0), Prev, 1, WHOLE_DOC),
+            None
+        ); // before the first
+        assert_eq!(
+            navigate_diagnostic_target(&[], pos(0, 0), Next, 1, WHOLE_DOC),
+            None
+        ); // none at all
     }
 }
 

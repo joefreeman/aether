@@ -4,7 +4,7 @@
 //! Columns are visual columns: tabs advance to the next tab stop (per `tab_width`) and other
 //! chars use `UnicodeWidthChar` (so ASCII is 1, common wide chars are 2, control / unknowns 0).
 
-use aether_protocol::viewport::{Highlight, LogicalLineRender, Segment, VisualRow, WrapMode};
+use aether_protocol::viewport::{Highlight, LogicalLineRender, Segment, WrapMode, WrappedRow};
 use unicode_width::UnicodeWidthChar;
 
 /// Per-viewport wrap-layout inputs — everything beyond the text itself that determines how a
@@ -45,7 +45,7 @@ pub fn render_line(
     highlights: Vec<Highlight>,
 ) -> LogicalLineRender {
     let visual_rows = match wrap {
-        WrapMode::None => vec![VisualRow {
+        WrapMode::None => vec![WrappedRow {
             byte_offset: 0,
             continuation_indent: 0,
             segments: vec![Segment {
@@ -59,20 +59,15 @@ pub fn render_line(
         logical_line,
         visual_rows,
         search_matches: Vec::new(),
-        virtual_rows_above: Vec::new(),
-        virtual_rows_below: Vec::new(),
-        diff_marker: None,
-        diff_stage: Default::default(),
-        diff_emphasis: Vec::new(),
-        conflict: None,
+        baseline_above: Vec::new(),
+        change: Default::default(),
         diagnostics: Vec::new(),
         sneak_targets: Vec::new(),
-        patch: None,
     }
 }
 
 /// One physical row of wrapped output along with the byte range of the logical line it covers.
-/// Separated from `VisualRow` so the wrap algorithm can be tested without depending on the wire
+/// Separated from `WrappedRow` so the wrap algorithm can be tested without depending on the wire
 /// type, and so cursor-motion code can consume it directly.
 pub(crate) struct RowInfo {
     /// Byte offset of `text` within the logical line.
@@ -87,13 +82,13 @@ fn wrap_line(
     marker_width: u32,
     tab_width: u32,
     highlights: &[Highlight],
-) -> Vec<VisualRow> {
+) -> Vec<WrappedRow> {
     let row_infos = compute_rows(line, cols, marker_width, tab_width);
     row_infos
         .into_iter()
         .map(|info| {
             let row_highlights = slice_highlights(highlights, info.byte_offset, info.text.len());
-            VisualRow {
+            WrappedRow {
                 byte_offset: info.byte_offset as u32,
                 continuation_indent: info.continuation_indent,
                 segments: vec![Segment {
@@ -262,7 +257,7 @@ fn leading_whitespace_cols(line: &str, tab_width: u32) -> u32 {
 mod tests {
     use super::*;
 
-    fn row_text(row: &VisualRow) -> String {
+    fn row_text(row: &WrappedRow) -> String {
         row.segments.iter().map(|s| s.text.as_str()).collect()
     }
 

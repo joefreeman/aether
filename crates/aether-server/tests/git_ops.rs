@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- git branch picker ---------------------------------------------------------------------------
@@ -2292,12 +2293,12 @@ async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBuffe
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -3297,7 +3298,12 @@ async fn a_conflicted_buffer_renders_sides_and_no_diff() {
     let (server, mut ws, _dir, _ours, buffer_id) = setup_stopped_rebase().await;
 
     let window = window_of(&mut ws, buffer_id).await;
-    let sides: Vec<Option<ConflictLine>> = window.lines.iter().map(|l| l.conflict).collect();
+    let sides: Vec<Option<ConflictLine>> = window
+        .root
+        .lines()
+        .into_iter()
+        .map(|l| l.change.conflict())
+        .collect();
     // `<<<<<<< HEAD` / theirs / `=======` / ours / `>>>>>>> commit` — the rebase replays our commit
     // on top of theirs, so "ours" is the upstream side and the labels are what say so.
     assert_eq!(
@@ -3312,13 +3318,21 @@ async fn a_conflicted_buffer_renders_sides_and_no_diff() {
         ],
         "got {:?}",
         window
-            .lines
-            .iter()
-            .map(|l| (l.conflict, l.visual_rows[0].segments[0].text.clone()))
+            .root
+            .lines()
+            .into_iter()
+            .map(|l| (
+                l.change.conflict(),
+                l.visual_rows[0].segments[0].text.clone()
+            ))
             .collect::<Vec<_>>()
     );
     assert!(
-        window.lines.iter().all(|l| l.diff_marker.is_none()),
+        window
+            .root
+            .lines()
+            .into_iter()
+            .all(|l| l.change.marker().is_none()),
         "a conflicted file has no baseline to diff, so no line may claim a diff marker"
     );
 
@@ -3374,7 +3388,7 @@ async fn hunk_navigation_steps_conflict_blocks() {
     let window = window_of(&mut ws, buffer_id).await;
     for line in [first.cursor.position.line, second.cursor.position.line] {
         assert_eq!(
-            window.lines[line as usize].conflict,
+            window.root.lines()[line as usize].change.conflict(),
             Some(ConflictLine::Marker),
             "landed mid-block at line {line}"
         );
@@ -3471,7 +3485,11 @@ async fn a_selection_resolves_every_block_it_covers() {
     );
     // And the decoration is gone with them.
     let window = window_of(&mut ws, buffer_id).await;
-    assert!(window.lines.iter().all(|l| l.conflict.is_none()));
+    assert!(window
+        .root
+        .lines()
+        .into_iter()
+        .all(|l| l.change.conflict().is_none()));
 
     drop(server);
 }
@@ -3564,7 +3582,11 @@ async fn marking_resolved_gates_on_markers_then_on_saving() {
     // And the editor stops describing a conflict that has ended.
     let window = window_of(&mut ws, buffer_id).await;
     assert_eq!(window.git_status.expect("in a repo").conflicts, 0);
-    assert!(window.lines.iter().all(|l| l.conflict.is_none()));
+    assert!(window
+        .root
+        .lines()
+        .into_iter()
+        .all(|l| l.change.conflict().is_none()));
 
     drop(server);
 }
@@ -3778,26 +3800,29 @@ async fn a_half_resolved_file_shows_conflicts_and_changes_side_by_side() {
 
     let window = window_of(&mut ws, buffer_id).await;
     assert!(
-        window.lines.iter().any(|l| l.conflict.is_some()),
+        window
+            .root
+            .lines()
+            .into_iter()
+            .any(|l| l.change.conflict().is_some()),
         "the untouched block still reads as a conflict"
     );
     assert!(
-        window.lines.iter().any(|l| l.diff_marker.is_some()),
+        window
+            .root
+            .lines()
+            .into_iter()
+            .any(|l| l.change.marker().is_some()),
         "and the resolved region reads as a change: {:?}",
         window
-            .lines
-            .iter()
-            .map(|l| (l.conflict, l.diff_marker))
+            .root
+            .lines()
+            .into_iter()
+            .map(|l| (l.change.conflict(), l.change.marker()))
             .collect::<Vec<_>>()
     );
-    // The rule that lets both encodings coexist: never on the same line.
-    assert!(
-        window
-            .lines
-            .iter()
-            .all(|l| !(l.conflict.is_some() && l.diff_marker.is_some())),
-        "no line may carry both decorations"
-    );
+    // The rule that lets both encodings coexist — never on the same line — used to be asserted
+    // here. It is now unrepresentable: `LineChange` has no variant carrying both.
     let status = window.git_status.expect("in a repo");
     assert_eq!(status.conflicts, 1);
     assert!(
@@ -3901,7 +3926,11 @@ async fn resolving_by_hand_clears_the_conflict_decoration() {
 
     let window = window_of(&mut ws, buffer_id).await;
     assert!(
-        window.lines.iter().all(|l| l.conflict.is_none()),
+        window
+            .root
+            .lines()
+            .into_iter()
+            .all(|l| l.change.conflict().is_none()),
         "the markers are gone, so the sides are too"
     );
     assert_eq!(

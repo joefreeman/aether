@@ -788,8 +788,8 @@ pub enum PickerItem {
         /// Configured upstream (`origin/main`); `None` for a branch never pushed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upstream: Option<String>,
-        /// Commits ahead of / behind `upstream`. Both `0` without one. Only as fresh as the last
-        /// fetch — there is no fetch yet (stage 3), so treat them as advisory.
+        /// Commits ahead of / behind `upstream`. Both `0` without one. Computed locally rather than
+        /// by contacting the remote, so they are only as fresh as the last `git/fetch` — advisory.
         #[serde(default, skip_serializing_if = "is_zero")]
         ahead: u32,
         #[serde(default, skip_serializing_if = "is_zero")]

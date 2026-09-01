@@ -105,7 +105,7 @@ pub struct SneakCancelParams {
 /// feedback that the entered letters still match. The client paints `label` over the chip's first
 /// cell and blanks the rest. `label` is `None` (and the chip is empty, `prefix_end == start`) for an
 /// overflow word — one beyond the available label alphabet — which stays highlighted but unlabelled.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SneakTarget {
     pub start: u32,
     pub end: u32,

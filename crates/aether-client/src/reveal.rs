@@ -40,6 +40,9 @@ pub enum Settled {
     /// must fetch a window around the cursor — nothing else will, since the shell's other fetch
     /// path chases the scroll position, which is exactly what hasn't caught up.
     Unpaid,
+    /// The window fetched **for the cursor** couldn't place it either, so nothing can: the debt has
+    /// been dropped. The caller must not fetch again — see [`PendingReveal::settle_chase`].
+    Unplaceable,
 }
 
 /// The reveal (and/or placement) a shell owes its viewport. See the module docs.
@@ -92,6 +95,30 @@ impl PendingReveal {
             Settled::Unpaid
         } else {
             Settled::Paid
+        }
+    }
+
+    /// [`Self::settle`] against the window that was fetched **for the cursor** — the answer to the
+    /// chase [`Settled::Unpaid`] asked for.
+    ///
+    /// If *that* window can't place the cursor, nothing can: the cursor is not in this view at all
+    /// (its line belongs to a different buffer than the focused element windows, say), and asking
+    /// again fetches the same window forever. Which is what the terminal did: every reply re-seated
+    /// the scroll to the element's start row, so the viewport flickered, refused to scroll, and
+    /// showed no cursor — because there was no cursor in it to show. The debt is dropped here, and
+    /// the caller is told so rather than being sent back round.
+    ///
+    /// This is the *only* forgiveness the debt has beyond being paid, and it is deliberately
+    /// narrow: it applies to the answer to a chase and nothing else. A window that arrived for some
+    /// other reason proves nothing about the cursor (see the module docs on out-of-order answers)
+    /// and still leaves the reveal owed.
+    pub fn settle_chase(&mut self, target: &mut impl RevealTarget) -> Settled {
+        match self.settle(target) {
+            Settled::Unpaid => {
+                self.abandon();
+                Settled::Unplaceable
+            }
+            other => other,
         }
     }
 }
@@ -171,8 +198,9 @@ mod tests {
         );
     }
 
-    /// Repeated failures keep re-reporting `Unpaid`, so the caller keeps re-fetching rather than
-    /// asking once and giving up.
+    /// Windows that arrive for other reasons keep re-reporting `Unpaid`, so the caller keeps
+    /// re-fetching rather than asking once and giving up on a reveal that is merely waiting for the
+    /// right window.
     #[test]
     fn an_unpayable_debt_keeps_asking() {
         let mut p = PendingReveal::default();
@@ -182,6 +210,41 @@ mod tests {
             assert_eq!(p.settle(&mut stale), Settled::Unpaid);
         }
         assert!(p.is_owed());
+    }
+
+    /// …but the answer to the chase is different: the window fetched *for the cursor* is the one
+    /// that was supposed to carry it, so if it doesn't, nothing will.
+    ///
+    /// The regression: the shell chased on every unpaid settle, including the chase's own answer,
+    /// so a cursor with no row in this view — its line belonging to a buffer the focused element
+    /// doesn't window — produced fetch → reply → fetch forever, each reply re-seating the scroll.
+    /// That is what a flickering viewport that refuses to scroll and shows no cursor *is*.
+    #[test]
+    fn a_chase_that_cannot_place_the_cursor_ends_the_debt() {
+        let mut p = PendingReveal::default();
+        p.owe_reveal(RevealStyle::Follow);
+        let mut stale = Stub::stale();
+        assert_eq!(
+            p.settle_chase(&mut stale),
+            Settled::Unplaceable,
+            "the chase came back and still couldn't place it"
+        );
+        assert!(!p.is_owed(), "so the debt is dropped rather than re-chased");
+        // And a later move owes a fresh one — giving up on this cursor doesn't disable reveals.
+        p.owe_reveal(RevealStyle::Jump);
+        let mut good = Stub::good();
+        assert_eq!(p.settle(&mut good), Settled::Paid);
+    }
+
+    /// A chase that *can* be paid is an ordinary settle — the give-up path is only for failure.
+    #[test]
+    fn a_chase_that_lands_pays_the_debt() {
+        let mut p = PendingReveal::default();
+        p.owe_reveal(RevealStyle::Jump);
+        let mut good = Stub::good();
+        assert_eq!(p.settle_chase(&mut good), Settled::Paid);
+        assert!(!p.is_owed());
+        assert_eq!(good.reveals, vec![RevealStyle::Jump]);
     }
 
     /// A motion arriving while a reveal is outstanding replaces the style rather than queueing:

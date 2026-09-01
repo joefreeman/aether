@@ -6,6 +6,7 @@ use super::effect::{Effects, ToastKind};
 use super::keymap::Action;
 use super::picker::PickerState;
 use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
+use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::{CommitInfo, GitOperation, GitRepoOperation};
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
@@ -16,6 +17,7 @@ use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::{MarkdownWidth, ThemeMode};
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
+use aether_protocol::ViewId;
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 
 /// A parked RPC result mapping (see [`Session::pending`]).
@@ -882,7 +884,14 @@ pub enum Pending {
 /// char) for find.
 #[derive(Debug, Clone)]
 pub enum RepeatTarget {
-    Action { action: Action, count: u32 },
+    /// `counted` rides along because `.` must repeat the *request*, not a reconstruction of it:
+    /// bare `g` and `1g` are different motions (the field's top vs. buffer line 1) and both record
+    /// `count: 1`, so the count alone cannot tell them apart on replay.
+    Action {
+        action: Action,
+        count: u32,
+        counted: bool,
+    },
     Find(Motion),
 }
 
@@ -899,6 +908,129 @@ pub enum PasteKind {
     /// Read-mode `Ctrl-v`/`Ctrl-Alt-v`: paste as its own block before the selection, or in place of
     /// the selected block(s) — `input/paste_block`, separator-normalized.
     Block { replace: bool },
+}
+
+/// State belonging to whatever the session is currently showing — see [`Session::view`].
+pub struct ViewState {
+    /// What this view *is* — the thing the picker lists, sessions restore, `buffer/close` closes,
+    /// and `viewport/subscribe` subscribes to.
+    ///
+    /// Distinct from [`Self::buffer`], which is the buffer currently being **edited**. They are the
+    /// same for every view that exists today, and diverge for a patch: one view over a file per
+    /// hunk. Keeping them apart is what lets an edit address the file under the cursor while
+    /// closing still closes the patch rather than one of the files it happens to show.
+    pub view_id: ViewId,
+    /// Whether this *view* is a patch — which its focused buffer cannot answer, since focus rebinds
+    /// `buffer` to whichever file the cursor is in and a file is not a patch. Decides where a
+    /// change-step goes: through the view's elements, or through one file's own diff.
+    pub view_is_patch: bool,
+    /// The buffer the cursor is in — the focused element's. Every text operation addresses this.
+    pub buffer: BufferInfo,
+    pub mode: Mode,
+    pub pending: Pending,
+    pub count: Option<u32>,
+    pub search: SearchState,
+    pub viewport_id: Option<ViewportId>,
+    /// Which editor element of this view holds the live cursor. Mirrors the server's `focused`,
+    /// which is the authority; the client keeps it to know where `Tab` starts from and, later,
+    /// which of a view's buffers it is editing.
+    pub focused_element: aether_protocol::viewport::FieldId,
+    pub window: Option<Window>,
+    /// The markdown reading view of the current buffer, when active.
+    pub read: Option<ReadView>,
+    pub diagnostics: DiagnosticCounts,
+    pub lsp: Option<LspServerStatus>,
+    /// The document-outline symbols enclosing the cursor, outermost first — the status bar's
+    /// breadcrumb. Server-derived (it owns the outline and the cursor); seeded by
+    /// `viewport/subscribe` and kept live by `lsp/symbol_path_changed`, which only fires when the
+    /// cursor crosses a symbol boundary. Empty with no language server, before the first outline
+    /// lands, or between top-level symbols. Shells truncate it themselves — see
+    /// [`crate::labels::truncate_symbol_path`].
+    pub symbol_path: Vec<SymbolCrumb>,
+    pub externally_modified: bool,
+    pub externally_deleted: bool,
+    /// The press a drag extends from: the element it landed in, its anchor, and its granularity.
+    /// The element is part of it because a drag's `cursor/set` must name the same buffer the press
+    /// did — the focus reply for the press can still be in flight.
+    pub drag: Option<(
+        aether_protocol::viewport::FieldId,
+        LogicalPosition,
+        Granularity,
+    )>,
+    /// Cursor-line blame for the EOL label, as pushed by the server's blame follow
+    /// (`git/blame_changed`): the followed line plus its raw [`BlameInfo`]. Shells format at
+    /// render time ("author · 3w ago" needs a clock, which the core deliberately lacks).
+    pub blame: Option<(u32, aether_protocol::git::BlameInfo)>,
+    /// Active sneak word-jump session (`s`/`S`), or `None` when not sneaking. While `Some`, the key
+    /// handler interprets keystrokes as query/label input rather than normal-mode bindings.
+    pub sneak: Option<SneakState>,
+    /// The logical-line range actually on screen (`first`..`last`, last exclusive), kept current by
+    /// the shells (which own the pixel scroll) via [`Session::set_visible_lines`]. Used to scope
+    /// sneak candidates to what's truly visible — the server's window carries a screen of overscan,
+    /// so it can't tell. `None` until a window is loaded.
+    pub visible_lines: Option<(u32, u32)>,
+    /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
+    /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
+    /// consumed by [`Session::resolve_scroll_anchor`]. See [`crate::grid::ScrollAnchor`].
+    relayout_anchor: Option<crate::grid::ScrollAnchor>,
+}
+
+impl ViewState {
+    /// A fresh view over `buffer`, every other field at its opening value.
+    ///
+    /// This is the whole point of the struct: switching what's on screen is one assignment, not
+    /// the sixteen it used to be. No `Default` derive, because a `BufferInfo` with id `0` is a
+    /// sentinel rather than a sensible zero — a view always has something in it.
+    /// Rebind the view onto `buffer`: both what the view *is* and what is being edited, which are
+    /// the same whenever a view is opened or reopened onto a buffer.
+    ///
+    /// One operation rather than two assignments, because the two must not drift: a `view_id` left
+    /// pointing at a closed buffer would have `viewport/subscribe` and `buffer/close` addressing
+    /// something that no longer exists, silently. Focus moving *within* a multi-buffer view is the
+    /// only thing that changes one without the other, and it goes through the focus path.
+    pub fn rebind(&mut self, buffer: BufferInfo) {
+        self.view_id = ViewId(buffer.buffer_id);
+        self.view_is_patch = buffer.is_patch;
+        self.buffer = buffer;
+        self.focused_element = 0;
+    }
+
+    /// Where the cursor is **in the view**: the focused element, and its line in that element's
+    /// buffer.
+    ///
+    /// The only correct way to ask "is this the cursor's line?", because a line number alone names
+    /// a line in every element at once. Compare [`crate::grid::ElementLine`]s, never bare numbers.
+    pub fn cursor_at(&self) -> crate::grid::ElementLine {
+        crate::grid::ElementLine::new(self.focused_element, self.buffer.cursor.position.line)
+    }
+
+    pub fn new(buffer: BufferInfo) -> Self {
+        Self {
+            // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
+            view_id: ViewId(buffer.buffer_id),
+            view_is_patch: buffer.is_patch,
+            buffer,
+            mode: Mode::Normal,
+            pending: Pending::None,
+            count: None,
+            search: SearchState::default(),
+            viewport_id: None,
+            // A fresh view starts on its first element, as the server's viewport does.
+            focused_element: 0,
+            window: None,
+            read: None,
+            diagnostics: DiagnosticCounts::default(),
+            lsp: None,
+            symbol_path: Vec::new(),
+            externally_modified: false,
+            externally_deleted: false,
+            drag: None,
+            blame: None,
+            sneak: None,
+            visible_lines: None,
+            relayout_anchor: None,
+        }
+    }
 }
 
 /// The window's editing context over its server connection — exactly what the server calls a
@@ -942,26 +1074,11 @@ pub struct Session {
     pub tether: Option<BufferId>,
     /// The commit message buffer this client opened, if any — see [`PendingCommit`].
     pub pending_commit: Option<PendingCommit>,
-    pub buffer: BufferInfo,
-    pub mode: Mode,
-    pub pending: Pending,
-    pub count: Option<u32>,
     pub last_repeat: Option<RepeatTarget>,
-    pub search: SearchState,
     /// `Up`/`Down` recall for every overlay text input. Session-wide, not per-overlay: the lists
     /// are workspace-scoped and only one input has the keyboard at a time.
     pub history: InputHistory,
-    /// Active sneak word-jump session (`s`/`S`), or `None` when not sneaking. While `Some`, the key
-    /// handler interprets keystrokes as query/label input rather than normal-mode bindings.
-    pub sneak: Option<SneakState>,
-    /// The logical-line range actually on screen (`first`..`last`, last exclusive), kept current by
-    /// the shells (which own the pixel scroll) via [`Session::set_visible_lines`]. Used to scope
-    /// sneak candidates to what's truly visible — the server's window carries a screen of overscan,
-    /// so it can't tell. `None` until a window is loaded.
-    pub visible_lines: Option<(u32, u32)>,
 
-    pub viewport_id: Option<ViewportId>,
-    pub window: Option<Window>,
     pub wrap: WrapMode,
     /// Coding ligatures in the editor font — an app-wide setting (`Space,`), seeded from
     /// `settings/get` at boot. The shells read it each render to pick their text shaping
@@ -1003,8 +1120,6 @@ pub struct Session {
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
-    /// The markdown reading view of the current buffer, when active.
-    pub read: Option<ReadView>,
     /// This session's live read-vs-source choice for markdown, flipped by `Space v`. Session
     /// state, not a per-buffer memory: reaching for source is a *task* ("show me the raw
     /// markdown to fix this link"), not a property of a document — editing works in the reading
@@ -1031,22 +1146,6 @@ pub struct Session {
     /// `open_path_at`, by a switch that lands in the editor, and by a failed content fetch, so a
     /// stale anchor never fires.
     pub(crate) pending_read_anchor: Option<String>,
-    pub diagnostics: DiagnosticCounts,
-    pub lsp: Option<LspServerStatus>,
-    /// The document-outline symbols enclosing the cursor, outermost first — the status bar's
-    /// breadcrumb. Server-derived (it owns the outline and the cursor); seeded by
-    /// `viewport/subscribe` and kept live by `lsp/symbol_path_changed`, which only fires when the
-    /// cursor crosses a symbol boundary. Empty with no language server, before the first outline
-    /// lands, or between top-level symbols. Shells truncate it themselves — see
-    /// [`crate::labels::truncate_symbol_path`].
-    pub symbol_path: Vec<SymbolCrumb>,
-    pub externally_modified: bool,
-    pub externally_deleted: bool,
-    pub drag: Option<(LogicalPosition, Granularity)>,
-    /// Cursor-line blame for the EOL label, as pushed by the server's blame follow
-    /// (`git/blame_changed`): the followed line plus its raw [`BlameInfo`]. Shells format at
-    /// render time ("author · 3w ago" needs a clock, which the core deliberately lacks).
-    pub blame: Option<(u32, aether_protocol::git::BlameInfo)>,
     /// The buffer whose cursor-line blame the server currently follows for us
     /// (`git/set_blame_follow`), or `None`. Synced by `sync_decoration_follow` on mode/buffer
     /// transitions — never per cursor move.
@@ -1063,10 +1162,6 @@ pub struct Session {
     /// The application-settings overlay (`Space,`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,
     pub conn: ConnState,
-    /// A content scroll anchor captured before a re-layout (wrap / diff toggle), so the view can be
-    /// restored to the same content afterwards. Set by [`Session::capture_scroll_anchor`] and
-    /// consumed by [`Session::resolve_scroll_anchor`]. See [`crate::grid::ScrollAnchor`].
-    relayout_anchor: Option<crate::grid::ScrollAnchor>,
     /// LSP servers (by [`lsp_toast_group`] key) we've asked to restart and are awaiting the
     /// `Ready`/`Crashed` outcome for. Gates the in-place "restarting → ready" toast so an ordinary
     /// busy→idle `lsp/status_changed` blip doesn't spuriously toast. See the `LspStatusChanged`
@@ -1076,6 +1171,19 @@ pub struct Session {
     /// `hints/state` snapshot adopts, and gated by [`Self::hints_enabled`]. Shells read
     /// [`crate::update`]'s `hint_view` and drive `on_hint_tick`.
     pub hints: crate::hints::HintEngine,
+
+    /// Everything scoped to the **thing currently on screen**, swapped wholesale when it changes.
+    ///
+    /// The split exists so that `adopt_switch` is a struct swap rather than the sixteen hand-written
+    /// field resets it used to be — a list nothing checked, and which had already drifted out of
+    /// step with the fields that are genuinely view-scoped.
+    ///
+    /// What deliberately stays *outside* it, on the session, is state that survives a switch:
+    /// presentation preferences the viewport will own once views are a real layer (`wrap`,
+    /// `diff_view`, `read_on`), and mirrors of server-side subscriptions that have to outlive the
+    /// buffer they were made against so they can be cancelled (`blame_follow_on`,
+    /// `highlight_follow_on`).
+    pub view: ViewState,
 }
 
 /// The markdown reading view of the current buffer: the parsed document, its navigable element
@@ -1094,7 +1202,7 @@ pub struct ReadView {
     /// The source text (for span → text slices and byte ↔ position conversion).
     pub text: String,
     pub blocks: Vec<crate::markdown::Block>,
-    pub elements: Vec<crate::markdown::Element>,
+    pub elements: Vec<crate::markdown::Stop>,
     /// Byte offset of each line start in `text`, for byte ↔ `LogicalPosition` conversion.
     line_starts: Vec<u32>,
     /// A content fetch is in flight (`true` until the first parse adopts, and again during a
@@ -1136,7 +1244,7 @@ impl ReadView {
     /// keyed to may have moved — and re-request via the update loop.
     pub fn adopt(&mut self, revision: u64, text: String) {
         self.blocks = crate::markdown::parse(&text);
-        self.elements = crate::markdown::elements(&self.blocks);
+        self.elements = crate::markdown::stops(&self.blocks);
         self.line_starts = std::iter::once(0)
             .chain(
                 text.char_indices()
@@ -1199,7 +1307,7 @@ impl ReadView {
         crate::markdown::element_at_matching(
             &self.elements,
             self.focus_byte(cursor),
-            crate::markdown::Element::is_block,
+            crate::markdown::Stop::is_block,
         )
     }
 
@@ -1242,7 +1350,7 @@ impl ReadView {
         crate::markdown::containing_element(&self.elements, self.byte_of(cursor), |e| {
             matches!(
                 e,
-                crate::markdown::Element::Item {
+                crate::markdown::Stop::Item {
                     checked: Some(_),
                     ..
                 }
@@ -1259,7 +1367,7 @@ impl ReadView {
         crate::markdown::containing_element(
             &self.elements,
             self.byte_of(cursor),
-            crate::markdown::Element::is_interactive,
+            crate::markdown::Stop::is_interactive,
         )
     }
 
@@ -1460,17 +1568,8 @@ impl Session {
             workspace_projects: workspace.projects,
             tether: None,
             pending_commit: None,
-            buffer,
-            mode: Mode::Normal,
-            pending: Pending::None,
-            count: None,
             last_repeat: None,
-            search: SearchState::default(),
             history: InputHistory::default(),
-            sneak: None,
-            visible_lines: None,
-            viewport_id: None,
-            window: None,
             wrap: WrapMode::Soft,
             ligatures: true,
             buffer_font_size: aether_protocol::settings::default_buffer_font_size(),
@@ -1481,19 +1580,11 @@ impl Session {
             worktree_store: String::new(),
             git_operation: None,
             diff_view: false,
-            read: None,
             read_on: true,
             markdown_read_default: true,
             markdown_width: aether_protocol::settings::default_markdown_width(),
             open_route_jumped: false,
             pending_read_anchor: None,
-            diagnostics: DiagnosticCounts::default(),
-            symbol_path: Vec::new(),
-            lsp: None,
-            externally_modified: false,
-            externally_deleted: false,
-            drag: None,
-            blame: None,
             blame_follow_on: None,
             highlight_follow_on: None,
             prompt: None,
@@ -1501,9 +1592,9 @@ impl Session {
             workspace_settings: None,
             app_settings: None,
             conn: ConnState::Connected,
-            relayout_anchor: None,
             lsp_restart_pending: std::collections::HashSet::new(),
             hints: crate::hints::HintEngine::default(),
+            view: ViewState::new(buffer),
         }
     }
 
@@ -1600,13 +1691,16 @@ impl Session {
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
     /// shell supplies its current top visual row and viewport height (the only geometry the core
     /// lacks); the cursor and window come from the session. Pairs with [`resolve_scroll_anchor`].
-    pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
-        self.relayout_anchor = self.window.as_ref().map(|w| {
+    pub fn capture_scroll_anchor(&mut self, top_row: VisualRow, viewport_rows: u32) {
+        let element = self.view.focused_element;
+        self.view.relayout_anchor = self.view.window.as_ref().map(|w| {
+            let cursor = self.view.buffer.cursor.position;
             crate::grid::capture_scroll_anchor(
                 w,
                 top_row,
                 viewport_rows,
-                self.buffer.cursor.position,
+                element,
+                cursor,
                 TAB_WIDTH,
             )
         });
@@ -1615,14 +1709,13 @@ impl Session {
     /// Consume the anchor captured by [`capture_scroll_anchor`] and resolve it against the current
     /// (post-relayout) window into a new absolute top visual row. `None` when no anchor is pending
     /// (so the shell falls back to its usual clamp + reveal-cursor).
-    pub fn resolve_scroll_anchor(&mut self) -> Option<u32> {
-        let anchor = self.relayout_anchor.take()?;
-        let w = self.window.as_ref()?;
+    pub fn resolve_scroll_anchor(&mut self) -> Option<VisualRow> {
+        let anchor = self.view.relayout_anchor.take()?;
+        let element = self.view.focused_element;
+        let w = self.view.window.as_ref()?;
+        let cursor = self.view.buffer.cursor.position;
         Some(crate::grid::resolve_scroll_anchor(
-            w,
-            anchor,
-            self.buffer.cursor.position,
-            TAB_WIDTH,
+            w, anchor, element, cursor, TAB_WIDTH,
         ))
     }
 
@@ -1630,8 +1723,9 @@ impl Session {
     /// path) must load a window around it so [`resolve_scroll_anchor`] can place it. `None` when no
     /// anchor is pending.
     pub fn relayout_anchor_line(&self) -> Option<u32> {
-        self.relayout_anchor
-            .map(|a| a.reference_line(self.buffer.cursor.position))
+        self.view
+            .relayout_anchor
+            .map(|a| a.reference_line(self.view.buffer.cursor.position))
     }
 
     /// The boot chooser's session (no workspace picked yet): every shell raises the Workspaces
@@ -1667,13 +1761,26 @@ impl Session {
     /// no-workspace view — no editor, no viewport subscribe — until a workspace is picked and
     /// [`Session::adopt_switch`](crate::update) lands the first real buffer.
     pub fn is_placeholder(&self) -> bool {
-        self.buffer.buffer_id == 0
+        self.view.buffer.buffer_id == 0
     }
 
-    /// The active buffer is the [tether](Self::tether) — closing it exits the client. What the
-    /// shells key the status bar's dim `*` mark on.
+    /// The buffer being edited is the [tether](Self::tether). What the shells key the status bar's
+    /// dim `*` mark on — it sits beside the label, which names the same buffer.
+    ///
+    /// **Not the test for whether closing exits** — see [`Self::tethered_view`].
     pub fn tethered(&self) -> bool {
-        self.tether == Some(self.buffer.buffer_id)
+        self.tether == Some(self.view.buffer.buffer_id)
+    }
+
+    /// The *view* is the tether, so closing it releases the `$EDITOR` contract and exits.
+    ///
+    /// Distinct from [`Self::tethered`] because close addresses `view_id` while the tether names a
+    /// document. In a composed view they diverge: focus rebinds `buffer` to whichever file the
+    /// cursor is in, so a working-changes view happening to sit on the tethered file reported
+    /// `tethered()` — and `Space x` on the *patch* then exited the client, leaving the file it was
+    /// waiting on still open.
+    pub fn tethered_view(&self) -> bool {
+        self.tether == Some(self.view.view_id.presenting_buffer())
     }
 }
 
@@ -1846,7 +1953,7 @@ mod tests {
         let item = read
             .elements
             .iter()
-            .position(|e| matches!(e, crate::markdown::Element::Item { .. }))
+            .position(|e| matches!(e, crate::markdown::Stop::Item { .. }))
             .expect("the item is an element");
         let at = read.block_append_byte(item) as usize;
         assert_eq!(&text[at..at + 1], "\n");

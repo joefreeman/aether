@@ -530,6 +530,13 @@ pub enum Action {
         staged: bool,
     },
 
+    /// `Tab` / `Shift-Tab` — move the live cursor to the next/previous editor element of the view.
+    ///
+    /// Inert in a view of one element, which is most of them. In a patch it steps between hunks,
+    /// and once elements window different files it is how you choose which file you are editing.
+    FocusNextElement,
+    FocusPrevElement,
+
     // ---- LSP ----
     GotoDefinition,
     NextDiagnostic,
@@ -540,7 +547,7 @@ pub enum Action {
 
     // ---- git (popovers) ----
     /// `Space m` — blame details for the cursor's line. Stays on the leader (not `Space g`) as the
-    /// third cursor-local *reveal*, beside `Tab` (hover) and `Space n` (diagnostic at cursor).
+    /// third cursor-local *reveal*, beside `Space t` (hover) and `Space n` (diagnostic at cursor).
     ShowCommitInfo,
 
     // ---- pickers ----
@@ -999,6 +1006,10 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to line from end (count, default last)"),
     bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
     bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
+    // Reserved for this since the element tree landed; `Tab` still indents in Insert, where there
+    // is no element to move between.
+    bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::FocusNextElement, "Motion", "Focus the next editor element"),
+    bind!(N, KeyCode::BackTab, Any, A::FocusPrevElement, "Motion", "Focus the previous editor element"),
 
     // ---- cursor-local git / diagnostic navigation (the list pickers live under Space) ----
     bind!(N, ch('c'), IgnoreShift(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
@@ -1069,7 +1080,6 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Selection), "Edit", "Toggle block comment"),
 
     // ---- reveal ----
-    bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::Hover, "Code", "Hover (type & docs)"),
 
     // ---- leaders ----
     bind!(N, ch(' '), Exact(Mods::NONE), A::BeginLeader, "Leader", "Space leader chord"),
@@ -1195,7 +1205,6 @@ static READ: &[Binding] = &[
     bind!(R, ch('k'), IgnoreShift(Mods::ALT), A::ReadStep(Direction::Backward)),
     bind!(R, ch('l'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Forward), "Read", "Focus next link in block"),
     bind!(R, ch('h'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Backward), "Read", "Focus previous link in block"),
-    bind!(R, KeyCode::Tab, Exact(Mods::NONE), A::ReadShowTarget, "Read", "Show link/image target"),
     bind!(R, ch('o'), IgnoreShift(Mods::NONE), A::ReadStepHeading(Direction::Forward), "Read", "Next heading"),
     bind!(R, ch('o'), IgnoreShift(Mods::ALT), A::ReadStepHeading(Direction::Backward), "Read", "Previous heading"),
     bind!(R, ch('g'), IgnoreShift(Mods::NONE), A::ReadEnds { last: false }, "Read", "First element"),
@@ -1315,6 +1324,17 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
     bind!(L, ch('j'), Exact(Mods::ALT), A::ClearJumplist, "Navigation", "Clear jumplist"),
+    // The cursor-reveals sit together: `t` type & docs, `n` diagnostic, `m` blame. Hover used to be
+    // `Tab` — the odd one out of the three — and moved here to free `Tab`/`Shift-Tab` for moving
+    // between the editors of a multi-element view. Bare letters are motions; a reveal is not one.
+    //
+    // `t` was left free after `Space g c` took over committing, so a stale reflex would land on
+    // nothing. Spent deliberately: a hover popover is an inert landing, the same argument that let
+    // the keybindings picker reclaim `y`.
+    //
+    // One binding covers the reading view too — `A::Hover` resolves to the focused link's target
+    // there — because "what is this thing?" is the same question either way.
+    bind!(L, ch('t'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
     bind!(L, ch('n'), Exact(Mods::NONE), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
@@ -1480,10 +1500,10 @@ mod tests {
             .iter()
             .filter(|e| e.mode == "Application")
             .all(|e| e.keys.starts_with("Space ")));
-        // Hover is a direct `Tab` in Normal mode.
-        assert!(entries
-            .iter()
-            .any(|e| e.mode == "Normal" && e.keys == "Tab" && e.desc == "Hover (type & docs)"));
+        // Hover is a leader chord, and one binding serves both source and the reading view.
+        assert!(entries.iter().any(|e| e.mode == "Application"
+            && e.keys == "Space t"
+            && e.desc == "Hover: type & docs, or link target"));
         // The flat list dedupes the shared Ctrl-editing keys: each (mode, keys, desc) row —
         // the picker item identity — appears exactly once.
         let mut seen = std::collections::HashSet::new();
@@ -1640,12 +1660,27 @@ mod tests {
     }
 
     #[test]
-    fn reveal_bindings_are_tab_hover_and_space_n_m() {
-        // Tab triggers hover directly — no leader chord.
+    fn reveal_bindings_are_space_t_n_m() {
+        // All three cursor-reveals are leader chords. Hover was a bare `Tab` until `Tab` was needed
+        // for moving between a multi-element view's editors — and a bare letter is a motion here,
+        // so the leader is where a reveal belongs anyway.
         assert!(matches!(
-            lookup(KeyContext::Normal, KeyCode::Tab, Mods::NONE).map(|b| b.action),
+            lookup(KeyContext::Leader, ch('t'), Mods::NONE).map(|b| b.action),
             Some(Action::Hover)
         ));
+        // `Tab` was reserved for element focus when hover moved off it; that reservation is now
+        // taken up, which is the whole reason hover had to move.
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::Tab, Mods::NONE).map(|b| b.action),
+            Some(Action::FocusNextElement)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, KeyCode::BackTab, Mods::NONE).map(|b| b.action),
+            Some(Action::FocusPrevElement)
+        ));
+        // Read still answers neither: block editing has its own navigation, and a reader is one
+        // element until the markdown ladder gives it more.
+        assert!(lookup(KeyContext::Read, KeyCode::Tab, Mods::NONE).is_none());
         // Diagnostic-at-cursor and blame live on the Space leader (`n` / `m`); `Space j` is
         // the jumplist picker.
         assert!(matches!(
@@ -1816,13 +1851,10 @@ mod tests {
         // A key with no git meaning resolves to nothing, so the chord just cancels.
         assert!(git(ch('j'), Mods::NONE).is_none());
 
-        // The old single-key homes are free — a stale reflex does nothing rather than something
-        // else (`t` commit, `u` uncommit).
-        for (code, mods) in [
-            (ch('t'), Mods::NONE),
-            (ch('t'), Mods::ALT),
-            (ch('u'), Mods::NONE),
-        ] {
+        // The old single-key homes stay free — a stale reflex does nothing rather than something
+        // else (`t` commit, `u` uncommit). `t` is the exception, spent on hover: an inert landing,
+        // the same argument that let the keybindings picker reclaim `y` below.
+        for (code, mods) in [(ch('t'), Mods::ALT), (ch('u'), Mods::NONE)] {
             assert!(
                 lookup(KeyContext::Leader, code, mods).is_none(),
                 "{code:?} + {mods:?} must be free on the leader"

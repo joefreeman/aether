@@ -46,7 +46,7 @@ export interface Segment {
   highlights: Highlight[];
 }
 
-export interface VisualRow {
+export interface WrappedRow {
   /** Byte offset within the logical line where this row's text starts. */
   byte_offset: number;
   continuation_indent: number;
@@ -70,13 +70,22 @@ export interface SneakTarget {
 
 /** "deleted" is the inline diff view's phantom baseline row; the rest are a generated patch's
  *  chrome, which is deliberately not buffer text so the cursor can never land on it. */
-export type VirtualRowKind =
-  | "deleted"
+/** Which piece of a generated patch's chrome a row is. */
+export type ChromeKind =
   | "rule"
   | "file_header"
   | "hunk_header"
   | "spacer"
   | "summary";
+
+/** Where a chrome row sits on the file rail. Structure, not presentation: the server answers it
+ *  once and each client spells it its own way (here, CSS classes). */
+export type RailJoin = "opens" | "tees" | "closes" | "detached";
+
+/** The leaves and rows of the element vocabulary — the part of `ViewNode` a single row contains.
+ *  A convenience alias, not a separate type: since the two vocabularies merged there is only
+ *  `ViewNode`. Mirrors `aether_protocol::ui::Element`. */
+export type UiElement = ViewNode;
 
 /** One intra-line diff emphasis range: byte offsets within the owning line's / row's text. */
 export interface EmphasisRange {
@@ -84,25 +93,11 @@ export interface EmphasisRange {
   end: number;
 }
 
-export interface VirtualRow {
-  text: string;
-  kind: VirtualRowKind;
-  /** Staged (text is HEAD's, already replaced in the index) vs unstaged (text is the index's).
-   *  Omitted on the wire when "unstaged". */
-  stage?: DiffStage;
-  /** Intra-line emphasis on this removed line (the parts its paired buffer line replaced). */
-  emphasis?: EmphasisRange[];
-  /** Syntax spans over `text`, same shape as Segment.highlights. Empty on "deleted" rows, whose
-   *  colour is wholly the diff palette's. A virtual row is one screen row (no soft wrap), so these
-   *  index the untruncated text. */
-  highlights?: Highlight[];
-}
-
 export type DiffMarker = "added" | "modified" | "deleted";
 
 /** Which part of a merge-conflict block a line belongs to. Present only on files a stopped merge
  *  or rebase left conflicted; the blocks are masked out of that file's diff, so a line never
- *  carries both this and a diff_marker. */
+ *  carries both this and a change marker — `LineChange` has no variant that could. */
 export type ConflictLine = "marker" | "ours" | "base" | "theirs";
 
 /** Which side of a *generated* patch a line is — the read-only buffers `git/show` materialises
@@ -134,42 +129,220 @@ export interface DiagnosticSpan {
   message: string;
 }
 
-export interface LogicalLineRender {
-  logical_line: number;
-  visual_rows: VisualRow[];
-  search_matches?: SearchMatchRange[];
-  virtual_rows_above?: VirtualRow[];
-  /** Closing chrome after the final line — a patch has no trailing newline to hang it on. */
-  virtual_rows_below?: VirtualRow[];
-  diff_marker?: DiffMarker | null;
-  /** Qualifies diff_marker in the combined view; omitted when "unstaged". */
-  diff_stage?: DiffStage;
-  /** Intra-line diff emphasis (diff view only): sub-ranges of the line a Modified hunk changed. */
-  diff_emphasis?: EmphasisRange[];
-  /** Which side of a merge conflict this line is; absent unless the file is conflicted. Unlike
-   *  the diff tint this is not gated on the diff view. */
-  conflict?: ConflictLine | null;
-  diagnostics?: DiagnosticSpan[];
-  sneak_targets?: SneakTarget[];
-  /** Which side of a generated patch this line is; absent on every ordinary buffer. Like
-   *  `conflict` and unlike the diff tint, not gated on the diff view. */
-  patch?: PatchLine | null;
+/** A baseline line the buffer removed or replaced, drawn above the surviving line while the inline
+ *  diff view is on. Occupies a screen row, holds no cursor position.
+ *
+ *  Anchored to a line, unlike a patch's chrome — which belongs *between* two hunks and is a
+ *  `Node` in the view's tree. Mirrors `aether_protocol::viewport::BaselineRow`. */
+export interface BaselineRow {
+  text: string;
+  /** Omitted on the wire when "unstaged". */
+  stage?: DiffStage;
+  emphasis?: EmphasisRange[];
 }
 
+/** A view's content: what it is composed of, in order.
+ *
+ *  Named `ViewNode`, not `Element`: the DOM has a global of that name and this file is read in a
+ *  browser context. Mirrors `aether_protocol::ui::Element` — **one** vocabulary for both axes now,
+ *  so an editor may sit inside a row. An ordinary buffer is a single `editor`; a generated patch
+ *  interleaves chrome and hunks. */
+export type ViewNode =
+  | { node: "stack"; children: ViewNode[] }
+  | { node: "row"; children: ViewNode[] }
+  | { node: "chrome"; kind: ChromeKind; rail: RailJoin; children: ViewNode[] }
+  | { node: "text"; text: string; highlights?: Highlight[] }
+  | { node: "space"; cols: number }
+  | { node: "fill"; glyph: string }
+  | {
+      node: "editor";
+      element: number;
+      /** The buffer this element windows, and its **total** visual row count — of which `lines` is
+       *  the slice currently loaded. Together they let the shell lay out and scroll a view from the
+       *  tree alone, requesting more of a buffer only as its element scrolls into range. */
+      buffer: number;
+      rows: number;
+      /** A line of **`buffer`**, not of the view — see `BufferWindow.first_view_line`. */
+      first_buffer_line: number;
+      lines: LogicalLineRender[];
+    };
+
+/** One row-producing item of a view, in order — mirrors `grid::RowItem`.
+ *
+ *  A chrome row occupies a screen row exactly as a phantom baseline row does, but belongs to no
+ *  logical line, which is why rows can no longer simply be summed per line.
+ *
+ *  A line carries its element because a logical line number is unique only *within* an element once
+ *  elements window different buffers. The lookups below still match on the number alone — correct
+ *  while every element windows one document, and what changes when focus arrives to supply the
+ *  element (the Rust side already threads it through `grid::position_cell`/`hit_test`). */
+export type RowItem =
+  | { kind: "chrome" }
+  | { kind: "line"; element: number; line: LogicalLineRender };
+
+export function rowItems(root: ViewNode): RowItem[] {
+  const out: RowItem[] = [];
+  const walk = (n: ViewNode) => {
+    if (n.node === "stack") n.children.forEach(walk);
+    else if (n.node === "editor")
+      for (const line of n.lines) out.push({ kind: "line", element: n.element, line });
+    // Chrome, or any inline element standing on its own: one screen row, no cursor position.
+    else out.push({ kind: "chrome" });
+  };
+  walk(root);
+  return out;
+}
+
+/** Visual rows an item occupies. Mirrors `grid::RowItem::rows`. */
+export function itemRows(i: RowItem): number {
+  return i.kind === "chrome"
+    ? 1
+    : (i.line.baseline_above?.length ?? 0) + i.line.visual_rows.length;
+}
+
+/** Every rendered line of a view, in order — for the paths that want lines and no structure. */
+export function nodeLines(n: ViewNode): LogicalLineRender[] {
+  if (n.node === "editor") return n.lines;
+  if (n.node === "stack") return n.children.flatMap(nodeLines);
+  return [];
+}
+
+/** The leaves of one row, left to right — text, spaces and fills, in painting order.
+ *  Mirrors `Element::inline`. */
+export function inlineOf(n: ViewNode): ViewNode[] {
+  if (n.node === "text" || n.node === "space" || n.node === "fill") return [n];
+  if (n.node === "stack" || n.node === "row" || n.node === "chrome")
+    return n.children.flatMap(inlineOf);
+  return [];
+}
+
+/** What a painter draws on one visual row — mirrors `grid::PaintedRow`.
+ *
+ *  Every row of a view is exactly one of these, in the order `paintedRows` produces. Replaces the
+ *  old `chromeByLine`, which keyed chrome by the logical line beneath it: two elements windowing
+ *  different files both start at, say, line 10, so their headings collapsed onto one key and the
+ *  first file lost its own. */
+export type PaintedRow =
+  | { kind: "chrome"; node: ViewNode }
+  | { kind: "baseline"; element: number; line: LogicalLineRender; index: number; row: BaselineRow }
+  | {
+      kind: "text";
+      element: number;
+      line: LogicalLineRender;
+      row: WrappedRow;
+      rowIndex: number;
+      /** The final rendered row of the whole view — what a closing rule hangs off. Positional, not
+       *  `logical_line + 1 === view_line_count`, which compares a buffer line to a view line. */
+      lastLine: boolean;
+    };
+
+/** Every visual row of the loaded window, top to bottom. Mirrors `grid::painted_rows`; the Rust
+ *  side is the specification and is tested against these same shapes. */
+export function paintedRows(root: ViewNode): PaintedRow[] {
+  const out: PaintedRow[] = [];
+  let pending: ViewNode[] = [];
+  const editors: { element: number; lines: LogicalLineRender[]; chrome: ViewNode[] }[] = [];
+  const walk = (n: ViewNode) => {
+    if (n.node === "stack") n.children.forEach(walk);
+    else if (n.node === "editor") {
+      editors.push({ element: n.element, lines: n.lines, chrome: pending });
+      pending = [];
+    } else pending.push(n);
+  };
+  walk(root);
+  const total = editors.reduce((n, e) => n + e.lines.length, 0);
+  let seen = 0;
+  for (const e of editors) {
+    for (const node of e.chrome) out.push({ kind: "chrome", node });
+    for (const line of e.lines) {
+      (line.baseline_above ?? []).forEach((row, index) =>
+        out.push({ kind: "baseline", element: e.element, line, index, row }),
+      );
+      seen += 1;
+      line.visual_rows.forEach((row, rowIndex) =>
+        out.push({
+          kind: "text",
+          element: e.element,
+          line,
+          row,
+          rowIndex,
+          lastLine: seen === total,
+        }),
+      );
+    }
+  }
+  // Chrome with no editor below it is the patch's closing rule.
+  for (const node of pending) out.push({ kind: "chrome", node });
+  return out;
+}
+
+export interface LogicalLineRender {
+  logical_line: number;
+  visual_rows: WrappedRow[];
+  search_matches?: SearchMatchRange[];
+  baseline_above?: BaselineRow[];
+  /** Closing chrome after the final line — a patch has no trailing newline to hang it on. */
+  /** This line's change-state. Omitted on the wire when there is none, which is most lines. */
+  change?: LineChange;
+  diagnostics?: DiagnosticSpan[];
+  sneak_targets?: SneakTarget[];
+}
+
+/** What a line's own change-state is: changed against a baseline, conflicted, or a side of a
+ *  generated patch.
+ *
+ *  One tagged value rather than the five parallel fields this used to be, because the cases are
+ *  mutually exclusive by construction: a conflicted file's blocks are masked out of its own diff,
+ *  and a generated patch has no baseline to diff against. Mirrors `aether_protocol::viewport::
+ *  LineChange`. */
+export type LineChange =
+  | { kind: "none" }
+  | {
+      kind: "changed";
+      marker: DiffMarker;
+      stage: DiffStage;
+      /** Diff-view only: sub-ranges the change actually touched. */
+      emphasis?: EmphasisRange[];
+    }
+  | { kind: "conflict"; side: ConflictLine }
+  | {
+      kind: "patch";
+      side: PatchLine;
+      stage: DiffStage;
+      emphasis?: EmphasisRange[];
+    };
+
+/** Accessors mirroring the Rust ones, so call sites stay as short as the five fields were. */
+export const changeMarker = (c?: LineChange): DiffMarker | null =>
+  c?.kind === "changed" ? c.marker : null;
+export const changeStage = (c?: LineChange): DiffStage =>
+  c && (c.kind === "changed" || c.kind === "patch") ? c.stage : "unstaged";
+export const changeEmphasis = (c?: LineChange): EmphasisRange[] =>
+  c && (c.kind === "changed" || c.kind === "patch") ? (c.emphasis ?? []) : [];
+export const changeConflict = (c?: LineChange): ConflictLine | null =>
+  c?.kind === "conflict" ? c.side : null;
+export const changePatchSide = (c?: LineChange): PatchLine | null =>
+  c?.kind === "patch" ? c.side : null;
+
 export interface BufferWindow {
-  first_logical_line: number;
-  last_logical_line_exclusive: number;
-  line_count: number;
-  max_scroll_logical_line: number;
-  /** Total visual rows in the buffer (real + diff phantom) — sizes the native scroll container. */
+  /** The slice of the **view** loaded, in view lines — indices into the concatenation of its
+   *  elements' extents. Not lines of any file: in a patch these match no buffer's numbering.
+   *  Mirrors `aether_protocol::coords::ViewLine`. */
+  first_view_line: number;
+  last_view_line_exclusive: number;
+  /** How many lines the **view** has: its elements' extents, summed. */
+  view_line_count: number;
+  max_scroll_view_line: number;
+  /** Total visual rows in the view (real + diff phantom + chrome) — sizes the native scroller. */
   total_visual_rows: number;
-  /** Visual-row index where first_logical_line begins — positions the window in the scroller. */
+  /** Visual row where first_view_line begins — positions the window in the scroller. */
   first_visual_row: number;
   /** Display cols of the widest line — sizes the native horizontal scroller (no-wrap). 0 under soft wrap. */
   max_line_width: number;
   /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */
   git_status?: GitBufferStatus;
-  lines: LogicalLineRender[];
+  /** What the view is composed of. Use `nodeLines` where the structure is irrelevant. */
+  root: ViewNode;
 }
 
 /** Buffer-wide Git change line counts vs HEAD, for the status bar (`+added ~modified -deleted`). */
@@ -341,6 +514,14 @@ export interface LspServerStatus {
 
 // ---- geometry RPC results (viewport/subscribe, scroll, scroll_to_row, resize) -------------------
 
+/** Which element of a view holds the cursor, and the buffer it windows — the reply to
+ *  `view/focus_element`, and what a composed view's subscribe carries so a client binds to the
+ *  buffer it is actually looking at rather than to the view's own document. */
+export interface ViewportFocusElementResult {
+  element: number;
+  buffer: BufferOpenResult;
+}
+
 export interface ViewportSubscribeResult {
   viewport_id: ViewportId;
   window: BufferWindow;
@@ -348,6 +529,11 @@ export interface ViewportSubscribeResult {
    *  Lets a client seed external-change flags, diagnostic counts, and LSP health the moment it
    *  starts showing a buffer, rather than waiting for the next change-notification. */
   buffer_status?: BufferStatusSnapshot;
+  /** Which element holds the cursor and the buffer it windows — present only for a *composed* view,
+   *  whose elements window buffers other than the one subscribed to. The core adopts it; a shell
+   *  never reads it directly. Absent for an ordinary editor view, where the subscribed buffer is
+   *  already the one the cursor is in. */
+  focus?: ViewportFocusElementResult;
 }
 
 /** Buffer-level state delivered with viewport/subscribe (counterpart to the server struct). */

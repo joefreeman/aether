@@ -154,7 +154,7 @@ pub enum SelectionEdge {
 
 pub struct CursorMove;
 impl RpcMethod for CursorMove {
-    const NAME: &'static str = "cursor/move";
+    const NAME: &'static str = "element/move";
     type Params = CursorMoveParams;
     type Result = CursorState;
 }
@@ -209,7 +209,7 @@ impl CursorState {
 
 pub struct CursorSet;
 impl RpcMethod for CursorSet {
-    const NAME: &'static str = "cursor/set";
+    const NAME: &'static str = "element/set";
     type Params = CursorSetParams;
     type Result = CursorState;
 }
@@ -251,7 +251,7 @@ pub struct CursorSetParams {
 
 pub struct CursorSelectLine;
 impl RpcMethod for CursorSelectLine {
-    const NAME: &'static str = "cursor/select_line";
+    const NAME: &'static str = "element/select_line";
     type Params = CursorSelectLineParams;
     type Result = CursorState;
 }
@@ -279,7 +279,7 @@ pub struct CursorSelectLineParams {
 /// Returns the new cursor state. See `resolve_select_word` server-side for the exact rule.
 pub struct CursorSelectWord;
 impl RpcMethod for CursorSelectWord {
-    const NAME: &'static str = "cursor/select_word";
+    const NAME: &'static str = "element/select_word";
     type Params = CursorSelectWordParams;
     type Result = CursorState;
 }
@@ -305,14 +305,14 @@ pub struct CursorSelectWordParams {
 
 pub struct CursorUndo;
 impl RpcMethod for CursorUndo {
-    const NAME: &'static str = "cursor/undo";
+    const NAME: &'static str = "element/cursor_undo";
     type Params = CursorUndoParams;
     type Result = CursorUndoResult;
 }
 
 pub struct CursorRedo;
 impl RpcMethod for CursorRedo {
-    const NAME: &'static str = "cursor/redo";
+    const NAME: &'static str = "element/cursor_redo";
     type Params = CursorUndoParams;
     type Result = CursorUndoResult;
 }
@@ -344,7 +344,7 @@ pub struct CursorUndoResult {
 
 pub struct CursorTreeSelect;
 impl RpcMethod for CursorTreeSelect {
-    const NAME: &'static str = "cursor/tree_select";
+    const NAME: &'static str = "element/tree_select";
     type Params = CursorTreeSelectParams;
     type Result = CursorState;
 }
@@ -375,7 +375,7 @@ pub struct CursorTreeSelectParams {
 
 pub struct CursorSwapAnchor;
 impl RpcMethod for CursorSwapAnchor {
-    const NAME: &'static str = "cursor/swap_anchor";
+    const NAME: &'static str = "element/swap_anchor";
     type Params = CursorSwapAnchorParams;
     type Result = CursorState;
 }
@@ -400,7 +400,7 @@ fn is_false(b: &bool) -> bool {
 /// the whole-line, forward-direction normal form. Returns the new cursor state.
 pub struct CursorSelectAll;
 impl RpcMethod for CursorSelectAll {
-    const NAME: &'static str = "cursor/select_all";
+    const NAME: &'static str = "element/select_all";
     type Params = CursorSelectAllParams;
     type Result = CursorState;
 }

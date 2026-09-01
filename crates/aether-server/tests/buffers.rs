@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // -------- save-as --------------------------------------------------------------------------------
@@ -43,12 +44,12 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: scratch.buffer_id,
+            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -528,12 +529,12 @@ async fn save_as_to_same_path_is_in_place_save() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -610,12 +611,12 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: scratch.buffer_id,
+            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -714,12 +715,12 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -802,12 +803,12 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: scratch.buffer_id,
+            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -919,7 +920,7 @@ async fn buffer_close_drops_buffer() {
     let r: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: b.buffer_id,
+            buffer_id: aether_protocol::ViewId(b.buffer_id),
             open_next: false,
         },
     )
@@ -983,7 +984,7 @@ async fn buffer_close_last_buffer_returns_none() {
     let r: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             open_next: false,
         },
     )
@@ -1028,12 +1029,12 @@ async fn buffer_close_drops_viewports() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -1046,7 +1047,7 @@ async fn buffer_close_drops_viewports() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             open_next: false,
         },
     )
@@ -1117,12 +1118,12 @@ async fn setup_watched_buffer(
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1166,12 +1167,12 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 5,
             scroll: ScrollPosition {
-                logical_line: 150,
+                logical_line: ViewLine(150),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1181,7 +1182,7 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
         },
     )
     .await;
-    assert_eq!(sub.window.first_logical_line, 145);
+    assert_eq!(sub.window.first_view_line, ViewLine(145));
 
     // Park the cursor deep too, so the reload's clamp has something to do.
     let st: CursorState = send_request::<CursorMove>(
@@ -1206,7 +1207,7 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     let push = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let p = expect_notification_within::<ViewportLinesChanged>(&mut ws, remaining).await;
-        if p.line_count == new_line_count {
+        if p.view_line_count == new_line_count {
             break p;
         }
     };
@@ -1214,16 +1215,16 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     // Scroll clamps to the last line (5); with rows 10 + overscan 5 the range saturates to the
     // whole file. The essential invariants: non-empty and inside the new bounds.
     let (start, end) = (
-        push.range.start_logical_line,
-        push.range.end_logical_line_exclusive,
+        push.range.start_view_line,
+        push.range.end_view_line_exclusive,
     );
     assert!(
         start < end,
-        "pushed window must be non-empty, got {start}..{end}"
+        "pushed window must be non-empty, got {start:?}..{end:?}"
     );
-    assert!(end <= new_line_count);
-    assert_eq!((start, end), (0, new_line_count));
-    assert_eq!(push.replacement_lines.len(), (end - start) as usize);
+    assert!(end <= ViewLine(new_line_count));
+    assert_eq!((start, end), (ViewLine(0), ViewLine(new_line_count)));
+    assert_eq!(push.root.lines().len(), start.distance_to(end) as usize);
 
     // The clamped cursor rides the push — without it the client shows a stale position (and no
     // cursor block at all) until the next round-trip.
@@ -1242,14 +1243,17 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
         &ViewportScrollParams {
             viewport_id: sub.viewport_id,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
         },
     )
     .await;
-    assert_eq!(scrolled.window.first_logical_line, 0);
-    assert!(!scrolled.window.lines.is_empty());
+    assert_eq!(
+        scrolled.window.first_view_line,
+        aether_protocol::coords::ViewLine(0)
+    );
+    assert!(!scrolled.window.root.lines().is_empty());
 
     drop(server);
 }
@@ -1263,12 +1267,12 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 1000,
+                logical_line: ViewLine(1000),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1280,15 +1284,15 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
     .await;
 
     let w = &sub.window;
-    assert_eq!(w.line_count, 4);
+    assert_eq!(w.view_line_count, 4);
     assert!(
-        w.first_logical_line < w.last_logical_line_exclusive,
+        w.first_view_line < w.last_view_line_exclusive,
         "window must be non-empty, got {}..{}",
-        w.first_logical_line,
-        w.last_logical_line_exclusive
+        w.first_view_line,
+        w.last_view_line_exclusive
     );
-    assert!(w.last_logical_line_exclusive <= w.line_count);
-    assert!(!w.lines.is_empty());
+    assert!(w.last_view_line_exclusive <= ViewLine(w.view_line_count));
+    assert!(!w.root.lines().is_empty());
 
     drop(server);
 }
@@ -1443,12 +1447,12 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1502,12 +1506,12 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1666,7 +1670,7 @@ async fn edit_in_one_workspace_streams_to_the_other_workspaces_viewport() {
     )
     .await;
     assert_eq!(
-        push.replacement_lines[0].visual_rows[0].segments[0].text,
+        push.root.lines()[0].visual_rows[0].segments[0].text,
         "shared-hello"
     );
     assert_eq!(buffer_text(&mut ws_b, buf_b).await, "shared-hello\n");
@@ -1838,7 +1842,7 @@ async fn close_in_one_workspace_keeps_shared_document_alive() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut ws_a,
         &BufferCloseParams {
-            buffer_id: buf_a,
+            buffer_id: aether_protocol::ViewId(buf_a),
             open_next: false,
         },
     )
@@ -2737,7 +2741,7 @@ async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
     let _close: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             open_next: false,
         },
     )
@@ -2793,7 +2797,7 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     let _close: BufferCloseResult = send_request::<BufferClose>(
         &mut ws_a,
         &BufferCloseParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             open_next: false,
         },
     )
@@ -3511,12 +3515,12 @@ async fn restore_flags_externally_modified_when_disk_changed() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: reopen.buffer_id,
+            buffer_id: aether_protocol::ViewId(reopen.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,

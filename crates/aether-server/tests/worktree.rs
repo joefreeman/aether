@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // -------- workspace/activate + switching ---------------------------------------------------------
@@ -910,12 +911,12 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
         let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: open.buffer_id,
+                buffer_id: aether_protocol::ViewId(open.buffer_id),
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: 0,
+                    logical_line: ViewLine(0),
                     sub_row: 0.0,
                 },
                 wrap: WrapMode::None,
@@ -1398,12 +1399,12 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
         let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             &mut ws,
             &ViewportSubscribeParams {
-                buffer_id: open.buffer_id,
+                buffer_id: aether_protocol::ViewId(open.buffer_id),
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: 0,
+                    logical_line: ViewLine(0),
                     sub_row: 0.0,
                 },
                 wrap: WrapMode::None,

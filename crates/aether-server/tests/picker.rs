@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- picker ------------------------------------------------------------------------------------
@@ -2270,7 +2271,7 @@ async fn scratch_number_is_per_workspace_lowest_unused() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: s1.buffer_id,
+            buffer_id: aether_protocol::ViewId(s1.buffer_id),
             open_next: false,
         },
     )
@@ -2305,12 +2306,12 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 24,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2392,12 +2393,12 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 24,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2483,12 +2484,12 @@ async fn buffers_picker_pushes_on_save() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: opened.buffer_id,
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 24,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,

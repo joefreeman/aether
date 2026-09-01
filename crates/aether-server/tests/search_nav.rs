@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- search/* -----------------------------------------------------------------------------------
@@ -1020,12 +1021,12 @@ async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u6
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -1175,7 +1176,7 @@ async fn nav_goto_reopens_by_path() {
     send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: buf_a,
+            buffer_id: aether_protocol::ViewId(buf_a),
             open_next: false,
         },
     )

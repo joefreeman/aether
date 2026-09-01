@@ -15,8 +15,11 @@ pub async fn buffer_close(
     params: BufferCloseParams,
 ) -> Result<aether_protocol::buffer::BufferCloseResult, RpcError> {
     let client_id = ctx.client_id;
+    // Close addresses a view; everything it then does — the live-buffer lookup, the dormant-row
+    // fallback, the teardown — is about the buffer presenting it. One crossing, named here.
+    let buffer_id = params.buffer_id.presenting_buffer();
     let mut s = state.lock().await;
-    if !s.buffers.contains_key(&params.buffer_id) {
+    if !s.buffers.contains_key(&buffer_id) {
         // Not a live buffer — but the Buffers picker also lists *dormant* rows (session-restored,
         // not yet loaded), and `Ctrl-d` on one of those should drop it from the list just like
         // closing a live buffer. A dormant buffer has only a reserved id and a session entry, so its
@@ -24,7 +27,7 @@ pub async fn buffer_close(
         // and rewrite the session so it isn't restored next time. Falls through to `buffer_not_found`
         // when the id is neither live nor dormant.
         if let Some(workspace) = s.active_workspace(client_id).map(|w| w.id.clone()) {
-            if let Some(dormant) = s.take_dormant(&workspace, params.buffer_id) {
+            if let Some(dormant) = s.take_dormant(&workspace, buffer_id) {
                 if let Some(root) = s.backups_path.as_deref() {
                     match &dormant.source {
                         // Discarding a dormant file discards the document-level backup: unsaved
@@ -52,33 +55,33 @@ pub async fn buffer_close(
                     let s = state.lock().await;
                     next_buffer_for_client(&s, client_id)
                 };
-                tracing::debug!(buffer_id = params.buffer_id, "dormant buffer closed");
+                tracing::debug!(buffer_id = buffer_id, "dormant buffer closed");
                 return Ok(aether_protocol::buffer::BufferCloseResult {
                     next_buffer_id,
                     opened: None,
                 });
             }
         }
-        return Err(RpcError::buffer_not_found(params.buffer_id));
+        return Err(RpcError::buffer_not_found(buffer_id));
     }
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
-    let affected = clients_affected_by_close(&s, &[params.buffer_id], client_id);
+    let affected = clients_affected_by_close(&s, &[buffer_id], client_id);
     // Remember the owning workspace before teardown drops the association, so we can retire an
     // ephemeral workspace once it loses its last buffer.
-    let owning_workspace = s.workspace_for_buffer(params.buffer_id).map(str::to_string);
+    let owning_workspace = s.workspace_for_buffer(buffer_id).map(str::to_string);
     // Closing is an explicit discard: drop any unsaved backup now, so the content isn't resurrected
     // the next time this path is opened (recover-on-open). Done before teardown drops the buffer.
     if let (Some(ws), Some(buf), Some(doc)) = (
         owning_workspace.as_deref(),
-        s.buffers.get(&params.buffer_id),
-        s.try_doc_of(params.buffer_id),
+        s.buffers.get(&buffer_id),
+        s.try_doc_of(buffer_id),
     ) {
         delete_buffer_backups(&s, ws, buf, doc);
     }
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
-    let stopped_server = s.close_buffer(params.buffer_id);
+    let stopped_server = s.close_buffer(buffer_id);
     // If that was the last buffer of an ephemeral context, retire it — and evict any *other*
     // client still parked in it (e.g. one that joined it from the switcher). They're told the
     // buffer closed just below (`buffer_closed_pushes`) and drop to the chooser; the context
@@ -108,7 +111,7 @@ pub async fn buffer_close(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    tracing::debug!(buffer_id = params.buffer_id, "buffer closed");
+    tracing::debug!(buffer_id = buffer_id, "buffer closed");
     // Composite post-step: attach the client to its next buffer (or a fresh scratch) in the same
     // round-trip.
     let opened = if params.open_next {
@@ -260,19 +263,18 @@ pub async fn buffer_cut(
 
     let mut search_summary_pushes = promote_transient(&mut s, params.buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, params.buffer_id));
-    let new_line_count = s.doc_of(params.buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id, new_line_count);
-    let buf_ref = s.doc_of(params.buffer_id);
+    refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id);
 
     let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
-        if vp.buffer_id != params.buffer_id {
+        if !vp.binds(params.buffer_id) {
             continue;
         }
         if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
+            && !edit_touches_window(
+                &s,
+                vp,
+                &[params.buffer_id],
                 old_first_line,
                 old_last_line_excl,
             )
@@ -285,20 +287,9 @@ pub async fn buffer_cut(
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let search = s.searches.get(&(vp.client_id, params.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(
-                buf_ref,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(&s, params.buffer_id),
-                buffer_conflicts(&s, params.buffer_id),
-                buffer_diagnostics(&s, params.buffer_id),
-                buffer_git_status(&s, params.buffer_id),
-                lines_changed_cursor(&s, vp),
-            ),
+            build_lines_changed_notif(&s, vp, revision, lines_changed_cursor(&s, vp)),
         ));
     }
 
@@ -700,8 +691,7 @@ pub(crate) fn reload_buffer_locked(
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let search_summary_pushes = refresh_searches_for_buffer(s, buffer_id);
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(s, buffer_id);
     // LSP: reload swapped the rope (manual or watcher-driven) — keep the server's analysis fresh.
     notify_lsp_change(s, buffer_id);
 
@@ -769,7 +759,7 @@ pub async fn buffer_open(
                 .record(entry);
         }
     }
-    let result = buffer_open_inner(state, ctx, params).await?;
+    let result = buffer_open_inner(state, ctx, params, OpenIntent::Navigate).await?;
     // Refresh the persisted session for this buffer's workspace: the open changed either its
     // membership (a new file) or its MRU order (a switch), both of which a restart restores from.
     // Skip transient opens — previews never enter the persisted set (see `session_buffer_paths`),
@@ -887,6 +877,176 @@ async fn open_restored_scratch(
 ///
 /// Answers [`GitShowResult::opened`] `None` for a clean working tree — see that field for why an
 /// empty patch is worth *not* opening.
+/// Describe an already-open buffer, as an open would — without opening it.
+///
+/// `buffer/open` builds this same shape, but on the way it restores scroll, resolves a remembered
+/// cursor, pins transients, touches the MRU and refreshes the pickers. Focus moving *within* a view
+/// wants none of that: it is not a navigation (see [`OpenIntent`]), and the cursor is the caller's,
+/// already resolved to the element it just moved to.
+pub fn describe_buffer(
+    s: &ServerState,
+    buffer_id: BufferId,
+    cursor: CursorState,
+) -> Result<BufferOpenResult, RpcError> {
+    let buffer = s
+        .buffers
+        .get(&buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    let doc = s.doc_of(buffer_id);
+    Ok(BufferOpenResult {
+        buffer_id,
+        language: doc.language.clone(),
+        line_count: doc.line_count(),
+        byte_count: doc.byte_count(),
+        revision: doc.revision,
+        saved_revision: doc.saved_revision(),
+        path: doc.canonical_path.as_ref().map(|p| p.display().to_string()),
+        scratch_number: buffer.scratch_number,
+        cursor,
+        // No remembered scroll: the caller is moving *inside* a view that is already scrolled, so
+        // restoring a per-buffer position here would fight the scroll the user can see.
+        scroll: None,
+        lsp_server: buffer_lsp_server_ref(s, buffer_id),
+        transient: buffer.transient,
+        title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
+        read_only: doc.read_only(),
+        is_patch: doc.generated.is_some(),
+    })
+}
+
+/// The buffer for a working-tree file a *view* needs — opened once and reused, without counting as
+/// somewhere the user navigated.
+///
+/// The working-changes patch's new side **is** the working tree, so its elements window the files
+/// you are actually editing: edit a hunk and you are editing the file. That is the whole point of
+/// the view, and the reason its elements bind to real paths rather than to blobs.
+#[allow(dead_code)]
+async fn buffer_for_working_file(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    absolute_path: &std::path::Path,
+) -> Result<BufferId, RpcError> {
+    Ok(buffer_open_inner(
+        state,
+        ctx,
+        BufferOpenParams {
+            absolute_path: Some(absolute_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        OpenIntent::Bind,
+    )
+    .await?
+    .buffer_id)
+}
+
+/// Build a patch view's elements over the **real files** it describes.
+///
+/// One element per generated region, each windowing its file at `rev` over the hunk's new-side
+/// lines, carrying the diff's account of those lines as decorations and the region's chrome. Which
+/// region an element came from is not guessed positionally: `PatchIndex.lines[start]` records every
+/// line's `(file, hunk)`, so the mapping is read off the structure that produced the text.
+///
+/// Regions the diff gave no hunks — a binary swap, a mode change, a deletion with nothing to show —
+/// keep windowing the generated document, which is where their placeholder line lives. A patch is
+/// therefore a mix until the last of the generated text goes away.
+async fn patch_elements_over_files(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    repo_id: &str,
+    rev: Option<&str>,
+    generated: &crate::patch::GeneratedPatch,
+) -> Vec<crate::state::ElementLayout> {
+    // Resolve every file the patch touches first — opening one is asynchronous, and the layout
+    // itself is a pure function of the diff plus this map.
+    let mut buffers: std::collections::HashMap<String, BufferId> = std::collections::HashMap::new();
+    for file in &generated.plan.files {
+        let Some(path) = file.new_path.as_deref() else {
+            continue;
+        };
+        if buffers.contains_key(path) {
+            continue;
+        }
+        // A revision's diff windows the blobs; the working-changes diff windows the working tree,
+        // which is what makes its hunks editable.
+        let resolved = match rev {
+            Some(rev) => buffer_for_file_at_rev(state, ctx, repo_id, rev, path).await,
+            None => {
+                buffer_for_working_file(state, ctx, &std::path::Path::new(repo_id).join(path)).await
+            }
+        };
+        // A file that will not materialise keeps its generated text rather than showing nothing:
+        // the patch stays readable, just not editable there.
+        if let Ok(buffer_id) = resolved {
+            buffers.insert(path.to_string(), buffer_id);
+        }
+    }
+    crate::patch::layout_over_files(generated, |path| buffers.get(path).copied())
+}
+
+/// The workspace's buffer already showing `target`, if any — the identity that stops re-showing the
+/// same revision stacking duplicate buffers.
+pub fn virtual_buffer_for(
+    s: &ServerState,
+    workspace: &str,
+    target: &crate::state::VirtualTarget,
+) -> Option<BufferId> {
+    s.buffers_in_workspace(workspace).into_iter().find(|id| {
+        s.buffers
+            .get(id)
+            .and_then(|b| s.documents.get(&b.document))
+            .and_then(|d| d.virtual_source.as_ref())
+            .is_some_and(|v| &v.target == target)
+    })
+}
+
+/// The buffer holding `path` as of `rev` — `git show <rev>:<path>` as a real, parsed, highlighted
+/// document.
+///
+/// Opened once per `(repo, rev, path)` and reused after: a revision cannot change under us, so an
+/// already-open one is simply the answer and needs no regeneration. This is what lets a view window
+/// a file it does not own — a patch's hunks over the real blobs rather than over a generated copy of
+/// them — and it is deliberately *per file*, so a forty-file patch opens only what it renders.
+// Exercised by tests, and by the patch driver once it binds elements to real files. Marked rather
+// than wired to a contrived caller: the alternative was routing `git/follow_patch_line` through it,
+// which needs the full open result and would have made this fit that caller instead of its purpose.
+pub async fn buffer_for_file_at_rev(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    repo_id: &str,
+    rev: &str,
+    path: &str,
+) -> Result<BufferId, RpcError> {
+    let target = crate::state::VirtualTarget::new(
+        repo_id.to_string(),
+        aether_protocol::git::ShowTarget::File {
+            rev: rev.to_string(),
+            path: path.to_string(),
+        },
+    );
+    let workspace = {
+        let s = state.lock().await;
+        s.active_workspace_or_err(ctx.client_id)?.id.clone()
+    };
+    if let Some(id) = {
+        let s = state.lock().await;
+        virtual_buffer_for(&s, &workspace, &target)
+    } {
+        return Ok(id);
+    }
+
+    let workdir = std::path::PathBuf::from(repo_id);
+    let (rev, path) = (rev.to_string(), path.to_string());
+    let content = tokio::task::spawn_blocking(move || crate::git::show_file(&workdir, &rev, &path))
+        .await
+        .map_err(|e| RpcError::internal(format!("git show: {e}")))?
+        .map_err(RpcError::git_show_failed)?;
+    Ok(
+        open_generated_buffer(state, ctx, target, content, None, None, OpenIntent::Bind)
+            .await?
+            .buffer_id,
+    )
+}
+
 pub async fn git_show(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -928,13 +1088,7 @@ pub async fn git_show(
     // by rewriting it in place.
     let existing = {
         let s = state.lock().await;
-        s.buffers_in_workspace(&workspace).into_iter().find(|id| {
-            s.buffers
-                .get(id)
-                .and_then(|b| s.documents.get(&b.document))
-                .and_then(|d| d.virtual_source.as_ref())
-                .is_some_and(|v| v.target == target)
-        })
+        virtual_buffer_for(&s, &workspace, &target)
     };
     // An immutable target that's already open has nothing to regenerate — attach, keeping whatever
     // cursor and pinned state it has, so re-selecting a log row lands you where you were.
@@ -946,6 +1100,7 @@ pub async fn git_show(
                 buffer_id: Some(buffer_id),
                 ..Default::default()
             },
+            OpenIntent::Navigate,
         )
         .await
         .map(opened);
@@ -1018,10 +1173,7 @@ pub async fn git_show(
     if let Some(buffer_id) = existing {
         {
             let mut s = state.lock().await;
-            let doc_id = s.buffers[&buffer_id].document;
-            if let Some(doc) = s.documents.get_mut(&doc_id) {
-                doc.replace_generated(&content.text, content.generated);
-            }
+            s.replace_generated(buffer_id, &content.text, content.generated);
             // Re-showing is a refresh point for the branch too: it may have moved (a checkout in a
             // terminal) since this buffer was minted.
             if let Some(status) = repo_status.clone() {
@@ -1046,21 +1198,48 @@ pub async fn git_show(
                 buffer_id: Some(buffer_id),
                 ..Default::default()
             },
+            OpenIntent::Navigate,
         )
         .await
         .map(opened);
     }
 
-    open_generated_buffer(
+    // ---- patch element binding ---------------------------------------------------------------
+    //
+    // Both a commit and the working tree bind their hunks to the real files, and the difference
+    // between them is mutability: a commit's blobs cannot change, so its extents cannot go stale,
+    // while the working tree's can and do — editing a hunk is the point. That is what
+    // `ServerState::shift_element_extents` handles, and `ViewLayout::of` clamps whatever it cannot
+    // (a wholesale replacement), so a stale extent yields a short window rather than a panic.
+    //
+    // Regions the diff gave no hunks keep windowing the generated document either way; see
+    // `patch::layout_over_files`.
+    let layout = match (&target.what, content.generated.as_ref()) {
+        (aether_protocol::git::ShowTarget::Commit { rev }, Some(generated)) => {
+            let (repo_id, rev) = (target.repo_id.clone(), rev.clone());
+            Some(patch_elements_over_files(state, ctx, &repo_id, Some(&rev), generated).await)
+        }
+        (aether_protocol::git::ShowTarget::WorkingChanges, Some(generated)) => {
+            let repo_id = target.repo_id.clone();
+            Some(patch_elements_over_files(state, ctx, &repo_id, None, generated).await)
+        }
+        _ => None,
+    };
+
+    let open = open_generated_buffer(
         state,
         ctx,
         target,
         content,
         repo_status,
         params.focus_path.as_deref(),
+        OpenIntent::Navigate,
     )
-    .await
-    .map(opened)
+    .await?;
+    if let Some(layout) = layout {
+        state.lock().await.set_view_layout(open.buffer_id, layout);
+    }
+    Ok(opened(open))
 }
 
 /// Where a patch line leads: a blob in history, or — from the working-changes view's new side —
@@ -1085,73 +1264,110 @@ pub async fn git_follow_patch_line(
 
     // Resolve everything the jump needs under one short lock, then let go: materialising the file
     // is `git_show`'s job and it takes the lock itself.
-    let Some((repo_id, follow, lineno)) = ({
+    // A patch element windows the file *itself*, at a revision, so following from one needs no
+    // patch index: the buffer already says which file and which revision it is, and the cursor is
+    // already on one of its real lines. `Enter` leads from the blob to the working tree's copy of
+    // it, at the same place. The index path below is for a patch whose elements are still slices of
+    // a generated document.
+    let from_element = {
         let s = state.lock().await;
-        let Some(doc) = s.try_doc_of(params.buffer_id) else {
-            return Ok(none());
-        };
-        let (Some(generated), Some(source)) = (doc.generated.as_ref(), doc.virtual_source.as_ref())
-        else {
-            return Ok(none());
-        };
-        let repo_id = source.target.repo_id.as_str();
-        let cursor_line = s
-            .cursors
-            .get(&(client_id, params.buffer_id))
-            .map(|c| c.position.line)
-            .unwrap_or_default();
-        // The metadata block and the message belong to no file — nothing to follow.
-        let Some(Some(info)) = generated.index.lines.get(cursor_line as usize).copied() else {
-            return Ok(none());
-        };
-        let Some(file) = generated.index.files.get(info.file as usize) else {
-            return Ok(none());
-        };
-
-        // A deleted file exists only on the old side and an added file only on the new one, so
-        // those decide before the line's own side does — otherwise `Enter` on a context line of a
-        // deleted file would ask for a blob that isn't there.
-        let take_old = match file.status {
-            PatchFileStatus::Deleted => true,
-            PatchFileStatus::Added => false,
-            _ => info.side == Some(aether_protocol::viewport::PatchLine::Removed),
-        };
-        let (path, lineno) = if take_old {
-            (file.old_path.clone(), info.old_lineno)
-        } else {
-            (file.new_path.clone(), info.new_lineno)
-        };
-        let Some(path) = path else {
-            return Ok(none());
-        };
-        let follow = match source.target.rev() {
-            // A commit's diff: both sides are blobs in history. The old side is the first parent's.
-            // A root commit has none, but also has no removals to follow, so that can't be reached.
-            Some(rev) if take_old => {
-                let Some(parent) = crate::git::first_parent(std::path::Path::new(repo_id), rev)
-                else {
-                    return Ok(none());
-                };
-                FollowTarget::Revision { rev: parent, path }
+        match s
+            .try_doc_of(params.buffer_id)
+            .and_then(|d| d.virtual_source.as_ref())
+            .map(|v| (v.target.repo_id.clone(), &v.target.what))
+        {
+            Some((repo_id, aether_protocol::git::ShowTarget::File { path, .. })) => {
+                let cursor_line = s
+                    .cursors
+                    .get(&(client_id, params.buffer_id))
+                    .map(|c| c.position.line)
+                    .unwrap_or_default();
+                let abs_path = std::path::Path::new(&repo_id).join(path);
+                // `lineno` is 1-based, as libgit2 reports it; the cursor is 0-based.
+                Some((
+                    repo_id,
+                    FollowTarget::WorkingFile { abs_path },
+                    Some(cursor_line + 1),
+                ))
             }
-            Some(rev) => FollowTarget::Revision {
-                rev: rev.to_string(),
-                path,
-            },
-            // The working-changes view. Its new side is the working tree itself, so `Enter` leads
-            // to the **real file** — the one place a patch leads somewhere editable, and what makes
-            // the view a place to work from rather than only to read. Its old side is HEAD, which
-            // is what `git diff HEAD` compared against.
-            None if take_old => FollowTarget::Revision {
-                rev: "HEAD".to_string(),
-                path,
-            },
-            None => FollowTarget::WorkingFile {
-                abs_path: std::path::Path::new(repo_id).join(path),
-            },
-        };
-        Some((repo_id.to_string(), follow, lineno))
-    }) else {
+            _ => None,
+        }
+    };
+
+    let resolved = match from_element {
+        Some(found) => Some(found),
+        None => {
+            let s = state.lock().await;
+            let Some(doc) = s.try_doc_of(params.buffer_id) else {
+                return Ok(none());
+            };
+            let Some(source) = doc.virtual_source.as_ref() else {
+                return Ok(none());
+            };
+
+            let Some(generated) = doc.generated.as_ref() else {
+                return Ok(none());
+            };
+            let repo_id = source.target.repo_id.as_str();
+            let cursor_line = s
+                .cursors
+                .get(&(client_id, params.buffer_id))
+                .map(|c| c.position.line)
+                .unwrap_or_default();
+            // The metadata block and the message belong to no file — nothing to follow.
+            let Some(Some(info)) = generated.index.lines.get(cursor_line as usize).copied() else {
+                return Ok(none());
+            };
+            let Some(file) = generated.index.files.get(info.file as usize) else {
+                return Ok(none());
+            };
+
+            // A deleted file exists only on the old side and an added file only on the new one, so
+            // those decide before the line's own side does — otherwise `Enter` on a context line of a
+            // deleted file would ask for a blob that isn't there.
+            let take_old = match file.status {
+                PatchFileStatus::Deleted => true,
+                PatchFileStatus::Added => false,
+                _ => info.side == Some(aether_protocol::viewport::PatchLine::Removed),
+            };
+            let (path, lineno) = if take_old {
+                (file.old_path.clone(), info.old_lineno)
+            } else {
+                (file.new_path.clone(), info.new_lineno)
+            };
+            let Some(path) = path else {
+                return Ok(none());
+            };
+            let follow = match source.target.rev() {
+                // A commit's diff: both sides are blobs in history. The old side is the first parent's.
+                // A root commit has none, but also has no removals to follow, so that can't be reached.
+                Some(rev) if take_old => {
+                    let Some(parent) = crate::git::first_parent(std::path::Path::new(repo_id), rev)
+                    else {
+                        return Ok(none());
+                    };
+                    FollowTarget::Revision { rev: parent, path }
+                }
+                Some(rev) => FollowTarget::Revision {
+                    rev: rev.to_string(),
+                    path,
+                },
+                // The working-changes view. Its new side is the working tree itself, so `Enter` leads
+                // to the **real file** — the one place a patch leads somewhere editable, and what makes
+                // the view a place to work from rather than only to read. Its old side is HEAD, which
+                // is what `git diff HEAD` compared against.
+                None if take_old => FollowTarget::Revision {
+                    rev: "HEAD".to_string(),
+                    path,
+                },
+                None => FollowTarget::WorkingFile {
+                    abs_path: std::path::Path::new(repo_id).join(path),
+                },
+            };
+            Some((repo_id.to_string(), follow, lineno))
+        }
+    };
+    let Some((repo_id, follow, lineno)) = resolved else {
         return Ok(none());
     };
 
@@ -1234,6 +1450,19 @@ pub async fn git_follow_patch_line(
 /// Takes whatever `git/show` materialised — a commit's patch, a file at a revision, the working
 /// tree's diff — since all three want identical buffer semantics and differ only in what they
 /// generated and what key it answers to.
+/// Why a buffer is being opened.
+///
+/// A **navigation** is something the user did: it belongs at the top of the MRU list and the buffer
+/// pickers should learn about it. A **binding** is a buffer a *view* needs in order to render — a
+/// patch's hunks over the real blobs — and must do neither, or opening a forty-file diff would put
+/// forty files at the top of your recent list and flood the picker with content you never asked to
+/// open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenIntent {
+    Navigate,
+    Bind,
+}
+
 async fn open_generated_buffer(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1241,6 +1470,7 @@ async fn open_generated_buffer(
     content: crate::git::RevisionContent,
     repo_status: Option<aether_protocol::git::GitBufferStatus>,
     focus_path: Option<&str>,
+    intent: OpenIntent,
 ) -> Result<BufferOpenResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -1256,6 +1486,8 @@ async fn open_generated_buffer(
         content.text,
         content.language,
         content.generated,
+        // A view's buffer must not stall the view: see `OpenIntent`.
+        intent == OpenIntent::Bind,
     );
     // Transient: a revision view is a preview, so it closes itself once nothing shows it. Since a
     // read-only buffer can never be promoted by an edit or a save, `Space k` is the only way to
@@ -1315,9 +1547,20 @@ async fn open_generated_buffer(
     if focused.position.line != 0 {
         set_cursor(&mut s, (client_id, id), focused);
     }
-    s.touch_mru(id);
-    let pushes = refresh_buffer_pickers(&mut s);
+    let pushes = match intent {
+        OpenIntent::Navigate => {
+            s.touch_mru(id);
+            refresh_buffer_pickers(&mut s)
+        }
+        OpenIntent::Bind => Vec::new(),
+    };
+    let parse_pending = s.doc_of(id).syntax_pending;
+    let parse_token = parse_pending.then(|| s.deferred.start());
     drop(s);
+    // The tree lands later and a `viewport/lines_changed` push restyles whatever is on screen.
+    if let Some(token) = parse_token {
+        tokio::spawn(finish_pending_parse(state.clone(), id, token));
+    }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
@@ -1328,6 +1571,7 @@ async fn buffer_open_inner(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: BufferOpenParams,
+    intent: OpenIntent,
 ) -> Result<BufferOpenResult, RpcError> {
     // `Option` wrapping is vestigial — every connected client has an id now (assigned at WS
     // accept). Kept locally so the surrounding code (which threads cursor/scroll lookups through
@@ -1363,7 +1607,13 @@ async fn buffer_open_inner(
                     absolute_path: Some(path.display().to_string()),
                     ..params
                 };
-                return Box::pin(buffer_open_inner(state, ctx, materialize)).await;
+                return Box::pin(buffer_open_inner(
+                    state,
+                    ctx,
+                    materialize,
+                    OpenIntent::Navigate,
+                ))
+                .await;
             }
             // A scratch has no path to re-dispatch through — rebuild it directly, restoring its
             // unsaved content from the backup keyed by its number.
@@ -1425,8 +1675,10 @@ async fn buffer_open_inner(
             read_only,
             is_patch,
         };
-        s.touch_mru(buffer_id);
-        pushes.extend(refresh_buffer_pickers(&mut s));
+        if intent == OpenIntent::Navigate {
+            s.touch_mru(buffer_id);
+            pushes.extend(refresh_buffer_pickers(&mut s));
+        }
         drop(s);
         for (sender, notif) in pushes {
             let _ = sender.send(notif).await;
@@ -1494,8 +1746,13 @@ async fn buffer_open_inner(
                 s.buffers.insert(id, buf);
                 s.buffer_workspaces
                     .insert(id, active_workspace_name.clone());
-                s.touch_mru(id);
-                let pushes = refresh_buffer_pickers(&mut s);
+                let pushes = match intent {
+                    OpenIntent::Navigate => {
+                        s.touch_mru(id);
+                        refresh_buffer_pickers(&mut s)
+                    }
+                    OpenIntent::Bind => Vec::new(),
+                };
                 drop(s);
                 for (sender, notif) in pushes {
                     let _ = sender.send(notif).await;
@@ -1723,6 +1980,7 @@ async fn buffer_open_inner(
         (git_baseline, git_unstaged, git_both)
     });
     let syntax_pending = doc.syntax_pending;
+    let syntax_token = syntax_pending.then(|| s.deferred.start());
     s.buffers.insert(id, buf);
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
@@ -1824,8 +2082,13 @@ async fn buffer_open_inner(
         read_only: false,
         is_patch: false,
     };
-    s.touch_mru(id);
-    let mut pushes = refresh_buffer_pickers(&mut s);
+    let mut pushes = match intent {
+        OpenIntent::Navigate => {
+            s.touch_mru(id);
+            refresh_buffer_pickers(&mut s)
+        }
+        OpenIntent::Bind => Vec::new(),
+    };
     // A restored buffer can come back externally-modified/-deleted (the source changed or vanished
     // while we were down). That state rides a `buffer/state` push, not the open result, so emit one
     // now — otherwise the client wouldn't learn until some later edit triggered a push.
@@ -1854,8 +2117,8 @@ async fn buffer_open_inner(
     // Warm the document-symbol outline so `o` and `Space o` work as soon as possible. A no-op if
     // the server isn't ready yet — the `publishDiagnostics` hook refreshes once it is.
     spawn_document_symbol_refresh(state.clone(), id);
-    if syntax_pending {
-        tokio::spawn(finish_pending_parse(state.clone(), id));
+    if let Some(token) = syntax_token {
+        tokio::spawn(finish_pending_parse(state.clone(), id, token));
     }
     if git_deferred {
         tokio::spawn(finish_git_baseline(state.clone(), id, canonical.clone()));
@@ -1966,7 +2229,15 @@ async fn finish_git_baseline(
 /// landed mid-parse make the tree stale, so the loop re-snapshots and parses again; it ends when a
 /// parse survives unchallenged or the buffer is gone. On attach, every viewport on the buffer
 /// (any client) gets a `viewport/lines_changed` re-render, restyling the unhighlighted first frame.
-async fn finish_pending_parse(state: SharedState, buffer_id: BufferId) {
+/// `_token` keeps the server's [`crate::state::Deferred`] count raised for the life of the parse,
+/// so `wait_quiet` covers it. Without it a caller waiting for the server to go quiet could observe
+/// a buffer *before* its tree lands — which is exactly what a test asserting on highlighting does,
+/// and it fails only under load, which is the worst way to find out.
+async fn finish_pending_parse(
+    state: SharedState,
+    buffer_id: BufferId,
+    _token: crate::state::DeferredToken,
+) {
     loop {
         let (text, revision, language) = {
             let mut s = state.lock().await;
@@ -2027,24 +2298,13 @@ pub fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> Pe
         return pushes;
     };
     for vp in s.viewports.values() {
-        if vp.buffer_id != buffer_id {
+        if !vp.shows(buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let search = s.searches.get(&(vp.client_id, buffer_id));
-        let notif = build_lines_changed_notif(
-            buf,
-            vp,
-            buf.revision,
-            search,
-            buffer_both_hunks(s, buffer_id),
-            buffer_conflicts(s, buffer_id),
-            buffer_diagnostics(s, buffer_id),
-            buffer_git_status(s, buffer_id),
-            lines_changed_cursor(s, vp),
-        );
+        let notif = build_lines_changed_notif(s, vp, buf.revision, lines_changed_cursor(s, vp));
         pushes.push((sender, notif));
     }
     pushes
@@ -2126,5 +2386,160 @@ mod next_buffer_tests {
     fn next_buffer_is_none_when_workspace_is_empty() {
         let (st, client_id) = state_with_active_workspace();
         assert_eq!(next_buffer_for_client(&st, client_id), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repo with `src/main.rs` committed twice, returning both revisions oldest-first.
+    fn repo_with_two_revisions(root: &std::path::Path) -> (git2::Repository, String, String) {
+        let repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut revs = Vec::new();
+        for body in ["fn main() {}\n", "fn main() { changed(); }\n"] {
+            std::fs::write(root.join("src/main.rs"), body).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("src/main.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = repo
+                .commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
+                .unwrap();
+            revs.push(oid.to_string());
+        }
+        let (a, b) = (revs[0].clone(), revs[1].clone());
+        (repo, a, b)
+    }
+
+    /// A client with an activated (ephemeral) workspace — the minimum for a handler to run.
+    fn state_with_client() -> (SharedState, ConnectionCtx) {
+        let mut s = ServerState::new();
+        let workspace = s.register_ephemeral_workspace();
+        let client_id = uuid::Uuid::new_v4();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        s.clients.insert(
+            client_id,
+            crate::state::ClientSession {
+                client_id,
+                outbound: tx,
+                pushes_written: Default::default(),
+                active_workspace: Some(workspace),
+            },
+        );
+        (
+            std::sync::Arc::new(tokio::sync::Mutex::new(s)),
+            ConnectionCtx { client_id },
+        )
+    }
+
+    /// A file at a revision resolves to one buffer per `(repo, rev, path)`, reused on re-resolution.
+    ///
+    /// This is what lets a view window a file it does not own. Reuse is not an optimisation here: a
+    /// patch resolves the same file once per hunk, so without it a forty-hunk diff would mint forty
+    /// copies of the same blob.
+    #[tokio::test]
+    async fn a_file_at_a_revision_resolves_to_one_reused_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_repo, first, second) = repo_with_two_revisions(&root);
+        let repo_id = root.to_string_lossy().into_owned();
+        let (state, mut ctx) = state_with_client();
+
+        let a = buffer_for_file_at_rev(&state, &mut ctx, &repo_id, &first, "src/main.rs")
+            .await
+            .expect("the first revision resolves");
+        let again = buffer_for_file_at_rev(&state, &mut ctx, &repo_id, &first, "src/main.rs")
+            .await
+            .expect("re-resolving the same target");
+        assert_eq!(a, again, "the same (repo, rev, path) is the same buffer");
+
+        let b = buffer_for_file_at_rev(&state, &mut ctx, &repo_id, &second, "src/main.rs")
+            .await
+            .expect("the second revision resolves");
+        assert_ne!(a, b, "a different revision is a different buffer");
+
+        let s = state.lock().await;
+        assert_eq!(
+            s.doc_of(a).text.to_string(),
+            "fn main() {}\n",
+            "the buffer holds that revision's content"
+        );
+        assert_eq!(s.doc_of(b).text.to_string(), "fn main() { changed(); }\n");
+    }
+
+    /// A buffer a view binds defers its parse, whatever its size.
+    ///
+    /// The measurement behind this: over the 40 largest files in this repo, reading costs 6.6 ms
+    /// and parsing costs 590 ms. A patch that parsed each file as it bound it would stall for most
+    /// of a second before showing anything — even though every individual file is small enough that
+    /// the size-based rule would happily parse it inline, which is why size alone is not the test.
+    #[tokio::test]
+    async fn a_bound_buffer_defers_its_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_repo, first, _second) = repo_with_two_revisions(&root);
+        let repo_id = root.to_string_lossy().into_owned();
+        let (state, mut ctx) = state_with_client();
+
+        let id = buffer_for_file_at_rev(&state, &mut ctx, &repo_id, &first, "src/main.rs")
+            .await
+            .expect("resolves");
+
+        let s = state.lock().await;
+        let doc = s.doc_of(id);
+        assert_eq!(
+            doc.language.as_deref(),
+            Some("rust"),
+            "the language is known, so an inline parse was affordable and was skipped anyway"
+        );
+        assert!(
+            doc.syntax_pending,
+            "a bound buffer hands its parse to the background"
+        );
+        assert!(
+            doc.syntax.is_none(),
+            "and has no tree yet, so binding forty costs forty reads, not forty parses"
+        );
+    }
+
+    /// Resolving a file for a *view* is not a navigation: it must not touch the MRU list.
+    ///
+    /// A forty-file patch resolves forty buffers. If each counted as somewhere the user had been,
+    /// the recent-buffers list — and the picker built on it — would be forty files they never
+    /// opened, burying the ones they did.
+    #[tokio::test]
+    async fn resolving_a_file_for_a_view_does_not_touch_the_mru() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (_repo, first, _second) = repo_with_two_revisions(&root);
+        let repo_id = root.to_string_lossy().into_owned();
+        let (state, mut ctx) = state_with_client();
+
+        let client_id = ctx.client_id;
+        let mru_len = |state: SharedState| async move {
+            let s = state.lock().await;
+            let workspace = s.active_workspace(client_id).unwrap().id.clone();
+            s.workspaces[&workspace].mru_buffers.len()
+        };
+        assert_eq!(mru_len(state.clone()).await, 0, "nothing opened yet");
+
+        buffer_for_file_at_rev(&state, &mut ctx, &repo_id, &first, "src/main.rs")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            mru_len(state.clone()).await,
+            0,
+            "a buffer a view bound is not a buffer the user visited"
+        );
     }
 }

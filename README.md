@@ -41,7 +41,7 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/code commands, `Space g` the sub-leader for git operations, and `Tab` reveals hover info
+app/file/code commands, `Space g` the sub-leader for git operations, and `Space t` reveals hover info
 at the cursor.
 
 ### Motions (normal mode)
@@ -68,6 +68,7 @@ at the cursor.
 | `Backspace`/`Alt-Backspace` | Jump back/forward (cross-file history) |
 | `]`/`[` | Next/previous jumplist entry |
 | `}`/`{` | Next/previous jumplist entry in this file |
+| `Tab`/`Shift-Tab` | Focus the next/previous editor element (a patch's hunks) |
 
 ### Selection & history (normal mode)
 
@@ -153,7 +154,7 @@ toggling back lands where you were reading.
 | `z`/`Alt-z` | Undo/redo the reading-position move |
 | `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
 | `Ctrl-Enter` | Follow a relative link in a new window |
-| `Tab` | Show the link's or image's target |
+| `Space t` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
 | `r`/`Alt-r` | Reverse the selection / orient it forward |
 | `%`/`,` | Select every block / collapse the selection to the cursor's block |
@@ -201,7 +202,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | `c`/`Alt-c` | Next/previous change (hunk) |
 | `Space c`/`Space Alt-c` | Git changes in current file / across the workspace (hunks) |
 | `Space m` | Blame commit details for the cursor line |
-| `Space i`/`Space Alt-i` | Toggle inline diff / choose what it diffs against |
+| `Space i`/`Space Alt-i` | Toggle inline diff, in a file or a patch view / choose what it diffs against |
 | `Space g s`/`Space g Alt-s` | Stage the change / the whole file (also marks a conflict resolved) |
 | `Space g u`/`Space g Alt-u` | Unstage the change / the whole file |
 | `Space g r`/`Space g Alt-r` | Revert the change / the whole file |
@@ -222,7 +223,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 
 | Chord | Action |
 | --- | --- |
-| `Tab` | Hover (type & docs) |
+| `Space t` | Hover (type & docs, or a link's target) |
 | `Enter` | Go to definition |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |

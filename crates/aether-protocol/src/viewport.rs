@@ -1,12 +1,16 @@
 //! Viewport messages.
 
+use crate::coords::{ViewLine, VisualRow};
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitBufferStatus;
 use crate::lsp::{DiagnosticCounts, LspServerStatus, SymbolCrumb};
 use crate::search::SearchMatchRange;
 use crate::sneak::SneakTarget;
-use crate::{BufferId, Revision, ViewportId};
+// The element vocabulary lives in `ui`; re-exported here because a view's tree is what
+// `viewport` messages carry, and that is where callers look for it.
+pub use crate::ui::{Element, FieldId};
+use crate::{Revision, ViewportId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,78 +20,36 @@ pub enum WrapMode {
     None,
 }
 
+/// Where a view is scrolled to: a line of the **view**, plus how far into that line's own rows.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScrollPosition {
-    pub logical_line: u32,
+    pub logical_line: ViewLine,
     pub sub_row: f32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicalLineRender {
     pub logical_line: u32,
-    pub visual_rows: Vec<VisualRow>,
+    pub visual_rows: Vec<WrappedRow>,
     /// Per-line byte ranges where the current server-side search query matches. Empty when no
     /// search is active on this buffer for this client. Multi-line matches contribute one entry
     /// to each line they touch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search_matches: Vec<SearchMatchRange>,
-    /// Virtual (non-buffer) rows rendered *above* this logical line. The client renders them
-    /// before the line's `visual_rows` and counts them as occupied screen rows, but never lets the
-    /// cursor land on them — which is the whole point of the mechanism.
+    /// Baseline lines this one removed or replaced, drawn above it while the inline diff view is
+    /// on. They occupy screen rows and hold no cursor position — which is the whole point, since
+    /// making some *buffer* lines unaddressable would need a skip rule in every motion, in search
+    /// landing, in sneak, and in jumplist and nav restore.
     ///
-    /// Two unrelated producers, which can never both apply to one buffer:
-    ///
-    /// - **Inline diff view** ([`VirtualRowKind::Deleted`]): the baseline lines a hunk removed or
-    ///   replaced, as phantom rows. Only while the viewport has the diff view on. Deletions at
-    ///   end-of-buffer anchor to the trailing empty line.
-    /// - **Generated patches** (the other kinds): a commit's file and hunk separators. These are
-    ///   *not* buffer text — that is deliberate and load-bearing. Chrome the cursor can't reach is
-    ///   free here, whereas making some buffer lines unaddressable would need a skip rule in every
-    ///   motion, in search landing, in sneak, and in jumplist/nav restore.
+    /// A generated patch's chrome used to share this field. It is an [`Element::Chrome`] sibling now:
+    /// a separator belongs between two hunks, not to the line beneath it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub virtual_rows_above: Vec<VirtualRow>,
-    /// Virtual rows rendered *below* this logical line, on the same terms as
-    /// [`Self::virtual_rows_above`]: they occupy screen rows and hold no cursor position.
-    ///
-    /// Only ever the closing chrome of a generated patch, and only on its last line — chrome that
-    /// has to sit *after* the final line has nowhere to hang otherwise, and a patch deliberately
-    /// ends without a trailing newline, so there is no empty last line to anchor it to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub virtual_rows_below: Vec<VirtualRow>,
-    /// Per-line Git change marker, computed whenever the buffer's hunks are known (independent of
-    /// the diff-view toggle) so the client can always draw a gutter change-bar. `Added` /
-    /// `Modified` are the new-side lines of those hunks; `Deleted` marks the line a pure deletion
-    /// sits above. `None` for unchanged lines. The client also reuses `Added`/`Modified` to tint
-    /// the line background while the diff view is on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff_marker: Option<DiffMarker>,
-    /// Qualifies `diff_marker`: whether the line's change is staged or unstaged. A line holding
-    /// both at once (modified, staged, then modified again) reads as `Unstaged` — the visible
-    /// text is the unstaged top layer, and that's the layer `git/apply_hunk` acts on. Drives the
-    /// marker / tint colour split. Omitted from the wire when `Unstaged`.
-    #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
-    pub diff_stage: DiffStage,
-    /// Intra-line diff emphasis: the byte ranges within this logical line that a Modified hunk
-    /// actually changed against its paired baseline line, rendered as a stronger tint over the
-    /// line's `diff_marker` background. Only populated while the viewport's inline diff view is
-    /// on (like `virtual_rows_above`); empty when the whole line changed too much to pick out
-    /// sub-ranges, so a range-less modified line renders exactly as before.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diff_emphasis: Vec<EmphasisRange>,
-    /// Which part of a merge conflict this line belongs to, when the file is left conflicted by a
-    /// stopped merge or rebase. `None` everywhere else — including in every file of an
-    /// unconflicted repo, which is the overwhelming case.
-    ///
-    /// **Unlike the diff tint this is not gated on the diff view.** A conflicted file cannot be
-    /// read correctly without knowing which side is which, and the markers delimiting them are
-    /// ordinary buffer text with nothing to distinguish them.
-    ///
-    /// A line carrying this never also carries a `diff_marker`: a conflicted file *is* diffed
-    /// (against HEAD, so a block resolved by hand shows up as an ordinary change), but the blocks
-    /// themselves are masked out of that diff — see `git::mask_conflicts`. The two decorations
-    /// share a file, never a line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conflict: Option<ConflictLine>,
+    pub baseline_above: Vec<BaselineRow>,
+    /// This line's change-state: diffed against a baseline, conflicted, or a side of a generated
+    /// patch. See [`LineChange`] — the three are mutually exclusive by construction, which is why
+    /// they are one field.
+    #[serde(default, skip_serializing_if = "LineChange::is_none")]
+    pub change: LineChange,
     /// Language-server diagnostics intersecting this logical line, as byte ranges within the line
     /// (already converted from the server's LSP position encoding). A diagnostic spanning multiple
     /// lines contributes one entry — carrying the full message — to each line it touches, so the
@@ -100,14 +62,101 @@ pub struct LogicalLineRender {
     /// sneak session is active for this client. See [`crate::sneak`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sneak_targets: Vec<SneakTarget>,
-    /// Which side of a **generated patch** this line is, for the read-only buffers `git/show`
-    /// materialises from a commit. `None` on every ordinary buffer, and on the patch's own
-    /// metadata and header lines — those take their styling from the syntax channel.
+}
+
+/// What a line's own change-state is: changed against a baseline, part of a conflict, or one side
+/// of a generated patch.
+///
+/// One field rather than five, because the five were never independent. A conflicted file *is*
+/// diffed, but its conflict blocks are masked out of that diff (`git::mask_conflicts`), so a line
+/// never carries both. A generated patch has no baseline of its own, so it never carries a marker.
+/// Those two rules used to be paragraphs of prose above fields that **two different producers wrote
+/// to** — the baseline diff and the patch generator both set `diff_stage` and `diff_emphasis`,
+/// each assuming the other hadn't.
+///
+/// Deliberately *not* a flat list of decorations: the three independent overlays a line can also
+/// carry — search matches, diagnostics, sneak targets — genuinely coexist and have no precedence
+/// question between them, and pooling them would only cost their payloads their types.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LineChange {
+    /// Unchanged, outside a repo, or a generated patch's context line.
+    #[default]
+    None,
+    /// Changed against the buffer's baseline.
+    Changed {
+        marker: DiffMarker,
+        stage: DiffStage,
+        /// Byte ranges the change actually touched, for the stronger intra-line tint. Populated
+        /// only while the viewport's inline diff view is on — unlike `marker`, which is ungated so
+        /// the gutter change-bar is right whether or not the view is up. Empty when the whole line
+        /// changed too much to pick sub-ranges out of.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        emphasis: Vec<EmphasisRange>,
+    },
+    /// Part of a merge conflict left by a stopped merge or rebase.
     ///
-    /// **Not gated on the inline diff view**, for the same reason [`Self::conflict`] isn't: the
-    /// buffer *is* a patch, so there is nothing to toggle off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub patch: Option<PatchLine>,
+    /// Never gated on the diff view, for a reason the marker isn't: a conflicted file cannot be
+    /// read correctly without knowing which side is which, and the markers delimiting the sides are
+    /// ordinary buffer text with nothing else to distinguish them.
+    Conflict { side: ConflictLine },
+    /// One side of a generated patch. Both sides are ordinary buffer text here — unlike the inline
+    /// diff view, where the old side is a phantom row the cursor can't reach.
+    Patch {
+        side: PatchLine,
+        stage: DiffStage,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        emphasis: Vec<EmphasisRange>,
+    },
+}
+
+impl LineChange {
+    /// Whether this line has no change-state at all — the overwhelmingly common case, and what
+    /// keeps it off the wire.
+    pub fn is_none(&self) -> bool {
+        matches!(self, LineChange::None)
+    }
+
+    /// The gutter change-bar marker, if this line has one.
+    pub fn marker(&self) -> Option<DiffMarker> {
+        match self {
+            LineChange::Changed { marker, .. } => Some(*marker),
+            _ => None,
+        }
+    }
+
+    /// Which side of a generated patch this line is; `None` on context lines and ordinary buffers.
+    pub fn patch_side(&self) -> Option<PatchLine> {
+        match self {
+            LineChange::Patch { side, .. } => Some(*side),
+            _ => None,
+        }
+    }
+
+    /// Which part of a conflict block this line is; `None` everywhere else.
+    pub fn conflict(&self) -> Option<ConflictLine> {
+        match self {
+            LineChange::Conflict { side } => Some(*side),
+            _ => None,
+        }
+    }
+
+    /// Which layer the change sits in. `Unstaged` where the question doesn't arise, which is also
+    /// what a stage-unaware renderer degrades to.
+    pub fn stage(&self) -> DiffStage {
+        match self {
+            LineChange::Changed { stage, .. } | LineChange::Patch { stage, .. } => *stage,
+            _ => DiffStage::Unstaged,
+        }
+    }
+
+    /// Intra-line emphasis ranges; empty where there are none.
+    pub fn emphasis(&self) -> &[EmphasisRange] {
+        match self {
+            LineChange::Changed { emphasis, .. } | LineChange::Patch { emphasis, .. } => emphasis,
+            _ => &[],
+        }
+    }
 }
 
 /// One diagnostic's footprint on a single logical line.
@@ -142,7 +191,7 @@ pub enum DiffMarker {
     Deleted,
 }
 
-/// Which side of a generated patch a line is — see [`LogicalLineRender::patch`].
+/// Which side of a generated patch a line is — see [`LineChange::Patch`].
 ///
 /// Deliberately separate from [`DiffMarker`], which decorates a *file* against its baseline: there
 /// a removal is a phantom row with no cursor position, and `Deleted` flags the surviving line
@@ -158,7 +207,7 @@ pub enum PatchLine {
     Removed,
 }
 
-/// Which part of a conflict block a line belongs to — see [`LogicalLineRender::conflict`].
+/// Which part of a conflict block a line belongs to — see [`LineChange::Conflict`].
 ///
 /// The four marker lines are one variant rather than four: they are scenery, styled the same and
 /// deleted by every resolution, and telling `<<<<<<<` from `=======` is what the line's own text is
@@ -178,7 +227,7 @@ pub enum ConflictLine {
 }
 
 /// Which side of the index a change sits on, in the combined staged+unstaged view. Tags both
-/// per-line markers ([`LogicalLineRender::diff_stage`]) and phantom rows ([`VirtualRow::stage`]).
+/// per-line changes ([`LineChange`]) and phantom rows ([`BaselineRow`]).
 /// `Unstaged` is the default and is omitted from the wire, so a stage-unaware renderer degrades
 /// to a single-colour look. Deliberately binary: where the two layers overlap, the unstaged top
 /// layer wins — bright means "`Space g s` will stage this", dim means "staged; `Space g u` pulls it
@@ -208,69 +257,60 @@ pub struct EmphasisRange {
     pub end: u32,
 }
 
-/// A rendered row that doesn't correspond to any buffer line — see
-/// [`LogicalLineRender::virtual_rows_above`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VirtualRow {
+/// A baseline line the working buffer removed or replaced, drawn above the surviving line while
+/// the inline diff view is on. Occupies a screen row but holds no cursor position.
+///
+/// Anchored to a line rather than placed in the view's tree, which is the difference between this
+/// and a patch's chrome: a phantom deletion belongs *above line N* of a particular buffer, whereas
+/// a file separator belongs between two hunks. Chrome is an [`Element::Chrome`] sibling; this is
+/// not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineRow {
     pub text: String,
-    pub kind: VirtualRowKind,
-    /// Staged (the row's text is HEAD's, already replaced in the index) vs unstaged (the text is
-    /// the index's, still present there). At most one layer per anchor: where both would stack,
-    /// the server sends only the unstaged rows, so what's shown deleted is exactly what a revert
-    /// would restore. Meaningless on the patch-chrome kinds, which leave it at its default.
+    /// Staged (the text is HEAD's, already replaced in the index) vs unstaged (the text is the
+    /// index's, still present there). At most one layer per anchor: where both would stack the
+    /// server sends only the unstaged rows, so what shows as deleted is exactly what a revert
+    /// would restore.
     #[serde(default, skip_serializing_if = "DiffStage::is_unstaged")]
     pub stage: DiffStage,
-    /// Intra-line emphasis on the old side: the byte ranges of this removed baseline line that
-    /// its paired buffer line replaced (the counterpart of the pair's
-    /// [`LogicalLineRender::diff_emphasis`]). Empty for whole-line changes and pure deletions.
+    /// Byte ranges of this removed line that its paired buffer line replaced — the old-side
+    /// counterpart of the new side's [`LineChange::Changed::emphasis`]. Empty for whole-line
+    /// changes and pure deletions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emphasis: Vec<EmphasisRange>,
-    /// Syntax spans over `text`, byte offsets within the row. Same shape and same meaning as
-    /// [`Segment::highlights`], so a shell styles a virtual row exactly the way it styles a real
-    /// one. Empty on [`VirtualRowKind::Deleted`], whose colour comes wholly from the diff palette;
-    /// the patch-chrome kinds use it to separate a path from its counts, or `@@ -a,b +c,d @@` from
-    /// the enclosing signature git prints after it.
-    ///
-    /// A virtual row is **one screen row** — virtual rows do not take part in soft wrap — so a
-    /// shell truncates rather than wrapping, and these spans index the untruncated text.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub highlights: Vec<Highlight>,
 }
 
+/// Which piece of a generated patch's chrome an [`Element::Chrome`] is. Its `child` says what to
+/// draw; this says what it *means*, which is what a shell keys its band and spacing off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum VirtualRowKind {
-    /// A baseline line removed or replaced in the working buffer (inline diff).
-    Deleted,
-    /// A full-width horizontal line opening a generated patch's file block — the heaviest
-    /// boundary in the buffer, and the only one drawn edge to edge.
+pub enum ChromeKind {
+    /// A full-width horizontal line opening a file block — the heaviest boundary in the buffer,
+    /// and the only one drawn edge to edge.
     Rule,
-    /// A generated patch's file separator: the path (or `old → new` for a rename) and its change
-    /// counts, on the row below its [`Self::Rule`].
+    /// The file separator: the path (or `old → new` for a rename) and its change counts.
     FileHeader,
-    /// Blank vertical space inside a chrome block — band and left rail, no text. One sits above
-    /// and below every run of code, so a section reads as boxed in by its chrome rather than
-    /// running straight into it. A row rather than an empty buffer line, so the breathing room
-    /// costs no cursor positions.
+    /// Blank vertical space inside a chrome block. One sits above and below every run of code, so a
+    /// section reads as boxed in by its chrome rather than running straight into it — and as a row
+    /// rather than an empty buffer line, the breathing room costs no cursor positions.
     Spacer,
-    /// A generated patch's section heading: the enclosing signature git names for the hunk. Empty
-    /// text where git found no signature, leaving a blank row.
-    ///
-    /// Deliberately *plain* — it used to trail a muted rule to the right edge, which made a hunk
-    /// boundary look as heavy as a file boundary and flattened the one hierarchy the view has.
-    /// [`Self::Rule`] is what a file gets; a section gets a name and nothing else.
+    /// A section heading: the enclosing signature git names for the hunk. Deliberately plain — it
+    /// once trailed a muted rule to the right edge, which made a hunk boundary look as heavy as a
+    /// file boundary and flattened the one hierarchy the view has.
     HunkHeader,
-    /// The patch's opening line: how many files it touches and its total `+N −M`. Sits above the
-    /// first file's [`Self::Rule`] and belongs to no file, so no rail runs into it.
-    ///
-    /// Chrome rather than buffer text because it is a caption on the whole diff: nothing in it can
-    /// be staged, followed or navigated to, so a cursor position on it is one the user has to step
-    /// over to reach the first thing that can.
+    /// The patch's opening caption: how many files it touches and its total `+N −M`. Belongs to no
+    /// file, so no rail runs into it.
     Summary,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VisualRow {
+/// The **content** of one row a logical line wrapped into: where it starts in the line, how far it
+/// is indented, and its styled text.
+///
+/// Was `VisualRow`, which now names a *position* in the visual-row space ([`crate::coords`]). The
+/// two are different kinds of thing — one is what to draw, the other is where — and having them
+/// share a name was how the renaming started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WrappedRow {
     /// Byte offset within the *logical line* where this row's text starts. For the first row
     /// of a logical line this is always 0; for continuation rows it's the byte right after the
     /// preceding row's break point. Used by the client to map a cursor's logical column to the
@@ -280,13 +320,13 @@ pub struct VisualRow {
     pub segments: Vec<Segment>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
     pub text: String,
     pub highlights: Vec<Highlight>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Highlight {
     /// Byte offset within the containing `Segment::text`.
     pub start: u32,
@@ -297,22 +337,25 @@ pub struct Highlight {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Window {
-    pub first_logical_line: u32,
-    pub last_logical_line_exclusive: u32,
-    /// Total number of logical lines in the buffer. Lets the client clamp scroll targets
-    /// without round-tripping.
-    pub line_count: u32,
-    /// Highest legal value for `ScrollPosition.logical_line`: the buffer's last visual row sits
+    /// The slice of the **view** currently pushed. View lines, not buffer lines: for a view of
+    /// several elements these index the concatenation of their extents and match no single file.
+    pub first_view_line: ViewLine,
+    pub last_view_line_exclusive: ViewLine,
+    /// How many lines the **view** has: its elements' extents, summed. Lets the client clamp
+    /// scroll targets without round-tripping.
+    pub view_line_count: u32,
+    /// Highest legal value for `ScrollPosition.logical_line`: the view's last visual row sits
     /// at the bottom of the viewport. Server-computed because under soft wrap each line can
     /// occupy multiple visual rows.
-    pub max_scroll_logical_line: u32,
-    /// Total visual rows in the whole buffer for this viewport's wrap+cols (real wrapped rows plus
-    /// any diff phantom rows). Lets a client size a native scroll container to the full document
-    /// (`total_visual_rows × line_height`). Equals `line_count` under `WrapMode::None` with no diff.
+    pub max_scroll_view_line: ViewLine,
+    /// Total visual rows in the whole view for this viewport's wrap+cols (real wrapped rows plus
+    /// any diff phantom rows and chrome). Lets a client size a native scroll container to the full
+    /// view (`total_visual_rows × line_height`). Equals `view_line_count` under `WrapMode::None`
+    /// with no diff and no chrome.
     pub total_visual_rows: u32,
-    /// Visual-row index at which `first_logical_line` begins (cumulative rows of all lines above
-    /// it). Lets a client absolutely-position this window inside the full-height scroller.
-    pub first_visual_row: u32,
+    /// Visual row at which `first_view_line` begins (cumulative rows of everything above it). Lets
+    /// a client absolutely-position this window inside the full-height scroller.
+    pub first_visual_row: VisualRow,
     /// Display width (in cols) of the buffer's widest line, for sizing a native horizontal scroll
     /// container under `WrapMode::None`. `0` under soft wrap (content always fits `cols`).
     pub max_line_width: u32,
@@ -320,27 +363,34 @@ pub struct Window {
     /// a repo. Rides the window so it updates live on edits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,
-    pub lines: Vec<LogicalLineRender>,
+    /// What the view is composed of. A single [`Element::Editor`] for an ordinary buffer; chrome
+    /// and hunks interleaved for a generated patch. Use [`Element::lines`] where the structure is
+    /// irrelevant and every rendered line is what's wanted.
+    pub root: Element,
 }
 
+/// A range of **view** lines — what a push says it has replaced.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogicalLineRange {
-    pub start_logical_line: u32,
-    pub end_logical_line_exclusive: u32,
+    pub start_view_line: ViewLine,
+    pub end_view_line_exclusive: ViewLine,
 }
 
 // ---- viewport/subscribe -------------------------------------------------------------------------
 
 pub struct ViewportSubscribe;
 impl RpcMethod for ViewportSubscribe {
-    const NAME: &'static str = "viewport/subscribe";
+    const NAME: &'static str = "view/subscribe";
     type Params = ViewportSubscribeParams;
     type Result = ViewportSubscribeResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewportSubscribeParams {
-    pub buffer_id: BufferId,
+    /// The **view** to show. Named `buffer_id` on the wire for compatibility, but it is a view
+    /// identity: for a patch this is the generated document, which no element windows and which
+    /// nothing edits. `ViewId` is `#[serde(transparent)]`, so the wire shape is unchanged.
+    pub buffer_id: crate::ViewId,
     pub cols: u32,
     pub rows: u32,
     pub overscan_rows: u32,
@@ -374,6 +424,17 @@ pub struct ViewportSubscribeResult {
     /// `lsp/diagnostics_changed`, and `lsp/status_changed`.
     #[serde(default)]
     pub buffer_status: BufferStatusSnapshot,
+    /// Which element of this view holds the cursor, and the buffer it windows — the same answer
+    /// [`ViewportFocusElement`] gives, because it is the same question.
+    ///
+    /// Present only when it says something the subscriber doesn't already know: a **composed** view
+    /// is a tree of elements windowing *other* buffers, so the buffer it was opened as (a patch's
+    /// generated document) is not the buffer its cursor is in. A client that holds both at once
+    /// holds two line spaces: its cursor is a position in the view's document while every rendered
+    /// line belongs to a file, so nothing draws the cursor and any reveal it owes can never be paid.
+    /// Absent for an ordinary editor view, whose one element windows the buffer it *is*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<ViewportFocusElementResult>,
 }
 
 /// The buffer-level state a client needs to start showing a buffer, beyond the rendered window —
@@ -405,7 +466,7 @@ pub struct BufferStatusSnapshot {
 
 pub struct ViewportResize;
 impl RpcMethod for ViewportResize {
-    const NAME: &'static str = "viewport/resize";
+    const NAME: &'static str = "view/resize";
     type Params = ViewportResizeParams;
     type Result = ViewportWindowResult;
 }
@@ -426,7 +487,7 @@ pub struct ViewportWindowResult {
 
 pub struct ViewportScroll;
 impl RpcMethod for ViewportScroll {
-    const NAME: &'static str = "viewport/scroll";
+    const NAME: &'static str = "view/scroll";
     type Params = ViewportScrollParams;
     type Result = ViewportWindowResult;
 }
@@ -437,6 +498,94 @@ pub struct ViewportScrollParams {
     pub scroll: ScrollPosition,
 }
 
+// ---- viewport/focus_element ---------------------------------------------------------------------
+
+/// Move focus to another of the view's editor elements.
+///
+/// Focus is *which element holds the live cursor*, and therefore which **buffer** an edit, a search
+/// or an undo acts on. In a view of one element it is inert; in a patch it is how you move between
+/// hunks, and once elements window different files it is what decides whose text you are editing.
+///
+/// The cursor lands at the element's first line, because an element you have just moved to has no
+/// remembered position within it — and the alternative, keeping the old line number, would land
+/// somewhere arbitrary once elements window different buffers whose line numbers merely collide.
+pub struct ViewportFocusElement;
+impl RpcMethod for ViewportFocusElement {
+    const NAME: &'static str = "view/focus_element";
+    type Params = ViewportFocusElementParams;
+    type Result = ViewportFocusElementResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportFocusElementParams {
+    pub viewport_id: ViewportId,
+    pub target: FocusTarget,
+}
+
+/// Which element to focus.
+///
+/// Relative for a keystroke — `Tab` moves through what the user can see, and the server already
+/// knows how many elements there are. Absolute for a **click**, which names one: without this the
+/// shell could only step towards it, and clicking a line in another hunk instead set the cursor to
+/// that line number *in the focused element's buffer* — a different file entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "to", rename_all = "snake_case")]
+pub enum FocusTarget {
+    Step { direction: FocusStep },
+    Element { element: FieldId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusStep {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportFocusElementResult {
+    /// Where focus ended up — unchanged at the ends, which is what makes repeated presses stop
+    /// rather than wrap.
+    pub element: FieldId,
+    /// Everything needed to bind to the buffer that element windows, carrying the cursor's landing
+    /// position.
+    ///
+    /// The *whole* description rather than an id, because crossing into another buffer changes what
+    /// the view is showing: its path, its label, whether it is read-only, which revision it is at.
+    /// A client given only an id would have to keep the old buffer's label beside the new one's
+    /// text. It is deliberately the same shape an open returns, so the client rebinds through the
+    /// path it already has.
+    pub buffer: crate::buffer::BufferOpenResult,
+}
+
+// ---- viewport/navigate_change -------------------------------------------------------------------
+
+/// Step to the next or previous **change** in a composed view — a patch's `c` / `Alt-c`.
+///
+/// View-scoped rather than buffer-scoped, and that is the whole point: a patch's changes are spread
+/// across its elements, each windowing a different file. Asking one of those files what changed in
+/// it answers a different question — for a commit it answers nothing at all, since a blob at a
+/// revision has no baseline to diff against. The view knows, because its elements carry the diff's
+/// own account of their lines.
+///
+/// Stepping past the last change stops rather than wrapping, as hunk navigation does in a file.
+pub struct ViewportNavigateChange;
+impl RpcMethod for ViewportNavigateChange {
+    const NAME: &'static str = "view/navigate_change";
+    type Params = ViewportNavigateChangeParams;
+    /// The same shape focus returns: crossing into another element may cross into another buffer,
+    /// and the client has to rebind to it.
+    type Result = ViewportFocusElementResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportNavigateChangeParams {
+    pub viewport_id: ViewportId,
+    pub direction: FocusStep,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
 // ---- viewport/scroll_to_row ---------------------------------------------------------------------
 
 /// Scroll so the given absolute visual row is at the top of the viewport. Visual-row-addressed
@@ -445,7 +594,7 @@ pub struct ViewportScrollParams {
 /// falls in and returns the window (with `first_visual_row` for absolute positioning).
 pub struct ViewportScrollToRow;
 impl RpcMethod for ViewportScrollToRow {
-    const NAME: &'static str = "viewport/scroll_to_row";
+    const NAME: &'static str = "view/scroll_to_row";
     type Params = ViewportScrollToRowParams;
     type Result = ViewportWindowResult;
 }
@@ -453,14 +602,43 @@ impl RpcMethod for ViewportScrollToRow {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewportScrollToRowParams {
     pub viewport_id: ViewportId,
-    pub top_visual_row: u32,
+    pub top_visual_row: VisualRow,
+}
+
+// ---- viewport/window_at_cursor ------------------------------------------------------------------
+
+/// Return (and scroll to) a window containing **this client's cursor** in the view's focused
+/// element.
+///
+/// The one thing a client cannot ask for in coordinates of its own. A window is addressed by view
+/// line or by visual row, and when the cursor's line has scrolled out of the loaded window the
+/// client knows neither: a view line is an index into the concatenation of the elements' extents,
+/// and a visual row depends on how the lines above the cursor wrapped — both facts the server holds
+/// and the client can only guess at. Guessing is what it used to do, by fetching around the focused
+/// *element's* start instead, which answers a different question the moment the cursor is more than
+/// a screen into a large element: the window comes back without the cursor's line in it, the reveal
+/// or placement waiting on it still cannot be performed, and the view has been dragged to the top of
+/// the element for nothing. That is what "`;` has to be pressed twice" was.
+///
+/// No coordinates cross the wire, because both halves — where the cursor is, and how the view is
+/// laid out — live here.
+pub struct ViewportWindowAtCursor;
+impl RpcMethod for ViewportWindowAtCursor {
+    const NAME: &'static str = "view/window_at_cursor";
+    type Params = ViewportWindowAtCursorParams;
+    type Result = ViewportWindowResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportWindowAtCursorParams {
+    pub viewport_id: ViewportId,
 }
 
 // ---- viewport/set_wrap --------------------------------------------------------------------------
 
 pub struct ViewportSetWrap;
 impl RpcMethod for ViewportSetWrap {
-    const NAME: &'static str = "viewport/set_wrap";
+    const NAME: &'static str = "view/set_wrap";
     type Params = ViewportSetWrapParams;
     type Result = ViewportWindowResult;
 }
@@ -475,26 +653,36 @@ pub struct ViewportSetWrapParams {
 
 pub struct ViewportLinesChanged;
 impl NotificationMethod for ViewportLinesChanged {
-    const NAME: &'static str = "viewport/lines_changed";
+    const NAME: &'static str = "view/lines_changed";
     type Params = ViewportLinesChangedParams;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewportLinesChangedParams {
     pub viewport_id: ViewportId,
+    /// Whose revision `revision` is, and whose lines these are.
+    ///
+    /// A view is not one buffer: a patch windows a file per hunk, so "the view's revision" is not a
+    /// well-formed idea. Without this a client would file one buffer's revision against another and
+    /// then discard the next push for that buffer as stale — the failure that makes any scheme
+    /// redirecting a buffer id behind the client's back unworkable.
+    pub buffer: crate::BufferId,
     pub revision: Revision,
     pub range: LogicalLineRange,
-    pub replacement_lines: Vec<LogicalLineRender>,
-    /// Total line count after the edit. Lets the client keep its `line_count` cache fresh as
-    /// edits add/remove lines, so scroll clamping stays accurate.
-    pub line_count: u32,
-    /// Recomputed maximum legal `scroll_logical_line` after the edit.
-    pub max_scroll_logical_line: u32,
+    /// The window's content after the change. A whole replacement rather than a splice: the client
+    /// rebuilds its window from this, and a patch regenerates wholesale anyway. Carries the tree
+    /// rather than a flat line list so a regenerated patch keeps its chrome.
+    pub root: Element,
+    /// The **view's** line count after the edit. Lets the client keep its `view_line_count` cache
+    /// fresh as edits add/remove lines, so scroll clamping stays accurate.
+    pub view_line_count: u32,
+    /// Recomputed maximum legal scroll line after the edit.
+    pub max_scroll_view_line: ViewLine,
     /// Recomputed total visual rows after the edit — lets a native-scrolling client resize its
     /// scroll container (the wrapped height can change when an edit lengthens/shortens a line).
     pub total_visual_rows: u32,
-    /// Visual-row index of the changed range's first line, so the client can reposition the window.
-    pub first_visual_row: u32,
+    /// Visual row of the changed range's first line, so the client can reposition the window.
+    pub first_visual_row: VisualRow,
     /// Recomputed widest-line width (cols) after the edit, for native horizontal scroll sizing.
     pub max_line_width: u32,
     /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.

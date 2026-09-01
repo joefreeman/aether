@@ -197,6 +197,7 @@ version = "0.4.0"
 dependencies = [
  "aether-client",
  "aether-protocol",
+ "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

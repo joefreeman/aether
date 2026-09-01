@@ -25,7 +25,7 @@ use aether_protocol::git::{
     GitBaselineChoice, GitBaselineSource, GitBufferStatus, GitHead, GitRepoOperation, GitStatus,
     GitUpstreamStatus, HunkAction,
 };
-use aether_protocol::viewport::{DiffStage, VirtualRowKind};
+use aether_protocol::viewport::{ChromeKind, DiffStage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -654,7 +654,7 @@ pub struct BranchRow {
     /// Configured upstream (`origin/main`), or `None` for a branch never pushed.
     pub upstream: Option<String>,
     /// Commits this branch has that its upstream doesn't, and vice versa. Both `0` without an
-    /// upstream. Computed locally, so they're only as fresh as the last fetch — stage 3's job.
+    /// upstream. Computed locally, so they're only as fresh as the last `git/fetch`.
     pub ahead: u32,
     pub behind: u32,
     /// The checkout in this family holding this branch, when one does. Git permits a branch in only
@@ -2749,7 +2749,7 @@ fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>, baseline_label: Opt
         text.push_str(&since);
     }
 
-    b.chrome(VirtualRowKind::Summary, text, &spans);
+    b.chrome(ChromeKind::Summary, text, &spans);
 }
 
 /// The first parent of `rev`, as a full hash — the revision a patch's `-` lines belong to.
@@ -4674,7 +4674,7 @@ mod tests {
     // ---- show_commit: a generated patch document ------------------------------------------------
 
     use crate::patch::{GeneratedPatch, PatchFileStatus, HUNK};
-    use aether_protocol::viewport::{PatchLine, VirtualRow, VirtualRowKind};
+    use aether_protocol::viewport::{ChromeKind, Element, PatchLine};
 
     /// The text a highlight span covers, so assertions read as "this word is a keyword" rather
     /// than as byte arithmetic.
@@ -4726,12 +4726,18 @@ mod tests {
         g.decorations.patch[line_at(text, want)]
     }
 
-    fn chrome(g: &GeneratedPatch, kind: VirtualRowKind) -> Vec<&VirtualRow> {
+    /// The contents of every chrome row of `kind`, in order.
+    fn chrome(g: &GeneratedPatch, want: ChromeKind) -> Vec<&[aether_protocol::ui::Element]> {
         g.decorations
-            .virtual_rows
+            .chrome
             .iter()
             .flatten()
-            .filter(|r| r.kind == kind)
+            .filter_map(|r| match r {
+                Element::Chrome { kind, children, .. } if *kind == want => {
+                    Some(children.as_slice())
+                }
+                _ => None,
+            })
             .collect()
     }
 
@@ -4751,14 +4757,14 @@ mod tests {
         assert_eq!(g.index.lines.len(), n);
         // Strictly equal again: the patch ends without a trailing newline, so there is no empty
         // last line, and the chrome that would have anchored there is `trailing_rows` instead.
-        assert_eq!(g.decorations.virtual_rows.len(), n);
+        assert_eq!(g.decorations.chrome.len(), n);
         assert!(
             !text.ends_with('\n'),
             "no trailing newline — the empty last line it makes is one the cursor can land on, \
              below everything the patch has to show"
         );
         assert!(
-            !g.decorations.trailing_rows.is_empty(),
+            !g.decorations.trailing_chrome.is_empty(),
             "the closing rule lives here, having no line to sit above"
         );
     }
@@ -4799,8 +4805,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(chrome(&g, VirtualRowKind::FileHeader).len(), 1);
-        assert_eq!(chrome(&g, VirtualRowKind::HunkHeader).len(), 1);
+        assert_eq!(chrome(&g, ChromeKind::FileHeader).len(), 1);
+        assert_eq!(chrome(&g, ChromeKind::HunkHeader).len(), 1);
     }
 
     /// A section heading is the enclosing signature alone.
@@ -4824,19 +4830,20 @@ mod tests {
         );
         let (_, g) = head_patch(dir.path());
 
-        let rows = chrome(&g, VirtualRowKind::HunkHeader);
+        let rows = chrome(&g, ChromeKind::HunkHeader);
         let row = rows.first().expect("a section heading");
-        assert_eq!(row.text, "fn wrapper() {", "the signature, nothing else");
-        assert!(
-            !row.text.contains("@@"),
-            "the ranges are gone: {:?}",
-            row.text
-        );
-        let kinds: Vec<&str> = row.highlights.iter().map(|h| h.kind.as_str()).collect();
+        let text: String = row.iter().map(Element::text_content).collect();
+        assert_eq!(text, "fn wrapper() {", "the signature, nothing else");
+        assert!(!text.contains("@@"), "the ranges are gone: {text:?}");
+        let kinds: Vec<&str> = row
+            .iter()
+            .flat_map(Element::highlight_runs)
+            .map(|h| h.kind.as_str())
+            .collect();
         assert_eq!(kinds, [HUNK]);
 
         // The file block opens with a full-width rule, and its path sits on the row below.
-        assert_eq!(chrome(&g, VirtualRowKind::Rule).len(), 1);
+        assert_eq!(chrome(&g, ChromeKind::Rule).len(), 1);
     }
 
     /// The file separator is the file-scope handle — for `Space g Alt-s` and for the eye — so it
@@ -4848,11 +4855,12 @@ mod tests {
         commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
         let (_, g) = head_patch(dir.path());
 
-        let rows = chrome(&g, VirtualRowKind::FileHeader);
+        let rows = chrome(&g, ChromeKind::FileHeader);
         let row = rows.first().expect("a file separator");
-        assert!(row.text.starts_with("src.rs"), "{:?}", row.text);
-        assert!(row.text.contains("+1"), "{:?}", row.text);
-        assert!(row.text.contains("−1"), "{:?}", row.text);
+        let text: String = row.iter().map(Element::text_content).collect();
+        assert!(text.starts_with("src.rs"), "{text:?}");
+        assert!(text.contains("+1"), "{text:?}");
+        assert!(text.contains("−1"), "{text:?}");
     }
 
     /// A file with no trailing newline makes libgit2 emit a `\ No newline at end of file` note.

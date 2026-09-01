@@ -17,3 +17,6 @@ serde_json = { workspace = true }
 # Pinned to the installed `wasm-bindgen` CLI (0.2.104); the two must match exactly.
 wasm-bindgen = "=0.2.104"
 serde-wasm-bindgen = "0.6"
+# The browser's clock. wasm32-unknown-unknown has no `SystemTime`, so anything dated — the blame
+# label, a picker's commit ages — gets "now" from JS through here.
+js-sys = "0.3"

@@ -9,7 +9,7 @@
 //!
 //! # Chrome is not buffer text
 //!
-//! File and hunk separators render as [`VirtualRow`]s hung above the first content line they
+//! File and hunk separators render as [`Element`]s hung above the first content line they
 //! introduce, exactly like the inline diff view's phantom deleted rows. The cursor therefore cannot
 //! reach them **by construction**, which is the whole reason for the arrangement: the alternative —
 //! buffer lines the cursor refuses to land on — would need a skip rule in cursor clamping, in every
@@ -23,8 +23,9 @@
 
 use std::collections::HashMap;
 
+use aether_protocol::ui::{Element, RailJoin};
 use aether_protocol::viewport::{
-    DiffStage, EmphasisRange, Highlight, PatchLine, VirtualRow, VirtualRowKind,
+    ChromeKind, DiffStage, EmphasisRange, FieldId, Highlight, PatchLine,
 };
 
 use crate::syntax::{InjectionLayer, LanguageConfig};
@@ -62,6 +63,10 @@ pub const REMOVED: &str = "diff.removed";
 pub struct GeneratedPatch {
     pub decorations: StaticDecorations,
     pub index: PatchIndex,
+    /// The diff's own shape — which files, which hunks, which lines each added and removed. Kept
+    /// beside the rendered text because a driver binding elements to real files needs the *diff's*
+    /// account of them, and deriving it back out of the rendered text would be reading tea leaves.
+    pub plan: PatchPlan,
 }
 
 /// Per-line decorations for a document whose text was *generated* rather than parsed.
@@ -82,13 +87,13 @@ pub struct StaticDecorations {
     /// tree's highlights would be, so they ride the ordinary `Segment::highlights` wire field.
     pub highlights: Vec<Vec<Highlight>>,
     /// Chrome rendered *after* the final line: the rule that closes the patch. Held apart from
-    /// [`Self::virtual_rows`] because it belongs to no line — the text ends without a trailing
+    /// [`Self::chrome`] because it belongs to no line — the text ends without a trailing
     /// newline, so there is no empty last line for it to sit above.
-    pub trailing_rows: Vec<VirtualRow>,
+    pub trailing_chrome: Vec<Element>,
     /// Chrome rendered above each line — file and hunk separators. Rides the same wire field as
     /// the inline diff view's phantom deleted rows; the two can never appear on one buffer, since
     /// a generated patch has no baseline of its own to be diffed against.
-    pub virtual_rows: Vec<Vec<VirtualRow>>,
+    pub chrome: Vec<Vec<Element>>,
     /// Which layer each line's change sits in — the bright/dim split the inline diff view already
     /// uses. Always `Unstaged` in a commit's diff (nothing there is pending); resolved per change
     /// block in the working-tree diff, where it is the only visible effect of staging.
@@ -97,6 +102,46 @@ pub struct StaticDecorations {
     /// over. Unlike the inline diff view — where only the new side is a buffer line and the old
     /// side is a phantom row — both sides are ordinary lines here, so both carry their own spans.
     pub emphasis: Vec<Vec<EmphasisRange>>,
+    /// The regions the chrome divides this document into, in line order and contiguous.
+    pub elements: Vec<ElementSpan>,
+}
+
+/// One editor region of a generated patch: a maximal run of lines with no chrome between them.
+///
+/// **Identity, assigned once over the whole document.** The renderer used to number these as it
+/// walked the *visible* window, so the same region was element 0 on one frame and element 2 after a
+/// scroll. That was harmless while every element windowed the same generated document and nothing
+/// downstream kept an id — but an element id is what names the buffer a region shows, and a name
+/// that changes when you scroll cannot do that job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementSpan {
+    pub id: FieldId,
+    /// Document lines the region covers: `start_line..end_line`.
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// Split a document into elements at every line carrying chrome above it.
+///
+/// The boundary rule is the renderer's, moved here: chrome is what separates one editor from the
+/// next, so the two agree by construction rather than by both remembering the same condition.
+fn element_spans(chrome: &[Vec<Element>], line_count: u32) -> Vec<ElementSpan> {
+    let mut spans: Vec<ElementSpan> = Vec::new();
+    for i in 0..line_count {
+        let starts = i == 0 || chrome.get(i as usize).is_some_and(|c| !c.is_empty());
+        if starts {
+            let id = spans.len() as FieldId;
+            if let Some(last) = spans.last_mut() {
+                last.end_line = i;
+            }
+            spans.push(ElementSpan {
+                id,
+                start_line: i,
+                end_line: line_count,
+            });
+        }
+    }
+    spans
 }
 
 /// The structure a generated patch knew while it was being built, in **buffer-line coordinates**.
@@ -265,12 +310,13 @@ pub struct PatchBuilder {
     text: String,
     sides: Vec<Option<PatchLine>>,
     highlights: Vec<Vec<Highlight>>,
-    virtual_rows: Vec<Vec<VirtualRow>>,
+    chrome: Vec<Vec<Element>>,
     emphasis: Vec<Vec<EmphasisRange>>,
     stage: Vec<DiffStage>,
     lines: Vec<Option<PatchLineInfo>>,
-    pending: Vec<VirtualRow>,
+    pending: Vec<Element>,
     files: Vec<PatchFile>,
+    plan: PatchPlan,
 }
 
 /// A highlight span given as byte offsets within the line or row it applies to.
@@ -307,14 +353,68 @@ impl PatchBuilder {
     }
 
     /// Queue a chrome row to render above the next content line.
-    pub fn chrome(&mut self, kind: VirtualRowKind, text: impl Into<String>, spans: &[Span]) {
-        self.pending.push(VirtualRow {
-            text: text.into(),
+    ///
+    /// The [`RailJoin`] is filled in when the group is flushed ([`Self::flush_rails`]) rather than
+    /// here: whether a row opens the rail or tees off it depends on what else ends up in its group,
+    /// which isn't known until the group is closed by a content line.
+    pub fn chrome(&mut self, kind: ChromeKind, text: impl Into<String>, spans: &[Span]) {
+        let text = text.into();
+        let content = match kind {
+            // A rule is the fill and nothing else — the rail sits outside the content width.
+            ChromeKind::Rule => Element::row(vec![Element::fill('─')]),
+            // Blank: the band and the rail are all a spacer is.
+            ChromeKind::Spacer => Element::row(Vec::new()),
+            // Set in from the rail by a space: chrome is a heading, not code, so it reads better
+            // than it would aligned to the column content starts at.
+            _ => Element::row(vec![
+                Element::space(1),
+                Element::text(text, spans_to_highlights(spans)),
+            ]),
+        };
+        self.pending.push(Element::Chrome {
             kind,
-            stage: Default::default(),
-            emphasis: Vec::new(),
-            highlights: spans_to_highlights(spans),
+            rail: RailJoin::Tees,
+            children: vec![content],
         });
+    }
+
+    /// Resolve the [`RailJoin`] of every row in the pending group, now that the group is complete.
+    ///
+    /// This was three client-side derivations — box glyphs in the terminal, a pixel rule in the
+    /// GUI, CSS classes on the web — each reconstructing the file structure from a flat row list.
+    /// The builder has the structure in hand, so it answers once.
+    fn flush_rails(rows: &mut [Element]) {
+        let opening = rows.iter().any(|r| {
+            matches!(
+                r,
+                Element::Chrome {
+                    kind: ChromeKind::Summary,
+                    ..
+                }
+            )
+        });
+        let mut above_rule = true;
+        for (idx, row) in rows.iter_mut().enumerate() {
+            let Element::Chrome { kind, rail, .. } = row else {
+                continue;
+            };
+            let is_rule = *kind == ChromeKind::Rule;
+            *rail = if !is_rule {
+                // The opening caption and its blank belong to no file, so nothing runs into them.
+                if opening && above_rule {
+                    RailJoin::Detached
+                } else {
+                    RailJoin::Tees
+                }
+            } else if above_rule && (opening || idx == 0) {
+                RailJoin::Opens
+            } else {
+                RailJoin::Tees
+            };
+            if is_rule {
+                above_rule = false;
+            }
+        }
     }
 
     /// A line of file content, which also flushes any queued chrome above itself. `highlights` are
@@ -347,7 +447,9 @@ impl PatchBuilder {
         self.highlights.push(highlights);
         self.emphasis.push(emphasis);
         self.stage.push(stage);
-        self.virtual_rows.push(std::mem::take(&mut self.pending));
+        let mut group = std::mem::take(&mut self.pending);
+        Self::flush_rails(&mut group);
+        self.chrome.push(group);
         self.lines.push(info);
     }
 
@@ -372,24 +474,23 @@ impl PatchBuilder {
         // A rule closing the patch, joining the rail up into the last section's blank. Whatever
         // chrome is still pending has nowhere to sit *above* — the text ends at its last content
         // line — so it becomes the trailing block instead.
-        self.pending.push(VirtualRow {
-            text: String::new(),
-            kind: VirtualRowKind::Rule,
-            stage: Default::default(),
-            emphasis: Vec::new(),
-            highlights: Vec::new(),
+        self.pending.push(Element::Chrome {
+            kind: ChromeKind::Rule,
+            rail: RailJoin::Closes,
+            children: vec![Element::fill('─')],
         });
         // No trailing newline: the empty last line it would create is one the cursor can land on,
         // below everything the patch has to show. The closing chrome hangs off the final content
-        // line instead, which is what `trailing_rows` exists for.
+        // line instead, which is what `trailing_chrome` exists for.
         if self.text.ends_with('\n') {
             self.text.pop();
         }
         let PatchBuilder {
+            plan,
             text,
             sides,
             highlights,
-            virtual_rows,
+            chrome,
             emphasis,
             stage,
             lines,
@@ -397,18 +498,21 @@ impl PatchBuilder {
             pending,
             ..
         } = self;
+        let elements = element_spans(&chrome, lines.len() as u32);
         (
             text,
             GeneratedPatch {
                 decorations: StaticDecorations {
                     patch: sides,
                     highlights,
-                    virtual_rows,
-                    trailing_rows: pending,
+                    chrome,
+                    trailing_chrome: pending,
                     emphasis,
                     stage,
+                    elements,
                 },
                 index: PatchIndex { files, lines },
+                plan,
             },
         )
     }
@@ -591,23 +695,201 @@ fn language_of(path: Option<&String>) -> Option<String> {
 /// stream can't distinguish "this file has no hunks" from "this file hasn't started yet", and a
 /// delta with no hunks — a binary file, a bare `chmod`, a pure rename — is exactly the case that
 /// needs a placeholder line inventing for it.
-pub fn render_diff(
-    repo: &git2::Repository,
-    diff: &git2::Diff<'_>,
-    b: &mut PatchBuilder,
-    against_worktree: bool,
-) -> Result<(), String> {
-    let mut parsed_files = 0usize;
+/// What a patch view is composed of, derived from the diff **and nothing else**.
+///
+/// No repository, no blobs, no filesystem — the signature is the guarantee. That matters because it
+/// is the claim the whole lazy-binding design rests on: a forty-file patch has to know how many
+/// regions it has and how tall each one is *before* deciding which files to open, or laying the view
+/// out would cost forty file reads and forty tree-sitter parses (measured at 96–446ms).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchPlan {
+    pub files: Vec<PlannedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub status: PatchFileStatus,
+    pub added: u32,
+    pub removed: u32,
+    /// One per hunk, in order. **Empty** for a delta with no textual content — a binary swap, a
+    /// mode change — which renders as a single placeholder rather than as an editor.
+    pub regions: Vec<PlannedRegion>,
+}
+
+/// One hunk, as line ranges on both sides. 1-based, as libgit2 reports them.
+///
+/// `new_lines == 0` is a pure deletion: the hunk shows entirely as phantom rows above
+/// `new_start`, and windows no line of the new side at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedRegion {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    /// New-side line numbers this hunk **added** (1-based). Context lines are absent, so a line of
+    /// the range not listed here is one the commit left alone.
+    pub added: Vec<u32>,
+    /// Removed lines, each anchored to the new-side line it sat **above** (1-based) — the same
+    /// arrangement the inline diff's phantom rows already use. A removal at the very end of a hunk
+    /// anchors one past its last line.
+    ///
+    /// The text comes from the diff itself, not from any file: `git2` carries hunk content, which
+    /// is what lets a patch describe its own removed lines without opening the old blob.
+    pub removed: Vec<(u32, String)>,
+}
+
+/// A patch view's elements, over whichever of its files `resolve` can supply a buffer for.
+///
+/// Pure: a function of the diff plus that map. That is what lets the two callers differ only in how
+/// they resolve — the open path opens files asynchronously, while the save/stage/commit refresh
+/// looks up buffers already open, since opening files *there* would be both surprising and async.
+/// Keeping the element logic here means those two cannot drift.
+///
+/// A region `resolve` declines keeps windowing the generated document. That is not only an error
+/// path: a **deleted** file has no new side to window, and a delta with no hunks at all (a binary
+/// swap, a mode change) has only a placeholder line. Those are why the generated text — and
+/// `LineChange::Patch` with it — is still load-bearing.
+///
+/// It is also why the two kinds of element answer the inline diff toggle differently. A bound
+/// element's removed lines become phantoms, which collapse onto the gutter marker when the diff is
+/// off. A generated slice's are ordinary buffer text with nowhere to collapse *to* — a file that is
+/// wholly gone has no surviving line to mark — so they stay. Removals collapse wherever there is a
+/// line left to collapse onto, and a deleted file's content is the only readable thing it has.
+pub fn layout_over_files(
+    generated: &GeneratedPatch,
+    mut resolve: impl FnMut(&str) -> Option<aether_protocol::BufferId>,
+) -> Vec<crate::state::ElementLayout> {
+    use aether_protocol::viewport::{BaselineRow, DiffMarker, DiffStage};
+
+    let mut layout = Vec::with_capacity(generated.decorations.elements.len());
+    for span in &generated.decorations.elements {
+        let chrome_above = std::sync::Arc::new(
+            generated
+                .decorations
+                .chrome
+                .get(span.start_line as usize)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let generated_slice = || crate::state::ElementLayout {
+            buffer_id: None,
+            start_line: span.start_line,
+            end_line_exclusive: span.end_line,
+            chrome_above: chrome_above.clone(),
+            decorations: None,
+        };
+
+        // Which file and hunk this element's first line belongs to — read from the index that
+        // produced the text, never guessed from position.
+        let info = generated
+            .index
+            .lines
+            .get(span.start_line as usize)
+            .copied()
+            .flatten();
+        let Some((info, hunk)) = info.and_then(|i| Some((i, i.hunk?))) else {
+            layout.push(generated_slice());
+            continue;
+        };
+        let Some(file) = generated.plan.files.get(info.file as usize) else {
+            layout.push(generated_slice());
+            continue;
+        };
+        let (Some(path), Some(region)) =
+            (file.new_path.as_deref(), file.regions.get(hunk as usize))
+        else {
+            layout.push(generated_slice());
+            continue;
+        };
+        let Some(buffer_id) = resolve(path) else {
+            layout.push(generated_slice());
+            continue;
+        };
+
+        // Two sources, each for what it alone knows. The **plan** carries the removed lines' text,
+        // already anchored to the new-side line they sat above, and it comes from the diff, so no
+        // file is read for it. The **generated record** carries each line's stage, and staged
+        // varies *within* a hunk — it is the only visible effect of staging in this view, while the
+        // plan holds one stage per region, which would flatten it.
+        let stage_of: HashMap<u32, DiffStage> = (span.start_line..span.end_line)
+            .filter_map(|line| {
+                let at = generated
+                    .index
+                    .lines
+                    .get(line as usize)
+                    .copied()
+                    .flatten()?;
+                let stage = generated
+                    .decorations
+                    .stage
+                    .get(line as usize)
+                    .copied()
+                    .unwrap_or_default();
+                Some((at.new_lineno?.saturating_sub(1), stage))
+            })
+            .collect();
+        let stage_at = |line: u32| stage_of.get(&line).copied().unwrap_or_default();
+
+        // libgit2 counts lines from 1 and buffers from 0: the shift happens here, once.
+        let mut decorations = crate::state::ElementDecorations::default();
+        for (anchor, text) in &region.removed {
+            let line = anchor.saturating_sub(1);
+            decorations
+                .baseline_above
+                .entry(line)
+                .or_default()
+                .push(BaselineRow {
+                    text: text.clone(),
+                    stage: stage_at(line),
+                    emphasis: Vec::new(),
+                });
+        }
+        for &added in &region.added {
+            let line = added.saturating_sub(1);
+            let marker = if decorations.baseline_above.contains_key(&line) {
+                DiffMarker::Modified
+            } else {
+                DiffMarker::Added
+            };
+            decorations.markers.insert(line, (marker, stage_at(line)));
+        }
+        // A context line with removals above it is a pure deletion: flagged, not tinted.
+        for line in decorations
+            .baseline_above
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            decorations
+                .markers
+                .entry(line)
+                .or_insert((DiffMarker::Deleted, stage_at(line)));
+        }
+
+        layout.push(crate::state::ElementLayout {
+            buffer_id: Some(buffer_id),
+            start_line: region.new_start.saturating_sub(1),
+            end_line_exclusive: region.new_start.saturating_sub(1) + region.new_lines,
+            chrome_above,
+            decorations: Some(std::sync::Arc::new(decorations)),
+        });
+    }
+    layout
+}
+
+/// The shape of a diff: which files it touches, and which line ranges of each.
+pub fn plan_diff(diff: &git2::Diff<'_>) -> Result<PatchPlan, String> {
+    let mut files = Vec::new();
     for (idx, delta) in diff.deltas().enumerate() {
-        let old_path = path_of(&delta.old_file());
-        let new_path = path_of(&delta.new_file());
-        let binary = delta.flags().is_binary();
         let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
         let hunk_count = patch.as_ref().map(|p| p.num_hunks()).unwrap_or(0);
         let (_, added, removed) = patch
             .as_ref()
             .and_then(|p| p.line_stats().ok())
             .unwrap_or((0, 0, 0));
+        let binary = delta.flags().is_binary();
 
         let mut status = match delta.status() {
             git2::Delta::Added => PatchFileStatus::Added,
@@ -627,21 +909,107 @@ pub fn render_diff(
             status = PatchFileStatus::ModeChanged;
         }
 
+        let mut regions = Vec::with_capacity(hunk_count);
+        if let Some(patch) = patch.as_ref() {
+            for h in 0..hunk_count {
+                let (hunk, _) = patch.hunk(h).map_err(|e| e.message().to_string())?;
+                let mut added = Vec::new();
+                let mut removed: Vec<(u32, String)> = Vec::new();
+                // Removals have no line of their own on the new side, so each waits for the next
+                // line that does and anchors above it.
+                let mut pending: Vec<String> = Vec::new();
+                let line_count = patch
+                    .num_lines_in_hunk(h)
+                    .map_err(|e| e.message().to_string())?;
+                for l in 0..line_count {
+                    let line = patch
+                        .line_in_hunk(h, l)
+                        .map_err(|e| e.message().to_string())?;
+                    let text = || {
+                        String::from_utf8_lossy(line.content())
+                            .trim_end_matches('\n')
+                            .to_string()
+                    };
+                    match line.origin() {
+                        '+' => {
+                            if let Some(n) = line.new_lineno() {
+                                added.push(n);
+                                removed.extend(pending.drain(..).map(|t| (n, t)));
+                            }
+                        }
+                        ' ' => {
+                            if let Some(n) = line.new_lineno() {
+                                removed.extend(pending.drain(..).map(|t| (n, t)));
+                            }
+                        }
+                        '-' => pending.push(text()),
+                        // `=`, `>`, `<` are "\ No newline at end of file" markers — an artefact of
+                        // the patch *format*, which this view deliberately isn't.
+                        _ => {}
+                    }
+                }
+                // Anything still pending was removed from the end of the hunk, so it anchors one
+                // past the last new-side line it could sit above.
+                let tail = hunk.new_start() + hunk.new_lines();
+                removed.extend(pending.into_iter().map(|t| (tail, t)));
+
+                regions.push(PlannedRegion {
+                    old_start: hunk.old_start(),
+                    old_lines: hunk.old_lines(),
+                    new_start: hunk.new_start(),
+                    new_lines: hunk.new_lines(),
+                    added,
+                    removed,
+                });
+            }
+        }
+
+        files.push(PlannedFile {
+            old_path: path_of(&delta.old_file()),
+            new_path: path_of(&delta.new_file()),
+            status,
+            added: added as u32,
+            removed: removed as u32,
+            regions,
+        });
+    }
+    Ok(PatchPlan { files })
+}
+
+pub fn render_diff(
+    repo: &git2::Repository,
+    diff: &git2::Diff<'_>,
+    b: &mut PatchBuilder,
+    against_worktree: bool,
+) -> Result<(), String> {
+    // The shape first, then the text. One source of truth for what each delta *is*: the driver will
+    // build its elements from this same plan, and a second copy of the status refinement here is
+    // exactly the kind of thing that drifts.
+    let plan = plan_diff(diff)?;
+    let mut parsed_files = 0usize;
+    for (idx, delta) in diff.deltas().enumerate() {
+        let planned = &plan.files[idx];
+        let old_path = planned.old_path.clone();
+        let new_path = planned.new_path.clone();
+        let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
+        let hunk_count = planned.regions.len();
+        let (status, added, removed) = (planned.status, planned.added, planned.removed);
+
         let file_idx = b.push_file(PatchFile {
             old_language: language_of(old_path.as_ref()),
             new_language: language_of(new_path.as_ref()),
             old_path: old_path.clone(),
             new_path: new_path.clone(),
             status,
-            added: added as u32,
-            removed: removed as u32,
+            added,
+            removed,
             start_line: b.next_line(),
             end_line: b.next_line(),
             hunks: Vec::new(),
             changes: Vec::new(),
         });
 
-        emit_file_header(b, &delta, status, added as u32, removed as u32);
+        emit_file_header(b, &delta, status, added, removed);
 
         if hunk_count == 0 {
             emit_placeholder(b, &delta, status, file_idx);
@@ -681,6 +1049,7 @@ pub fn render_diff(
         }
         b.close_file(file_idx);
     }
+    b.plan = plan;
     Ok(())
 }
 
@@ -694,7 +1063,7 @@ fn emit_file_header(
 ) {
     // A full-width rule opens every file block, including the first: the heaviest boundary in the
     // buffer, and the one thing drawn edge to edge.
-    b.chrome(VirtualRowKind::Rule, "", &[]);
+    b.chrome(ChromeKind::Rule, "", &[]);
 
     let old_path = path_of(&delta.old_file());
     let new_path = path_of(&delta.new_file());
@@ -740,10 +1109,10 @@ fn emit_file_header(
         text.push_str(&s);
     }
 
-    b.chrome(VirtualRowKind::FileHeader, text, &spans);
+    b.chrome(ChromeKind::FileHeader, text, &spans);
     // A blank between the path and its first section heading, so the file's name reads as a title
     // rather than as the first of a run of headings.
-    b.chrome(VirtualRowKind::Spacer, "", &[]);
+    b.chrome(ChromeKind::Spacer, "", &[]);
 }
 
 /// The one content line standing in for a delta git gave no hunks: a binary file, a bare mode
@@ -797,7 +1166,7 @@ fn emit_placeholder(
         // Nothing textual to locate in the index, so it reads as the top layer.
         stage: DiffStage::Unstaged,
     });
-    b.chrome(VirtualRowKind::Spacer, "", &[]);
+    b.chrome(ChromeKind::Spacer, "", &[]);
     b.content_line(
         &text,
         spans_to_highlights(&[(0, text.len(), META)]),
@@ -811,7 +1180,7 @@ fn emit_placeholder(
             new_lineno: None,
         },
     );
-    b.chrome(VirtualRowKind::Spacer, "", &[]);
+    b.chrome(ChromeKind::Spacer, "", &[]);
 }
 
 /// One content line of a hunk, gathered before anything is pushed.
@@ -899,8 +1268,8 @@ fn emit_hunk(
     } else {
         vec![(0, signature.len(), HUNK)]
     };
-    b.chrome(VirtualRowKind::HunkHeader, signature, &spans);
-    b.chrome(VirtualRowKind::Spacer, "", &[]);
+    b.chrome(ChromeKind::HunkHeader, signature, &spans);
+    b.chrome(ChromeKind::Spacer, "", &[]);
 
     let start_line = b.next_line();
     let line_count = patch
@@ -1015,7 +1384,7 @@ fn emit_hunk(
         });
     }
 
-    b.chrome(VirtualRowKind::Spacer, "", &[]);
+    b.chrome(ChromeKind::Spacer, "", &[]);
 
     let end_line = b.next_line();
     b.file_mut(file_idx).hunks.push(PatchHunk {
@@ -1032,6 +1401,237 @@ fn emit_hunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo whose HEAD commit changes two files, one of them in two places.
+    fn repo_with_a_two_file_commit(root: &std::path::Path) -> git2::Repository {
+        let repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let commit = |repo: &git2::Repository, files: &[(&str, &str)]| {
+            for (name, body) in files {
+                std::fs::write(root.join(name), body).unwrap();
+            }
+            let mut index = repo.index().unwrap();
+            for (name, _) in files {
+                index.add_path(std::path::Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &refs)
+                .unwrap();
+        };
+        let long = (1..=40).map(|i| format!("line {i}\n")).collect::<String>();
+        commit(&repo, &[("a.txt", long.as_str()), ("b.txt", "one\n")]);
+        // Two separate edits to a.txt, far enough apart to be distinct hunks.
+        let edited = long
+            .replace("line 2\n", "LINE 2\n")
+            .replace("line 38\n", "LINE 38\n");
+        commit(&repo, &[("a.txt", edited.as_str()), ("b.txt", "ONE\n")]);
+        repo
+    }
+
+    fn head_diff(repo: &git2::Repository) -> git2::Diff<'_> {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let parent = head.parent(0).unwrap();
+        repo.diff_tree_to_tree(
+            Some(&parent.tree().unwrap()),
+            Some(&head.tree().unwrap()),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A patch's shape comes from the diff alone — one region per hunk, with the new-side range
+    /// each windows.
+    ///
+    /// The whole lazy-binding design rests on this: a forty-file patch has to know how many regions
+    /// it has and how tall each is *before* choosing which files to open. `plan_diff` takes only a
+    /// `&git2::Diff` — no repository, no blobs, no filesystem — so the guarantee is in the
+    /// signature, and this pins the numbers it produces.
+    #[test]
+    fn a_diff_plans_one_region_per_hunk_without_opening_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_a_two_file_commit(&root);
+        let plan = plan_diff(&head_diff(&repo)).expect("the diff plans");
+
+        let names: Vec<&str> = plan
+            .files
+            .iter()
+            .map(|f| f.new_path.as_deref().unwrap_or("?"))
+            .collect();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
+
+        let a = &plan.files[0];
+        assert_eq!(a.status, PatchFileStatus::Modified);
+        assert_eq!(
+            a.regions.len(),
+            2,
+            "two edits far apart are two hunks: {:?}",
+            a.regions
+        );
+        // Each region windows the new side around its edit — line 2 and line 38, with context.
+        assert!(
+            a.regions[0].new_start <= 2 && a.regions[0].new_lines > 0,
+            "the first hunk covers line 2: {:?}",
+            a.regions[0]
+        );
+        assert!(
+            a.regions[1].new_start <= 38 && a.regions[1].new_start + a.regions[1].new_lines > 38,
+            "the second hunk covers line 38: {:?}",
+            a.regions[1]
+        );
+        assert_eq!(a.added, 2, "one added line per hunk");
+        assert_eq!(a.removed, 2);
+
+        let b = &plan.files[1];
+        assert_eq!(b.regions.len(), 1, "one edit is one hunk");
+        assert_eq!((b.added, b.removed), (1, 1));
+    }
+
+    /// A hunk knows which new-side lines it added, and where its removed lines sat.
+    ///
+    /// This is what a patch element's decorations are built from: the `+` lines become
+    /// `DiffMarker::Added`, and the `-` lines become phantom rows anchored above the line that
+    /// replaced them — the arrangement the inline diff already uses, which is why a patch can share
+    /// its decoration path. All of it comes from the diff; no file is read.
+    #[test]
+    fn a_hunk_knows_its_added_lines_and_where_its_removals_sat() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_a_two_file_commit(&root);
+        let plan = plan_diff(&head_diff(&repo)).expect("plans");
+
+        // b.txt: the single line "one" became "ONE" — one addition, one removal above it.
+        let b = &plan.files[1];
+        let region = &b.regions[0];
+        assert_eq!(region.added, vec![1], "line 1 of the new side was added");
+        assert_eq!(
+            region.removed,
+            vec![(1, "one".to_string())],
+            "and the line it replaced sat above it"
+        );
+
+        // a.txt: two separate single-line edits, each a removal replaced by an addition.
+        let a = &plan.files[0];
+        assert_eq!(a.regions[0].added, vec![2]);
+        assert_eq!(a.regions[0].removed, vec![(2, "line 2".to_string())]);
+        assert_eq!(a.regions[1].added, vec![38]);
+        assert_eq!(a.regions[1].removed, vec![(38, "line 38".to_string())]);
+
+        // Context lines are absent from `added` — that is what makes the marker map meaningful.
+        assert!(
+            !a.regions[0].added.contains(&1),
+            "line 1 is context and was not added: {:?}",
+            a.regions[0].added
+        );
+    }
+
+    /// The plan agrees with what the renderer actually emitted: one hunk heading per planned region.
+    ///
+    /// Cheap cross-check, and the thing that would catch the two walks drifting apart — the reason
+    /// `render_diff` consumes the plan rather than recomputing the status refinement itself.
+    #[test]
+    fn the_plan_matches_what_the_renderer_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_a_two_file_commit(&root);
+        let diff = head_diff(&repo);
+        let plan = plan_diff(&diff).expect("plans");
+
+        let mut b = PatchBuilder::default();
+        render_diff(&repo, &diff, &mut b, false).expect("renders");
+        let (_, generated) = b.finish();
+
+        let planned_regions: usize = plan.files.iter().map(|f| f.regions.len()).sum();
+        // Named, so a mutual zero can't pass as agreement.
+        assert_eq!(planned_regions, 3, "two hunks in a.txt and one in b.txt");
+        let hunk_headings = generated
+            .decorations
+            .chrome
+            .iter()
+            .flatten()
+            .chain(generated.decorations.trailing_chrome.iter())
+            .filter(|n| {
+                matches!(
+                    n,
+                    Element::Chrome {
+                        kind: ChromeKind::HunkHeader,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            planned_regions, hunk_headings,
+            "every planned region should have produced exactly one hunk heading"
+        );
+        assert_eq!(
+            plan.files.len(),
+            generated.index.files.len(),
+            "the plan and the index should agree on how many files there are"
+        );
+    }
+
+    fn rule() -> Element {
+        Element::Chrome {
+            kind: ChromeKind::Rule,
+            rail: RailJoin::Tees,
+            children: vec![Element::fill('─')],
+        }
+    }
+
+    /// Chrome above lines 2 and 5 makes three regions, and line 0 opens one whether or not it has
+    /// chrome of its own.
+    #[test]
+    fn element_spans_split_on_chrome() {
+        let chrome: Vec<Vec<Element>> = (0..6)
+            .map(|i| {
+                if i == 2 || i == 5 {
+                    vec![rule()]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+        let spans = element_spans(&chrome, 6);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.id, s.start_line, s.end_line))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 2), (1, 2, 5), (2, 5, 6)]
+        );
+    }
+
+    /// The property the bindings rely on: every line belongs to exactly one element, so resolving
+    /// a cursor to its region can never come up empty or ambiguous.
+    #[test]
+    fn element_spans_cover_every_line_exactly_once() {
+        for pattern in [vec![0usize], vec![1], vec![0, 1, 2, 3], vec![3], vec![]] {
+            let chrome: Vec<Vec<Element>> = (0..4)
+                .map(|i| {
+                    if pattern.contains(&i) {
+                        vec![rule()]
+                    } else {
+                        vec![]
+                    }
+                })
+                .collect();
+            let spans = element_spans(&chrome, 4);
+            let covered: Vec<u32> = spans
+                .iter()
+                .flat_map(|s| s.start_line..s.end_line)
+                .collect();
+            assert_eq!(covered, (0..4).collect::<Vec<_>>(), "pattern {pattern:?}");
+        }
+    }
 
     fn line(text: &str, side: Option<PatchLine>) -> HunkLine {
         HunkLine {
@@ -1195,5 +1795,56 @@ mod tests {
         );
         assert_eq!(language_of(None), None);
         assert_eq!(language_of(Some(&"notes.unknownext".to_string())), None);
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    fn chrome(kind: ChromeKind) -> Element {
+        Element::Chrome {
+            kind,
+            rail: RailJoin::Tees,
+            children: Vec::new(),
+        }
+    }
+
+    fn rails(kinds: &[ChromeKind]) -> Vec<RailJoin> {
+        let mut rows: Vec<Element> = kinds.iter().copied().map(chrome).collect();
+        PatchBuilder::flush_rails(&mut rows);
+        rows.iter()
+            .map(|r| match r {
+                Element::Chrome { rail, .. } => *rail,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// The rail's whole job is making a file's chrome read as belonging to that file. The patch's
+    /// summary caption belongs to no file, so it floats; every *later* file is reached down the
+    /// rail from the one before it, so its rule tees rather than cornering.
+    ///
+    /// Ported from the terminal shell, which used to derive this itself — as did the GUI and the
+    /// web, differently. The answer is structural, so it is settled here once.
+    #[test]
+    fn the_rail_starts_at_the_first_file_not_at_the_summary() {
+        use ChromeKind::*;
+        use RailJoin::*;
+
+        // The opening block: caption, its blank, then the first file.
+        assert_eq!(
+            rails(&[Summary, Spacer, Rule, FileHeader, Spacer, HunkHeader, Spacer]),
+            [Detached, Detached, Opens, Tees, Tees, Tees, Tees],
+            "the caption and its blank float; the first file corners because nothing runs into it"
+        );
+
+        // Every later block opens with the blank that closed the previous file — which carries the
+        // rail down into this file's rule, so it tees rather than cornering.
+        assert_eq!(
+            rails(&[Spacer, Rule, FileHeader, Spacer]),
+            [Tees, Tees, Tees, Tees],
+            "the closing blank still carries the rail into the next file's rule"
+        );
     }
 }

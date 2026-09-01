@@ -24,6 +24,7 @@ use crate::keymap::{
 use crate::picker::{PickerMsg, PickerState, Reveal};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
+use aether_protocol::coords::{ViewLine, VisualRow};
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
 
@@ -31,10 +32,10 @@ use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
-    ViewportScrollToRow, ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams,
-    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult,
-    Window, WrapMode,
+    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScrollToRow,
+    ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowAtCursor,
+    ViewportWindowAtCursorParams, ViewportWindowResult, Window, WrapMode,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceOpenPath,
@@ -415,6 +416,11 @@ pub enum Message {
     /// churn, mirroring the TUI).
     Subscribed(Result<ViewportSubscribeResult, crate::connection::RpcError>),
     WindowUpdate(Result<ViewportWindowResult, crate::connection::RpcError>),
+    /// A window fetched to chase the **cursor**: the answer an owed reveal is waiting for. Its own
+    /// message because only this reply can prove a cursor unplaceable — window replies don't answer
+    /// one-for-one to the request that armed the debt (see [`aether_client::reveal`]), so a scroll
+    /// fetch arriving in between proves nothing about the cursor.
+    CursorWindowUpdate(Result<ViewportWindowResult, crate::connection::RpcError>),
 
     /// A core event: forwarded to `Session::on_event`, whose effects the shell executes. Grows a
     /// subsystem at a time as update logic migrates into core.
@@ -509,6 +515,9 @@ pub struct App {
     /// window, paid once a window carrying that line arrives. See [`aether_client::reveal`] for
     /// why it's a debt rather than a one-shot callback.
     pending_reveal: PendingReveal,
+    /// Set while handling the reply to a cursor chase, so the shared `WindowUpdate` body settles
+    /// the reveal as a chase answer. See [`Message::CursorWindowUpdate`].
+    chased_window: bool,
     /// The picker jumplist's scroll offset in px. The core tracks rows, not pixels; resets
     /// arrive as `Effect::PickerScrollReset`.
     picker_scroll_y: f32,
@@ -611,12 +620,13 @@ impl App {
             scroll_anchor: None,
             sent_grid: None,
             subscribe_scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine::ZERO,
                 sub_row: 0.0,
             },
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
+            chased_window: false,
             picker_scroll_y: 0.0,
             read_last_focus: None,
             read_reveal_snap: false,
@@ -715,7 +725,7 @@ impl App {
 
     /// `[workspace] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
-        crate::labels::window_title(&self.session.workspace, &self.session.buffer.label)
+        crate::labels::window_title(&self.session.workspace, &self.session.view.buffer.label)
     }
 
     /// Keyboard, modifier and resize events for *every* window, each tagged with the window it
@@ -897,12 +907,13 @@ impl App {
                 SettingsRow::Root(_) | SettingsRow::Project(_) => None,
             };
         }
-        if self.session.mode == Mode::Search {
+        if self.session.view.mode == Mode::Search {
             // No focus target when an option chip is selected — its row keys (Left/Right/
             // Backspace/Enter/Esc) must reach the core, but a focused `text_input` would capture
             // the editing keys among them. Defocusing lets every key bubble (picker parity).
             return self
                 .session
+                .view
                 .search
                 .chip_selected
                 .is_none()
@@ -1077,7 +1088,7 @@ impl App {
                 self.pending_subscribe = None;
                 tracing::debug!(
                     viewport_id = res.viewport_id,
-                    lines = res.window.lines.len(),
+                    lines = aether_client::grid::window_lines(&res.window).len(),
                     total_visual_rows = res.window.total_visual_rows,
                     "viewport subscribed"
                 );
@@ -1086,10 +1097,11 @@ impl App {
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
                 let scroll = self.subscribe_scroll;
                 self.session.adopt_subscribe(res);
-                if let (Some(cell), Some(w)) = (self.cell, self.session.window.as_ref()) {
-                    if let Some(rel) = grid::rows_before_line(w, scroll.logical_line) {
-                        let row = w.first_visual_row + rel;
-                        self.scroll_px = (row as f32 + scroll.sub_row) * cell.height;
+                if let (Some(cell), Some(w)) = (self.cell, self.session.view.window.as_ref()) {
+                    // The *block's* first row, so a line's chrome comes with it — see
+                    // `grid::block_start_of_view_line`.
+                    if let Some(row) = grid::block_start_of_view_line(w, scroll.logical_line) {
+                        self.scroll_px = (row.get() as f32 + scroll.sub_row) * cell.height;
                     }
                 }
                 self.clamp_scroll();
@@ -1110,6 +1122,15 @@ impl App {
                 }
             }
 
+            Message::CursorWindowUpdate(r) => {
+                // Same handling, one difference: a reveal the cursor's own window couldn't pay is
+                // unpayable, and chasing it again is the loop that leaves the viewport flickering
+                // at a fixed scroll with no cursor drawn.
+                self.chased_window = r.is_ok();
+                let task = self.update(Message::WindowUpdate(r));
+                self.chased_window = false;
+                task
+            }
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
                 self.session.adopt_window(res);
@@ -1124,6 +1145,8 @@ impl App {
                 self.clamp_scroll();
                 if anchored {
                     self.pending_reveal.abandon();
+                } else if self.chased_window {
+                    self.settle_chased_reveal();
                 } else {
                     self.settle_pending_reveal();
                 }
@@ -1518,7 +1541,8 @@ impl App {
                 Effect::SaveScrollAnchor => self.scroll_anchor = Some(self.scroll_px),
                 Effect::SaveContentAnchor => {
                     if let Some(cell) = self.cell {
-                        let top_row = (self.scroll_px / cell.height).round().max(0.0) as u32;
+                        let top_row =
+                            VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
                         self.session
                             .capture_scroll_anchor(top_row, self.visible_rows());
                     }
@@ -1605,10 +1629,10 @@ impl App {
         // outline jump, search `n`), glide the document toward it. Widget layout heights aren't
         // knowable here, so position approximates as the focus span's fraction of the source —
         // the best-effort contract.
-        if let Some(read) = self.session.read.as_ref() {
+        if let Some(read) = self.session.view.read.as_ref() {
             // Keyed to the Enter target when the cursor sits inside one (a Tab step must
             // reveal the link, not just its paragraph), else the block-grain position.
-            let cursor = self.session.buffer.cursor.position;
+            let cursor = self.session.view.buffer.cursor.position;
             let focus = read
                 .target_focus(cursor)
                 .or_else(|| read.block_focus(cursor))
@@ -1656,6 +1680,7 @@ impl App {
         // The cache is URL-keyed and session-lived, so revisits and re-parses are free.
         let scan_key = self
             .session
+            .view
             .read
             .as_ref()
             .filter(|r| !r.blocks.is_empty())
@@ -1664,7 +1689,13 @@ impl App {
             if self.read_remote_scan != Some(key) {
                 self.read_remote_scan = Some(key);
                 let urls = remote_image_sources(
-                    &self.session.read.as_ref().expect("scanned above").blocks,
+                    &self
+                        .session
+                        .view
+                        .read
+                        .as_ref()
+                        .expect("scanned above")
+                        .blocks,
                 );
                 for url in urls {
                     if !self.remote_images.contains_key(&url) {
@@ -1702,7 +1733,7 @@ impl App {
                 if cols == 0 || rows == 0 {
                     return Task::none();
                 }
-                match self.session.viewport_id {
+                match self.session.view.viewport_id {
                     None => {
                         if self.sent_grid.is_some() {
                             return Task::none(); // subscribe in flight
@@ -1765,10 +1796,10 @@ impl App {
                     let fx = self.session.close_picker();
                     return self.run_core(fx);
                 }
-                let Some(window) = &self.session.window else {
+                let Some(window) = &self.session.view.window else {
                     return Task::none();
                 };
-                let Some(pos) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
+                let Some((element, pos)) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
                     return Task::none();
                 };
                 let granularity = match kind {
@@ -1776,16 +1807,17 @@ impl App {
                     ClickKind::Double => Granularity::Word,
                     ClickKind::Triple => Granularity::Line,
                 };
-                // Selection semantics (drag anchor, click-streak granularity, and the
-                // selection-in-Insert → Normal switch) live in the core, shared by every shell.
-                let fx = self.session.pointer_press(pos, granularity, shift);
+                // Selection semantics — the drag anchor, the click-streak granularity, the
+                // selection-in-Insert → Normal switch, and focusing the element the click landed in
+                // — all live in the core, shared by every shell.
+                let fx = self.session.pointer_press(element, pos, granularity, shift);
                 self.run_core(fx)
             }
             EditorEvent::Dragged { row, dcol } => {
-                let Some(window) = &self.session.window else {
+                let Some(window) = &self.session.view.window else {
                     return Task::none();
                 };
-                let Some(pos) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
+                let Some((_element, pos)) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
                     return Task::none();
                 };
                 let fx = self.session.pointer_drag(pos);
@@ -1857,7 +1889,7 @@ impl App {
         // Report the on-screen line range so sneak scopes labels to what's visible (the core owns no
         // pixel scroll). `scroll_px / cell.height` is the absolute top visual row.
         if let Some(cell) = self.cell {
-            let top_row = (self.scroll_px / cell.height).round().max(0.0) as u32;
+            let top_row = VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
             self.session.set_visible_lines(top_row, visible_rows);
         }
         let fx = self.session.on_key(code, mods, text, visible_rows);
@@ -1961,8 +1993,10 @@ impl App {
             _ => {}
         }
         // A selected option chip parks focus off the search input, so there's no caret to keep.
-        if self.session.mode == Mode::Search && self.session.search.chip_selected.is_none() {
-            return Some((OverlayField::Search, self.session.search.query.clone()));
+        if self.session.view.mode == Mode::Search
+            && self.session.view.search.chip_selected.is_none()
+        {
+            return Some((OverlayField::Search, self.session.view.search.query.clone()));
         }
         let ed = self.session.picker.as_ref()?.chip_editor.as_ref()?;
         Some(if ed.field == crate::chips::ChipEditorField::Root {
@@ -2024,7 +2058,7 @@ impl App {
                 // In the reading view the vertical scroll is the document scrollable's;
                 // Left/Right pan the *focused* code panel (its scrollable carries
                 // `read_code_scroll_id` only while focused, so this no-ops elsewhere).
-                if self.session.read.is_some() {
+                if self.session.view.read.is_some() {
                     if matches!(dir, ScrollDir::Left | ScrollDir::Right) {
                         let step = match unit {
                             ScrollUnit::Line => 48.0,
@@ -2083,7 +2117,7 @@ impl App {
             A::PlaceCursor(place) => {
                 // Reading view: edge-matched placement of the focused block — measured
                 // against real widget geometry by the reveal probe, in explicit mode.
-                if self.session.read.is_some() {
+                if self.session.view.read.is_some() {
                     return iced::advanced::widget::operate(ReadRevealProbe::placing(
                         self.window,
                         place,
@@ -2094,7 +2128,7 @@ impl App {
                 Task::batch([task, self.maybe_fetch()])
             }
             A::ToggleWrap => {
-                let Some(viewport_id) = self.session.viewport_id else {
+                let Some(viewport_id) = self.session.view.viewport_id else {
                     return Task::none();
                 };
                 self.session.wrap = match self.session.wrap {
@@ -2134,15 +2168,11 @@ impl App {
         self.fetch_in_flight = false;
         self.refetch_queued = false;
         self.pending_reveal.abandon();
-        let scroll = self.session.buffer.scroll.unwrap_or(ScrollPosition {
+        let scroll = self.session.view.buffer.scroll.unwrap_or(ScrollPosition {
             // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
             // counterpart of the in-buffer jump reveal.
             logical_line: self
-                .session
-                .buffer
-                .cursor
-                .position
-                .line
+                .view_line_for(self.session.view.buffer.cursor.position.line)
                 .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
             sub_row: 0.0,
         });
@@ -2155,7 +2185,9 @@ impl App {
         }
         let id = self.rpc::<ViewportSubscribe>(
             ViewportSubscribeParams {
-                buffer_id: self.session.buffer.buffer_id,
+                // The *view* is what a viewport subscribes to: the server builds its element
+                // bindings from it, and a patch's elements window files the view merely shows.
+                buffer_id: self.session.view.view_id,
                 cols,
                 rows,
                 overscan_rows: rows,
@@ -2202,10 +2234,10 @@ impl App {
         let version = self.client_version.clone();
         let server_url = self.server_url.clone();
         let workspace = s.workspace.clone();
-        let path = s.buffer.path.clone();
-        let buffer_id = s.buffer.buffer_id;
-        let transient = s.buffer.transient;
-        let cursor = s.buffer.cursor.position;
+        let path = s.view.buffer.path.clone();
+        let buffer_id = s.view.buffer.buffer_id;
+        let transient = s.view.buffer.transient;
+        let cursor = s.view.buffer.cursor.position;
         self.task(
             async move {
                 tokio::time::sleep(reconnect_backoff(attempt)).await;
@@ -2350,6 +2382,18 @@ impl App {
 
     // ---- scroll / view sync -----------------------------------------------------------------
 
+    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one.
+    /// Mirrors the terminal shell's helper of the same name — exact while the line is loaded,
+    /// carried across unchanged when it isn't (which is exactly when a fetch is being issued).
+    fn view_line_for(&self, line: u32) -> ViewLine {
+        self.session
+            .view
+            .window
+            .as_ref()
+            .and_then(|w| grid::view_line_of(w, self.session.view.focused_element, line))
+            .unwrap_or(ViewLine(line))
+    }
+
     fn visible_rows(&self) -> u32 {
         match self.cell {
             Some(cell) => (((self.view_size.height - PAD) / cell.height) as u32).max(1),
@@ -2378,11 +2422,11 @@ impl App {
     fn resolve_anchor_px(&mut self) -> Option<f32> {
         let cell = self.cell?;
         let row = self.session.resolve_scroll_anchor()?;
-        Some(row as f32 * cell.height)
+        Some(row.get() as f32 * cell.height)
     }
 
     fn max_scroll_x_px(&self) -> f32 {
-        match (&self.session.window, self.cell) {
+        match (&self.session.view.window, self.cell) {
             (Some(w), Some(cell)) => {
                 let content_w = self.view_size.width - (GUTTER_COLS as f32 + 1.0) * cell.width;
                 (w.max_line_width as f32 * cell.width - content_w).max(0.0)
@@ -2392,7 +2436,7 @@ impl App {
     }
 
     fn max_scroll_px(&self) -> f32 {
-        match (&self.session.window, self.cell) {
+        match (&self.session.view.window, self.cell) {
             (Some(w), Some(cell)) => (PAD * 2.0 + w.total_visual_rows as f32 * cell.height
                 - self.view_size.height)
                 .max(0.0),
@@ -2479,19 +2523,22 @@ impl App {
         if self.session.conn != ConnState::Connected {
             return Task::none();
         }
-        let (Some(window), Some(cell), Some(viewport_id)) =
-            (&self.session.window, self.cell, self.session.viewport_id)
-        else {
+        let (Some(window), Some(cell), Some(viewport_id)) = (
+            &self.session.view.window,
+            self.cell,
+            self.session.view.viewport_id,
+        ) else {
             return Task::none();
         };
-        let top_row = (((self.scroll_px - PAD) / cell.height).floor()).max(0.0) as u32;
+        let top_row = VisualRow((((self.scroll_px - PAD) / cell.height).floor()).max(0.0) as u32);
         let loaded_start = window.first_visual_row;
-        let loaded_end = loaded_start + loaded_rows(window);
+        let loaded_end = loaded_start.saturating_add(loaded_rows(window));
         let margin = self.visible_rows();
         let visible = self.visible_rows();
-        let need_above = loaded_start > 0 && top_row < loaded_start.saturating_add(margin);
-        let need_below = loaded_end < window.total_visual_rows
-            && top_row + visible > loaded_end.saturating_sub(margin);
+        let need_above =
+            loaded_start > VisualRow::ZERO && top_row < loaded_start.saturating_add(margin);
+        let need_below = loaded_end.get() < window.total_visual_rows
+            && top_row.saturating_add(visible) > loaded_end.saturating_sub(margin);
         if !(need_above || need_below) {
             return Task::none();
         }
@@ -2519,11 +2566,13 @@ impl App {
     }
 
     fn ensure_cursor_visible_inner(&mut self, style: RevealStyle) -> Task<Message> {
-        let Some(window) = &self.session.window else {
+        let Some(window) = &self.session.view.window else {
             return Task::none();
         };
-        let line = self.session.buffer.cursor.position.line;
-        if line < window.first_logical_line || line >= window.last_logical_line_exclusive {
+        let line = self.session.view.buffer.cursor.position.line;
+        // Loadedness is a per-element question: the window's line range is in *view* coordinates,
+        // while the cursor's line belongs to its element's buffer.
+        if !aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line) {
             self.pending_reveal.owe_reveal(style);
             self.fetch_cursor_window();
             return Task::none();
@@ -2552,6 +2601,16 @@ impl App {
         settled != Settled::Nothing
     }
 
+    /// [`Self::settle_pending_reveal`] for the reply to the cursor's own chase — the one window
+    /// that can prove there is nothing to reveal. It never chases again; see
+    /// [`aether_client::reveal::PendingReveal::settle_chase`].
+    fn settle_chased_reveal(&mut self) -> bool {
+        let mut pending = std::mem::take(&mut self.pending_reveal);
+        let settled = pending.settle_chase(self);
+        self.pending_reveal = pending;
+        settled != Settled::Nothing
+    }
+
     /// Pull a window around the cursor's line — the fetch an owed reveal waits on, and the
     /// counterpart of [`Self::maybe_fetch`], which chases `scroll_px` instead.
     ///
@@ -2565,19 +2624,17 @@ impl App {
         if self.fetch_in_flight {
             return;
         }
-        let Some(viewport_id) = self.session.viewport_id else {
+        let Some(viewport_id) = self.session.view.viewport_id else {
             return;
         };
         self.fetch_in_flight = true;
-        self.rpc::<ViewportScroll>(
-            ViewportScrollParams {
-                viewport_id,
-                scroll: ScrollPosition {
-                    logical_line: self.session.buffer.cursor.position.line,
-                    sub_row: 0.0,
-                },
-            },
-            Message::WindowUpdate,
+        // "The window my cursor is in" — a question only the server can answer once the cursor's
+        // line has scrolled out of the loaded window: a view line indexes the elements' concatenated
+        // extents and a visual row depends on how the lines above wrapped. Naming the focused
+        // element's start instead is the same place only while the cursor is within a screen of it.
+        self.rpc::<ViewportWindowAtCursor>(
+            ViewportWindowAtCursorParams { viewport_id },
+            Message::CursorWindowUpdate,
         );
     }
 
@@ -2593,16 +2650,19 @@ impl App {
     /// Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
     /// `scroll_to_px` animates a short glide there and snaps when the target is far (> ~1.5 screens).
     fn reveal_cursor_jump(&mut self) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
+        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
             return false;
         };
-        let Some((row, _, _)) =
-            grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
-        else {
+        let Some((row, _, _)) = grid::position_cell(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+            TAB_WIDTH,
+        ) else {
             return false;
         };
         let h = cell.height;
-        let top = PAD + row as f32 * h;
+        let top = PAD + row.get() as f32 * h;
         let view_h = self.view_size.height;
         // Already fully visible → don't disturb the view.
         if top >= self.scroll_px && top + h <= self.scroll_px + view_h {
@@ -2613,16 +2673,19 @@ impl App {
     }
 
     fn reveal_cursor(&mut self) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
+        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
             return false;
         };
-        let Some((row, dcol, _)) =
-            grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
-        else {
+        let Some((row, dcol, _)) = grid::position_cell(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+            TAB_WIDTH,
+        ) else {
             return false;
         };
         let h = cell.height;
-        let top = PAD + row as f32 * h;
+        let top = PAD + row.get() as f32 * h;
         // Overscroll by half a row so the cursor lands just inside the edge.
         let margin = h / 2.0;
         let view_h = self.view_size.height;
@@ -2646,19 +2709,16 @@ impl App {
     }
 
     fn place_cursor(&mut self, place: ViewportPlace) -> Task<Message> {
-        let line = self.session.buffer.cursor.position.line;
-        let loaded = self
-            .session
-            .window
-            .as_ref()
-            .map(|w| (w.first_logical_line, w.last_logical_line_exclusive));
-        let Some((first, last)) = loaded else {
+        let line = self.session.view.buffer.cursor.position.line;
+        let Some(window) = self.session.view.window.as_ref() else {
             return Task::none();
         };
+        let loaded =
+            aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
         // When the cursor's line has been scrolled out of the loaded window, its visual row is
         // unknown — pull that region from the server (scrolling the viewport to the line), then
         // place once it lands. Mirrors `ensure_cursor_visible_inner`.
-        if line < first || line >= last {
+        if !loaded {
             self.pending_reveal.owe_place(place);
             self.fetch_cursor_window();
             return Task::none();
@@ -2676,16 +2736,19 @@ impl App {
     /// the loaded window (the caller pulls it in first otherwise); reports `false` if its cell is
     /// unknown, on the same terms as [`Self::reveal_cursor`].
     fn place_cursor_in_window(&mut self, place: ViewportPlace) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.window) else {
+        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
             return false;
         };
-        let Some((row, _, _)) =
-            grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH)
-        else {
+        let Some((row, _, _)) = grid::position_cell(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+            TAB_WIDTH,
+        ) else {
             return false;
         };
         self.scroll_to_px(
-            PAD + row as f32 * cell.height - self.view_size.height * place.fraction(),
+            PAD + row.get() as f32 * cell.height - self.view_size.height * place.fraction(),
             true,
         );
         true
@@ -2726,7 +2789,7 @@ impl App {
                         ..container::Style::default()
                     })
                     .into()
-            } else if self.session.read.is_some() {
+            } else if self.session.view.read.is_some() {
                 // The markdown reading view replaces the editor wholesale while active — the same
                 // status bar and overlays around it.
                 column![self.read_view(), self.status_bar()].into()
@@ -2734,19 +2797,20 @@ impl App {
                 let editor = editor::editor(
                     editor::Content {
                         palette: p,
-                        window: self.session.window.as_ref(),
-                        cursor: self.session.buffer.cursor,
-                        insert_mode: self.session.mode == Mode::Insert,
-                        awaiting_key: !matches!(self.session.pending, Pending::None)
-                            || self.session.count.is_some()
-                            || self.session.sneak.is_some(),
+                        window: self.session.view.window.as_ref(),
+                        focused_element: self.session.view.focused_element,
+                        cursor: self.session.view.buffer.cursor,
+                        insert_mode: self.session.view.mode == Mode::Insert,
+                        awaiting_key: !matches!(self.session.view.pending, Pending::None)
+                            || self.session.view.count.is_some()
+                            || self.session.view.sneak.is_some(),
                         diff_view: self.session.diff_view,
                         scroll_px: self.scroll_px,
                         scroll_x_px: self.scroll_x_px,
                         // Normal-mode only (matching the other shells); formatted per view —
                         // "3w ago" needs a clock, which the core deliberately lacks.
-                        blame: (self.session.mode == Mode::Normal)
-                            .then_some(self.session.blame.as_ref())
+                        blame: (self.session.view.mode == Mode::Normal)
+                            .then_some(self.session.view.blame.as_ref())
                             .flatten()
                             .map(|(line, b)| (*line, aether_client::labels::format_blame(b))),
                         tab_width: TAB_WIDTH,
@@ -2758,7 +2822,7 @@ impl App {
                 column![Element::from(editor), self.status_bar()].into()
             };
         let mut layers: Vec<Element<'_, Message>> = vec![base];
-        if self.session.mode == Mode::Search {
+        if self.session.view.mode == Mode::Search {
             layers.push(self.search_bar());
         }
         if self.hover.is_some() {
@@ -3520,9 +3584,9 @@ impl App {
         // `on_key` (commit / history nav / cancel) since `on_submit` is unset. With option chips
         // present (and none yet selected), Left/Backspace at the query start steps into the chip
         // row instead of editing — the browser tag-input gesture, mirroring the picker query.
-        let chips = self.session.search.option_chips();
+        let chips = self.session.view.search.option_chips();
         let input = {
-            let inner = iced::widget::text_input("Search", &self.session.search.query)
+            let inner = iced::widget::text_input("Search", &self.session.view.search.query)
                 .id(OverlayField::Search.id(self.window))
                 .on_input(SearchInputMsg::Typed)
                 .font(SANS)
@@ -3537,11 +3601,11 @@ impl App {
                     value: p.fg_bright,
                     selection: p.accent,
                 });
-            let intercept = !chips.is_empty() && self.session.search.chip_selected.is_none();
+            let intercept = !chips.is_empty() && self.session.view.search.chip_selected.is_none();
             let wrapped = if intercept {
                 crate::alt_filter::alt_passthrough_intercept(
                     inner,
-                    self.session.search.query.clone(),
+                    self.session.view.search.query.clone(),
                     move |key, at_start| {
                         use iced::keyboard::key::Named;
                         if !at_start {
@@ -3570,7 +3634,7 @@ impl App {
         // the grep picker's filter chips. The chip row is *always* the first child (empty when no
         // options are set) so the query input keeps a stable tree position — prepending a chip must
         // not knock focus off the `text_input`.
-        let selected = self.session.search.chip_selected;
+        let selected = self.session.view.search.chip_selected;
         let mut chips_row = row![].spacing(4).align_y(iced::Alignment::Center);
         for (i, chip) in chips.iter().enumerate() {
             chips_row = chips_row.push(option_chip(chip, selected == Some(i), ui, p));
@@ -4082,15 +4146,20 @@ impl App {
         let est_h = est_lines as f32 * ui.line_height() + 20.0;
         let mut anchor = None;
         let mut max_h = MAX_H;
-        if self.session.read.is_some() {
+        if self.session.view.read.is_some() {
             // Reading view: there's no cursor cell to hang from — park bottom-left over the
             // document (the terminal's bottom-anchored popover placement), where the read
             // target reveal (`Tab`) expects it.
             let view_h = self.view_size.height;
             max_h = MAX_H.min((view_h - 2.0 * MARGIN).max(40.0));
             anchor = Some((MARGIN + 4.0, HoverPlace::Bottom(view_h - MARGIN)));
-        } else if let (Some(cell), Some(window)) = (self.cell, &self.session.window) {
-            let pc = grid::position_cell(window, self.session.buffer.cursor.position, TAB_WIDTH);
+        } else if let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) {
+            let pc = grid::position_cell(
+                window,
+                self.session.view.focused_element,
+                self.session.view.buffer.cursor.position,
+                TAB_WIDTH,
+            );
             // Horizontal anchor: refreshed while the cursor is in the loaded window, and retained
             // when it scrolls out of range so the popover keeps its column instead of jumping left.
             let x = match pc {
@@ -4112,12 +4181,17 @@ impl App {
             let place = match pc {
                 // Cursor scrolled out of the loaded window: park against the edge it left by
                 // (orientation no longer matters — the line isn't visible).
-                None if self.session.buffer.cursor.position.line < window.first_logical_line => {
+                None if !aether_client::grid::line_is_loaded(
+                    window,
+                    self.session.view.focused_element,
+                    self.session.view.buffer.cursor.position.line,
+                ) =>
+                {
                     HoverPlace::Top(MARGIN)
                 }
                 None => HoverPlace::Bottom(view_h - MARGIN),
                 Some((row, _, _)) => {
-                    let line_top = PAD + row as f32 * cell.height - self.scroll_px;
+                    let line_top = PAD + row.get() as f32 * cell.height - self.scroll_px;
                     let line_bottom = line_top + cell.height;
                     // Orientation is decided once (the first frame, line on-screen) and retained, so
                     // the popover never flips sides mid-scroll: below if it fits there, else above if
@@ -4229,10 +4303,10 @@ impl App {
     /// Prompt count label: "3/47", "3/10000+", bare total when the cursor isn't on a match,
     /// "no matches" — `None` while the query is empty.
     fn search_count_label(&self) -> Option<String> {
-        if self.session.search.query.is_empty() {
+        if self.session.view.search.query.is_empty() {
             return None;
         }
-        let summary = self.session.search.summary.as_ref()?;
+        let summary = self.session.view.search.summary.as_ref()?;
         if summary.total == 0 {
             return Some("no matches".into());
         }
@@ -4253,9 +4327,9 @@ impl App {
     /// Cursor `line:col`, or the selection span in Normal mode (1-based) — the web client's
     /// `positionLabel`.
     fn position_label(&self) -> String {
-        let p = self.session.buffer.cursor.position;
-        let a = self.session.buffer.cursor.anchor;
-        if self.session.mode == Mode::Insert || p == a {
+        let p = self.session.view.buffer.cursor.position;
+        let a = self.session.view.buffer.cursor.anchor;
+        if self.session.view.mode == Mode::Insert || p == a {
             return format!("{}:{}", p.line + 1, p.col + 1);
         }
         let lo = min_pos(p, a);
@@ -4321,7 +4395,7 @@ impl App {
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / ui.char_width()) as usize).max(12);
-        let label = crate::labels::truncate_path(&self.session.buffer.label, budget);
+        let label = crate::labels::truncate_path(&self.session.view.buffer.label, budget);
         used += label.chars().count();
         let name = text(label)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -4329,7 +4403,7 @@ impl App {
             .color(p.fg)
             .font(
                 // A transient (preview) buffer slants the file label, like the other clients.
-                if self.session.buffer.transient {
+                if self.session.view.buffer.transient {
                     SANS_ITALIC
                 } else {
                     SANS
@@ -4360,6 +4434,7 @@ impl App {
         // section, by a dim `·` divider.
         else if let Some(gs) = self
             .session
+            .view
             .window
             .as_ref()
             .and_then(|w| w.git_status.as_ref())
@@ -4443,8 +4518,8 @@ impl App {
             *used += s.chars().count() + 2;
         };
         // Committed-search counter, only while the cursor sits on a match (web convention).
-        if self.session.search.active {
-            if let Some(s) = self.session.search.summary.as_ref() {
+        if self.session.view.search.active {
+            if let Some(s) = self.session.view.search.summary.as_ref() {
                 if s.current_index > 0 && s.total > 0 {
                     let seg = format!("{}/{}", s.current_index, format_total(s));
                     gap(&mut right_used, &seg);
@@ -4452,21 +4527,21 @@ impl App {
                 }
             }
         }
-        if let Some(results) = self.session.buffer.cursor.jumplist_position {
+        if let Some(results) = self.session.view.buffer.cursor.jumplist_position {
             let seg = format!("({}/{})", results.current, results.total);
             gap(&mut right_used, &seg);
             right = right.push(t(seg, p.fg));
         }
         // Diagnostic counts, as a tight cluster left of the position. Text glyphs stand in for
         // the web client's SVG icons (same forms as the TUI).
-        if !self.session.diagnostics.is_empty() {
+        if !self.session.view.diagnostics.is_empty() {
             use aether_protocol::viewport::DiagnosticSeverity as S;
             let mut diag = row![].spacing(8);
             for (n, sev) in [
-                (self.session.diagnostics.errors, S::Error),
-                (self.session.diagnostics.warnings, S::Warning),
-                (self.session.diagnostics.infos, S::Information),
-                (self.session.diagnostics.hints, S::Hint),
+                (self.session.view.diagnostics.errors, S::Error),
+                (self.session.view.diagnostics.warnings, S::Warning),
+                (self.session.view.diagnostics.infos, S::Information),
+                (self.session.view.diagnostics.hints, S::Hint),
             ] {
                 if n > 0 {
                     let seg = format!("{} {n}", theme::diag_glyph(sev));
@@ -4480,7 +4555,7 @@ impl App {
         gap(&mut right_used, &position);
         right = right.push(t(position, p.fg));
         // LSP health dot: state-coloured; a ready server with in-flight progress shows busy.
-        if let Some(lsp) = &self.session.lsp {
+        if let Some(lsp) = &self.session.view.lsp {
             let color = if matches!(lsp.status, LspStatus::Ready) && !lsp.progress.is_empty() {
                 p.warning
             } else {
@@ -4501,7 +4576,7 @@ impl App {
         // `CRUMB_SEPARATOR`, and glyph-plus-two-gaps is deliberately tuned to land at about that
         // width, so the estimate it already makes is the right one.
         let parts = aether_client::labels::truncate_symbol_path_parts(
-            &self.session.symbol_path,
+            &self.session.view.symbol_path,
             crumb_budget_cols(self.chrome_width(), &ui, used + right_used),
         );
         if let Some((innermost, ancestors)) = parts.split_last() {
@@ -4783,7 +4858,12 @@ fn core_key_message(code: KeyCode) -> Message {
 }
 
 fn loaded_rows(window: &Window) -> u32 {
-    window.lines.iter().map(grid::line_rows).sum()
+    // Chrome rows occupy screen rows too, so the loaded height counts every row-producing
+    // item, not only the lines.
+    grid::row_items(window)
+        .iter()
+        .map(grid::RowItem::rows)
+        .sum()
 }
 
 /// Where the hover popover hangs relative to the cursor line: `Top(y)` puts its top edge at `y`
@@ -5192,7 +5272,7 @@ impl App {
     fn read_view(&self) -> Element<'_, Message> {
         let ui = self.ui();
         let p = self.palette();
-        let Some(read) = self.session.read.as_ref() else {
+        let Some(read) = self.session.view.read.as_ref() else {
             return iced::widget::Space::new().into();
         };
         let body = self.session.buffer_font_size as f32 * READ_SCALE;
@@ -5201,7 +5281,7 @@ impl App {
         // position; the target pill inverts the interactive span the cursor sits inside, on top of
         // it. An extended selection adds the NORD2 tint over its blocks and suppresses the pill
         // (`display_target`).
-        let cursor_state = self.session.buffer.cursor;
+        let cursor_state = self.session.view.buffer.cursor;
         let block_span = read
             .display_block_focus(&cursor_state)
             .map(|i| read.elements[i].span());
@@ -5586,6 +5666,7 @@ impl App {
                 // the editor's own token colours; plain body-coloured monospace until then.
                 let hls = self
                     .session
+                    .view
                     .read
                     .as_ref()
                     .and_then(|r| r.code_highlights.get(&span.start))
@@ -6570,13 +6651,13 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
 /// Buffer-state dot colour for the session, shown in the status bar.
 fn session_state_color(s: &Session) -> Option<iced::Color> {
     let p = theme::palette(s.theme);
-    if s.externally_deleted {
+    if s.view.externally_deleted {
         return Some(p.state_deleted);
     }
-    if s.externally_modified {
+    if s.view.externally_modified {
         return Some(p.state_changed);
     }
-    if s.buffer.revision != s.buffer.saved_revision {
+    if s.view.buffer.revision != s.view.buffer.saved_revision {
         return Some(p.state_unsaved);
     }
     None
@@ -7578,7 +7659,7 @@ mod tests {
         use crate::core::markdown;
         let src = "- Two paragraphs. The first.\n\n  And the second.\n\n  ```json\n  {}\n  ```\n\n- A solo item\n";
         let blocks = markdown::parse(src);
-        let stops: Vec<u32> = markdown::elements(&blocks)
+        let stops: Vec<u32> = markdown::stops(&blocks)
             .iter()
             .filter(|e| e.is_block())
             .map(|e| e.span().start)

@@ -158,7 +158,7 @@ impl NotificationMethod for SearchStateChanged {
 
 /// Byte range within a logical line covered by a search match. Multi-line matches show up as one
 /// entry per line they touch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SearchMatchRange {
     pub start: u32,
     pub end: u32,

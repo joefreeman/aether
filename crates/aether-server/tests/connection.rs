@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::{ViewLine, VisualRow};
 use common::*;
 
 // ---- (preamble) --------------------------------------------------------------------------------
@@ -164,12 +165,12 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -198,7 +199,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         &ViewportScrollParams {
             viewport_id,
             scroll: ScrollPosition {
-                logical_line: 8,
+                logical_line: ViewLine(8),
                 sub_row: 0.0,
             },
         },
@@ -224,7 +225,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
     assert_eq!(reopen.buffer_id, buffer_id);
     assert_eq!(reopen.cursor.position, cursor_target);
     let scroll = reopen.scroll.expect("scroll restored on reopen");
-    assert_eq!(scroll.logical_line, 8);
+    assert_eq!(scroll.logical_line, ViewLine(8));
 
     drop(server);
 }
@@ -274,12 +275,12 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -295,7 +296,7 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
         &mut ws,
         &ViewportScrollToRowParams {
             viewport_id: sub.viewport_id,
-            top_visual_row: 20,
+            top_visual_row: VisualRow(20),
         },
     )
     .await;
@@ -317,7 +318,8 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
     assert_eq!(reopen.buffer_id, buffer_id);
     let scroll = reopen.scroll.expect("scroll restored on reopen");
     assert_eq!(
-        scroll.logical_line, 20,
+        scroll.logical_line,
+        ViewLine(20),
         "a row-based scroll is restored on reopen, not just logical-line scrolls"
     );
 
@@ -372,12 +374,12 @@ async fn buffer_open_jump_drops_saved_scroll() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -393,7 +395,7 @@ async fn buffer_open_jump_drops_saved_scroll() {
         &ViewportScrollParams {
             viewport_id: sub.viewport_id,
             scroll: ScrollPosition {
-                logical_line: 8,
+                logical_line: ViewLine(8),
                 sub_row: 0.0,
             },
         },
@@ -471,12 +473,12 @@ async fn buffer_open_isolates_scroll_per_client() {
         let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             &mut ws,
             &ViewportSubscribeParams {
-                buffer_id: open.buffer_id,
+                buffer_id: aether_protocol::ViewId(open.buffer_id),
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: 0,
+                    logical_line: ViewLine(0),
                     sub_row: 0.0,
                 },
                 wrap: WrapMode::None,
@@ -498,7 +500,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &ViewportScrollParams {
             viewport_id: vp_a,
             scroll: ScrollPosition {
-                logical_line: 5,
+                logical_line: ViewLine(5),
                 sub_row: 0.0,
             },
         },
@@ -509,7 +511,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         &ViewportScrollParams {
             viewport_id: vp_b,
             scroll: ScrollPosition {
-                logical_line: 17,
+                logical_line: ViewLine(17),
                 sub_row: 0.0,
             },
         },
@@ -544,8 +546,8 @@ async fn buffer_open_isolates_scroll_per_client() {
         },
     )
     .await;
-    assert_eq!(reopen_a.scroll.expect("a").logical_line, 5);
-    assert_eq!(reopen_b.scroll.expect("b").logical_line, 17);
+    assert_eq!(reopen_a.scroll.expect("a").logical_line, ViewLine(5));
+    assert_eq!(reopen_b.scroll.expect("b").logical_line, ViewLine(17));
 
     drop(server);
 }
@@ -735,12 +737,12 @@ async fn viewport_subscribe_renders_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -752,15 +754,15 @@ async fn viewport_subscribe_renders_window() {
     )
     .await;
 
-    assert_eq!(sub.window.first_logical_line, 0);
+    assert_eq!(sub.window.first_view_line, ViewLine(0));
     // 5 newlines in our content => ropey reports 6 lines (final empty).
-    assert!(sub.window.last_logical_line_exclusive >= 5);
+    assert!(sub.window.last_view_line_exclusive >= ViewLine(5));
 
-    let line0 = &sub.window.lines[0];
+    let line0 = &sub.window.root.lines()[0];
     assert_eq!(line0.logical_line, 0);
     assert_eq!(line0.visual_rows.len(), 1);
     assert_eq!(line0.visual_rows[0].segments[0].text, "alpha");
-    let line2 = &sub.window.lines[2];
+    let line2 = &sub.window.root.lines()[2];
     assert_eq!(line2.visual_rows[0].segments[0].text, "gamma");
 }
 
@@ -801,12 +803,12 @@ async fn viewport_subscribe_wraps_long_line() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 20,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -819,7 +821,7 @@ async fn viewport_subscribe_wraps_long_line() {
     .await;
 
     // The single logical line should wrap to multiple visual rows.
-    let line0 = &sub.window.lines[0];
+    let line0 = &sub.window.root.lines()[0];
     assert_eq!(line0.logical_line, 0);
     assert!(
         line0.visual_rows.len() >= 2,
@@ -882,12 +884,12 @@ async fn viewport_scroll_returns_new_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 2,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -898,22 +900,22 @@ async fn viewport_scroll_returns_new_window() {
         },
     )
     .await;
-    assert_eq!(sub.window.first_logical_line, 0);
+    assert_eq!(sub.window.first_view_line, ViewLine(0));
 
     let scrolled: ViewportWindowResult = send_request::<ViewportScroll>(
         &mut ws,
         &ViewportScrollParams {
             viewport_id: sub.viewport_id,
             scroll: ScrollPosition {
-                logical_line: 20,
+                logical_line: ViewLine(20),
                 sub_row: 0.0,
             },
         },
     )
     .await;
-    assert_eq!(scrolled.window.first_logical_line, 18); // 20 - overscan(2)
-    assert!(scrolled.window.last_logical_line_exclusive >= 25);
-    let first_text = &scrolled.window.lines[2].visual_rows[0].segments[0].text;
+    assert_eq!(scrolled.window.first_view_line, ViewLine(18)); // 20 - overscan(2)
+    assert!(scrolled.window.last_view_line_exclusive >= ViewLine(25));
+    let first_text = &scrolled.window.root.lines()[2].visual_rows[0].segments[0].text;
     assert_eq!(first_text, "line 20");
 }
 
@@ -964,12 +966,12 @@ async fn the_socket_logs_pushes_it_read_past() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut b,
         &ViewportSubscribeParams {
-            buffer_id: b_open.buffer_id,
+            buffer_id: aether_protocol::ViewId(b_open.buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -1011,7 +1013,7 @@ async fn the_socket_logs_pushes_it_read_past() {
         "B's socket should have logged the lines_changed push it read past"
     );
     assert!(
-        pushes.iter().any(|p| p.replacement_lines.iter().any(|l| l
+        pushes.iter().any(|p| p.root.lines().iter().any(|l| l
             .visual_rows
             .iter()
             .any(|r| r.segments.iter().any(|s| s.text.contains('X'))))),

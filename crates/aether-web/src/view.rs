@@ -30,16 +30,21 @@ fn name<T: std::fmt::Debug>(v: &T) -> String {
 /// Build the render view from the session. The TS shell reads this each frame.
 pub fn build_view(s: &Session) -> Value {
     json!({
-        "mode": mode(s.mode),
+        "mode": mode(s.view.mode),
         "conn": conn(&s.conn),
         "workspace": s.workspace,
         "workspace_paths": s.workspace_paths,
         // Which context this window is in — the label reads it, and the picker's open-in-new-tab
         // links carry it so a link opened from a worktree lands in that worktree.
         "workspace_worktrees": s.workspace_worktrees,
+        // What this view *is*, as distinct from the buffer being edited — see `ViewState::view_id`.
+        // `viewport/subscribe` addresses this one.
+        "view_id": s.view.view_id,
+        // Which element holds the cursor: "is this line loaded?" is a per-element question.
+        "focused_element": s.view.focused_element,
         "buffer": buffer(s),
-        "viewport_id": s.viewport_id,
-        "window": s.window.as_ref().map(jv),
+        "viewport_id": s.view.viewport_id,
+        "window": s.view.window.as_ref().map(jv),
         "wrap": jv(&s.wrap),
         "diff_view": s.diff_view,
         "ligatures": s.ligatures,
@@ -51,24 +56,24 @@ pub fn build_view(s: &Session) -> Value {
         // "dark" | "light" (ThemeMode's lowercase wire form): the shell stamps this onto
         // `<html data-theme>` and theme.css switches its role variables on it.
         "theme": jv(&s.theme),
-        "diagnostics": jv(&s.diagnostics),
-        "lsp": s.lsp.as_ref().map(jv),
-        "externally_modified": s.externally_modified,
-        "externally_deleted": s.externally_deleted,
+        "diagnostics": jv(&s.view.diagnostics),
+        "lsp": s.view.lsp.as_ref().map(jv),
+        "externally_modified": s.view.externally_modified,
+        "externally_deleted": s.view.externally_deleted,
         // The long-running git operation in flight, if any. The repo id it also carries stays in
         // the core — the shell only paints the indicator; `Space g x` is dispatched core-side.
         "git_operation": s.git_operation.as_ref().map(|(_, op)| jv(op)),
         // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
         // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
-        "blame": s.blame.as_ref().map(|(line, b)| json!({
+        "blame": s.view.blame.as_ref().map(|(line, b)| json!({
             "line": line,
             "author": b.author,
             "timestamp": b.timestamp,
             "is_uncommitted": b.is_uncommitted,
         })),
-        "count": s.count,
-        "pending": pending(&s.pending),
-        "sneak_active": s.sneak.is_some(),
+        "count": s.view.count,
+        "pending": pending(&s.view.pending),
+        "sneak_active": s.view.sneak.is_some(),
         "search": search(s),
         "prompt": prompt(&s.prompt, &s.workspace_paths, &s.conn),
         "picker": picker(&s.picker, &s.workspace_paths),
@@ -89,11 +94,11 @@ pub fn build_view(s: &Session) -> Value {
 /// (always present for a non-empty document); `target_span` is the interactive span the cursor sits
 /// inside, absent otherwise.
 fn read_view(s: &Session) -> Value {
-    let Some(read) = &s.read else {
+    let Some(read) = &s.view.read else {
         return Value::Null;
     };
     let span_json = |sp: aether_client::markdown::Span| json!({ "start": sp.start, "end": sp.end });
-    let cursor = s.buffer.cursor;
+    let cursor = s.view.buffer.cursor;
     let block = read
         .display_block_focus(&cursor)
         .map(|i| read.elements[i].span());
@@ -446,7 +451,7 @@ fn conn(c: &ConnState) -> Value {
 }
 
 fn buffer(s: &Session) -> Value {
-    let b = &s.buffer;
+    let b = &s.view.buffer;
     json!({
         "buffer_id": b.buffer_id,
         "path": b.path,
@@ -484,7 +489,7 @@ fn pending(p: &Pending) -> Value {
 }
 
 fn search(s: &Session) -> Value {
-    let q = &s.search;
+    let q = &s.view.search;
     // The active match options as chips (case / whole-word / literal), rendered with the same
     // styling as the grep picker's filter chips. `flag` marks the chips that render underlined.
     let chips = q
@@ -523,6 +528,80 @@ mod tests {
         assert_eq!(v["pending"], Value::Null);
         // The buffer projection carries the protocol cursor verbatim.
         assert!(v["buffer"]["cursor"].is_object());
+    }
+
+    /// The browser's render path over a patch-shaped view, at every kind of scroll position.
+    ///
+    /// `render()` calls `set_visible_lines` and then `view()` on every frame, and both walk the
+    /// window's tree. A patch is the shape that breaks tree walks — several elements, chrome
+    /// between them, lines numbered from their own files — and a panic in either is invisible in the
+    /// browser beyond `RuntimeError: unreachable executed` (see `install_panic_hook`).
+    #[test]
+    fn rendering_a_patch_view_walks_its_tree_without_panicking() {
+        use aether_protocol::coords::{ViewLine, VisualRow};
+        use aether_protocol::viewport::{Element, LogicalLineRender, Segment, Window, WrappedRow};
+        let mut s = WasmSession::new();
+        let line = |n: u32| LogicalLineRender {
+            logical_line: n,
+            visual_rows: vec![WrappedRow {
+                byte_offset: 0,
+                continuation_indent: 0,
+                segments: vec![Segment {
+                    text: format!("line {n}"),
+                    highlights: vec![],
+                }],
+            }],
+            search_matches: vec![],
+            baseline_above: vec![],
+            change: Default::default(),
+            diagnostics: vec![],
+            sneak_targets: vec![],
+        };
+        let chrome = Element::Chrome {
+            kind: aether_protocol::viewport::ChromeKind::FileHeader,
+            rail: aether_protocol::ui::RailJoin::Opens,
+            children: vec![aether_protocol::ui::Element::text("a.rs", vec![])],
+        };
+        let w = Window {
+            first_view_line: ViewLine(0),
+            last_view_line_exclusive: ViewLine(4),
+            view_line_count: 4,
+            max_scroll_view_line: ViewLine(0),
+            total_visual_rows: 6,
+            first_visual_row: VisualRow(0),
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Stack {
+                children: vec![
+                    chrome.clone(),
+                    Element::Editor {
+                        element: 0,
+                        buffer: 7,
+                        rows: 2,
+                        first_buffer_line: 16,
+                        lines: vec![line(16), line(17)],
+                    },
+                    chrome,
+                    Element::Editor {
+                        element: 1,
+                        buffer: 8,
+                        rows: 2,
+                        first_buffer_line: 40,
+                        lines: vec![line(40), line(41)],
+                    },
+                ],
+            },
+        };
+        s.session_mut().view.window = Some(w);
+        s.session_mut().view.focused_element = 1;
+        s.session_mut().view.buffer.cursor.position =
+            aether_protocol::LogicalPosition { line: 40, col: 0 };
+        // What `render()` does, in order.
+        for top in [0u32, 3, 5, 6, 99] {
+            s.set_visible_lines(top, 40);
+            let v = build_view(s.session());
+            assert!(v["window"].is_object(), "top={top}");
+        }
     }
 
     #[test]

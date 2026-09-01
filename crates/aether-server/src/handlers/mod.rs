@@ -13,8 +13,9 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, DeferredToken, Document, DocumentId, EditKindTag, LineEnding, NavEntry,
-    SearchEntry, ServerState, SharedState, SneakCandidate, SneakEntry, Viewport,
+    BlameCache, Buffer, DeferredToken, Document, DocumentId, EditKindTag, ElementBinding,
+    LineEnding, NavEntry, SearchEntry, ServerState, SharedState, SneakCandidate, SneakEntry,
+    ViewLayout, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -98,11 +99,11 @@ use aether_protocol::sneak::{
     SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
 };
 use aether_protocol::viewport::{
-    BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
-    LogicalLineRange, LogicalLineRender, PatchLine, ScrollPosition, ViewportLinesChanged,
-    ViewportLinesChangedParams, ViewportResizeParams, ViewportScrollParams, ViewportSetWrapParams,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRow,
-    VirtualRowKind, Window,
+    BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,
+    Element, EmphasisRange, LineChange, LogicalLineRange, LogicalLineRender, PatchLine,
+    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams,
+    ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportWindowResult, Window,
 };
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,
@@ -114,7 +115,7 @@ use aether_protocol::workspace::{
     WorkspaceSummary,
 };
 use aether_protocol::LogicalPosition;
-use aether_protocol::{BufferId, ClientId, Revision};
+use aether_protocol::{BufferId, ClientId, Revision, ViewId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;

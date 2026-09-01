@@ -6,16 +6,22 @@ use super::*;
 
 pub const SEARCH_MAX_MATCHES: usize = 10_000;
 
-/// Run `query` against the buffer and produce a fresh `SearchEntry`, honouring `options`: by
-/// default the query is matched literally (escaped), and `regex` opts into regex syntax;
-/// `whole_word` wraps it in `\b…\b`, and `case` selects smartcase (case-insensitive unless the
-/// query has an uppercase letter), forced-sensitive or forced-insensitive. `multi_line: true`
-/// throughout. Zero-width matches are skipped so patterns like `^` don't pin the cursor.
+/// Run `query` against the focused element's window onto the buffer and produce a fresh
+/// `SearchEntry`, honouring `options`: by default the query is matched literally (escaped), and
+/// `regex` opts into regex syntax; `whole_word` wraps it in `\b…\b`, and `case` selects smartcase
+/// (case-insensitive unless the query has an uppercase letter), forced-sensitive or
+/// forced-insensitive. `multi_line: true` throughout. Zero-width matches are skipped so patterns
+/// like `^` don't pin the cursor.
+///
+/// Scoped like every motion, and for the same reason: matching a whole file while the view shows one
+/// hunk of it counted matches the user cannot see and let `n` step the cursor onto a line nothing
+/// rendered. A whole-buffer element searches the whole buffer, which is every view but a patch.
 pub fn compute_search_entry(
-    buf: &Document,
+    scope: &motion::Scope,
     query: &str,
     options: &MatchOptions,
 ) -> Result<SearchEntry, RpcError> {
+    let buf = scope.doc();
     if query.is_empty() {
         return Ok(SearchEntry {
             query: String::new(),
@@ -31,7 +37,7 @@ pub fn compute_search_entry(
         .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?;
     let mut matches: Vec<(LogicalPosition, LogicalPosition)> = Vec::new();
     let mut truncated = false;
-    let len_bytes = buf.text.len_bytes();
+    let len_bytes = scope.text().len_bytes();
     if len_bytes == 0 {
         return Ok(SearchEntry {
             query: query.to_string(),
@@ -41,7 +47,11 @@ pub fn compute_search_entry(
             last_pushed_index: 0,
         });
     }
-    let source: String = buf.text.chunks().collect();
+    // The element's text and nothing else — so `truncated` counts what the view holds, and a match
+    // below the hunk is not a match. Offsets come back relative to the window; `base` returns them
+    // to the document's own bytes.
+    let source: String = scope.text().chunks().collect();
+    let base = scope.first_byte();
     for m in regex.find_iter(&source) {
         if matches.len() >= SEARCH_MAX_MATCHES {
             truncated = true;
@@ -51,8 +61,8 @@ pub fn compute_search_entry(
             continue;
         }
         matches.push((
-            byte_to_logical(buf, m.start()),
-            byte_to_logical(buf, m.end()),
+            byte_to_logical(buf, base + m.start()),
+            byte_to_logical(buf, base + m.end()),
         ));
     }
     Ok(SearchEntry {
@@ -64,6 +74,49 @@ pub fn compute_search_entry(
     })
 }
 
+/// Re-run one client's active search under its **current** scope, returning the summary push if
+/// there was a search to re-run.
+///
+/// Focus moving is the one thing that changes a search's answer without touching a character of
+/// text: matches belong to the focused element, so stepping to the next hunk has to re-run the query
+/// there. Without this, `n` would step through the *previous* element's matches — the same "cursor
+/// lands where the view shows nothing" bug in a different coat.
+pub fn rescope_search(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> PendingPushes {
+    let key = (client_id, buffer_id);
+    let Some(existing) = s.searches.get(&key) else {
+        return Vec::new();
+    };
+    let (query, options) = (existing.query.clone(), existing.options);
+    let Ok(scope) = s.motion_scope(client_id, buffer_id) else {
+        return Vec::new();
+    };
+    let Ok(mut entry) = compute_search_entry(&scope, &query, &options) else {
+        return Vec::new();
+    };
+    let cursor = s.cursors.get(&key).copied().unwrap_or_default();
+    let summary = summary_for(scope.doc(), &entry, buffer_id, &cursor);
+    entry.last_pushed_index = summary.current_index;
+    s.searches.insert(key, entry);
+    s.clients
+        .get(&client_id)
+        .map(|c| c.outbound.clone())
+        .map(|sender| {
+            vec![(
+                sender,
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: SearchStateChanged::NAME.into(),
+                    params: serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null),
+                },
+            )]
+        })
+        .unwrap_or_default()
+}
+
 pub async fn search_set(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -71,9 +124,8 @@ pub async fn search_set(
 ) -> Result<SearchSetResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
+    let buf = scope.doc();
     let key = (client_id, params.buffer_id);
 
     let mut cursor = s.cursors.get(&key).copied().unwrap_or_default();
@@ -113,7 +165,7 @@ pub async fn search_set(
         let pushes = collect_viewport_refresh(&s, client_id, params.buffer_id);
         (summary, pushes)
     } else {
-        let mut entry = compute_search_entry(buf, &params.query, &params.options)?;
+        let mut entry = compute_search_entry(&scope, &params.query, &params.options)?;
         // If the caller passed an anchor, jump the cursor to the first match at-or-after it
         // (wrapping to the first match if none). This is how incremental search keeps the cursor
         // anchored at `/`-press time across keystrokes.

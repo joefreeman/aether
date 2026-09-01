@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EditResult {
+    /// Which buffer the edit landed in, and whose revision this is.
+    ///
+    /// Not always the buffer the client named: an edit is addressed to a *view*, and the server
+    /// resolves which of its elements — hence which buffer — it acts on. Even for a one-buffer view
+    /// it matters, because the client's view can switch while the edit is in flight, and adopting
+    /// the old buffer's revision against the new one makes every later push for it look stale.
+    pub buffer: BufferId,
     pub revision: Revision,
     /// Cursor position immediately after the edit. Saves the client a round-trip to learn where
     /// the cursor landed.
@@ -25,7 +32,7 @@ pub struct BufferOnlyParams {
 
 pub struct InputText;
 impl RpcMethod for InputText {
-    const NAME: &'static str = "input/text";
+    const NAME: &'static str = "element/text";
     const MUTATES_TEXT: bool = true;
     type Params = InputTextParams;
     type Result = EditResult;
@@ -59,7 +66,7 @@ pub struct InputTextParams {
 /// delete.
 pub struct InputDelete;
 impl RpcMethod for InputDelete {
-    const NAME: &'static str = "input/delete";
+    const NAME: &'static str = "element/delete";
     const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
@@ -74,7 +81,7 @@ impl RpcMethod for InputDelete {
 /// selection collapses to a single empty line. Normal-mode `Ctrl-e`.
 pub struct InputChange;
 impl RpcMethod for InputChange {
-    const NAME: &'static str = "input/change";
+    const NAME: &'static str = "element/change";
     const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
@@ -103,7 +110,7 @@ pub struct CountedEditParams {
 /// and "delete the previous char" is its own gesture, distinct from "delete the selection".
 pub struct InputBackspace;
 impl RpcMethod for InputBackspace {
-    const NAME: &'static str = "input/backspace";
+    const NAME: &'static str = "element/backspace";
     const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
@@ -121,7 +128,7 @@ impl RpcMethod for InputBackspace {
 /// free to cross the line boundary, exactly as `b` does in Normal mode.
 pub struct InputDeleteWord;
 impl RpcMethod for InputDeleteWord {
-    const NAME: &'static str = "input/delete_word";
+    const NAME: &'static str = "element/delete_word";
     const MUTATES_TEXT: bool = true;
     type Params = InputDeleteWordParams;
     type Result = EditResult;
@@ -153,7 +160,7 @@ pub struct InputDeleteWordParams {
 /// the previous stop within a line's leading whitespace.
 pub struct InputTab;
 impl RpcMethod for InputTab {
-    const NAME: &'static str = "input/tab";
+    const NAME: &'static str = "element/tab";
     const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
@@ -166,7 +173,7 @@ impl RpcMethod for InputTab {
 /// promoted up, or the previous line if we deleted the last line). Insert-mode `Ctrl-d`.
 pub struct InputDeleteLine;
 impl RpcMethod for InputDeleteLine {
-    const NAME: &'static str = "input/delete_line";
+    const NAME: &'static str = "element/delete_line";
     const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
@@ -176,7 +183,7 @@ impl RpcMethod for InputDeleteLine {
 /// lands at col 0 of the now-empty line. Insert-mode `Ctrl-c` ("change line").
 pub struct InputChangeLine;
 impl RpcMethod for InputChangeLine {
-    const NAME: &'static str = "input/change_line";
+    const NAME: &'static str = "element/change_line";
     const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
@@ -187,7 +194,7 @@ impl RpcMethod for InputChangeLine {
 /// newline boundary moves to wherever `text` ends." Insert-mode `Ctrl-r`.
 pub struct InputReplaceLine;
 impl RpcMethod for InputReplaceLine {
-    const NAME: &'static str = "input/replace_line";
+    const NAME: &'static str = "element/replace_line";
     const MUTATES_TEXT: bool = true;
     type Params = InputReplaceLineParams;
     type Result = EditResult;
@@ -203,7 +210,7 @@ pub struct InputReplaceLineParams {
 
 pub struct InputIndent;
 impl RpcMethod for InputIndent {
-    const NAME: &'static str = "input/indent";
+    const NAME: &'static str = "element/indent";
     const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
@@ -211,7 +218,7 @@ impl RpcMethod for InputIndent {
 
 pub struct InputDedent;
 impl RpcMethod for InputDedent {
-    const NAME: &'static str = "input/dedent";
+    const NAME: &'static str = "element/dedent";
     const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
@@ -228,7 +235,7 @@ impl RpcMethod for InputDedent {
 /// then digits), or when `delta` is zero.
 pub struct InputAdjustNumber;
 impl RpcMethod for InputAdjustNumber {
-    const NAME: &'static str = "input/adjust_number";
+    const NAME: &'static str = "element/adjust_number";
     const MUTATES_TEXT: bool = true;
     type Params = InputAdjustNumberParams;
     type Result = EditResult;
@@ -252,7 +259,7 @@ pub struct InputAdjustNumberParams {
 
 pub struct InputNewlineAndIndent;
 impl RpcMethod for InputNewlineAndIndent {
-    const NAME: &'static str = "input/newline_and_indent";
+    const NAME: &'static str = "element/newline_and_indent";
     const MUTATES_TEXT: bool = true;
     type Params = InputNewlineAndIndentParams;
     type Result = EditResult;
@@ -276,7 +283,7 @@ pub struct InputNewlineAndIndentParams {
 /// `Above` opens an unindented one (the TUI semantics all clients shared).
 pub struct InputOpenLine;
 impl RpcMethod for InputOpenLine {
-    const NAME: &'static str = "input/open_line";
+    const NAME: &'static str = "element/open_line";
     const MUTATES_TEXT: bool = true;
     type Params = InputOpenLineParams;
     type Result = EditResult;
@@ -320,7 +327,7 @@ pub enum CommentStyle {
 /// on either side — so toggling twice restores the original buffer and selection.
 pub struct InputToggleComment;
 impl RpcMethod for InputToggleComment {
-    const NAME: &'static str = "input/toggle_comment";
+    const NAME: &'static str = "element/toggle_comment";
     const MUTATES_TEXT: bool = true;
     type Params = ToggleCommentParams;
     type Result = EditResult;
@@ -346,7 +353,7 @@ pub struct ToggleCommentParams {
 /// edge.
 pub struct InputMoveLines;
 impl RpcMethod for InputMoveLines {
-    const NAME: &'static str = "input/move_lines";
+    const NAME: &'static str = "element/move_lines";
     const MUTATES_TEXT: bool = true;
     type Params = InputMoveLinesParams;
     type Result = EditResult;
@@ -387,7 +394,7 @@ pub enum SurroundTarget {
 /// collapses to a point past the close. An unrecognized delimiter is a no-op.
 pub struct InputSurround;
 impl RpcMethod for InputSurround {
-    const NAME: &'static str = "input/surround";
+    const NAME: &'static str = "element/surround";
     const MUTATES_TEXT: bool = true;
     type Params = InputSurroundParams;
     type Result = EditResult;
@@ -408,7 +415,7 @@ pub struct InputSurroundParams {
 /// repeated presses peel nested layers. If they aren't a pair, it's a no-op.
 pub struct InputUnsurround;
 impl RpcMethod for InputUnsurround {
-    const NAME: &'static str = "input/unsurround";
+    const NAME: &'static str = "element/unsurround";
     const MUTATES_TEXT: bool = true;
     type Params = InputUnsurroundParams;
     type Result = EditResult;
@@ -499,7 +506,7 @@ impl CaseKind {
 /// is a no-op.
 pub struct InputTransformCase;
 impl RpcMethod for InputTransformCase {
-    const NAME: &'static str = "input/transform_case";
+    const NAME: &'static str = "element/transform_case";
     const MUTATES_TEXT: bool = true;
     type Params = InputTransformCaseParams;
     type Result = EditResult;
@@ -524,7 +531,7 @@ pub struct InputTransformCaseParams {
 
 pub struct EditUndo;
 impl RpcMethod for EditUndo {
-    const NAME: &'static str = "edit/undo";
+    const NAME: &'static str = "element/undo";
     const MUTATES_TEXT: bool = true;
     type Params = UndoRedoParams;
     type Result = UndoResult;
@@ -532,7 +539,7 @@ impl RpcMethod for EditUndo {
 
 pub struct EditRedo;
 impl RpcMethod for EditRedo {
-    const NAME: &'static str = "edit/redo";
+    const NAME: &'static str = "element/redo";
     const MUTATES_TEXT: bool = true;
     type Params = UndoRedoParams;
     type Result = UndoResult;
@@ -562,7 +569,7 @@ pub struct UndoRedoParams {
 /// lines, join all of them.
 pub struct InputJoinLines;
 impl RpcMethod for InputJoinLines {
-    const NAME: &'static str = "input/join_lines";
+    const NAME: &'static str = "element/join_lines";
     const MUTATES_TEXT: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
@@ -570,6 +577,12 @@ impl RpcMethod for InputJoinLines {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UndoResult {
+    /// Which buffer was undone in — see [`EditResult::buffer`], which this mirrors.
+    ///
+    /// Undo is buffer-scoped: the stack lives on the document, so in a multi-buffer view `Ctrl-z`
+    /// undoes in the focused element's buffer, which is not necessarily the one the client thinks
+    /// of as the view's.
+    pub buffer: BufferId,
     pub revision: Revision,
     pub applied: bool,
     /// Cursor position for the requesting client after the operation. When `applied` is `false`
@@ -587,6 +600,8 @@ pub struct UndoResult {
 /// Result shared by the block-edit family.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockEditResult {
+    /// Which buffer the edit landed in — see [`EditResult::buffer`], which this mirrors.
+    pub buffer: BufferId,
     pub applied: bool,
     /// One-line refusal reason to toast; absent for quiet boundary no-ops and successes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,7 +627,7 @@ pub enum BlockUnit {
 /// the gaps; the moved text lands selected.
 pub struct InputMoveBlock;
 impl RpcMethod for InputMoveBlock {
-    const NAME: &'static str = "input/move_block";
+    const NAME: &'static str = "element/move_block";
     const MUTATES_TEXT: bool = true;
     type Params = MoveBlockParams;
     type Result = BlockEditResult;
@@ -629,7 +644,7 @@ pub struct MoveBlockParams {
 /// run), the blocks' own source returned for the clipboard.
 pub struct InputDeleteBlock;
 impl RpcMethod for InputDeleteBlock {
-    const NAME: &'static str = "input/delete_block";
+    const NAME: &'static str = "element/delete_block";
     const MUTATES_TEXT: bool = true;
     type Params = BufferOnlyParams;
     type Result = BlockEditResult;
@@ -639,7 +654,7 @@ impl RpcMethod for InputDeleteBlock {
 /// selected block(s) (`replace: true`), separator-normalized either way.
 pub struct InputPasteBlock;
 impl RpcMethod for InputPasteBlock {
-    const NAME: &'static str = "input/paste_block";
+    const NAME: &'static str = "element/paste_block";
     const MUTATES_TEXT: bool = true;
     type Params = PasteBlockParams;
     type Result = BlockEditResult;
@@ -657,7 +672,7 @@ pub struct PasteBlockParams {
 /// paragraph everywhere else. The client enters Insert when the result comes back applied.
 pub struct InputOpenBlock;
 impl RpcMethod for InputOpenBlock {
-    const NAME: &'static str = "input/open_block";
+    const NAME: &'static str = "element/open_block";
     const MUTATES_TEXT: bool = true;
     type Params = OpenBlockParams;
     type Result = BlockEditResult;
@@ -673,7 +688,7 @@ pub struct OpenBlockParams {
 /// riding along). Refuses elsewhere with a reason.
 pub struct InputBlockDepth;
 impl RpcMethod for InputBlockDepth {
-    const NAME: &'static str = "input/block_depth";
+    const NAME: &'static str = "element/block_depth";
     const MUTATES_TEXT: bool = true;
     type Params = BlockDepthParams;
     type Result = BlockEditResult;
@@ -689,7 +704,7 @@ pub struct BlockDepthParams {
 /// the cursor stays put.
 pub struct InputToggleTask;
 impl RpcMethod for InputToggleTask {
-    const NAME: &'static str = "input/toggle_task";
+    const NAME: &'static str = "element/toggle_task";
     const MUTATES_TEXT: bool = true;
     type Params = ToggleTaskParams;
     type Result = BlockEditResult;

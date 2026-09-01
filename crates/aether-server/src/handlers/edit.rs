@@ -6,6 +6,7 @@
 //! are inseparable from the multi-step apply they drive.
 
 use super::*;
+use aether_protocol::coords::ViewLine;
 
 pub async fn input_move_lines_once(
     state: &SharedState,
@@ -43,12 +44,19 @@ pub async fn input_move_lines_once(
         line_count.saturating_sub(1)
     };
 
+    // The element's edges, not the buffer's. A patch's hunk is a window onto a file, so the line
+    // "below" its last one isn't in the view: moving into it would swap a line you can see with one
+    // you can't, and carry the cursor out of the element on the way. The same thing this already
+    // does at the file's edge — a silent no-op — is the right answer at the element's, and for a
+    // whole-buffer element (every view but a patch) the two are the same line.
+    let scope = s.motion_scope(client_id, buffer_id)?;
     let can_move = match params.direction {
-        VerticalDirection::Down => b < last_real_line,
-        VerticalDirection::Up => a > 0,
+        VerticalDirection::Down => b < scope.last_line().min(last_real_line),
+        VerticalDirection::Up => a > scope.first_line(),
     };
     if !can_move {
         return Ok(EditResult {
+            buffer: buffer_id,
             revision: buf.revision,
             cursor,
         });
@@ -130,8 +138,7 @@ pub async fn input_move_lines_once(
 
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes =
         collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
@@ -151,6 +158,7 @@ pub async fn input_move_lines_once(
         let _ = sender.send(notif).await;
     }
     Ok(EditResult {
+        buffer: buffer_id,
         revision,
         cursor: new_cursor,
     })
@@ -219,7 +227,13 @@ async fn input_join_lines_once(
         } else {
             b.line
         };
-        let last = last.min(line_count.saturating_sub(1));
+        // Clamped to the **element's** last line: a join pulls up the line below, and below a
+        // hunk's last line is a line the view doesn't show. Clamping there makes `first >= last`,
+        // which is already the "nothing to join" no-op this uses at the end of a file.
+        let scope = s.motion_scope(client_id, buffer_id)?;
+        let last = last
+            .min(scope.last_line())
+            .min(line_count.saturating_sub(1));
         (first, last)
     };
 
@@ -228,6 +242,7 @@ async fn input_join_lines_once(
         let s = state.lock().await;
         let buf = s.doc_of(buffer_id);
         return Ok(EditResult {
+            buffer: buffer_id,
             revision: buf.revision,
             cursor: s
                 .cursors
@@ -317,8 +332,7 @@ async fn input_join_lines_once(
         let mut s = state.lock().await;
         let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
         search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-        let new_line_count = s.doc_of(buffer_id).line_count();
-        refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+        refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
         let pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         // LSP: full-document sync.
@@ -338,6 +352,7 @@ async fn input_join_lines_once(
     }
 
     Ok(EditResult {
+        buffer: buffer_id,
         revision,
         cursor: new_cursor,
     })
@@ -397,6 +412,7 @@ pub async fn apply_undo_or_redo(
             .copied()
             .unwrap_or_default();
         return Ok(UndoResult {
+            buffer: buffer_id,
             revision: buf.revision,
             applied: false,
             cursor,
@@ -454,8 +470,7 @@ pub async fn apply_undo_or_redo(
     // wholesale, so we can't be surgical about it.
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
     let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
@@ -474,6 +489,7 @@ pub async fn apply_undo_or_redo(
     }
 
     Ok(UndoResult {
+        buffer: buffer_id,
         revision,
         applied: true,
         cursor: undoing_cursor,
@@ -715,9 +731,11 @@ pub async fn apply_edit_reporting(
     // Phase 1: hold the lock for the whole edit; gather notification senders before dropping it.
     let mut s = state.lock().await;
 
-    let buf = s
-        .try_doc_of(buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    // The edit's operands resolve against the focused element's window onto the buffer, exactly as
+    // a motion does — `Alt-Backspace` at the top of a hunk used to delete the file's *previous*
+    // line, which the view doesn't show.
+    let scope = s.motion_scope(client_id, buffer_id)?;
+    let buf = scope.doc();
     // Refuse before resolving the edit rather than after: a virtual buffer holds a revision's
     // content and there is nothing an edit against it could mean. This is the early-out, not the
     // guarantee — `ServerState::editable_doc` is what makes the refusal unskippable, here and in
@@ -746,7 +764,7 @@ pub async fn apply_edit_reporting(
     // the fresh entropy it draws here — is caught by the no-op guard below.
     let transform_edit = match &edit {
         EditKind::TransformCase { kind, scan } => {
-            resolve_transform_case(buf, &cursor, *kind, *scan)
+            resolve_transform_case(&scope, &cursor, *kind, *scan)
         }
         _ => None,
     };
@@ -755,7 +773,7 @@ pub async fn apply_edit_reporting(
     // earlier lock; this resolution — same parse, this lock — is the one the splice uses. A
     // refusal here is a stale precheck verdict, caught by the no-op guard.
     let block_edit = match &edit {
-        EditKind::BlockEdit { op } => Some(resolve_block_edit(buf, &cursor, op).ok()),
+        EditKind::BlockEdit { op } => Some(resolve_block_edit(&scope, &cursor, op).ok()),
         _ => None,
     };
     // This — not a revision delta — is what the RPC reports back: it is the verdict of the
@@ -782,7 +800,11 @@ pub async fn apply_edit_reporting(
     if resolved_noop {
         let revision = buf.revision;
         let cursor = wrap_for_response(&s, client_id, buffer_id, cursor);
-        return Ok(EditResult { revision, cursor });
+        return Ok(EditResult {
+            buffer: buffer_id,
+            revision,
+            cursor,
+        });
     }
 
     // Compute the char range to replace and the affected line range. The range_is_inclusive
@@ -893,7 +915,7 @@ pub async fn apply_edit_reporting(
                 client_tab_width(&s, client_id, buffer_id),
             ) as u32;
             let prev = motion::resolve_motion(
-                buf,
+                &scope,
                 cursor.position,
                 &Motion::Char {
                     direction: Direction::Backward,
@@ -916,7 +938,7 @@ pub async fn apply_edit_reporting(
             count,
         } => {
             let target = motion::resolve_motion(
-                buf,
+                &scope,
                 cursor.position,
                 &Motion::Word {
                     direction: *direction,
@@ -1237,8 +1259,7 @@ pub async fn apply_edit_reporting(
 
     // Recompute every viewport's pushed range against the new line count, so a mutation that
     // *grew* the buffer (e.g. typing a newline) extends the window to cover the new lines.
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
 
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
@@ -1269,13 +1290,10 @@ pub async fn apply_edit_reporting(
     }
 
     Ok(EditResult {
+        buffer: buffer_id,
         revision,
         cursor: new_cursor_state,
     })
-}
-
-pub fn ranges_overlap(a_start: u32, a_end_excl: u32, b_start: u32, b_end_excl: u32) -> bool {
-    a_start < b_end_excl && b_start < a_end_excl
 }
 
 /// The edit-push range gate's alternative: queue a revision-only `buffer/changed` for a viewport
@@ -1353,8 +1371,8 @@ pub fn workspace_candidates(
 /// decorated the same way RPC responses are (`wrap_for_response`). `None` when the client has no
 /// cursor on the buffer — the client then keeps its local state.
 pub fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
-    let cursor = s.cursors.get(&(vp.client_id, vp.buffer_id)).copied()?;
-    Some(wrap_for_response(s, vp.client_id, vp.buffer_id, cursor))
+    let cursor = s.cursors.get(&(vp.client_id, vp.buffer_id())).copied()?;
+    Some(wrap_for_response(s, vp.client_id, vp.buffer_id(), cursor))
 }
 
 /// Full-window `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
@@ -1374,42 +1392,24 @@ pub fn collect_doc_edit_pushes(
     edit_last_excl: u32,
 ) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
-    let Some(doc) = s.try_doc_of(buffer_id) else {
+    if s.try_doc_of(buffer_id).is_none() {
         return pushes;
-    };
+    }
     let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values() {
-        if !attached.contains(&vp.buffer_id) {
+        if !attached.iter().any(|id| vp.shows(*id)) {
             continue;
         }
-        if !vp.diff_view
-            && !ranges_overlap(
-                vp.first_logical_line,
-                vp.last_logical_line_exclusive,
-                edit_first,
-                edit_last_excl,
-            )
-        {
-            push_buffer_changed(s, vp, vp.buffer_id, revision, &mut pushes);
+        if !vp.diff_view && !edit_touches_window(s, vp, &attached, edit_first, edit_last_excl) {
+            push_buffer_changed(s, vp, vp.buffer_id(), revision, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let search = s.searches.get(&(vp.client_id, vp.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(
-                doc,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(s, vp.buffer_id),
-                buffer_conflicts(s, vp.buffer_id),
-                buffer_diagnostics(s, vp.buffer_id),
-                buffer_git_status(s, vp.buffer_id),
-                lines_changed_cursor(s, vp),
-            ),
+            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
         ));
     }
     pushes
@@ -1439,85 +1439,81 @@ pub fn collect_doc_lines_changed_pushes(
     revision: Revision,
 ) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
-    let Some(doc) = s.try_doc_of(buffer_id) else {
+    if s.try_doc_of(buffer_id).is_none() {
         return pushes;
-    };
+    }
     let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values() {
-        if !attached.contains(&vp.buffer_id) {
+        if !attached.iter().any(|id| vp.shows(*id)) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let search = s.searches.get(&(vp.client_id, vp.buffer_id));
         pushes.push((
             sender,
-            build_lines_changed_notif(
-                doc,
-                vp,
-                revision,
-                search,
-                buffer_both_hunks(s, vp.buffer_id),
-                buffer_conflicts(s, vp.buffer_id),
-                buffer_diagnostics(s, vp.buffer_id),
-                buffer_git_status(s, vp.buffer_id),
-                lines_changed_cursor(s, vp),
-            ),
+            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
         ));
     }
     pushes
 }
 
-#[allow(clippy::too_many_arguments)] // one notification builder, 12 call sites
 pub fn build_lines_changed_notif(
-    buffer: &Document,
+    s: &ServerState,
     vp: &Viewport,
     revision: Revision,
-    search: Option<&SearchEntry>,
-    hunks: &[crate::git::DiffHunk],
-    conflicts: &[crate::git::ConflictRegion],
-    diagnostics: &[crate::lsp::diagnostics::BufferDiagnostic],
-    git_status: Option<GitBufferStatus>,
     cursor: Option<CursorState>,
 ) -> Notification {
-    let line_count = buffer.line_count();
-    let new_first = vp.first_logical_line.min(line_count);
+    // The view, not the focused element's buffer: this push carries the whole rendered view, and
+    // its revision and line count are the view's. Saying otherwise would have a client file one
+    // buffer's revision against another — the very thing `buffer` exists to prevent.
+    let buffer_id = vp.view_id;
+    // Clamped against the **view's** length, not its own document's. For a bound patch the generated
+    // document is far longer than the view built over it, so clamping against the document let the
+    // pushed range run past the view's real end, where every element clips to nothing.
+    let view_lines = ViewLayout::of(&vp.elements, |id| s.doc_of(id).line_count()).line_count();
+    let new_first = vp.first_view_line.min(ViewLine(view_lines));
     let new_last_excl = vp
-        .last_logical_line_exclusive
-        .min(line_count)
+        .last_view_line_exclusive
+        .min(ViewLine(view_lines))
         .max(new_first);
     let window = render_window(
-        buffer,
+        s,
+        vp.client_id,
+        vp.view_id,
+        &vp.elements,
+        vp.focused,
         new_first,
         new_last_excl,
         vp.wrap_geometry(),
         vp.rows,
-        WindowDecorations {
-            search,
-            // Post-edit / async broadcast path: a sneak session can't coexist with an edit by the
-            // same client, so labels never ride this render. They reappear on the next sneak/update.
-            sneak: None,
-            diff_view: vp.diff_view,
-            hunks,
-            conflicts,
-            diagnostics,
-            git_status,
-        },
+        vp.diff_view,
+        // Post-edit / async broadcast path: a sneak session can't coexist with an edit by the same
+        // client, so labels never ride this render. They reappear on the next sneak/update.
+        SneakLabels::Hidden,
     );
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
+        // Behaviour preserved verbatim across the `ViewId` split, because the two sides of this
+        // field disagree and the disagreement predates the type. The server says the revision "is
+        // the view's" (above); the client adopts only when `p.buffer` equals the buffer it is
+        // *editing* (`update.rs`, "the revision belongs to `p.buffer`, which is not always the
+        // view's"). Those coincide for an ordinary view and never for a composed one, so a
+        // composed view's revision is not adopted from this push at all. Whether the fix is to
+        // send the focused element's buffer or to widen the client's test is a live question, not
+        // a rename decision.
+        buffer: buffer_id.presenting_buffer(),
         revision,
         range: LogicalLineRange {
-            start_logical_line: vp.first_logical_line,
-            end_logical_line_exclusive: vp.last_logical_line_exclusive,
+            start_view_line: vp.first_view_line,
+            end_view_line_exclusive: vp.last_view_line_exclusive,
         },
         total_visual_rows: window.total_visual_rows,
         first_visual_row: window.first_visual_row,
         max_line_width: window.max_line_width,
-        replacement_lines: window.lines,
-        line_count,
-        max_scroll_logical_line: window.max_scroll_logical_line,
+        root: window.root,
+        view_line_count: window.view_line_count,
+        max_scroll_view_line: window.max_scroll_view_line,
         git_status: window.git_status,
         cursor,
     };

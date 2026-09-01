@@ -19,7 +19,7 @@
 //! - **The markdown reading view**: parses whole buffers. Every block
 //!   and interactive inline carries its **source byte span**, the foundation of the read view's
 //!   source map — focus derivation, outline jumps and edit-toggle fidelity all resolve through
-//!   those spans. The flattened [`Element`] list built by [`elements`] is the navigable form.
+//!   those spans. The flattened [`Stop`] list built by [`stops`] is the navigable form.
 //!
 //! `Serialize` is for the wasm boundary (the web shell renders the AST as JSON); the native and
 //! terminal shells consume the Rust values directly.
@@ -28,7 +28,7 @@
 //! cells, tight lists, task markers, setext headings, footnotes, front matter, smart
 //! punctuation) before this design was committed — ranges are exact for everything the source
 //! map needs. The one quirk: an *indented* code block's span starts after the first line's
-//! indent. Harmless at element grain.
+//! indent. Harmless at stop grain.
 
 pub mod edit;
 
@@ -207,7 +207,7 @@ pub enum ColAlign {
 }
 
 /// An inline (span-level) node. Interactive inlines (link, image, footnote ref) carry source spans —
-/// they're focusable elements in the reading view; plain text runs don't (match painting, which
+/// they're focusable stops in the reading view; plain text runs don't (match painting, which
 /// needs text-run spans, is a later phase).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -399,7 +399,7 @@ impl Builder {
     /// The inline list to append to: the innermost inline frame, or a trailing paragraph opened
     /// in the current block context (a tight list item / blockquote emits inline text with no
     /// wrapping paragraph, so we synthesise one — spanned to its container, which is the
-    /// element-grain unit anyway).
+    /// stop-grain unit anyway).
     fn inline_target(&mut self) -> &mut Vec<Inline> {
         if self.inlines_mut().is_some() {
             return self.inlines_mut().expect("inline frame present");
@@ -679,15 +679,15 @@ fn inlines_text(inlines: &[Inline]) -> String {
     out
 }
 
-// ---- the element list ---------------------------------------------------------------------------
+// ---- the stop list ---------------------------------------------------------------------------
 
-/// A navigable element of the rendered document, in document order (outer before inner at equal
-/// starts). The reading view's focus model runs entirely over this list: block-grain elements are
+/// A navigable stop of the rendered document, in document order (outer before inner at equal
+/// starts). The reading view's focus model runs entirely over this list: block-grain stops are
 /// `j`/`k` stops, interactive ones are `Tab` stops and `Enter` targets, headings serve the
 /// `o`/`Alt-o` motion and anchor-link resolution.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Element {
+pub enum Stop {
     /// A non-heading block-grain stop: paragraph, code block, rule, table, quote, footnote
     /// definition, front matter, HTML block.
     Block {
@@ -700,7 +700,7 @@ pub enum Element {
         slug: String,
         text: String,
     },
-    /// A list item (nested items are their own elements; a loose item's inner paragraphs are not).
+    /// A list item (nested items are their own stops; a loose item's inner paragraphs are not).
     Item {
         span: Span,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -711,7 +711,7 @@ pub enum Element {
         href: String,
     },
     /// An image target — always interactive-grain, never a `j`/`k` stop: a *display* image's
-    /// block identity is a separate [`Element::Block`] over the paragraph span, so `l` opts
+    /// block identity is a separate [`Stop::Block`] over the paragraph span, so `l` opts
     /// into the image exactly like it opts into a link.
     Image {
         span: Span,
@@ -723,15 +723,15 @@ pub enum Element {
     },
 }
 
-impl Element {
+impl Stop {
     pub fn span(&self) -> Span {
         match self {
-            Element::Block { span }
-            | Element::Heading { span, .. }
-            | Element::Item { span, .. }
-            | Element::Link { span, .. }
-            | Element::Image { span, .. }
-            | Element::FootnoteRef { span, .. } => *span,
+            Stop::Block { span }
+            | Stop::Heading { span, .. }
+            | Stop::Item { span, .. }
+            | Stop::Link { span, .. }
+            | Stop::Image { span, .. }
+            | Stop::FootnoteRef { span, .. } => *span,
         }
     }
 
@@ -739,7 +739,7 @@ impl Element {
     pub fn is_block(&self) -> bool {
         matches!(
             self,
-            Element::Block { .. } | Element::Heading { .. } | Element::Item { .. }
+            Stop::Block { .. } | Stop::Heading { .. } | Stop::Item { .. }
         )
     }
 
@@ -747,24 +747,24 @@ impl Element {
     pub fn is_interactive(&self) -> bool {
         matches!(
             self,
-            Element::Link { .. } | Element::Image { .. } | Element::FootnoteRef { .. }
+            Stop::Link { .. } | Stop::Image { .. } | Stop::FootnoteRef { .. }
         )
     }
 }
 
-/// Flatten the AST into the element list. Construction order is document order: containers
+/// Flatten the AST into the stop list. Construction order is document order: containers
 /// before their contents, inline interactives inside their block, in source order.
-pub fn elements(blocks: &[Block]) -> Vec<Element> {
+pub fn stops(blocks: &[Block]) -> Vec<Stop> {
     let mut out = Vec::new();
     let mut slugs: HashMap<String, u32> = HashMap::new();
     walk_blocks(blocks, None, &mut out, &mut slugs);
     out
 }
 
-/// Collect the block-grain elements of one level. `parent` is the enclosing container's span —
+/// Collect the block-grain stops of one level. `parent` is the enclosing container's span —
 /// `None` at the document's top level.
 ///
-/// **Every block is an element, at any depth.** A quote's paragraphs, a list item's second
+/// **Every block is an stop, at any depth.** A quote's paragraphs, a list item's second
 /// paragraph, a fence inside an item: all of them are reading stops and all of them can be
 /// selected and edited, because focus resolves innermost-first and so the inner block wins over
 /// its container wherever there is one. Containers used to list
@@ -780,7 +780,7 @@ pub fn elements(blocks: &[Block]) -> Vec<Element> {
 fn walk_blocks(
     blocks: &[Block],
     parent: Option<Span>,
-    out: &mut Vec<Element>,
+    out: &mut Vec<Stop>,
     slugs: &mut HashMap<String, u32>,
 ) {
     let solo_child = parent.is_some() && blocks.len() == 1;
@@ -792,11 +792,11 @@ fn walk_blocks(
                 content,
                 span,
             } => {
-                // Headings are elements at any depth — the outline should see a heading inside
+                // Headings are stops at any depth — the outline should see a heading inside
                 // a quote (rare, but legal markdown).
                 let text = inlines_text(content).trim().to_string();
                 let slug = unique_slug(&text, slugs);
-                out.push(Element::Heading {
+                out.push(Stop::Heading {
                     span: *span,
                     level: *level,
                     slug,
@@ -806,7 +806,7 @@ fn walk_blocks(
             }
             Block::Paragraph { content, span } => {
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
                 walk_inlines(content, out);
             }
@@ -815,14 +815,14 @@ fn walk_blocks(
             | Block::FrontMatter { span, .. }
             | Block::Html { span, .. } => {
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
             }
             Block::Table {
                 head, rows, span, ..
             } => {
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
                 for cell in head.iter().chain(rows.iter().flatten()) {
                     walk_inlines(cell, out);
@@ -838,28 +838,28 @@ fn walk_blocks(
                 // the Enter target — leaving the trailing whitespace as the rest byte, so a
                 // display image joins the `l`-opts-in model like links do.
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
-                out.push(Element::Image {
+                out.push(Stop::Image {
                     span: *inner_span,
                     src: src.clone(),
                 });
             }
             Block::Quote { content, span, .. } => {
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
                 walk_blocks(content, Some(*span), out, slugs);
             }
             Block::FootnoteDef { content, span, .. } => {
                 if listed(span) {
-                    out.push(Element::Block { span: *span });
+                    out.push(Stop::Block { span: *span });
                 }
                 walk_blocks(content, Some(*span), out, slugs);
             }
             Block::List { items, .. } => {
                 for item in items {
-                    out.push(Element::Item {
+                    out.push(Stop::Item {
                         span: item.span,
                         checked: item.checked,
                     });
@@ -870,7 +870,7 @@ fn walk_blocks(
     }
 }
 
-fn walk_inlines(inlines: &[Inline], out: &mut Vec<Element>) {
+fn walk_inlines(inlines: &[Inline], out: &mut Vec<Stop>) {
     for inl in inlines {
         match inl {
             Inline::Link {
@@ -878,20 +878,20 @@ fn walk_inlines(inlines: &[Inline], out: &mut Vec<Element>) {
                 content,
                 span,
             } => {
-                out.push(Element::Link {
+                out.push(Stop::Link {
                     span: *span,
                     href: href.clone(),
                 });
                 walk_inlines(content, out);
             }
             Inline::Image { src, span, .. } => {
-                out.push(Element::Image {
+                out.push(Stop::Image {
                     span: *span,
                     src: src.clone(),
                 });
             }
             Inline::FootnoteRef { label, span } => {
-                out.push(Element::FootnoteRef {
+                out.push(Stop::FootnoteRef {
                     span: *span,
                     label: label.clone(),
                 });
@@ -930,42 +930,38 @@ fn unique_slug(text: &str, seen: &mut HashMap<String, u32>) -> String {
     slug
 }
 
-/// The element the reading cursor at byte `pos` focuses: the **innermost** element containing
-/// `pos`, else the first element starting after it, else the last element. `None` only for an empty
+/// The stop the reading cursor at byte `pos` focuses: the **innermost** stop containing
+/// `pos`, else the first stop starting after it, else the last stop. `None` only for an empty
 /// document. This is the pure "focus = f(cursor)" derivation.
-pub fn element_at(elements: &[Element], pos: u32) -> Option<usize> {
+pub fn element_at(stops: &[Stop], pos: u32) -> Option<usize> {
     let mut best: Option<usize> = None;
-    for (i, el) in elements.iter().enumerate() {
+    for (i, el) in stops.iter().enumerate() {
         if el.span().contains(pos) {
             best = Some(match best {
-                Some(b) if elements[b].span().len() < el.span().len() => b,
+                Some(b) if stops[b].span().len() < el.span().len() => b,
                 _ => i,
             });
         }
     }
-    best.or_else(|| elements.iter().position(|e| e.span().start >= pos))
-        .or(if elements.is_empty() {
+    best.or_else(|| stops.iter().position(|e| e.span().start >= pos))
+        .or(if stops.is_empty() {
             None
         } else {
-            Some(elements.len() - 1)
+            Some(stops.len() - 1)
         })
 }
 
-/// The innermost element matching `pred` whose span contains `pos` — the class-relative anchor
+/// The innermost stop matching `pred` whose span contains `pos` — the class-relative anchor
 /// for stepping. Stepping blocks while an inline (a link) holds the focus must start from the
 /// link's *containing block*: a lone-link paragraph derives focus back to the link after every
 /// Goto to the paragraph start, so stepping backward from the link's own index would land on the
 /// containing paragraph again and again, never past it.
-pub fn containing_element(
-    elements: &[Element],
-    pos: u32,
-    pred: impl Fn(&Element) -> bool,
-) -> Option<usize> {
+pub fn containing_element(stops: &[Stop], pos: u32, pred: impl Fn(&Stop) -> bool) -> Option<usize> {
     let mut best: Option<usize> = None;
-    for (i, el) in elements.iter().enumerate() {
+    for (i, el) in stops.iter().enumerate() {
         if el.span().contains(pos) && pred(el) {
             best = Some(match best {
-                Some(b) if elements[b].span().len() < el.span().len() => b,
+                Some(b) if stops[b].span().len() < el.span().len() => b,
                 _ => i,
             });
         }
@@ -973,29 +969,25 @@ pub fn containing_element(
     best
 }
 
-/// [`element_at`] restricted to elements matching `pred`: the innermost matching element
-/// containing `pos`, else the first matching element starting after it, else the last matching
-/// one. The reading-position (block-grain) derivation — `Some` whenever any matching element
+/// [`element_at`] restricted to stops matching `pred`: the innermost matching stop
+/// containing `pos`, else the first matching stop starting after it, else the last matching
+/// one. The reading-position (block-grain) derivation — `Some` whenever any matching stop
 /// exists, so the position marker never vanishes.
 pub fn element_at_matching(
-    elements: &[Element],
+    stops: &[Stop],
     pos: u32,
-    pred: impl Fn(&Element) -> bool,
+    pred: impl Fn(&Stop) -> bool,
 ) -> Option<usize> {
-    containing_element(elements, pos, &pred)
-        .or_else(|| {
-            elements
-                .iter()
-                .position(|e| pred(e) && e.span().start >= pos)
-        })
-        .or_else(|| elements.iter().rposition(pred))
+    containing_element(stops, pos, &pred)
+        .or_else(|| stops.iter().position(|e| pred(e) && e.span().start >= pos))
+        .or_else(|| stops.iter().rposition(pred))
 }
 
-/// Indices of the interactive elements (links, images, footnote refs) whose spans nest inside
+/// Indices of the interactive stops (links, images, footnote refs) whose spans nest inside
 /// `container`, in document order — the reading view's within-block link ring (`h`/`l` step the
 /// Enter target inside the focused block).
-pub fn interactive_within(elements: &[Element], container: Span) -> Vec<usize> {
-    elements
+pub fn interactive_within(stops: &[Stop], container: Span) -> Vec<usize> {
+    stops
         .iter()
         .enumerate()
         .filter(|(_, e)| {
@@ -1011,11 +1003,11 @@ pub fn interactive_within(elements: &[Element], container: Span) -> Vec<usize> {
 /// paragraph shows the position bar alone and `l` opts into the link. Falls back to the span start
 /// when no such byte exists — a block image IS its own target, and staying targeted is the honest
 /// state there.
-pub fn block_rest_byte(elements: &[Element], block: usize) -> u32 {
-    let span = elements[block].span();
+pub fn block_rest_byte(stops: &[Stop], block: usize) -> u32 {
+    let span = stops[block].span();
     let mut pos = span.start;
     while pos < span.end {
-        let covering = elements
+        let covering = stops
             .iter()
             .enumerate()
             .find(|(i, e)| *i != block && e.is_interactive() && e.span().contains(pos));
@@ -1027,23 +1019,23 @@ pub fn block_rest_byte(elements: &[Element], block: usize) -> u32 {
     span.start
 }
 
-/// The nearest element matching `pred` strictly after (`forward`) or before `from` in list
-/// order. `from` may be any element index (e.g. the focused link when stepping blocks).
+/// The nearest stop matching `pred` strictly after (`forward`) or before `from` in list
+/// order. `from` may be any stop index (e.g. the focused link when stepping blocks).
 pub fn step_element(
-    elements: &[Element],
+    stops: &[Stop],
     from: usize,
     forward: bool,
-    pred: impl Fn(&Element) -> bool,
+    pred: impl Fn(&Stop) -> bool,
 ) -> Option<usize> {
     if forward {
-        elements
+        stops
             .iter()
             .enumerate()
             .skip(from + 1)
             .find(|(_, e)| pred(e))
             .map(|(i, _)| i)
     } else {
-        elements
+        stops
             .iter()
             .enumerate()
             .take(from)
@@ -1054,10 +1046,10 @@ pub fn step_element(
 }
 
 /// Resolve an in-document anchor (`#some-heading`) against the heading slugs.
-pub fn heading_by_slug(elements: &[Element], slug: &str) -> Option<usize> {
-    elements
+pub fn heading_by_slug(stops: &[Stop], slug: &str) -> Option<usize> {
+    stops
         .iter()
-        .position(|e| matches!(e, Element::Heading { slug: s, .. } if s == slug))
+        .position(|e| matches!(e, Stop::Heading { slug: s, .. } if s == slug))
 }
 
 /// Every fenced code block that names a language, recursively, as `(span, language, code)` — the
@@ -1301,7 +1293,7 @@ mod tests {
         assert!(!ordered);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].checked, None);
-        // The tight item's synthesized paragraph carries the item's span (the element grain).
+        // The tight item's synthesized paragraph carries the item's span (the stop grain).
         assert_eq!(
             items[0].blocks,
             vec![Block::Paragraph {
@@ -1562,12 +1554,12 @@ mod tests {
 
     #[test]
     fn container_children_are_reading_stops_of_their_own() {
-        // Every block is an element at any depth, so focus — which resolves innermost-first — lands
+        // Every block is an stop at any depth, so focus — which resolves innermost-first — lands
         // on the inner block rather than its container. Containers used to list only headings and
         // list items, which is why "act on the inner thing" worked for a heading in a quote but not
         // a paragraph in the same quote.
         let spans = |md: &str| -> Vec<(u32, u32)> {
-            elements(&parse(md))
+            stops(&parse(md))
                 .iter()
                 .filter(|e| e.is_block())
                 .map(|e| (e.span().start, e.span().end))
@@ -1583,12 +1575,12 @@ mod tests {
             spans("- First para.\n\n  Second para.\n\n- Next item.\n"),
             vec![(0, 31), (2, 14), (17, 30), (31, 44)]
         );
-        // …and the innermost element at a byte inside it is that paragraph, not the item.
+        // …and the innermost stop at a byte inside it is that paragraph, not the item.
         let md = "- First para.\n\n  Second para.\n\n- Next item.\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         let at = md.find("Second").unwrap() as u32;
         assert_eq!(
-            element_at_matching(&els, at, Element::is_block).map(|i| els[i].span()),
+            element_at_matching(&els, at, Stop::is_block).map(|i| els[i].span()),
             Some(Span { start: 17, end: 30 })
         );
 
@@ -1597,24 +1589,24 @@ mod tests {
         assert_eq!(spans("> Alpha.\n"), vec![(0, 9)]);
         assert_eq!(spans("- a\n- b\n"), vec![(0, 4), (4, 8)]);
         // A heading stays listed even as a solo child — `o`/`Alt-o` and `#anchor` slugs need it.
-        let els = elements(&parse("> ### H\n"));
-        assert!(els.iter().any(|e| matches!(e, Element::Heading { .. })));
+        let els = stops(&parse("> ### H\n"));
+        assert!(els.iter().any(|e| matches!(e, Stop::Heading { .. })));
     }
 
     #[test]
     fn element_list_document_order_and_kinds() {
         let md = "# Title\n\nA [link](https://x.y) here.\n\n- one\n- two\n\n> quoted [inner](https://q.z)\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         // Document order, outer before inner.
         let kinds: Vec<&str> = els
             .iter()
             .map(|e| match e {
-                Element::Heading { .. } => "heading",
-                Element::Block { .. } => "block",
-                Element::Item { .. } => "item",
-                Element::Link { .. } => "link",
-                Element::Image { .. } => "image",
-                Element::FootnoteRef { .. } => "ref",
+                Stop::Heading { .. } => "heading",
+                Stop::Block { .. } => "block",
+                Stop::Item { .. } => "item",
+                Stop::Link { .. } => "link",
+                Stop::Image { .. } => "image",
+                Stop::FootnoteRef { .. } => "ref",
             })
             .collect();
         assert_eq!(
@@ -1626,8 +1618,8 @@ mod tests {
         let mut sorted = starts.clone();
         sorted.sort();
         assert_eq!(starts, sorted);
-        // The quote is the block element; the link inside it is still a Tab stop.
-        let Element::Link { href, .. } = &els[6] else {
+        // The quote is the block stop; the link inside it is still a Tab stop.
+        let Stop::Link { href, .. } = &els[6] else {
             panic!("expected link, got {:?}", els[6]);
         };
         assert_eq!(href, "https://q.z");
@@ -1636,20 +1628,20 @@ mod tests {
     #[test]
     fn element_at_prefers_innermost_then_next() {
         let md = "Intro para.\n\nA [link](https://x.y) here.\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         // Inside the link → the link, not its paragraph.
         let link_pos = md.find("[link]").unwrap() as u32 + 1;
         let idx = element_at(&els, link_pos).unwrap();
-        assert!(matches!(els[idx], Element::Link { .. }));
+        assert!(matches!(els[idx], Stop::Link { .. }));
         // In paragraph text → the paragraph.
         let para_pos = md.find("here").unwrap() as u32;
         let idx = element_at(&els, para_pos).unwrap();
-        assert!(matches!(els[idx], Element::Block { .. }));
+        assert!(matches!(els[idx], Stop::Block { .. }));
         // On the blank line between blocks → the next block.
         let gap = md.find("\n\nA").unwrap() as u32 + 1;
         let idx = element_at(&els, gap).unwrap();
         assert_eq!(els[idx].span(), els[1].span());
-        // Past the end → the last element.
+        // Past the end → the last stop.
         let idx = element_at(&els, md.len() as u32 + 100).unwrap();
         assert_eq!(idx, els.len() - 1);
     }
@@ -1657,47 +1649,43 @@ mod tests {
     #[test]
     fn step_element_filters_by_class() {
         let md = "# H\n\nPara with [a](https://a.a) and [b](https://b.b).\n\nNext.\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         // From the heading, the next block skips over the links.
-        let next = step_element(&els, 0, true, Element::is_block).unwrap();
-        assert!(matches!(els[next], Element::Block { .. }));
+        let next = step_element(&els, 0, true, Stop::is_block).unwrap();
+        assert!(matches!(els[next], Stop::Block { .. }));
         // From that paragraph, the next interactive is link a, then link b.
-        let a = step_element(&els, next, true, Element::is_interactive).unwrap();
-        let b = step_element(&els, a, true, Element::is_interactive).unwrap();
-        let (Element::Link { href: ha, .. }, Element::Link { href: hb, .. }) = (&els[a], &els[b])
-        else {
+        let a = step_element(&els, next, true, Stop::is_interactive).unwrap();
+        let b = step_element(&els, a, true, Stop::is_interactive).unwrap();
+        let (Stop::Link { href: ha, .. }, Stop::Link { href: hb, .. }) = (&els[a], &els[b]) else {
             panic!("expected links");
         };
         assert_eq!((ha.as_str(), hb.as_str()), ("https://a.a", "https://b.b"));
         // Stepping back from link b lands on link a; no interactive before the first link.
-        assert_eq!(
-            step_element(&els, b, false, Element::is_interactive),
-            Some(a)
-        );
-        assert_eq!(step_element(&els, a, false, Element::is_interactive), None);
+        assert_eq!(step_element(&els, b, false, Stop::is_interactive), Some(a));
+        assert_eq!(step_element(&els, a, false, Stop::is_interactive), None);
     }
 
     #[test]
     fn interactive_within_scopes_the_link_ring_to_a_block() {
         let md = "Para with [a](https://a.a) and [b](https://b.b).\n\nAnother [c](https://c.c).\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         // The first paragraph's ring holds its two links, in order — not the third one.
         let para = els
             .iter()
-            .position(|e| matches!(e, Element::Block { .. }))
+            .position(|e| matches!(e, Stop::Block { .. }))
             .unwrap();
         let ring = interactive_within(&els, els[para].span());
         let hrefs: Vec<&str> = ring
             .iter()
             .map(|&i| match &els[i] {
-                Element::Link { href, .. } => href.as_str(),
+                Stop::Link { href, .. } => href.as_str(),
                 other => panic!("expected link, got {other:?}"),
             })
             .collect();
         assert_eq!(hrefs, vec!["https://a.a", "https://b.b"]);
         // A container with no interactives yields an empty ring.
         let md2 = "# Plain\n\nNo links here.\n";
-        let els2 = elements(&parse(md2));
+        let els2 = stops(&parse(md2));
         assert!(interactive_within(&els2, els2[0].span()).is_empty());
     }
 
@@ -1706,10 +1694,10 @@ mod tests {
         // A lone-link paragraph: the rest byte sits after the link (the trailing newline), so
         // block steps select the paragraph without auto-targeting the link.
         let md = "[docs](https://x.y)\n\nSee [a](https://a.a) here.\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         let lone = els
             .iter()
-            .position(|e| matches!(e, Element::Block { .. }))
+            .position(|e| matches!(e, Stop::Block { .. }))
             .unwrap();
         let rest = block_rest_byte(&els, lone);
         assert_eq!(rest, "[docs](https://x.y)".len() as u32);
@@ -1721,7 +1709,7 @@ mod tests {
         let para = els
             .iter()
             .enumerate()
-            .filter(|(_, e)| matches!(e, Element::Block { .. }))
+            .filter(|(_, e)| matches!(e, Stop::Block { .. }))
             .nth(1)
             .unwrap()
             .0;
@@ -1729,13 +1717,13 @@ mod tests {
         // A block image now splits into Block (paragraph span) + Image target (markup span),
         // so it has a rest byte too — the trailing newline — and joins the l-opts-in model.
         let md2 = "![d](i.png)\n";
-        let els2 = elements(&parse(md2));
-        assert!(matches!(els2[0], Element::Block { .. }));
-        assert!(matches!(els2[1], Element::Image { .. }));
+        let els2 = stops(&parse(md2));
+        assert!(matches!(els2[0], Stop::Block { .. }));
+        assert!(matches!(els2[1], Stop::Image { .. }));
         let rest = block_rest_byte(&els2, 0);
         assert_eq!(rest, "![d](i.png)".len() as u32);
         assert_eq!(
-            containing_element(&els2, rest, Element::is_interactive),
+            containing_element(&els2, rest, Stop::is_interactive),
             None,
             "no auto-target at the rest byte"
         );
@@ -1744,18 +1732,18 @@ mod tests {
     #[test]
     fn containing_element_filters_by_class() {
         let md = "# H\n\n[docs](https://x.y)\n";
-        let els = elements(&parse(md));
-        // At the link's first byte the innermost element is the link, but the innermost *block*
+        let els = stops(&parse(md));
+        // At the link's first byte the innermost stop is the link, but the innermost *block*
         // is its containing paragraph — the class-relative step anchor.
         let pos = md.find("[docs]").unwrap() as u32;
         let link = element_at(&els, pos).unwrap();
-        assert!(matches!(els[link], Element::Link { .. }));
-        let block = containing_element(&els, pos, Element::is_block).unwrap();
-        assert!(matches!(els[block], Element::Block { .. }));
+        assert!(matches!(els[link], Stop::Link { .. }));
+        let block = containing_element(&els, pos, Stop::is_block).unwrap();
+        assert!(matches!(els[block], Stop::Block { .. }));
         assert!(els[block].span().contains(pos));
         // No heading contains that byte.
         assert_eq!(
-            containing_element(&els, pos, |e| matches!(e, Element::Heading { .. })),
+            containing_element(&els, pos, |e| matches!(e, Stop::Heading { .. })),
             None
         );
     }
@@ -1763,18 +1751,18 @@ mod tests {
     #[test]
     fn element_at_matching_falls_forward_then_back() {
         let md = "# H\n\nA [x](https://x.y) para.\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         // In the gap between blocks → the next block, never the link inside it… well, the
         // paragraph *is* first in document order; the point is the pred filter applies.
         let gap = md.find("\n\nA").unwrap() as u32 + 1;
-        let idx = element_at_matching(&els, gap, Element::is_block).unwrap();
-        assert!(matches!(els[idx], Element::Block { .. }));
-        // Past the end → the last matching element (the paragraph, skipping the link).
-        let idx = element_at_matching(&els, md.len() as u32 + 50, Element::is_block).unwrap();
-        assert!(matches!(els[idx], Element::Block { .. }));
+        let idx = element_at_matching(&els, gap, Stop::is_block).unwrap();
+        assert!(matches!(els[idx], Stop::Block { .. }));
+        // Past the end → the last matching stop (the paragraph, skipping the link).
+        let idx = element_at_matching(&els, md.len() as u32 + 50, Stop::is_block).unwrap();
+        assert!(matches!(els[idx], Stop::Block { .. }));
         // No interactive contains the heading position, and none precedes it.
         assert_eq!(
-            element_at_matching(&els, 0, Element::is_interactive),
+            element_at_matching(&els, 0, Stop::is_interactive),
             els.iter().position(|e| e.is_interactive()),
             "falls forward to the first interactive"
         );
@@ -1783,11 +1771,11 @@ mod tests {
     #[test]
     fn heading_slugs_github_style_and_deduped() {
         let md = "# Hello World!\n\n## Hello World!\n\n## With `code` & more\n";
-        let els = elements(&parse(md));
+        let els = stops(&parse(md));
         let slugs: Vec<&str> = els
             .iter()
             .filter_map(|e| match e {
-                Element::Heading { slug, .. } => Some(slug.as_str()),
+                Stop::Heading { slug, .. } => Some(slug.as_str()),
                 _ => None,
             })
             .collect();

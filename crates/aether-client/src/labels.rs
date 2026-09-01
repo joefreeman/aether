@@ -489,6 +489,15 @@ pub fn baseline_token(baseline: &aether_protocol::git::GitBaselineSource) -> Str
 /// commit read `6mo ago` there and `26w ago` elsewhere. This is the terminal/browser shape, which
 /// is both the majority and the newer of the two — the browser's copy was a stated port of the
 /// terminal's.
+/// **Native only — wasm has no clock.** `SystemTime::now()` is unsupported on
+/// `wasm32-unknown-unknown`: calling it traps, and a trap in the browser surfaces as a bare
+/// `RuntimeError: unreachable executed` with no message, no file and no line — it isn't a Rust
+/// panic, so not even a panic hook catches it. Reached through the blame label, it took down every
+/// render that had blame on.
+///
+/// The browser reads its clock from JS and calls [`time_ago_between`]. The `cfg` is what makes that
+/// mandatory: without it the mistake is a runtime trap in one shell, with it the compiler says no.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn time_ago(unix_secs: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -521,17 +530,63 @@ pub fn time_ago_between(now: i64, then: i64) -> String {
 
 /// The end-of-line blame label: author and how long ago, or `uncommitted` for a line that has
 /// never been committed.
+/// **Native only**, for the same reason as [`time_ago`] — it reads the clock. The browser passes
+/// its own and calls [`format_blame_at`].
+#[cfg(not(target_arch = "wasm32"))]
 pub fn format_blame(b: &aether_protocol::git::BlameInfo) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_blame_at(now, b)
+}
+
+/// The clock-free [`format_blame`]: the shell says what "now" is. Every platform that has no clock
+/// of its own — which is the browser — comes through here.
+pub fn format_blame_at(now_unix_secs: i64, b: &aether_protocol::git::BlameInfo) -> String {
     if b.is_uncommitted {
         "uncommitted".into()
     } else {
-        format!("{} · {}", b.author, time_ago(b.timestamp))
+        format!(
+            "{} · {}",
+            b.author,
+            time_ago_between(now_unix_secs, b.timestamp)
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blame label is built from a clock the *caller* supplies, so it can be built where there
+    /// is no clock at all.
+    ///
+    /// The browser is that platform: `wasm32-unknown-unknown` has no `SystemTime`, and reaching for
+    /// one traps. Not a panic — so no message reaches the console, only
+    /// `RuntimeError: unreachable executed` from whatever render touched a blame label. The
+    /// clock-reading wrappers are `cfg`'d off wasm so that mistake is a compile error there; this
+    /// pins the clock-free path they leave behind.
+    #[test]
+    fn the_blame_label_takes_its_clock_from_the_caller() {
+        let blame = |author: &str, then: i64, uncommitted: bool| {
+            format_blame_at(
+                1_000_000,
+                &aether_protocol::git::BlameInfo {
+                    commit: String::new(),
+                    author: author.into(),
+                    timestamp: then,
+                    is_uncommitted: uncommitted,
+                },
+            )
+        };
+        assert_eq!(
+            blame("Joe", 1_000_000 - 60 * 60 * 24 * 21, false),
+            "Joe · 3w ago"
+        );
+        assert_eq!(blame("Joe", 1_000_000 - 30, false), "Joe · just now");
+        assert_eq!(blame("Joe", 0, true), "uncommitted");
+    }
 
     /// The shells render decorations from these pieces, so the literals and the two-colour split
     /// live here rather than three times over. Composing them back gives git's own text — the same

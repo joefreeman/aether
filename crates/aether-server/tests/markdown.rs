@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // -------- transient buffers -----------------------------------------------------------------
@@ -1489,12 +1490,12 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 100,
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,

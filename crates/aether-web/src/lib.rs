@@ -17,6 +17,7 @@ use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
 use aether_protocol::buffer::BufferOpenResult;
+use aether_protocol::coords::{ViewLine, VisualRow};
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::{JsonRpc, Notification};
 use aether_protocol::viewport::{ViewportSubscribeResult, ViewportWindowResult};
@@ -32,11 +33,45 @@ pub struct WasmSession {
 }
 
 #[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(msg: &str);
+}
+
+/// Print Rust panics to the browser console.
+///
+/// A panic in wasm traps, and a trap surfaces as a bare `RuntimeError: unreachable executed` with a
+/// stack of minified JS glue — the message, the file and the line are all gone, so the one thing
+/// that would identify it never leaves the module. This hook costs nothing and is the difference
+/// between "something panicked somewhere" and a name.
+///
+/// Deliberately not `console_error_panic_hook`: the whole of it is these few lines, and the binding
+/// needs nothing this crate doesn't already have.
+fn install_panic_hook() {
+    // wasm only: `console_error` is an imported binding, and calling it on the host — which the
+    // view-builder tests do, since they construct a `WasmSession` — panics inside the panic handler
+    // and aborts the test instead of reporting it.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                console_error(&format!("aether-web panic: {info}"));
+                previous(info);
+            }));
+        });
+    }
+}
+
+#[wasm_bindgen]
 impl WasmSession {
     /// A placeholder session (no workspace, empty buffer). Phase 1 uses this to prove the boundary;
     /// the real constructor takes a bootstrapped buffer once `buffer/open` is wired (Phase 3).
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmSession {
+        install_panic_hook();
         WasmSession {
             inner: Session::placeholder(),
         }
@@ -139,7 +174,7 @@ impl WasmSession {
     /// see `.status-crumb-sep` in theme.css.
     pub fn symbol_path_parts(&self, max_chars: u32) -> Vec<String> {
         aether_client::labels::truncate_symbol_path_parts(
-            &self.inner.symbol_path,
+            &self.inner.view.symbol_path,
             max_chars as usize,
         )
     }
@@ -170,6 +205,7 @@ impl WasmSession {
 
     /// Adopt a `viewport/subscribe` result (a geometry RPC the shell issued).
     /// The shell does its pixel positioning afterward, reading `view`.
+    ///
     pub fn adopt_subscribe(&mut self, res: JsValue) -> Result<(), JsValue> {
         let res: ViewportSubscribeResult = from_js(res)?;
         self.inner.adopt_subscribe(res);
@@ -187,13 +223,17 @@ impl WasmSession {
     /// to what's actually visible. `top_visual_row` is absolute; `viewport_rows` is the visible
     /// height in rows.
     pub fn set_visible_lines(&mut self, top_visual_row: u32, viewport_rows: u32) {
-        self.inner.set_visible_lines(top_visual_row, viewport_rows);
+        // The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate
+        // spaces are named here, once, on the way in.
+        self.inner
+            .set_visible_lines(VisualRow(top_visual_row), viewport_rows);
     }
 
     /// Pointer press at an already-resolved buffer position (the shell converts pixels → cell).
     /// `granularity` is `"char"`/`"word"`/`"line"`; `extend` is shift-click. Returns `Effect[]`.
     pub fn pointer_press(
         &mut self,
+        element: u32,
         line: u32,
         col: u32,
         granularity: &str,
@@ -206,7 +246,7 @@ impl WasmSession {
         };
         let fx = self
             .inner
-            .pointer_press(LogicalPosition { line, col }, g, extend);
+            .pointer_press(element, LogicalPosition { line, col }, g, extend);
         to_js(&effects_to_json(fx))
     }
 
@@ -225,7 +265,8 @@ impl WasmSession {
     /// `SaveContentAnchor` effect). `top_row` is the absolute visual row at the top of the viewport
     /// (`(scrollTop - pad) / lineHeight`); `viewport_rows` its height in rows.
     pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
-        self.inner.capture_scroll_anchor(top_row, viewport_rows);
+        self.inner
+            .capture_scroll_anchor(VisualRow(top_row), viewport_rows);
     }
 
     /// Resolve the anchor captured by [`WasmSession::capture_scroll_anchor`] against the new window
@@ -233,7 +274,38 @@ impl WasmSession {
     /// anchor is pending (the shell then reveals the cursor as usual). Call after adopting the
     /// re-laid-out window (wrap `set_wrap` result / diff `WindowAdopted`).
     pub fn resolve_scroll_anchor(&mut self) -> Option<u32> {
-        self.inner.resolve_scroll_anchor()
+        self.inner.resolve_scroll_anchor().map(VisualRow::get)
+    }
+
+    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one —
+    /// a subscribe's `scroll` position, which the server reads as a view line. Mirrors the helper
+    /// of the same name in both native shells, including its fallback: exact while the window has
+    /// the line loaded, carried across unchanged when it doesn't (the two spaces coincide for every
+    /// single-element view, and for a patch the server clamps into the view).
+    pub fn view_line_for(&self, line: u32) -> u32 {
+        self.inner
+            .view
+            .window
+            .as_ref()
+            .and_then(|w| {
+                aether_client::grid::view_line_of(w, self.inner.view.focused_element, line)
+            })
+            .map_or(line, ViewLine::get)
+    }
+
+    /// The absolute visual row a **view** line's block starts at — the chrome standing above it
+    /// included — or `null` when that line isn't in the loaded window. What "position the viewport
+    /// at this scroll line" means: seating the line's own text row at the top instead scrolls the
+    /// file heading that introduces it above the fold.
+    pub fn block_start_of_view_line(&self, view_line: u32) -> Option<u32> {
+        // The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate spaces
+        // are named here, once, on the way in and out.
+        self.inner
+            .view
+            .window
+            .as_ref()
+            .and_then(|w| aether_client::grid::block_start_of_view_line(w, ViewLine(view_line)))
+            .map(VisualRow::get)
     }
 
     /// Mouse wheel over the picker results list: move the highlighted row (+down / -up), refetching
@@ -486,6 +558,11 @@ impl WasmSession {
         &self.inner
     }
 
+    #[cfg(test)]
+    pub(crate) fn session_mut(&mut self) -> &mut Session {
+        &mut self.inner
+    }
+
     /// The host-testable core of [`WasmSession::on_key`]: normalise, dispatch, lower the effects to
     /// JSON. Kept separate from the `JsValue` conversion so it runs under `cargo test` (no wasm).
     fn dispatch_key(
@@ -587,18 +664,40 @@ pub fn picker_placeholder(kind: Option<String>) -> String {
 /// drifted over whether a sub-minute age is `now` or `just now`, and whether months exist.
 #[wasm_bindgen]
 pub fn time_ago(unix_secs: f64) -> String {
-    aether_client::labels::time_ago(unix_secs as i64)
+    aether_client::labels::time_ago_between(now_unix_secs(), unix_secs as i64)
+}
+
+/// Seconds since the Unix epoch, from the platform's own clock.
+///
+/// The browser's clock is JS's: `wasm32-unknown-unknown` has no `SystemTime`, and reaching for one
+/// traps — which is what this crate is for. Every clock the core needs arrives from the shell like
+/// this (the hint engine's tick is the other one).
+#[cfg(target_arch = "wasm32")]
+fn now_unix_secs() -> i64 {
+    (js_sys::Date::now() / 1000.0) as i64
+}
+
+/// The host build (the view-builder tests) has a real clock.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The end-of-line blame label — author and relative age, or `uncommitted`.
 #[wasm_bindgen]
 pub fn format_blame(author: &str, timestamp: f64, is_uncommitted: bool) -> String {
-    aether_client::labels::format_blame(&aether_protocol::git::BlameInfo {
-        commit: String::new(),
-        author: author.to_string(),
-        timestamp: timestamp as i64,
-        is_uncommitted,
-    })
+    aether_client::labels::format_blame_at(
+        now_unix_secs(),
+        &aether_protocol::git::BlameInfo {
+            commit: String::new(),
+            author: author.to_string(),
+            timestamp: timestamp as i64,
+            is_uncommitted,
+        },
+    )
 }
 
 /// Frame a freshly-opened picker group run — the `run` flavour of the reveal effect.
@@ -966,7 +1065,7 @@ mod tests {
         // list (the whole point of Phase 1's boundary), without needing a live server.
         let mut s = WasmSession::new();
         let _effects = s.dispatch_key("i", "KeyI", false, false, false, 40);
-        assert_eq!(s.inner.mode, aether_client::session::Mode::Insert);
+        assert_eq!(s.inner.view.mode, aether_client::session::Mode::Insert);
     }
 
     #[test]
@@ -986,8 +1085,8 @@ mod tests {
 
     #[test]
     fn intern_is_stable_and_bounded() {
-        let a = intern("cursor/move");
-        let b = intern("cursor/move");
+        let a = intern("element/move");
+        let b = intern("element/move");
         assert!(std::ptr::eq(a, b)); // same name → same leaked pointer, not a fresh leak
     }
 
@@ -995,7 +1094,7 @@ mod tests {
     fn rpc_result_for_unknown_token_is_a_noop() {
         let mut s = WasmSession::new();
         // No request was parked under token 99 — the outcome is dropped, no effects.
-        let fx = s.rpc_result(99, true, "cursor/move", json!({}));
+        let fx = s.rpc_result(99, true, "element/move", json!({}));
         assert!(fx.is_empty());
     }
 
@@ -1029,7 +1128,7 @@ mod tests {
         // for the TS shell to format ("3w ago" needs the shell's clock). Proves the
         // push → core → view boundary end to end.
         let mut s = WasmSession::new();
-        let buffer_id = s.inner.buffer.buffer_id;
+        let buffer_id = s.inner.view.buffer.buffer_id;
         s.inner.on_event(blame_push(buffer_id, 0, "ada"));
         let v = view::build_view(&s.inner);
         assert_eq!(v["blame"]["line"], 0);
@@ -1042,7 +1141,7 @@ mod tests {
         // A push that raced a buffer switch (still keyed to the previous buffer) is discarded,
         // never shown against the wrong file.
         let mut s = WasmSession::new();
-        let other = s.inner.buffer.buffer_id + 1;
+        let other = s.inner.view.buffer.buffer_id + 1;
         s.inner.on_event(blame_push(other, 0, "grace"));
         assert!(view::build_view(&s.inner)["blame"].is_null());
     }
@@ -1076,11 +1175,11 @@ mod tests {
         assert_eq!(info["pinned"], false);
         let req = effect_value(Effect::Request {
             token: 7,
-            method: "cursor/move",
+            method: "element/move",
             params: json!({ "motion": "char" }),
         });
         assert_eq!(req["tag"], "Request");
         assert_eq!(req["token"], 7);
-        assert_eq!(req["method"], "cursor/move");
+        assert_eq!(req["method"], "element/move");
     }
 }

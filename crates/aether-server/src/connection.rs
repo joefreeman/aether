@@ -53,7 +53,8 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::viewport::{
-    ViewportResize, ViewportScroll, ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe,
+    ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportScroll,
+    ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe, ViewportWindowAtCursor,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceBindWorktree,
@@ -303,7 +304,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .viewports
             .values()
             .filter(|v| v.client_id == client_id)
-            .map(|v| v.buffer_id)
+            .map(|v| v.buffer_id())
             .collect();
         s.drop_viewports_for_client(client_id);
         let (closed, _stopped) = s.close_orphaned_transients(viewed);
@@ -501,7 +502,16 @@ async fn dispatch(
         ViewportResize::NAME => run!(ViewportResize, handlers::viewport_resize),
         ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),
         ViewportScrollToRow::NAME => run!(ViewportScrollToRow, handlers::viewport_scroll_to_row),
+        ViewportWindowAtCursor::NAME => {
+            run!(ViewportWindowAtCursor, handlers::viewport_window_at_cursor)
+        }
         ViewportSetWrap::NAME => run!(ViewportSetWrap, handlers::viewport_set_wrap),
+        ViewportFocusElement::NAME => {
+            run!(ViewportFocusElement, handlers::viewport_focus_element)
+        }
+        ViewportNavigateChange::NAME => {
+            run!(ViewportNavigateChange, handlers::viewport_navigate_change)
+        }
         CursorMove::NAME => run!(CursorMove, handlers::cursor_move),
         CursorSet::NAME => run!(CursorSet, handlers::cursor_set),
         CursorSelectLine::NAME => run!(CursorSelectLine, handlers::cursor_select_line),

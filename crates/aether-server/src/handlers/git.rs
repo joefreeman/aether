@@ -3461,15 +3461,16 @@ pub async fn git_set_diff_view(
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.diff_view = params.enabled;
     let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
-        vp.cols,
+        vp.focus().cols,
         vp.rows,
         vp.overscan_rows,
         vp.wrap,
-        vp.continuation_marker_width,
+        vp.focus().continuation_marker_width,
         vp.tab_width,
-        vp.buffer_id,
-        vp.scroll_logical_line,
+        vp.buffer_id(),
+        vp.scroll_view_line,
     );
+    let elements = elements_of(&s, params.viewport_id);
 
     // Refresh hunks so the first diff frame is accurate; clearing the view leaves them as-is
     // (harmless — nothing renders them).
@@ -3477,19 +3478,23 @@ pub async fn git_set_diff_view(
         recompute_diff_hunks_if_viewed(&mut s, buffer_id);
     }
 
-    let buf = s
-        .try_doc_of(buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-    let line_count = buf.line_count();
+    if s.try_doc_of(buffer_id).is_none() {
+        return Err(RpcError::buffer_not_found(buffer_id));
+    }
+    // Against the **view's** length, not the focused element's document. `scroll_line` is a view
+    // line, and `pushed_range` clamps it to the count it is given: measured against one file of a
+    // patch, a scroll position further down the view than that file is long clamped back to the
+    // file's end, and the window came back from the top of the view instead of from where the
+    // client was. The client then found its anchor line missing and fell back to the window's
+    // first row — a scroll that jumps on toggle, on exactly the views where the two spaces differ.
+    let line_count = ViewLayout::of(&elements, |id| s.doc_of(id).line_count()).line_count();
     let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let search = render_matches(&s, client_id, buffer_id);
-    let sneak = s.sneaks.get(&(client_id, buffer_id));
-    let hunks = buffer_both_hunks(&s, buffer_id);
-    let conflicts = buffer_conflicts(&s, buffer_id);
-    let diagnostics = buffer_diagnostics(&s, buffer_id);
-    let buf = s.doc_of(buffer_id);
     let window = render_window(
-        buf,
+        &s,
+        client_id,
+        crate::handlers::view_id_of(&s, params.viewport_id, buffer_id),
+        &elements,
+        crate::handlers::focused_of(&s, params.viewport_id),
         first,
         last_excl,
         wrap::WrapGeometry {
@@ -3499,23 +3504,16 @@ pub async fn git_set_diff_view(
             tab_width,
         },
         rows,
-        WindowDecorations {
-            search,
-            sneak,
-            diff_view: params.enabled,
-            hunks,
-            conflicts,
-            diagnostics,
-            git_status: buffer_git_status(&s, buffer_id),
-        },
+        params.enabled,
+        SneakLabels::Shown,
     );
 
     let vp = s
         .viewports
         .get_mut(&params.viewport_id)
         .expect("just checked");
-    vp.first_logical_line = first;
-    vp.last_logical_line_exclusive = last_excl;
+    vp.first_view_line = first;
+    vp.last_view_line_exclusive = last_excl;
     Ok(ViewportWindowResult { window })
 }
 
@@ -3594,22 +3592,35 @@ pub async fn git_navigate_hunk(
         anchors.dedup();
         anchors
     };
-    // Walk `count` hunks in `direction`, clamping to the furthest available so an over-large
-    // count lands on the last/first change rather than refusing to move.
+    // The field's extent. `c` is a *target* motion, so a hunk outside the element the cursor is in
+    // is not a destination — the same rule `d` follows. In an ordinary editor view the field is the
+    // whole buffer and this filters nothing; it matters wherever a view windows part of a file.
+    // (A composed view's `c` is routed to `view/navigate_change` by the client instead, which steps
+    // between the view's elements — a different verb, and the reason this one stays element-local.)
+    let (field_first, field_last) = {
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
+    let anchors: Vec<u32> = anchors
+        .into_iter()
+        .filter(|&a| a >= field_first && a <= field_last)
+        .collect();
+    // Walk `count` hunks in `direction`. An over-large count **refuses** rather than landing on the
+    // last/first change: the count names which hunk, and there isn't one. At `count == 1` the two
+    // readings coincide, so this changes nothing for a bare `c`.
     let skip = (params.count.max(1) - 1) as usize;
     let target = match params.direction {
-        HunkDirection::Next => {
-            let mut it = anchors.iter().filter(|&&a| a > params.from_line);
-            it.nth(skip)
-                .or_else(|| anchors.iter().rfind(|&&a| a > params.from_line))
-                .copied()
-        }
-        HunkDirection::Prev => {
-            let mut it = anchors.iter().rev().filter(|&&a| a < params.from_line);
-            it.nth(skip)
-                .or_else(|| anchors.iter().find(|&&a| a < params.from_line))
-                .copied()
-        }
+        HunkDirection::Next => anchors
+            .iter()
+            .filter(|&&a| a > params.from_line)
+            .nth(skip)
+            .copied(),
+        HunkDirection::Prev => anchors
+            .iter()
+            .rev()
+            .filter(|&&a| a < params.from_line)
+            .nth(skip)
+            .copied(),
     };
 
     let Some(target_line) = target else {
@@ -3690,7 +3701,13 @@ enum PatchApply {
     },
 }
 
-/// Resolve a stage/unstage against a patch buffer.
+/// Resolve a stage/unstage aimed at the **patch buffer itself**.
+///
+/// The fallback, not the main road. A patch's hunks window real files, so the cursor is normally in
+/// one of those files and the ordinary apply handles it; what reaches here is a cursor that has not
+/// entered an element, or an element windowing the generated text because there is no file to
+/// window (a deletion, a binary swap). Those are resolved through the patch's own line index, which
+/// is the only thing that can name them.
 ///
 /// Only the **working-changes** view; see [`PatchApply`] for why the ways of resolving nothing are
 /// distinguished rather than collapsed.
@@ -4016,9 +4033,7 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
             })
             .collect();
 
-        if let Some(doc) = s.documents.get_mut(&doc_id) {
-            doc.replace_generated(&content.text, content.generated);
-        }
+        s.replace_generated(buffer_id, &content.text, content.generated);
         for (client, anchor) in anchors {
             let Some(line) = s
                 .doc_of(buffer_id)
@@ -4050,8 +4065,7 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
         // document, a cursor whose file is gone from the diff — still has to land inside the new
         // text.
         clamp_doc_cursors(&mut s, buffer_id);
-        let line_count = s.doc_of(buffer_id).line_count();
-        refresh_viewport_ranges_for_buffer(&mut s, buffer_id, line_count);
+        refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
         let revision = s.doc_of(buffer_id).revision;
         let mut pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
         // The state push as well as the content one, exactly as a reload sends both. A client
@@ -4146,10 +4160,17 @@ pub async fn git_apply_hunk(
     // a file that has been open for more than a moment.
     ensure_git_baseline(state, buffer_id).await;
 
-    // Staging *from the working-changes view*. The patch buffer isn't the file being staged, so
-    // resolve which file and which of its lines the cursor addresses, then run the ordinary apply
-    // against that file's own buffer — reusing the dirty-buffer guard, the layer resolution and the
-    // status reporting rather than reimplementing an index write here.
+    // Staging *from the working-changes view*, for the case where the cursor is still on the patch
+    // buffer itself.
+    //
+    // Usually it is not: a patch's hunks window the real files, so focus rebinds the view's buffer
+    // to the file under the cursor and the client names *that* buffer here — whereupon this returns
+    // `NotAPatch` and the ordinary apply below runs against the real file's baseline, with no patch
+    // coordinates involved at all. That is the element-resolved path, and it is the normal one.
+    //
+    // What still arrives on the patch buffer: a cursor that has not entered an element yet, and
+    // elements that window the generated text because there is no file to window — a deleted file,
+    // a binary swap. Those resolve through the patch's own index, which is why it stays.
     //
     // Every arm but `NotAPatch` answers here. The fall-through below reads a *file's* baseline, and
     // a patch buffer has none — so letting one reach it reports `Unavailable`, which the client
@@ -4432,9 +4453,8 @@ pub async fn git_apply_hunk(
 
             let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
             search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-            let new_line_count = s.doc_of(buffer_id).line_count();
             // Also recomputes the cached hunks, so the pushed gutter markers are post-revert.
-            refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+            refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
             notify_lsp_change(&mut s, buffer_id);
 
             let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
@@ -4551,8 +4571,7 @@ pub async fn git_resolve_conflict(
 
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     // Explicitly, *not* relying on the refresh above: that rescan is gated on the buffer having a
     // viewport (the per-edit work is only worth doing for something on screen), and the count this
     // call reports — "how many are left" — has to be true whether or not anyone is looking.

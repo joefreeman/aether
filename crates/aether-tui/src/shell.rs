@@ -25,11 +25,12 @@ use aether_client::session::{
     Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
+use aether_protocol::coords::{ViewLine, VisualRow};
 
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScroll, ViewportScrollParams,
-    ViewportScrollToRow, ViewportScrollToRowParams, ViewportSubscribe, ViewportSubscribeParams,
-    ViewportSubscribeResult, ViewportWindowResult, Window, WrapMode,
+    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScrollToRow,
+    ViewportScrollToRowParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportWindowAtCursor, ViewportWindowAtCursorParams, ViewportWindowResult, Window, WrapMode,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -76,8 +77,14 @@ enum Continuation {
     /// so a reply from a burst of subscribes (e.g. `<`/`>` grep jumps) that survives to dispatch
     /// is always the live one — never a since-deleted viewport_id.
     Subscribed,
-    /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`).
+    /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`) — one chasing the
+    /// *scroll* position.
     Window,
+    /// A window-returning call made to chase the **cursor**: the answer an owed reveal is waiting
+    /// for. Distinct from [`Continuation::Window`] because only this reply can prove a cursor
+    /// unplaceable — window replies do not answer one-for-one to the request that armed the debt
+    /// (see [`aether_client::reveal`]), so a scroll fetch arriving in between proves nothing.
+    CursorWindow,
 }
 
 /// The core's toast kind for one of ours — the pair the shell keeps in sync so the lifetime policy
@@ -175,9 +182,9 @@ pub struct Shell {
     inflight: std::collections::HashMap<u64, Continuation>,
     /// The view's scroll position as a visual row into the buffer's full height —
     /// the iced shell's `scroll_px` with rows for pixels.
-    top_visual_row: u32,
+    top_visual_row: VisualRow,
     /// The search prompt's Esc-restore anchor (`SaveScrollAnchor` effect).
-    scroll_anchor: Option<u32>,
+    scroll_anchor: Option<VisualRow>,
     /// Horizontal scroll: the first visible display column when soft-wrap is off (always 0 under
     /// soft wrap, which never overflows right). The renderer drops this many columns from each
     /// row; cursor moves keep it in `[scroll_col, scroll_col + viewport_cols)`.
@@ -293,12 +300,12 @@ pub async fn run(
         state: connecting_state(term.0, term.1),
         pending: FuturesUnordered::new(),
         inflight: std::collections::HashMap::new(),
-        top_visual_row: 0,
+        top_visual_row: VisualRow::ZERO,
         scroll_anchor: None,
         scroll_col: 0,
         sent_grid: None,
         subscribe_scroll: ScrollPosition {
-            logical_line: 0,
+            logical_line: ViewLine::ZERO,
             sub_row: 0.0,
         },
         fetch_in_flight: false,
@@ -656,7 +663,7 @@ impl Shell {
                     self.run_effects(fx);
                 }
                 Continuation::Subscribed => self.pending_subscribe = None,
-                Continuation::Window => {
+                Continuation::Window | Continuation::CursorWindow => {
                     self.fetch_in_flight = false;
                     self.refetch_queued = false;
                 }
@@ -691,9 +698,15 @@ impl Shell {
                             self.top_visual_row = row;
                             self.clamp_scroll();
                         } else {
-                            if let Some(w) = self.session.window.as_ref() {
-                                if let Some(rel) = rows_before_line(w, scroll.logical_line) {
-                                    self.top_visual_row = w.first_visual_row + rel;
+                            if let Some(w) = self.session.view.window.as_ref() {
+                                // The *block's* first row, so a line's chrome comes with it: a
+                                // patch opened at line 0 shows its first file heading rather than
+                                // starting just below it.
+                                if let Some(row) = aether_client::grid::block_start_of_view_line(
+                                    w,
+                                    scroll.logical_line,
+                                ) {
+                                    self.top_visual_row = row;
                                 }
                             }
                             self.clamp_scroll();
@@ -704,13 +717,20 @@ impl Shell {
                     Err(e) => self.error_detail("Subscribe failed", e.message),
                 }
             }
-            Continuation::Window => {
+            Continuation::Window | Continuation::CursorWindow => {
+                let chased = matches!(cont, Continuation::CursorWindow);
                 match crate::connection::parse_reply::<ViewportWindowResult>(method, result) {
                     Ok(res) => {
                         self.fetch_in_flight = false;
                         self.session.adopt_window(res);
                         self.clamp_scroll();
-                        self.settle_pending_reveal();
+                        // A reply to the cursor's own chase settles differently: if it can't place
+                        // the cursor, nothing can, and chasing again is the loop that flickers.
+                        if chased {
+                            self.settle_chased_reveal();
+                        } else {
+                            self.settle_pending_reveal();
+                        }
                         // Always re-check, not just when a refetch was queued: the window just
                         // adopted can be a *stale* one that doesn't cover the view at all (a
                         // cursor reveal and a scroll fetch answering out of turn), and nothing
@@ -996,11 +1016,12 @@ impl Shell {
                 _ => None,
             };
         }
-        if self.session.mode == Mode::Search {
+        if self.session.view.mode == Mode::Search {
             // A selected option chip makes every key a command (chip-row nav / remove / cycle), so
             // drop the editor and let the core's `on_search_key` own the keyboard.
             return self
                 .session
+                .view
                 .search
                 .chip_selected
                 .is_none()
@@ -1060,7 +1081,7 @@ impl Shell {
                 Some(Prompt::OpenPath(ed)) => ed.input.text.clone(),
                 _ => String::new(),
             },
-            OverlayField::Search => self.session.search.query.clone(),
+            OverlayField::Search => self.session.view.search.query.clone(),
             OverlayField::WorkspaceName => self
                 .session
                 .workspace_settings
@@ -1235,7 +1256,7 @@ impl Shell {
         // The reading view owns the mouse while active: the wheel scrolls the document, horizontal
         // wheel (or shift+wheel) pans the code block under the pointer, a left press focuses the
         // element under it.
-        if self.session.read.is_some() {
+        if self.session.view.read.is_some() {
             match m.kind {
                 MouseEventKind::ScrollLeft => {
                     let e = self.read_element_at_row(m.row);
@@ -1276,7 +1297,9 @@ impl Shell {
             MouseEventKind::ScrollDown => self.scroll_by(3),
             MouseEventKind::Down(MouseButton::Left) => self.on_left_press(m),
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pos) = ui::screen_to_logical(&self.state, m.row, m.column) {
+                if let Some((_, pos)) = ui::screen_to_logical(&self.state, m.row, m.column) {
+                    // A drag stays in the element it started in: dragging *between* elements would
+                    // mean a selection spanning two buffers, which no edit could act on.
                     let fx = self.session.pointer_drag(pos);
                     self.run_effects(fx);
                 }
@@ -1328,7 +1351,7 @@ impl Shell {
         if m.modifiers.contains(KeyModifiers::SHIFT) {
             return;
         }
-        let Some(pos) = ui::screen_to_logical(&self.state, m.row, m.column) else {
+        let Some((element, pos)) = ui::screen_to_logical(&self.state, m.row, m.column) else {
             return;
         };
         // Synthesize the click streak from a same-cell press chain (terminals report no count).
@@ -1349,14 +1372,14 @@ impl Shell {
             2 => aether_protocol::cursor::Granularity::Word,
             _ => aether_protocol::cursor::Granularity::Line,
         };
-        let fx = self.session.pointer_press(pos, granularity, false);
+        let fx = self.session.pointer_press(element, pos, granularity, false);
         self.run_effects(fx);
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
         self.term = (cols, rows);
         self.sent_grid = Some(self.grid());
-        let Some(viewport_id) = self.session.viewport_id else {
+        let Some(viewport_id) = self.session.view.viewport_id else {
             return;
         };
         let (cols, rows) = self.grid();
@@ -1412,7 +1435,7 @@ impl Shell {
                 // In the reading view the vertical scroll is the document's; Left/Right pan
                 // the *focused* block's horizontal window (only code rows can overflow, so
                 // this is a clamped no-op anywhere else).
-                if self.session.read.is_some() {
+                if self.session.view.read.is_some() {
                     match dir {
                         ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
                         ScrollDir::Down => self.read_scroll_by(delta as i32),
@@ -1425,10 +1448,9 @@ impl Shell {
                                 ScrollUnit::Half => (window / 2).max(1),
                                 ScrollUnit::Page => window,
                             };
-                            let focused =
-                                self.session.read.as_ref().and_then(|r| {
-                                    r.block_focus(self.session.buffer.cursor.position)
-                                });
+                            let focused = self.session.view.read.as_ref().and_then(|r| {
+                                r.block_focus(self.session.view.buffer.cursor.position)
+                            });
                             let signed = if matches!(dir, ScrollDir::Left) {
                                 -step
                             } else {
@@ -1507,19 +1529,15 @@ impl Shell {
         // saved scroll, else center on the cursor.
         let scroll = if let Some(line) = self.session.relayout_anchor_line() {
             ScrollPosition {
-                logical_line: line,
+                logical_line: self.view_line_for(line),
                 sub_row: 0.0,
             }
         } else {
-            self.session.buffer.scroll.unwrap_or(ScrollPosition {
+            self.session.view.buffer.scroll.unwrap_or(ScrollPosition {
                 // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
                 // counterpart of the in-buffer jump reveal.
                 logical_line: self
-                    .session
-                    .buffer
-                    .cursor
-                    .position
-                    .line
+                    .view_line_for(self.session.view.buffer.cursor.position.line)
                     .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
                 sub_row: 0.0,
             })
@@ -1534,7 +1552,9 @@ impl Shell {
         let id = self
             .handle
             .send::<ViewportSubscribe>(ViewportSubscribeParams {
-                buffer_id: self.session.buffer.buffer_id,
+                // The *view* is what a viewport subscribes to: the server builds its element
+                // bindings from it, and a patch's elements window files the view merely shows.
+                buffer_id: self.session.view.view_id,
                 cols,
                 rows,
                 overscan_rows: rows,
@@ -1548,13 +1568,32 @@ impl Shell {
         self.pending_subscribe = Some(id);
     }
 
-    fn max_scroll_row(&self) -> u32 {
-        match &self.session.window {
-            Some(w) => w
-                .total_visual_rows
-                .saturating_sub(self.visible_rows())
-                .min(w.total_visual_rows),
-            None => 0,
+    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one.
+    ///
+    /// Exact while the window has the line loaded. When it doesn't — which is precisely when a
+    /// fetch-around-the-cursor is being issued — the number is carried across unchanged: the two
+    /// spaces coincide for every single-element view, and for a patch the server clamps into the
+    /// view and the follow-up window lands somewhere sane rather than nowhere. It stops being an
+    /// approximation when scrolling moves client-side and requests name an element.
+    fn view_line_for(&self, line: u32) -> ViewLine {
+        self.session
+            .view
+            .window
+            .as_ref()
+            .and_then(|w| {
+                aether_client::grid::view_line_of(w, self.session.view.focused_element, line)
+            })
+            .unwrap_or(ViewLine(line))
+    }
+
+    fn max_scroll_row(&self) -> VisualRow {
+        match &self.session.view.window {
+            Some(w) => VisualRow(
+                w.total_visual_rows
+                    .saturating_sub(self.visible_rows())
+                    .min(w.total_visual_rows),
+            ),
+            None => VisualRow::ZERO,
         }
     }
 
@@ -1562,31 +1601,33 @@ impl Shell {
         self.top_visual_row = self.top_visual_row.min(self.max_scroll_row());
     }
 
-    fn scroll_to_row(&mut self, row: u32) {
+    fn scroll_to_row(&mut self, row: VisualRow) {
         self.top_visual_row = row.min(self.max_scroll_row());
         self.maybe_fetch();
     }
 
     fn scroll_by(&mut self, delta: i64) {
-        let target = (self.top_visual_row as i64 + delta).max(0) as u32;
+        let target = VisualRow((self.top_visual_row.get() as i64 + delta).max(0) as u32);
         self.scroll_to_row(target);
     }
 
     /// Fetch a new window when the view nears the loaded range's edge (iced's
     /// `maybe_fetch`, row units).
     fn maybe_fetch(&mut self) {
-        let (Some(window), Some(viewport_id)) = (&self.session.window, self.session.viewport_id)
+        let (Some(window), Some(viewport_id)) =
+            (&self.session.view.window, self.session.view.viewport_id)
         else {
             return;
         };
         let loaded_start = window.first_visual_row;
-        let loaded_end = loaded_start + loaded_rows(window);
+        let loaded_end = loaded_start.saturating_add(loaded_rows(window));
         let margin = self.visible_rows();
         let visible = self.visible_rows();
         let top_row = self.top_visual_row;
-        let need_above = loaded_start > 0 && top_row < loaded_start.saturating_add(margin);
-        let need_below = loaded_end < window.total_visual_rows
-            && top_row + visible > loaded_end.saturating_sub(margin);
+        let need_above =
+            loaded_start > VisualRow::ZERO && top_row < loaded_start.saturating_add(margin);
+        let need_below = loaded_end.get() < window.total_visual_rows
+            && top_row.saturating_add(visible) > loaded_end.saturating_sub(margin);
         if !(need_above || need_below) {
             return;
         }
@@ -1607,11 +1648,13 @@ impl Shell {
     /// After a cursor move: fetch around the cursor when it left the loaded window,
     /// otherwise scroll the minimum to reveal it.
     fn ensure_cursor_visible(&mut self, style: RevealStyle) {
-        let Some(window) = &self.session.window else {
+        let Some(window) = &self.session.view.window else {
             return;
         };
-        let line = self.session.buffer.cursor.position.line;
-        if line < window.first_logical_line || line >= window.last_logical_line_exclusive {
+        let line = self.session.view.buffer.cursor.position.line;
+        // Per element: a cursor line is a line of *its element's* buffer, and comparing it against
+        // the window's view-line range says "not loaded" for a line sitting in plain sight.
+        if !aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line) {
             self.pending_reveal.owe_reveal(style);
             self.fetch_cursor_window();
             return;
@@ -1640,32 +1683,51 @@ impl Shell {
         settled != Settled::Nothing
     }
 
-    /// Pull a window around the cursor's line — the fetch an owed reveal waits on, and the
-    /// counterpart of [`Self::maybe_fetch`], which chases `top_visual_row` instead.
+    /// [`Self::settle_pending_reveal`] for the reply to the cursor's own chase — which is the one
+    /// window that can prove there is nothing to reveal.
     ///
-    /// Coalesced against `fetch_in_flight` for the same reason `maybe_fetch` is: a held-down
-    /// motion key outside the loaded window would otherwise put one full window render per
-    /// keystroke on the wire, and the view can't follow the cursor until that backlog drains.
-    /// Skipping loses nothing — [`Self::settle_pending_reveal`] re-issues while the debt is
-    /// unpaid, and it re-reads the cursor, so the request that does go out asks about wherever
-    /// the cursor has reached by then.
+    /// It never chases again. Chasing here is what made the viewport unusable: a cursor with no row
+    /// in this view (its line belonging to a buffer the focused element doesn't window) meant every
+    /// reply re-armed the same request and re-seated the scroll, so the screen flickered, scrolling
+    /// wouldn't stick, and no cursor was ever drawn.
+    fn settle_chased_reveal(&mut self) -> bool {
+        let mut pending = std::mem::take(&mut self.pending_reveal);
+        let settled = pending.settle_chase(self);
+        self.pending_reveal = pending;
+        settled != Settled::Nothing
+    }
+
+    /// Pull a window around the cursor — the fetch an owed reveal waits on, and the counterpart of
+    /// [`Self::maybe_fetch`], which chases `top_visual_row` instead.
+    ///
+    /// Asks the server for "the window my cursor is in" rather than naming a position: a view line
+    /// is an index into the elements' concatenated extents and a visual row depends on how the lines
+    /// above wrapped, and when the cursor's line has scrolled out of the window the client knows
+    /// neither. It used to fetch around the focused *element's* start instead, which is the same
+    /// place only while the cursor is within a screen of it — past that the window came back without
+    /// the cursor's line in it, so the reveal or placement still could not be performed, and the
+    /// view had been dragged to the top of the element for nothing. That is what needing to press
+    /// `;` twice was: the first press moved the view and fetched, the second finally had the line.
+    ///
+    /// It no longer scrolls at all. The fetch loads content; what to do with the viewport is the
+    /// debt's business, settled when the window lands.
+    ///
+    /// Coalesced against `fetch_in_flight` for the same reason `maybe_fetch` is: a held-down motion
+    /// key outside the loaded window would otherwise put one full window render per keystroke on the
+    /// wire. Skipping loses nothing — [`Self::settle_pending_reveal`] re-issues while the debt is
+    /// unpaid, and the request that does go out asks about wherever the cursor has reached by then.
     fn fetch_cursor_window(&mut self) {
         if self.fetch_in_flight {
             return;
         }
-        let Some(viewport_id) = self.session.viewport_id else {
+        let Some(viewport_id) = self.session.view.viewport_id else {
             return;
         };
-        let line = self.session.buffer.cursor.position.line;
         self.fetch_in_flight = true;
-        let id = self.handle.send::<ViewportScroll>(ViewportScrollParams {
-            viewport_id,
-            scroll: ScrollPosition {
-                logical_line: line,
-                sub_row: 0.0,
-            },
-        });
-        self.inflight.insert(id, Continuation::Window);
+        let id = self
+            .handle
+            .send::<ViewportWindowAtCursor>(ViewportWindowAtCursorParams { viewport_id });
+        self.inflight.insert(id, Continuation::CursorWindow);
     }
 
     /// Whether the reveal could be performed — `false` when the cursor's line isn't in the loaded
@@ -1682,17 +1744,21 @@ impl Shell {
     /// it already is when visible. The follow behaviour for ordinary motions.
     fn reveal_cursor(&mut self) -> bool {
         self.reveal_cursor_col();
-        let Some(window) = &self.session.window else {
+        let Some(window) = &self.session.view.window else {
             return false;
         };
-        let Some(row) = cursor_visual_row(window, self.session.buffer.cursor.position) else {
+        let Some(row) = cursor_visual_row(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+        ) else {
             return false;
         };
         let visible = self.visible_rows();
         if row < self.top_visual_row {
             self.top_visual_row = row;
-        } else if row + 1 > self.top_visual_row + visible {
-            self.top_visual_row = row + 1 - visible;
+        } else if row.get() + 1 > self.top_visual_row.get() + visible {
+            self.top_visual_row = VisualRow(row.get() + 1 - visible);
         }
         self.maybe_fetch();
         true
@@ -1702,14 +1768,18 @@ impl Shell {
     /// of the viewport (more context below). The TUI snaps — only the GUI/web animate.
     fn reveal_cursor_jump(&mut self) -> bool {
         self.reveal_cursor_col();
-        let Some(window) = &self.session.window else {
+        let Some(window) = &self.session.view.window else {
             return false;
         };
-        let Some(row) = cursor_visual_row(window, self.session.buffer.cursor.position) else {
+        let Some(row) = cursor_visual_row(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+        ) else {
             return false;
         };
         let visible = self.visible_rows();
-        if row >= self.top_visual_row && row < self.top_visual_row + visible {
+        if row >= self.top_visual_row && row < self.top_visual_row.saturating_add(visible) {
             self.maybe_fetch(); // already visible — don't disturb the view
             return true;
         }
@@ -1730,7 +1800,7 @@ impl Shell {
         if cols == 0 {
             return;
         }
-        let col = self.session.buffer.cursor.position.col;
+        let col = self.session.view.buffer.cursor.position.col;
         if col < self.scroll_col {
             self.scroll_col = col;
         } else if col >= self.scroll_col.saturating_add(cols) {
@@ -1743,8 +1813,8 @@ impl Shell {
         // leaves READ_GAP between the view top and the block's top, `Alt-;` between the view bottom
         // and the block's bottom. Read scroll is shell-owned rows; the document-end clamp
         // happens in `read_view`.
-        if let Some(read) = self.session.read.as_ref() {
-            let cursor = self.session.buffer.cursor.position;
+        if let Some(read) = self.session.view.read.as_ref() {
+            let cursor = self.session.view.buffer.cursor.position;
             let Some(focus) = read.block_focus(cursor) else {
                 return;
             };
@@ -1777,19 +1847,17 @@ impl Shell {
             self.read_scroll = target.max(0.0) as u16;
             return;
         }
-        let line = self.session.buffer.cursor.position.line;
-        let loaded = self
-            .session
-            .window
-            .as_ref()
-            .map(|w| (w.first_logical_line, w.last_logical_line_exclusive));
-        let Some((first, last)) = loaded else {
+        let line = self.session.view.buffer.cursor.position.line;
+        let loaded = self.session.view.window.as_ref().map(|w| {
+            aether_client::grid::line_is_loaded(w, self.session.view.focused_element, line)
+        });
+        let Some(loaded) = loaded else {
             return;
         };
         // When the cursor's line has been scrolled out of the loaded window, its visual row is
         // unknown — pull that region from the server (scrolling the viewport to the line), then
         // place once it lands. Mirrors `ensure_cursor_visible`.
-        if line < first || line >= last {
+        if !loaded {
             self.pending_reveal.owe_place(place);
             self.fetch_cursor_window();
             return;
@@ -1805,10 +1873,14 @@ impl Shell {
     /// known, on the same terms as [`Self::reveal_cursor`].
     fn place_cursor_in_window(&mut self, place: ViewportPlace) -> bool {
         self.reveal_cursor_col();
-        let Some(window) = &self.session.window else {
+        let Some(window) = &self.session.view.window else {
             return false;
         };
-        let Some(row) = cursor_visual_row(window, self.session.buffer.cursor.position) else {
+        let Some(row) = cursor_visual_row(
+            window,
+            self.session.view.focused_element,
+            self.session.view.buffer.cursor.position,
+        ) else {
             return false;
         };
         let above = (self.visible_rows() as f32 * place.fraction()) as u32;
@@ -1864,10 +1936,10 @@ impl Shell {
 
     fn spawn_reconnect(&mut self, attempt: u32) {
         let workspace = self.session.workspace.clone();
-        let path = self.session.buffer.path.clone();
-        let buffer_id = self.session.buffer.buffer_id;
-        let transient = self.session.buffer.transient;
-        let cursor = self.session.buffer.cursor.position;
+        let path = self.session.view.buffer.path.clone();
+        let buffer_id = self.session.view.buffer.buffer_id;
+        let transient = self.session.view.buffer.transient;
+        let cursor = self.session.view.buffer.cursor.position;
         let version = env!("CARGO_PKG_VERSION").to_string();
         let server_url = self.server_url.clone();
         self.pending.push(Box::pin(async move {
@@ -1911,12 +1983,12 @@ impl Shell {
             let (before, keys, after) = h.parts();
             (before.to_string(), keys.to_string(), after.to_string())
         });
-        st.pending_leader = match s.pending {
+        st.pending_leader = match s.view.pending {
             Pending::Leader => Some(PendingLeader::Space),
             Pending::LeaderGit => Some(PendingLeader::SpaceG),
             _ => None,
         };
-        st.lsp_status = match (&s.lsp, &s.buffer.lsp_server) {
+        st.lsp_status = match (&s.view.lsp, &s.view.buffer.lsp_server) {
             (Some(status), Some(server)) => {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
@@ -1929,10 +2001,10 @@ impl Shell {
         };
         st.diagnostic_counts = {
             let mut m = std::collections::HashMap::new();
-            m.insert(s.buffer.buffer_id, s.diagnostics);
+            m.insert(s.view.buffer.buffer_id, s.view.diagnostics);
             m
         };
-        st.symbol_path = s.symbol_path.clone();
+        st.symbol_path = s.view.symbol_path.clone();
 
         st.editor = editor;
         st.read = read;
@@ -2106,7 +2178,7 @@ impl Shell {
     /// `(buffer, revision, cols)`), derive the focused element from the server cursor, reveal it
     /// when the focus changed, and clamp the scroll.
     fn read_view(&mut self) -> Option<crate::app::ReadViewState> {
-        let read = self.session.read.as_ref()?;
+        let read = self.session.view.read.as_ref()?;
         // First fetch still in flight: show the loading page WITHOUT touching the layout cache —
         // the adopt often lands at the same revision (an unedited buffer stays at rev 0), so a
         // cached empty layout would otherwise mask the parsed document.
@@ -2156,7 +2228,7 @@ impl Shell {
         // position; the interactive target inverts on top of it. An extended selection adds a third
         //: the selection tint over the selected blocks' rows — and suppresses the pill
         // (display_target), one selection on screen at a time.
-        let cursor_state = self.session.buffer.cursor;
+        let cursor_state = self.session.view.buffer.cursor;
         let block_focus = read.display_block_focus(&cursor_state);
         let target_focus = read.display_target(&cursor_state);
         // The selected block range, as rows: first..=last row whose element's span falls inside
@@ -2293,7 +2365,7 @@ impl Shell {
     /// selects click-follow (`read_click_activate`) over plain focusing.
     fn read_hit(&self, row: u16, col: u16) -> Option<(u32, bool)> {
         use unicode_width::UnicodeWidthStr;
-        let read = self.session.read.as_ref()?;
+        let read = self.session.view.read.as_ref()?;
         let rows = &self.read_cache.as_ref()?.4;
         if u32::from(row) >= self.visible_rows() {
             return None; // the status row (or below)
@@ -2322,21 +2394,56 @@ impl Shell {
         Some((read.elements.get(element?)?.span().start, interactive))
     }
 
+    /// The row to *paint* from: the scroll position, clamped into what the window can actually
+    /// answer for.
+    ///
+    /// The scroll is free to be somewhere the loaded window isn't — a fetch is in flight, or one
+    /// came back covering somewhere else — and the painter has to show something in the meantime.
+    /// Showing the last screenful it holds is a mild misposition that corrects itself when the
+    /// window lands. Painting from a row the window has no line for is not: the row resolves to the
+    /// last line there is, that one line is drawn, and the rest of the screen is blank. Which is
+    /// what the terminal did, for a whole class of causes upstream.
+    ///
+    /// This is the render's own floor, not a scroll clamp: `top_visual_row` keeps its value, so the
+    /// fetch it triggered still asks about where the user actually is.
+    fn paintable_row(&self, w: &Window) -> VisualRow {
+        let top = self.top_visual_row.get();
+        let first = w.first_visual_row.get();
+        let loaded_end = first + loaded_rows(w);
+        // Inside the loaded range — including its last rows, where the screen is only partly filled
+        // while the fetch that fills it is in flight. Painting the *right* region half-empty beats
+        // painting the wrong one whole: pulling back to the last full screen here would drag the
+        // view backwards on every scroll and snap forward when the window landed.
+        if top >= first && top < loaded_end {
+            return VisualRow(top);
+        }
+        // Outside it entirely: there is nothing at that row to draw. Show the nearest edge — for a
+        // scroll past the end, the last screenful the window holds.
+        VisualRow(if top < first {
+            first
+        } else {
+            loaded_end.saturating_sub(self.visible_rows()).max(first)
+        })
+    }
+
     fn editor_view(&self) -> EditorState {
         let s = &self.session;
-        let window = s.window.as_ref();
-        // A buffer switch clears `session.window` until the fresh subscribe lands; keep
+        let window = s.view.window.as_ref();
+        // A buffer switch clears `session.view.window` until the fresh subscribe lands; keep
         // showing the previous window meanwhile (web parity) — a blank frame between
         // buffers reads as a flash, worst on same-file grep `<`/`>` jumps where it's
         // conceptually just a cursor move.
         let prev = self.state.editor.as_ref().filter(|_| window.is_none());
-        let (scroll_logical_line, scroll_skip_rows) = match (window, prev) {
-            (Some(w), _) => line_at_row(w, self.top_visual_row),
-            (None, Some(p)) => (p.scroll_logical_line, p.scroll_skip_rows),
+        // The *index* of the top line in the flattened list, not its logical line: a logical line
+        // identifies a line only within its element, so it cannot index the list once a view spans
+        // several files.
+        let (scroll_line_index, scroll_skip_rows) = match (window, prev) {
+            (Some(w), _) => line_at_row(w, self.paintable_row(w)),
+            (None, Some(p)) => (p.scroll_line_index, p.scroll_skip_rows),
             (None, None) => (0, 0),
         };
         EditorState {
-            mode: match s.mode {
+            mode: match s.view.mode {
                 Mode::Normal => EditorMode::Normal,
                 Mode::Insert => EditorMode::Insert,
                 Mode::Search => EditorMode::Search,
@@ -2344,30 +2451,62 @@ impl Shell {
                 // cursor over the editor window).
                 Mode::Read => EditorMode::Normal,
             },
-            buffer_id: s.buffer.buffer_id,
-            viewport_id: s.viewport_id.unwrap_or(0),
-            cursor: s.buffer.cursor,
-            scroll_logical_line,
+            buffer_id: s.view.buffer.buffer_id,
+            viewport_id: s.view.viewport_id.unwrap_or(0),
+            cursor: s.view.buffer.cursor,
+            scroll_line_index,
             scroll_skip_rows,
-            window_first_logical_line: window
-                .map(|w| w.first_logical_line)
-                .or(prev.map(|p| p.window_first_logical_line))
-                .unwrap_or(0),
+            focused_element: self.session.view.focused_element,
             lines: window
-                .map(|w| w.lines.clone())
+                .map(|w| {
+                    aether_client::grid::window_lines(w)
+                        .into_iter()
+                        .map(|(at, line)| (at, line.clone()))
+                        .collect()
+                })
                 .or_else(|| prev.map(|p| p.lines.clone()))
                 .unwrap_or_default(),
+            root: window
+                .map(|w| w.root.clone())
+                .or_else(|| prev.map(|p| p.root.clone()))
+                .unwrap_or(aether_protocol::viewport::Element::Editor {
+                    element: 0,
+                    buffer: 0,
+                    rows: 0,
+                    first_buffer_line: 0,
+                    lines: Vec::new(),
+                }),
+            chrome_above: window
+                .map(|w| {
+                    aether_client::grid::chrome_by_line_index(&w.root)
+                        .0
+                        .into_iter()
+                        .map(|(k, v)| (k, v.into_iter().cloned().collect()))
+                        .collect()
+                })
+                .or_else(|| prev.map(|p| p.chrome_above.clone()))
+                .unwrap_or_default(),
+            trailing_chrome: window
+                .map(|w| {
+                    aether_client::grid::chrome_by_line_index(&w.root)
+                        .1
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .or_else(|| prev.map(|p| p.trailing_chrome.clone()))
+                .unwrap_or_default(),
             line_count: window
-                .map(|w| w.line_count)
+                .map(|w| w.view_line_count)
                 .or(prev.map(|p| p.line_count))
                 .unwrap_or(0),
             git_status: window
                 .and_then(|w| w.git_status.clone())
                 .or_else(|| prev.and_then(|p| p.git_status.clone())),
-            max_scroll_logical_line: window
-                .map(|w| w.max_scroll_logical_line)
-                .or(prev.map(|p| p.max_scroll_logical_line))
-                .unwrap_or(0),
+            max_scroll_view_line: window
+                .map(|w| w.max_scroll_view_line)
+                .or(prev.map(|p| p.max_scroll_view_line))
+                .unwrap_or(ViewLine::ZERO),
             total_visual_rows: window
                 .map(|w| w.total_visual_rows)
                 .or(prev.map(|p| p.total_visual_rows))
@@ -2377,7 +2516,7 @@ impl Shell {
             top_visual_row: window
                 .map(|_| self.top_visual_row)
                 .or(prev.map(|p| p.top_visual_row))
-                .unwrap_or(0),
+                .unwrap_or(VisualRow::ZERO),
             wrap: s.wrap,
             diff_view: s.diff_view,
             scroll_col: self.scroll_col,
@@ -2386,12 +2525,12 @@ impl Shell {
             drag_granularity: aether_protocol::cursor::Granularity::Char,
             last_click: None,
             click_streak: 0,
-            revision: s.buffer.revision,
-            saved_revision: s.buffer.saved_revision,
-            externally_modified: s.externally_modified,
-            externally_deleted: s.externally_deleted,
-            pending_count: s.count.unwrap_or(0),
-            pending_find: match s.pending {
+            revision: s.view.buffer.revision,
+            saved_revision: s.view.buffer.saved_revision,
+            externally_modified: s.view.externally_modified,
+            externally_deleted: s.view.externally_deleted,
+            pending_count: s.view.count.unwrap_or(0),
+            pending_find: match s.view.pending {
                 Pending::Find {
                     dir,
                     till,
@@ -2405,32 +2544,33 @@ impl Shell {
                 }),
                 _ => None,
             },
-            pending_surround: match s.pending {
+            pending_surround: match s.view.pending {
                 Pending::Surround(t) => Some(t),
                 _ => None,
             },
-            sneak_active: s.sneak.is_some(),
+            sneak_active: s.view.sneak.is_some(),
             search: self.search_view(),
             // Formatted at sync time — "3w ago" needs a clock, which the core deliberately
             // lacks; the data itself arrives via the server's blame-follow push.
             blame: BlameState {
-                line: s.blame.as_ref().map(|(l, _)| *l),
+                line: s.view.blame.as_ref().map(|(l, _)| *l),
                 text: s
+                    .view
                     .blame
                     .as_ref()
                     .map(|(_, b)| aether_client::labels::format_blame(b)),
             },
-            transient: s.buffer.transient,
+            transient: s.view.buffer.transient,
             tethered: s.tethered(),
-            file_path: s.buffer.path.clone(),
-            file_label: s.buffer.label.clone(),
-            language: s.buffer.language.clone(),
-            lsp_server: s.buffer.lsp_server.clone(),
+            file_path: s.view.buffer.path.clone(),
+            file_label: s.view.buffer.label.clone(),
+            language: s.view.buffer.language.clone(),
+            lsp_server: s.view.buffer.lsp_server.clone(),
         }
     }
 
     fn search_view(&self) -> TuiSearchState {
-        let s = &self.session.search;
+        let s = &self.session.view.search;
         let mut query = crate::text_input::TextInput::default();
         query.set(s.query.clone());
         // The caret lives in the shell-owned overlay editor (text mechanics are shell-side now);
@@ -2813,38 +2953,41 @@ fn save_as_view(
 /// Visual rows of every loaded line — phantom deleted rows (inline diff view) included,
 /// via the core's grid math (the same fns the iced shell scrolls with).
 fn loaded_rows(window: &Window) -> u32 {
-    window
-        .lines
+    // Every row-producing item, not just the lines: a chrome row occupies a screen row too, and
+    // leaving it out here would make the loaded window read as shorter than it draws.
+    aether_client::grid::row_items(window)
         .iter()
-        .map(aether_client::grid::line_rows)
+        .map(aether_client::grid::RowItem::rows)
         .sum()
 }
 
-/// Cumulative visual rows before `line` within the loaded window — absolute row when added
-/// to `first_visual_row`. Phantom rows included; `None` when the line isn't loaded.
-fn rows_before_line(window: &Window, line: u32) -> Option<u32> {
-    aether_client::grid::rows_before_line(window, line)
-}
-
-/// The buffer-absolute visual row of the cursor's cell — past any phantom rows, since the
-/// cursor never lands on them.
-fn cursor_visual_row(window: &Window, pos: aether_protocol::LogicalPosition) -> Option<u32> {
-    aether_client::grid::position_cell(window, pos, TAB_WIDTH).map(|(row, _, _)| row)
+/// The absolute visual row of the cursor's cell — past any phantom rows, since the cursor never
+/// lands on them.
+///
+/// Takes the focused element rather than deriving one from the line number: a line number names a
+/// line only *within* an element, and two hunks of two files both have a line 12.
+fn cursor_visual_row(
+    window: &Window,
+    element: aether_protocol::viewport::FieldId,
+    pos: aether_protocol::LogicalPosition,
+) -> Option<VisualRow> {
+    aether_client::grid::position_cell(window, element, pos, TAB_WIDTH).map(|(row, _, _)| row)
 }
 
 /// Resolve a buffer-absolute visual row to `(logical_line, rows_hidden_above)` for the
-/// renderer's `scroll_logical_line`/`scroll_skip_rows` pair. Line heights count the whole
+/// renderer's `scroll_view_line`/`scroll_skip_rows` pair. Line heights count the whole
 /// block (phantom rows + wrapped content rows), matching how the renderer skips.
-fn line_at_row(window: &Window, row: u32) -> (u32, u32) {
-    let mut rel = row.saturating_sub(window.first_visual_row);
-    for l in &window.lines {
-        let h = aether_client::grid::line_rows(l);
-        if rel < h {
-            return (l.logical_line, rel);
-        }
-        rel -= h;
-    }
-    (window.last_logical_line_exclusive.saturating_sub(1), 0)
+/// The top line's **index in the flattened list** and how many of its rows are scrolled above.
+///
+/// An index rather than a logical line: see [`aether_client::grid::line_index_at_row`]. Painting
+/// walks the list from here, taking each line's identity *from the line*.
+fn line_at_row(window: &Window, row: VisualRow) -> (usize, u32) {
+    aether_client::grid::line_index_at_row(window, row).unwrap_or((
+        aether_client::grid::window_lines(window)
+            .len()
+            .saturating_sub(1),
+        0,
+    ))
 }
 
 /// crossterm key event → the core's `(KeyCode, Mods, typed text)`.
@@ -3072,7 +3215,7 @@ pub async fn bootstrap(
                     // rather than dropping to the chooser. A directory is a session, not an errand:
                     // it lands on a scratch with the explorer over it, and has nothing to tether to.
                     if tether && !directory {
-                        session.tether = Some(session.buffer.buffer_id);
+                        session.tether = Some(session.view.buffer.buffer_id);
                     }
                     let startup = if directory {
                         session.open_picker(
@@ -3165,7 +3308,7 @@ pub async fn bootstrap(
             // so closing it exits. A missing path is a file to create and tethers too; a directory
             // opens the explorer over whatever buffer we landed on — nothing to tether to.
             if tether && resolved.as_ref().is_some_and(|p| !p.is_dir()) {
-                session.tether = Some(session.buffer.buffer_id);
+                session.tether = Some(session.view.buffer.buffer_id);
             }
             let startup = match &resolved {
                 Some(abs) if abs.is_dir() => session.open_picker(
@@ -3240,4 +3383,457 @@ fn make_state(
 /// conn state. `ui::draw` renders its no-workspace backdrop with the centered indicator.
 pub fn connecting_state(cols: u16, rows: u16) -> AppState {
     make_state(String::new(), Vec::new(), cols, rows, ConnState::Connecting)
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use aether_protocol::viewport::{Element, LogicalLineRender, Segment, Window, WrappedRow};
+
+    const ROWS: u16 = 25; // 24 text rows + the status row
+
+    fn line(n: u32) -> LogicalLineRender {
+        LogicalLineRender {
+            logical_line: n,
+            visual_rows: vec![WrappedRow {
+                byte_offset: 0,
+                continuation_indent: 0,
+                segments: vec![Segment {
+                    text: format!("line {n}"),
+                    highlights: Vec::new(),
+                }],
+            }],
+            search_matches: Vec::new(),
+            baseline_above: Vec::new(),
+            change: Default::default(),
+            diagnostics: Vec::new(),
+            sneak_targets: Vec::new(),
+        }
+    }
+
+    /// A patch-shaped view: each element is `(buffer, first_buffer_line, height)`, introduced by a
+    /// chrome row, with `loaded` naming which elements carry lines (the rest are on-screen only as
+    /// height — exactly how a window works once a view is taller than the fetch).
+    fn window_of(elements: &[(u64, u32, u32)], loaded: &[usize]) -> Window {
+        let mut children = Vec::new();
+        for (i, (buffer, first, height)) in elements.iter().enumerate() {
+            children.push(Element::Chrome {
+                kind: aether_protocol::viewport::ChromeKind::FileHeader,
+                rail: aether_protocol::ui::RailJoin::Opens,
+                children: vec![aether_protocol::ui::Element::text("a file", Vec::new())],
+            });
+            children.push(Element::Editor {
+                element: i as u32,
+                buffer: *buffer,
+                rows: *height,
+                first_buffer_line: *first,
+                lines: if loaded.contains(&i) {
+                    (*first..*first + *height).map(line).collect()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+        let total: u32 = elements.iter().map(|e| e.2 + 1).sum();
+        Window {
+            first_view_line: ViewLine(0),
+            last_view_line_exclusive: ViewLine(total),
+            view_line_count: elements.iter().map(|e| e.2).sum(),
+            max_scroll_view_line: ViewLine(0),
+            total_visual_rows: total,
+            first_visual_row: VisualRow(0),
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Stack { children },
+        }
+    }
+
+    /// A shell wired to a dummy transport, holding `window`, with the cursor at `(element, line)`.
+    ///
+    /// The scroll/reveal machinery is shell-owned and was, until this module, the one substantial
+    /// part of the terminal with no test at all — which is how "the view doesn't scroll when you
+    /// Tab" and "`;` needs two presses" both lived here unnoticed.
+    fn shell_with(window: Window, element: u32, line: u32) -> Shell {
+        let mut session = Session::placeholder();
+        session.conn = ConnState::Connected;
+        session.view.viewport_id = Some(1);
+        session.view.focused_element = element;
+        session.view.buffer.cursor.position = aether_protocol::LogicalPosition { line, col: 0 };
+        session.view.buffer.cursor.anchor = session.view.buffer.cursor.position;
+        session.view.window = Some(window);
+        Shell {
+            handle: crate::connection::dummy_handle(),
+            inbound: crate::connection::dummy_inbound(),
+            session,
+            state: connecting_state(80, ROWS),
+            pending: FuturesUnordered::new(),
+            inflight: std::collections::HashMap::new(),
+            top_visual_row: VisualRow::ZERO,
+            scroll_anchor: None,
+            scroll_col: 0,
+            sent_grid: None,
+            subscribe_scroll: ScrollPosition {
+                logical_line: ViewLine::ZERO,
+                sub_row: 0.0,
+            },
+            fetch_in_flight: false,
+            refetch_queued: false,
+            pending_reveal: PendingReveal::default(),
+            picker_scroll: crate::ui::PickerScroll::default(),
+            pending_group_reveal: false,
+            pending_subscribe: None,
+            last_click: None,
+            click_streak: 0,
+            should_quit: false,
+            overlay_edit: None,
+            term: (80, ROWS),
+            next_toast_id: 0,
+            boot: None,
+            boot_attempt: 0,
+            fatal: None,
+            server_url: String::new(),
+            read_scroll: 0,
+            read_last_focus: None,
+            read_cache: None,
+            read_hscroll: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The single `Effect::Request` in `fx` — these tests pin exact traffic.
+    fn the_request(fx: &Effects) -> (u64, &'static str) {
+        let mut it = fx.0.iter().filter_map(|e| match e {
+            Effect::Request { token, method, .. } => Some((*token, *method)),
+            _ => None,
+        });
+        let first = it.next().expect("a request");
+        assert!(it.next().is_none(), "expected exactly one request");
+        first
+    }
+
+    fn focus_result(element: u32, buffer_id: u64, line: u32) -> serde_json::Value {
+        serde_json::json!({
+            "element": element,
+            "buffer": {
+                "buffer_id": buffer_id,
+                "language": null,
+                "line_count": 200,
+                "byte_count": 2000,
+                "revision": 1,
+                "saved_revision": 1,
+                "path": "/repo/a.rs",
+                "cursor": {
+                    "position": { "line": line, "col": 0 },
+                    "anchor": { "line": line, "col": 0 },
+                },
+            }
+        })
+    }
+
+    /// `Tab` to an element **below the fold** rests it near the top, like any other jump.
+    ///
+    /// It used to reveal *minimally*, which scrolls the target just far enough to touch the bottom
+    /// row — so moving to a tall hunk showed a line or two of it and read as "Tab didn't scroll".
+    #[test]
+    fn tab_to_an_element_below_the_fold_rests_it_near_the_top() {
+        // Element 0 is 60 lines, so element 1 starts well past a 24-row viewport.
+        let mut sh = shell_with(window_of(&[(7, 0, 60), (8, 0, 100)], &[0, 1]), 0, 0);
+        let start =
+            aether_client::grid::element_start_row(sh.session.view.window.as_ref().unwrap(), 1)
+                .expect("element 1 is in the tree");
+        assert!(
+            start.get() >= sh.visible_rows(),
+            "the fixture wants the target off screen"
+        );
+
+        let fx = sh
+            .session
+            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let (token, method) = the_request(&fx);
+        assert_eq!(method, "view/focus_element");
+        sh.run_effects(fx);
+        sh.on_response(
+            Continuation::Core { token },
+            "view/focus_element",
+            Ok(focus_result(1, 8, 0)),
+        );
+
+        let rest = (sh.visible_rows() as f32 * CURSOR_REST_FRACTION) as u32;
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(start.get() - rest),
+            "a jump rests its target near the top, with context below"
+        );
+    }
+
+    /// `Tab` to an element that is **already on screen** doesn't scroll at all.
+    ///
+    /// The other half of the same rule, and the one that separates a jump from a re-frame: the thing
+    /// navigated to is already in front of you, so moving the view under it is disorienting — and
+    /// when the navigation came from a click it also drags the text out from under the pointer.
+    #[test]
+    fn tab_to_an_element_on_screen_leaves_the_view_alone() {
+        // Element 1 starts at row 22 of a 24-row viewport: visible, if only just.
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
+        let start =
+            aether_client::grid::element_start_row(sh.session.view.window.as_ref().unwrap(), 1)
+                .expect("element 1 is in the tree");
+        assert!(
+            start.get() < sh.visible_rows(),
+            "the fixture wants it visible"
+        );
+
+        let fx = sh
+            .session
+            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let (token, _) = the_request(&fx);
+        sh.run_effects(fx);
+        sh.on_response(
+            Continuation::Core { token },
+            "view/focus_element",
+            Ok(focus_result(1, 8, 0)),
+        );
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(0),
+            "the target was already on screen: a jump leaves the view where it is"
+        );
+    }
+
+    /// Tab at the last element doesn't move focus, so it doesn't re-frame anything.
+    ///
+    /// It still *reveals* — a keystroke may bring an off-screen cursor back — but a placement would
+    /// scroll a view that is already showing exactly what it should, on a keystroke that did
+    /// nothing. The distinction is why the focus reply's element is compared before it is adopted.
+    #[test]
+    fn tab_at_the_last_element_does_not_reframe_the_view() {
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 1, 0);
+        // The cursor (element 1's first line, row 22) is the viewport's top row: visible, so a
+        // reveal has nothing to do and only a placement would move the view.
+        sh.top_visual_row = VisualRow(22);
+        let fx = sh
+            .session
+            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let (token, _) = the_request(&fx);
+        sh.run_effects(fx);
+        // The server clamps at the end: focus comes back unchanged.
+        sh.on_response(
+            Continuation::Core { token },
+            "view/focus_element",
+            Ok(focus_result(1, 8, 0)),
+        );
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(22),
+            "a keystroke that changed no focus must not re-frame the view"
+        );
+    }
+
+    /// Clicking into another element that is already on screen must not re-frame the view.
+    ///
+    /// Regression from making focus place its element: a click is not blind navigation — the user is
+    /// looking at the thing they clicked — so scrolling it to a rest position moves the text out from
+    /// under the pointer. That is disorienting on its own, and it also manufactures a selection: the
+    /// press anchors at the clicked cell, the content then moves, and the first drag event maps the
+    /// same screen cell to a different line, so a selection appears between the two.
+    #[test]
+    fn clicking_into_a_visible_element_does_not_scroll() {
+        // Scrolled into the middle of the tall element, so its *start* (row 22) is off screen —
+        // which is where focusing seats the cursor, and therefore where a jump would rest the view.
+        // A click has already told us where the user is looking: nowhere near it.
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
+        sh.top_visual_row = VisualRow(60);
+        let fx = sh.session.focus_clicked_element(1);
+        let (token, method) = the_request(&fx);
+        assert_eq!(method, "view/focus_element");
+        sh.run_effects(fx);
+        sh.on_response(
+            Continuation::Core { token },
+            "view/focus_element",
+            Ok(focus_result(1, 8, 0)),
+        );
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(60),
+            "a click frames nothing: the press's own cursor/set decides where the cursor goes"
+        );
+    }
+
+    /// A click into another element sets the cursor in **that element's** buffer.
+    ///
+    /// The press cannot wait for the focus reply — it is a round trip behind — so it has to name the
+    /// buffer itself. Sending the clicked *line* to whichever buffer the view was still bound to
+    /// applies a line number to a different file: the cursor lands somewhere arbitrary in the buffer
+    /// being left, while the element just clicked keeps whatever position focus seated in it. The
+    /// requests are ordered, so by the time this one runs the server has already moved focus.
+    #[test]
+    fn a_click_sets_the_cursor_in_the_element_it_landed_in() {
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
+        let fx = sh.session.focus_clicked_element(1);
+        sh.run_effects(fx);
+        let fx = sh.session.pointer_press(
+            1,
+            aether_protocol::LogicalPosition { line: 40, col: 3 },
+            aether_protocol::cursor::Granularity::Char,
+            false,
+        );
+        let params = fx
+            .0
+            .iter()
+            .find_map(|e| match e {
+                Effect::Request { method, params, .. } if *method == "element/set" => Some(params),
+                _ => None,
+            })
+            .expect("the press sets the cursor");
+        assert_eq!(
+            params["buffer_id"], 8,
+            "the buffer element 1 windows, not the one the view is still bound to"
+        );
+    }
+
+    /// A view opens at its top — chrome included.
+    ///
+    /// The subscribe asks for view line 0 and the reply positions the viewport on it. Positioned by
+    /// "rows before that line", the chrome above it counted as rows to skip, so a patch opened just
+    /// below its own first file heading. The line's *block* is where the line starts.
+    #[test]
+    fn a_view_opens_showing_the_chrome_above_its_first_line() {
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 30)], &[0, 1]), 0, 0);
+        sh.top_visual_row = VisualRow(999); // whatever it was before the subscribe lands
+        sh.subscribe_scroll = ScrollPosition {
+            logical_line: ViewLine::ZERO,
+            sub_row: 0.0,
+        };
+        let res = aether_protocol::viewport::ViewportSubscribeResult {
+            viewport_id: 1,
+            window: window_of(&[(7, 0, 20), (8, 0, 30)], &[0, 1]),
+            buffer_status: Default::default(),
+            focus: None,
+        };
+        sh.on_response(
+            Continuation::Subscribed,
+            "view/subscribe",
+            Ok(serde_json::to_value(res).expect("serialises")),
+        );
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(0),
+            "the view opens at its first row — the file heading above line 0, not below it"
+        );
+    }
+
+    /// Scrolling to the end reaches the end: the last row of the view lands on the last row of the
+    /// screen.
+    ///
+    /// The scroll bound is `total_visual_rows` — the height the *server* reports — while every row
+    /// the painter resolves is counted off the **tree** it was sent. The two have to be the same
+    /// number. When the tree was shorter (chrome for elements not opening in view was left out of
+    /// it), the scroll kept going after the content had run out: the last rows were unreachable.
+    #[test]
+    fn scrolling_to_the_end_reaches_the_end() {
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
+        let total = sh.session.view.window.as_ref().unwrap().total_visual_rows;
+        // The tree and the reported height must agree — the server's half of this is pinned by
+        // `a_views_height_is_the_height_of_the_tree_at_every_scroll`.
+        let painted: u32 = aether_client::grid::row_items(sh.session.view.window.as_ref().unwrap())
+            .iter()
+            .map(aether_client::grid::RowItem::rows)
+            .sum();
+        assert_eq!(
+            painted, total,
+            "the fixture is only honest if the tree is the view"
+        );
+
+        sh.scroll_by(10_000);
+        let w = sh.session.view.window.as_ref().unwrap();
+        let (idx, skip) = line_at_row(w, sh.top_visual_row);
+        let (first_row, _) = aether_client::grid::scroll_top(&w.root, idx, skip);
+        assert_eq!(
+            first_row + sh.visible_rows(),
+            total,
+            "the last screenful ends exactly at the view's last row"
+        );
+    }
+
+    /// A scroll position the loaded window can't answer for still paints a full screen.
+    ///
+    /// The scroll runs ahead of the fetch, and a window can come back covering somewhere else. What
+    /// the painter must never do is resolve the row against a window that has no line for it: that
+    /// falls back to the last line there is, draws that one row, and leaves the rest of the screen
+    /// blank — the failure the terminal kept showing whatever the upstream cause.
+    #[test]
+    fn a_scroll_past_the_loaded_window_still_paints_a_screenful() {
+        // Only the first element's lines are loaded; the scroll is far below them.
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0]), 0, 0);
+        sh.top_visual_row = VisualRow(90);
+
+        // Through the real path — what the painter is actually handed each frame.
+        let ed = sh.editor_view();
+        let w = sh.session.view.window.as_ref().unwrap();
+        let loaded_rows_here = loaded_rows(w);
+        let (first_row, _) =
+            aether_client::grid::scroll_top(&ed.root, ed.scroll_line_index, ed.scroll_skip_rows);
+        let painted_from_there = w.first_visual_row.get() + loaded_rows_here - first_row;
+        // A screenful, or everything the window holds when it holds less than a screen.
+        assert_eq!(
+            painted_from_there,
+            sh.visible_rows().min(loaded_rows_here),
+            "painting from row {first_row} shows {painted_from_there} rows of the {loaded_rows_here} \
+             loaded, on a {}-row screen",
+            sh.visible_rows()
+        );
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(90),
+            "and the scroll itself is untouched, so the fetch still asks about where we are"
+        );
+    }
+
+    /// `;` with the cursor's line already loaded places it in one press.
+    #[test]
+    fn placing_a_loaded_cursor_lands_in_one_press() {
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 1, 50);
+        sh.top_visual_row = VisualRow(80);
+        sh.place_cursor(ViewportPlace::Upper);
+        let rest = (sh.visible_rows() as f32 * ViewportPlace::Upper.fraction()) as u32;
+        // Element 1 starts at row 22; its line 50 is 50 rows further down.
+        assert_eq!(sh.top_visual_row, VisualRow(22 + 50 - rest));
+    }
+
+    /// `;` with the cursor scrolled out of the loaded window asks for **the window the cursor is
+    /// in**, leaves the view alone until it arrives, and then places in that same press.
+    ///
+    /// Reported as "`;` sometimes needs to be pressed twice". The fetch used to be aimed at the
+    /// focused element's *start* — the only position the client could name — which for a cursor
+    /// more than a screen into a tall element brings back a window without the cursor's line in it.
+    /// The placement then still couldn't be performed, and the view had been yanked to the top of
+    /// the element on the way. The second press worked because the first had (incidentally) loaded
+    /// the region the cursor was in.
+    #[test]
+    fn placing_an_unloaded_cursor_fetches_the_cursors_own_window() {
+        // Element 1's lines aren't loaded, and the cursor is 50 lines into it.
+        let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0]), 1, 50);
+        sh.top_visual_row = VisualRow(0);
+
+        sh.place_cursor(ViewportPlace::Upper);
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(0),
+            "the fetch must not move the view: where it goes is the placement's decision"
+        );
+        assert!(sh.fetch_in_flight, "and it does go and ask");
+
+        // The window the server sends back carries the cursor's line.
+        let window = window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]);
+        sh.on_response(
+            Continuation::CursorWindow,
+            "view/window_at_cursor",
+            Ok(serde_json::json!({ "window": window })),
+        );
+        let rest = (sh.visible_rows() as f32 * ViewportPlace::Upper.fraction()) as u32;
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow(22 + 50 - rest),
+            "one press, and the placement lands where a loaded cursor's would"
+        );
+    }
 }

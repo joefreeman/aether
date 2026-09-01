@@ -675,4 +675,36 @@ mod tests {
         assert_eq!(t.git_status_bullet(GitStatus::Ignored), None);
         assert_eq!(t.git_status_bullet(GitStatus::Untracked), Some(t.git_added));
     }
+
+    /// Every colour role must have a matching `--kebab-case` custom property in the web shell's
+    /// `theme.css`, which hand-mirrors these tables (see the module header). Roles are the shared
+    /// vocabulary; only the final role → pixel step is per-shell — ratatui `Color`, iced `Color`,
+    /// CSS variable — so a role the core can emit but the web can't paint is the one way the three
+    /// clients drift apart, and until now nothing but a comment guarded it.
+    ///
+    /// The role list is scraped from this file's own source because Rust has no field reflection:
+    /// a new `pub x: Rgb` field is picked up here automatically, which is the whole point. The
+    /// check is deliberately one-directional — `theme.css` legitimately carries non-colour
+    /// variables of its own (`--ui-font-size`, `--ui-heading`, …) that have no role behind them.
+    #[test]
+    fn every_role_has_a_web_custom_property() {
+        let css = include_str!("../../../web/src/theme.css");
+        let declared: Vec<String> = css
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("--"))
+            .filter_map(|l| l.split(':').next())
+            .map(|n| n.trim().to_string())
+            .collect();
+        let missing: Vec<String> = include_str!("theme.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("    pub "))
+            .filter_map(|l| l.strip_suffix(": Rgb,"))
+            .map(|f| f.replace('_', "-"))
+            .filter(|role| !declared.iter().any(|d| d == role))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "roles with no `--` custom property in web/src/theme.css: {missing:?}"
+        );
+    }
 }

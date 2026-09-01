@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod app;
 pub mod buffer;
+pub mod coords;
 pub mod cursor;
 pub mod directory;
 pub mod envelope;
@@ -23,11 +24,51 @@ pub mod search;
 pub mod settings;
 pub mod sneak;
 pub mod syntax;
+pub mod ui;
 pub mod viewport;
 pub mod workspace;
 
 pub type BufferId = u64;
 pub type ViewportId = u64;
+
+/// What a client is *looking at*, as opposed to the text it is editing.
+///
+/// A view is presented by a buffer — for an ordinary editor, the very buffer being edited, which is
+/// why this was a bare [`BufferId`] for as long as those could not differ. A composed view (a patch
+/// over one file per hunk) breaks that: the view is the generated document, while the cursor,
+/// edits, search and undo all address whichever file the focused element windows. The two are then
+/// different ids of the same type, and every site that picks one is a silent choice.
+///
+/// So the choice becomes a type. `buffer/close` closes a view; `element/*` edits a buffer; the
+/// picker lists views; a session records views. Where a conversion is genuinely right — an ordinary
+/// view *is* its buffer — it is spelled, and spelling it is the point.
+///
+/// `#[serde(transparent)]`: the wire is unchanged, so no client or on-disk session has to know this
+/// happened.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct ViewId(pub BufferId);
+
+impl ViewId {
+    pub fn get(self) -> BufferId {
+        self.0
+    }
+
+    /// The buffer that presents this view. Correct by construction: a view *is* presented by a
+    /// buffer, and that buffer's id is this id. Distinct from the buffer being **edited**, which is
+    /// the focused element's and which no conversion can produce.
+    pub fn presenting_buffer(self) -> BufferId {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ViewId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 pub type Revision = u64;
 pub type ClientId = uuid::Uuid;
 

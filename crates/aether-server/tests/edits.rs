@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- input/move_lines --------------------------------------------------------------------------
@@ -2889,12 +2890,12 @@ async fn input_delete_line_removes_line_with_newline() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2920,7 +2921,7 @@ async fn input_delete_line_removes_line_with_newline() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.line_count, 3,
+        notif.view_line_count, 3,
         "buffer drops from 4 lines (incl trailing empty) to 3"
     );
 
@@ -2935,12 +2936,12 @@ async fn input_change_line_blanks_content_keeps_newline() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2968,7 +2969,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Line count stays at 4 (alpha, empty, gamma, trailing empty).
-    assert_eq!(notif.line_count, 4);
+    assert_eq!(notif.view_line_count, 4);
 
     drop(server);
 }
@@ -2981,12 +2982,12 @@ async fn input_replace_line_swaps_content() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -3033,12 +3034,12 @@ async fn subscribe_full(ws: &mut Ws, buffer_id: u64) -> ViewportSubscribeResult 
     send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3084,7 +3085,7 @@ async fn surround_wraps_selection_and_selects_inner() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "a(bc)"
     );
 
@@ -3120,7 +3121,7 @@ async fn surround_aliases_and_quotes() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "{hi}"
     );
 
@@ -3190,7 +3191,7 @@ async fn unsurround_strips_hugging_pair() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "abcd"
     );
 
@@ -3257,7 +3258,7 @@ async fn surround_then_unsurround_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "a[bc]"
     );
 
@@ -3272,10 +3273,7 @@ async fn surround_then_unsurround_roundtrips() {
     .await;
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "abc"
-    );
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
 
     drop(server);
 }
@@ -3309,10 +3307,7 @@ async fn unsurround_peels_nested_layers_per_press() {
     assert_eq!(r1.revision, 1);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "(x)"
-    );
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "(x)");
 
     // Selection now sits on "x" again — a second press peels the next layer: "(x)" → "x".
     let r2: EditResult = send_request::<InputUnsurround>(
@@ -3326,10 +3321,7 @@ async fn unsurround_peels_nested_layers_per_press() {
     assert_eq!(r2.revision, 2);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "x"
-    );
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "x");
 
     // Nothing left to strip: third press is a no-op (revision unchanged).
     let r3: EditResult = send_request::<InputUnsurround>(
@@ -3369,7 +3361,7 @@ async fn surround_line_wraps_whole_line_content() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "(abc)"
     );
 
@@ -3409,18 +3401,12 @@ async fn surround_line_targets_cursor_line() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Only line 1 is wrapped; the neighbours are untouched.
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "x");
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "x"
-    );
-    assert_eq!(
-        notif.replacement_lines[1].visual_rows[0].segments[0].text,
+        notif.root.lines()[1].visual_rows[0].segments[0].text,
         "\"abc\""
     );
-    assert_eq!(
-        notif.replacement_lines[2].visual_rows[0].segments[0].text,
-        "y"
-    );
+    assert_eq!(notif.root.lines()[2].visual_rows[0].segments[0].text, "y");
 
     drop(server);
 }
@@ -3457,10 +3443,7 @@ async fn unsurround_line_strips_wrapping_pair() {
 
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
-        "abc"
-    );
+    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
 
     drop(server);
 }
@@ -3501,7 +3484,7 @@ async fn surround_line_then_unsurround_line_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "{hello}"
     );
 
@@ -3516,7 +3499,7 @@ async fn surround_line_then_unsurround_line_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.replacement_lines[0].visual_rows[0].segments[0].text,
+        notif.root.lines()[0].visual_rows[0].segments[0].text,
         "hello"
     );
 
@@ -3655,12 +3638,12 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -3696,20 +3679,16 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     .await;
     let line0 = on
         .window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .find(|l| l.logical_line == 0)
         .expect("line 0 in window");
-    assert_eq!(
-        line0.virtual_rows_above.len(),
-        1,
-        "one deleted baseline row"
-    );
-    assert_eq!(line0.virtual_rows_above[0].text, "alpha");
-    assert_eq!(line0.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
+    assert_eq!(line0.baseline_above.len(), 1, "one deleted baseline row");
+    assert_eq!(line0.baseline_above[0].text, "alpha");
     assert_eq!(line0.visual_rows[0].segments[0].text, "Xalpha");
     // The edited real line is tinted as Modified.
-    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line0.change.marker(), Some(DiffMarker::Modified));
 
     // Turning it back off clears the phantom rows.
     let off: ViewportWindowResult = send_request::<GitSetDiffView>(
@@ -3722,16 +3701,17 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     .await;
     let line0 = off
         .window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .find(|l| l.logical_line == 0)
         .unwrap();
     // Phantom rows are gone, but the gutter marker persists — it's always-on, independent of the
     // inline diff toggle.
-    assert!(line0.virtual_rows_above.is_empty());
-    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert!(line0.baseline_above.is_empty());
+    assert_eq!(line0.change.marker(), Some(DiffMarker::Modified));
     assert!(
-        line0.diff_emphasis.is_empty(),
+        line0.change.emphasis().is_empty(),
         "intra-line emphasis is diff-view-only, like the phantom rows"
     );
 
@@ -3873,12 +3853,12 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -3891,32 +3871,34 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
 
     let line0 = sub
         .window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .find(|l| l.logical_line == 0)
         .expect("line 0 in window");
     // New side: "total" occupies bytes [4, 9) of "let total = 1;".
-    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line0.change.marker(), Some(DiffMarker::Modified));
     assert_eq!(
-        line0.diff_emphasis,
+        line0.change.emphasis(),
         vec![EmphasisRange { start: 4, end: 9 }]
     );
     // Old side: "count" at the same offsets within the phantom row's "let count = 1;".
-    assert_eq!(line0.virtual_rows_above.len(), 1);
-    assert_eq!(line0.virtual_rows_above[0].text, "let count = 1;");
+    assert_eq!(line0.baseline_above.len(), 1);
+    assert_eq!(line0.baseline_above[0].text, "let count = 1;");
     assert_eq!(
-        line0.virtual_rows_above[0].emphasis,
+        line0.baseline_above[0].emphasis,
         vec![EmphasisRange { start: 4, end: 9 }]
     );
     // The untouched line 1 carries neither marker nor emphasis.
     let line1 = sub
         .window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .find(|l| l.logical_line == 1)
         .unwrap();
-    assert_eq!(line1.diff_marker, None);
-    assert!(line1.diff_emphasis.is_empty());
+    assert_eq!(line1.change.marker(), None);
+    assert!(line1.change.emphasis().is_empty());
 
     drop(server);
 }
@@ -3960,12 +3942,12 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -3989,12 +3971,12 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -4007,18 +3989,18 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     // The very first window already carries the phantom deleted baseline row — no GitSetDiffView.
     let line0 = sub
         .window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .find(|l| l.logical_line == 0)
         .expect("line 0 in window");
     assert_eq!(
-        line0.virtual_rows_above.len(),
+        line0.baseline_above.len(),
         1,
         "subscribe with diff_view on shows the deleted baseline row in the first frame"
     );
-    assert_eq!(line0.virtual_rows_above[0].text, "alpha");
-    assert_eq!(line0.virtual_rows_above[0].kind, VirtualRowKind::Deleted);
-    assert_eq!(line0.diff_marker, Some(DiffMarker::Modified));
+    assert_eq!(line0.baseline_above[0].text, "alpha");
+    assert_eq!(line0.change.marker(), Some(DiffMarker::Modified));
 
     drop(server);
 }
@@ -4060,12 +4042,12 @@ async fn git_status_counts_ride_the_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -4157,12 +4139,12 @@ async fn git_status_splits_staged_and_unstaged() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -4236,12 +4218,12 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -4252,10 +4234,11 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
     )
     .await;
     let marker_of = |w: &aether_protocol::viewport::Window, line: u32| {
-        w.lines
+        w.root
+            .lines()
             .iter()
             .find(|l| l.logical_line == line)
-            .map(|l| (l.diff_marker, l.diff_stage))
+            .map(|l| (l.change.marker(), l.change.stage()))
             .unwrap()
     };
     use aether_protocol::viewport::DiffStage;
@@ -4292,12 +4275,12 @@ async fn setup_with_viewport(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 200,
             rows: 50,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -4388,7 +4371,7 @@ async fn sneak_targets_ride_the_render() {
     .await;
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    let targets = &notif.replacement_lines[0].sneak_targets;
+    let targets = &notif.root.lines()[0].sneak_targets;
     assert_eq!(targets.len(), 1, "one matched word on line 0");
     assert_eq!(targets[0].start, 0);
     assert_eq!(targets[0].end, 5, "covers 'alpha'");
@@ -4923,7 +4906,7 @@ async fn buffer_close_unknown_id_errors() {
     let msg = send_request_expect_err::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: 999_999,
+            buffer_id: aether_protocol::ViewId(999_999),
             open_next: false,
         },
     )

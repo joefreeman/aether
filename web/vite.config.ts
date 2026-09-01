@@ -6,6 +6,13 @@ import { defineConfig } from "vite";
 // aether-server serves under a fixed, server-owned index.html in production.
 export default defineConfig({
   server: { port: 5173 },
+  // `npm test` runs the painter tests under happy-dom: `renderBuffer` builds real DOM, so the only
+  // thing it needs that Node lacks is a document. Deliberately no browser — what these cover is the
+  // row layout (which chrome, phantom and text rows land where), which is geometry, not rendering.
+  test: {
+    environment: "happy-dom",
+    include: ["src/**/*.test.ts"],
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

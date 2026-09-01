@@ -9,15 +9,15 @@ pub async fn cursor_move(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    // Every motion below resolves against this: the buffer, bounded to what the focused element
+    // windows of it. There is no unbounded resolver to reach for.
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
     // Visual motions need viewport state (wrap mode + width). Look it up and dispatch to the
     // dedicated resolver; everything else goes through `resolve_motion` which only needs the
-    // buffer.
+    // scope.
     let virtual_col_in = s.virtual_col.get(&key).copied();
     // `Some(col)` → set virtual col to `col`; `None` → clear it. Only `VisualLine` preserves it.
     let mut new_virtual_col: Option<u32> = None;
@@ -36,7 +36,7 @@ pub async fn cursor_move(
                 )
             })?;
             let (pos, target_vcol) = motion::resolve_visual_line(
-                buf,
+                &scope,
                 vp.wrap_geometry(),
                 current.position,
                 virtual_col_in,
@@ -53,7 +53,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_start(buf, vp.wrap_geometry(), current.position)
+            motion::resolve_visual_line_start(&scope, vp.wrap_geometry(), current.position)
         }
         Motion::VisualLineEnd { viewport_id } => {
             let vp = s.viewports.get(viewport_id).ok_or_else(|| {
@@ -62,7 +62,7 @@ pub async fn cursor_move(
                     format!("unknown viewport_id: {viewport_id}"),
                 )
             })?;
-            motion::resolve_visual_line_end(buf, vp.wrap_geometry(), current.position)
+            motion::resolve_visual_line_end(&scope, vp.wrap_geometry(), current.position)
         }
         Motion::LogicalLine {
             direction,
@@ -75,11 +75,11 @@ pub async fn cursor_move(
             let tab_width = s
                 .viewports
                 .values()
-                .find(|v| v.buffer_id == params.buffer_id && v.client_id == client_id)
+                .find(|v| v.binds(params.buffer_id) && v.client_id == client_id)
                 .map(|v| v.tab_width)
                 .unwrap_or(4);
             let (pos, target_vcol) = motion::resolve_logical_line(
-                buf,
+                &scope,
                 current.position,
                 virtual_col_in,
                 *direction,
@@ -93,7 +93,7 @@ pub async fn cursor_move(
         // Selection-edge motions read the whole selection (anchor + cursor), which
         // `resolve_motion` doesn't see — dispatch to the dedicated resolver.
         Motion::SelectionEdge { edge } => {
-            motion::resolve_selection_edge(buf, current.position, current.anchor, *edge)
+            motion::resolve_selection_edge(&scope, current.position, current.anchor, *edge)
         }
         // Navigation-unit motions (`o`) walk only the LSP document-symbol outline (the same tree
         // `Space o` shows). With no outline yet — still loading, or no language server — the slice
@@ -110,7 +110,7 @@ pub async fn cursor_move(
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let (pos, anchor) = motion::resolve_navigation_motion(
-                buf,
+                &scope,
                 symbols,
                 current.position,
                 current.anchor,
@@ -126,13 +126,28 @@ pub async fn cursor_move(
         // collapsing it across the anchor. Routed through `nav_anchor` so it overrides the default
         // keep-anchor path below.
         Motion::LogicalLineFirstNonblank { .. } => {
-            let pos = motion::resolve_motion(buf, current.position, &params.motion);
+            let pos = motion::resolve_motion(&scope, current.position, &params.motion);
             if params.extend_selection {
                 nav_anchor = Some(extend_anchor(&current, pos));
             }
             pos
         }
-        _ => motion::resolve_motion(buf, current.position, &params.motion),
+        // Everything else resolves through `resolve_motion` — once, or, for a motion whose count
+        // *is* a repetition, `count` single steps under the one count rule. Doing the repetition
+        // here rather than inside each arm is the point: an arm cannot forget the rule, because an
+        // arm never sees a count above 1.
+        _ => match motion::single_step(&params.motion) {
+            Some((step, count)) => {
+                match motion::all_or_nothing(count, current.position, |pos| {
+                    motion::resolve_motion(&scope, pos, &step)
+                }) {
+                    Some(pos) => pos,
+                    // Refused: leave the cursor exactly where it was.
+                    None => current.position,
+                }
+            }
+            None => motion::resolve_motion(&scope, current.position, &params.motion),
+        },
     };
     // A navigation motion that supplies its own anchor wins: `o`/`Alt-o` select the identifier, and
     // `Shift-o`/`Shift-Alt-o` grow the selection to include it (anchor pinned to the kept edge).
@@ -144,6 +159,28 @@ pub async fn cursor_move(
     } else {
         new_pos
     });
+    // Clamped to the field, and this is the *only* place it can be.
+    //
+    // Every motion above resolves its head against the scope, but the anchor is carried through
+    // untouched — so once focus has moved, or an edit has shrunk the element under it, a
+    // `Shift`-motion produces a selection whose far end sits outside the window. Nothing downstream
+    // re-checks it: `set_cursor` and `wrap_for_response` both take the pair as given, and then every
+    // selection-operand edit — copy, cut, change, comment — acts on that range.
+    //
+    // One line, but it is the widest hole in the scope model: `q` was one key that could reach
+    // outside the element; the anchor is all of them at once.
+
+    // Clamped to the field, and this is the *only* place it can be.
+    //
+    // Every motion above resolves its head against the scope, but the anchor is carried through
+    // untouched — so once focus has moved, or an edit has shrunk the element under it, a
+    // `Shift`-motion produces a selection whose far end sits outside the window. Nothing downstream
+    // re-checks it: `set_cursor` and `wrap_for_response` both take the pair as given, and then every
+    // selection-operand edit — copy, cut, change, comment — acts on that range.
+    //
+    // One line, but it is the widest hole in the scope model: `q` was one key that could reach
+    // outside the element; the anchor is all of them at once.
+    let new_anchor = scope.clamp(new_anchor);
 
     let new_state = CursorState {
         position: new_pos,
@@ -181,30 +218,31 @@ pub async fn cursor_select_word(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
     let key = (client_id, params.buffer_id);
     let original = s.cursors.get(&key).copied().unwrap_or_default();
 
-    // The repeat loop lives server-side (`3w` = one round-trip).
-    let mut working = original;
-    for _ in 0..params.count.max(1) {
+    // The repeat loop lives server-side (`3w` = one round-trip), and follows the one count rule:
+    // `count` selections or none. `3w` with two words left selects nothing rather than stopping on
+    // the second and reporting success — see `motion::all_or_nothing`.
+    let Some(new_state) = motion::all_or_nothing(params.count, original, |working| {
         let (position, anchor) = motion::resolve_select_word(
-            buf,
+            &scope,
             working.position,
             working.anchor,
             params.boundary,
             params.extend,
         );
-        working = CursorState {
+        CursorState {
             position,
             anchor,
             match_bracket: None,
             jumplist_position: None,
-        };
-    }
-    let new_state = working;
+        }
+    }) else {
+        let response = wrap_for_response(&s, client_id, params.buffer_id, original);
+        return Ok(response);
+    };
 
     set_cursor(&mut s, key, new_state);
     s.record_motion(key, original, new_state);
@@ -238,12 +276,30 @@ pub async fn cursor_select_line(
     ctx: &mut ConnectionCtx,
     params: CursorSelectLineParams,
 ) -> Result<CursorState, RpcError> {
-    // The repeat loop lives server-side (`3x` = one round-trip).
-    let mut last = None;
+    // The repeat loop lives server-side (`3x` = one round-trip), and follows the one count rule:
+    // `count` lines or none. Each step is a real handler call (it mutates the stored cursor), so
+    // the stall check is on the *returned* cursor and a stall restores what we started with rather
+    // than leaving the partial selection behind.
+    let before = {
+        let s = state.lock().await;
+        s.cursors
+            .get(&(ctx.client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default()
+    };
+    let mut current = before;
     for _ in 0..params.count.max(1) {
-        last = Some(cursor_select_line_once(state, ctx, &params).await?);
+        let next = cursor_select_line_once(state, ctx, &params).await?;
+        if next.position == current.position && next.anchor == current.anchor {
+            // Stalled: undo the partial walk and report the original selection unchanged.
+            let mut s = state.lock().await;
+            set_cursor(&mut s, (ctx.client_id, params.buffer_id), before);
+            let response = wrap_for_response(&s, ctx.client_id, params.buffer_id, before);
+            return Ok(response);
+        }
+        current = next;
     }
-    Ok(last.expect("count.max(1) iterations"))
+    Ok(current)
 }
 
 async fn cursor_select_line_once(
@@ -253,9 +309,10 @@ async fn cursor_select_line_once(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    // `x` does its own line arithmetic rather than resolving a `Motion`, so it takes the bound
+    // explicitly — the edges it steps to are the element's, not the file's.
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
+    let buf = scope.doc();
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
     let cur = current.position;
@@ -309,9 +366,8 @@ async fn cursor_select_line_once(
         (false, Direction::Backward) => (new_top, new_top),
     };
 
-    let last_line = (buf.text.len_lines() as u32).saturating_sub(1);
-    let top_line = top_line.min(last_line);
-    let bottom_line = bottom_line.min(last_line);
+    let top_line = top_line.clamp(scope.first_line(), scope.last_line());
+    let bottom_line = bottom_line.clamp(scope.first_line(), scope.last_line());
     let top_pos = LogicalPosition {
         line: top_line,
         col: 0,
@@ -393,24 +449,22 @@ pub async fn cursor_select_all(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
-    // Anchor at the buffer start, cursor at the end of the last line — clamping an out-of-range
-    // position resolves the buffer end in the system's column units (the whole-line / forward
-    // normal form, per CLAUDE.md).
-    let position = motion::clamp_position(
-        buf,
-        LogicalPosition {
-            line: u32::MAX,
-            col: u32::MAX,
-        },
-    );
+    // "All" means the **focused element**, not the whole file: in a patch you are looking at one
+    // hunk of it, and selecting the file's other three thousand lines — none of them rendered — is
+    // not what `%` looks like it does. Same rule as every other motion, and now the same mechanism:
+    // the scope's own edges, resolved in the system's column units (the whole-line / forward normal
+    // form, per CLAUDE.md). A whole-buffer element spans the file and this reads as it always did.
+    let position = scope.clamp(LogicalPosition {
+        line: u32::MAX,
+        col: u32::MAX,
+    });
+    let anchor = scope.clamp(LogicalPosition { line: 0, col: 0 });
     let result = CursorState {
         position,
-        anchor: LogicalPosition { line: 0, col: 0 },
+        anchor,
         match_bracket: None,
         jumplist_position: None,
     };
@@ -434,14 +488,14 @@ pub async fn cursor_set(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let buf = s
-        .try_doc_of(params.buffer_id)
-        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    // A click names the element it landed in and the client focuses that element first, so by the
+    // time this arrives the scope *is* the clicked element — which is what keeps a drag running off
+    // its bottom edge from selecting into the next hunk's file.
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
-    let position = motion::clamp_position(buf, params.position);
-    let anchor = motion::clamp_position(buf, params.anchor);
-    let (position, anchor) = motion::snap_selection(buf, position, anchor, params.granularity);
+    let (position, anchor) =
+        motion::snap_selection(&scope, params.position, params.anchor, params.granularity);
     let result = CursorState {
         position,
         anchor,
@@ -589,22 +643,33 @@ pub async fn cursor_tree_select(
     ctx: &mut ConnectionCtx,
     params: CursorTreeSelectParams,
 ) -> Result<CursorState, RpcError> {
-    // Repeat server-side, stopping once the cursor stops changing (top of the tree /
-    // single node — repeated presses are a no-op, not an error).
-    let mut last: Option<CursorState> = None;
+    // Repeat server-side under the one count rule: `count` expansions or none. A stall — the top
+    // of the tree, or an enclosing node that leaves the field — abandons the whole request and
+    // restores the selection we started with, rather than keeping a partial walk.
+    let before = {
+        let s = state.lock().await;
+        s.cursors
+            .get(&(ctx.client_id, params.buffer_id))
+            .copied()
+            .unwrap_or_default()
+    };
+    let mut current = before;
     for _ in 0..params.count.max(1) {
-        let r = match params.direction {
+        let next = match params.direction {
             TreeSelectDirection::Expand => cursor_expand_once(state, ctx, params.buffer_id).await?,
             TreeSelectDirection::Contract => {
                 cursor_contract_once(state, ctx, params.buffer_id).await?
             }
         };
-        if last == Some(r) {
-            break;
+        if next.position == current.position && next.anchor == current.anchor {
+            let mut s = state.lock().await;
+            set_cursor(&mut s, (ctx.client_id, params.buffer_id), before);
+            let response = wrap_for_response(&s, ctx.client_id, params.buffer_id, before);
+            return Ok(response);
         }
-        last = Some(r);
+        current = next;
     }
-    Ok(last.expect("count.max(1) iterations"))
+    Ok(current)
 }
 
 async fn cursor_expand_once(
@@ -614,6 +679,14 @@ async fn cursor_expand_once(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
+    // The field's extent, before the document borrow. The syntax tree spans the whole file, so an
+    // expansion is the one motion that can select text the view does not render: in a patch, `q`
+    // on a hunk reaches the enclosing `impl`, and `Ctrl-x` then cuts hundreds of lines nobody can
+    // see. The tree is whole-file by nature, so the guard has to be on the *result*.
+    let (field_first, field_last) = {
+        let scope = s.motion_scope(client_id, buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
     let buf = s
         .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
@@ -652,6 +725,15 @@ async fn cursor_expand_once(
     let new_last_char = new_end_char_excl.saturating_sub(1).max(new_start_char);
     let anchor = motion::char_to_pos(buf, new_start_char);
     let position = motion::char_to_pos(buf, new_last_char);
+    // The enclosing node reaches outside the field: there is nowhere to expand *to* that the view
+    // shows, so refuse rather than selecting text off-screen. Returning `current` unchanged is
+    // also what the caller's stall check reads as "stop".
+    // The enclosing node reaches outside the field: there is nowhere to expand *to* that the view
+    // shows, so refuse rather than selecting text off-screen. Returning `current` unchanged is
+    // also what the caller's stall check reads as "stop".
+    if anchor.line < field_first || position.line > field_last {
+        return Ok(current);
+    }
     let new_cursor = CursorState {
         position,
         anchor,
@@ -739,14 +821,17 @@ pub struct TransformEdit {
 /// (Normal mode) it's exactly the selection — a point cursor being the single char under the
 /// block. Shared by the no-op precheck and `apply_edit`, so the two always agree.
 pub fn resolve_transform_case(
-    buf: &Document,
+    scope: &motion::Scope,
     cursor: &CursorState,
     kind: CaseKind,
     scan: bool,
 ) -> Option<TransformEdit> {
+    let buf = scope.doc();
     let total = buf.text.len_chars();
     let (start_char, end_char, first_line, last_line) = if scan {
-        let (start_pos, end_pos) = motion::word_run(buf, cursor.position);
+        // The identifier under the caret, as the element sees it: a run reaching the element's edge
+        // ends there rather than continuing into a line the view doesn't show.
+        let (start_pos, end_pos) = motion::word_run(scope, cursor.position);
         let sc = motion::pos_to_char(buf, start_pos);
         let ec = motion::pos_to_char(buf, end_pos)
             .saturating_add(1)
@@ -830,5 +915,9 @@ pub async fn current_edit_result(
         .copied()
         .unwrap_or_default();
     let cursor = wrap_for_response(&s, client_id, buffer_id, cursor);
-    Ok(EditResult { revision, cursor })
+    Ok(EditResult {
+        buffer: buffer_id,
+        revision,
+        cursor,
+    })
 }

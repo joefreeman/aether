@@ -7,6 +7,7 @@
 //! both the re-exported protocol surface and the fixtures. Without these two allows, each
 //! binary would fail `clippy -D warnings` for the helpers its siblings need.
 #![allow(dead_code, unused_imports)]
+pub use aether_protocol::coords::{ViewLine, VisualRow};
 
 pub use aether_protocol::buffer::{
     BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferCloseResult,
@@ -96,15 +97,15 @@ pub use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
+pub use aether_protocol::viewport::Element;
 pub use aether_protocol::viewport::{
-    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
+    BaselineRow, ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
 };
 pub use aether_protocol::viewport::{
-    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
+    ChromeKind, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
     ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
     ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, VirtualRowKind,
-    WrapMode,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
 };
 pub use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -177,6 +178,16 @@ impl Ws {
             .iter()
             .filter(|(method, _)| method == N::NAME)
             .map(|(_, params)| serde_json::from_value(params.clone()).expect("typed params"))
+            .collect()
+    }
+
+    /// Every notification of `method` as raw JSON — for capturing a real push to replay against a
+    /// client (a shell bug is reproduced by the bytes it received, not by a hand-built fixture).
+    pub fn seen_raw(&self, method: &str) -> Vec<serde_json::Value> {
+        self.seen
+            .iter()
+            .filter(|(m, _)| m == method)
+            .map(|(_, params)| params.clone())
             .collect()
     }
 
@@ -462,12 +473,12 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 200,
             rows: 100,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -478,8 +489,9 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
     )
     .await;
     sub.window
-        .lines
-        .iter()
+        .root
+        .lines()
+        .into_iter()
         .map(|l| l.visual_rows[0].segments[0].text.as_str().to_string())
         .collect::<Vec<_>>()
         .join("\n")
@@ -946,12 +958,12 @@ pub async fn open_and_subscribe_with_lsp(
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             cols: 100,
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -1136,12 +1148,12 @@ pub fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams 
 
 pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
     ViewportSubscribeParams {
-        buffer_id,
+        buffer_id: aether_protocol::ViewId(buffer_id),
         cols: 80,
         rows: 10,
         overscan_rows: 0,
         scroll: ScrollPosition {
-            logical_line: 0,
+            logical_line: ViewLine(0),
             sub_row: 0.0,
         },
         wrap: WrapMode::None,
@@ -1344,22 +1356,39 @@ pub async fn pull(ws: &mut Ws, repo: &std::path::Path) -> GitPullResult {
 }
 
 /// Subscribe a viewport on an already-open buffer and return the window it renders.
+///
+/// With the inline diff **off**, which is what a client opens with. Removed lines are phantoms of
+/// that view — on a patch as much as on an ordinary file — so a test that wants to see them wants
+/// [`diffed_window_of`].
 pub async fn window_of(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewport::Window {
+    window_with_diff(ws, buffer_id, false).await
+}
+
+/// [`window_of`] with the inline diff on: the view that draws removed lines.
+pub async fn diffed_window_of(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewport::Window {
+    window_with_diff(ws, buffer_id, true).await
+}
+
+async fn window_with_diff(
+    ws: &mut Ws,
+    buffer_id: u64,
+    diff_view: bool,
+) -> aether_protocol::viewport::Window {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
-            diff_view: false,
+            diff_view,
         },
     )
     .await;
@@ -1372,4 +1401,35 @@ pub async fn resolve_conflict(
     side: ConflictSide,
 ) -> GitResolveConflictResult {
     send_request::<GitResolveConflict>(ws, &GitResolveConflictParams { buffer_id, side }).await
+}
+
+/// The content tree of a chrome row. Panics on a baseline row — the two are separate
+/// variants precisely so a test can't confuse them.
+pub fn chrome_content(row: &Element) -> &[Element] {
+    match row {
+        Element::Chrome { children, .. } => children,
+        _ => panic!("expected a chrome node"),
+    }
+}
+
+/// The literal text a chrome row draws, left to right.
+pub fn chrome_text(row: &Element) -> String {
+    chrome_content(row)
+        .iter()
+        .map(Element::text_content)
+        .collect()
+}
+
+/// Every chrome node of a window's tree, in order.
+pub fn chrome_nodes(window: &aether_protocol::viewport::Window) -> Vec<&Element> {
+    fn walk<'a>(n: &'a Element, out: &mut Vec<&'a Element>) {
+        match n {
+            Element::Stack { children } => children.iter().for_each(|c| walk(c, out)),
+            Element::Chrome { .. } => out.push(n),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&window.root, &mut out);
+    out
 }

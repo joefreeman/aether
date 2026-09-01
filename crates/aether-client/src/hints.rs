@@ -4,7 +4,7 @@
 //! stamped on ticks from the shell, randomness is a seeded generator, and persistence rides
 //! `hints/record` / `hints/state` effects.
 //!
-//! Two principles from the design doc shape everything here:
+//! Two principles shape everything here:
 //!
 //! - **Learning is global; display is contextual.** Each hint has one usage record no matter
 //!   where its trigger fires; a hint declares the contexts it may *display* in, and the sampler
@@ -250,7 +250,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "goto-def", tier: 3, contexts: &[C::Normal], keys: "Enter",
         trigger: Trigger::Action(|a| matches!(a, Action::GotoDefinition)),
         text: "Use {} to go to the definition" },
-    HintDef { id: "hover", tier: 3, contexts: &[C::Normal], keys: "Tab",
+    HintDef { id: "hover", tier: 3, contexts: &[C::Normal], keys: "Space t",
         trigger: Trigger::Action(|a| matches!(a, Action::Hover)),
         text: "Use {} to see types & docs under the cursor" },
     HintDef { id: "diagnostics", tier: 3, contexts: &[C::Normal], keys: "d",
@@ -293,8 +293,11 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "read-follow", tier: 3, contexts: &[C::Read], keys: "Enter",
         trigger: Trigger::Action(|a| matches!(a, Action::ReadActivate)),
         text: "Use {} to follow the selected link" },
-    HintDef { id: "read-peek", tier: 3, contexts: &[C::Read], keys: "Tab",
-        trigger: Trigger::Action(|a| matches!(a, Action::ReadShowTarget)),
+    // Same key and same action as `hover`, distinguished by context: over the reading view the
+    // question "what is this?" is answered by the link's target rather than by the type. The id is
+    // kept because hint ids are a persistence contract — a user's progress is stored against them.
+    HintDef { id: "read-peek", tier: 3, contexts: &[C::Read], keys: "Space t",
+        trigger: Trigger::Action(|a| matches!(a, Action::Hover)),
         text: "Use {} to preview the selection's target" },
     HintDef { id: "read-back", tier: 3, contexts: &[C::Read], keys: "Backspace",
         trigger: Trigger::Action(|a| matches!(a, Action::NavBack)),

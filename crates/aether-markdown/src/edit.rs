@@ -17,7 +17,7 @@
 //! them merge. Both directions are load-bearing — see [`separator_between`] for the case where
 //! carrying a gap verbatim silently reparents a block.
 
-use crate::{Block, Element, Span};
+use crate::{Block, Span, Stop};
 use std::ops::Range;
 
 /// A resolved structural edit: replace `range` with `text`, then land the selection at
@@ -137,13 +137,13 @@ fn blank_run_before(text: &str, upto: usize) -> usize {
     at
 }
 
-/// The block range under an inclusive byte selection: `(top, bottom)` element indices. Edges
+/// The block range under an inclusive byte selection: `(top, bottom)` stop indices. Edges
 /// resolve forward at the top and back at the bottom, so a range edge sitting on a separator
 /// line never rounds outward past its own blocks. (The reading view's
 /// `ReadView::selection_blocks` derives from this.)
 pub fn selection_block_range(
     text: &str,
-    elements: &[Element],
+    stops: &[Stop],
     min: u32,
     max: u32,
 ) -> Option<(usize, usize)> {
@@ -156,7 +156,7 @@ pub fn selection_block_range(
     // container's focus to that child — `Ctrl-j` on a focused nested quote moved its first
     // paragraph around inside it instead of moving the quote.
     if min == max {
-        let i = crate::element_at_matching(elements, point_byte(text, min), Element::is_block)?;
+        let i = crate::element_at_matching(stops, point_byte(text, min), Stop::is_block)?;
         return Some((i, i));
     }
     let min = floor_boundary(text, min as usize) as u32;
@@ -167,7 +167,7 @@ pub fn selection_block_range(
     // below — which resolves the top edge inward and would answer "the first child" to both.
     // Innermost wins a tie, the same rule focus resolution follows.
     let sel = line_start(text, min as usize)..line_end_incl(text, max as usize);
-    let exact = elements
+    let exact = stops
         .iter()
         .enumerate()
         .filter(|(_, e)| {
@@ -189,10 +189,10 @@ pub fn selection_block_range(
     let head = &text[min as usize..];
     let skipped = min + (quote_prefix_len(head) + indent_after_prefix(head)) as u32;
     let min = skipped.min(max);
-    let top = crate::element_at_matching(elements, min, Element::is_block)?;
-    let bottom = crate::containing_element(elements, max, Element::is_block)
+    let top = crate::element_at_matching(stops, min, Stop::is_block)?;
+    let bottom = crate::containing_element(stops, max, Stop::is_block)
         .or_else(|| {
-            elements
+            stops
                 .iter()
                 .enumerate()
                 .rev()
@@ -214,7 +214,7 @@ enum Ancestor {
 /// Where a block-grain span sits in the block *tree*: the child sequence of its innermost
 /// container (its siblings — for a top-level block that includes whole lists; for an item,
 /// its fellow items) plus its index there, and the enclosing container chain outermost →
-/// innermost. The element list cannot answer this — it is item-grain with no list nodes, so
+/// innermost. The stop list cannot answer this — it is item-grain with no list nodes, so
 /// "the paragraph's next sibling is the whole list" only falls out of the tree.
 #[derive(Debug, Clone)]
 struct TreePlace {
@@ -477,17 +477,17 @@ fn separator_between<'a>(text: &'a str, gap: Range<usize>, place: &TreePlace) ->
 pub fn resolve_move_block(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     sel_min: u32,
     sel_max: u32,
     down: bool,
 ) -> Resolved {
     let (top, bottom) =
-        selection_block_range(text, elements, sel_min, sel_max).ok_or(Refusal::Quiet)?;
-    let (ts, bs) = (elements[top].span(), elements[bottom].span());
-    let is_item = |e: &Element| matches!(e, Element::Item { .. });
-    let tp = locate(blocks, ts, is_item(&elements[top])).ok_or(Refusal::Quiet)?;
-    let bp = locate(blocks, bs, is_item(&elements[bottom])).ok_or(Refusal::Quiet)?;
+        selection_block_range(text, stops, sel_min, sel_max).ok_or(Refusal::Quiet)?;
+    let (ts, bs) = (stops[top].span(), stops[bottom].span());
+    let is_item = |e: &Stop| matches!(e, Stop::Item { .. });
+    let tp = locate(blocks, ts, is_item(&stops[top])).ok_or(Refusal::Quiet)?;
+    let bp = locate(blocks, bs, is_item(&stops[bottom])).ok_or(Refusal::Quiet)?;
     if tp.siblings != bp.siblings {
         return Err(Refusal::Why("Selection spans containers"));
     }
@@ -617,17 +617,17 @@ fn around_range(text: &str, ts: Span, bs: Span) -> Range<usize> {
 fn ordered_head_handoff(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     top: usize,
     bottom: usize,
     body: &Range<usize>,
     removal: &Range<usize>,
 ) -> Option<(usize, String)> {
-    let is_item = |i: usize| matches!(elements[i], Element::Item { .. });
+    let is_item = |i: usize| matches!(stops[i], Stop::Item { .. });
     if !is_item(top) || !is_item(bottom) {
         return None;
     }
-    let tp = locate(blocks, elements[top].span(), true)?;
+    let tp = locate(blocks, stops[top].span(), true)?;
     let ordered = matches!(
         tp.ancestors.last(),
         Some((Ancestor::List { ordered: true }, _))
@@ -636,7 +636,7 @@ fn ordered_head_handoff(
         return None;
     }
     // A survivor has to exist in the same list, below everything being removed.
-    let bp = locate(blocks, elements[bottom].span(), true)?;
+    let bp = locate(blocks, stops[bottom].span(), true)?;
     if bp.siblings != tp.siblings || bp.index + 1 >= tp.siblings.len() {
         return None;
     }
@@ -654,20 +654,20 @@ fn ordered_head_handoff(
 pub fn resolve_delete(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     sel_min: u32,
     sel_max: u32,
 ) -> Result<(BlockEdit, String), Refusal> {
     let (top, bottom) =
-        selection_block_range(text, elements, sel_min, sel_max).ok_or(Refusal::Quiet)?;
-    let (ts, bs) = (elements[top].span(), elements[bottom].span());
+        selection_block_range(text, stops, sel_min, sel_max).ok_or(Refusal::Quiet)?;
+    let (ts, bs) = (stops[top].span(), stops[bottom].span());
     guard_front_matter(blocks, &[ts, bs])?;
     let body = chunk_of(text, ts, bs);
     let clipboard = text[body.clone()].to_string();
     let mut range = around_range(text, ts, bs);
     let mut replacement = String::new();
     if let Some((end, marked)) =
-        ordered_head_handoff(text, blocks, elements, top, bottom, &body, &range)
+        ordered_head_handoff(text, blocks, stops, top, bottom, &body, &range)
     {
         range.end = end;
         replacement = marked;
@@ -696,7 +696,7 @@ pub fn resolve_delete(
 pub fn resolve_paste(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     sel_min: u32,
     sel_max: u32,
     clip: &str,
@@ -706,11 +706,11 @@ pub fn resolve_paste(
     if body.is_empty() {
         return Err(Refusal::Quiet);
     }
-    let Some((top, bottom)) = selection_block_range(text, elements, sel_min, sel_max) else {
+    let Some((top, bottom)) = selection_block_range(text, stops, sel_min, sel_max) else {
         // No block to anchor against. That is the empty document — where the paste becomes the
         // whole content — but *not only* the empty document: a file the parse yields no blocks
         // for (nothing but link reference definitions, say) reaches here with every byte of its
-        // content intact. Replacing `0..text.len` on the strength of an empty element list
+        // content intact. Replacing `0..text.len` on the strength of an empty stop list
         // would delete a document the reading view merely had nothing to show for, so anything
         // non-blank keeps its text and takes the paste at the end.
         if text.trim().is_empty() {
@@ -741,7 +741,7 @@ pub fn resolve_paste(
             anchor,
         ));
     };
-    let (ts, bs) = (elements[top].span(), elements[bottom].span());
+    let (ts, bs) = (stops[top].span(), stops[bottom].span());
     guard_front_matter(blocks, &[ts, bs])?;
     if replace {
         let range = around_range(text, ts, bs);
@@ -785,7 +785,7 @@ pub fn resolve_paste(
         // both sides are list items, so cutting an item and pasting it back restores the list
         // instead of splitting it in two — while pasting prose above a list still gets its
         // blank line.
-        matches!(elements[top], Element::Item { .. })
+        matches!(stops[top], Stop::Item { .. })
             && marker_width(body.split('\n').next().unwrap_or("").trim_start()).is_some()
     };
     let new = format!("{body}\n{}", if tight { "" } else { "\n" });
@@ -911,31 +911,23 @@ fn quote_marker_len(line: &str) -> Option<usize> {
 pub fn resolve_depth(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     sel_min: u32,
     sel_max: u32,
     deeper: bool,
 ) -> Resolved {
     let (top, bottom) =
-        selection_block_range(text, elements, sel_min, sel_max).ok_or(Refusal::Quiet)?;
+        selection_block_range(text, stops, sel_min, sel_max).ok_or(Refusal::Quiet)?;
     if top != bottom {
         // A run of list items has its own obvious reading — nest them all — which isn't built;
         // say so rather than silently quoting them instead.
-        if (top..=bottom).all(|i| matches!(elements[i], Element::Item { .. })) {
+        if (top..=bottom).all(|i| matches!(stops[i], Stop::Item { .. })) {
             return Err(Refusal::Why("Nest one list item at a time"));
         }
-        return resolve_quote_depth(
-            text,
-            blocks,
-            elements,
-            top,
-            bottom,
-            deeper,
-            sel_min == sel_max,
-        );
+        return resolve_quote_depth(text, blocks, stops, top, bottom, deeper, sel_min == sel_max);
     }
-    match &elements[top] {
-        Element::Heading { span, level, .. } => {
+    match &stops[top] {
+        Stop::Heading { span, level, .. } => {
             let at = span.start as usize;
             if !text[at..].starts_with('#') {
                 return Err(Refusal::Why("Setext headings keep their level"));
@@ -965,7 +957,7 @@ pub fn resolve_depth(
                 at,
             ))
         }
-        Element::Item { span, .. } => {
+        Stop::Item { span, .. } => {
             let item_range = chunk_of(text, *span, *span);
             // Everything below is measured from after the container prefix: inside a quote the
             // item's line starts at `> `, not at column 0, and padding inserted before that
@@ -1069,15 +1061,7 @@ pub fn resolve_depth(
                 ))
             }
         }
-        _ => resolve_quote_depth(
-            text,
-            blocks,
-            elements,
-            top,
-            bottom,
-            deeper,
-            sel_min == sel_max,
-        ),
+        _ => resolve_quote_depth(text, blocks, stops, top, bottom, deeper, sel_min == sel_max),
     }
 }
 
@@ -1087,13 +1071,13 @@ pub fn resolve_depth(
 fn resolve_quote_depth(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     top: usize,
     bottom: usize,
     deeper: bool,
     was_point: bool,
 ) -> Resolved {
-    let (ts, bs) = (elements[top].span(), elements[bottom].span());
+    let (ts, bs) = (stops[top].span(), stops[bottom].span());
     guard_front_matter(blocks, &[ts, bs])?;
     let chunk = chunk_of(text, ts, bs);
     let quoted = quote_marker_len(&text[chunk.clone()]).is_some();
@@ -1163,16 +1147,16 @@ fn split_lines_incl(text: &str) -> impl Iterator<Item = &str> {
 pub fn resolve_open(
     text: &str,
     blocks: &[Block],
-    elements: &[Element],
+    stops: &[Stop],
     sel_min: u32,
     sel_max: u32,
     above: bool,
 ) -> Resolved {
-    let Some((top, bottom)) = selection_block_range(text, elements, sel_min, sel_max) else {
+    let Some((top, bottom)) = selection_block_range(text, stops, sel_min, sel_max) else {
         return open_blockless(text, above);
     };
     let idx = if above { top } else { bottom };
-    let span = elements[idx].span();
+    let span = stops[idx].span();
     // Only above: nothing pushed above front matter leaves it front matter, while opening
     // *below* it is an ordinary paragraph after a legal block.
     if above {
@@ -1185,8 +1169,8 @@ pub fn resolve_open(
     // what keeps the opened block inside the container rather than after it.
     let own_start = (span.start as usize).clamp(chunk.start, first_line_end);
     let prefix = &text[chunk.start..own_start];
-    let opened = match &elements[idx] {
-        Element::Item { checked, .. } => format!(
+    let opened = match &stops[idx] {
+        Stop::Item { checked, .. } => format!(
             "{prefix}{}",
             sibling_marker(&text[own_start..first_line_end], checked.is_some(), above)
         ),
@@ -1195,7 +1179,7 @@ pub fn resolve_open(
     // A blank line inside a quote is spelt with the quote's own markers; a bare one would end
     // the quote. Trailing spaces on it would just be trailing whitespace.
     let separator = format!("{}\n", prefix.trim_end());
-    let sep = if matches!(elements[idx], Element::Item { .. })
+    let sep = if matches!(stops[idx], Stop::Item { .. })
         && item_seam_is_tight(text, blocks, span, above)
     {
         ""
@@ -1319,16 +1303,11 @@ fn open_blockless(text: &str, above: bool) -> Resolved {
 /// `Enter` on a task item: flip its checkbox. `byte` is the cursor; the innermost task item
 /// containing it — and only a containing one — is the target. The document length is
 /// unchanged, so the cursor stays put.
-pub fn resolve_toggle_task(
-    text: &str,
-    elements: &[Element],
-    byte: u32,
-    set: Option<bool>,
-) -> Resolved {
-    let is_task = |e: &Element| {
+pub fn resolve_toggle_task(text: &str, stops: &[Stop], byte: u32, set: Option<bool>) -> Resolved {
+    let is_task = |e: &Stop| {
         matches!(
             e,
-            Element::Item {
+            Stop::Item {
                 checked: Some(_),
                 ..
             }
@@ -1349,8 +1328,8 @@ pub fn resolve_toggle_task(
     if is_blank_line(&text[line_start(text, at)..line_end_incl(text, at)]) {
         return Err(Refusal::Quiet);
     }
-    let idx = crate::containing_element(elements, at as u32, is_task).ok_or(Refusal::Quiet)?;
-    let span = elements[idx].span();
+    let idx = crate::containing_element(stops, at as u32, is_task).ok_or(Refusal::Quiet)?;
+    let span = stops[idx].span();
     let first_line_end = line_end_incl(text, span.start as usize);
     let line = &text[span.start as usize..first_line_end];
     // The checkbox sits immediately after the item's marker — read it *there* rather than
@@ -1381,11 +1360,11 @@ pub fn resolve_toggle_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{elements, parse};
+    use crate::{parse, stops};
 
-    fn fixture(md: &str) -> (Vec<Block>, Vec<Element>) {
+    fn fixture(md: &str) -> (Vec<Block>, Vec<Stop>) {
         let blocks = parse(md);
-        let els = elements(&blocks);
+        let els = stops(&blocks);
         (blocks, els)
     }
 
@@ -1400,7 +1379,7 @@ mod tests {
     /// resolves to, and whether it left a selection. Structural edits hand back the selection
     /// state they were given, so both halves matter.
     fn landing(out: &str, e: &BlockEdit) -> (String, bool) {
-        let els = elements(&parse(out));
+        let els = stops(&parse(out));
         let (lo, hi) = (e.anchor.min(e.cursor) as u32, e.anchor.max(e.cursor) as u32);
         let (top, _) = selection_block_range(out, &els, lo, hi).expect("landing resolves");
         let span = els[top].span();
@@ -1978,7 +1957,7 @@ mod tests {
 
     #[test]
     fn ops_reach_inside_containers_now_that_children_are_stops() {
-        // A container's children are elements, so the innermost-first focus rule lands on
+        // A container's children are stops, so the innermost-first focus rule lands on
         // them and every op acts on the inner block rather than the whole container.
         let doc = "> Para one.\n>\n> Para two.\n";
         let (blocks, els) = fixture(doc);
@@ -2257,7 +2236,7 @@ mod tests {
 
     /// Loose task items toggle too — including from the cursor sitting in a *second* paragraph,
     /// which resolves to the enclosing item. Both used to refuse quietly: the parse dropped
-    /// `checked` on loose items, so no `Element::Item { checked: Some(_) }` existed to target.
+    /// `checked` on loose items, so no `Stop::Item { checked: Some(_) }` existed to target.
     #[test]
     fn toggle_task_works_on_loose_items() {
         let doc = "- [ ] open\n\n- [x] done\n";
@@ -2386,7 +2365,7 @@ mod tests {
                 let i = els
                     .iter()
                     .position(|e| e.span().start == quote)
-                    .expect("the quote is an element");
+                    .expect("the quote is an stop");
                 Some((i, i))
             },
             "the whole quote, not the paragraphs inside it"
@@ -2431,7 +2410,7 @@ mod tests {
 
     #[test]
     fn paste_into_a_document_the_parse_finds_no_blocks_in_keeps_its_text() {
-        // Link reference definitions are real content that yields no elements. Taking the
+        // Link reference definitions are real content that yields no stops. Taking the
         // empty-document branch here replaced the whole file with the clipboard.
         let doc = "[a]: https://example.com\n";
         let (blocks, els) = fixture(doc);
@@ -2578,7 +2557,7 @@ mod tests {
             matches!(parse(&out).as_slice(), [Block::Quote { .. }]),
             "one quote, not two: {out:?}"
         );
-        // A quote holding a *single* block lists only the container (the element list's
+        // A quote holding a *single* block lists only the container (the stop list's
         // solo-child rule), so the focused block there is the quote itself — and the block
         // opened next to it is its sibling, at the top level. The grain decides, as it does
         // for move and cut.

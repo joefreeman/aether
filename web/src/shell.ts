@@ -39,6 +39,7 @@ import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
   BufferOpenResult,
   BufferWindow,
+  ViewNode,
   CommitRef,
   CursorState,
   DiagnosticCounts,
@@ -58,7 +59,8 @@ import type {
   ViewportWindowResult,
   WrapMode,
 } from "./protocol";
-import { REPO_OPERATION_LABELS } from "./protocol";
+// Row arithmetic shared with the core: a chrome row occupies a screen row like any other.
+import { itemRows, rowItems, REPO_OPERATION_LABELS } from "./protocol";
 
 const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
@@ -457,6 +459,11 @@ interface CoreView {
   theme: "dark" | "light";
   window: BufferWindow | null;
   viewport_id: number | null;
+  /** What this view *is* — what `viewport/subscribe` and `buffer/close` address. Distinct from
+   *  `buffer`, which is the buffer currently being edited; a patch is one view over many files. */
+  view_id: number;
+  /** Which editor element holds the cursor — see `grid::line_is_loaded`. */
+  focused_element: number;
   buffer: {
     buffer_id: number;
     path: string | null;
@@ -562,16 +569,20 @@ interface AppSettingsView {
   groups: { title: string; rows: { label: string; hint: string; control: AppSettingControl }[] }[];
 }
 
-/** Cumulative visual rows before `line` in the loaded window (phantom rows included), or null when
- *  the line isn't loaded — mirrors `grid::rows_before_line`, used to position a restored scroll. */
-function rowsBeforeLine(w: BufferWindow, line: number): number | null {
-  if (line < w.first_logical_line || line >= w.last_logical_line_exclusive) return null;
-  let rows = 0;
-  for (const l of w.lines) {
-    if (l.logical_line === line) return rows;
-    rows += (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length + (l.virtual_rows_below?.length ?? 0);
-  }
-  return null;
+/** Whether `line` of `element` is among the lines this window carries.
+ *
+ *  The window's `first_view_line`/`last_view_line_exclusive` are *view* coordinates — an
+ *  index into the view's concatenated lines — while a cursor's line belongs to its element's own
+ *  buffer. In a patch the two are unrelated, so a range test reports "not loaded" for a line in
+ *  plain sight, and refetching around it fetches nothing. Mirrors `grid::line_is_loaded`. */
+function lineIsLoaded(w: BufferWindow, element: number, line: number): boolean {
+  const editors = (function walk(n: ViewNode): ViewNode[] {
+    if (n.node === "stack") return n.children.flatMap(walk);
+    return n.node === "editor" ? [n] : [];
+  })(w.root);
+  return editors.some(
+    (e) => e.node === "editor" && e.element === element && e.lines.some((l) => l.logical_line === line),
+  );
 }
 
 function basename(p: string): string {
@@ -2581,7 +2592,7 @@ export class Shell {
     const epoch = ++this.viewportEpoch;
     let res: ViewportWindowResult;
     try {
-      res = await this.client.rpc<ViewportWindowResult>("viewport/set_wrap", {
+      res = await this.client.rpc<ViewportWindowResult>("view/set_wrap", {
         viewport_id: v.viewport_id,
         wrap: v.wrap,
       });
@@ -2607,7 +2618,9 @@ export class Shell {
     // Position the new viewport at the buffer's restored scroll, else centre the cursor — which, for
     // a grep/goto jump, sits on the target. Derived FRESH from the current buffer every time (never a
     // cached value), so a jump always loads the window containing its target and the reveal lands.
-    const cursorLine = v.buffer.cursor.position.line;
+    // Named as a *view* line, which is what a scroll position is: a composed view's cursor is a
+    // buffer line of the element it focuses, and in a patch the two spaces are unrelated.
+    const cursorLine = this.session.view_line_for(v.buffer.cursor.position.line);
     // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
     // the in-buffer jump reveal.
     const scroll = v.buffer.scroll ?? {
@@ -2618,8 +2631,9 @@ export class Shell {
     this.fetchInFlight = false;
     let res: ViewportSubscribeResult;
     try {
-      res = await this.client.rpc<ViewportSubscribeResult>("viewport/subscribe", {
-        buffer_id: v.buffer.buffer_id,
+      res = await this.client.rpc<ViewportSubscribeResult>("view/subscribe", {
+        // The *view* is what a viewport subscribes to; its elements may window other buffers.
+        buffer_id: v.view_id,
         cols: this.cols,
         rows: this.rows,
         overscan_rows: this.rows,
@@ -2639,12 +2653,13 @@ export class Shell {
     // A subscribe replaces the whole window (a buffer switch / wrap toggle), so it snaps — there's no
     // scroll to animate. Same-buffer *moves* (grep next-hit, cursor motions) animate via the
     // cursor-move path (RevealCursor → revealCursor → scrollTopTo), not here.
-    const w = this.snapshot?.window;
-    if (w) {
-      const rel = rowsBeforeLine(w, scroll.logical_line);
-      if (rel !== null) {
-        this.bufferEl.scrollTop = (w.first_visual_row + rel) * this.cell.h + BUFFER_PAD;
-      }
+    // The *block's* first row, so a line's chrome comes with it: a patch opened at its first line
+    // shows the file heading that introduces it rather than starting just below it. The core
+    // answers, in view space — asking the window for `(element, buffer line)` here is what put the
+    // working-changes view a whole heading down from the top the other shells opened it at.
+    const row = this.session.block_start_of_view_line(scroll.logical_line);
+    if (row != null) {
+      this.bufferEl.scrollTop = (row + scroll.sub_row) * this.cell.h + BUFFER_PAD;
     }
     this.revealCursor();
   }
@@ -2660,13 +2675,17 @@ export class Shell {
     const v = this.view();
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
-    if (cl < v.window.first_logical_line || cl >= v.window.last_logical_line_exclusive) {
+    if (!lineIsLoaded(v.window, v.focused_element, cl)) {
       const epoch = this.viewportEpoch;
       let res: ViewportWindowResult;
       try {
-        res = await this.client.rpc<ViewportWindowResult>("viewport/scroll", {
+        // "The window my cursor is in" — no coordinates, because the client has none to give: a
+        // view line indexes the elements' concatenated extents and a visual row depends on how
+        // the lines above wrapped, and the cursor's line has scrolled out of the window. Passing
+        // the cursor's *buffer* line as a view line (which this did) names a line of a different
+        // file in a patch, so the window came back from somewhere else and the view went blank.
+        res = await this.client.rpc<ViewportWindowResult>("view/window_at_cursor", {
           viewport_id: v.viewport_id,
-          scroll: { logical_line: cl, sub_row: 0 },
         });
       } catch {
         return; // viewport gone (e.g. a resubscribe raced in) — that subscribe reveals afresh
@@ -2771,7 +2790,7 @@ export class Shell {
     const epoch = this.viewportEpoch;
     this.fetchInFlight = true;
     this.client
-      .rpc<ViewportWindowResult>("viewport/scroll_to_row", {
+      .rpc<ViewportWindowResult>("view/scroll_to_row", {
         viewport_id: this.snapshot?.viewport_id,
         top_visual_row: Math.max(0, topRow),
       })
@@ -2829,13 +2848,17 @@ export class Shell {
     // When the cursor's line has been scrolled out of the loaded window its visual row is unknown —
     // pull that region from the server (scrolling the viewport to the line), then place. Mirrors
     // `ensureCursorVisible`.
-    if (cl < v.window.first_logical_line || cl >= v.window.last_logical_line_exclusive) {
+    if (!lineIsLoaded(v.window, v.focused_element, cl)) {
       const epoch = this.viewportEpoch;
       let res: ViewportWindowResult;
       try {
-        res = await this.client.rpc<ViewportWindowResult>("viewport/scroll", {
+        // "The window my cursor is in" — no coordinates, because the client has none to give: a
+        // view line indexes the elements' concatenated extents and a visual row depends on how
+        // the lines above wrapped, and the cursor's line has scrolled out of the window. Passing
+        // the cursor's *buffer* line as a view line (which this did) names a line of a different
+        // file in a patch, so the window came back from somewhere else and the view went blank.
+        res = await this.client.rpc<ViewportWindowResult>("view/window_at_cursor", {
           viewport_id: v.viewport_id,
-          scroll: { logical_line: cl, sub_row: 0 },
         });
       } catch {
         return; // viewport gone (e.g. a resubscribe raced in)
@@ -2915,7 +2938,7 @@ export class Shell {
     const v = this.snapshot;
     if (!v?.viewport_id || `${this.cols}x${this.rows}` === before) return;
     this.client
-      .rpc<ViewportWindowResult>("viewport/resize", {
+      .rpc<ViewportWindowResult>("view/resize", {
         viewport_id: v.viewport_id,
         cols: this.cols,
         rows: this.rows,
@@ -2943,7 +2966,13 @@ export class Shell {
     // The browser counts clicks for us (`detail`): double = word, triple = line.
     const granularity = e.detail <= 1 ? "char" : e.detail === 2 ? "word" : "line";
     this.runEffects(
-      this.session.pointer_press(pos.line, pos.col, granularity, e.shiftKey) as CoreEffect[],
+      this.session.pointer_press(
+        pos.element,
+        pos.line,
+        pos.col,
+        granularity,
+        e.shiftKey,
+      ) as CoreEffect[],
     );
   }
 
@@ -2961,7 +2990,7 @@ export class Shell {
 
   /** Map a mouse event to a buffer `(line, col)`: find the `.row` under it (render.ts tags each with
    *  `data-line` + `data-byte`), then measure the click x against the row text → byte column. */
-  private mouseToPos(e: MouseEvent): { line: number; col: number } | null {
+  private mouseToPos(e: MouseEvent): { element: number; line: number; col: number } | null {
     // Use the element under the pointer (not e.target): during a window-level drag, e.target may be
     // outside the buffer, but the coordinates still resolve to the row under the cursor.
     // Rows live in the buffer's shadow root, where `document.elementFromPoint` would only ever
@@ -2969,16 +2998,20 @@ export class Shell {
     const root = this.bufferShadow ?? document;
     const rowEl = root.elementFromPoint(e.clientX, e.clientY)?.closest(".row") as HTMLElement | null;
     if (!rowEl || rowEl.dataset.line === undefined) return null;
+    // The element the row belongs to, not just its line: a logical line names a line only within an
+    // element, so a click resolved to a line alone lands in whichever element holds the cursor —
+    // which is why clicking outside the focused editor did nothing.
+    const element = Number(rowEl.dataset.element ?? 0);
     const line = Number(rowEl.dataset.line);
     const rowByte = Number(rowEl.dataset.byte);
     const textEl = rowEl.querySelector(".row-text") as HTMLElement | null;
-    if (!textEl) return { line, col: rowByte };
+    if (!textEl) return { element, line, col: rowByte };
     const rect = textEl.getBoundingClientRect();
     const charIdx = Math.max(0, Math.round((e.clientX - rect.left) / this.cell.w));
     const { byteStart, byteLen } = decodeRow(textEl.textContent ?? "");
     // A click past the last char maps to the line-end byte (so you can select to EOL).
     const within = charIdx >= byteStart.length ? byteLen : byteStart[charIdx];
-    return { line, col: rowByte + within };
+    return { element, line, col: rowByte + within };
   }
 
   private recomputeGrid(): void {
@@ -2991,11 +3024,8 @@ export class Shell {
   }
 
   private loadedVisualRows(w: BufferWindow): number {
-    let rows = 0;
-    for (const l of w.lines)
-      rows +=
-        (l.virtual_rows_above?.length ?? 0) + l.visual_rows.length + (l.virtual_rows_below?.length ?? 0);
-    return rows;
+    // Every row-producing item, not just the lines: a chrome row occupies a screen row too.
+    return rowItems(w.root).reduce((n, item) => n + itemRows(item), 0);
   }
 
   /** Absolute visual-row index of the cursor in the document, or null if its line isn't loaded. */
@@ -3003,11 +3033,16 @@ export class Shell {
     const v = this.snapshot;
     if (!v?.window) return null;
     const cl = v.buffer.cursor.position.line;
-    if (cl < v.window.first_logical_line || cl >= v.window.last_logical_line_exclusive) return null;
+    if (!lineIsLoaded(v.window, v.focused_element, cl)) return null;
     let row = v.window.first_visual_row;
-    for (const l of v.window.lines) {
-      const above = l.virtual_rows_above?.length ?? 0;
-      if (l.logical_line === cl) {
+    for (const item of rowItems(v.window.root)) {
+      if (item.kind === "chrome") {
+        row += 1;
+        continue;
+      }
+      const l = item.line;
+      const above = l.baseline_above?.length ?? 0;
+      if (item.element === v.focused_element && l.logical_line === cl) {
         let idx = 0;
         for (let i = 0; i < l.visual_rows.length; i++) {
           if (l.visual_rows[i].byte_offset <= v.buffer.cursor.position.col) idx = i;
@@ -3190,6 +3225,7 @@ export class Shell {
         v.blame && v.mode === "normal" && v.blame.line === v.buffer.cursor.position.line
           ? format_blame(v.blame.author, v.blame.timestamp, v.blame.is_uncommitted)
           : null,
+      focusedElement: v.focused_element,
       diffView: v.diff_view,
     });
   }

@@ -686,24 +686,60 @@ html, body, #app {
    reach, and chrome is not one of them. Making "unreachable" legible is its whole job. */
 .row.patch-chrome { color: var(--fg-muted); background: var(--patch-chrome-bg); }
 /* A left rail down the file's chrome, in the gutter column, meeting the rule that opens the block —
-   so the heading rows read as belonging to the file above rather than floating in the diff. */
-.row.patch-chrome .gutter { border-left-color: var(--fg-faint); }
+   so the heading rows read as belonging to the file above rather than floating in the diff.
+   The gutter takes the *band's* colour rather than the editor background it paints on every other
+   row: it is opaque either way (it has to be — it is sticky, so text scrolls under it), and painting
+   the editor background here left a strip of it down the left of every chrome row. The band stopped
+   a column short of the edge and the rail read as living in the gutter rather than in the block. */
+.row.patch-chrome .gutter {
+  /* A quarter-cell in from the row's left edge, not hard against it. The terminal draws the rail as
+     `│`, whose ink sits centred in its cell, and the GUI insets its hairline by a quarter cell; a
+     rail on the gutter's own border edge had no such gap and read as pinned to the window. Drawn as
+     a background layer for the same reason — a border can only ever be at the edge — measured from
+     the border box so the offset is from the row's edge rather than from inside the (transparent)
+     change-bar border. A hairline, not the change-bar's 3px: this is a rail joining chrome rows
+     together, and at the gutter's weight it read as a git marker on rows that have no line to mark.
+     The column keeps its 1ch width (`border-box`), so chrome text stays aligned with code text. */
+  --rail-x: 0.25ch;
+  background-color: var(--patch-chrome-bg);
+  background-image: linear-gradient(var(--fg-faint), var(--fg-faint));
+  background-size: 1px 100%;
+  background-position: var(--rail-x) 0;
+  background-origin: border-box;
+  background-repeat: no-repeat;
+}
+/* A rule *joins* the rail: the terminal spells the join as one glyph (`┌`/`├`/`└`) whose horizontal
+   arm leaves the very cell the vertical line is in, and this is the same figure in two halves — an
+   arm across the gutter, drawn here, and the filler across the content, drawn below. Two halves
+   because the gutter is `position: sticky` (so the change-bar survives horizontal scrolling) and
+   therefore paints over anything the row draws underneath it: a single line spanning the row would
+   be hidden for exactly the width that has to reach the rail.
+   Layers, in paint order: the arm, then the rail itself — the arm leaves *from* the rail, so it
+   starts at the same quarter-cell offset and runs to the gutter's edge (sized a full cell and
+   clipped there), where the content's filler picks it up. */
+.row.patch-chrome.rule .gutter {
+  background-image:
+    linear-gradient(var(--fg-faint), var(--fg-faint)),
+    linear-gradient(var(--fg-faint), var(--fg-faint));
+  background-size: 100% 1px, 1px 100%;
+  background-position: var(--rail-x) 50%, var(--rail-x) 0;
+  background-repeat: no-repeat;
+}
+.row.patch-chrome.rule.closes .gutter {
+  background-image:
+    linear-gradient(var(--fg-faint), var(--fg-faint)),
+    linear-gradient(to bottom, var(--fg-faint) 50%, transparent 50%);
+}
 /* The first file has no rail running into it, so its rule corners rather than teeing: the rail
    starts halfway down, where the horizontal line meets it. */
-.row.patch-chrome.rule.closes .gutter {
-  border-left-color: transparent;
-  background-image: linear-gradient(to bottom, var(--fg-faint) 50%, transparent 50%);
-  background-size: 1px 100%;
-  background-repeat: no-repeat;
-}
 .row.patch-chrome.rule.corners .gutter {
-  border-left-color: transparent;
-  background-image: linear-gradient(to bottom, transparent 50%, var(--fg-faint) 50%);
-  background-size: 1px 100%;
-  background-repeat: no-repeat;
+  background-image:
+    linear-gradient(var(--fg-faint), var(--fg-faint)),
+    linear-gradient(to bottom, transparent 50%, var(--fg-faint) 50%);
 }
 .row.patch-chrome .content { display: flex; align-items: center; }
-/* A file block opens with a rule drawn edge to edge; its path and counts sit on the row below. */
+/* A file block opens with a rule drawn edge to edge; its path and counts sit on the row below. The
+   filler is the right-hand half of the join above — it starts where the gutter's arm stops. */
 .row.patch-chrome.rule .content::after {
   content: "";
   flex: 1;
@@ -714,7 +750,7 @@ html, body, #app {
    read as heavily as the file rule above it and flattened the file/hunk hierarchy. */
 /* The patch's summary caption sits above the first file's rule and belongs to no file, so the rail
    doesn't run through it (see `.detached`). */
-.row.patch-chrome.detached .gutter { border-left-color: transparent; background-image: none; }
+.row.patch-chrome.detached .gutter { background-image: none; }
 .hl-diff-file { color: var(--fg); font-weight: 600; }
 .hl-diff-added { color: var(--git-added); }
 .hl-diff-removed { color: var(--git-deleted); }

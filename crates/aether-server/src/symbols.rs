@@ -53,7 +53,7 @@ pub async fn query_server(
 ///
 /// Handles both response shapes: the classic `SymbolInformation[]` and LSP 3.17's `WorkspaceSymbol`
 /// (whose `location` may be a bare `{ uri }` needing a `workspaceSymbol/resolve` round-trip — those
-/// are dropped, see the doc's Deferred list).
+/// are dropped rather than resolved, since each would cost a further request).
 pub fn parse_symbols(
     reply: &Value,
     encoding: PositionEncoding,

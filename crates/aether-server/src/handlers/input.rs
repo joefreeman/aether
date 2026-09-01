@@ -12,12 +12,10 @@ pub async fn input_text(
     // state changes as a `cursor/set`.
     if let Some(edge) = params.at {
         let mut s = state.lock().await;
-        let buf = s
-            .try_doc_of(params.buffer_id)
-            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
         let key = (client_id, params.buffer_id);
         let current = s.cursors.get(&key).copied().unwrap_or_default();
-        let pos = motion::resolve_selection_edge(buf, current.position, current.anchor, edge);
+        let pos = motion::resolve_selection_edge(&scope, current.position, current.anchor, edge);
         let collapsed = CursorState {
             position: pos,
             anchor: pos,
@@ -169,7 +167,7 @@ pub async fn input_tab(
 pub fn client_tab_width(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> u32 {
     s.viewports
         .values()
-        .find(|v| v.buffer_id == buffer_id && v.client_id == client_id)
+        .find(|v| v.binds(buffer_id) && v.client_id == client_id)
         .map(|v| v.tab_width)
         .unwrap_or(4)
 }
@@ -254,7 +252,11 @@ pub async fn input_unsurround(
         if !has_pair {
             let revision = buf.revision;
             let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
-            return Ok(EditResult { revision, cursor });
+            return Ok(EditResult {
+                buffer: params.buffer_id,
+                revision,
+                cursor,
+            });
         }
     }
     apply_edit(
@@ -276,15 +278,13 @@ pub async fn input_transform_case(
     // never push a no-op undo entry through `apply_edit`.
     let is_noop = {
         let s = state.lock().await;
-        let buf = s
-            .try_doc_of(params.buffer_id)
-            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
         let cursor = s
             .cursors
             .get(&(client_id, params.buffer_id))
             .copied()
             .unwrap_or_default();
-        resolve_transform_case(buf, &cursor, params.kind, params.scan_at_cursor).is_none()
+        resolve_transform_case(&scope, &cursor, params.kind, params.scan_at_cursor).is_none()
     };
     if is_noop {
         return current_edit_result(state, client_id, params.buffer_id).await;
@@ -611,6 +611,7 @@ async fn apply_toggle_comment(
         let revision = buf.revision;
         let response = wrap_for_response(&s, client_id, buffer_id, cursor);
         return Ok(EditResult {
+            buffer: buffer_id,
             revision,
             cursor: response,
         });
@@ -990,6 +991,7 @@ async fn apply_toggle_comment(
         let revision = buf.revision;
         let response = wrap_for_response(&s, client_id, buffer_id, cursor);
         return Ok(EditResult {
+            buffer: buffer_id,
             revision,
             cursor: response,
         });
@@ -1025,8 +1027,7 @@ async fn apply_toggle_comment(
     let edit_last_excl = edit_last_incl + 1;
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes =
         collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
@@ -1046,6 +1047,7 @@ async fn apply_toggle_comment(
         let _ = sender.send(notif).await;
     }
     Ok(EditResult {
+        buffer: buffer_id,
         revision,
         cursor: new_cursor,
     })
@@ -1427,7 +1429,11 @@ pub async fn input_adjust_number(
         if resolve_number_edit(buf, &cursor, delta, scan).is_none() {
             let revision = buf.revision;
             let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
-            return Ok(EditResult { revision, cursor });
+            return Ok(EditResult {
+                buffer: params.buffer_id,
+                revision,
+                cursor,
+            });
         }
     }
     apply_edit(
@@ -1510,6 +1516,7 @@ async fn apply_indent_or_dedent(
 
     if !any_changed {
         return Ok(EditResult {
+            buffer: buffer_id,
             revision: buf.revision,
             cursor,
         });
@@ -1554,8 +1561,7 @@ async fn apply_indent_or_dedent(
     let edit_last_excl = b + 1;
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
-    let new_line_count = s.doc_of(buffer_id).line_count();
-    refresh_viewport_ranges_for_buffer(&mut s, buffer_id, new_line_count);
+    refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes =
         collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
 
@@ -1575,6 +1581,7 @@ async fn apply_indent_or_dedent(
         let _ = sender.send(notif).await;
     }
     Ok(EditResult {
+        buffer: buffer_id,
         revision,
         cursor: new_cursor,
     })

@@ -2,6 +2,7 @@
 
 mod common;
 
+use aether_protocol::coords::{ViewLine, VisualRow};
 use common::*;
 
 // ---- real-LSP verification ---------------------------------------------------------------------
@@ -37,8 +38,9 @@ async fn run_lsp_diagnostics(
                     let p: ViewportLinesChangedParams =
                         serde_json::from_value(n.params).expect("typed params");
                     let diags: Vec<(DiagnosticSeverity, String)> = p
-                        .replacement_lines
-                        .iter()
+                        .root
+                        .lines()
+                        .into_iter()
                         .flat_map(|l| l.diagnostics.iter())
                         .map(|d| (d.severity, d.message.clone()))
                         .collect();
@@ -1672,7 +1674,7 @@ async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut ws,
         &BufferCloseParams {
-            buffer_id: open.buffer_id,
+            buffer_id: aether_protocol::ViewId(open.buffer_id),
             open_next: false,
         },
     )
@@ -2839,7 +2841,7 @@ async fn http_rejects_foreign_host() {
 
 /// The viewport reports the buffer's total visual-row height and the window's first visual row, so
 /// a native-scrolling client can size a full-document scroller and position the loaded window. Under
-/// no-wrap the total equals the logical line count; first_visual_row tracks first_logical_line.
+/// no-wrap the total equals the logical line count; first_visual_row tracks first_view_line.
 #[tokio::test]
 async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
@@ -2848,12 +2850,12 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 10,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::None,
@@ -2864,8 +2866,11 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     )
     .await;
     // No-wrap: one visual row per logical line; window starts at the top.
-    assert_eq!(sub.window.total_visual_rows, sub.window.line_count);
-    assert_eq!(sub.window.first_visual_row, 0);
+    assert_eq!(sub.window.total_visual_rows, sub.window.view_line_count);
+    assert_eq!(
+        sub.window.first_visual_row,
+        aether_protocol::coords::VisualRow(0)
+    );
     // Widest line is "line 10".."line 99" — 7 cols.
     assert_eq!(sub.window.max_line_width, 7);
     let viewport_id = sub.viewport_id;
@@ -2875,14 +2880,22 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
         &mut ws,
         &ViewportScrollToRowParams {
             viewport_id,
-            top_visual_row: 50,
+            top_visual_row: VisualRow(50),
         },
     )
     .await;
-    // Under no-wrap, first_visual_row == first_logical_line, and line 50 is in the loaded window.
-    assert_eq!(res.window.first_visual_row, res.window.first_logical_line);
-    assert!(res.window.first_logical_line <= 50);
-    assert!(res.window.lines.iter().any(|l| l.logical_line == 50));
+    // Under no-wrap, first_visual_row == first_view_line, and line 50 is in the loaded window.
+    assert_eq!(
+        res.window.first_visual_row.get(),
+        res.window.first_view_line.get()
+    );
+    assert!(res.window.first_view_line <= aether_protocol::coords::ViewLine(50));
+    assert!(res
+        .window
+        .root
+        .lines()
+        .into_iter()
+        .any(|l| l.logical_line == 50));
 
     drop(server);
 }
@@ -2896,12 +2909,12 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id,
+            buffer_id: aether_protocol::ViewId(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 5,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -2913,10 +2926,10 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
     .await;
     // The 30-char line wraps to several rows, so the total exceeds the 3 logical lines.
     assert!(
-        sub.window.total_visual_rows > sub.window.line_count,
+        sub.window.total_visual_rows > sub.window.view_line_count,
         "total_visual_rows {} should exceed line_count {}",
         sub.window.total_visual_rows,
-        sub.window.line_count
+        sub.window.view_line_count
     );
     // Soft wrap never overflows horizontally, so no max-line-width is reported.
     assert_eq!(sub.window.max_line_width, 0);
@@ -2941,12 +2954,12 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
         let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id,
+                buffer_id: aether_protocol::ViewId(buffer_id),
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: 0,
+                    logical_line: ViewLine(0),
                     sub_row: 0.0,
                 },
                 wrap: WrapMode::Soft,
@@ -3002,7 +3015,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     let result: BufferCloseResult = send_request::<BufferClose>(
         &mut ws_a,
         &BufferCloseParams {
-            buffer_id: buf_a,
+            buffer_id: aether_protocol::ViewId(buf_a),
             open_next: false,
         },
     )
@@ -3054,12 +3067,12 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws_a,
         &ViewportSubscribeParams {
-            buffer_id: buf_b,
+            buffer_id: aether_protocol::ViewId(buf_b),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: 0,
+                logical_line: ViewLine(0),
                 sub_row: 0.0,
             },
             wrap: WrapMode::Soft,
@@ -3080,7 +3093,7 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut ws_b,
         &BufferCloseParams {
-            buffer_id: buf_a,
+            buffer_id: aether_protocol::ViewId(buf_a),
             open_next: false,
         },
     )
@@ -3134,7 +3147,7 @@ async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
     let _: BufferCloseResult = send_request::<BufferClose>(
         &mut browser,
         &BufferCloseParams {
-            buffer_id: buf,
+            buffer_id: aether_protocol::ViewId(buf),
             open_next: false,
         },
     )
@@ -3360,5 +3373,211 @@ async fn restart_server_takes_the_language_down_and_brings_it_back() {
     )
     .await;
     wait_for_buffer_diagnostic(&mut ws, open.buffer_id).await;
+    drop(server);
+}
+
+/// A composed view's status snapshot describes the **focused file**, not the view's own document.
+///
+/// `view/subscribe` answers with a `BufferStatusSnapshot` — external-change flags, diagnostic
+/// counts, language-server health and the outline breadcrumb. All four were read off the buffer
+/// being subscribed to, which for a working-changes view is the *generated patch*: a document with
+/// no language server, no diagnostics and no outline. So opening `Space g w` showed zeroed counts
+/// and an empty breadcrumb until the cursor moved and the follow loop pushed the real ones.
+///
+/// Diagnostics are the cheapest of the four to pin — they need no outline round-trip — and all four
+/// read the same `focus_buffer`, so this covers the line that was wrong.
+#[tokio::test]
+async fn a_composed_views_status_snapshot_describes_the_focused_file() {
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "main.rs", "fn a() {}\n");
+    // A working-tree change, so the view has an element windowing this file.
+    std::fs::write(root.join("main.rs"), "fn a() {}\nfn ADDED() {}\n").unwrap();
+
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(1, 0, 2),
+            severity: 1,
+            message: "boom".into(),
+        }],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "composed-status",
+        &root,
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The file's own diagnostics have landed before the patch view is opened.
+    wait_for_buffer_diag_present(&mut ws, open.buffer_id, true).await;
+
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &aether_protocol::git::GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: aether_protocol::git::ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    assert_ne!(
+        patch.buffer_id, open.buffer_id,
+        "the view is the generated patch, not the file"
+    );
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: aether_protocol::coords::ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert!(
+        sub.focus.is_some(),
+        "the view windows a real file, so it answers with a focused element"
+    );
+    assert_eq!(
+        sub.buffer_status.diagnostics.errors, 1,
+        "the snapshot is the focused file's; zero here means it was read off the patch document"
+    );
+    drop(server);
+}
+
+/// `d` refuses a diagnostic outside the focused hunk — driven through `lsp/navigate_diagnostic`
+/// against a real working-changes view, not against the target picker in isolation.
+///
+/// This is the case that started §3: "if the diagnostic isn't visible, we wouldn't move the cursor,
+/// rather than sometimes moving to the end of the editor block if there happens to be a diagnostic
+/// later in the buffer." The non-vacuity assertion is the load-bearing one — the *same* file with
+/// the *same* diagnostics, opened plainly, does find the far one.
+#[tokio::test]
+async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+
+    // 40 lines; only line 20 changes, so the working-changes hunk is a short window around it.
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    let committed = format!("{}\n", lines.join("\n"));
+    commit_file(&repo, "main.rs", &committed);
+    lines[20] = "fn CHANGED() {}".into();
+    std::fs::write(root.join("main.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    // One diagnostic inside the hunk, one far below it.
+    let dummy = DummyLspConfig {
+        diagnostics: vec![
+            DummyDiagnostic {
+                range: DummyRange::on(20, 0, 2),
+                severity: 1,
+                message: "inside the hunk".into(),
+            },
+            DummyDiagnostic {
+                range: DummyRange::on(38, 0, 2),
+                severity: 1,
+                message: "far below it".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let (server, mut ws) =
+        open_and_subscribe_with_lsp("diag-scope", &root, "main.rs", vec![("rust".into(), dummy)])
+            .await;
+    let file: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    wait_for_buffer_diagnostic(&mut ws, file.buffer_id).await;
+
+    // Non-vacuity first, while the plain view of the file is still what we are subscribed to:
+    // from line 20, `d` finds the diagnostic on line 38.
+    set_cursor(&mut ws, file.buffer_id, 20, 0).await;
+    let plain = navigate(&mut ws, file.buffer_id, DiagnosticDirection::Next).await;
+    assert!(
+        plain.moved,
+        "in a plain view the far diagnostic is reachable"
+    );
+    assert_eq!(plain.cursor.position.line, 38);
+
+    // Now the composed view: subscribing rebinds the scope to the hunk around line 20.
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &aether_protocol::git::GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: aether_protocol::git::ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: aether_protocol::coords::ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Edits address the file's buffer, which is what the element windows.
+    set_cursor(&mut ws, file.buffer_id, 20, 0).await;
+    let scoped = navigate(&mut ws, file.buffer_id, DiagnosticDirection::Next).await;
+    assert!(
+        !scoped.moved,
+        "the only diagnostic ahead is 18 lines outside the hunk, so `d` must refuse"
+    );
+    assert_eq!(
+        scoped.cursor.position.line, 20,
+        "and the cursor stays put rather than sliding to the element's edge"
+    );
     drop(server);
 }
